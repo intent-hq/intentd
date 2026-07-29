@@ -433,11 +433,11 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
-    /// Shared cache + offload gates for the git-derived workspace card
-    /// aggregates (`diffSummary` rollups, CoW support probes) so the
-    /// `workspace.list` / `workspace.get` emit paths never run blocking
-    /// libgit2/FS work inline on the async runtime (§9.1). Shared across
-    /// clones so concurrent list calls single-flight the same worktree.
+    /// Shared cache + offload gates for git-derived aggregates that are still
+    /// computed on demand (`diffSummary` for explicit callers, CoW support
+    /// probes on list/get). Diff rollups are **not** attached to the high-
+    /// frequency list/get emit path; the cache is invalidated from file/git
+    /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
@@ -916,19 +916,23 @@ impl Services {
     }
 
     /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
-    /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
-    /// Each is computed from live state (notes / agents / git worktree) and
+    /// `cowSupported`) for the `workspace.list` / `workspace.get` emit path (§9.1).
+    /// Each is computed from live state (notes / agents / FS capability) and
     /// omitted when not computable; a read failure degrades to an absent
     /// aggregate rather than failing the whole call. `lastActivity` is derived
     /// inline from the same notes/sessions scan (mirrors
     /// [`Services::derive_last_activity`] so list/get callers get both in one
     /// round-trip); keep the two derivations in lock-step when the rules or
-    /// underlying store queries change. The git/FS-derived aggregates
-    /// (`diffSummary`, `cowSupported`) go through the shared
-    /// [`workspace_aggregates::WorkspaceAggregateCache`]: computed on the
-    /// blocking pool with bounded concurrency, cached, and degraded to the
-    /// last known value / omission when over budget, so a slow worktree can
-    /// never stall the async runtime or blow past FE RPC timeouts.
+    /// underlying store queries change.
+    ///
+    /// `diffSummary` is intentionally **not** computed here. Full worktree
+    /// rollups are too expensive for the high-frequency list/get/subscription
+    /// re-read path; desktop FE already treats the field as deprecated and
+    /// fetches on demand via `GET_DIFF_SUMMARY`, and embedding the rollup on
+    /// every workspace re-read pinned the blocking pool. The
+    /// [`workspace_aggregates::WorkspaceAggregateCache`] remains for optional
+    /// on-demand callers and is invalidated from `file:*` /
+    /// `changes:git-status` events.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -954,14 +958,8 @@ impl Services {
             }
             ws.agent_summary = Some(build_agent_summary(&sessions));
         }
-        ws.diff_summary = match ws.worktree_path.as_deref().filter(|p| !p.is_empty()) {
-            Some(worktree) => {
-                self.workspace_aggregates
-                    .diff_summary(ws.id.as_str(), PathBuf::from(worktree))
-                    .await
-            }
-            None => None,
-        };
+        // diffSummary: omitted on list/get/subscription re-reads (see method docs).
+        ws.diff_summary = None;
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
@@ -1669,7 +1667,14 @@ impl Services {
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
-        self.event_bus = Some(bus);
+        self.event_bus = Some(bus.clone());
+        // Keep the on-demand diffSummary cache coherent with the worktree:
+        // invalidate when files change or git status is published. No-op when
+        // there is no tokio runtime (some unit-test constructors).
+        workspace_aggregates::spawn_diff_cache_invalidation(
+            bus,
+            Arc::clone(&self.workspace_aggregates),
+        );
         self
     }
 

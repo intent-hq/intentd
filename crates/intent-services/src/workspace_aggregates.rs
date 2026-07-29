@@ -1,34 +1,29 @@
-//! Offloaded, cached computation of the git-derived workspace card aggregates
-//! (`diffSummary`, `cowSupported`) for the `workspace.list` / `workspace.get`
-//! emit path (§9.1).
+//! Offloaded, cached computation of git-derived workspace aggregates
+//! (`diffSummary` for on-demand callers, `cowSupported` for list/get).
 //!
-//! Both aggregates are blocking libgit2/filesystem work (`head_diff_rollup`
-//! runs two full workdir diffs plus an untracked scan; `cow_probe` does a live
-//! clone probe). Running them inline per workspace made `workspace.list`
-//! O(workspaces × workdir-diff) on the async runtime and blew past FE RPC
-//! timeouts. This module bounds that cost:
+//! ## Diff summary is off the high-frequency read path
 //!
-//! - **Blocking pool**: all rollups/probes run under `spawn_blocking`, never
-//!   inline on tokio worker threads.
-//! - **Bounded concurrency**: a global semaphore caps concurrent rollups.
-//! - **Single-flight + adaptive TTL cache**: one rollup per worktree at a
-//!   time; completed rollups are cached so FE list polling doesn't redo the
-//!   same diff every call. The freshness window scales with the last observed
-//!   compute duration (clamped to [`DIFF_SUMMARY_TTL`]..[`DIFF_SUMMARY_TTL_MAX`]),
-//!   so a worktree whose rollup takes tens of seconds is not recomputed every
-//!   few seconds.
-//! - **Per-call budget**: a list/get call waits at most [`AGGREGATE_BUDGET`]
-//!   for a rollup, then serves the last completed value (possibly stale) or
-//!   omits the aggregate — the wire shape keeps both fields optional. The
-//!   detached computation still finishes and fills the cache, so a subsequent
-//!   poll picks the value up.
-//! - **CoW probe cache**: `cowSupported` is invariant per workspaces root
-//!   (it is a machine capability of the root's filesystem), so successful
-//!   probes are cached for the daemon's lifetime (over-budget probes finish
-//!   detached and backfill the cache; failed probes are not cached so a
-//!   later call retries). Live probes are serialized because concurrent
-//!   probes into the same `workspaces_root` would collide on the shared
-//!   `.cow_probe_temp` file now that enrichment fans out in parallel.
+//! `workspace.list` / `workspace.get` / live-state subscription re-reads used
+//! to embed a full `head_diff_rollup` on every workspace. That pinned the
+//! blocking pool whenever list polling or `lastActivity` events re-materialized
+//! workspace rows. Desktop FE already deprecated `diffSummary` on metadata
+//! payloads and fetches it on demand (`GET_DIFF_SUMMARY`). This module still
+//! exposes the rollup for optional/on-demand callers, but list/get enrichment
+//! no longer attaches it.
+//!
+//! ## Cache coherency
+//!
+//! - **Blocking pool + bounded concurrency + single-flight** for rollups.
+//! - **Event-driven invalidation** (primary): `spawn_diff_cache_invalidation`
+//!   drops cached entries when `file:created` / `file:changed` / `file:deleted`
+//!   or `changes:git-status` fires for a workspace. Idle worktrees are never
+//!   re-diffed just because the workspace row was re-read.
+//! - **Long TTL backstop** only: retained so a missed watcher event eventually
+//!   expires; not the primary refresh trigger.
+//! - **Per-call budget**: over-budget calls serve last known / omit; detached
+//!   work still fills the cache.
+//! - **CoW probe cache**: machine capability of the workspaces root; lifetime
+//!   cache with single-flight + serialized live probes.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -41,7 +36,7 @@ use intent_core::{now_iso, WorkspaceDiffSummary};
 /// Minimum freshness window for a completed diff rollup. Card aggregates are
 /// advisory (workspace cards, not the Changes panel), so brief staleness is
 /// acceptable in exchange for not re-diffing every FE list poll.
-const DIFF_SUMMARY_TTL: Duration = Duration::from_secs(5);
+const DIFF_SUMMARY_TTL: Duration = Duration::from_secs(60);
 
 /// Multiplier applied to the last observed rollup duration when deriving the
 /// adaptive TTL: a rollup that took `d` stays fresh for `d × N`, so a worktree
@@ -94,9 +89,15 @@ struct DiffCacheEntry {
 /// Shared cache + offload gates for the git-derived card aggregates. Held as
 /// an `Arc` field on `Services` so every clone (and thus every concurrent
 /// list/get call) observes the same cache and single-flight state.
+// On-demand rollup path is retained for tests and potential future RPC callers;
+// list/get enrichment no longer attaches diffSummary (high-frequency re-read).
+#[allow(dead_code)]
 pub(crate) struct WorkspaceAggregateCache {
     /// Last completed diff rollup per worktree path.
     diff: Mutex<HashMap<String, DiffCacheEntry>>,
+    /// workspace_id to worktree cache keys last computed for that workspace.
+    /// Lets event-driven invalidation drop entries without knowing the path.
+    by_workspace: Mutex<HashMap<String, HashSet<String>>>,
     /// Worktrees with a rollup currently in flight (single-flight guard).
     diff_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Bounds concurrent blocking rollups.
@@ -156,6 +157,7 @@ impl WorkspaceAggregateCache {
     pub(crate) fn with_timing(ttl: Duration, max_ttl: Duration, budget: Duration) -> Self {
         Self {
             diff: Mutex::new(HashMap::new()),
+            by_workspace: Mutex::new(HashMap::new()),
             diff_in_flight: Arc::new(Mutex::new(HashSet::new())),
             gate: tokio::sync::Semaphore::new(MAX_CONCURRENT_ROLLUPS),
             cow: Mutex::new(HashMap::new()),
@@ -171,6 +173,7 @@ impl WorkspaceAggregateCache {
     /// worktree. Never blocks the async runtime and never waits longer than
     /// the configured budget; on a miss that can't complete in time it returns
     /// the last completed rollup (possibly stale) or `None`.
+    #[allow(dead_code)]
     pub(crate) async fn diff_summary(
         self: &Arc<Self>,
         workspace_id: &str,
@@ -225,6 +228,7 @@ impl WorkspaceAggregateCache {
     /// the inner value is the cached summary (which may itself be `None`).
     /// `fresh_only` enforces the entry's adaptive TTL; stale entries are
     /// served on the degradation paths above.
+    #[allow(dead_code)]
     fn lookup_diff(&self, key: &str, fresh_only: bool) -> Option<Option<WorkspaceDiffSummary>> {
         let map = self.diff.lock().unwrap();
         map.get(key)
@@ -238,6 +242,7 @@ impl WorkspaceAggregateCache {
 
     /// Run one bounded, offloaded rollup and record the result. Failures
     /// (blocking-task panic) are not cached so the next call retries.
+    #[allow(dead_code)]
     async fn rollup_and_store(
         &self,
         workspace_id: &str,
@@ -286,8 +291,33 @@ impl WorkspaceAggregateCache {
                 summary: summary.clone(),
             },
         );
+        self.by_workspace
+            .lock()
+            .unwrap()
+            .entry(workspace_id.to_string())
+            .or_default()
+            .insert(key.to_string());
         summary
     }
+
+    /// Drop cached diff summaries for a workspace (event-driven invalidation).
+    /// Next on-demand diff_summary call recomputes. No-op when nothing is cached.
+    pub(crate) fn invalidate_workspace(&self, workspace_id: &str) {
+        let keys = self
+            .by_workspace
+            .lock()
+            .unwrap()
+            .remove(workspace_id)
+            .unwrap_or_default();
+        if keys.is_empty() {
+            return;
+        }
+        let mut map = self.diff.lock().unwrap();
+        for key in keys {
+            map.remove(&key);
+        }
+    }
+
 
     /// Compute (or serve from cache) the `cowSupported` aggregate for a
     /// workspaces root. The probe runs root→root, so it reports whether the
@@ -377,10 +407,54 @@ impl WorkspaceAggregateCache {
     }
 }
 
+/// Subscribe to worktree / git events and invalidate the on-demand
+/// diffSummary cache. Spawns a background task; safe to call once per
+/// Services wiring. No-op if the current thread is not inside a tokio runtime
+/// (unit tests that construct Services without a runtime).
+pub(crate) fn spawn_diff_cache_invalidation(
+    bus: crate::events::EventBus,
+    cache: Arc<WorkspaceAggregateCache>,
+) {
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            tracing::debug!(
+                "workspace aggregates: no tokio runtime; skipping diff cache invalidation subscriber"
+            );
+            return;
+        }
+    };
+    handle.spawn(async move {
+        use crate::events::filter::SubscriptionFilter;
+        use intent_core::events::{CHANGES_GIT_STATUS, FILE_CHANGED, FILE_CREATED, FILE_DELETED};
+
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![
+                FILE_CREATED.to_string(),
+                FILE_CHANGED.to_string(),
+                FILE_DELETED.to_string(),
+                CHANGES_GIT_STATUS.to_string(),
+            ],
+            ..SubscriptionFilter::default()
+        });
+        while let Some(batch) = sub.recv().await {
+            let mut seen = HashSet::new();
+            for ev in batch {
+                let id = ev.workspace_id.as_str().to_string();
+                if id.is_empty() || !seen.insert(id.clone()) {
+                    continue;
+                }
+                cache.invalidate_workspace(&id);
+            }
+        }
+    });
+}
+
 /// The blocking `diffSummary` rollup body (runs on the blocking pool): ports
 /// the on-demand TS `computeWorkspaceDiffSummary`. Returns `None` when the
 /// worktree is not a git repo or there are no changes (matching the TS
 /// `undefined` fallback).
+#[allow(dead_code)]
 fn compute_diff_summary_blocking(worktree: &Path) -> Option<WorkspaceDiffSummary> {
     if !worktree.join(".git").exists() {
         return None;
@@ -683,5 +757,34 @@ mod tests {
         let result = cache.cow_supported(root.clone()).await;
         assert!(result.is_some(), "probe should create the missing root");
         assert!(root.exists());
+    }
+
+    #[tokio::test]
+    async fn invalidate_workspace_forces_recompute() {
+        let dir = seeded_dirty_repo();
+        let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        let first = cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(first.total_files, 1);
+
+        fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+        let cached = cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(cached.total_files, 1);
+
+        cache.invalidate_workspace("ws-1");
+        let second = cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(second.total_files, 2);
     }
 }
