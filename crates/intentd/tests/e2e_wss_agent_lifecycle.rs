@@ -3400,6 +3400,156 @@ async fn terminal_create_env_over_wss() {
     );
 }
 
+/// Regression (paste/echo throughput): `terminal:data` is transient /
+/// broadcast-only (PROTOCOL §5.10 retention note, §6.5), so a PTY producing
+/// many small output chunks must (a) deliver every chunk to a live WSS
+/// subscriber, in order, before `terminal:exit`, and (b) leave zero
+/// `terminal:data` rows behind for `event.query` — while `terminal:exit`
+/// stays durable. Before the fix each chunk awaited a durable SQLite commit,
+/// serializing paste echo behind the writer batch window.
+#[tokio::test]
+async fn terminal_data_many_chunks_transient_over_wss() {
+    use base64::Engine as _;
+
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE spawning so no chunk is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["terminal:data", "terminal:exit"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — spawn a bare `sh` and drive it via terminal.write, so the
+    // loop output streams as many small live chunks (paste-echo shape).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "terminal.create",
+        json!({ "workspaceId": ws_id, "cols": 80, "rows": 24, "command": "sh" }),
+    )
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId in terminal.create result")
+        .to_string();
+
+    // 200 fixed-width markers; the command echo carries the literal
+    // `CHUNK-%03d-END` template, which never collides with an expanded marker.
+    const CHUNKS: usize = 200;
+    let script =
+        format!("for i in $(seq 1 {CHUNKS}); do printf 'CHUNK-%03d-END\\n' \"$i\"; done; exit\n");
+    let written = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.write",
+        json!({
+            "terminalId": terminal_id,
+            "data": base64::engine::general_purpose::STANDARD.encode(script.as_bytes()),
+        }),
+    )
+    .await;
+    assert_eq!(written["ok"], json!(true));
+
+    // Accumulate decoded chunks until `terminal:exit`; deadline-driven like
+    // `terminal_create_env_over_wss` so slow CI dribble never truncates. The
+    // in-order marker scan below runs against ONLY the bytes accumulated
+    // before the exit frame, so it doubles as the exit-never-overtakes-data
+    // assertion.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_exit = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !saw_exit {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let next = match timeout(remaining, sub.next()).await {
+            Ok(next) => next,
+            Err(_) => break,
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                if frame["method"] != "events.event" {
+                    continue;
+                }
+                let event = &frame["params"]["event"];
+                if event["data"]["terminalId"].as_str() != Some(&terminal_id) {
+                    continue;
+                }
+                match event["type"].as_str() {
+                    Some("terminal:data") => {
+                        if let Some(chunk) = event["data"]["chunk"].as_str() {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(chunk)
+                                .expect("valid base64 in terminal:data.chunk");
+                            acc.extend_from_slice(&bytes);
+                        }
+                    }
+                    Some("terminal:exit") => saw_exit = true,
+                    _ => {}
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let text = String::from_utf8_lossy(&acc);
+    assert!(
+        saw_exit,
+        "terminal:exit must arrive after the loop finishes; output was: {text:?}"
+    );
+    // Every marker delivered, in order, before exit (exit never overtakes
+    // data: only pre-exit bytes are in `acc`).
+    let mut cursor = 0usize;
+    for i in 1..=CHUNKS {
+        let marker = format!("CHUNK-{i:03}-END");
+        let pos = text[cursor..].find(&marker).unwrap_or_else(|| {
+            panic!("marker {marker} missing or out of order (cursor {cursor}); output: {text:?}")
+        });
+        cursor += pos + marker.len();
+    }
+
+    // Transient: zero persisted terminal:data rows; durable: terminal:exit
+    // committed before its broadcast, so it is already queryable here.
+    let data_rows = wss_rpc(
+        &mut rpc,
+        4,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "terminal:data" }),
+    )
+    .await;
+    assert_eq!(
+        data_rows,
+        json!([]),
+        "terminal:data must not be persisted (PROTOCOL §5.10 / §6.5)"
+    );
+    let exit_rows = wss_rpc(
+        &mut rpc,
+        5,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "terminal:exit" }),
+    )
+    .await;
+    assert!(
+        !exit_rows.as_array().expect("exit rows array").is_empty(),
+        "terminal:exit stays durable: {exit_rows}"
+    );
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and

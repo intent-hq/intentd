@@ -364,8 +364,12 @@ pub async fn start_stream(
     Ok(request_id)
 }
 
-/// Spawn a per-pipe reader that chunks bytes into base64 and publishes them as
-/// `event_type` frames until the pipe closes.
+/// Spawn a per-pipe reader that chunks bytes into base64 and broadcasts them as
+/// `event_type` frames until the pipe closes. Chunks are transient
+/// (broadcast-only, never persisted — same path as `agent:stream:chunk`):
+/// streamed output is consumed live by the correlated subscriber and has no
+/// event-table readback, so a chatty child must not serialize behind a durable
+/// SQLite commit per chunk. The terminal `host:exec:exit` stays durable.
 fn spawn_reader<R>(
     bus: EventBus,
     workspace_id: WorkspaceId,
@@ -383,9 +387,7 @@ fn spawn_reader<R>(
                 Ok(n) => {
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                     let ev = chunk_event(&workspace_id, &request_id, event_type, chunk);
-                    if let Err(e) = bus.publish(&ev).await {
-                        tracing::warn!(error = %e, "failed to publish {event_type}");
-                    }
+                    bus.publish_transient(&ev);
                 }
                 Err(_) => break,
             }

@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
-use crate::{publish_event, system_actor, SettingsRegistry};
+use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
 
 /// How often the output streamer polls for natural process exit. The broadcast
 /// sender lives in the (still-tracked) session, so a child that exits on its own
@@ -424,12 +424,12 @@ pub(crate) fn spawn_output_stream(
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
-            emit_data(&bus, &workspace_id, &terminal_id, &attachment.backlog).await;
+            emit_data(&bus, &workspace_id, &terminal_id, &attachment.backlog);
         }
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk).await,
+                    Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk),
                     Err(RecvError::Lagged(_)) => continue,
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
@@ -439,7 +439,7 @@ pub(crate) fn spawn_output_stream(
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
-                        drain_pending(&mut live, &bus, &workspace_id, &terminal_id).await;
+                        drain_pending(&mut live, &bus, &workspace_id, &terminal_id);
                         break;
                     }
                 }
@@ -452,7 +452,7 @@ pub(crate) fn spawn_output_stream(
 
 /// Flush any output buffered on the live channel without blocking (used once the
 /// child has exited so trailing output still streams before `terminal:exit`).
-async fn drain_pending(
+fn drain_pending(
     live: &mut tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
     bus: &Option<EventBus>,
     workspace_id: &WorkspaceId,
@@ -460,28 +460,37 @@ async fn drain_pending(
 ) {
     loop {
         match live.try_recv() {
-            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk).await,
+            Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
             Err(TryRecvError::Lagged(_)) => continue,
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
         }
     }
 }
 
-/// Publish a `terminal:data` event carrying a base64 output `chunk`.
-async fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
+/// Broadcast a `terminal:data` event carrying a base64 output `chunk`.
+///
+/// Transient (broadcast-only, never persisted — same path as
+/// `agent:stream:chunk`): PTY output is high-volume and must not serialize
+/// behind a durable SQLite commit per chunk, which throttled paste echo to one
+/// chunk per writer-batch window. Scrollback replay reads the PTY host ring
+/// buffer via `terminal.getBuffer`, so nothing consumes persisted
+/// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
+/// task broadcasts every chunk synchronously before it awaits the durable
+/// `emit_exit`, so exit can never overtake data.
+fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
     let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
-    publish_event(
+    publish_event_transient(
         bus,
         terminal_event(
             ws,
             TERMINAL_DATA,
             json!({ "terminalId": terminal_id, "chunk": chunk }),
         ),
-    )
-    .await;
+    );
 }
 
-/// Publish a self-sufficient `terminal:exit` event.
+/// Publish a self-sufficient `terminal:exit` event (durable, emitted after the
+/// stream task has broadcast every `terminal:data` chunk).
 async fn emit_exit(
     bus: &Option<EventBus>,
     ws: &WorkspaceId,
@@ -1415,6 +1424,77 @@ mod tests {
         // After a kill the session is gone, so no exit code can be latched.
         assert!(exit.data["exitCode"].is_null());
         assert!(exit.data["signal"].is_null());
+    }
+
+    /// Regression (paste/echo throughput): `terminal:data` is transient —
+    /// broadcast to live subscribers but never persisted to the event table —
+    /// while `terminal:exit` stays durable and never overtakes data chunks.
+    #[tokio::test]
+    async fn data_is_transient_exit_is_durable() {
+        let pty = host();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let res = create(
+            pty.clone(),
+            Some(bus),
+            None,
+            None,
+            ws("ws-1"),
+            80,
+            24,
+            None,
+            Some("cat".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = term_id(&res);
+
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"TRANSIENT_MARK\n"),
+        )
+        .unwrap();
+        let acc = collect_data_until(&mut sub, b"TRANSIENT_MARK", TIMEOUT).await;
+        assert!(
+            contains_sub(&acc, b"TRANSIENT_MARK"),
+            "terminal:data must reach live subscribers"
+        );
+
+        kill(pty.as_ref(), &id).await.unwrap();
+        // `publish` commits before broadcasting, so once the subscriber sees
+        // the exit the durable row is already queryable.
+        wait_for_event(&mut sub, TERMINAL_EXIT, TIMEOUT)
+            .await
+            .expect("terminal:exit event");
+
+        let data_rows = store
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![TERMINAL_DATA.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query terminal:data");
+        assert!(
+            data_rows.is_empty(),
+            "terminal:data must not be persisted (transient publish path)"
+        );
+        let exit_rows = store
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![TERMINAL_EXIT.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query terminal:exit");
+        assert_eq!(
+            exit_rows.len(),
+            1,
+            "terminal:exit stays durable exactly once"
+        );
     }
 
     #[tokio::test]

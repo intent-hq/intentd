@@ -27,7 +27,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::events::EventBus;
-use crate::{publish_event, system_actor};
+use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
 const AUTO_RESTART_DELAY: Duration = Duration::from_millis(1000);
@@ -612,8 +612,7 @@ impl ScriptManager {
                     &format!(
                         "Exited too quickly ({ms}ms) — not restarting. Check your configuration."
                     ),
-                )
-                .await;
+                );
                 break;
             }
             if restart_count >= AUTO_RESTART_MAX_RETRIES {
@@ -641,8 +640,7 @@ impl ScriptManager {
                 &ws,
                 &script_id,
                 &format!("Restarting (attempt {attempt}/{AUTO_RESTART_MAX_RETRIES})"),
-            )
-            .await;
+            );
         }
     }
 
@@ -663,7 +661,7 @@ impl ScriptManager {
         let mut live = attachment.live;
         let mut url_done = !detect_url;
         if !attachment.backlog.is_empty() {
-            self.emit_output(ws, script_id, &attachment.backlog).await;
+            self.emit_output(ws, script_id, &attachment.backlog);
             if !url_done {
                 url_done = self
                     .try_detect_url(ws, script_id, &attachment.backlog)
@@ -674,7 +672,7 @@ impl ScriptManager {
             tokio::select! {
                 recv = live.recv() => match recv {
                     Ok(chunk) => {
-                        self.emit_output(ws, script_id, &chunk).await;
+                        self.emit_output(ws, script_id, &chunk);
                         if !url_done {
                             url_done = self.try_detect_url(ws, script_id, &chunk).await;
                         }
@@ -687,7 +685,7 @@ impl ScriptManager {
                         loop {
                             match live.try_recv() {
                                 Ok(chunk) => {
-                                    self.emit_output(ws, script_id, &chunk).await;
+                                    self.emit_output(ws, script_id, &chunk);
                                     if !url_done {
                                         url_done =
                                             self.try_detect_url(ws, script_id, &chunk).await;
@@ -788,18 +786,25 @@ impl ScriptManager {
         self.emit_state(ws, script_id, &state).await;
     }
 
-    /// Publish a `script:output` event carrying a base64 output `chunk`.
-    async fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
+    /// Broadcast a `script:output` event carrying a base64 output `chunk`.
+    ///
+    /// Transient (broadcast-only, never persisted — same path as
+    /// `agent:stream:chunk` / `terminal:data`): script PTY output is
+    /// high-volume and must not serialize behind a durable SQLite commit per
+    /// chunk. Scrollback replay reads the PTY host ring buffer via
+    /// `script.output`, so nothing consumes persisted `script:output` rows.
+    /// The durable `script:state` transitions are emitted after the `run_one`
+    /// loop has broadcast every chunk, so state never overtakes output.
+    fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
         let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
-        publish_event(
+        publish_event_transient(
             &self.bus,
             script_event(
                 ws,
                 SCRIPT_OUTPUT,
                 json!({ "scriptId": script_id, "chunk": chunk }),
             ),
-        )
-        .await;
+        );
     }
 
     /// Publish a self-sufficient `script:state` event (the runtime state plus the
@@ -813,9 +818,9 @@ impl ScriptManager {
     }
 
     /// Stream a synthetic separator line (e.g. restart notices) as `script:output`.
-    async fn emit_separator(&self, ws: &WorkspaceId, script_id: &str, message: &str) {
+    fn emit_separator(&self, ws: &WorkspaceId, script_id: &str, message: &str) {
         let line = format!("\r\n--- {message} ---\r\n");
-        self.emit_output(ws, script_id, line.as_bytes()).await;
+        self.emit_output(ws, script_id, line.as_bytes());
     }
 
     /// Resolve the script's working directory: the workspace worktree root, or a

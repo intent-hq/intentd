@@ -277,6 +277,11 @@ impl Store {
         //   live-output shape as terminal:data; was leaking pre-fix and
         //   dominated the event table on long-lived daemons). Exact type,
         //   not a `script:` prefix, so `script:state` (lifecycle) survives.
+        //
+        // `terminal:data`, `script:output`, and the `host:exec:stdout`/
+        // `host:exec:stderr` chunks are now published transient
+        // (broadcast-only, never persisted) at the emit site; their arms here
+        // stay so rows persisted by older daemon versions still age out.
         let mut removed = 0;
         removed += self
             .delete_type_prefix_before(intent_core::events::AGENT_STREAM_PREFIX, cutoff)
