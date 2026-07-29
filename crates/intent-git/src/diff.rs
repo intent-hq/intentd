@@ -4,6 +4,11 @@
 //! deletions, and the old/new blob SHAs) without materializing hunks. Hunks are
 //! computed lazily from the recorded blob SHAs via [`hunks_between`], so a caller
 //! only pays for the files it actually expands.
+//!
+//! [`diff_index_to_workdir_with_hunks`] is the single-pass variant: it returns
+//! per-file summaries **and** hunks from one diff traversal, with optional
+//! pathspec narrowing so libgit2 prunes the walk instead of scanning the whole
+//! tree.
 
 use std::path::Path;
 use std::time::Instant;
@@ -53,6 +58,15 @@ pub struct FileDiff {
     pub new_blob: Option<String>,
 }
 
+/// One file's summary plus its hunks, produced together by
+/// [`diff_index_to_workdir_with_hunks`] from a single diff traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiffWithHunks {
+    pub file: FileDiff,
+    /// Empty for binary files (and any delta without a text patch).
+    pub hunks: Vec<DiffHunk>,
+}
+
 /// Summaries for the index→workdir diff (staged + unstaged + untracked), without
 /// hunks. Use [`hunks_between`] with each file's blob SHAs to expand on demand.
 pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
@@ -88,6 +102,64 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
             is_binary,
             old_blob: oid_to_opt(delta.old_file().id()),
             new_blob: oid_to_opt(delta.new_file().id()),
+        });
+    }
+    Ok(out)
+}
+
+/// Per-file summaries **and** hunks for the index→workdir diff (staged +
+/// unstaged + untracked), from a **single** diff traversal — unlike the
+/// two-pass combination of [`diff_index_to_workdir`] +
+/// [`hunks_index_to_workdir`], which walks the tree once per call.
+///
+/// `pathspecs` narrows the diff: when `Some`, each entry is added as a libgit2
+/// pathspec so the walk is pruned to matching paths (a path with no pending
+/// change yields no entry). `None` diffs the full tree. An empty slice behaves
+/// like `None` (libgit2 treats no pathspecs as match-all).
+pub fn diff_index_to_workdir_with_hunks(
+    repo_path: &Path,
+    pathspecs: Option<&[&str]>,
+) -> Result<Vec<FileDiffWithHunks>> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    if let Some(specs) = pathspecs {
+        for spec in specs {
+            opts.pathspec(spec);
+        }
+    }
+    let diff = repo
+        .diff_index_to_workdir(None, Some(&mut opts))
+        .map_err(map_git_err)?;
+    let mut out = Vec::new();
+    for i in 0..diff.deltas().len() {
+        let delta = diff.get_delta(i).expect("delta index in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_binary = delta.flags().is_binary();
+        let (additions, deletions, hunks) = match Patch::from_diff(&diff, i).map_err(map_git_err)? {
+            Some(patch) => {
+                let (_ctx, adds, dels) = patch.line_stats().map_err(map_git_err)?;
+                (adds, dels, patch_to_hunks(&patch)?)
+            }
+            None => (0, 0, Vec::new()),
+        };
+        out.push(FileDiffWithHunks {
+            file: FileDiff {
+                path,
+                additions,
+                deletions,
+                is_binary,
+                old_blob: oid_to_opt(delta.old_file().id()),
+                new_blob: oid_to_opt(delta.new_file().id()),
+            },
+            hunks,
         });
     }
     Ok(out)
@@ -400,13 +472,15 @@ pub fn hunks_between(
 /// the workdir content rather than looking up a post-image blob in the object DB.
 /// This is the variant the agent-edit pipeline uses: an unstaged change's new
 /// content is not yet a blob, so [`hunks_between`] cannot hydrate it. Returns an
-/// empty vec when `rel_path` has no pending change (or is binary).
+/// empty vec when `rel_path` has no pending change (or is binary). The path is
+/// set as a pathspec so libgit2 prunes the walk instead of scanning the tree.
 pub fn hunks_index_to_workdir(repo_path: &Path, rel_path: &str) -> Result<Vec<DiffHunk>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let mut opts = DiffOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .show_untracked_content(true);
+        .show_untracked_content(true)
+        .pathspec(rel_path);
     let diff = repo
         .diff_index_to_workdir(None, Some(&mut opts))
         .map_err(map_git_err)?;
@@ -560,6 +634,140 @@ mod tests {
         assert!(hunks_index_to_workdir(dir.path(), "a.txt")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn hunks_index_to_workdir_path_inside_untracked_dir() {
+        // The pathspec must still surface files inside untracked directories
+        // (recurse_untracked_dirs descends before the pathspec filters).
+        let dir = init_repo("diff-workdir-untracked-dir");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "sub/dir/nested.txt", "alpha\nbeta\n");
+        let hunks = hunks_index_to_workdir(dir.path(), "sub/dir/nested.txt").unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0]
+            .lines
+            .iter()
+            .all(|l| l.kind == DiffLineKind::Addition));
+    }
+
+    #[test]
+    fn hunks_index_to_workdir_binary_path_is_empty() {
+        let dir = init_repo("diff-workdir-binary");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        std::fs::write(dir.path().join("img.bin"), [0u8, 159, 146, 150]).unwrap();
+        assert!(hunks_index_to_workdir(dir.path(), "img.bin")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The two-pass equivalent of [`diff_index_to_workdir_with_hunks`]:
+    /// summaries from one traversal, then hunks per file from another.
+    fn two_pass_index_to_workdir(repo_path: &Path) -> Vec<FileDiffWithHunks> {
+        diff_index_to_workdir(repo_path)
+            .unwrap()
+            .into_iter()
+            .map(|file| {
+                let hunks = hunks_index_to_workdir(repo_path, &file.path).unwrap();
+                FileDiffWithHunks { file, hunks }
+            })
+            .collect()
+    }
+
+    /// Seed a repo with a modified tracked file, an untracked file, a file
+    /// inside an untracked directory, and an untracked binary file.
+    fn seed_mixed_repo(tag: &str) -> crate::testutil::TempDir {
+        let dir = init_repo(tag);
+        commit_file(dir.path(), "a.txt", "line1\nline2\nline3\n");
+        write_file(dir.path(), "a.txt", "line1\nCHANGED\nline3\nline4\n");
+        write_file(dir.path(), "new.txt", "hello\nworld\n");
+        write_file(dir.path(), "sub/dir/nested.txt", "alpha\nbeta\n");
+        std::fs::write(dir.path().join("img.bin"), [0u8, 159, 146, 150]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn single_pass_matches_two_pass_summaries_and_hunks() {
+        let dir = seed_mixed_repo("diff-single-pass");
+        let single = diff_index_to_workdir_with_hunks(dir.path(), None).unwrap();
+        let two_pass = two_pass_index_to_workdir(dir.path());
+        assert_eq!(single, two_pass);
+
+        let paths: Vec<&str> = single.iter().map(|e| e.file.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "img.bin", "new.txt", "sub/dir/nested.txt"]);
+
+        // Modified tracked file: hunks carry the workdir post-image.
+        let a = single.iter().find(|e| e.file.path == "a.txt").unwrap();
+        assert_eq!((a.file.additions, a.file.deletions), (2, 1));
+        assert!(a.hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffLineKind::Addition && l.content.contains("CHANGED")));
+
+        // Untracked file: content is shown (show_untracked_content).
+        let new = single.iter().find(|e| e.file.path == "new.txt").unwrap();
+        assert_eq!(new.file.additions, 2);
+        assert!(new.file.old_blob.is_none());
+        assert!(!new.hunks.is_empty());
+
+        // File inside an untracked directory (recurse_untracked_dirs).
+        let nested = single
+            .iter()
+            .find(|e| e.file.path == "sub/dir/nested.txt")
+            .unwrap();
+        assert!(!nested.hunks.is_empty());
+
+        // Binary file: summary present, hunks empty.
+        let bin = single.iter().find(|e| e.file.path == "img.bin").unwrap();
+        assert!(bin.hunks.is_empty());
+    }
+
+    #[test]
+    fn single_pass_pathspec_narrows_to_single_path() {
+        let dir = seed_mixed_repo("diff-single-pass-one");
+        let full = diff_index_to_workdir_with_hunks(dir.path(), None).unwrap();
+        let narrowed = diff_index_to_workdir_with_hunks(dir.path(), Some(&["a.txt"])).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        let expected = full.iter().find(|e| e.file.path == "a.txt").unwrap();
+        assert_eq!(&narrowed[0], expected);
+    }
+
+    #[test]
+    fn single_pass_pathspec_accepts_multiple_paths() {
+        let dir = seed_mixed_repo("diff-single-pass-multi");
+        let narrowed =
+            diff_index_to_workdir_with_hunks(dir.path(), Some(&["a.txt", "new.txt"])).unwrap();
+        let paths: Vec<&str> = narrowed.iter().map(|e| e.file.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn single_pass_pathspec_matches_file_in_untracked_dir() {
+        let dir = seed_mixed_repo("diff-single-pass-untracked");
+        let narrowed =
+            diff_index_to_workdir_with_hunks(dir.path(), Some(&["sub/dir/nested.txt"])).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].file.path, "sub/dir/nested.txt");
+        assert!(!narrowed[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn single_pass_pathspec_binary_file_has_empty_hunks() {
+        let dir = seed_mixed_repo("diff-single-pass-binary");
+        let narrowed = diff_index_to_workdir_with_hunks(dir.path(), Some(&["img.bin"])).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].file.path, "img.bin");
+        assert!(narrowed[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn single_pass_pathspec_missing_path_is_empty() {
+        let dir = seed_mixed_repo("diff-single-pass-missing");
+        assert!(
+            diff_index_to_workdir_with_hunks(dir.path(), Some(&["no-such-file.txt"]))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
