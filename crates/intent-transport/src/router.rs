@@ -1759,13 +1759,23 @@ async fn dispatch(
         // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
         "git.diffs" | "git.diff" => {
             let ws = require_ws_note(params)?;
-            let path = opt_str(params, "path");
+            // §5.6 extension: `paths` narrows the diff to exactly those
+            // workspace-relative files (literal matching). The legacy single
+            // `path` is folded into the same set; when both are supplied they
+            // are unioned. Absent/empty ⇒ full tree.
+            let mut paths = opt_str_array(params, "paths").unwrap_or_default();
+            if let Some(path) = opt_str(params, "path") {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            let paths = if paths.is_empty() { None } else { Some(paths) };
             let staged = parse_bool(params, "staged");
             // §5.6 extension: when `commitHash` is set the result is the hunks
             // for `<commitHash>^..<commitHash>` and `staged` is ignored.
             let commit_hash = opt_str(params, "commitHash");
             let r = api
-                .git_diffs(ws, path, staged, commit_hash)
+                .git_diffs(ws, paths, staged, commit_hash)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

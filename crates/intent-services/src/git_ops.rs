@@ -190,28 +190,32 @@ pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) ->
 /// Build the `git.diffs` wire result (`[{ path, hunks }]`) for a worktree.
 /// When `commit_hash` is set, returns hunks for `<commit_hash>^..<commit_hash>`
 /// and `staged` is ignored. Otherwise `staged` selects the HEAD→index diff
-/// (else index→workdir). `path` filters to a single file. Hunks for staged /
-/// committed changes are hydrated from the recorded blob SHAs; the unstaged
-/// case comes from a **single** index→workdir traversal (summaries + hunks
-/// together, pathspec-narrowed when `path` is set) instead of one scan per
-/// changed file. Binary files yield an empty `hunks` array. A `commit_hash`
-/// that does not resolve degrades to an empty array.
+/// (else index→workdir). `paths` filters to exactly those files (`None` or
+/// empty ⇒ full tree). Hunks for staged / committed changes are hydrated from
+/// the recorded blob SHAs (full-tree walk, set-filtered); the unstaged case
+/// comes from a **single** index→workdir traversal (summaries + hunks together,
+/// pathspec-narrowed when `paths` is set) instead of one scan per changed file.
+/// Binary files yield an empty `hunks` array. A `commit_hash` that does not
+/// resolve degrades to an empty array.
 pub(crate) fn build_diffs(
     worktree: &Path,
-    path: Option<&str>,
+    paths: Option<&[String]>,
     staged: bool,
     commit_hash: Option<&str>,
 ) -> Result<Value> {
+    let paths = paths.filter(|p| !p.is_empty());
+    let requested: Option<std::collections::HashSet<&str>> =
+        paths.map(|p| p.iter().map(String::as_str).collect());
     if commit_hash.is_none() && !staged {
-        let specs = path.map(|p| vec![p]);
+        let specs: Option<Vec<&str>> = paths.map(|p| p.iter().map(String::as_str).collect());
         let entries =
             intent_git::diff::diff_index_to_workdir_with_hunks(worktree, specs.as_deref())?;
         let mut out = Vec::new();
         for entry in &entries {
             // The pathspec prunes the walk but can match more than the exact
-            // path; keep the strict equality filter the wire contract promises.
-            if let Some(p) = path {
-                if entry.file.path != p {
+            // paths; keep the strict equality filter the wire contract promises.
+            if let Some(req) = &requested {
+                if !req.contains(entry.file.path.as_str()) {
                     continue;
                 }
             }
@@ -235,8 +239,8 @@ pub(crate) fn build_diffs(
     };
     let mut out = Vec::new();
     for fd in &files {
-        if let Some(p) = path {
-            if fd.path != p {
+        if let Some(req) = &requested {
+            if !req.contains(fd.path.as_str()) {
                 continue;
             }
         }

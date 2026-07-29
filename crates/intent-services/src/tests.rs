@@ -9384,7 +9384,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some("seed.txt".to_string()), true, None)
+            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -9526,7 +9526,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some("seed.txt".to_string()), false, Some(head))
+            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), false, Some(head))
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -9658,7 +9658,7 @@ mod file_tracking {
             .await
             .unwrap();
         let narrowed = svc
-            .git_diffs(ws_id, Some("b.txt".to_string()), false, None)
+            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None)
             .await
             .unwrap();
         let arr = narrowed.as_array().unwrap();
@@ -9671,6 +9671,105 @@ mod file_tracking {
             .find(|d| d["path"] == "b.txt")
             .unwrap();
         assert_eq!(&arr[0], expected);
+    }
+
+    /// `git.diffs` (unstaged) with a multi-entry `paths` set returns exactly
+    /// the requested files that have pending changes (others excluded), each
+    /// entry byte-identical to the full-tree payload's.
+    #[tokio::test]
+    async fn git_diffs_unstaged_paths_narrows_to_subset() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let full = svc
+            .git_diffs(ws_id.clone(), None, false, None)
+            .await
+            .unwrap();
+        let narrowed = svc
+            .git_diffs(
+                ws_id,
+                Some(vec!["b.txt".to_string(), "new.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let arr = narrowed.as_array().unwrap();
+        let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+        assert_eq!(arr.len(), 2, "exactly the two requested files: {paths:?}");
+        for p in ["b.txt", "new.txt"] {
+            let entry = arr.iter().find(|d| d["path"] == p).expect("requested file");
+            let expected = full
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["path"] == p)
+                .unwrap();
+            assert_eq!(entry, expected);
+        }
+    }
+
+    /// `git.diffs` (unstaged) with an empty `paths` vec behaves like `None`
+    /// (full tree), and a `paths` entry with no pending change yields no entry.
+    #[tokio::test]
+    async fn git_diffs_unstaged_empty_paths_is_full_tree() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let full = svc
+            .git_diffs(ws_id.clone(), None, false, None)
+            .await
+            .unwrap();
+        let empty_paths = svc
+            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None)
+            .await
+            .unwrap();
+        assert_eq!(empty_paths, full);
+
+        let clean = svc
+            .git_diffs(
+                ws_id,
+                Some(vec!["no-such-file.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clean, serde_json::json!([]));
+    }
+
+    /// `git.diffs` (staged) with a multi-entry `paths` set filters the
+    /// HEAD→index walk to exactly the requested files.
+    #[tokio::test]
+    async fn git_diffs_staged_paths_filters_to_subset() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged change\n").unwrap();
+        std::fs::write(repo.dir.join("other.txt"), "other\n").unwrap();
+        std::fs::write(repo.dir.join("third.txt"), "third\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.add_path(std::path::Path::new("other.txt")).unwrap();
+            idx.add_path(std::path::Path::new("third.txt")).unwrap();
+            idx.write().unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(
+                ws_id,
+                Some(vec!["seed.txt".to_string(), "third.txt".to_string()]),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+        assert!(paths.contains(&"seed.txt"));
+        assert!(paths.contains(&"third.txt"));
     }
 
     /// Regression (monorepo#1061): `diffs::compute_and_store` (single

@@ -472,17 +472,21 @@ pub fn hunks_between(
 }
 
 /// Compute hunks for a single file directly from the index→workdir diff, reading
-/// the workdir content rather than looking up a post-image blob in the object DB.
-/// This is the variant the agent-edit pipeline uses: an unstaged change's new
-/// content is not yet a blob, so [`hunks_between`] cannot hydrate it. Returns an
-/// empty vec when `rel_path` has no pending change (or is binary). The path is
-/// set as a pathspec so libgit2 prunes the walk instead of scanning the tree.
+/// the workdir content rather than looking up a post-image blob in the object DB
+/// (an unstaged change's new content is not yet a blob, so [`hunks_between`]
+/// cannot hydrate it). Production callers now use the single-pass
+/// [`diff_index_to_workdir_with_hunks`]; this per-file variant is retained as the
+/// two-pass reference for regression tests. Returns an empty vec when `rel_path`
+/// has no pending change (or is binary). The path is set as a **literal**
+/// pathspec (fnmatch matching disabled, matching the single-pass variant) so
+/// libgit2 prunes the walk instead of scanning the tree.
 pub fn hunks_index_to_workdir(repo_path: &Path, rel_path: &str) -> Result<Vec<DiffHunk>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let mut opts = DiffOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true)
+        .disable_pathspec_match(true)
         .pathspec(rel_path);
     let diff = repo
         .diff_index_to_workdir(None, Some(&mut opts))

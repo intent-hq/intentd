@@ -2421,18 +2421,20 @@ pub trait WorkspaceApi: Send + Sync {
     /// the per-file hunks for `<commit_hash>^..<commit_hash>` (the commit's own
     /// changes vs its first parent; a root commit yields all-additions) and the
     /// `staged` flag is ignored. Otherwise `staged` selects the HEAD→index diff
-    /// (`true`) or the index→workdir diff (`false`, default). `path` restricts
-    /// the result to a single file. Returns `[{ path, hunks }]`; remote/non-repo
+    /// (`true`) or the index→workdir diff (`false`, default). `paths` restricts
+    /// the result to exactly those workspace-relative files (literal matching;
+    /// the wire `path` param arrives folded into this set); `None` or an empty
+    /// vec means the full tree. Returns `[{ path, hunks }]`; remote/non-repo
     /// workspaces and an unresolvable `commit_hash` return an empty array
     /// (wire §7.7).
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
-        path: Option<String>,
+        paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, staged, commit_hash);
+        let _ = (workspace_id, paths, staged, commit_hash);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_diffs not implemented".to_string(),

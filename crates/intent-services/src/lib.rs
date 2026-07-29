@@ -14366,7 +14366,7 @@ impl WorkspaceApi for Services {
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
-        path: Option<String>,
+        paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -14387,7 +14387,7 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, path.as_deref(), staged, commit_hash.as_deref())
+            git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
         })
     }
 
