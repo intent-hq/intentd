@@ -7091,6 +7091,62 @@ mod merge_user_mcp_servers_tests {
         );
     }
 
+    /// monorepo#1049 — a whitespace-containing bridge path collapses to the
+    /// executable basename, and the entry's PATH prepends the parent dir to
+    /// the inherited PATH. Asserted on the final (post-baseline-merge) env:
+    /// the server env wins that merge, so the override itself must carry the
+    /// full inherited PATH rather than relying on the baseline's PATH.
+    #[tokio::test]
+    async fn spaced_bridge_path_normalizes_to_basename_with_path_prepend() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/opt/App Support/bin/intentd");
+        let servers = mgr
+            .normalized_mcp_servers("127.0.0.1:9999".to_string())
+            .await
+            .unwrap();
+        let NormalizedMcpServer::Stdio { command, args, env } =
+            servers.get("workspace-mcp").unwrap()
+        else {
+            panic!("workspace-mcp is stdio");
+        };
+        assert_eq!(command, "intentd", "spaced path collapses to the basename");
+        assert_eq!(args[..], ["mcp-bridge", "--connect", "127.0.0.1:9999"]);
+        let inherited = std::env::var("PATH").expect("test process has PATH");
+        let expected = std::env::join_paths(
+            std::iter::once(std::path::PathBuf::from("/opt/App Support/bin"))
+                .chain(std::env::split_paths(&inherited)),
+        )
+        .unwrap();
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(&*expected.to_string_lossy()),
+            "PATH starts with the parent dir and keeps the full inherited PATH"
+        );
+    }
+
+    /// Whitespace-free bridge path is untouched: absolute command, and the
+    /// entry's PATH is just the baseline (inherited) PATH — no injection.
+    #[tokio::test]
+    async fn unspaced_bridge_path_stays_absolute_without_path_override() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/usr/local/bin/intentd");
+        let servers = mgr
+            .normalized_mcp_servers("127.0.0.1:9999".to_string())
+            .await
+            .unwrap();
+        let NormalizedMcpServer::Stdio { command, env, .. } = servers.get("workspace-mcp").unwrap()
+        else {
+            panic!("workspace-mcp is stdio");
+        };
+        assert_eq!(command, "/usr/local/bin/intentd", "absolute path verbatim");
+        let inherited = std::env::var("PATH").expect("test process has PATH");
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(inherited.as_str()),
+            "baseline PATH only — no injected override"
+        );
+    }
+
     // Prevent dead-code warnings for `manager` when this module compiles alone.
     #[allow(dead_code)]
     async fn _use_manager() {

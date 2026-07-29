@@ -7,6 +7,8 @@
 //! servers (the `applyBaselineEnvToStdioServers` analog).
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::Path;
 
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
@@ -413,4 +415,46 @@ pub fn apply_baseline_env_to_stdio_servers(
         out.insert(name.clone(), next);
     }
     out
+}
+
+/// Command + optional `PATH` override for launching the workspace-mcp bridge
+/// executable (monorepo#1049). Some provider launchers (Auggie) shell-split
+/// the configured stdio command without preserving whitespace, so an absolute
+/// executable path containing spaces (e.g. under `~/Library/Application
+/// Support/...`) fails to spawn. When `exe` contains whitespace, return its
+/// basename as the command plus a `PATH` value that prepends the executable's
+/// parent directory to `inherited_path` so PATH lookup resolves the same
+/// binary. Note the returned `PATH` must carry the full inherited value
+/// itself: [`apply_baseline_env_to_stdio_servers`] merges the baseline env
+/// with the server env and the server env wins, so a bare parent-dir `PATH`
+/// would clobber the baseline `PATH`. Whitespace-free paths (and edge cases a
+/// basename lookup cannot fix, e.g. a spaced basename) are returned verbatim
+/// with no override.
+pub fn normalize_spaced_bridge_command(
+    exe: &Path,
+    inherited_path: Option<&OsStr>,
+) -> (String, Option<String>) {
+    let command = exe.to_string_lossy().into_owned();
+    if !command.chars().any(char::is_whitespace) {
+        return (command, None);
+    }
+    let (Some(parent), Some(file_name)) = (exe.parent(), exe.file_name()) else {
+        return (command, None);
+    };
+    if parent.as_os_str().is_empty() {
+        return (command, None);
+    }
+    let basename = file_name.to_string_lossy().into_owned();
+    if basename.chars().any(char::is_whitespace) {
+        return (command, None);
+    }
+    let entries = std::iter::once(parent.to_path_buf()).chain(
+        inherited_path
+            .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    match std::env::join_paths(entries) {
+        Ok(joined) => (basename, Some(joined.to_string_lossy().into_owned())),
+        Err(_) => (command, None),
+    }
 }
