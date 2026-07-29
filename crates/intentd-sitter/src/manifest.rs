@@ -15,12 +15,18 @@ use crate::cli::Channel;
 /// Channel manifest schema version this sitter understands.
 pub const MANIFEST_SCHEMA_VERSION: u64 = 1;
 
-/// Base URL the fixed channel-release manifests are downloaded from:
-/// `<base>/channel-<channel>/<channel>.json`. Overridable via
-/// [`crate::updater::Updater::with_base_url`] so tests can point at a local
-/// fixture server.
-pub const DEFAULT_MANIFEST_BASE_URL: &str =
-    "https://github.com/intent-hq/intentd/releases/download";
+/// Ordered base URLs the fixed channel-release manifests are downloaded
+/// from (`<base>/channel-<channel>/<channel>.json`): the public
+/// `intentd-releases` repo first, then the original `intentd` repo as a
+/// fallback. The updater tries each base in order for the manifest fetch
+/// (archive URLs come from inside the manifest, so downloads need no
+/// fallback). Overridable via [`crate::updater::Updater::with_base_url`] —
+/// exactly one base, no fallback — so tests can point at a local fixture
+/// server.
+pub const DEFAULT_MANIFEST_BASE_URLS: &[&str] = &[
+    "https://github.com/intent-hq/intentd-releases/releases/download",
+    "https://github.com/intent-hq/intentd/releases/download",
+];
 
 /// Compile-time Rust target triple of this sitter build — the key into the
 /// manifest's `platforms` map (set by `build.rs`).
@@ -92,14 +98,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_urls_for_both_channels() {
-        let base = DEFAULT_MANIFEST_BASE_URL;
+    fn default_bases_prefer_intentd_releases_then_intentd() {
         assert_eq!(
-            manifest_url(base, Channel::Stable),
+            DEFAULT_MANIFEST_BASE_URLS,
+            [
+                "https://github.com/intent-hq/intentd-releases/releases/download",
+                "https://github.com/intent-hq/intentd/releases/download",
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_urls_for_both_channels() {
+        assert_eq!(
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[0], Channel::Stable),
+            "https://github.com/intent-hq/intentd-releases/releases/download/channel-stable/stable.json"
+        );
+        assert_eq!(
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[0], Channel::Beta),
+            "https://github.com/intent-hq/intentd-releases/releases/download/channel-beta/beta.json"
+        );
+        assert_eq!(
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[1], Channel::Stable),
             "https://github.com/intent-hq/intentd/releases/download/channel-stable/stable.json"
         );
         assert_eq!(
-            manifest_url(base, Channel::Beta),
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[1], Channel::Beta),
             "https://github.com/intent-hq/intentd/releases/download/channel-beta/beta.json"
         );
     }

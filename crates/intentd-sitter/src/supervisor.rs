@@ -64,8 +64,9 @@ use crate::paths::SitterPaths;
 use crate::state;
 use crate::updater::{UpdateError, UpdateOutcome, Updater};
 
-/// Env override for the channel-manifest base URL (tests point this at a
-/// local fixture server; production never sets it).
+/// Env override for the channel-manifest base URL — exactly one base, no
+/// fallback (tests point this at a local fixture server; production never
+/// sets it).
 pub const MANIFEST_BASE_URL_ENV: &str = "INTENTD_SITTER_MANIFEST_BASE_URL";
 
 /// Test-only env overrides (integer milliseconds) for the timing knobs in
@@ -251,9 +252,9 @@ pub fn run(
     channel: ResolvedChannel,
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
-    base_url: String,
+    base_urls: Vec<String>,
 ) -> i32 {
-    let updater = match Updater::with_base_url(paths.clone(), base_url) {
+    let updater = match Updater::with_base_urls(paths.clone(), base_urls) {
         Ok(updater) => Arc::new(updater),
         Err(e) => {
             eprintln!("intentd-sitter: {e}");

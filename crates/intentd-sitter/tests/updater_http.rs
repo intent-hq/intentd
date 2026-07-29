@@ -389,3 +389,125 @@ fn prune_keeps_current_and_one_previous_version() {
         Some("0.3.0")
     );
 }
+
+/// Base URL that refuses connections (bound then immediately dropped).
+fn unreachable_base() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    base_url
+}
+
+#[test]
+fn primary_base_is_preferred_when_both_bases_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let primary = serve_release("0.3.0", b"daemon from primary", false);
+    let fallback = serve_release("0.2.0", b"daemon from fallback", false);
+
+    let updater = Updater::with_base_urls(paths.clone(), [primary, fallback]).unwrap();
+    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::Installed {
+            version: "0.3.0".to_string(),
+            previous: None,
+        }
+    );
+    assert_eq!(
+        fs::read(paths.daemon_binary("0.3.0")).unwrap(),
+        b"daemon from primary"
+    );
+}
+
+#[test]
+fn falls_back_to_second_base_when_primary_manifest_fetch_fails() {
+    let unparseable = HashMap::from([(
+        "/channel-stable/stable.json".to_string(),
+        b"not json".to_vec(),
+    )]);
+    let cases = [
+        ("404", serve(HashMap::new())),
+        ("connection refused", unreachable_base()),
+        ("unparseable manifest", serve(unparseable)),
+    ];
+    for (case, primary) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let fallback = serve_release("0.2.0", b"daemon from fallback", false);
+
+        let updater = Updater::with_base_urls(paths.clone(), [primary, fallback]).unwrap();
+        let outcome = updater.check_and_install(Channel::Stable).unwrap();
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Installed {
+                version: "0.2.0".to_string(),
+                previous: None,
+            },
+            "case: {case}"
+        );
+        assert_eq!(
+            fs::read(paths.daemon_binary("0.2.0")).unwrap(),
+            b"daemon from fallback",
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
+fn all_bases_failing_reports_the_last_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let primary = serve(HashMap::new());
+    let fallback = serve(HashMap::new());
+
+    let updater = Updater::with_base_urls(paths.clone(), [primary, fallback.clone()]).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    match err {
+        UpdateError::HttpStatus { url, status } => {
+            assert_eq!(status.as_u16(), 404);
+            assert!(
+                url.starts_with(&fallback),
+                "expected the last error to come from the fallback base, got {url}"
+            );
+        }
+        other => panic!("expected HttpStatus, got {other:?}"),
+    }
+    assert!(installed_versions(&paths).is_empty());
+    assert_eq!(state::load(&paths.state_path).current_version, None);
+}
+
+#[test]
+fn empty_base_url_list_is_a_soft_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let err = match Updater::with_base_urls(paths, Vec::<String>::new()) {
+        Ok(_) => panic!("expected an error for an empty base URL list"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, UpdateError::NoBaseUrls),
+        "expected NoBaseUrls, got {err:?}"
+    );
+}
+
+#[test]
+fn with_base_url_means_exactly_one_base_and_never_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let base_url = serve(HashMap::new());
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    match err {
+        UpdateError::HttpStatus { url, status } => {
+            assert_eq!(status.as_u16(), 404);
+            assert!(
+                url.starts_with(&base_url),
+                "expected the error to come from the single configured base, got {url}"
+            );
+        }
+        other => panic!("expected HttpStatus, got {other:?}"),
+    }
+    assert!(installed_versions(&paths).is_empty());
+}
