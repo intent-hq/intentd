@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.13] - 2026-07-29
+
+### 🚀 Features
+
+- *(intent-git)* Single-pass index-to-workdir diff with hunks and pathspec pruning ([#705](https://github.com/intent-hq/intentd/pull/705))
+- Derive omitted agent name from specialist display name ([#710](https://github.com/intent-hq/intentd/pull/710))
+
+### 🐛 Bug Fixes
+
+- Retarget providers.paths[\unsloth\] to the unsloth CLI ([#707](https://github.com/intent-hq/intentd/pull/707))
+
+### 🔧 Refactor
+
+- Remove unused file-tracking.sync/.init/.load wire methods ([#704](https://github.com/intent-hq/intentd/pull/704))
+
+### ⚡ Performance
+
+- *(services)* Adopt single-pass index-to-workdir diff in build_diffs and compute_and_store ([#709](https://github.com/intent-hq/intentd/pull/709))
+
+
 ## [0.2.12] - 2026-07-29
 
 ### 🚀 Features
