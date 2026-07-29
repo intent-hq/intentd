@@ -1,11 +1,16 @@
-//! Regression tests for specialist frontmatter `model` resolution at agent creation.
+//! Regression tests for specialist frontmatter `model` and display-name
+//! resolution at agent creation.
 //!
-//! Covers the Wave 2 fix: when `agent.create` receives no explicit model but a specialist id,
+//! Model: when `agent.create` receives no explicit model but a specialist id,
 //! the specialist's resolved frontmatter `model` (3-tier: project > user > bundled) is used
 //! before the settings chain.
 //!
 //! Full precedence:
 //! explicit model > specialist frontmatter model > settings chain > CLI default
+//!
+//! Name: when `agent.create` receives no explicit name but a specialist id,
+//! the specialist's resolved display name (frontmatter `name`) is used before
+//! the generic `Agent {6-hex}` fallback, and counts as explicitly set.
 
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
@@ -277,4 +282,131 @@ async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
         malicious_agent.id.0.starts_with("agent-"),
         "malicious agent created with default type"
     );
+}
+
+/// Create an agent with an optional name, returning the created `agent` value.
+async fn create_agent_with_optional_name(
+    svc: &Services,
+    ws: &WorkspaceId,
+    name: Option<&str>,
+    specialist: Option<String>,
+    extra: intent_core::AgentCreateExtra,
+) -> serde_json::Value {
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            name.map(str::to_string),
+            None,
+            specialist,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    created["agent"].clone()
+}
+
+/// A name-less create carrying a specialist derives the agent name from the
+/// specialist's frontmatter display name and counts it as explicitly set
+/// (matches the desktop FE, which resolves the display name client-side and
+/// sends it as an explicit `name`).
+#[tokio::test]
+async fn omitted_name_derives_from_specialist_display_name() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    std::fs::write(
+        specialists_dir.path().join("test-specialist.md"),
+        "---\nname: \"Fancy Display Name\"\ndescription: \"d\"\n---\n\nTest prompt",
+    )
+    .expect("write specialist");
+
+    let agent = create_agent_with_optional_name(
+        &svc,
+        &ws,
+        None,
+        Some("test-specialist".into()),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(agent["name"], "Fancy Display Name");
+    assert_eq!(agent["nameExplicitlySet"], true);
+}
+
+/// The embedded bundled `spec-writer` resolves with zero local files: a
+/// name-less create yields its frontmatter display name "Coordinator".
+#[tokio::test]
+async fn omitted_name_derives_from_embedded_spec_writer() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let agent = create_agent_with_optional_name(
+        &svc,
+        &ws,
+        None,
+        Some("spec-writer".into()),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(agent["name"], "Coordinator");
+    assert_eq!(agent["nameExplicitlySet"], true);
+}
+
+/// An explicit client-supplied name beats the specialist display name.
+#[tokio::test]
+async fn explicit_name_beats_specialist_display_name() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let agent = create_agent_with_optional_name(
+        &svc,
+        &ws,
+        Some("My Explicit Name"),
+        Some("spec-writer".into()),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(agent["name"], "My Explicit Name");
+    assert_eq!(agent["nameExplicitlySet"], true);
+}
+
+/// No name and no specialist keeps the generic `Agent {6-hex}` fallback,
+/// which stays renameable (not explicitly set).
+#[tokio::test]
+async fn no_specialist_falls_back_to_generic_name() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let agent = create_agent_with_optional_name(&svc, &ws, None, None, Default::default()).await;
+    let name = agent["name"].as_str().expect("name");
+    assert!(name.starts_with("Agent "), "generic fallback: {name}");
+    assert_eq!(agent["nameExplicitlySet"], false);
+}
+
+/// An unknown specialist id never fails the create — it falls back to the
+/// generic `Agent {6-hex}` label (renameable, not explicitly set).
+#[tokio::test]
+async fn unknown_specialist_falls_back_to_generic_name() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let agent = create_agent_with_optional_name(
+        &svc,
+        &ws,
+        None,
+        Some("no-such-specialist".into()),
+        Default::default(),
+    )
+    .await;
+    let name = agent["name"].as_str().expect("name");
+    assert!(name.starts_with("Agent "), "generic fallback: {name}");
+    assert_eq!(agent["nameExplicitlySet"], false);
+}
+
+/// Delegate flows that pass `name_explicitly_set: Some(false)` keep their
+/// override: a specialist-derived name still stays renameable by the child's
+/// opening-turn `setAgentName` (`skipIfExplicitlySet: true`).
+#[tokio::test]
+async fn delegate_override_keeps_derived_name_renameable() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        name_explicitly_set: Some(false),
+        ..Default::default()
+    };
+    let agent =
+        create_agent_with_optional_name(&svc, &ws, None, Some("spec-writer".into()), extra).await;
+    assert_eq!(agent["name"], "Coordinator");
+    assert_eq!(agent["nameExplicitlySet"], false);
 }
