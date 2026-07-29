@@ -9772,6 +9772,53 @@ mod file_tracking {
         assert!(paths.contains(&"third.txt"));
     }
 
+    /// Regression (monorepo#1078): `git.diffs` (unstaged) treats `paths`
+    /// entries as literal paths, not globs — requesting `a[1].txt` returns
+    /// exactly that file and never the sibling `a1.txt` the glob would match.
+    #[tokio::test]
+    async fn git_diffs_unstaged_paths_are_literal_not_globs() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("a[1].txt"), "meta\nchange\n").unwrap();
+        std::fs::write(repo.dir.join("a1.txt"), "sibling\nchange\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None)
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only the literal path matches: {arr:?}");
+        assert_eq!(arr[0]["path"], "a[1].txt");
+        assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
+    /// Regression (monorepo#1078): the staged (HEAD→index) walk applies the
+    /// same strict path equality — `a[1].txt` in `paths` never matches the
+    /// staged sibling `a1.txt`.
+    #[tokio::test]
+    async fn git_diffs_staged_paths_are_literal_not_globs() {
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("a[1].txt"), "meta\nchange\n").unwrap();
+        std::fs::write(repo.dir.join("a1.txt"), "sibling\nchange\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("a[1].txt")).unwrap();
+            idx.add_path(std::path::Path::new("a1.txt")).unwrap();
+            idx.write().unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None)
+            .await
+            .unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only the literal path matches: {arr:?}");
+        assert_eq!(arr[0]["path"], "a[1].txt");
+        assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
     /// Regression (monorepo#1061): `diffs::compute_and_store` (single
     /// pathspec-narrowed pass) returns the same summary + persisted hunks
     /// JSON as the legacy two-pass compute for modified, untracked, and
