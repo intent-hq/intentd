@@ -830,7 +830,10 @@ impl UnslothServerManager {
     /// `unsloth_cli_override` is the `providers.paths["unsloth"]` setting
     /// (the caller's per-call settings snapshot), threaded into
     /// [`UnslothConfig::resolve_binary`] as the explicit-path tier for the
-    /// `unsloth` CLI — it never affects the opencode ACP primary.
+    /// `unsloth` CLI — it never affects the opencode ACP primary. The
+    /// reuse/attach early-return paths below return before `resolve_binary`
+    /// runs, so a changed override takes effect on the next cold start or
+    /// model switch, not while a healthy managed server is being reused.
     pub async fn ensure_endpoint(
         &self,
         repo_id: &str,

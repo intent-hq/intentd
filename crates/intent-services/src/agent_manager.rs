@@ -5064,8 +5064,9 @@ fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
 /// always spawned via `npx -y <pinned package>` — no local-binary discovery.
 /// Other providers resolve their binary to an absolute path using the
 /// precedence: `providers.paths` map (keyed by the binary-owning provider,
-/// [`ProviderConfig::primary_binary_provider_id`]) → `~/.augment/bin/<command>`
-/// (for auggie) → enhanced PATH scan.
+/// [`ProviderConfig::primary_binary_provider_id`]) → native-installer location
+/// where one exists (e.g. `~/.opencode/bin`) → `~/.augment/bin/<command>`
+/// (auggie back-compat tier) → enhanced PATH scan.
 fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
@@ -5202,7 +5203,8 @@ fn resolve_spawn(
         });
     }
 
-    // Resolve provider binary using the precedence: setting → managed → PATH.
+    // Resolve provider binary using the precedence: setting → native
+    // installer → ~/.augment/bin → PATH (`find_provider_binary`'s tiers).
     // The `providers.paths` key is the provider that OWNS the primary binary
     // ([`ProviderConfig::primary_binary_provider_id`]): unsloth rides the
     // opencode binary, so its primary honors `providers.paths["opencode"]`,
