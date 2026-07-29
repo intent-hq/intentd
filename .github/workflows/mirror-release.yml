@@ -7,9 +7,12 @@
 # scripts/mirror-release-assets.sh (idempotent: re-runs re-upload with
 # --clobber). Optionally also republishes the beta/stable channel manifests on
 # intentd-releases, rebuilt with ASSET_REPO so their platform URLs point at the
-# mirrored assets. A channel is only republished when its current manifest on
-# this repo already references the given tag, so a backfill of an older tag can
-# never move a channel manifest backwards.
+# mirrored assets. Each channel republish runs in its own job that shares the
+# concurrency group of the workflow that normally publishes that channel
+# (publish-channel-manifest.yml for beta, promote-stable.yml for stable), so
+# the "current manifest points at this tag" guard and the mirror publish are
+# serialized with releases/promotions in flight — a backfill of an older tag
+# can never move a mirror channel manifest backwards.
 #
 # Unlike the release workflows, this is an explicit dispatch, so a missing
 # INTENTD_RELEASES_TOKEN secret fails the run instead of soft-skipping.
@@ -36,21 +39,19 @@ on:
 permissions:
   contents: read
 
-# Serialize with ourselves; manifest publishes to intentd-releases are also
-# idempotent uploads guarded by the tag-match check below.
-concurrency:
-  group: intentd-mirror-release
-  cancel-in-progress: false
+env:
+  MIRROR_REPO: intent-hq/intentd-releases
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: intentd-mirror-release
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ inputs.tag }}
-      REPUBLISH: ${{ inputs.republish }}
-      MIRROR_REPO: intent-hq/intentd-releases
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,10 +59,12 @@ jobs:
       - name: Validate tag format
         shell: bash
         run: |
-          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+          # Charset-restricted prerelease suffix (semver identifiers), so a
+          # tag that passes validation is safe to echo in logs/summaries.
+          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             # Deliberately not echoing the raw input: it is unvalidated and
             # could contain workflow-command sequences (log injection).
-            echo "::error::Invalid tag input. Expected [v]X.Y.Z or [v]X.Y.Z-<prerelease>."
+            echo "::error::Invalid tag input. Expected [v]X.Y.Z or [v]X.Y.Z-<prerelease> (prerelease limited to [0-9A-Za-z.-])."
             exit 1
           fi
           echo "Tag $TAG is valid"
@@ -77,42 +80,10 @@ jobs:
       - name: Mirror release assets to intentd-releases
         shell: bash
         env:
-          DEST_REPO: intent-hq/intentd-releases
+          DEST_REPO: ${{ env.MIRROR_REPO }}
           DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
         run: |
           ./scripts/mirror-release-assets.sh "$TAG"
-      # For each requested channel: republish only when the channel's current
-      # manifest on this repo already points at the mirrored tag, then rebuild
-      # it with ASSET_REPO so the platform URLs target the mirrored assets.
-      - name: Republish channel manifests on intentd-releases
-        if: inputs.republish != 'none'
-        shell: bash
-        env:
-          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
-        run: |
-          channels=()
-          case "$REPUBLISH" in
-            beta) channels=(beta) ;;
-            stable) channels=(stable) ;;
-            both) channels=(beta stable) ;;
-            *) echo "::error::Unknown republish option"; exit 1 ;;
-          esac
-          tmpdir=$(mktemp -d)
-          trap 'rm -rf "$tmpdir"' EXIT
-          for channel in "${channels[@]}"; do
-            gh release download "channel-$channel" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$channel.json" --dir "$tmpdir" --clobber
-            current_tag=$(jq -r '.tag // empty' "$tmpdir/$channel.json")
-            if [[ "$current_tag" != "$TAG" ]]; then
-              echo "::error::Current $channel.json on $GITHUB_REPOSITORY points at '$current_tag', not the mirrored tag; refusing to republish $channel"
-              exit 1
-            fi
-            mkdir -p mirror
-            ASSET_REPO="$MIRROR_REPO" \
-              ./scripts/make-channel-manifest.sh "$TAG" "$channel" "mirror/$channel.json"
-            GH_TOKEN="$INTENTD_RELEASES_TOKEN" \
-              ./scripts/publish-channel-manifest.sh "$channel" "mirror/$channel.json" "$MIRROR_REPO"
-          done
       - name: Post summary
         shell: bash
         run: |
@@ -121,7 +92,114 @@ jobs:
             echo ""
             echo "**Mirrored tag:** $TAG"
             echo ""
-            echo "**Manifests republished:** $REPUBLISH"
-            echo ""
             echo "- [Mirrored release](https://github.com/$MIRROR_REPO/releases/tag/$TAG)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One job per channel so a failed guard on one channel neither blocks nor
+  # masks the other in the Actions UI, and each shares the concurrency group
+  # of the workflow that normally publishes that channel (see header).
+  republish-beta:
+    needs: mirror
+    if: inputs.republish == 'beta' || inputs.republish == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-beta-manifest-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Republish beta manifest on intentd-releases
+        id: publish
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          gh release download channel-beta --repo "$GITHUB_REPOSITORY" \
+            --pattern beta.json --dir "$tmpdir" --clobber
+          current_tag=$(jq -r '.tag // empty' "$tmpdir/beta.json")
+          if [[ "$current_tag" != "$TAG" ]]; then
+            echo "::error::Current beta.json on $GITHUB_REPOSITORY does not point at the mirrored tag; refusing to republish beta"
+            exit 1
+          fi
+          mkdir -p mirror
+          ASSET_REPO="$MIRROR_REPO" \
+            ./scripts/make-channel-manifest.sh "$TAG" beta mirror/beta.json
+          GH_TOKEN="$INTENTD_RELEASES_TOKEN" \
+            ./scripts/publish-channel-manifest.sh beta mirror/beta.json "$MIRROR_REPO"
+      - name: Post summary
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "## Beta manifest republish"
+            echo ""
+            if [[ "$OUTCOME" == "success" ]]; then
+              echo "**beta.json republished on $MIRROR_REPO for $TAG**"
+              echo ""
+              echo "- [beta.json](https://github.com/$MIRROR_REPO/releases/download/channel-beta/beta.json)"
+            else
+              echo "**Beta republish failed or was refused** (see the step log; the asset mirror from the mirror job is unaffected)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  republish-stable:
+    needs: mirror
+    if: inputs.republish == 'stable' || inputs.republish == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-stable-promotion
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Republish stable manifest on intentd-releases
+        id: publish
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          gh release download channel-stable --repo "$GITHUB_REPOSITORY" \
+            --pattern stable.json --dir "$tmpdir" --clobber
+          current_tag=$(jq -r '.tag // empty' "$tmpdir/stable.json")
+          if [[ "$current_tag" != "$TAG" ]]; then
+            echo "::error::Current stable.json on $GITHUB_REPOSITORY does not point at the mirrored tag; refusing to republish stable"
+            exit 1
+          fi
+          mkdir -p mirror
+          ASSET_REPO="$MIRROR_REPO" \
+            ./scripts/make-channel-manifest.sh "$TAG" stable mirror/stable.json
+          GH_TOKEN="$INTENTD_RELEASES_TOKEN" \
+            ./scripts/publish-channel-manifest.sh stable mirror/stable.json "$MIRROR_REPO"
+      - name: Post summary
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "## Stable manifest republish"
+            echo ""
+            if [[ "$OUTCOME" == "success" ]]; then
+              echo "**stable.json republished on $MIRROR_REPO for $TAG**"
+              echo ""
+              echo "- [stable.json](https://github.com/$MIRROR_REPO/releases/download/channel-stable/stable.json)"
+            else
+              echo "**Stable republish failed or was refused** (see the step log; the asset mirror from the mirror job is unaffected)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
