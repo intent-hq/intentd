@@ -304,10 +304,16 @@ fn resolve_auggie_override(path: &str) -> Option<std::path::PathBuf> {
 ///
 /// `override_path` is the raw `providers.paths` value for the provider's
 /// [`override_key`], applied as `find_provider_binary`'s explicit-path tier
-/// (monorepo#1086): a valid override wins (and is what the probe spawns), an
-/// invalid one warns and falls through to the auto-detection tiers. auggie's
-/// override is validated with checkAuggie parity instead
-/// ([`resolve_auggie_override`]), falling through to
+/// (monorepo#1086) — but only when the gate command IS the registry primary
+/// command the key describes. The special-case gates (claude-code, codex, pi)
+/// probe a binary that is not their registry primary (`claude-agent-acp`,
+/// `codex-acp`, `pi-acp`), so an adapter override must not shadow or stand in
+/// for the real CLI there; those gates ignore the override, matching spawn
+/// resolution (npx-only warns it away) and discovery (monorepo#1065 skips
+/// npx-only overrides). A valid applied override wins (and is what the probe
+/// spawns — pi never gets here); an invalid one warns and falls through to
+/// the auto-detection tiers. auggie's override is validated with checkAuggie
+/// parity instead ([`resolve_auggie_override`]), falling through to
 /// [`crate::auggie_discovery::find_auggie`].
 fn resolve_probe_binary(
     provider_id: &str,
@@ -328,8 +334,14 @@ fn resolve_probe_binary(
         "pi" => "pi",
         _ => return None,
     };
-    intent_providers::find_provider_binary(provider_id, command, override_path)
-        .map(|p| p.into_os_string())
+    let override_applies =
+        intent_providers::find_provider(provider_id).is_some_and(|cfg| cfg.command == command);
+    intent_providers::find_provider_binary(
+        provider_id,
+        command,
+        override_path.filter(|_| override_applies),
+    )
+    .map(|p| p.into_os_string())
 }
 
 /// Per-provider auth-status cache: last outcome + fetch instant, plus a
@@ -619,6 +631,32 @@ mod tests {
                 resolve_probe_binary("droid", Some(bad)),
                 baseline,
                 "{bad:?}"
+            );
+        }
+    }
+
+    /// The special-case gates (claude-code, codex, pi) probe a binary that is
+    /// not the registry primary their `providers.paths` key describes, so a
+    /// valid adapter override must neither open the gate nor shadow a
+    /// PATH-resolved real CLI — the gate resolves exactly what no override
+    /// would.
+    #[cfg(unix)]
+    #[test]
+    fn special_case_gates_ignore_adapter_overrides() {
+        for id in ["claude-code", "codex", "pi"] {
+            let cfg = intent_providers::find_provider(id).expect("registry entry");
+            assert_ne!(
+                cfg.command, id,
+                "{id}: gate command matches registry primary; drop it from this test"
+            );
+            let dir = unique_temp_dir(&format!("adapter-override-{id}"));
+            let adapter = dir.join(cfg.command);
+            make_executable(&adapter);
+            let baseline = resolve_probe_binary(id, None);
+            assert_eq!(
+                resolve_probe_binary(id, Some(adapter.to_str().unwrap())),
+                baseline,
+                "{id}"
             );
         }
     }
