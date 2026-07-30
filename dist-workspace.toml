@@ -28,7 +28,7 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # Injected into build-local-artifacts: provisions rustup/toolchain/targets on
 # the self-hosted runners, which don't have the hosted images' preinstalled
 # toolchains (see the file header for details).
-github-build-setup = "dist-build-setup.yml"
+github-build-setup = "../dist-build-setup.yml"
 
 # All release jobs run on the org's self-hosted runners (GH-hosted billing is
 # unavailable): tinybox (Linux x64, Ubuntu 22.04), m1mac (macOS arm64), 5090pc
