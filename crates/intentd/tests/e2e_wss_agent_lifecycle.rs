@@ -8885,6 +8885,388 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     );
 }
 
+/// SUB-1 child→parent watch suppression + §7.1 delta metadata over the real
+/// WSS transport (regression for intentd#773).
+///
+/// A parent spawns a child through `ws.agent.create` (persisting the
+/// `parent_agent_id` linkage), the child sends a coordination message back to
+/// its parent through `ws.agent.send`, and:
+/// - the child's persisted send tool result carries NO `subscriptionId` (the
+///   SUB-1 sender auto-watch is suppressed for child→parent sends), while a
+///   parentless bystander's identical send DOES get one — and only the
+///   bystander is later woken by the parent's completion;
+/// - the parent's `chat.subscribe` delta for the delivered row lifts the
+///   persisted `agent_message` sender-attribution `metadata` onto the wire
+///   entity (§7.1), while a human `agent.sendMessage` row keeps the lean
+///   metadata-free entity shape.
+#[tokio::test]
+async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_wss() {
+    let Some(script) = gate("WSS child→parent watch suppression + delta metadata E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Rule 1 (parent kickoff): spawn the child through the real MCP
+    // `workspace_api` binding so the session persists `parent_agent_id`.
+    // Rule 2 (child kickoff + bystander kickoff): find the parent by name and
+    // send to it — same code path for both callers; only the caller's parent
+    // linkage differs. `emitToolBlocks` persists the tool results so the
+    // suppression (no `subscriptionId`) is asserted from the transcript.
+    let spawn_code = "return await ws.agent.create('ChildC', 'please MESSAGE_PARENT now', \
+                      { model: 'mock:default' });";
+    let send_code = "const agents = await ws.agent.list(true); \
+                     const target = agents.find(a => a.name === 'Coordinator'); \
+                     return await ws.agent.send(target.id, 'child says hi');";
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "SPAWN_CHILD",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_code, "summary": "spawn child e2e" }
+                },
+                "response": "child spawned",
+                "emitToolBlocks": true
+            },
+            {
+                "ifPromptContains": "MESSAGE_PARENT",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "send to parent e2e" }
+                },
+                "response": "sent upward",
+                "emitToolBlocks": true
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
+
+    // CHAT conn on the PARENT — subscribed BEFORE any turn so the delivered
+    // child→parent row's delta is observed live.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    // Kick off: the parent's turn spawns the child (MCP create → the session
+    // persists `parent_agent_id`), whose kickoff turn sends back upward.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "please SPAWN_CHILD" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // Wait for the parent's spawn turn, resolve the child by name, then wait
+    // for the child's kickoff turn (which performed the upward send).
+    let mut done: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        if done.contains(&parent_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(done.contains(&parent_id), "parent turn completed: {done:?}");
+    let list = wss_rpc(&mut rpc, 12, "agent.list", json!({ "workspaceId": &ws_id })).await;
+    let child_id = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["name"] == "ChildC")
+        .and_then(|a| a["id"].as_str())
+        .unwrap_or_else(|| panic!("child listed: {list}"))
+        .to_string();
+    for _ in 0..200 {
+        if done.contains(&child_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(done.contains(&child_id), "child turn completed: {done:?}");
+
+    // Extract a caller's persisted `ws.agent.send` tool result (the JSON the
+    // MCP binding returned) from its transcript.
+    let send_tool_result = |conv: &Value, target: &str| -> Value {
+        conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["contentBlocks"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| b["output"].as_array().and_then(|arr| arr.first()))
+            .filter_map(|item| item["text"].as_str())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .find(|v| v["agentId"] == json!(target))
+            .unwrap_or_else(|| panic!("send tool result persisted: {conv}"))
+    };
+
+    // THE SUB-1 assertion: the child's send to its own parent registered NO
+    // sender auto-watch — the tool result has no `subscriptionId`.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &child_id }),
+    )
+    .await;
+    let result = send_tool_result(&conv, &parent_id);
+    assert_eq!(result["ok"], json!(true), "child send ok: {result}");
+    assert!(
+        result.get("subscriptionId").is_none(),
+        "child→parent send must NOT register a sender watch: {result}"
+    );
+
+    // THE §7.1 assertion: the delivered row's delta entity on the parent's
+    // chat channel carries the persisted `agent_message` metadata.
+    let tagged = timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("child says hi"))
+                })
+            {
+                return entity.clone();
+            }
+        }
+    })
+    .await
+    .expect("child→parent delivered row reached the chat channel");
+    assert_eq!(
+        tagged["role"], "user",
+        "delivered row is a user row: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["type"],
+        json!("agent_message"),
+        "delta entity lifts the persisted sender-attribution metadata: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["fromAgentId"],
+        json!(child_id),
+        "attribution names the child sender: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["fromAgentName"],
+        json!("ChildC"),
+        "attribution carries the sender name: {tagged}"
+    );
+
+    // Lean-shape control: a human send's delta entity carries NO metadata.
+    let human = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "human hello" }),
+    )
+    .await;
+    assert_eq!(human["success"], true, "human sendMessage ok: {human}");
+    let lean = timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("human hello"))
+                })
+            {
+                return entity.clone();
+            }
+        }
+    })
+    .await
+    .expect("human row reached the chat channel");
+    assert!(
+        lean.get("metadata").is_none(),
+        "a metadata-free row keeps the lean entity shape: {lean}"
+    );
+
+    // Contrast: a parentless BYSTANDER running the identical send DOES get
+    // the SUB-1 sender watch — and is later woken by the parent's completion.
+    let bystander = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "mock:default" }),
+    )
+    .await;
+    let bystander_id = bystander["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_PARENT now" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "bystander kickoff ok: {sent}");
+    for _ in 0..200 {
+        if done.contains(&bystander_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(
+        done.contains(&bystander_id),
+        "bystander turn completed: {done:?}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
+    )
+    .await;
+    let result = send_tool_result(&conv, &parent_id);
+    assert!(
+        result["subscriptionId"].is_string(),
+        "a non-child sender still gets the SUB-1 watch: {result}"
+    );
+
+    // The parent's post-send idle fires the bystander's oneShot watch — the
+    // wake lands in the bystander transcript. The CHILD, whose watch was
+    // suppressed, has no wake despite the parent idling multiple times since
+    // its earlier send.
+    let mut woken = false;
+    for attempt in 0..120i64 {
+        let conv = wss_rpc(
+            &mut rpc,
+            100 + attempt,
+            "agent.getConversation",
+            json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
+        )
+        .await;
+        let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
+        if text.contains("[WORKSPACE EVENTS]") {
+            woken = true;
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert!(woken, "bystander received the parent-completion wake");
+    let conv = wss_rpc(
+        &mut rpc,
+        300,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &child_id }),
+    )
+    .await;
+    let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
+    assert!(
+        !text.contains("[WORKSPACE EVENTS]"),
+        "the child must NOT be woken by its own parent's completion: {text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // agent.editAndRegenerate (PROTOCOL §5.5 extension)
 // ---------------------------------------------------------------------------
