@@ -5578,9 +5578,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut streamed_chunks = 0;
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
-            if ev.event_type == intent_core::events::AGENT_STREAM_CHUNK
-                || ev.event_type == intent_core::events::AGENT_STREAM_CONTENT_BLOCKS
-            {
+            if ev.event_type == intent_core::events::AGENT_STREAM_CHUNK {
                 streamed_chunks += 1;
             }
         }
