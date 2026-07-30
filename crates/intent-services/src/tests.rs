@@ -193,13 +193,15 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
 
-    // Spec note links four task notes (the cancelled one is excluded from
-    // `total`); a spec-linked filter is exercised since the spec body has links.
+    // Spec note links five task notes (the cancelled one is excluded from
+    // `total`; the blocked one counts in `total` but NOT `inProgress`); a
+    // spec-linked filter is exercised since the spec body has links.
     let spec = note(
         &ws,
         "spec",
         "- [A](intent://local/task/task-a)\n- [B](intent://local/task/task-b)\n\
-         - [C](intent://local/task/task-c)\n- [D](intent://local/task/task-d)",
+         - [C](intent://local/task/task-c)\n- [D](intent://local/task/task-d)\n\
+         - [E](intent://local/task/task-e)",
     );
     store.insert_note(&spec).await.expect("spec");
 
@@ -228,6 +230,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .insert_note(&mk_task("task-d", TaskStatus::Cancelled))
         .await
         .unwrap();
+    store
+        .insert_note(&mk_task("task-e", TaskStatus::Blocked))
+        .await
+        .unwrap();
 
     // Distinct `created_at` values pin the `ORDER BY created_at` agent
     // ordering: seeding both agents with `now_iso()` lets the timestamps tie
@@ -253,6 +259,9 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -294,9 +303,9 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     // workspace.get
     let got = svc.get_workspace(ws.clone()).await.expect("get");
     let stats = got.task_stats.expect("task_stats present");
-    assert_eq!(stats.total, 3); // cancelled excluded
+    assert_eq!(stats.total, 4); // cancelled excluded; blocked counts in total
     assert_eq!(stats.completed, 1);
-    assert_eq!(stats.in_progress, 2); // in_progress + review_required
+    assert_eq!(stats.in_progress, 2); // in_progress + review_required; blocked excluded
     let summary = got.agent_summary.expect("agent_summary present");
     assert_eq!(summary.count, 2);
     assert!(summary.agents.iter().any(|a| a.name == "Builder"
@@ -314,7 +323,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     // workspace.list carries the same aggregates; assert the nested wire shape.
     let list = svc.list_workspaces(false).await.expect("list");
     let v = serde_json::to_value(&list[0]).unwrap();
-    assert_eq!(v["taskStats"]["total"], 3);
+    assert_eq!(v["taskStats"]["total"], 4);
     assert_eq!(v["taskStats"]["completed"], 1);
     assert_eq!(v["taskStats"]["inProgress"], 2);
     assert_eq!(v["agentSummary"]["count"], 2);
@@ -1431,6 +1440,9 @@ async fn note_add_stamps_agent_author_with_session_name() {
         skip_auto_commit: false,
         completion_report: None,
         completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
         delegation_depth: None,
         initial_message: None,
         context_references: None,
@@ -3787,6 +3799,9 @@ mod change_event_parity {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -5530,6 +5545,9 @@ mod mcp_callback {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -10560,6 +10578,9 @@ mod search_adapters {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12324,6 +12345,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12453,6 +12477,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12572,6 +12599,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12687,6 +12717,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12802,6 +12835,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -12921,6 +12957,9 @@ mod rules {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -15399,6 +15438,9 @@ mod file_ops_service {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -16382,6 +16424,9 @@ mod heal_stale_agent_sessions {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -17328,6 +17373,9 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         skip_auto_commit: false,
         completion_report: None,
         completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
         delegation_depth: None,
         created_at: now_iso(),
         updated_at: now_iso(),
@@ -17363,6 +17411,9 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         skip_auto_commit: false,
         completion_report: None,
         completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
         delegation_depth: None,
         created_at: now_iso(),
         updated_at: now_iso(),
@@ -17477,6 +17528,9 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         skip_auto_commit: false,
         completion_report: None,
         completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
         delegation_depth: None,
         created_at: ts.clone(),
         updated_at: ts.clone(),
@@ -18036,6 +18090,9 @@ mod last_activity_events {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -18289,6 +18346,9 @@ mod turn_token_usage {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,

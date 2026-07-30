@@ -8412,6 +8412,316 @@ async fn report_to_parent_immediate_after_group_delivery() {
 }
 
 // ===========================================================================
+// Agent attention requests (requestDiscussion / reportBlocker shared op)
+// ===========================================================================
+
+/// The shared attention op persists the pending request on the session
+/// (exposed via the `AgentLite` metadata projection), appends the system-role
+/// transcript notice with the structured `meta.kind`, and works for a
+/// user-created (non-delegated) agent with no linked task — the task
+/// transition and parent wake are simply skipped.
+#[tokio::test]
+async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    let r = svc
+        .agent_request_attention_op(
+            ws.clone(),
+            "discussion".into(),
+            "need input on API shape".into(),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("request attention");
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["kind"], json!("discussion"));
+    assert_eq!(r["reason"], json!("need input on API shape"));
+
+    // Session fields persisted + projected (omitted-when-absent contract is
+    // covered by the None assertions after the clear test below).
+    let got = svc.agent_get_op(agent.clone(), None).await.expect("get");
+    let v = serde_json::to_value(&got).expect("lite json");
+    assert_eq!(v["metadata"]["attentionRequestKind"], "discussion");
+    assert_eq!(
+        v["metadata"]["attentionRequestReason"],
+        "need input on API shape"
+    );
+    assert_eq!(v["metadata"]["attentionRequestTimestamp"], r["savedAt"]);
+
+    // Transcript notice: system role + meta.kind = "discussion-request".
+    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let notice = session
+        .messages
+        .iter()
+        .find(|m| m.role == "system")
+        .expect("system notice");
+    assert_eq!(
+        notice.content,
+        json!([{
+            "type": "text",
+            "text": "need input on API shape",
+            "meta": { "kind": "discussion-request" }
+        }])
+    );
+    // Agent status untouched (no error/retry interaction): never `Error`,
+    // and `stop_reason` stays unset.
+    assert_ne!(session.status, intent_core::AgentStatus::Error);
+    assert_eq!(session.stop_reason, None);
+}
+
+/// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
+/// linked task to the new `blocked` status; `kind: "discussion"` moves it to
+/// `discussion_needed`.
+#[tokio::test]
+async fn request_attention_transitions_linked_task_per_kind() {
+    for (kind, meta_kind, expected_status) in [
+        (
+            "discussion",
+            "discussion-request",
+            intent_core::TaskStatus::DiscussionNeeded,
+        ),
+        (
+            "blocker",
+            "blocker-report",
+            intent_core::TaskStatus::Blocked,
+        ),
+    ] {
+        let (_t, svc, ws) = setup().await;
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let note_id = seed_task(&svc, &ws, "Task under attention").await;
+        WorkspaceApi::task_update_note_status(
+            &svc,
+            ws.clone(),
+            note_id.clone(),
+            "in_progress".into(),
+            None,
+            None,
+        )
+        .await
+        .expect("start task");
+        let created = svc
+            .agent_create_op(
+                ws.clone(),
+                Some("Child".into()),
+                None,
+                None,
+                Some(parent.clone()),
+                Some(note_id.clone()),
+                false,
+                Default::default(),
+            )
+            .await
+            .expect("create child");
+        let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+        svc.agent_request_attention_op(
+            ws.clone(),
+            kind.into(),
+            format!("{kind} reason"),
+            Some(child.clone()),
+        )
+        .await
+        .expect("request attention");
+
+        let refreshed = svc
+            .store()
+            .get_note(&ws, &note_id)
+            .await
+            .expect("refresh note");
+        assert_eq!(
+            refreshed.metadata.task.expect("task metadata").status,
+            expected_status,
+            "kind {kind} must set the matching task status"
+        );
+        let session = svc.store().get_agent_session(&child).await.expect("sess");
+        assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
+        let notice = session
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("system notice");
+        assert_eq!(notice.content[0]["meta"]["kind"], json!(meta_kind));
+    }
+}
+
+/// Terminal task statuses (`complete` / `cancelled`) are never overwritten by
+/// an attention request — parity with `reportToParent`'s terminal guard.
+#[tokio::test]
+async fn request_attention_does_not_overwrite_terminal_task_status() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Done task").await;
+    WorkspaceApi::task_update_note_status(
+        &svc,
+        ws.clone(),
+        note_id.clone(),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("complete task");
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Late".into()),
+            None,
+            None,
+            None,
+            Some(note_id.clone()),
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_request_attention_op(ws.clone(), "blocker".into(), "too late".into(), Some(agent))
+        .await
+        .expect("request attention");
+
+    let refreshed = svc
+        .store()
+        .get_note(&ws, &note_id)
+        .await
+        .expect("refresh note");
+    assert_eq!(
+        refreshed.metadata.task.expect("task metadata").status,
+        intent_core::TaskStatus::Complete,
+        "terminal status must not be downgraded"
+    );
+}
+
+/// Input validation: an unknown kind and an empty/whitespace reason are
+/// `InvalidParams`; a missing caller (FE/RPC front door) is `Internal`; a
+/// cross-workspace call is `NotFound` with no side effects.
+#[tokio::test]
+async fn request_attention_validates_inputs() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    assert!(matches!(
+        svc.agent_request_attention_op(ws.clone(), "panic".into(), "r".into(), Some(agent.clone()))
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        svc.agent_request_attention_op(
+            ws.clone(),
+            "discussion".into(),
+            "   ".into(),
+            Some(agent.clone())
+        )
+        .await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        svc.agent_request_attention_op(ws.clone(), "discussion".into(), "r".into(), None)
+            .await,
+        Err(Error::Internal(_))
+    ));
+    let other_ws = WorkspaceId::new();
+    assert!(matches!(
+        svc.agent_request_attention_op(
+            other_ws,
+            "discussion".into(),
+            "r".into(),
+            Some(agent.clone())
+        )
+        .await,
+        Err(Error::NotFound(_))
+    ));
+    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    assert_eq!(session.attention_request_kind, None);
+    assert!(session.messages.iter().all(|m| m.role != "system"));
+}
+
+/// A delegated (non-grouped) caller's parent receives the kind-flavored wake
+/// immediately, carrying the reason.
+#[tokio::test]
+async fn request_attention_wakes_parent_for_delegated_agent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("reports a blocker: sandbox exploded"),
+        "wake text must be kind-flavored with the reason: {text}"
+    );
+}
+
+/// A child enrolled in an undelivered `after_all` group skips the immediate
+/// wake; the aggregated group wake folds the attention request into that
+/// child's line.
+#[tokio::test]
+async fn request_attention_folds_into_after_all_group_wake() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "which schema version?".into(),
+        Some(c1.clone()),
+    )
+    .await
+    .expect("request attention c1");
+    // Suppressed: no immediate parent send for the grouped child.
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Settle the group: both children idle, then the parent idles.
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    }
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    // Exactly one aggregated wake; c1's line carries the attention fold.
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("Requested a discussion: which schema version?"),
+        "group wake must fold the attention request: {text}"
+    );
+}
+
+// ===========================================================================
 // AS-6: joined end-to-end integration over the real EventBus + delivery loop
 // ===========================================================================
 
@@ -10543,6 +10853,62 @@ async fn clear_completion_report_on_turn_begin() {
         .await
         .expect("second clear");
     assert!(!cleared, "no report on second clear");
+}
+
+/// Clear-on-next-message: a pending attention request is cleared when the
+/// agent's next turn begins (the same turn-begin hook that clears completion
+/// reports — covering every delivery path: sendMessage, queue drain, wake).
+/// The clear returns `true` exactly once, the `AgentLite` metadata projection
+/// drops the fields (omitted-when-absent), and repeats are `false` no-ops.
+#[tokio::test]
+async fn clear_attention_request_on_next_message() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    // No request initially — clear returns false.
+    let cleared = svc
+        .store()
+        .clear_attention_request(&ws, &agent, &now_iso())
+        .await
+        .expect("clear when none");
+    assert!(!cleared, "no request to clear initially");
+
+    // Raise an attention request.
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "missing credentials".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("request attention");
+    let before = svc.agent_get_op(agent.clone(), None).await.expect("get");
+    let v = serde_json::to_value(&before).expect("lite json");
+    assert_eq!(v["metadata"]["attentionRequestKind"], "blocker");
+
+    // Clear (simulates the turn-begin hook on the next delivered message).
+    let cleared = svc
+        .store()
+        .clear_attention_request(&ws, &agent, &now_iso())
+        .await
+        .expect("clear when set");
+    assert!(cleared, "request was pending and cleared");
+
+    // Omitted-when-absent: the metadata keys disappear from the wire form.
+    let after = svc.agent_get_op(agent.clone(), None).await.expect("get");
+    let v = serde_json::to_value(&after).expect("lite json");
+    let metadata = v["metadata"].as_object().expect("metadata object");
+    assert!(!metadata.contains_key("attentionRequestKind"));
+    assert!(!metadata.contains_key("attentionRequestReason"));
+    assert!(!metadata.contains_key("attentionRequestTimestamp"));
+
+    // Second clear is the no-op false again.
+    let cleared = svc
+        .store()
+        .clear_attention_request(&ws, &agent, &now_iso())
+        .await
+        .expect("second clear");
+    assert!(!cleared, "no request on second clear");
 }
 
 /// `agent_send_message_op` (store-only fallback when no AgentManager is attached)

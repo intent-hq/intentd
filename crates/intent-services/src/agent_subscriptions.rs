@@ -1370,6 +1370,11 @@ impl Services {
                         if let Some(s) = &stall {
                             s.annotate_event_data(&mut data);
                         }
+                        annotate_attention_request(
+                            &mut data,
+                            session.attention_request_kind.as_deref(),
+                            session.attention_request_reason.as_deref(),
+                        );
                         let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
@@ -1483,10 +1488,19 @@ impl Services {
                 Some(s) => self.stall_suspicion_for_session(s).await,
                 None => None,
             };
+            let attention = session.as_ref().map(|s| {
+                (
+                    s.attention_request_kind.clone(),
+                    s.attention_request_reason.clone(),
+                )
+            });
             let report = session.and_then(|s| s.completion_report);
             let mut data = event_data.clone();
             if let Some(s) = &stall {
                 s.annotate_event_data(&mut data);
+            }
+            if let Some((kind, reason)) = &attention {
+                annotate_attention_request(&mut data, kind.as_deref(), reason.as_deref());
             }
             let event = Event {
                 id: String::new(),
@@ -1513,6 +1527,28 @@ impl Services {
             )
             .await;
         }
+    }
+}
+
+/// Merge a child's pending attention request (persisted session fields set by
+/// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) into a group-record
+/// event's `data`, so `format_group_child_line` can fold the kind-flavored
+/// attention text into the aggregated group wake (a grouped child skips its
+/// immediate parent wake). No-op when no request is pending.
+fn annotate_attention_request(
+    data: &mut serde_json::Value,
+    kind: Option<&str>,
+    reason: Option<&str>,
+) {
+    let Some(kind) = kind.filter(|k| !k.is_empty()) else {
+        return;
+    };
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("attentionRequestKind".to_string(), serde_json::json!(kind));
+        obj.insert(
+            "attentionRequestReason".to_string(),
+            serde_json::json!(reason.unwrap_or("")),
+        );
     }
 }
 
