@@ -124,10 +124,13 @@ impl Drop for RunReservation {
         if !self.armed {
             return;
         }
-        let mut guard = self.mgr.scripts.lock().unwrap();
-        if let Some(m) = guard.get_mut(&self.key) {
-            if m.state.status == ScriptStatus::Running {
-                m.state.status = self.prev;
+        // Best-effort restore: a poisoned registry mutex must not abort the
+        // process by panicking inside a drop during unwinding.
+        if let Ok(mut guard) = self.mgr.scripts.lock() {
+            if let Some(m) = guard.get_mut(&self.key) {
+                if m.state.status == ScriptStatus::Running {
+                    m.state.status = self.prev;
+                }
             }
         }
     }
@@ -556,16 +559,16 @@ impl ScriptManager {
             let m = guard
                 .get_mut(&(workspace_id.clone(), script_id.to_string()))
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
-            if m.state.status == ScriptStatus::Running {
-                return Ok(json!({
-                    "output": "",
-                    "warning": "Script is already running; wait for it to finish or use script.stop.",
-                }));
-            }
             if m.def.mode == ScriptMode::Service {
                 return Ok(json!({
                     "output": "",
                     "warning": "Script is a service; use script.start instead of script.run.",
+                }));
+            }
+            if m.state.status == ScriptStatus::Running {
+                return Ok(json!({
+                    "output": "",
+                    "warning": "Script is already running; wait for it to finish or use script.stop.",
                 }));
             }
             // Reserve the run before releasing the lock: a concurrent `run()`
@@ -574,8 +577,13 @@ impl ScriptManager {
             // resolve/spawn failure resets via `fail()`, and a caller-side
             // cancellation before the PTY exists restores the prior status
             // via `reservation` (nothing to clean up yet, no event emitted).
+            // The previous run's `pid` is cleared here so the window never
+            // reports `running` with a stale pid; `script.stop` inside the
+            // window is a benign no-op (nothing spawned yet, one store read
+            // wide) and the run proceeds to its own timeout/exit.
             let prev = m.state.status;
             m.state.status = ScriptStatus::Running;
+            m.state.pid = None;
             (m.def.clone(), prev)
         };
         let mut reservation = RunReservation {
@@ -612,7 +620,13 @@ impl ScriptManager {
         let sid = script_id.to_string();
         reservation.armed = false;
         let completion = tokio::spawn(async move {
-            mgr.mark_running(&ws_task, &sid, pty_id).await;
+            // Removed concurrently (script.remove / create-upsert) between
+            // `pty.spawn` and here: the remover killed the *old* pty_id (or
+            // none), so reap the fresh PTY ourselves — mirrors `supervise()`.
+            if !mgr.mark_running(&ws_task, &sid, pty_id).await {
+                mgr.pty.kill(pty_id).await;
+                return (None, false);
+            }
             let timed_out = match timeout_seconds.filter(|s| *s > 0) {
                 Some(s) => {
                     let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
