@@ -28,6 +28,15 @@ jobs:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
       # this job's target dir stays small, and tinybox has ~380G free.
       - uses: actions/checkout@v7
+      # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
+      # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
+      # relies on the runner user's passwordless sudo.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
       # the start of every job, and all jobs on this runner share one work
@@ -132,6 +141,13 @@ jobs:
       NEXTEST_TEST_THREADS: 64
     steps:
       - uses: actions/checkout@v7
+      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
@@ -190,6 +206,13 @@ jobs:
       NEXTEST_TEST_THREADS: 64
     steps:
       - uses: actions/checkout@v7
+      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
