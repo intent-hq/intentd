@@ -24,10 +24,16 @@
 # load-correlated silent mock death (empty stderr, ~4s TRY 1 fail, ~11s TRY 2
 # pass under NEXTEST_TEST_THREADS=8 + llvm-cov), delay-invariant, not locally
 # reproducible. Mechanism not pinned; serialization removes the load condition.
+#
+# e2e_wss_pool_contention_stress also runs isolated: its tests assert wall-clock
+# read-latency bounds (<2s workspace.list / note.list mid-write-storm), which
+# measure pool behavior, not machine load. Under llvm-cov with 32+ parallel
+# tests on the tinybox runner the read took ~3-4s on both tries purely from
+# scheduler contention (PR #750). Isolation makes the latency bound meaningful.
 [profile.default]
 retries = 1
 slow-timeout = { period = "90s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all)'
+filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress)'
 threads-required = 'num-test-threads'
