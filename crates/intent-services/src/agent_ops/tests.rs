@@ -9170,6 +9170,78 @@ async fn diagnostics_agent_filter_narrows_scope() {
     assert_eq!(diag["filters"]["agentId"], json!(a.0));
 }
 
+/// monorepo#1150: the `taskNoteId` filter matches the agents actually
+/// associated with the task — the union of sessions persisting
+/// `task_note_id` (`agent.delegate`) and the note-side `assigned_agents`
+/// (`task.assignAgent`) — instead of matching nothing.
+#[tokio::test]
+async fn diagnostics_task_filter_matches_task_agents() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "diagnostics filter task").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("work the task".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let delegated = resp["agentId"].as_str().expect("agentId").to_string();
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["filters"]["taskNoteId"], json!(note_id.as_str()));
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1, "only the task's agent is in scope: {diag}");
+    assert_eq!(agents[0]["id"], json!(delegated));
+    assert_eq!(diag["summary"]["agents"], json!(1));
+}
+
+/// monorepo#1150: an agent assigned note-side only (`task.assignAgent`; its
+/// session's `task_note_id` is unset) is still in the `taskNoteId` scope.
+#[tokio::test]
+async fn diagnostics_task_filter_includes_note_side_assignees() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "note-side assignment task").await;
+    let assignee = create_agent(&svc, &ws, "Assignee").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), assignee.0.clone())
+        .await
+        .expect("assign");
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None)
+        .await
+        .expect("diagnostics");
+    let agents = result["diagnostics"]["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1, "note-side assignee is in scope: {result}");
+    assert_eq!(agents[0]["id"], json!(assignee.0));
+}
+
+/// monorepo#1150: a nonexistent `taskNoteId` yields an empty snapshot, not
+/// an error.
+#[tokio::test]
+async fn diagnostics_task_filter_unknown_note_yields_empty_snapshot() {
+    let (_t, svc, ws) = setup().await;
+    let _agent = create_agent(&svc, &ws, "Someone").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(NoteId::from("note-missing")), None)
+        .await
+        .expect("diagnostics must not error on an unknown note");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["summary"]["agents"], json!(0));
+    assert_eq!(diag["agents"], json!([]));
+}
+
 /// A completion watch whose parent has no live session surfaces an
 /// `orphaned-subscription` stuck-risk signal.
 #[tokio::test]

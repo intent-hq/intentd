@@ -4502,10 +4502,25 @@ impl Services {
         let groups = self.all_groups(&workspace_id);
 
         let agent_filter = agent_id.as_ref().map(|a| a.0.clone());
-        // Sessions carry no taskNoteId in the daemon model, so a taskNoteId
-        // filter matches nothing (mirrors `agent.metadata?.taskNoteId` undefined).
+        // A taskNoteId filter matches the agents actually associated with the
+        // task (monorepo#1150): sessions persist `task_note_id` (set by
+        // `agent.delegate`) and the note side tracks `assigned_agents`
+        // (`task.assignAgent`) — the scope is the union of both, mirroring
+        // `agent.sendToTask`'s note-side resolution. A missing or non-task
+        // note yields an empty scope (empty snapshot), never an error.
         let task_filter = task_note_id.as_ref().map(|n| n.0.clone());
         let has_filter = agent_filter.is_some() || task_filter.is_some();
+        let mut task_agent_ids: HashSet<String> = HashSet::new();
+        if let Some(tid) = &task_note_id {
+            for s in &sessions {
+                if s.task_note_id.as_ref() == Some(tid) {
+                    task_agent_ids.insert(s.id.0.clone());
+                }
+            }
+            if let Ok(task) = self.get_my_task(workspace_id.clone(), tid.clone()).await {
+                task_agent_ids.extend(task.assigned_agents.into_iter().map(|a| a.0));
+            }
+        }
 
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
         let session_by_id: std::collections::HashMap<String, &AgentSession> =
@@ -4519,10 +4534,15 @@ impl Services {
                     continue;
                 }
             }
-            if task_filter.is_some() {
+            if task_filter.is_some() && !task_agent_ids.contains(&s.id.0) {
                 continue;
             }
             matching.insert(s.id.0.clone());
+        }
+        if agent_filter.is_none() {
+            // Note-side assignees without a session row still scope the
+            // snapshot (union semantics).
+            matching.extend(task_agent_ids.iter().cloned());
         }
         if let Some(aid) = &agent_filter {
             matching.insert(aid.clone());
