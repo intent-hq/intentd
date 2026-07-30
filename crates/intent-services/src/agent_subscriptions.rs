@@ -1534,8 +1534,10 @@ impl Services {
 /// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) into a group-record
 /// event's `data`, so `format_group_child_line` can fold the kind-flavored
 /// attention text into the aggregated group wake (a grouped child skips its
-/// immediate parent wake). No-op when no request is pending.
-fn annotate_attention_request(
+/// immediate parent wake). No-op when no request is pending. Shared by all
+/// group-record annotation sites (including the completion-watch path in
+/// `lib.rs`) so the payload shape and empty-kind guard cannot drift.
+pub(crate) fn annotate_attention_request(
     data: &mut serde_json::Value,
     kind: Option<&str>,
     reason: Option<&str>,

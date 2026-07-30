@@ -2498,13 +2498,11 @@ impl Services {
                 let event = match &attention {
                     Some((kind, reason)) => {
                         let mut e = event.clone();
-                        if let Some(obj) = e.data.as_object_mut() {
-                            obj.insert("attentionRequestKind".to_string(), serde_json::json!(kind));
-                            obj.insert(
-                                "attentionRequestReason".to_string(),
-                                serde_json::json!(reason),
-                            );
-                        }
+                        agent_subscriptions::annotate_attention_request(
+                            &mut e.data,
+                            Some(kind),
+                            Some(reason),
+                        );
                         attention_annotated = e;
                         &attention_annotated
                     }

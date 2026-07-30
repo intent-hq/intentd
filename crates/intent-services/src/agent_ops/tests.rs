@@ -8545,6 +8545,71 @@ async fn request_attention_transitions_linked_task_per_kind() {
     }
 }
 
+/// A repeated raise while the linked task is already at the target status
+/// skips the task writer entirely (the `task.status == target` guard in
+/// `transition_linked_task_status`): the note's `rev` is unchanged by the
+/// second call, so repeated attention requests do not churn the note.
+#[tokio::test]
+async fn request_attention_repeat_at_target_status_does_not_churn_note() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note_id = seed_task(&svc, &ws, "Repeat attention task").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            Some(note_id.clone()),
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "first raise".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("first request");
+    let after_first = svc
+        .store()
+        .get_note(&ws, &note_id)
+        .await
+        .expect("note after first");
+    assert_eq!(
+        after_first.metadata.task.as_ref().expect("task").status,
+        intent_core::TaskStatus::DiscussionNeeded
+    );
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "second raise".into(),
+        Some(child),
+    )
+    .await
+    .expect("second request");
+    let after_second = svc
+        .store()
+        .get_note(&ws, &note_id)
+        .await
+        .expect("note after second");
+    assert_eq!(
+        after_second.rev, after_first.rev,
+        "already-at-target raise must skip the task writer (no rev churn)"
+    );
+    assert_eq!(
+        after_second.metadata.task.expect("task").status,
+        intent_core::TaskStatus::DiscussionNeeded
+    );
+}
+
 /// Terminal task statuses (`complete` / `cancelled`) are never overwritten by
 /// an attention request — parity with `reportToParent`'s terminal guard.
 #[tokio::test]
