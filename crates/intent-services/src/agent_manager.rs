@@ -3945,6 +3945,19 @@ impl AgentManager {
         if self.busy.lock().unwrap().contains(agent_id) {
             return true;
         }
+        // Perf (PR review, PROTOCOL §5.5): a non-consuming peek — in-memory,
+        // no store round-trip — so the two `question_hold_active` reads
+        // below only run once a notification is actually buffered. Without
+        // this, every idle agent with a live handle costs ~2 SQLite reads
+        // per `HARNESS_WAKE_POLL` tick (50ms) even when nothing is pending.
+        {
+            let Ok(peek) = notes.try_lock() else {
+                return true;
+            };
+            if peek.is_empty() {
+                return true;
+            }
+        }
         // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
         // append a fresh assistant message, superseding the pending Q&A the
         // hold protects. Skip the tick (buffered notifications stay
@@ -3954,7 +3967,9 @@ impl AgentManager {
         }
         // Owned lock so the claimed path below can move the receiver guard
         // into the spawned drive task with no unlock/relock gap another
-        // consumer could slip into.
+        // consumer could slip into. The notification observed by the peek
+        // above may already be gone (a concurrent consumer drained it) —
+        // `try_recv` below re-checks and this tick is a no-op either way.
         let Ok(mut guard) = notes.try_lock_owned() else {
             return true;
         };

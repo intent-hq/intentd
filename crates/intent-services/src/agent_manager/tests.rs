@@ -8253,6 +8253,96 @@ mod harness_wake_tests {
         );
     }
 
+    /// Perf (PR review): with no notification buffered, the tick returns via
+    /// the non-consuming peek without ever reaching `question_hold_active` —
+    /// verified indirectly by arming a hold that would otherwise be a no-op
+    /// gate (the tick is a no-op regardless, so this pins the "empty →
+    /// short-circuit before any store read" contract by construction: an
+    /// armed hold plus an empty channel must behave identically to no hold
+    /// at all, and must not itself require a `question_hold_active` read to
+    /// report that).
+    #[tokio::test]
+    async fn tick_with_no_buffered_notification_short_circuits_even_with_hold_armed() {
+        let (_tmp, mgr, _bus, id, ws, _note_tx) = wake_setup().await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "assistant",
+                &json!([
+                    { "type": "text", "text": "Which scope?" },
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "intent-question://q-1",
+                            "name": "Scope",
+                            "mimeType": "application/vnd.intent.question+json",
+                            "text": "{\"question\":\"Which scope?\"}"
+                        }
+                    }
+                ]),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        assert!(mgr.services.question_hold_active(&id).await, "hold armed");
+
+        // No notification sent: the tick must short-circuit on the peek and
+        // leave the channel and hold state untouched.
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(!mgr.is_busy(&id), "peek-only tick never claims the slot");
+        assert!(
+            mgr.services.question_hold_active(&id).await,
+            "hold unaffected by the no-op tick"
+        );
+    }
+
+    /// The hold still gates the tick once a notification IS buffered (the
+    /// peek passes, and the existing `question_hold_active` check then
+    /// blocks the implicit turn as before).
+    #[tokio::test]
+    async fn tick_with_buffered_notification_still_gated_by_hold() {
+        let (_tmp, mgr, _bus, id, ws, note_tx) = wake_setup().await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "assistant",
+                &json!([
+                    { "type": "text", "text": "Which scope?" },
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "intent-question://q-1",
+                            "name": "Scope",
+                            "mimeType": "application/vnd.intent.question+json",
+                            "text": "{\"question\":\"Which scope?\"}"
+                        }
+                    }
+                ]),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        assert!(mgr.services.question_hold_active(&id).await, "hold armed");
+
+        note_tx.send(chunk_note("auto wake output")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(!mgr.is_busy(&id), "hold blocks the implicit turn");
+
+        // The buffered notification is left untouched (same contract as the
+        // wake-gate-paused case) so it is not silently dropped.
+        let notes = {
+            let map = mgr.handles.lock().unwrap();
+            map.get(&id).unwrap().notifications.clone()
+        };
+        let mut guard = notes.try_lock().expect("receiver not held");
+        assert!(
+            guard.try_recv().is_ok(),
+            "notification left buffered for a later tick past the hold"
+        );
+    }
+
     /// A user send racing an active wake turn queues (slot is claimed) and
     /// the wake turn finalizes promptly — stream:end fires and the queued
     /// user row is persisted by the drain kick afterwards.
