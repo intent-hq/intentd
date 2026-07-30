@@ -71,6 +71,17 @@ fn session_setup_timeout() -> Duration {
 /// all 30 minutes, so the daemon must not cut idle turns earlier than the FE
 /// stops waiting (STAB-49; the previous 15-minute default killed healthy
 /// long-running implementor turns).
+///
+/// Do NOT raise this timeout (or advise bumping
+/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`) to accommodate one long-running silent
+/// turn. It applies to EVERY agent harness/provider driving a
+/// `session/prompt` turn through intentd — it is not per-agent or
+/// per-workload — so widening it affects all harnesses and breaks the FE
+/// 30-minute contract above. The remedy for long silent operations (e.g. an
+/// agent blocking on `sleep` / `gh pr checks --watch` loops for >30 min) is
+/// agent-side: emit periodic activity by polling in shorter intervals.
+/// Context: intent-hq/monorepo#1106 diagnosis (2026-07-29), where a
+/// 30-minute silent watch loop tripped this timeout.
 fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
