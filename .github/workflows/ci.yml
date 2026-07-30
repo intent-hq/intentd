@@ -98,8 +98,8 @@ jobs:
       # later `shell: bash` step resolves Git Bash instead.
       - name: Put Git Bash first on PATH (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\Git\bin'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>%GITHUB_PATH%
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale; re-add swatinem/rust-cache, keyed
       # per target, if a GH-hosted matrix entry is re-enabled). On the Windows
