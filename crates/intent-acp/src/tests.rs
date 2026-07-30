@@ -1587,6 +1587,7 @@ mod mcp_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             _message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.sent
                 .lock()
@@ -7417,6 +7418,7 @@ mod wsapi4_bindings_tests {
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
+                dismissed_questions_message_id: None,
             },
         }
     }
@@ -7458,6 +7460,7 @@ mod wsapi4_bindings_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_send_calls.lock().unwrap().push((
                 agent_id.as_str().to_string(),

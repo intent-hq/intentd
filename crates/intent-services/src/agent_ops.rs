@@ -262,6 +262,24 @@ pub(crate) struct QueuedMessage {
     /// Preempted message's file attachments, carried like `prepend_content`.
     #[serde(default)]
     pub prepend_file_blocks: Option<Value>,
+    /// `true` when this entry was enqueued with `priority: "interrupt"`
+    /// (question hold / PROTOCOL §5.5): interrupt entries ALWAYS enter the
+    /// queue ahead of all normal entries, preserving arrival order among
+    /// themselves ([`Services::enqueue_message`]). Persisted so the ordering
+    /// survives daemon restarts; `to_value` emits `interruptPriority: true`
+    /// so queue snapshots reflect the marker.
+    #[serde(default)]
+    pub interrupt_priority: bool,
+    /// `true` when the entry carries a USER-originated `agent.sendMessage`
+    /// that was parked by a queue-fallback path (busy race, quarantine,
+    /// append-failure). The question hold never blocks user messages
+    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
+    /// hold-gated drain paths deliver the first user-origin entry instead
+    /// of suspending — without this marker a user answer parked by the
+    /// turn-end busy race would deadlock against the hold it is supposed
+    /// to release. Persisted so the bypass survives daemon restarts.
+    #[serde(default)]
+    pub user_origin: bool,
 }
 
 impl QueuedMessage {
@@ -302,6 +320,9 @@ impl QueuedMessage {
         }
         if let Some(md) = &self.message_metadata {
             v["messageMetadata"] = md.clone();
+        }
+        if self.interrupt_priority {
+            v["interruptPriority"] = Value::Bool(true);
         }
         v
     }
@@ -906,6 +927,20 @@ pub(crate) fn user_message_blocks(
         }
     }
     Value::Array(blocks)
+}
+
+/// `true` iff a message's content-block array carries at least one pending
+/// question resource block (`application/vnd.intent.question+json` — the MIME
+/// type `ws.app.question.ask` emits; reused from `intent-acp` so hold
+/// detection cannot drift from the binding). Non-array content is `false`.
+pub(crate) fn has_question_blocks(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+    })
 }
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
@@ -2545,8 +2580,15 @@ impl Services {
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
-        let (queued, position) =
-            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+        let (queued, position) = self.enqueue_message(
+            &agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            None,
+            None,
+            false,
+        );
         let result = json!({
             "success": true,
             "queuedMessage": queued.to_value(position),
@@ -2773,8 +2815,15 @@ impl Services {
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
                 // path's behavior.
-                let (queued, position) =
-                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+                let (queued, position) = self.enqueue_message(
+                    &agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    None,
+                    None,
+                    false,
+                );
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -2865,6 +2914,134 @@ impl Services {
         )
         .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
+    }
+
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
+    /// walking back from the tail of the transcript past any trailing
+    /// `system` rows (e.g. the resume-interruption marker —
+    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
+    /// continuation), the first non-system message is an assistant message
+    /// carrying at least one `application/vnd.intent.question+json` resource
+    /// block AND its id differs from the session's persisted dismissal
+    /// marker. `system` rows are transparent to the derivation — same as the
+    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
+    /// `assistant` row — so a system marker can neither supersede nor rescue
+    /// a pending Q&A. Derived, not stored: any later user/assistant message
+    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
+    /// supersedes the questions and flips the hold false;
+    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Fails open (`false`) on store errors so a read failure can never wedge
+    /// deliveries.
+    pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        // Page back over the tail, growing the window while every fetched
+        // row is `system`-role, so an arbitrarily long run of trailing
+        // system markers (e.g. repeated interruption notices) can never hide
+        // a still-pending question underneath it. Stops as soon as a
+        // non-system row is found, the fetched page comes back shorter than
+        // requested (the whole transcript was system rows or empty — no
+        // hold), or the safety cap is hit (fails open to `false`).
+        const HOLD_DERIVATION_TAIL_START: i64 = 10;
+        const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
+        let mut tail = HOLD_DERIVATION_TAIL_START;
+        let last = loop {
+            let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
+                return false;
+            };
+            if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
+                break last.clone();
+            }
+            if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
+                return false;
+            }
+            tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
+        };
+        if last.role != "assistant" || !has_question_blocks(&last.content) {
+            return false;
+        }
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        session.dismissed_questions_message_id() != Some(last.id.as_str())
+    }
+
+    /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session so the dismissed
+    /// question set never re-surfaces (survives reload), emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume.
+    /// Idempotent: re-dismissing the same message succeeds. Fails closed on a
+    /// nonexistent target or a workspace mismatch (`NotFound`).
+    pub(crate) async fn agent_dismiss_questions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            return Err(Error::InvalidParams("messageId is required".to_string()));
+        }
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (defense-in-depth against bare-id probes).
+        let mut session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        // Preserve non-object metadata verbatim under a side key rather than
+        // discarding it: the column is documented/typed as a free-form
+        // object today, but silently replacing a non-object value (should
+        // one ever land there) would drop data (monorepo#751 review).
+        let mut metadata = match session.metadata.take() {
+            Some(Value::Object(map)) => map,
+            Some(other) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    "agent_session.metadata was a non-object JSON value; \
+                     preserving it under `priorNonObjectMetadata` while adding the \
+                     dismissal marker"
+                );
+                let mut map = serde_json::Map::new();
+                map.insert("priorNonObjectMetadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
+            Value::String(message_id.clone()),
+        );
+        session.metadata = Some(Value::Object(metadata));
+        session.updated_at = now_iso();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "dismissedQuestionsMessageId": message_id,
+            }),
+        )
+        .await;
+        // The hold (if it was gating this message's questions) is now released:
+        // kick the drain so held queue entries resume without waiting for the
+        // next end-of-turn drain.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(agent_id.clone(), workspace_id)
+                .await;
+        }
+        Ok(json!({
+            "success": true,
+            "dismissedQuestionsMessageId": message_id,
+        }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -3229,9 +3406,15 @@ impl Services {
     /// 4. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
     /// 5. wakes a delegated caller's parent with a kind-flavored message —
-    ///    skipped when the child is in an undelivered `after_all` delegation
-    ///    group (the group's aggregated wake folds the attention request in)
-    ///    and for non-delegated callers.
+    ///    delivered IMMEDIATELY even when the child is in an undelivered
+    ///    `after_all` delegation group (mirroring the STAB-160 immediate
+    ///    grouped-failure wake: an attention request is an alert the parent
+    ///    must hear now, not at group settlement). The group's later
+    ///    aggregated wake also annotates the child's line from the persisted
+    ///    session fields (the record) while the request is still pending —
+    ///    the fields are cleared when the child next receives a message, so
+    ///    a parent reply before settlement retires the fold. Non-delegated
+    ///    callers have no parent to wake.
     ///
     /// Agent status and `stop_reason` are untouched: the turn ends normally
     /// (no retry/requeue interaction).
@@ -3355,57 +3538,59 @@ impl Services {
             )
             .await;
         }
-        // 5. Kind-flavored parent wake for delegated callers. Grouped children
-        // skip the immediate wake — the `after_all` group's aggregated wake
-        // folds the attention request in (the group-record sites annotate the
-        // child line from the persisted session fields). Non-delegated
-        // callers have no parent to wake.
+        // 5. Kind-flavored parent wake for delegated callers — delivered
+        // immediately even when the child is enrolled in an undelivered
+        // `after_all` delegation group (mirroring the STAB-160 immediate
+        // grouped-failure wake in `deliver_completion_to_watches`): the
+        // request is an alert the parent must hear now, not at group
+        // settlement. The group's later aggregated wake also annotates the
+        // child's line from the persisted session fields (the record) while
+        // the request is still pending — a parent reply before settlement
+        // clears the fields and retires the fold. Non-delegated callers have
+        // no parent to wake.
         if let Some(parent) = parent {
-            let grouped = self.child_in_undelivered_group(&parent, &caller);
-            if !grouped {
-                let parent_home_ws = self
-                    .store
-                    .get_agent_session(&parent)
-                    .await
-                    .map(|s| s.workspace_id)
-                    .unwrap_or_else(|_| workspace_id.clone());
-                let wake_text = format!(
-                    "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
-                    session.name, caller.0, wake_verb, reason
+            let parent_home_ws = self
+                .store
+                .get_agent_session(&parent)
+                .await
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|_| workspace_id.clone());
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
+                session.name, caller.0, wake_verb, reason
+            );
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                    "timestamp": saved_at,
+                    "data": {
+                        "workspaceId": workspace_id.0,
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "kind": kind,
+                        "reason": reason,
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            if let Err(e) = self
+                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver attention-request wake to parent"
                 );
-                let metadata = json!({
-                    "type": "event_notification",
-                    "eventCount": 1,
-                    "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
-                    "events": [{
-                        "id": uuid::Uuid::new_v4().to_string(),
-                        "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
-                        "timestamp": saved_at,
-                        "data": {
-                            "workspaceId": workspace_id.0,
-                            "agentId": caller.0,
-                            "agentName": session.name.clone(),
-                            "kind": kind,
-                            "reason": reason,
-                        },
-                        "actor": {
-                            "type": "agent",
-                            "id": caller.0,
-                            "name": session.name.clone(),
-                        }
-                    }]
-                });
-                if let Err(e) = self
-                    .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        parent = %parent.0,
-                        child = %caller.0,
-                        "failed to deliver attention-request wake to parent"
-                    );
-                }
             }
         }
 
@@ -4939,20 +5124,49 @@ impl Services {
                     .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
-            (None, _) => {
+            (None, interrupt) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
                 // `agent_send_message` — plumb the metadata through the
                 // store-only append so attribution is consistent across
-                // deployments with and without a runtime manager.
-                self.agent_send_message_op(
-                    agent.clone(),
-                    message,
-                    None,
-                    None,
-                    None,
-                    options.message_metadata,
-                )
-                .await?
+                // deployments with and without a runtime manager. Question
+                // hold (PROTOCOL §5.5): sendToTask is automatic by
+                // definition, so an active hold parks the message instead
+                // of persisting the superseding user row.
+                if self.question_hold_active(&agent).await {
+                    let (queued, position) = self.enqueue_message(
+                        &agent,
+                        message,
+                        None,
+                        None,
+                        options.message_metadata,
+                        None,
+                        interrupt,
+                    );
+                    let held = json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.publish_queue_updated(&agent).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this `(None, _)` arm only
+                    // runs with no `AgentManager` attached, so there is no
+                    // drain to kick here — same as the other store-only
+                    // fallbacks above.
+                    held
+                } else {
+                    self.agent_send_message_op(
+                        agent.clone(),
+                        message,
+                        None,
+                        None,
+                        None,
+                        options.message_metadata,
+                    )
+                    .await?
+                }
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
@@ -5542,6 +5756,41 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
+        // Question hold (PROTOCOL §5.5): wakes are automatic by definition
+        // (`agent.wakeOrCreate` context messages, reportToParent /
+        // completion-watch wakes) — while the target's hold is active they
+        // park in the queue instead of claiming the slot, so the pending Q&A
+        // is never superseded. Checked BEFORE `try_begin_turn` so even an
+        // idle asking agent holds the wake.
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content_owned,
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer): re-check and kick the drain if the
+            // hold cleared while the enqueue above was in flight, mirroring
+            // `AgentManager::send_message`'s hold-gate re-check — otherwise
+            // this entry could be stranded with no future drain trigger.
+            if !self.question_hold_active(agent_id).await {
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            }));
+        }
         if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
@@ -5553,6 +5802,7 @@ impl Services {
                 None,
                 message_metadata.cloned(),
                 None,
+                false,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -5578,6 +5828,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -5638,6 +5889,43 @@ impl Services {
     where
         F: Fn() -> Value,
     {
+        // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
+        // runtime path above — the store-only persist would append the user
+        // row that supersedes the pending Q&A, so park the wake in the queue
+        // instead (hermetic wiring keeps the hold contract testable).
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content.to_string(),
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            });
+            self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer), same shape as the runtime path
+            // above. This wiring has no attached `AgentManager` by
+            // definition (that is why we are in the store-only fallback),
+            // so there is nothing to kick — the re-check only matters if a
+            // manager is (or becomes) attached, which `try_drain_queue`
+            // itself would then handle on its own next trigger.
+            if !self.question_hold_active(agent_id).await {
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
+            return Ok(result);
+        }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -5673,6 +5961,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 let result = json!({
                     "success": true,
@@ -5738,6 +6027,14 @@ impl Services {
     /// a queue-fallback interrupt still delivers the preempted message ahead
     /// of the interrupt message on drain; sends without prepend content pass
     /// `None`.
+    ///
+    /// `interrupt` marks a `priority: "interrupt"` enqueue (question hold /
+    /// PROTOCOL §5.5): the entry is inserted AFTER the queue's leading
+    /// interrupt entries but AHEAD of all normal entries — arrival order is
+    /// preserved among interrupts, and every fallback path that parks an
+    /// interrupt (hold gate, busy race, quarantine park, append-failure
+    /// auto-queue) shares this ordering. Normal enqueues append at the tail.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -5746,6 +6043,38 @@ impl Services {
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+    ) -> (QueuedMessage, usize) {
+        self.enqueue_message_with_origin(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            false,
+        )
+    }
+
+    /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
+    /// `true` records that the entry carries a USER-originated
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure). The question-hold drain gates deliver
+    /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
+    /// answer supersedes the pending Q&A and must never deadlock against
+    /// the hold it releases).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_origin(
+        &self,
+        agent_id: &AgentId,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        user_origin: bool,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = new_message_id();
@@ -5763,14 +6092,23 @@ impl Services {
             prepend_content: prepend.content,
             prepend_image_blocks: prepend.image_blocks,
             prepend_file_blocks: prepend.file_blocks,
+            interrupt_priority: interrupt,
+            user_origin,
         };
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.entry(agent_id.clone()).or_default();
-        queue.push(queued.clone());
-        let position = queue.len() - 1;
+        let position = if interrupt {
+            // Behind earlier interrupts, ahead of every normal entry.
+            let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
+            queue.insert(idx, queued.clone());
+            idx
+        } else {
+            queue.push(queued.clone());
+            queue.len() - 1
+        };
         (queued, position)
     }
 
@@ -5786,6 +6124,22 @@ impl Services {
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
         let idx = queue.iter().position(|m| !m.editing)?;
+        Some(queue.remove(idx))
+    }
+
+    /// Pop the oldest ready-to-send **user-origin** queued message, if any
+    /// (question hold, PROTOCOL §5.5). While the hold is active the drain
+    /// paths deliver ONLY user-origin entries — a user answer parked by the
+    /// turn-end busy race must supersede the pending Q&A instead of
+    /// deadlocking behind the hold it is supposed to release; automatic
+    /// entries stay parked.
+    pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let idx = queue.iter().position(|m| !m.editing && m.user_origin)?;
         Some(queue.remove(idx))
     }
 
@@ -5830,6 +6184,18 @@ impl Services {
             .expect("agent queue registry poisoned")
             .get(agent_id)
             .map(|q| q.iter().any(|m| !m.editing))
+            .unwrap_or(false)
+    }
+
+    /// `true` iff at least one ready-to-send queued entry is user-origin
+    /// (question hold, PROTOCOL §5.5): the hold-gated drain paths use this
+    /// to decide whether a drain may proceed for the user entry alone.
+    pub(crate) fn has_user_origin_ready(&self, agent_id: &AgentId) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map(|q| q.iter().any(|m| !m.editing && m.user_origin))
             .unwrap_or(false)
     }
 
@@ -6591,7 +6957,9 @@ impl Services {
         let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 
         // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load)
+        // (lazily respawns provider and resumes via ACP session/load).
+        // Automatic origin: a resume continuation must not supersede a Q&A
+        // the agent had pending when the harness shut down (question hold).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),
@@ -6605,6 +6973,7 @@ impl Services {
                 None,
                 None,
                 None,
+                intent_core::MessageOrigin::Automatic,
             )
             .await
         {
