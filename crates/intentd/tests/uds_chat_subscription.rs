@@ -1514,3 +1514,139 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// monorepo#1157: a user row persisted with a client-minted `userAppMessageId`
+/// round-trips the lifted `appMessageId` through `chat.subscribe` — the
+/// non-assistant row delta stamps it on every entity, and the seq-0 snapshot
+/// row (the `agent.getConversation` read shape, reused verbatim) carries it
+/// too (snapshot/delta parity). A send without the id emits entities without
+/// the key (additive, backward compatible).
+#[tokio::test]
+async fn chat_user_row_delta_and_snapshot_carry_app_message_id() {
+    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].as_str().is_some());
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+
+    // Direct send (store-only path) with a client-minted userAppMessageId.
+    let sent = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "hello",
+            "messageId": "user-msg-e2e-1", "userAppMessageId": "app-msg-e2e-1",
+        }),
+    )
+    .await;
+    assert_eq!(sent["messageId"], "user-msg-e2e-1");
+
+    let push = read_json(&mut sub_reader).await;
+    assert_eq!(push["params"]["kind"], "delta");
+    let delta = &push["params"]["delta"];
+    let added = delta["added"].as_array().expect("added entities");
+    assert!(
+        !added.is_empty(),
+        "user-row delta must carry entities: {delta}"
+    );
+    for e in added {
+        assert_eq!(e["messageId"], "user-msg-e2e-1");
+        assert_eq!(e["role"], "user");
+        assert_eq!(
+            e["appMessageId"], "app-msg-e2e-1",
+            "delta entity mirrors the lifted appMessageId: {e}"
+        );
+    }
+
+    // A send WITHOUT the id emits entities without the key.
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "content": "plain",
+            "messageId": "user-msg-e2e-2",
+        }),
+    )
+    .await;
+    let push2 = read_json(&mut sub_reader).await;
+    let delta2 = &push2["params"]["delta"];
+    for e in delta2["added"].as_array().expect("added entities") {
+        assert_eq!(e["messageId"], "user-msg-e2e-2");
+        assert!(
+            e.get("appMessageId").is_none(),
+            "no appMessageId key without a client id: {e}"
+        );
+    }
+
+    // Snapshot parity: a fresh subscription's seq-0 snapshot serves the same
+    // rows — the tagged one with the lifted appMessageId, the plain one
+    // without the key.
+    let (sub2_read, mut sub2_write) = connect_retry(&socket).await.into_split();
+    let mut sub2_reader = tokio::io::BufReader::new(sub2_read);
+    send(
+        &mut sub2_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _resp2 = read_json(&mut sub2_reader).await;
+    let snap2 = read_json(&mut sub2_reader).await;
+    let messages = snap2["params"]["snapshot"]["messages"]
+        .as_array()
+        .expect("snapshot messages");
+    let tagged = messages
+        .iter()
+        .find(|m| m["id"] == "user-msg-e2e-1")
+        .expect("tagged row in snapshot");
+    assert_eq!(
+        tagged["appMessageId"], "app-msg-e2e-1",
+        "seq-0 snapshot row carries the lifted appMessageId"
+    );
+    let plain = messages
+        .iter()
+        .find(|m| m["id"] == "user-msg-e2e-2")
+        .expect("plain row in snapshot");
+    assert!(plain.get("appMessageId").is_none());
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

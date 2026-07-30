@@ -1187,6 +1187,10 @@ mod chat_message_delta {
             assert_eq!(e["messageSeq"], 4);
             assert_eq!(e["timestamp"], "2026-07-30T00:00:00Z");
             assert_eq!(e["streamingComplete"], true);
+            assert!(
+                e.get("appMessageId").is_none(),
+                "a row without appMessageId must emit entities without the key: {e}"
+            );
         }
         // Stable synthetic ids `{messageId}:{index}` stamped on blocks that
         // persisted without one, so re-delivery upserts by id.
@@ -1252,6 +1256,50 @@ mod chat_message_delta {
                 e.get("metadata").is_none(),
                 "rows without metadata keep the lean entity shape: {e}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_row_message_lifts_app_message_id_onto_entities() {
+        // A user row persisted with a client-minted `userAppMessageId` serves
+        // its lifted `appMessageId` on the `agent.getConversation` read; the
+        // re-read delta path mirrors it onto every emitted entity
+        // (monorepo#1157) so subscribers can collapse the optimistic insert.
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "appMessageId": "app-msg-opt-1",
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "contentBlocks": [
+                        { "type": "text", "text": "hello" },
+                        { "type": "image", "data": "abc", "mimeType": "image/png" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        let e = message_event("agent-1", "user-msg-1", "user");
+        let d = s.delta(&api, &e).await.expect("user-row delta");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 2);
+        for entity in added {
+            assert_eq!(
+                entity["appMessageId"], "app-msg-opt-1",
+                "every entity mirrors the row's appMessageId: {entity}"
+            );
+        }
+        // Re-delivery routes to `updated` and still carries the id.
+        let second = s.delta(&api, &e).await.expect("re-delivery");
+        for entity in second["updated"].as_array().unwrap() {
+            assert_eq!(entity["appMessageId"], "app-msg-opt-1");
         }
     }
 

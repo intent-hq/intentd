@@ -613,7 +613,11 @@ impl ChatDeltaState {
     /// terminal reconcile use, preserving byte-parity. A re-read miss (row
     /// outside the newest page, or a read error) maps to `None`; the
     /// per-turn assistant accumulation state is not touched (a queue-drain
-    /// user row lands right before the turn's first chunk).
+    /// user row lands right before the turn's first chunk). Each entity also
+    /// carries the row's lifted `appMessageId` when present (a user row sent
+    /// with `userAppMessageId`, PROTOCOL §5.5), so subscribers can collapse
+    /// their optimistic insert against the canonical row (monorepo#1157);
+    /// the field is absent otherwise, matching the seq-0 snapshot rows.
     async fn message_row_delta(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
         let d = &event.data;
         let role = d.get("role").and_then(Value::as_str)?;
@@ -652,6 +656,7 @@ impl ChatDeltaState {
         // sender attribution chip on an `agent_message`-tagged row — without
         // a refetch. Rows without metadata keep the lean entity shape.
         let metadata = msg.get("metadata").filter(|m| !m.is_null());
+        let app_message_id = msg.get("appMessageId").and_then(Value::as_str);
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -675,6 +680,12 @@ impl ChatDeltaState {
             let mut entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
             if let (Some(md), Some(obj)) = (metadata, entity.as_object_mut()) {
                 obj.insert("metadata".to_string(), md.clone());
+            }
+            if let (Some(app_id), Some(obj)) = (app_message_id, entity.as_object_mut()) {
+                obj.insert(
+                    "appMessageId".to_string(),
+                    Value::String(app_id.to_string()),
+                );
             }
             push_entity(&mut added, &mut updated, is_added, entity);
         }
