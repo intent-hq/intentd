@@ -2857,6 +2857,579 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
 }
 
+/// Agent attention requests over WSS — discussion kind, task-linked caller.
+/// A parentless delegated agent linked to an `in_progress` task note calls
+/// `ws.agent.requestDiscussion(reason)` mid-turn. Asserts over the real wire
+/// (PROTOCOL §5.5/§6.5):
+///  - the self-sufficient `agent:attention-requested` event carries
+///    `{ workspaceId, agentId, agentName, kind: "discussion", reason }`;
+///  - the raise `agent:updated` carries `attentionRequestKind` +
+///    `attentionRequestTimestamp`, and the system-role transcript notice's
+///    persist emits `agent:message` with `role: "system"`;
+///  - the linked task moves to `discussion_needed` (`task:status-changed`
+///    attributed to the caller, read back via `task.get`);
+///  - `agent.getSession` serves the pending `attentionRequest*` session
+///    fields and the persisted notice with `meta.kind = "discussion-request"`,
+///    and the agent's status is NOT `error` (the turn ended normally);
+///  - the next received message retires the request: `agent:updated` with
+///    `attentionRequestCleared: true`, and the session fields are gone.
+#[tokio::test]
+async fn attention_request_discussion_over_wss() {
+    let Some(script) = gate("WSS attention-request discussion E2E") else {
+        return;
+    };
+
+    const CHILD_MARKER: &str = "ATTN_DISCUSS_CHILD";
+    const REASON: &str = "ATTN_WSS need a decision on the migration approach";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": CHILD_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": request_js, "summary": "raise discussion request" }
+            },
+            "response": "turn ended after requestDiscussion",
+        }],
+        "response": "follow-up acknowledged",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent + task events, registered BEFORE the turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // Task-linked parentless delegate (router front door): sets the child
+    // session's `taskNoteId` so the attention op can transition the task.
+    let delegated = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "agentInstructions": format!("{CHILD_MARKER} raise a discussion request"),
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let agent_id = delegated["agentId"].as_str().expect("agent id").to_string();
+    let agent_name = delegated["name"].as_str().expect("agent name").to_string();
+
+    // Order-insensitive milestones under one hard deadline (the attention
+    // events fire DURING the child's turn, racing its terminal idle).
+    let mut attention: Option<Value> = None;
+    let mut raise_updated = false;
+    let mut system_message = false;
+    let mut task_changed: Option<Value> = None;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some()
+        && raise_updated
+        && system_message
+        && task_changed.is_some()
+        && idle)
+    {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} raise_updated={raise_updated} \
+                 system_message={system_message} task_changed={t} idle={idle}",
+                a = attention.is_some(),
+                t = task_changed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(agent_id) => {
+                attention = Some(data.clone());
+            }
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                assert_eq!(
+                    data["attentionRequestKind"], "discussion",
+                    "raise agent:updated kind: {data}"
+                );
+                assert!(
+                    data["attentionRequestTimestamp"].is_string(),
+                    "raise agent:updated carries the timestamp: {data}"
+                );
+                raise_updated = true;
+            }
+            "agent:message" if data["agentId"] == json!(agent_id) && data["role"] == "system" => {
+                assert!(
+                    data["messageId"].is_string(),
+                    "system notice agent:message carries messageId: {data}"
+                );
+                system_message = true;
+            }
+            "task:status-changed" if data["noteId"] == json!(note_id) => {
+                task_changed = Some(data.clone());
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("attention event captured");
+    assert_eq!(
+        attention["workspaceId"],
+        json!(ws_id),
+        "attention event carries workspaceId: {attention}"
+    );
+    assert_eq!(
+        attention["agentName"],
+        json!(agent_name),
+        "attention event carries agentName: {attention}"
+    );
+    assert_eq!(
+        attention["kind"], "discussion",
+        "attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], REASON,
+        "attention event reason: {attention}"
+    );
+    let task_changed = task_changed.expect("task:status-changed captured");
+    assert_eq!(
+        task_changed["previousStatus"], "in_progress",
+        "task transition source: {task_changed}"
+    );
+    assert_eq!(
+        task_changed["newStatus"], "discussion_needed",
+        "task transition target: {task_changed}"
+    );
+    assert_eq!(
+        task_changed["agentId"],
+        json!(agent_id),
+        "task transition attributed to the caller: {task_changed}"
+    );
+
+    // task.get reads the transitioned status back over the wire.
+    let got_task = wss_rpc(
+        &mut rpc,
+        12,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        got_task["task"]["status"], "discussion_needed",
+        "linked task persisted at discussion_needed: {got_task}"
+    );
+
+    // agent.getSession serves the pending attentionRequest* fields, the
+    // persisted meta.kind notice, and a non-error status.
+    let got = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "session attentionRequestReason"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "session attentionRequestTimestamp present"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "turn ended normally, status is NOT error: {}",
+        session["status"]
+    );
+    let messages = session["messages"].as_array().expect("messages array");
+    let notice = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == "discussion-request"
+        })
+        .expect("persisted discussion-request notice");
+    assert_eq!(
+        notice["contentBlocks"][0]["type"], "text",
+        "notice block is a text block: {notice}"
+    );
+    assert_eq!(
+        notice["contentBlocks"][0]["text"], REASON,
+        "notice carries the reason: {notice}"
+    );
+
+    // The next received message retires the pending request: agent:updated
+    // with attentionRequestCleared, and the session fields are gone.
+    let sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for attentionRequestCleared"),
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"] == json!(agent_id)
+            && ev["data"]["attentionRequestCleared"] == true
+        {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = got["session"].as_object().expect("session object");
+    assert!(
+        !session.contains_key("attentionRequestKind"),
+        "attentionRequestKind cleared on next message"
+    );
+    assert!(
+        !session.contains_key("attentionRequestReason"),
+        "attentionRequestReason cleared on next message"
+    );
+    assert!(
+        !session.contains_key("attentionRequestTimestamp"),
+        "attentionRequestTimestamp cleared on next message"
+    );
+}
+
+/// Agent attention requests over WSS — blocker kind + the taskless-caller
+/// path. Phase 1: a task-linked delegated agent calls
+/// `ws.agent.reportBlocker(reason)` → `agent:attention-requested` with
+/// `kind: "blocker"`, the linked task moves to `blocked`, the transcript
+/// notice persists with `meta.kind = "blocker-report"`, and the agent's
+/// status is NOT `error`. Phase 2: a plain user-created agent (non-delegated,
+/// no linked task) calls `ws.agent.requestDiscussion(reason)` — the call
+/// succeeds, the session fields persist, and NO `task:status-changed` fires
+/// (no linked task = the transition is skipped).
+#[tokio::test]
+async fn attention_request_blocker_and_taskless_caller_over_wss() {
+    let Some(script) = gate("WSS attention-request blocker/taskless E2E") else {
+        return;
+    };
+
+    const BLOCKER_MARKER: &str = "ATTN_BLOCKER_CHILD";
+    const TASKLESS_MARKER: &str = "ATTN_TASKLESS_AGENT";
+    const BLOCK_REASON: &str = "ATTN_WSS sandbox filesystem is read-only";
+    const TASKLESS_REASON: &str = "ATTN_WSS which provider should I target?";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let blocker_js = format!(
+        "return await ws.agent.reportBlocker({});",
+        json!(BLOCK_REASON)
+    );
+    let taskless_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(TASKLESS_REASON)
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": BLOCKER_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": blocker_js, "summary": "report blocker" }
+                },
+                "response": "turn ended after reportBlocker",
+            },
+            {
+                "ifPromptContains": TASKLESS_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": taskless_js, "summary": "taskless requestDiscussion" }
+                },
+                "response": "turn ended after taskless requestDiscussion",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // --- Phase 1: task-linked blocker ------------------------------------
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let delegated = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "agentInstructions": format!("{BLOCKER_MARKER} report an environment blocker"),
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let blocker_id = delegated["agentId"].as_str().expect("agent id").to_string();
+
+    let mut attention: Option<Value> = None;
+    let mut task_changed: Option<Value> = None;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some() && task_changed.is_some() && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} task_changed={t} idle={idle}",
+                a = attention.is_some(),
+                t = task_changed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(blocker_id) => {
+                attention = Some(data.clone());
+            }
+            "task:status-changed" if data["noteId"] == json!(note_id) => {
+                task_changed = Some(data.clone());
+            }
+            "agent:idle" if data["agentId"] == json!(blocker_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("blocker attention event");
+    assert_eq!(
+        attention["kind"], "blocker",
+        "attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], BLOCK_REASON,
+        "attention event reason: {attention}"
+    );
+    let task_changed = task_changed.expect("task:status-changed captured");
+    assert_eq!(
+        task_changed["newStatus"], "blocked",
+        "task transition target: {task_changed}"
+    );
+    let got_task = wss_rpc(
+        &mut rpc,
+        12,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        got_task["task"]["status"], "blocked",
+        "linked task persisted at blocked: {got_task}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getSession",
+        json!({ "agentId": blocker_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], BLOCK_REASON,
+        "session attentionRequestReason"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "blocker turn ended normally: {}",
+        session["status"]
+    );
+    let messages = session["messages"].as_array().expect("messages array");
+    let notice = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == "blocker-report"
+        })
+        .expect("persisted blocker-report notice");
+    assert_eq!(
+        notice["contentBlocks"][0]["text"], BLOCK_REASON,
+        "notice carries the reason: {notice}"
+    );
+
+    // --- Phase 2: taskless caller -----------------------------------------
+    let created = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "mock:default" }),
+    )
+    .await;
+    let taskless_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": taskless_id, "content": TASKLESS_MARKER }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut attention: Option<Value> = None;
+    let mut idle = false;
+    let mut task_events = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some() && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} idle={idle}",
+                a = attention.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(taskless_id) => {
+                attention = Some(data.clone());
+            }
+            "task:status-changed" => task_events += 1,
+            "agent:idle" if data["agentId"] == json!(taskless_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("taskless attention event");
+    assert_eq!(
+        attention["kind"], "discussion",
+        "taskless attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], TASKLESS_REASON,
+        "taskless attention event reason: {attention}"
+    );
+    assert_eq!(
+        task_events, 0,
+        "no task:status-changed for a taskless caller"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        22,
+        "agent.getSession",
+        json!({ "agentId": taskless_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "taskless session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], TASKLESS_REASON,
+        "taskless session attentionRequestReason"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "taskless turn ended normally: {}",
+        session["status"]
+    );
+}
+
 /// Pre-seed the daemon's SQLite store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
