@@ -534,25 +534,40 @@ impl ScriptManager {
         let ws = workspace_id.clone();
         let cwd = self.resolve_cwd(&ws, &def).await?;
         let pty_id = self.pty.spawn(self.build_spec(&ws, &def, &cwd))?;
-        self.mark_running(&ws, script_id, pty_id).await;
-        let timed_out = match timeout_seconds.filter(|s| *s > 0) {
-            Some(s) => {
-                let fut = self.run_one(&ws, script_id, pty_id, false);
-                match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
-                    Ok(_) => false,
-                    Err(_) => {
-                        self.pty.kill(pty_id).await;
-                        true
+        // The completion path (mark-running → stream → timeout kill →
+        // `mark_exited`) runs on a detached task spawned with no await point
+        // after `pty.spawn` (modeled on `host_exec_stream::run_wait_loop`), so
+        // dropping this future — e.g. an eval-level timeout cancelling the
+        // RPC — cannot orphan the PTY or skip the `script:state` teardown
+        // (monorepo#1155).
+        let mgr = self.clone();
+        let ws_task = ws.clone();
+        let sid = script_id.to_string();
+        let completion = tokio::spawn(async move {
+            mgr.mark_running(&ws_task, &sid, pty_id).await;
+            let timed_out = match timeout_seconds.filter(|s| *s > 0) {
+                Some(s) => {
+                    let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
+                    match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
+                        Ok(_) => false,
+                        Err(_) => {
+                            mgr.pty.kill(pty_id).await;
+                            true
+                        }
                     }
                 }
-            }
-            None => {
-                self.run_one(&ws, script_id, pty_id, false).await;
-                false
-            }
-        };
-        let exit = self.pty.try_exit(pty_id).ok().flatten();
-        self.mark_exited(&ws, script_id, exit.clone()).await;
+                None => {
+                    mgr.run_one(&ws_task, &sid, pty_id, false).await;
+                    false
+                }
+            };
+            let exit = mgr.pty.try_exit(pty_id).ok().flatten();
+            mgr.mark_exited(&ws_task, &sid, exit.clone()).await;
+            (exit, timed_out)
+        });
+        let (exit, timed_out) = completion
+            .await
+            .map_err(|e| Error::Internal(format!("script.run completion task failed: {e}")))?;
         let bytes = self.pty.scrollback(pty_id).unwrap_or_default();
         let mut output = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(n) = max_lines.filter(|n| *n > 0) {
@@ -1869,6 +1884,69 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["timedOut"], true);
+    }
+
+    /// Regression (monorepo#1155): dropping the `script.run` future mid-flight
+    /// (as an eval-level timeout cancelling the RPC does) must not skip
+    /// cleanup — the detached completion task still enforces the script-level
+    /// timeout, kills the PTY (child reaped, no orphan), and emits the
+    /// `exited` `script:state` transition.
+    #[tokio::test]
+    async fn script_run_dropped_future_still_reaps_and_marks_exited() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
+        // Drive `run` until the script is `running`, then drop the future
+        // mid-flight (caller-side cancellation).
+        let pid = {
+            let mut fut = Box::pin(
+                h.services
+                    .script_run(h.ws.clone(), id.clone(), None, Some(1)),
+            );
+            'running: loop {
+                tokio::select! {
+                    res = &mut fut => panic!("script.run finished before cancellation: {res:?}"),
+                    batch = tokio::time::timeout(LIVENESS, sub.recv()) => {
+                        let batch = batch
+                            .expect("event delivered before deadline")
+                            .expect("subscription open");
+                        for ev in &batch {
+                            let v = serde_json::to_value(ev).expect("serialize");
+                            if v["type"] == "script:state" && v["data"]["status"] == "running" {
+                                break 'running v["data"]["pid"].as_i64().expect("pid");
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // The detached completion task must still time the script out, kill
+        // the PTY, and flip the state to `exited`.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited");
+        // The child process must be reaped — no orphan (kill -0 fails).
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run kill -0")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "script process {pid} still alive after dropped script.run"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
