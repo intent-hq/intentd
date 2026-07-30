@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -26,7 +26,7 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
-      # this job's target dir stays small, and the self-hosted Mac has ~500G free.
+      # this job's target dir stays small, and tinybox has ~380G free.
       - uses: actions/checkout@v7
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
@@ -120,16 +120,16 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 8-core M1: the e2e tests spend most of their time
-      # blocked on daemon startup/IO, not CPU (flake retries are handled by
-      # .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 16
+      # No oversubscription on the 64-core tinybox: 64 threads already covers
+      # the IO-blocked e2e tests without stacking 100+ daemons (flake retries
+      # are handled by .config/nextest.toml).
+      NEXTEST_TEST_THREADS: 64
     steps:
       - uses: actions/checkout@v7
       # Per-job persistent target dir outside the work dir (see the `check`
@@ -148,10 +148,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Node is required (not preinstalled on the self-hosted Mac, unlike
-      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
-      # and silently self-skip without it, which silently drops coverage below
-      # the floor.
+      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
+      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
+      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -179,16 +178,16 @@ jobs:
           if-no-files-found: warn
 
   coverage-all:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 8-core M1: much of the suite is blocked on daemon
-      # startup/IO/timeouts, not CPU (flake retries are handled by
-      # .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 16
+      # No oversubscription on the 64-core tinybox: 64 threads already covers
+      # the IO/timeout-blocked suite without stacking 100+ daemons (flake
+      # retries are handled by .config/nextest.toml).
+      NEXTEST_TEST_THREADS: 64
     steps:
       - uses: actions/checkout@v7
       # Per-job persistent target dir outside the work dir (see the `check`
@@ -207,10 +206,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Node is required (not preinstalled on the self-hosted Mac, unlike
-      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
-      # and silently self-skip without it, which silently drops coverage below
-      # the floor.
+      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
+      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
+      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
