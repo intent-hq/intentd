@@ -238,7 +238,7 @@ jobs:
           if-no-files-found: warn
 
   pr-title:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.event_name == 'pull_request'
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -263,7 +263,7 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
@@ -304,8 +304,10 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
+  # Runs on the self-hosted Linux runner (Ubuntu 22.04), which has the
+  # required dpkg-deb / tar+xz toolchain preinstalled.
   deb-packaging:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
