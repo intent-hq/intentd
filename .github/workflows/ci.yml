@@ -8,12 +8,14 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  # The route job reads the Actions queue to decide tinybox vs WarpBuild.
-  actions: read
 
 env:
   # Burst the Linux jobs to WarpBuild when more than this many Linux
-  # runs/jobs are queued ahead of this run (see the route job).
+  # jobs are queued/running ahead of this run (see the route job). Note
+  # that jobs still blocked on `needs` are invisible to the jobs API, so
+  # a queued run ahead of us counts only its ~4 utility jobs — one fully
+  # queued PR run is already enough to clear this threshold, which is
+  # intended: it means tinybox is at least one full run behind.
   LINUX_BURST_THRESHOLD: 2
 
 # The heavy jobs share a single self-hosted runner slot and serialize, so
@@ -26,12 +28,20 @@ concurrency:
 jobs:
   # Decides where the Linux-heavy jobs (check / coverage-e2e / coverage-all)
   # run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. The probe fails open to tinybox so a
-  # GitHub API hiccup can never strand the required checks. The mac build is
+  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
+  # the probe never waits behind the very queue it is measuring. The probe
+  # fails open to tinybox on API errors; if the job itself fails (runner
+  # outage, action download failure, timeout), the routed jobs are skipped
+  # and need a re-run — a deliberate trade-off. The mac build is
   # intentionally not routed — it stays pinned to m1mac.
   route:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reads the Actions queue; job-level so the routed jobs (which run on
+      # third-party WarpBuild runners when bursting) don't inherit it.
+      actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
@@ -41,15 +51,22 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
         with:
+          # tinybox serves several repos on one runner slot, so the probe
+          # wants to size the queue across all of them — but the default
+          # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
+          # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
+          # on the sibling repos) to enable cross-repo counting; without
+          # it those repos are skipped and contribute 0.
+          github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
             const burst = ["warp-ubuntu-latest-x64-32x"];
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
-            // tinybox serves several repos on a single runner slot, so the
-            // queue must be sized across all of them: count queued Linux
-            // self-hosted jobs of queued/in-progress runs in each repo. A
-            // repo the token can't read (GITHUB_TOKEN is repo-scoped)
-            // contributes 0 rather than failing the probe.
+            // Count self-hosted Linux jobs that are queued or running in
+            // queued/in-progress runs: a running job occupies the single
+            // tinybox slot just as much as a queued one. WarpBuild jobs
+            // don't match the self-hosted+Linux label filter, so bursted
+            // jobs never inflate the depth.
             const owner = context.repo.owner;
             const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
@@ -59,11 +76,11 @@ jobs:
                   const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
                   for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
                     const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                    depth += jobs.data.jobs.filter(j => j.status === "queued" && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                    depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
                   }
                 }
               } catch (e) {
-                core.warning(`queue probe skipped ${repo}: ${e.message}`);
+                core.info(`queue probe skipped ${repo}: ${e.message}`);
               }
             }
             const useBurst = depth > threshold;
