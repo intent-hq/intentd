@@ -951,24 +951,103 @@ impl Services {
         removed
     }
 
-    /// Remove ONE delegation group by id, only if it is parented by
-    /// `parent_id`; returns the removed snapshot or `None` when no such group
-    /// exists. In-memory only — the caller owns the persisted-row delete
-    /// (the scoped `agent.cancelSubscriptions` path).
-    pub(crate) fn remove_group_for_parent(
+    /// Remove ONE delegation group by id together with EVERY watch carrying
+    /// its `group_id`, in a single registry critical section — closing the
+    /// window in which a concurrently registered grouped watch could survive
+    /// as an orphan pointing at a deleted group. Only removes a group
+    /// parented by `parent_id`; returns the removed snapshot or `None` when
+    /// no such group exists. The persisted watch rows are swept best-effort
+    /// (spawned, like every other watch-delete path); the caller owns the
+    /// persisted GROUP row delete (durable-before-observable in the scoped
+    /// `agent.cancelSubscriptions` path).
+    pub(crate) fn remove_group_with_watches(
         &self,
         parent_id: &AgentId,
         group_id: &str,
     ) -> Option<DelegationGroup> {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let idx = guard
-            .delegation_groups
-            .iter()
-            .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
-        Some(guard.delegation_groups.remove(idx))
+        let (group, watch_ids) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let idx = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
+            let group = guard.delegation_groups.remove(idx);
+            let mut watch_ids = Vec::new();
+            guard.subscriptions.retain(|s| {
+                if s.group_id.as_deref() == Some(group_id) {
+                    watch_ids.push(s.id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            (group, watch_ids)
+        };
+        if !watch_ids.is_empty() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for id in watch_ids {
+                    if let Err(e) = store.delete_completion_watch(&id).await {
+                        tracing::warn!("completion_watch delete failed {id}: {e}");
+                    }
+                }
+            });
+        }
+        Some(group)
+    }
+
+    /// Drop `child_id` from a group's expected/completed/deleted sets (the
+    /// scoped `agent.cancelSubscriptions` of a grouped watch). At steady
+    /// state group settlement is driven exclusively by the grouped watch, so
+    /// a cancelled child must also stop gating `is_group_complete` or the
+    /// group would stall forever — the surviving siblings' aggregated wake
+    /// included. The shrunk group is persisted write-through (best-effort,
+    /// like `enroll_child_in_group`); when the expected set becomes empty the
+    /// group can never fire, so it is removed outright and its persisted row
+    /// swept (best-effort). Returns `true` when the group still exists
+    /// afterwards — the caller should `try_fire_group` it, since the shrunk
+    /// group may now be sealed AND complete.
+    pub(crate) fn remove_child_from_group(&self, group_id: &str, child_id: &AgentId) -> bool {
+        let (shrunk, emptied) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(idx) = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id)
+            else {
+                return false;
+            };
+            let g = &mut guard.delegation_groups[idx];
+            g.expected_agent_ids.retain(|id| id != child_id);
+            g.completed_agent_ids.retain(|id| id != child_id);
+            g.deleted_agent_ids.retain(|id| id != child_id);
+            if g.expected_agent_ids.is_empty() {
+                guard.delegation_groups.remove(idx);
+                (None, true)
+            } else {
+                (Some(g.clone()), false)
+            }
+        };
+        if let Some(g) = shrunk {
+            self.persist_delegation_group(&g);
+            return true;
+        }
+        if emptied {
+            let store = self.store.clone();
+            let gid = group_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store.delete_delegation_group(&gid).await {
+                    tracing::warn!("delegation_group delete failed {gid}: {e}");
+                }
+            });
+        }
+        false
     }
 
     /// Test-only snapshot of a parent's delegation group, if one exists.
