@@ -5807,26 +5807,24 @@ async fn run_message_worker(
         // append a user row that supersedes the pending Q&A. A parked
         // USER-origin entry (a user answer that lost the busy race against
         // this very turn) is exempt: it IS the hold's documented release, so
-        // it drains and supersedes the questions. Otherwise park the queue
-        // and exit the worker; `agent.dismissQuestions` (which kicks
-        // `try_drain_queue`) or a user answer resumes delivery.
-        let hold_drain = if mgr.services.question_hold_active(&agent_id).await {
-            if !mgr.services.has_user_origin_ready(&agent_id) {
+        // it drains and supersedes the questions. Otherwise skip the
+        // pre-release drain (no `break 'outer` here!) and fall through to the
+        // post-`end_turn` raced re-check below, which repeats this same
+        // hold-aware `dequeue_user_origin_message` check AFTER the slot is
+        // actually released — closing the window where a user answer enqueued
+        // between `has_user_origin_ready` returning false and the slot's
+        // release would otherwise strand behind a gone worker with nothing to
+        // kick `try_drain_queue`.
+        let drained = if mgr.services.question_hold_active(&agent_id).await {
+            if mgr.services.has_user_origin_ready(&agent_id) {
+                mgr.services.dequeue_user_origin_message(&agent_id)
+            } else {
                 tracing::debug!(
                     agent = %agent_id,
                     "worker drain suspended: question hold active (awaiting answer or dismissQuestions)"
                 );
-                mgr.end_turn(&agent_id).await;
-                break 'outer;
+                None
             }
-            true
-        } else {
-            false
-        };
-        // Drain the next queued message while still holding the in-flight
-        // slot (under an active hold, only a user-origin entry).
-        let drained = if hold_drain {
-            mgr.services.dequeue_user_origin_message(&agent_id)
         } else {
             mgr.services.dequeue_message(&agent_id)
         };
