@@ -1167,7 +1167,9 @@ where
 /// - registration publishes `agent:subscriptions-changed` in `__chief__`,
 /// - each target's completion delivers a `[WORKSPACE EVENTS]` wake into the
 ///   chief transcript and the consumed oneShot watches drain the registry,
-/// - a re-registered wait is removed by `agent.cancelSubscriptions`.
+/// - a re-registered wait is removed one-at-a-time by the scoped
+///   `agent.cancelSubscriptions` (`subscriptionId`), an unknown id is
+///   rejected with `-32602`, and the unscoped call removes the rest.
 #[tokio::test]
 async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     let Some(script) = gate("WSS chief waitFor immediate E2E") else {
@@ -1399,8 +1401,9 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     // NEXT turn end. (Terminal Completed/Error targets DO reconcile into an
     // immediate synthetic wake — covered by the
     // `app_agents_wait_*_reconciles_already_settled_target*` unit tests.)
-    // → 2 fresh watches → `agent.cancelSubscriptions` removes them all over
-    // the wire.
+    // → 2 fresh watches → scoped `agent.cancelSubscriptions` removes ONE by
+    // `subscriptionId`, an unknown id errors, and the unscoped call removes
+    // the rest — all over the wire.
     let resp = wss_rpc_envelope(
         &mut rpc,
         30,
@@ -1413,7 +1416,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     )
     .await;
     assert_eq!(resp["result"]["success"], json!(true), "round 2: {resp}");
-    poll_subscriptions(
+    let resub = poll_subscriptions(
         &mut rpc,
         700,
         CHIEF_WORKSPACE_ID,
@@ -1422,9 +1425,92 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         |r| r["subscriptions"].as_array().map(Vec::len) == Some(2),
     )
     .await;
+    let scoped_sid = resub["subscriptions"][0]["id"]
+        .as_str()
+        .expect("watch id")
+        .to_string();
+
+    // Unknown `subscriptionId` → -32602, registry untouched.
     let resp = wss_rpc_envelope(
         &mut rpc,
         31,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "subscriptionId": "no-such-watch",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "unknown subscriptionId: {resp}"
+    );
+
+    // Present-but-non-string `subscriptionId` → -32602 at the router; it must
+    // NOT be coerced to `None` (which would cancel everything).
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        36,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "subscriptionId": 42,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "non-string subscriptionId: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["message"],
+        json!("subscriptionId must be a string"),
+        "non-string subscriptionId message: {resp}"
+    );
+
+    // Scoped cancel removes EXACTLY the named watch; the other stays live.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        32,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "subscriptionId": scoped_sid,
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "scoped cancelSubscriptions errored: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "scoped cancel: {resp}"
+    );
+    let remaining = poll_subscriptions(
+        &mut rpc,
+        750,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "one watch after scoped cancel",
+        |r| r["subscriptions"].as_array().map(Vec::len) == Some(1),
+    )
+    .await;
+    assert_ne!(
+        remaining["subscriptions"][0]["id"],
+        json!(scoped_sid),
+        "the scoped watch is the one that was removed: {remaining}"
+    );
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        33,
         "agent.cancelSubscriptions",
         json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
     )
@@ -1436,7 +1522,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     assert_eq!(resp["result"]["success"], json!(true), "cancel: {resp}");
     let resp = wss_rpc_envelope(
         &mut rpc,
-        32,
+        34,
         "agent.getSubscriptions",
         json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
     )
@@ -1447,7 +1533,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         "cancelSubscriptions cleared the registry: {resp}"
     );
 
-    let _ = wss_rpc_envelope(&mut rpc, 33, "agent.stop", json!({ "agentId": chief_id })).await;
+    let _ = wss_rpc_envelope(&mut rpc, 35, "agent.stop", json!({ "agentId": chief_id })).await;
 }
 
 /// `ws.app.agents.waitFor` (after_all mode) end-to-end over the real WSS
@@ -1657,6 +1743,174 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
         CHIEF_WORKSPACE_ID,
         &chief_id,
         "registry drained after group settlement",
+        |r| r["subscriptions"] == json!([]) && r["delegationGroups"] == json!([]),
+    )
+    .await;
+
+    let _ = wss_rpc_envelope(&mut rpc, 30, "agent.stop", json!({ "agentId": chief_id })).await;
+}
+
+/// Scoped `agent.cancelSubscriptions` by `groupId` end-to-end over the real
+/// WSS wire: the chief registers an after_all delegation group on two
+/// targets, an unknown `groupId` is rejected with `-32602` (registry
+/// untouched), and cancelling the real `groupId` removes the group AND both
+/// grouped watches in one call.
+#[tokio::test]
+async fn chief_scoped_group_cancel_over_wss() {
+    let Some(script) = gate("WSS scoped groupId cancel E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
+              return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'after_all' });";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "REGISTER_GROUP",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "waitFor after_all for scoped cancel e2e" },
+            },
+            "response": "group waits registered",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let (_ws1_id, _t1_id) = seed_target(&mut rpc, 2, "Cancel WS One", "Target One").await;
+    let (_ws2_id, _t2_id) = seed_target(&mut rpc, 4, "Cancel WS Two", "Target Two").await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Group Canceller",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief agent id")
+        .to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        7,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "please REGISTER_GROUP waits on the targets",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    // Both grouped watches + the delegation-group record land in the registry.
+    let subs_payload = poll_subscriptions(
+        &mut rpc,
+        400,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "2 grouped watches + group record",
+        |r| {
+            r["subscriptions"].as_array().map(Vec::len) == Some(2)
+                && r["delegationGroups"].as_array().map(Vec::len) == Some(1)
+        },
+    )
+    .await;
+    let group_id = subs_payload["delegationGroups"][0]["groupId"]
+        .as_str()
+        .expect("groupId")
+        .to_string();
+
+    // Unknown `groupId` → -32602, registry untouched.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        20,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "groupId": "no-such-group",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "unknown groupId: {resp}"
+    );
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        21,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["subscriptions"].as_array().map(Vec::len),
+        Some(2),
+        "registry untouched after unknown groupId: {resp}"
+    );
+
+    // Scoped cancel by the REAL groupId removes the group and BOTH grouped
+    // watches in one call.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        22,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "groupId": group_id,
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "scoped group cancel errored: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "scoped group cancel: {resp}"
+    );
+    poll_subscriptions(
+        &mut rpc,
+        500,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "registry drained after scoped group cancel",
         |r| r["subscriptions"] == json!([]) && r["delegationGroups"] == json!([]),
     )
     .await;

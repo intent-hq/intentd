@@ -13,9 +13,13 @@ env:
   # Burst the Linux jobs to WarpBuild when more than this many Linux
   # jobs are queued/running ahead of this run (see the route job). Note
   # that jobs still blocked on `needs` are invisible to the jobs API, so
-  # a queued run ahead of us counts only its ~4 utility jobs — one fully
+  # a queued run ahead of us counts only its utility jobs (pr-title /
+  # conflict-markers / deb-packaging when routed to tinybox) — one fully
   # queued PR run is already enough to clear this threshold, which is
-  # intended: it means tinybox is at least one full run behind.
+  # intended: it means tinybox is at least one full run behind. Bursted
+  # jobs (utility included) don't carry the self-hosted+Linux labels and
+  # stop counting toward the depth, so the system naturally falls back
+  # to tinybox as it frees up.
   LINUX_BURST_THRESHOLD: 2
 
 # The heavy jobs share a single self-hosted runner slot and serialize, so
@@ -26,27 +30,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the Linux-heavy jobs (check / coverage-e2e / coverage-all)
-  # run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. Runs on tinybox itself (GitHub-
-  # hosted runners are disabled for this org): the probe can queue behind
-  # the backlog it measures, but it is a seconds-long job and self-hosted
-  # jobs are drained FIFO, so it adds one short hop rather than negating
-  # the burst. The probe fails open to tinybox on API errors; if the job
-  # itself fails (runner outage, timeout), the routed jobs are skipped and
-  # need a re-run — a deliberate trade-off. The mac build is intentionally
-  # not routed — it stays pinned to m1mac.
+  # Decides where the Linux jobs — heavy (check / coverage-e2e /
+  # coverage-all) and utility (pr-title / conflict-markers / deb-packaging)
+  # — run: the local tinybox runner normally, or WarpBuild ephemeral runners
+  # when the tinybox queue is backed up. Runs on a small WarpBuild ephemeral
+  # runner so the burst decision is independent of the tinybox queue: when
+  # the probe ran on tinybox it queued behind the very backlog it measures
+  # (and deadlocked entirely with tinybox offline). The probe fails open to
+  # tinybox on API errors; if the job itself fails (runner outage, timeout),
+  # the routed jobs are skipped and need a re-run — a deliberate trade-off.
+  # The mac build is intentionally not routed — it stays pinned to m1mac.
   route:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: warp-ubuntu-latest-x64-2x
     timeout-minutes: 5
     permissions:
       contents: read
-      # Reads the Actions queue; job-level so the routed jobs (which run on
-      # third-party WarpBuild runners when bursting) don't inherit it.
+      # Reads the Actions queue; job-level so the other jobs don't inherit
+      # it. The probe (and the optional cross-repo CI_QUEUE_READ_TOKEN)
+      # now runs on third-party WarpBuild ephemeral runners — an accepted
+      # trade-off.
       actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
+      utility_labels: ${{ steps.decide.outputs.utility_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
     steps:
       - id: decide
@@ -69,12 +76,16 @@ jobs:
             // cheaper 16x runner instead.
             const burst = ["warp-ubuntu-latest-x64-32x"];
             const checkBurst = ["warp-ubuntu-latest-x64-16x"];
+            // The utility jobs (pr-title / conflict-markers / deb-packaging)
+            // are seconds-long; a 2x runner is plenty when bursting.
+            const utilityBurst = ["warp-ubuntu-latest-x64-2x"];
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
             // Count self-hosted Linux jobs that are queued or running in
             // queued/in-progress runs: a running job occupies the single
-            // tinybox slot just as much as a queued one. WarpBuild jobs
-            // don't match the self-hosted+Linux label filter, so bursted
-            // jobs never inflate the depth.
+            // tinybox slot just as much as a queued one. WarpBuild jobs —
+            // including this route job and bursted heavy jobs — don't match
+            // the self-hosted+Linux label filter, so they never inflate the
+            // depth.
             const owner = context.repo.owner;
             const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
@@ -95,6 +106,7 @@ jobs:
             core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
+            core.setOutput("utility_labels", JSON.stringify(useBurst ? utilityBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
 
   check:
@@ -383,7 +395,8 @@ jobs:
           if-no-files-found: warn
 
   pr-title:
-    runs-on: [self-hosted, Linux, X64]
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
     if: github.event_name == 'pull_request'
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -408,7 +421,8 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    runs-on: [self-hosted, Linux, X64]
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
@@ -449,10 +463,12 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Runs on the self-hosted Linux runner (Ubuntu 22.04), which has the
-  # required dpkg-deb / tar+xz toolchain preinstalled.
+  # Routed like the other utility jobs: tinybox (Ubuntu 22.04) normally,
+  # a WarpBuild 2x runner when bursting — both have the required
+  # dpkg-deb / tar+xz toolchain preinstalled.
   deb-packaging:
-    runs-on: [self-hosted, Linux, X64]
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7

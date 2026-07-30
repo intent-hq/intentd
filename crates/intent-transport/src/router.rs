@@ -8,7 +8,7 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
     WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
@@ -1132,6 +1132,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
+            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
+            // ONLY user-originated entry point — user sends are never held
+            // (they supersede a pending Q&A by design).
             let result = api
                 .agent_send_message(
                     ws,
@@ -1145,6 +1148,7 @@ async fn dispatch(
                     stdin_context,
                     context_references,
                     message_metadata,
+                    MessageOrigin::User,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -1156,6 +1160,16 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .agent_send_queued_message_now(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.dismissQuestions" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_dismiss_questions(ws, agent_id, message_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1450,8 +1464,22 @@ async fn dispatch(
         "agent.cancelSubscriptions" => {
             let ws = require_ws_note(params)?;
             let agent_id = require_agent_id(params)?;
+            // Optional scoping (additive): cancel one watch and/or one
+            // delegation group instead of everything. A present-but-non-string
+            // id is rejected — falling back to `None` would silently turn a
+            // malformed scoped request into an unscoped cancel-everything.
+            let subscription_id = match params.get("subscriptionId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "subscriptionId must be a string")),
+            };
+            let group_id = match params.get("groupId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "groupId must be a string")),
+            };
             let result = api
-                .agent_cancel_subscriptions(ws, agent_id)
+                .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

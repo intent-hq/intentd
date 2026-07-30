@@ -2536,9 +2536,9 @@ impl Services {
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,
                 // mirroring the TS event-notification formatter. A pending
-                // attention request (whose immediate wake is likewise
-                // suppressed for grouped children) is folded into the child's
-                // line + event data the same way.
+                // attention request (whose immediate wake already fired at
+                // raise time — the alert) is folded into the child's line +
+                // event data the same way (the record).
                 let child_session = self.store.get_agent_session(child_id).await.ok();
                 let attention = child_session.as_ref().and_then(|s| {
                     s.attention_request_kind
@@ -3417,6 +3417,35 @@ impl Services {
                     .await
             }
             None => {
+                // Question hold (PROTOCOL §5.5): parent wakes are automatic —
+                // an active hold parks the wake in the queue instead of
+                // appending the user row that would supersede the pending
+                // Q&A (mirrors the manager path's `send_message` gate).
+                if self.question_hold_active(&parent_agent_id).await {
+                    let (queued, position) = self.enqueue_message(
+                        &parent_agent_id,
+                        content,
+                        None,
+                        None,
+                        message_metadata,
+                        None,
+                        false,
+                    );
+                    let result = serde_json::json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                    });
+                    self.publish_queue_updated(&parent_agent_id).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this branch is only taken
+                    // when no `AgentManager` is attached (see the `match`
+                    // above), so there is no drain to kick here — a manager
+                    // attaching later re-derives the hold on its own next
+                    // trigger.
+                    return Ok(result);
+                }
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
                 self.store
                     .append_agent_message_with_metadata(
@@ -6623,10 +6652,11 @@ pub(crate) fn format_group_child_line(
             line.push_str(&format!(" Error: {err}"));
         }
     }
-    // Pending attention request (agent:attention-requested): a grouped child
-    // skips its immediate parent wake, so the aggregated line carries the
-    // kind-flavored attention text instead (annotated onto the event data by
-    // the group-record sites from the persisted session fields).
+    // Pending attention request (agent:attention-requested): the child's
+    // immediate parent wake already fired at raise time (the alert); the
+    // aggregated line carries the kind-flavored attention text as the record
+    // (annotated onto the event data by the group-record sites from the
+    // persisted session fields).
     if let Some(kind) = event
         .data
         .get("attentionRequestKind")
@@ -15275,6 +15305,7 @@ impl WorkspaceApi for Services {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
@@ -15292,6 +15323,7 @@ impl WorkspaceApi for Services {
                         image_blocks,
                         file_blocks,
                         message_metadata,
+                        origin,
                         ..crate::agent_manager::TurnOptions::default()
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
@@ -15311,6 +15343,37 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
+                    // Question hold (PROTOCOL §5.5): the store-only fallback
+                    // must honor the automatic-delivery gate too — persisting
+                    // the row would supersede the pending Q&A. User-originated
+                    // sends pass through (a user answer/typed message is the
+                    // documented hold release).
+                    if !origin.is_user() && self.question_hold_active(&agent_id).await {
+                        self.require_agent_session(&agent_id).await?;
+                        let (queued, position) = self.enqueue_message(
+                            &agent_id,
+                            content,
+                            image_blocks,
+                            file_blocks,
+                            message_metadata,
+                            None,
+                            crate::agent_ops::is_interrupt_priority(priority.as_deref()),
+                        );
+                        let result = serde_json::json!({
+                            "success": true,
+                            "queued": true,
+                            "heldForQuestions": true,
+                            "queuedMessage": queued.to_value(position),
+                            "turnId": queued.turn_id,
+                        });
+                        self.publish_queue_updated(&agent_id).await;
+                        // Race close (hold-check → enqueue vs a concurrent
+                        // `dismissQuestions`/answer): this `None` arm only
+                        // runs with no `AgentManager` attached, so there is
+                        // no drain to kick here — same as the other
+                        // store-only fallbacks.
+                        return Ok(result);
+                    }
                     // Read-only fallback (no `agent_manager` wired): plumb
                     // `messageMetadata` through the store-only append so the
                     // persisted row matches the production
@@ -15351,6 +15414,18 @@ impl WorkspaceApi for Services {
                         .await
                 }
             }
+        })
+    }
+
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
+                .await
         })
     }
 
@@ -15829,9 +15904,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_cancel_subscriptions_op(workspace_id, agent_id)
+            self.agent_cancel_subscriptions_op(workspace_id, agent_id, subscription_id, group_id)
                 .await
         })
     }

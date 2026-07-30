@@ -728,10 +728,12 @@ impl Services {
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
-    /// group parented by `parent_id`. Retained for tests and future callers;
-    /// the immediate-mode `reportToParent` suppression has moved to SUB-2
-    /// (the child's `agent:idle` drives the single wake, so grouped children
-    /// no longer need the pre-persist branch this predicate used to gate).
+    /// group parented by `parent_id`. Gates the immediate `reportToParent`
+    /// wake in `agent_report_to_parent_op` (grouped children defer to the
+    /// group's aggregated wake) and the SUB-1 auto-watch registration
+    /// (grouped children are already covered by the grouped watch). Attention
+    /// requests (`agent_request_attention_op`) intentionally bypass it — that
+    /// wake is delivered immediately regardless of grouping.
     pub(crate) fn child_in_undelivered_group(
         &self,
         parent_id: &AgentId,
@@ -996,15 +998,137 @@ impl Services {
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
     pub(crate) fn remove_groups_for_parent(&self, parent_id: &AgentId) -> usize {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let before = guard.delegation_groups.len();
-        guard
-            .delegation_groups
-            .retain(|g| &g.parent_agent_id != parent_id);
-        before - guard.delegation_groups.len()
+        let removed_ids: Vec<String> = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let mut ids = Vec::new();
+            guard.delegation_groups.retain(|g| {
+                if &g.parent_agent_id == parent_id {
+                    ids.push(g.group_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            ids
+        };
+        let removed = removed_ids.len();
+        if removed > 0 {
+            // Best-effort DB sweep (mirrors `remove_all_for_parent`): drop the
+            // persisted rows so cancelled groups don't rehydrate on restart. A
+            // failed delete self-heals — cancel is idempotent, so a repeat
+            // cancel (or group delivery) clears any resurrected group.
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for gid in removed_ids {
+                    if let Err(e) = store.delete_delegation_group(&gid).await {
+                        tracing::warn!("delegation_group parent sweep failed {gid}: {e}");
+                    }
+                }
+            });
+        }
+        removed
+    }
+
+    /// Remove ONE delegation group by id together with EVERY watch carrying
+    /// its `group_id`, in a single registry critical section — closing the
+    /// window in which a concurrently registered grouped watch could survive
+    /// as an orphan pointing at a deleted group. Only removes a group
+    /// parented by `parent_id`; returns the removed snapshot or `None` when
+    /// no such group exists. The persisted watch rows are swept best-effort
+    /// (spawned, like every other watch-delete path); the caller owns the
+    /// persisted GROUP row delete (durable-before-observable in the scoped
+    /// `agent.cancelSubscriptions` path).
+    pub(crate) fn remove_group_with_watches(
+        &self,
+        parent_id: &AgentId,
+        group_id: &str,
+    ) -> Option<DelegationGroup> {
+        let (group, watch_ids) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let idx = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
+            let group = guard.delegation_groups.remove(idx);
+            let mut watch_ids = Vec::new();
+            guard.subscriptions.retain(|s| {
+                if s.group_id.as_deref() == Some(group_id) {
+                    watch_ids.push(s.id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            (group, watch_ids)
+        };
+        if !watch_ids.is_empty() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for id in watch_ids {
+                    if let Err(e) = store.delete_completion_watch(&id).await {
+                        tracing::warn!("completion_watch delete failed {id}: {e}");
+                    }
+                }
+            });
+        }
+        Some(group)
+    }
+
+    /// Drop `child_id` from a group's expected/completed/deleted sets (the
+    /// scoped `agent.cancelSubscriptions` of a grouped watch). At steady
+    /// state group settlement is driven exclusively by the grouped watch, so
+    /// a cancelled child must also stop gating `is_group_complete` or the
+    /// group would stall forever — the surviving siblings' aggregated wake
+    /// included. The shrunk group is persisted write-through (best-effort,
+    /// like `enroll_child_in_group`); when the expected set becomes empty the
+    /// group can never fire, so it is removed outright and its persisted row
+    /// swept (best-effort). Returns `true` when the group still exists
+    /// afterwards — the caller should `try_fire_group` it, since the shrunk
+    /// group may now be sealed AND complete.
+    pub(crate) fn remove_child_from_group(&self, group_id: &str, child_id: &AgentId) -> bool {
+        let (shrunk, emptied) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(idx) = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id)
+            else {
+                return false;
+            };
+            let g = &mut guard.delegation_groups[idx];
+            g.expected_agent_ids.retain(|id| id != child_id);
+            g.completed_agent_ids.retain(|id| id != child_id);
+            g.deleted_agent_ids.retain(|id| id != child_id);
+            if g.expected_agent_ids.is_empty() {
+                guard.delegation_groups.remove(idx);
+                (None, true)
+            } else {
+                (Some(g.clone()), false)
+            }
+        };
+        if let Some(g) = shrunk {
+            self.persist_delegation_group(&g);
+            return true;
+        }
+        if emptied {
+            let store = self.store.clone();
+            let gid = group_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store.delete_delegation_group(&gid).await {
+                    tracing::warn!("delegation_group delete failed {gid}: {e}");
+                }
+            });
+        }
+        false
     }
 
     /// Test-only snapshot of a parent's delegation group, if one exists.
@@ -1657,10 +1781,13 @@ impl Services {
 /// Merge a child's pending attention request (persisted session fields set by
 /// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) into a group-record
 /// event's `data`, so `format_group_child_line` can fold the kind-flavored
-/// attention text into the aggregated group wake (a grouped child skips its
-/// immediate parent wake). No-op when no request is pending. Shared by all
-/// group-record annotation sites (including the completion-watch path in
-/// `lib.rs`) so the payload shape and empty-kind guard cannot drift.
+/// attention text into the aggregated group wake as the record (the immediate
+/// parent wake already fired at raise time — the alert). No-op when no request
+/// is pending — including when a parent reply before settlement already
+/// cleared the child's session fields. Shared by all group-record annotation
+/// sites (including the
+/// completion-watch path in `lib.rs`) so the payload shape and empty-kind
+/// guard cannot drift.
 pub(crate) fn annotate_attention_request(
     data: &mut serde_json::Value,
     kind: Option<&str>,
