@@ -51,7 +51,11 @@ impl Drop for TempDb {
 
 /// Serializes env-mutating tests: process env is global, so a test that SETS
 /// `MOCK_AGENT_SCRIPT_PATH` (or a retry-backoff knob) must not interleave
-/// with one that unsets it.
+/// with one that unsets it. Crate-wide (via the `pub(crate)` [`EnvGuard`]):
+/// tests in OTHER modules that mutate the same vars (e.g. `agent_session`'s
+/// idle-timeout tests and this module's worker redrive tests both pin
+/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`) must serialize through the same lock or
+/// one test's Drop-restore races another's live window.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pins env vars for the guard's lifetime — holding [`ENV_LOCK`] so
@@ -62,7 +66,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// guard: constructing a second before the first drops deadlocks the test
 /// thread. Mutate every var (sets AND unsets) through a single
 /// [`EnvGuard::apply`] call instead.
-pub(super) struct EnvGuard {
+pub(crate) struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -77,7 +81,7 @@ impl EnvGuard {
 
     /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
     /// the var, `None` unsets it. Prior values are restored on drop.
-    pub(super) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
+    pub(crate) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
         let lock = Self::acquire();
         let mut saved = Vec::new();
         for (key, value) in pairs {
@@ -95,7 +99,7 @@ impl EnvGuard {
     }
 
     /// Set every `(key, value)` pair for the guard's lifetime.
-    fn set_all(pairs: &[(&'static str, &str)]) -> Self {
+    pub(crate) fn set_all(pairs: &[(&'static str, &str)]) -> Self {
         let pairs: Vec<(&'static str, Option<&str>)> =
             pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
         Self::apply(&pairs)
@@ -5945,6 +5949,262 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
         "stop_reason names the transport failure: {stop_reason}"
     );
     let _ = std::fs::remove_file(&attempt_file);
+}
+
+/// Warn-and-continue: a prompt idle timeout injects a persisted user-role
+/// warning message and immediately drives a fresh turn — no `agent:failed`,
+/// no Error park, no requeue — and a message queued during the hung turn is
+/// NOT drained ahead of the warning turn. The child survives (keep-alive
+/// cancel): the mock parks its FIRST prompt until `session/cancel`, then
+/// serves the warning + queued turns from the SAME process.
+#[tokio::test]
+async fn idle_timeout_injects_warning_and_redrives() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "parkIfPromptContains": "park-me",
+        "rules": [
+            { "ifPromptContains": "[SYSTEM WARNING]", "response": "continued after warning" },
+            { "ifPromptContains": "queued follow-up", "response": "queued served" },
+        ],
+        "response": "unmatched",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        // Short idle window; the prompt loop polls at 1s, so the first hung
+        // turn times out on the first tick.
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-idle-w"), AgentId::from("a-idle-w"));
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "park-me and go silent".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+    // While the first turn hangs, queue a follow-up: the warning turn must
+    // run BEFORE it.
+    mgr.services
+        .enqueue_message(&id, "queued follow-up".to_string(), None, None, None, None);
+
+    // The warning redrive + queued drain complete: the agent settles idle.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("warning redrive + queued turn complete and the agent goes idle");
+
+    // No failure surface anywhere in the sequence.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "no agent:failed on a warn-and-continue timeout"
+    );
+    // Every stream:end is the normal shape (none carries an error field).
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "agent:stream:end")
+            .all(|e| e.data.get("error").is_none()),
+        "stream:end events stay error-free"
+    );
+    // Nothing parked or requeued; no stale Error/stop_reason.
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(session.stop_reason.is_none(), "no error stop_reason");
+
+    // Transcript ordering proves the warning turn ran BEFORE the queued
+    // message: original user row → warning row → warning turn's assistant
+    // response → queued user row → its response.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    // The warning row is persisted, names the configured window, and reached
+    // clients as a user-role `agent:message` echo (payload carries the row id).
+    let warning_row = messages
+        .iter()
+        .find(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[SYSTEM WARNING]"))
+        })
+        .expect("warning user row persisted");
+    assert!(
+        warning_row.content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("of silence"),
+        "warning names the configured window"
+    );
+    assert!(
+        events.iter().any(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE
+                && e.data["role"] == json!("user")
+                && e.data["messageId"] == json!(warning_row.id)
+        }),
+        "agent:message echo for the warning row reached the bus"
+    );
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            format!(
+                "{}:{}",
+                m.role,
+                m.content[0]["text"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    let warning_idx = texts
+        .iter()
+        .position(|t| t.starts_with("user:[SYSTEM WARNING]"))
+        .unwrap_or_else(|| panic!("warning user row persisted: {texts:?}"));
+    let continued_idx = texts
+        .iter()
+        .position(|t| t == "assistant:continued after warning")
+        .unwrap_or_else(|| panic!("warning turn streamed: {texts:?}"));
+    let queued_idx = texts
+        .iter()
+        .position(|t| t == "user:queued follow-up")
+        .unwrap_or_else(|| panic!("queued user row persisted: {texts:?}"));
+    assert!(
+        warning_idx < continued_idx && continued_idx < queued_idx,
+        "warning turn runs before the queued message: {texts:?}"
+    );
+}
+
+/// Warn-and-continue cap: after [`super::MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES`]
+/// back-to-back silent timeouts (each answered with a warning turn), the NEXT
+/// timeout takes the terminal path — exactly one `agent:failed` (emitted by
+/// the worker, since `run_prompt_turn` suppressed it), Error park with the
+/// idle-timeout stop_reason, and a requeue for `agent.retry`. The mock parks
+/// EVERY prompt ("of silence" matches the warning text too), so no turn ever
+/// produces intervening activity.
+#[tokio::test]
+async fn idle_timeout_cap_exceeded_takes_terminal_path() {
+    let script = mock_agent_script();
+    let behavior = json!({ "parkIfPromptContains": "of silence" }).to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-idle-cap"),
+        AgentId::from("a-idle-cap"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "a stretch of silence begins".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // 4 consecutive silent timeouts at ~1s each (poll tick), 3 warning
+    // redrives in between, then the terminal park.
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("4th consecutive idle timeout parks the session in error");
+
+    // Exactly MAX warnings were injected (cap boundary: the 4th timeout gets
+    // no warning).
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let warnings = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[SYSTEM WARNING]"))
+        })
+        .count();
+    assert_eq!(
+        warnings,
+        super::MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES as usize,
+        "one warning per redrive, none for the terminal timeout: {messages:?}"
+    );
+
+    // Exactly one agent:failed (the worker's cap-exceeded emit) and it names
+    // the idle timeout.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "exactly one terminal agent:failed");
+    assert!(
+        failed[0].data["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("idle timeout")),
+        "agent:failed names the idle timeout: {:?}",
+        failed[0].data
+    );
+    // Error park + requeue for agent.retry (the last warning turn is the
+    // failed message).
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stop_reason = session.stop_reason.expect("error stop_reason persisted");
+    assert!(
+        stop_reason.contains("idle timeout"),
+        "stop_reason names the idle timeout: {stop_reason}"
+    );
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "failed turn requeued for agent.retry"
+    );
 }
 
 #[tokio::test]

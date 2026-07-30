@@ -93,6 +93,7 @@ mod search_ops;
 mod sentry_ops;
 mod settings;
 mod settings_registry;
+mod shell;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
@@ -587,6 +588,29 @@ impl Services {
             .as_ref()
             .map(|r| r.snapshot().effective.clone())
             .unwrap_or_default()
+    }
+
+    /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
+    /// §3b): the persisted per-workspace override when set (mirrored from the
+    /// global `git.autoCommit` at create time, toggled via
+    /// `workspace.setAutoCommit`), else the global `git.autoCommit` setting.
+    /// NULL rows (pre-migration workspaces, and Chief's seeded row — which is
+    /// excluded from reads and never seeded with an override) and lookup
+    /// failures fall back to the global value so the gate never hard-fails on
+    /// resolution.
+    pub(crate) async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
+        match self.store.workspace_auto_commit(workspace_id).await {
+            Ok(Some(enabled)) => enabled,
+            Ok(None) => self.effective_settings().git.auto_commit,
+            Err(e) => {
+                tracing::debug!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "effective_auto_commit: falling back to global git.autoCommit"
+                );
+                self.effective_settings().git.auto_commit
+            }
+        }
     }
 
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
@@ -1177,6 +1201,29 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// The currently configured `workspace.worktreesLocation` directory for
+    /// teardown sweeps: `None` when the setting is empty or the startup pin
+    /// (`INTENTD_WORKSPACES_DIR`) keeps precedence, or when the expanded path
+    /// is not absolute. Unlike [`resolve_workspaces_parent`] this never
+    /// creates the directory — teardown must not mint new parents.
+    fn configured_worktrees_location(&self) -> Option<PathBuf> {
+        let pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
+        if pinned {
+            return None;
+        }
+        let location = settings::worktrees_location(&self.effective_settings());
+        let location = location.trim();
+        if location.is_empty() {
+            return None;
+        }
+        let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+        dir.is_absolute().then_some(dir)
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -4386,6 +4433,75 @@ fn derive_repo_name_from_path(path: &str) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
+/// Resolve the parent directory `workspace.create` provisions new checkouts
+/// under. Precedence: the startup-pinned `workspaces.root`
+/// (`INTENTD_WORKSPACES_DIR`) wins, then a non-empty
+/// `workspace.worktreesLocation` setting (tilde-expanded, created when
+/// missing — an invalid or uncreatable location fails the create rather than
+/// silently falling back), then the boot-time root.
+fn resolve_workspaces_parent(
+    boot_root: Option<PathBuf>,
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Result<PathBuf> {
+    let location = worktrees_location.trim();
+    if root_pinned || location.is_empty() {
+        return Ok(boot_root.unwrap_or_else(default_workspaces_root));
+    }
+    let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+    if !dir.is_absolute() {
+        return Err(Error::Internal(format!(
+            "workspace.worktreesLocation must be an absolute path, got `{location}`"
+        )));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        Error::Internal(format!(
+            "cannot create workspace.worktreesLocation directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+/// Candidate `<parent>/<id>` directories for a workspace's on-disk layout,
+/// deduplicated in priority order. Teardown paths (`workspace.delete`,
+/// `workspace.cleanup`) must not re-derive the parent from current settings
+/// only: a workspace created under `workspace.worktreesLocation` lives there
+/// even after the setting changes. The persisted worktree's parent wins (the
+/// location in force at create time); the boot root and the currently
+/// configured location are swept as well so worktree-less rows and
+/// setting-flips stay covered (all candidates are named after the workspace
+/// id, so removing a non-existent one is a harmless no-op).
+fn workspace_dir_candidates(
+    id: &WorkspaceId,
+    worktree_path: Option<&str>,
+    boot_root: &Path,
+    current_location: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = worktree_path
+        .filter(|p| !p.is_empty())
+        .and_then(|p| Path::new(p).parent())
+        .filter(|parent| {
+            parent
+                .file_name()
+                .map(|n| n == std::ffi::OsStr::new(id.as_str()))
+                .unwrap_or(false)
+        })
+    {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.push(boot_root.join(id.as_str()));
+    if let Some(loc) = current_location {
+        let dir = loc.join(id.as_str());
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.dedup();
+    dirs
+}
+
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
 /// override, else `~/intent/workspaces` — the FE's
 /// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
@@ -4994,14 +5110,21 @@ impl Services {
     /// Startup sweep entry point for [`sweep_orphaned_worktree_trash`]
     /// (monorepo#473). Resolves the workspaces root the same way the
     /// `workspace.*` operations do (injected root, else
-    /// [`default_workspaces_root`]) and runs the potentially multi-GB removal
+    /// [`default_workspaces_root`]), sweeps the currently configured
+    /// `workspace.worktreesLocation` as well (workspaces provisioned there
+    /// leave their trash there), and runs the potentially multi-GB removal
     /// on the blocking pool. Best-effort: a failed (or panicked) sweep task
     /// is logged and reported as 0 removals.
     pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
         let root = self.workspaces_root.clone();
+        let location = self.configured_worktrees_location();
         let task = tokio::task::spawn_blocking(move || {
             let root = root.unwrap_or_else(default_workspaces_root);
-            sweep_orphaned_worktree_trash(&root)
+            let mut removed = sweep_orphaned_worktree_trash(&root);
+            if let Some(location) = location.filter(|l| *l != root) {
+                removed += sweep_orphaned_worktree_trash(&location);
+            }
+            removed
         })
         .await;
         match task {
@@ -8543,6 +8666,18 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         let settings_branch_prefix = settings::branch_prefix(&self.effective_settings());
         let cow_isolation = self.effective_settings().workspace.cow_isolation;
+        let worktrees_location = settings::worktrees_location(&self.effective_settings());
+        // Mirror-at-creation seed for the per-workspace auto-commit override
+        // (spec Diagnosis §3b): the new row persists the global `git.autoCommit`
+        // in force when the workspace is created.
+        let global_auto_commit = self.effective_settings().git.auto_commit;
+        // Startup pin (`INTENTD_WORKSPACES_DIR` → pinned `workspaces.root`)
+        // keeps precedence over the `workspace.worktreesLocation` setting.
+        let workspaces_root_pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
         Box::pin(async move {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
@@ -8570,8 +8705,11 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
-                    let workspaces_root =
-                        workspaces_root.unwrap_or_else(default_workspaces_root);
+                    let workspaces_root = resolve_workspaces_parent(
+                        workspaces_root,
+                        workspaces_root_pinned,
+                        &worktrees_location,
+                    )?;
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
                     // random adjective-animal pair; uniquified with a `-N`
@@ -9168,7 +9306,14 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
-                    store.insert_workspace(&ws).await?;
+                    // Mirror-at-creation (spec Diagnosis §3b): persist the
+                    // global `git.autoCommit` as the workspace's own override
+                    // in the same INSERT so later global changes don't
+                    // retroactively flip existing workspaces — atomic, so the
+                    // row can never exist without its seed.
+                    store
+                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                        .await?;
                     // Write explicit setupScript to the workspace's worktree (AFTER provisioning
                     // so git_ops::worktree_path resolves correctly). Must land as a committable
                     // change in the workspace, visible in the workspace's diff view.
@@ -9331,6 +9476,12 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
+                        // Harness-owned commits: same derivation as
+                        // `agent.create` — the initial agent opts out of the
+                        // idle subscriber when the workspace's effective
+                        // auto-commit (just seeded above) is off.
+                        let skip_auto_commit =
+                            !services.effective_auto_commit(&ws.id).await;
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
@@ -9339,7 +9490,7 @@ impl WorkspaceApi for Services {
                                 nonempty_owned(agent.specialist),
                                 None,
                                 None,
-                                false,
+                                skip_auto_commit,
                                 extra,
                             )
                             .await?;
@@ -9498,8 +9649,26 @@ impl WorkspaceApi for Services {
                                     }
                                 }
                             }
-                            let script_path =
-                                intent_dir.join(format!("setup-{}.sh", script_id.simple()));
+                            // Select the platform runner: POSIX always spawns
+                            // absolute /bin/sh + the inline timing wrapper
+                            // (byte-identical to the historic spawn); Windows
+                            // prefers a discovered Git-for-Windows sh.exe
+                            // running the same wrapper (so bash setup scripts
+                            // keep working), else falls back to a cmd.exe
+                            // `.cmd` wrapper with the same summary format.
+                            let runner = setup_runner::select(
+                                cfg!(windows),
+                                if cfg!(windows) {
+                                    setup_runner::find_windows_sh()
+                                } else {
+                                    None
+                                },
+                            );
+                            let script_path = intent_dir.join(format!(
+                                "setup-{}.{}",
+                                script_id.simple(),
+                                runner.script_extension()
+                            ));
                             if let Err(e) = write_private_script(&script_path, &script).await {
                                 tracing::warn!(
                                     workspace = %workspace_id.as_str(),
@@ -9508,17 +9677,38 @@ impl WorkspaceApi for Services {
                                 );
                                 return;
                             }
-                            // Spawn via absolute /bin/sh (matching codebase fallback pattern),
-                            // through the timing wrapper so the scrollback ends with a
-                            // completion summary and the script's exit code is preserved.
+                            // cmd.exe fallback only: the timing wrapper is a
+                            // sibling .cmd file rather than an inline `-c`
+                            // string (cmd has no equivalent of `sh -c`).
+                            let wrapper_path = if runner.needs_cmd_wrapper_file() {
+                                let p = intent_dir
+                                    .join(format!("setup-wrapper-{}.cmd", script_id.simple()));
+                                if let Err(e) =
+                                    write_private_script(&p, setup_runner::SETUP_SCRIPT_WRAPPER_CMD)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        error = %e,
+                                        "failed to write setup script cmd wrapper"
+                                    );
+                                    let _ = tokio::fs::remove_file(&script_path).await;
+                                    return;
+                                }
+                                Some(p)
+                            } else {
+                                None
+                            };
+                            // Spawn through the timing wrapper so the scrollback
+                            // ends with a completion summary and the script's
+                            // exit code is preserved. `extra_env` carries the
+                            // cmd.exe fallback's script path (see
+                            // `SetupScriptRunner::command`); empty otherwise.
+                            let (program, args, extra_env) =
+                                runner.command(&script_path, wrapper_path.as_deref());
                             let mut spec =
-                                intent_pty::SpawnSpec::new(workspace_id.as_str(), "/bin/sh");
-                            spec.args = vec![
-                                "-c".to_string(),
-                                SETUP_SCRIPT_WRAPPER.to_string(),
-                                "sh".to_string(),
-                                script_path.to_string_lossy().to_string(),
-                            ];
+                                intent_pty::SpawnSpec::new(workspace_id.as_str(), program);
+                            spec.args = args;
                             spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
                             spec.name = Some(SETUP_TERMINAL_NAME.to_string());
                             spec.cwd = Some(worktree_for_read.clone());
@@ -9528,6 +9718,7 @@ impl WorkspaceApi for Services {
                                 ("BRANCH_NAME".to_string(), branch_name),
                                 ("SOURCE_BRANCH".to_string(), source_branch),
                             ];
+                            spec.env.extend(extra_env);
                             match pty_for_setup.spawn(spec) {
                                 Ok(pty_id) => {
                                     let terminal_id = pty_id.to_string();
@@ -9546,8 +9737,11 @@ impl WorkspaceApi for Services {
                                     );
                                     // Wait for the script to actually complete before cleanup
                                     let _ = pty_for_setup.wait(pty_id).await;
-                                    // Best-effort cleanup of the script file (after exit)
+                                    // Best-effort cleanup of the script + wrapper files (after exit)
                                     let _ = tokio::fs::remove_file(&script_path).await;
+                                    if let Some(w) = &wrapper_path {
+                                        let _ = tokio::fs::remove_file(w).await;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -9557,6 +9751,9 @@ impl WorkspaceApi for Services {
                                     );
                                     // Cleanup on spawn failure
                                     let _ = tokio::fs::remove_file(&script_path).await;
+                                    if let Some(w) = &wrapper_path {
+                                        let _ = tokio::fs::remove_file(w).await;
+                                    }
                                 }
                             }
                         });
@@ -9762,6 +9959,11 @@ impl WorkspaceApi for Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(default_workspaces_root);
+        // Custom `workspace.worktreesLocation` sweep target: the workspace's
+        // actual parent is derived from its persisted worktree path below,
+        // but worktree-less rows created under a custom location need the
+        // currently configured location as a candidate too.
+        let worktrees_location = self.configured_worktrees_location();
         // Live-state teardown handles: cloned so the boxed future owns them
         // across the store cascade below. `agent_manager()` upgrades the weak
         // reference; read-only/test wiring with no manager attached simply
@@ -9985,6 +10187,7 @@ impl WorkspaceApi for Services {
             // `workspace.delete` of the recreated workspace will clean up any
             // mismatched leftovers.
             let workspaces_root_bg = workspaces_root.clone();
+            let worktrees_location_bg = worktrees_location.clone();
             let id_bg = id.clone();
             let store_bg = store.clone();
             let worktree_locks_bg = worktree_locks.clone();
@@ -9997,6 +10200,9 @@ impl WorkspaceApi for Services {
                 // `<workspaces_root>/<id>/` directory if it doesn't match the
                 // recreated workspace's path, for orphan-cleanup parity.
                 let recreated = store_bg.get_workspace(&id_bg).await.ok();
+                let deleted_worktree_path = ws_for_cleanup
+                    .as_ref()
+                    .and_then(|w| w.worktree_path.clone());
                 if let Some(ws_cleanup) = ws_for_cleanup {
                     // Only run the worktree cleanup if the workspace is still
                     // deleted (no recreate) or the recreate has a different
@@ -10098,26 +10304,39 @@ impl WorkspaceApi for Services {
                     }
                 }
                 // Final sweep of the daemon-owned workspace directory
-                // (`<workspaces_root>/<id>/`). The worktree cleanup's
-                // best-effort `remove_dir` (empty-only) leaves any residual
-                // content behind, and legacy pre-daemon workspaces have a
-                // directory but no worktree path at all. Recursive best-effort
-                // removal keeps the FE `FileSystemWorkspaceRepository.findAll`
-                // scan from re-surfacing the deleted id (ENOENT WARN spam) and
+                // (`<parent>/<id>/`). The worktree cleanup's best-effort
+                // `remove_dir` (empty-only) leaves any residual content
+                // behind, and legacy pre-daemon workspaces have a directory
+                // but no worktree path at all. Recursive best-effort removal
+                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
+                // from re-surfacing the deleted id (ENOENT WARN spam) and
                 // makes the delete idempotent for orphaned directories.
                 //
+                // Candidates cover every parent this workspace may live under
+                // (persisted worktree's parent — the location in force at
+                // create time — plus the boot root and the currently
+                // configured `workspace.worktreesLocation`), so deleting a
+                // workspace created under a custom location does not leak
+                // `<location>/<id>/`.
+                //
                 // If a same-slug recreate happened and uses the same
-                // `<workspaces_root>/<id>/` parent, skip the removal so we
-                // don't destroy the recreated workspace's directory tree.
-                let skip_dir = recreated
+                // `<parent>/<id>/` directory, skip that candidate so we don't
+                // destroy the recreated workspace's directory tree.
+                let recreated_parent = recreated
                     .as_ref()
                     .and_then(|r| r.worktree_path.as_deref())
                     .filter(|p| !p.is_empty())
                     .and_then(|wt_path| Path::new(wt_path).parent())
-                    .map(|parent| parent == workspaces_root_bg.join(id_bg.as_str()))
-                    .unwrap_or(false);
-                if !skip_dir {
-                    let dir = workspaces_root_bg.join(id_bg.as_str());
+                    .map(Path::to_path_buf);
+                for dir in workspace_dir_candidates(
+                    &id_bg,
+                    deleted_worktree_path.as_deref(),
+                    &workspaces_root_bg,
+                    worktrees_location_bg.as_deref(),
+                ) {
+                    if recreated_parent.as_deref() == Some(dir.as_path()) {
+                        continue;
+                    }
                     let cleanup =
                         tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
                             Ok(()) => Ok(()),
@@ -10236,11 +10455,16 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let worktree_locks = self.worktree_locks.clone();
         let this = self.clone();
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(default_workspaces_root);
+        let boot_workspaces_root = self.workspaces_root.clone();
         let cow_isolation = self.effective_settings().workspace.cow_isolation;
+        let worktrees_location = settings::worktrees_location(&self.effective_settings());
+        // Startup pin (`INTENTD_WORKSPACES_DIR` → pinned `workspaces.root`)
+        // keeps precedence over the `workspace.worktreesLocation` setting.
+        let workspaces_root_pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
         Box::pin(async move {
             // Chief is virtual and never carries user content; duplication is
             // not meaningful (TS parity: coverflow never exposes a duplicate
@@ -10250,6 +10474,14 @@ impl WorkspaceApi for Services {
                     "cannot duplicate chief workspace".to_string(),
                 ));
             }
+            // Same parent-dir precedence as `workspace.create`: startup pin >
+            // `workspace.worktreesLocation` > boot root — so a duplicate lands
+            // next to where a freshly created workspace would.
+            let workspaces_root = resolve_workspaces_parent(
+                boot_workspaces_root,
+                workspaces_root_pinned,
+                &worktrees_location,
+            )?;
             let source = store.get_workspace(&id).await?;
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
@@ -10622,7 +10854,14 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
-            store.insert_workspace(&ws).await?;
+            // Seed the duplicate's auto-commit override from the source's
+            // effective value (source override → global fallback) in the same
+            // INSERT, matching the atomic mirror-at-creation semantics of
+            // `workspace.create`.
+            let source_auto_commit = this.effective_auto_commit(&id).await;
+            store
+                .insert_workspace_with_auto_commit(&ws, Some(source_auto_commit))
+                .await?;
             // Record branch provenance so `workspace.delete` cleans up the
             // duplicated branch alongside its worktree (same guard as
             // `workspace.create`: only auto-generated branches are deleted).
@@ -10705,6 +10944,7 @@ impl WorkspaceApi for Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(default_workspaces_root);
+        let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
             // Chief is virtual: no on-disk cache and no worktree — TS parity's
             // `isVirtualWorkspace` guard.
@@ -10716,28 +10956,41 @@ impl WorkspaceApi for Services {
             // sweeping a random directory.
             let ws = store.get_workspace(&id).await?;
             // Best-effort recursive delete of the daemon-owned cache directory
-            // (`<workspaces_root>/<id>/cache`). Missing / non-existent is a
-            // success; other errors are logged and swallowed.
-            let cache_dir = workspaces_root.join(id.as_str()).join("cache");
-            let cache_task =
-                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&cache_dir) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                })
-                .await;
-            match cache_task {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %e,
-                    "workspace.cleanup: failed to remove cache directory"
-                ),
-                Err(join_err) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %join_err,
-                    "workspace.cleanup: cache cleanup task failed"
-                ),
+            // (`<parent>/<id>/cache`). The parent candidates cover the
+            // persisted worktree's parent (the location in force at create
+            // time) plus the boot root and the current
+            // `workspace.worktreesLocation`, so caches under a custom
+            // location are cleaned too. Missing / non-existent is a success;
+            // other errors are logged and swallowed.
+            for dir in workspace_dir_candidates(
+                &id,
+                ws.worktree_path.as_deref(),
+                &workspaces_root,
+                worktrees_location.as_deref(),
+            ) {
+                let cache_dir = dir.join("cache");
+                let cache_task =
+                    tokio::task::spawn_blocking(move || {
+                        match std::fs::remove_dir_all(&cache_dir) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .await;
+                match cache_task {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "workspace.cleanup: failed to remove cache directory"
+                    ),
+                    Err(join_err) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %join_err,
+                        "workspace.cleanup: cache cleanup task failed"
+                    ),
+                }
             }
             // Run `git gc` against the worktree when there is one — reclaims
             // loose objects and packs (TS `cleanupWorkspace` parity).
@@ -10908,6 +11161,59 @@ impl WorkspaceApi for Services {
             // `NotFound` propagates so the router maps it to `-32602` (§5.23).
             let ws = store.get_workspace(&id).await?;
             Ok(ws.token_usage.unwrap_or_default())
+        })
+    }
+
+    fn get_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            // Chief's seeded row is excluded from reads and never commits, so
+            // force `source: "global"` regardless of the row's column — without
+            // this guard a stray write to the seeded row would flip the source
+            // to "workspace". Real workspaces surface `NotFound` from the store
+            // so the router maps it to `-32602`.
+            if id.is_chief() {
+                return Ok(serde_json::json!({
+                    "enabled": this.effective_settings().git.auto_commit,
+                    "source": "global",
+                }));
+            }
+            let (enabled, source) = match store.workspace_auto_commit(&id).await? {
+                Some(v) => (v, "workspace"),
+                None => (this.effective_settings().git.auto_commit, "global"),
+            };
+            Ok(serde_json::json!({ "enabled": enabled, "source": source }))
+        })
+    }
+
+    fn set_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            // Chief is virtual: nothing to persist and the toggle is not
+            // meaningful for a workspace that never commits.
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot set autoCommit on chief workspace".to_string(),
+                ));
+            }
+            store.set_workspace_auto_commit(&id, enabled).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5) so live
+            // clients mirror the toggle without a follow-up read.
+            publish_event(
+                &bus,
+                workspace_updated_event(&id, serde_json::json!({ "autoCommitEnabled": enabled })),
+            )
+            .await;
+            Ok(serde_json::json!({ "enabled": enabled, "source": "workspace" }))
         })
     }
 
@@ -14115,8 +14421,11 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
-        let settings = self.effective_settings();
+        let this = self.clone();
         Box::pin(async move {
+            // TS `ws.git.commit` gates on auto-commit (no userRequested
+            // bypass), resolved per-workspace (override → global fallback).
+            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let event_bus = bus.clone();
@@ -14128,8 +14437,7 @@ impl WorkspaceApi for Services {
                 "git.commit",
                 move || async move {
                     let store = op_store;
-                    // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-                    git_ops::assert_agent_commit_allowed(&settings, false)?;
+                    git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
                     // All commit failures surface as `-32603` (the TS handler wraps the
                     // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
                     let ws = store
@@ -14178,10 +14486,12 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
-        let settings = self.effective_settings();
+        let this = self.clone();
         Box::pin(async move {
-            // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(&settings, user_requested)?;
+            // userRequested bypasses the auto-commit gate (TS parity); the
+            // gate reads the per-workspace resolution (override → global).
+            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
+            git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -14833,6 +15143,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
+            // Harness-owned commits: sessions created while the workspace's
+            // effective auto-commit is off opt out of the idle subscriber, so
+            // nothing commits unless the user explicitly asks.
+            let skip_auto_commit = !self.effective_auto_commit(&workspace_id).await;
             with_idempotency(
                 &self.store,
                 &ws_scope,
@@ -14846,7 +15160,7 @@ impl WorkspaceApi for Services {
                         specialist_id,
                         parent_agent_id,
                         None,
-                        false,
+                        skip_auto_commit,
                         extra,
                     )
                     .await
@@ -18152,7 +18466,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(&self.effective_settings(), true)?;
+        git_ops::assert_agent_commit_allowed(self.effective_auto_commit(workspace_id).await, true)?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;
@@ -19849,4 +20163,399 @@ async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()
 #[cfg(not(unix))]
 async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     tokio::fs::write(path, contents).await
+}
+
+/// Platform-parametrized runner selection for the workspace setup-script
+/// terminal (`workspace.create`). POSIX always spawns the historic
+/// `/bin/sh -c SETUP_SCRIPT_WRAPPER` invocation byte-for-byte. Windows
+/// prefers a discovered Git-for-Windows `sh.exe` running the same POSIX
+/// wrapper (so bash setup scripts keep working) and falls back to a
+/// cmd.exe-native `.cmd` wrapper preserving the same completion-summary line
+/// format. The helpers take an explicit `is_windows` flag so the logic is
+/// unit-testable on any host OS; the call site wires `cfg!(windows)`.
+pub(crate) mod setup_runner {
+    use std::path::{Path, PathBuf};
+
+    /// How the setup-script terminal runs the script file.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum SetupScriptRunner {
+        /// A POSIX `sh` runs the inline timing wrapper
+        /// (`<sh> -c <wrapper> sh <script>`). On POSIX `sh` is always
+        /// `/bin/sh`; on Windows it is a discovered Git-for-Windows `sh.exe`.
+        PosixSh { sh: PathBuf, is_windows: bool },
+        /// Windows with no POSIX sh available: `cmd.exe` runs a generated
+        /// `.cmd` timing wrapper file with the script path as `%1`.
+        CmdWrapper,
+    }
+
+    /// Select the runner for the platform. POSIX ignores `windows_sh` and
+    /// always picks `/bin/sh`; Windows uses the discovered sh when present,
+    /// else the cmd.exe wrapper fallback.
+    pub(crate) fn select(is_windows: bool, windows_sh: Option<PathBuf>) -> SetupScriptRunner {
+        if !is_windows {
+            return SetupScriptRunner::PosixSh {
+                sh: PathBuf::from("/bin/sh"),
+                is_windows: false,
+            };
+        }
+        match windows_sh {
+            Some(sh) => SetupScriptRunner::PosixSh {
+                sh,
+                is_windows: true,
+            },
+            None => SetupScriptRunner::CmdWrapper,
+        }
+    }
+
+    impl SetupScriptRunner {
+        /// Extension for the on-disk script file: `sh` for POSIX-sh runs
+        /// (unchanged unix behavior), `cmd` for the cmd.exe fallback.
+        pub(crate) fn script_extension(&self) -> &'static str {
+            match self {
+                Self::PosixSh { .. } => "sh",
+                Self::CmdWrapper => "cmd",
+            }
+        }
+
+        /// True when a `.cmd` wrapper file must be written next to the script
+        /// before spawning.
+        pub(crate) fn needs_cmd_wrapper_file(&self) -> bool {
+            matches!(self, Self::CmdWrapper)
+        }
+
+        /// Build the `(program, args, extra_env)` triple for the PTY spawn.
+        /// `wrapper_path` is the on-disk `.cmd` wrapper (required for
+        /// `CmdWrapper`, ignored otherwise). The POSIX shape is byte-identical
+        /// to the historic `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>`
+        /// spawn; the Windows sh path forward-slashes the script argument and
+        /// templates the discovered sh into the wrapper (MSYS sh has no
+        /// `/bin/sh` guarantee from a native-process spawn).
+        ///
+        /// `CmdWrapper` passes the script path via `extra_env`
+        /// (`INTENT_SETUP_SCRIPT`) rather than as a second argv token: with
+        /// both the wrapper and script under the same (spaces-prone)
+        /// `.intent` dir, `portable-pty` double-quotes each spaced argument,
+        /// and cmd.exe's `/C` quote handling only preserves quoting when
+        /// *exactly two* quote characters appear on the whole command line.
+        /// Two quoted args produce four quotes and get mis-parsed; one
+        /// quoted arg (the wrapper) keeps the count at two.
+        pub(crate) fn command(
+            &self,
+            script_path: &Path,
+            wrapper_path: Option<&Path>,
+        ) -> (String, Vec<String>, Vec<(String, String)>) {
+            match self {
+                Self::PosixSh { sh, is_windows } => {
+                    let (wrapper, script_arg) = if *is_windows {
+                        (
+                            wrapper_for_sh(&forward_slashes(sh)),
+                            forward_slashes(script_path),
+                        )
+                    } else {
+                        (
+                            crate::SETUP_SCRIPT_WRAPPER.to_string(),
+                            script_path.to_string_lossy().to_string(),
+                        )
+                    };
+                    (
+                        sh.to_string_lossy().to_string(),
+                        vec!["-c".to_string(), wrapper, "sh".to_string(), script_arg],
+                        Vec::new(),
+                    )
+                }
+                Self::CmdWrapper => {
+                    let wrapper = wrapper_path.expect("CmdWrapper requires a wrapper file path");
+                    (
+                        "cmd.exe".to_string(),
+                        vec![
+                            "/d".to_string(),
+                            "/c".to_string(),
+                            wrapper.to_string_lossy().to_string(),
+                        ],
+                        vec![(
+                            "INTENT_SETUP_SCRIPT".to_string(),
+                            script_path.to_string_lossy().to_string(),
+                        )],
+                    )
+                }
+            }
+        }
+    }
+
+    /// Forward-slash a path for MSYS `sh` consumption (`C:\x` → `C:/x`);
+    /// a no-op on paths without backslashes.
+    fn forward_slashes(p: &Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    /// [`crate::SETUP_SCRIPT_WRAPPER`] with the inner interpreter templated:
+    /// identical text except the script runs through the double-quoted `sh`
+    /// instead of bare `/bin/sh` (drift-guarded against the const in tests).
+    pub(crate) fn wrapper_for_sh(sh: &str) -> String {
+        format!(
+            r#"start=$(date +%s); "{sh}" "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#
+        )
+    }
+
+    /// cmd.exe-native timing wrapper (Windows fallback when no POSIX sh is
+    /// found): the script path is read from the `INTENT_SETUP_SCRIPT`
+    /// environment variable rather than passed as `%1`, so the spawn only
+    /// has one quoted argv token (the wrapper itself) — see the doc comment
+    /// on [`SetupScriptRunner::command`] for why a second quoted path
+    /// argument breaks under cmd.exe's `/C` quote-stripping when the
+    /// workspace path contains spaces. Mirrors the POSIX wrapper's output
+    /// contract — blank separator line, then `Setup script completed in <N>s
+    /// (exit code <C>)` (or the `failed` variant) — and exits with the
+    /// script's own code. Elapsed seconds derive from `%TIME%` (space padding
+    /// normalized to `0`, `1%x%-100` avoids octal parsing of zero-padded
+    /// fields, day rollover corrected). CRLF line endings for cmd.exe.
+    pub(crate) const SETUP_SCRIPT_WRAPPER_CMD: &str = concat!(
+        "@echo off\r\n",
+        "setlocal\r\n",
+        "set \"_st=%TIME: =0%\"\r\n",
+        "call \"%INTENT_SETUP_SCRIPT%\"\r\n",
+        "set \"code=%ERRORLEVEL%\"\r\n",
+        "set \"_en=%TIME: =0%\"\r\n",
+        "set /a \"_s=(1%_st:~0,2%-100)*3600+(1%_st:~3,2%-100)*60+(1%_st:~6,2%-100)\"\r\n",
+        "set /a \"_e=(1%_en:~0,2%-100)*3600+(1%_en:~3,2%-100)*60+(1%_en:~6,2%-100)\"\r\n",
+        "if %_e% lss %_s% set /a \"_e+=86400\"\r\n",
+        "set /a \"elapsed=_e-_s\"\r\n",
+        "if %code%==0 (set \"verb=completed\") else (set \"verb=failed\")\r\n",
+        "echo.\r\n",
+        "echo Setup script %verb% in %elapsed%s (exit code %code%)\r\n",
+        "exit /b %code%\r\n",
+    );
+
+    /// Standard Git-for-Windows `sh.exe` install locations under the given
+    /// environment roots (`%ProgramFiles%`, `%ProgramFiles(x86)%`,
+    /// `%LocalAppData%`), in probe order. Pure so tests can drive it on any
+    /// host.
+    pub(crate) fn git_sh_candidates(
+        program_files: Option<&str>,
+        program_files_x86: Option<&str>,
+        local_app_data: Option<&str>,
+    ) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for pf in [program_files, program_files_x86].into_iter().flatten() {
+            roots.push(Path::new(pf).join("Git"));
+        }
+        if let Some(lad) = local_app_data {
+            roots.push(Path::new(lad).join("Programs").join("Git"));
+        }
+        let mut out = Vec::new();
+        for git in roots {
+            out.push(git.join("bin").join("sh.exe"));
+            out.push(git.join("usr").join("bin").join("sh.exe"));
+        }
+        out
+    }
+
+    /// Scan a PATH-style string for a directory containing `sh.exe`. The
+    /// separator is parametrized (`;` on Windows) so the scan is testable on
+    /// POSIX hosts; empty entries are skipped.
+    pub(crate) fn find_sh_in_path(path_var: &str, separator: char) -> Option<PathBuf> {
+        path_var
+            .split(separator)
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join("sh.exe"))
+            .find(|p| p.is_file())
+    }
+
+    /// Discover a POSIX `sh.exe` on Windows: Git-for-Windows standard install
+    /// locations first, then a `%PATH%` scan. `None` when no sh is found (the
+    /// caller falls back to the cmd.exe wrapper).
+    pub(crate) fn find_windows_sh() -> Option<PathBuf> {
+        let pf = std::env::var("ProgramFiles").ok();
+        let pf86 = std::env::var("ProgramFiles(x86)").ok();
+        let lad = std::env::var("LOCALAPPDATA").ok();
+        git_sh_candidates(pf.as_deref(), pf86.as_deref(), lad.as_deref())
+            .into_iter()
+            .find(|p| p.is_file())
+            .or_else(|| {
+                std::env::var("PATH")
+                    .ok()
+                    .and_then(|p| find_sh_in_path(&p, ';'))
+            })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn posix_select_ignores_windows_sh_and_is_bin_sh() {
+            let runner = select(false, Some(PathBuf::from("C:/Git/bin/sh.exe")));
+            assert_eq!(
+                runner,
+                SetupScriptRunner::PosixSh {
+                    sh: PathBuf::from("/bin/sh"),
+                    is_windows: false
+                }
+            );
+            assert_eq!(runner.script_extension(), "sh");
+            assert!(!runner.needs_cmd_wrapper_file());
+        }
+
+        /// The POSIX spawn shape is byte-identical to the historic
+        /// `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>` invocation.
+        #[test]
+        fn posix_command_is_byte_identical_to_historic_spawn() {
+            let runner = select(false, None);
+            let (program, args, extra_env) =
+                runner.command(Path::new("/w/.intent/setup-a.sh"), None);
+            assert_eq!(program, "/bin/sh");
+            assert_eq!(
+                args,
+                vec![
+                    "-c".to_string(),
+                    crate::SETUP_SCRIPT_WRAPPER.to_string(),
+                    "sh".to_string(),
+                    "/w/.intent/setup-a.sh".to_string(),
+                ]
+            );
+            assert!(extra_env.is_empty());
+        }
+
+        #[test]
+        fn windows_with_sh_runs_posix_wrapper_through_it() {
+            let sh = PathBuf::from(r"C:\Program Files\Git\bin\sh.exe");
+            let runner = select(true, Some(sh.clone()));
+            assert_eq!(runner.script_extension(), "sh");
+            assert!(!runner.needs_cmd_wrapper_file());
+            let (program, args, extra_env) =
+                runner.command(Path::new(r"C:\w\.intent\setup-a.sh"), None);
+            assert_eq!(program, sh.to_string_lossy());
+            assert_eq!(args[0], "-c");
+            assert!(
+                args[1].contains(r#""C:/Program Files/Git/bin/sh.exe" "$1""#),
+                "wrapper must template the forward-slashed sh: {}",
+                args[1]
+            );
+            assert!(args[1].contains(r"printf '\nSetup script completed in %ss (exit code %s)\n'"));
+            assert!(args[1].contains(r"printf '\nSetup script failed in %ss (exit code %s)\n'"));
+            assert_eq!(args[2], "sh");
+            assert_eq!(args[3], "C:/w/.intent/setup-a.sh");
+            assert!(extra_env.is_empty());
+        }
+
+        /// The script path travels via env (`INTENT_SETUP_SCRIPT`), not as a
+        /// second quoted argv token, so a spaced workspace path (common on
+        /// Windows, e.g. under `C:\Users\John Smith\...`) doesn't blow past
+        /// cmd.exe's `/C` exactly-two-quotes rule (only the wrapper path is
+        /// quoted on the command line).
+        #[test]
+        fn windows_without_sh_falls_back_to_cmd_wrapper() {
+            let runner = select(true, None);
+            assert_eq!(runner, SetupScriptRunner::CmdWrapper);
+            assert_eq!(runner.script_extension(), "cmd");
+            assert!(runner.needs_cmd_wrapper_file());
+            let (program, args, extra_env) = runner.command(
+                Path::new(r"C:\w\.intent\setup-a.cmd"),
+                Some(Path::new(r"C:\w\.intent\setup-wrapper-a.cmd")),
+            );
+            assert_eq!(program, "cmd.exe");
+            assert_eq!(
+                args,
+                vec![
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    r"C:\w\.intent\setup-wrapper-a.cmd".to_string(),
+                ]
+            );
+            assert_eq!(
+                extra_env,
+                vec![(
+                    "INTENT_SETUP_SCRIPT".to_string(),
+                    r"C:\w\.intent\setup-a.cmd".to_string(),
+                )]
+            );
+        }
+
+        /// Regression for the spaced-workspace-path bug: only the wrapper
+        /// path is a quoted argv token even when both the wrapper and script
+        /// live under a directory containing spaces, keeping the command
+        /// line at exactly two quote characters.
+        #[test]
+        fn windows_cmd_wrapper_command_line_has_one_quoted_token_with_spaced_paths() {
+            let runner = select(true, None);
+            let (_, args, extra_env) = runner.command(
+                Path::new(r"C:\a b\.intent\setup-x.cmd"),
+                Some(Path::new(r"C:\a b\.intent\setup-wrapper-x.cmd")),
+            );
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[2], r"C:\a b\.intent\setup-wrapper-x.cmd");
+            assert_eq!(
+                extra_env,
+                vec![(
+                    "INTENT_SETUP_SCRIPT".to_string(),
+                    r"C:\a b\.intent\setup-x.cmd".to_string(),
+                )]
+            );
+        }
+
+        /// Drift guard: the templated wrapper for `/bin/sh` matches the POSIX
+        /// const except for the double quotes around the interpreter.
+        #[test]
+        fn wrapper_for_sh_matches_posix_const() {
+            assert_eq!(
+                wrapper_for_sh("/bin/sh").replacen("\"/bin/sh\"", "/bin/sh", 1),
+                crate::SETUP_SCRIPT_WRAPPER
+            );
+        }
+
+        #[test]
+        fn cmd_wrapper_preserves_summary_format_and_exit_code_contract() {
+            let w = SETUP_SCRIPT_WRAPPER_CMD;
+            assert!(w.starts_with("@echo off\r\n"));
+            assert!(w.contains("call \"%INTENT_SETUP_SCRIPT%\"\r\n"));
+            assert!(
+                w.contains("echo.\r\necho Setup script %verb% in %elapsed%s (exit code %code%)")
+            );
+            assert!(w.contains("(set \"verb=completed\")"));
+            assert!(w.contains("(set \"verb=failed\")"));
+            assert!(w.ends_with("exit /b %code%\r\n"));
+        }
+
+        #[test]
+        fn git_sh_candidates_probe_order_and_roots() {
+            let got = git_sh_candidates(
+                Some(r"C:\Program Files"),
+                Some(r"C:\Program Files (x86)"),
+                Some(r"C:\Users\u\AppData\Local"),
+            );
+            let expected: Vec<PathBuf> = [
+                Path::new(r"C:\Program Files").join("Git"),
+                Path::new(r"C:\Program Files (x86)").join("Git"),
+                Path::new(r"C:\Users\u\AppData\Local")
+                    .join("Programs")
+                    .join("Git"),
+            ]
+            .iter()
+            .flat_map(|root| {
+                [
+                    root.join("bin").join("sh.exe"),
+                    root.join("usr").join("bin").join("sh.exe"),
+                ]
+            })
+            .collect();
+            assert_eq!(got, expected);
+            assert!(git_sh_candidates(None, None, None).is_empty());
+        }
+
+        #[test]
+        fn find_sh_in_path_scans_entries_and_skips_empties() {
+            let dir = std::env::temp_dir().join(format!(
+                "setup-runner-path-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sh = dir.join("sh.exe");
+            std::fs::write(&sh, "").unwrap();
+            let path_var = format!(";/nonexistent;{};", dir.to_string_lossy());
+            assert_eq!(find_sh_in_path(&path_var, ';'), Some(sh));
+            assert_eq!(find_sh_in_path("/nonexistent;/also-missing", ';'), None);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
 }

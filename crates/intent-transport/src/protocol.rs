@@ -2,13 +2,14 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.6 adds the
-//! `providers.catalog` router method serving the static provider registry
-//! (monorepo#928), covering 305 dispatchable method names (269 router + 34
-//! fast-path + 2 aliases) + 1 notification + 4 reverse RPCs.
+//! `system.status` → `protocolVersion`. Version 2.7 adds the
+//! `workspace.getAutoCommit` / `workspace.setAutoCommit` router methods for
+//! the persisted per-workspace auto-commit override, covering 307
+//! dispatchable method names (271 router + 34 fast-path + 2 aliases) + 1
+//! notification + 4 reverse RPCs.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.6";
+pub const PROTOCOL_VERSION: &str = "2.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

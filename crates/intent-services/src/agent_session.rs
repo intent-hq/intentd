@@ -50,6 +50,16 @@ mod tests_meta;
 pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
     "session/prompt transport closed before output:";
 
+/// Suffix appended to the wrapped idle-timeout error when the timed-out turn
+/// DID receive `session/update` traffic before going silent (`session/prompt
+/// failed: session/prompt idle timeout (…) [turn streamed output]`). ANY
+/// received update counts — including variants that don't map to turn updates
+/// (plan/thought/mode/usage) — because each one reset the idle timer. The
+/// turn worker's warn-and-continue path resets its consecutive-timeout
+/// counter on this marker: intervening activity means the back-to-back
+/// timeout accounting starts over.
+pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
+
 /// Whether a `session/prompt` failure is transport-shaped: the writer task
 /// observed a closed pipe (`transport closed: …`, e.g. "writer task closed")
 /// or the child's stdout closed with the request still pending (the transport
@@ -1148,12 +1158,18 @@ impl Services {
         // provider streamed anything, a transport failure is no longer
         // provably output-free.
         let mut updates_applied = false;
+        // Whether ANY `session/update` arrived at all — a superset of
+        // `updates_applied` (unmapped variants like plan/thought/mode/usage
+        // return false from `route_notification` but still reset the idle
+        // timer). Input to the idle-timeout streamed-activity marker below.
+        let mut any_update_received = false;
         let result = loop {
             tokio::select! {
                 res = &mut prompt_fut => break res,
                 maybe = notifications.recv(), if !closed => match maybe {
                     Some(note) => {
                         activity.touch();
+                        any_update_received = true;
                         updates_applied |= self
                             .route_notification(&note, agent_id, workspace_id, &mut transcript)
                             .await;
@@ -1164,6 +1180,7 @@ impl Services {
         };
         // Drain updates buffered before the prompt response resolved.
         while let Ok(note) = notifications.try_recv() {
+            any_update_received = true;
             updates_applied |= self
                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
                 .await;
@@ -1212,6 +1229,21 @@ impl Services {
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
             && blocks.is_empty();
+        // Idle-timeout classification (warn-and-continue): the turn went the
+        // whole idle window with no `session/update` traffic. The partial
+        // transcript (if any) is flushed and the normal `agent:stream:end`
+        // below still fires, but `agent:failed` is suppressed — the turn
+        // worker decides between a warning redrive and (once the consecutive
+        // cap is spent) the terminal path, which emits `agent:failed` itself.
+        let prompt_idle_timeout = matches!(&result, Err(AcpError::PromptIdleTimeout(_)));
+        // Whether the timed-out turn saw ANY `session/update` before going
+        // silent — intervening activity that resets the worker's consecutive-
+        // timeout counter (marked via the wrapped error's suffix below). Keyed
+        // off `any_update_received`, not `updates_applied`: unmapped variants
+        // (plan/thought/mode/usage) also reset the idle timer, so they must
+        // count as activity for the streak accounting too.
+        let idle_timeout_streamed =
+            prompt_idle_timeout && (any_update_received || !blocks.is_empty());
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -1389,6 +1421,19 @@ impl Services {
                     "pre-output transport failure — deferring terminal events to the turn worker",
                 );
             }
+            Err(e) if prompt_idle_timeout => {
+                // Suppressed (warn-and-continue): the idle timeout is not a
+                // user-visible failure — the partial transcript was flushed
+                // and the normal stream:end above closed the turn. The
+                // worker decides between a warning redrive and the terminal
+                // path (which emits agent:failed itself once the
+                // consecutive-timeout cap is spent).
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "prompt idle timeout — deferring the warn/terminal decision to the turn worker",
+                );
+            }
             Err(e) => {
                 let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                 if let Some(tid) = turn_id {
@@ -1401,6 +1446,13 @@ impl Services {
         result.map_err(|e| {
             if pre_output_transport_failure {
                 Error::Internal(format!("{PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX} {e}"))
+            } else if idle_timeout_streamed {
+                // Streamed-activity marker for the worker's consecutive-
+                // timeout accounting (the suffix rides INSIDE the ordinary
+                // wrapper so `prompt_idle_timeout_error` still classifies).
+                Error::Internal(format!(
+                    "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
+                ))
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }

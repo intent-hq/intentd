@@ -251,6 +251,37 @@ async fn dispatch(
             let token_usage = api.get_token_usage(id).await.map_err(workspace_err)?;
             Ok(json!({ "tokenUsage": token_usage }))
         }
+        "workspace.getAutoCommit" => {
+            let id = require_workspace_id(params)?;
+            let auto_commit = api
+                .get_workspace_auto_commit(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "workspace.setAutoCommit" => {
+            let id = require_workspace_id(params)?;
+            let enabled = match params.get("enabled") {
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(rpc(
+                        INVALID_PARAMS,
+                        "Invalid parameter: enabled must be a boolean",
+                    ))
+                }
+                None => {
+                    return Err(rpc(
+                        INVALID_PARAMS,
+                        "Missing required parameter: enabled (boolean)",
+                    ))
+                }
+            };
+            let auto_commit = api
+                .set_workspace_auto_commit(id, enabled)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "autoCommit": auto_commit }))
+        }
         "workspace.getSetupScript" => {
             let id = require_workspace_id(params)?;
             let setup_script = api.get_setup_script(id).await.map_err(workspace_err)?;

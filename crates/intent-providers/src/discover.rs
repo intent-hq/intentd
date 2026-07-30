@@ -82,19 +82,42 @@ pub struct NpxStatus {
 /// Platform `PATH` list separator.
 const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 
-/// Candidate filename suffixes to try when resolving a command on `PATH`
-/// (Windows resolves `.exe`/`.cmd`/`.bat`; POSIX uses the bare name).
+/// Extensions Windows can actually run for a provider entry point
+/// (`CreateProcess` / `cmd.exe`-runnable), in resolution-preference order.
+const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+/// True when `path` carries a Windows-runnable executable extension
+/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
+fn has_windows_exec_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            WINDOWS_EXEC_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+        })
+}
+
+/// Candidate filenames to try when resolving a command in a directory.
+/// POSIX uses the bare name. Windows probes only runnable entry points
+/// (`.exe`/`.cmd`/`.bat`) and never the bare extensionless name —
+/// `CreateProcess` cannot run it, and npm shim pairs (`auggie` next to
+/// `auggie.cmd`) must resolve the `.cmd` shim — unless the command itself
+/// already carries an executable extension.
 fn name_candidates(command: &str) -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            command.to_string(),
-            format!("{command}.exe"),
-            format!("{command}.cmd"),
-            format!("{command}.bat"),
-        ]
-    } else {
-        vec![command.to_string()]
+    name_candidates_for(command, cfg!(windows))
+}
+
+/// [`name_candidates`] parametrized on the platform (test seam — Windows CI
+/// is disabled, so both arms are unit-tested on POSIX).
+fn name_candidates_for(command: &str, is_windows: bool) -> Vec<String> {
+    if !is_windows || has_windows_exec_extension(std::path::Path::new(command)) {
+        return vec![command.to_string()];
     }
+    WINDOWS_EXEC_EXTENSIONS
+        .iter()
+        .map(|ext| format!("{command}.{ext}"))
+        .collect()
 }
 
 /// Resolve `command` to an executable path by scanning `PATH`, or `None`.
@@ -413,16 +436,26 @@ fn native_install_dir(provider_id: &str) -> Option<&'static str> {
 }
 
 /// Candidate paths for a provider's native installer location under `home`
-/// (`~/<dot_dir>/bin/<command>`, plus `.exe`/`.cmd` variants on Windows).
+/// (`~/<dot_dir>/bin/<command>`; Windows probes only the runnable
+/// `.exe`/`.cmd`/`.bat` variants, same preference as [`name_candidates`]).
 /// Port of `GROK_NATIVE_PATHS` / `OPENCODE_NATIVE_PATHS` from the FE resolvers.
 fn native_install_candidates(home: &std::path::Path, dot_dir: &str, command: &str) -> Vec<PathBuf> {
+    native_install_candidates_for(home, dot_dir, command, cfg!(windows))
+}
+
+/// [`native_install_candidates`] parametrized on the platform (test seam —
+/// Windows CI is disabled, so both arms are unit-tested on POSIX).
+fn native_install_candidates_for(
+    home: &std::path::Path,
+    dot_dir: &str,
+    command: &str,
+    is_windows: bool,
+) -> Vec<PathBuf> {
     let bin = home.join(dot_dir).join("bin");
-    let mut candidates = vec![bin.join(command)];
-    if cfg!(windows) {
-        candidates.push(bin.join(format!("{command}.exe")));
-        candidates.push(bin.join(format!("{command}.cmd")));
-    }
-    candidates
+    name_candidates_for(command, is_windows)
+        .into_iter()
+        .map(|name| bin.join(name))
+        .collect()
 }
 
 /// Resolve a provider's native installer binary under an explicit `home`
@@ -457,11 +490,21 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// True when `p` is a file that is executable (unix checks the exec bit; on
-/// other platforms existence as a file is sufficient).
+/// True when `p` is a file that is executable (unix checks the exec bit;
+/// Windows requires a runnable executable extension — `CreateProcess` cannot
+/// run a bare extensionless file, so its mere existence is not enough).
 fn is_executable_file(p: &std::path::Path) -> bool {
+    is_executable_file_for(p, cfg!(windows))
+}
+
+/// [`is_executable_file`] parametrized on the platform (test seam — Windows
+/// CI is disabled, so the Windows arm is unit-tested on POSIX).
+fn is_executable_file_for(p: &std::path::Path, is_windows: bool) -> bool {
     if !p.is_file() {
         return false;
+    }
+    if is_windows {
+        return has_windows_exec_extension(p);
     }
     #[cfg(unix)]
     {
@@ -491,11 +534,18 @@ fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
 /// Find the first executable for `command` in `dirs`, in order (test seam —
 /// lets tests scan a controlled dir list without spawning a login shell).
 fn find_in_dirs(dirs: &[PathBuf], command: &str) -> Option<PathBuf> {
-    let candidates = name_candidates(command);
+    find_in_dirs_for(dirs, command, cfg!(windows))
+}
+
+/// [`find_in_dirs`] parametrized on the platform (test seam — Windows CI is
+/// disabled, so the Windows candidate/executability arm is unit-tested on
+/// POSIX).
+fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option<PathBuf> {
+    let candidates = name_candidates_for(command, is_windows);
     for dir in dirs {
         for candidate in &candidates {
             let full = dir.join(candidate);
-            if is_executable_file(&full) {
+            if is_executable_file_for(&full, is_windows) {
                 return Some(full);
             }
         }
@@ -662,43 +712,41 @@ mod find_provider_binary_tests {
     #[test]
     fn grok_native_candidates_prefer_home_grok_bin() {
         let home = PathBuf::from("/home/tester");
-        let candidates = native_install_candidates(&home, ".grok", "grok");
+        let bin = home.join(".grok").join("bin");
         assert_eq!(
-            candidates[0],
-            home.join(".grok").join("bin").join("grok"),
-            "native installer path must be the first candidate"
+            native_install_candidates_for(&home, ".grok", "grok", false),
+            vec![bin.join("grok")],
+            "POSIX probes only the bare native installer path"
         );
-        if cfg!(windows) {
-            assert!(candidates
-                .iter()
-                .any(|p| p.ends_with(PathBuf::from("bin").join("grok.exe"))));
-            assert!(candidates
-                .iter()
-                .any(|p| p.ends_with(PathBuf::from("bin").join("grok.cmd"))));
-        } else {
-            assert_eq!(candidates.len(), 1);
-        }
+        assert_eq!(
+            native_install_candidates_for(&home, ".grok", "grok", true),
+            vec![
+                bin.join("grok.exe"),
+                bin.join("grok.cmd"),
+                bin.join("grok.bat")
+            ],
+            "Windows probes runnable entry points, never the bare name"
+        );
     }
 
     #[test]
     fn opencode_native_candidates_prefer_home_opencode_bin() {
         let home = PathBuf::from("/home/tester");
-        let candidates = native_install_candidates(&home, ".opencode", "opencode");
+        let bin = home.join(".opencode").join("bin");
         assert_eq!(
-            candidates[0],
-            home.join(".opencode").join("bin").join("opencode"),
-            "native installer path must be the first candidate"
+            native_install_candidates_for(&home, ".opencode", "opencode", false),
+            vec![bin.join("opencode")],
+            "POSIX probes only the bare native installer path"
         );
-        if cfg!(windows) {
-            assert!(candidates
-                .iter()
-                .any(|p| p.ends_with(PathBuf::from("bin").join("opencode.exe"))));
-            assert!(candidates
-                .iter()
-                .any(|p| p.ends_with(PathBuf::from("bin").join("opencode.cmd"))));
-        } else {
-            assert_eq!(candidates.len(), 1);
-        }
+        assert_eq!(
+            native_install_candidates_for(&home, ".opencode", "opencode", true),
+            vec![
+                bin.join("opencode.exe"),
+                bin.join("opencode.cmd"),
+                bin.join("opencode.bat")
+            ],
+            "Windows probes runnable entry points, never the bare name"
+        );
     }
 
     #[cfg(unix)]
@@ -1145,5 +1193,138 @@ mod override_aware_discovery_tests {
         // Path fields stay auto-detected: never the override paths.
         assert_ne!(u.resolved_path.as_ref(), Some(&opencode));
         assert_ne!(secondary.resolved_path.as_ref(), Some(&unsloth));
+    }
+}
+
+/// Windows executable-resolution semantics (monorepo#1054): Windows must
+/// prefer runnable entry points (`.exe`/`.cmd`/`.bat`) and never resolve a
+/// bare extensionless file (`CreateProcess` cannot run it) — the npm shim
+/// pair `auggie` + `auggie.cmd` must resolve the `.cmd` shim. Windows CI is
+/// disabled, so both platform arms are driven through the `_for` seams on
+/// POSIX; POSIX behavior stays byte-identical.
+#[cfg(test)]
+mod windows_resolution_tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn name_candidates_posix_is_bare_name_only() {
+        assert_eq!(name_candidates_for("auggie", false), vec!["auggie"]);
+        assert_eq!(name_candidates_for("auggie.exe", false), vec!["auggie.exe"]);
+    }
+
+    #[test]
+    fn name_candidates_windows_prefers_executable_extensions_over_bare_name() {
+        assert_eq!(
+            name_candidates_for("auggie", true),
+            vec!["auggie.exe", "auggie.cmd", "auggie.bat"],
+            "the bare extensionless name must not be a candidate on Windows"
+        );
+    }
+
+    #[test]
+    fn name_candidates_windows_keeps_command_carrying_executable_extension() {
+        assert_eq!(name_candidates_for("auggie.cmd", true), vec!["auggie.cmd"]);
+        // Case-insensitive, matching Windows filename semantics.
+        assert_eq!(name_candidates_for("AUGGIE.EXE", true), vec!["AUGGIE.EXE"]);
+    }
+
+    #[test]
+    fn name_candidates_windows_suffixes_non_executable_extension() {
+        // A non-runnable extension is not an entry point; it still gets the
+        // runnable suffixes appended like an extensionless command.
+        assert_eq!(
+            name_candidates_for("foo.py", true),
+            vec!["foo.py.exe", "foo.py.cmd", "foo.py.bat"]
+        );
+    }
+
+    #[test]
+    fn is_executable_file_windows_requires_runnable_extension() {
+        let dir = unique_temp_dir("win-exec");
+        let bare = dir.join("auggie");
+        let cmd = dir.join("auggie.cmd");
+        let exe_upper = dir.join("tool.EXE");
+        fs::write(&bare, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&cmd, "@echo off\r\n").unwrap();
+        fs::write(&exe_upper, "MZ").unwrap();
+        assert!(
+            !is_executable_file_for(&bare, true),
+            "an extensionless file is not runnable on Windows"
+        );
+        assert!(is_executable_file_for(&cmd, true));
+        assert!(
+            is_executable_file_for(&exe_upper, true),
+            "extension matching must be case-insensitive"
+        );
+        assert!(!is_executable_file_for(&dir.join("missing.exe"), true));
+        assert!(
+            !is_executable_file_for(&dir, true),
+            "directories never resolve"
+        );
+    }
+
+    #[test]
+    fn find_in_dirs_windows_npm_shim_pair_resolves_the_cmd_shim() {
+        // Regression: npm installs the extensionless POSIX script `auggie`
+        // next to the runnable `auggie.cmd` shim in the same dir; the .cmd
+        // shim must win (the bare file used to be resolved first).
+        let dir = unique_temp_dir("win-shim-pair");
+        fs::write(dir.join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
+        let cmd = dir.join("auggie.cmd");
+        fs::write(&cmd, "@echo off\r\n").unwrap();
+        assert_eq!(
+            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", true),
+            Some(cmd)
+        );
+    }
+
+    #[test]
+    fn find_in_dirs_windows_extensionless_file_alone_does_not_resolve() {
+        let dir = unique_temp_dir("win-bare-only");
+        fs::write(dir.join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(
+            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", true),
+            None,
+            "CreateProcess cannot run a bare extensionless file"
+        );
+    }
+
+    #[test]
+    fn find_in_dirs_windows_resolves_command_carrying_executable_extension() {
+        let dir = unique_temp_dir("win-explicit-ext");
+        let cmd = dir.join("auggie.cmd");
+        fs::write(&cmd, "@echo off\r\n").unwrap();
+        assert_eq!(
+            find_in_dirs_for(std::slice::from_ref(&dir), "auggie.cmd", true),
+            Some(cmd)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_dirs_posix_still_resolves_the_bare_executable() {
+        // POSIX behavior stays byte-identical: the bare name resolves once
+        // executable, and no extension variants are probed.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("posix-bare");
+        let bin = dir.join("auggie");
+        fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("auggie.cmd"), "@echo off\r\n").unwrap();
+        assert_eq!(
+            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", false),
+            Some(bin)
+        );
     }
 }

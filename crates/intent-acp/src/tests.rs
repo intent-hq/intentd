@@ -168,6 +168,33 @@ async fn is_alive_flips_after_writer_hits_closed_stdin() {
     assert!(!alive, "writer task exit closes the channel → not alive");
 }
 
+/// Dropping an in-flight request future removes its pending-map entry (the
+/// transport's cancel-safety drop guard): abandoning a `session/prompt` on
+/// idle timeout must not leak the correlation entry until stdout closes.
+#[tokio::test]
+async fn dropped_request_future_cleans_pending_map_entry() {
+    // An "agent" that never responds: keep both remote ends alive so the
+    // request stays pending until the caller drops the future.
+    let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+    let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+    let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+
+    let mut fut =
+        Box::pin(conn.request_timeout("session/prompt", json!({}), Duration::from_secs(60)));
+    // Drive the future far enough to write the request and insert the entry.
+    tokio::select! {
+        _ = &mut fut => panic!("request must still be pending"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    assert_eq!(conn.pending_len(), 1, "in-flight request is correlated");
+    drop(fut);
+    assert_eq!(
+        conn.pending_len(),
+        0,
+        "dropping the future removes the entry"
+    );
+}
+
 #[tokio::test]
 async fn stderr_captured_and_auth_flagged() {
     let hooks = ConnectionHooks {
@@ -2547,6 +2574,7 @@ mod client_served_tests {
 mod error_tests {
     use crate::{AcpError, JsonRpcError};
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn json_rpc_error_display_format() {
@@ -2695,6 +2723,10 @@ mod error_tests {
             ),
             (AcpError::Transport("eof".into()), "transport closed: eof"),
             (AcpError::Timeout("foo".into()), "request `foo` timed out"),
+            (
+                AcpError::PromptIdleTimeout(Duration::from_secs(1800)),
+                "session/prompt idle timeout (1800s of silence)",
+            ),
             (AcpError::Serde("bad".into()), "serialization error: bad"),
             (AcpError::Auth("login".into()), "login"),
             (AcpError::Protocol("xx".into()), "protocol error: xx"),
@@ -2711,6 +2743,24 @@ mod error_tests {
         });
         // `#[error("{0}")]` delegates to JsonRpcError::Display.
         assert_eq!(rpc.to_string(), "JSON-RPC error 7: m");
+    }
+
+    #[test]
+    fn acp_error_prompt_idle_timeout_display_is_prefix_anchored() {
+        // The service layer classifies the idle timeout AFTER the error is
+        // flattened to a string (`session/prompt failed: {e}`), matching
+        // prefix-anchored on PROMPT_IDLE_TIMEOUT_PREFIX — pin the Display
+        // rendering to the exported const so the contract cannot drift.
+        let err = AcpError::PromptIdleTimeout(Duration::from_secs(1800));
+        assert!(err
+            .to_string()
+            .starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
+        // The plain request timeout must NOT carry the marker even when the
+        // timed-out method is `session/prompt` (the 24h fallback timeout).
+        let err = AcpError::Timeout("session/prompt".into());
+        assert!(!err
+            .to_string()
+            .starts_with(crate::PROMPT_IDLE_TIMEOUT_PREFIX));
     }
 
     #[test]

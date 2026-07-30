@@ -42,7 +42,7 @@ on:
 
 jobs:
   plan:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -90,18 +90,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Self-hosted runners: m1mac (macOS arm64; x86_64 target is a cross
+          # build, smoke-tested under Rosetta 2), tinybox (Linux x64; musl
+          # targets cross-built with cargo-zigbuild as before), 5090pc
+          # (Windows x64).
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64, m1mac]
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64, m1mac]
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-22.04
+            os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-22.04
+            os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: [self-hosted, Windows, X64]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -125,11 +129,16 @@ jobs:
           shared-key: build-${{ matrix.target }}
           save-if: false
       # Mirror the dist pipeline's musl approach: cross-compile with
-      # cargo-zigbuild (the PyPI package bundles the zig toolchain).
+      # cargo-zigbuild (the PyPI package bundles the zig toolchain). On the
+      # self-hosted runner the user-site install lands in ~/.local/bin, which
+      # is not on the runner service's PATH.
       - name: Install cargo-zigbuild
         if: ${{ matrix.zigbuild }}
         shell: bash
-        run: pip3 install cargo-zigbuild
+        run: |
+          pip3 install cargo-zigbuild
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build (cargo)
         if: ${{ !matrix.zigbuild }}
         shell: bash
@@ -146,19 +155,29 @@ jobs:
           cp "target/$TARGET/release/intentd-sitter" "staging/intentd-$TARGET/intentd"
           chmod +x "staging/intentd-$TARGET/intentd"
           tar -cJf "intentd-$TARGET.tar.xz" -C staging "intentd-$TARGET"
+      # Compress-Archive instead of 7z (not installed on the self-hosted
+      # Windows runner); the zip stays flat like dist zips.
       - name: Package (windows zip)
         if: ${{ runner.os == 'Windows' }}
-        shell: bash
+        shell: powershell
         run: |
-          mkdir -p staging
-          cp "target/$TARGET/release/intentd-sitter.exe" staging/intentd.exe
-          (cd staging && 7z a "../intentd-$TARGET.zip" intentd.exe)
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "target\$env:TARGET\release\intentd-sitter.exe" staging\intentd.exe
+          Compress-Archive -Path staging\intentd.exe -DestinationPath "intentd-$env:TARGET.zip" -Force
+      # GNU-style "HASH *NAME" output. The self-hosted Mac has no GNU
+      # coreutils (its /sbin/sha256sum is a Darwin variant with different
+      # flags/output), so use shasum there — `-b` emits the same
+      # "HASH *NAME" format as `sha256sum --binary`.
       - name: Checksum sidecar
         shell: bash
         run: |
           for archive in intentd-"$TARGET".tar.xz intentd-"$TARGET".zip; do
             if [[ -f "$archive" ]]; then
-              sha256sum --binary "$archive" > "$archive.sha256"
+              if [[ "$RUNNER_OS" == "macOS" ]]; then
+                shasum -a 256 -b "$archive" > "$archive.sha256"
+              else
+                sha256sum --binary "$archive" > "$archive.sha256"
+              fi
             fi
           done
       # Smoke: the packaged binary must run and exit 0. x86_64-apple-darwin
@@ -193,7 +212,7 @@ jobs:
     needs:
       - plan
       - build
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Serialize sitter-latest updates so two tags pushed close together cannot
     # interleave and leave the fixed release with mixed assets.
@@ -271,7 +290,7 @@ jobs:
       - plan
       - publish
       - deb
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     outputs:
       enabled: ${{ steps.mirror.outputs.enabled }}
@@ -350,7 +369,7 @@ jobs:
       - publish
       - mirror
     if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
     # non-fast-forward push.
@@ -374,6 +393,12 @@ jobs:
       - name: Style-check rendered formula (advisory)
         run: |
           export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          # Linuxbrew is not installed on the self-hosted Linux runner; this
+          # check is advisory, so skip rather than fail when brew is absent.
+          if ! command -v brew >/dev/null 2>&1; then
+            echo "::warning::brew not installed on this runner; skipping advisory formula style check"
+            exit 0
+          fi
           # brew style only accepts formulas inside a tap; stage the rendered
           # file in a scratch tap (mirroring where it ships: Formula/ in the
           # real tap) so formula cops apply instead of bare Ruby-file cops.
@@ -409,7 +434,7 @@ jobs:
     needs:
       - plan
       - publish
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Own group (not the publish one): asset names are disjoint from the
     # archives, so deb refreshes only need to serialize against themselves.

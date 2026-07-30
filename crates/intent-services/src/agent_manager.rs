@@ -48,7 +48,7 @@ use crate::events::EventBus;
 use crate::Services;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Capitalize the leading ASCII byte of `s` (leaves the rest of the string
 /// untouched). Used to normalize OAuth `token_type` values into the
@@ -90,6 +90,42 @@ const GB: u64 = 1024 * 1024 * 1024;
 /// live socket) is a real anomaly and stays at WARN.
 fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
     matches!(e, intent_acp::AcpError::Transport(_))
+}
+
+/// Settle a hung `session/prompt` after the idle timeout WITHOUT killing the
+/// child: send `session/cancel` so the agent resolves/abandons the hung turn
+/// server-side (its in-flight prompt already had its client-side pending-map
+/// entry cleaned by the transport's drop guard when `prompt()` returned
+/// early). The child + ACP session stay alive for a follow-up turn — the
+/// keep-alive half of [`AgentManager::interrupt`], without the worker-abort /
+/// stream-end machinery (the caller still owns the turn).
+///
+/// Returns whether the cancel was delivered: `false` when the transport is
+/// already closed (the child died — the expected race, tolerated exactly like
+/// [`is_cancel_transport_closed`] in the interrupt path, logged at DEBUG) or
+/// on any other wire error (logged at WARN). Best-effort by design: a `false`
+/// tells the caller the child is likely not settleable and a respawn path is
+/// more appropriate than a warn-and-continue turn.
+async fn cancel_and_settle_idle_prompt(
+    conn: &Connection,
+    agent_id: &AgentId,
+    acp_session_id: &str,
+) -> bool {
+    match intent_acp::session::cancel(conn, acp_session_id).await {
+        Ok(()) => true,
+        Err(e) if is_cancel_transport_closed(&e) => {
+            tracing::debug!(
+                agent = %agent_id,
+                error = %e,
+                "idle-prompt settle skipped: transport already closed"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "idle-prompt settle: session/cancel failed");
+            false
+        }
+    }
 }
 
 /// Per-turn prompt-assembly hints threaded through `agent.sendMessage`
@@ -1265,11 +1301,12 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `git.autoCommit` / `rtk.enabled` are global (non-workspace-scoped)
-            // settings, so this snapshot is independent of the session and
-            // cheap to take here.
+            // `rtk.enabled` is a global (non-workspace-scoped) setting;
+            // auto-commit resolves per-workspace (persisted override →
+            // global `git.autoCommit` fallback, spec Diagnosis §3b) so the
+            // prompt reflects what the commit gate will actually enforce.
             let settings = self.services.effective_settings();
-            let auto_commit_enabled = settings.git.auto_commit;
+            let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
             // background workers (`is_background`) skip the suggested-prompts
             // directive, matching the reference `isSubAgent` derivation. The
@@ -5439,6 +5476,13 @@ async fn run_message_worker(
     // budget; a second pre-output failure on the same message takes the
     // terminal path.
     let mut silent_redrive_used = false;
+    // Consecutive idle-timeout streak (warn-and-continue): incremented on
+    // each back-to-back silent timeout, reset to zero on any completed turn
+    // and restarted at one when the timed-out turn streamed output first
+    // (intervening activity). While the streak is within
+    // [`MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES`] the worker injects a warning
+    // turn instead of failing; past it the timeout takes the terminal path.
+    let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -5477,12 +5521,147 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A completed turn also resets the consecutive
+                        // idle-timeout streak (warn-and-continue).
+                        consecutive_idle_timeouts = 0;
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
                             // Concurrent stop/cancel won the turn — not a failure.
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
+                            consecutive_idle_timeouts = 0;
+                        } else if prompt_idle_timeout_error(&e) {
+                            // Warn-and-continue: the turn went the whole idle
+                            // window silent. `run_prompt_turn` already flushed
+                            // the partial transcript and emitted a NORMAL
+                            // `agent:stream:end` while suppressing
+                            // `agent:failed` — this arm decides between a
+                            // warning redrive and (past the consecutive cap)
+                            // the terminal path.
+                            consecutive_idle_timeouts = if idle_timeout_turn_streamed(&e) {
+                                // Streamed output is intervening activity:
+                                // restart the back-to-back accounting at
+                                // this timeout.
+                                1
+                            } else {
+                                consecutive_idle_timeouts + 1
+                            };
+                            if consecutive_idle_timeouts <= MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES {
+                                // Settle the hung prompt server-side WITHOUT
+                                // killing the child (interrupt keep-alive
+                                // semantics). When the transport is already
+                                // dead, tear the child down so the warning
+                                // turn spawns fresh instead of hanging again.
+                                let conn = mgr
+                                    .handles
+                                    .lock()
+                                    .unwrap()
+                                    .get(&agent_id)
+                                    .map(|h| h.connection.clone());
+                                let settled = match conn {
+                                    Some(conn) => {
+                                        cancel_and_settle_idle_prompt(
+                                            conn.as_ref(),
+                                            &agent_id,
+                                            &acp_session_id,
+                                        )
+                                        .await
+                                    }
+                                    None => false,
+                                };
+                                if !settled {
+                                    mgr.kill_child_only(&agent_id).await;
+                                }
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    streak = consecutive_idle_timeouts,
+                                    error = %e,
+                                    "prompt idle timeout — injecting a warning turn and continuing"
+                                );
+                                // The warning is a NEW persisted, user-visible
+                                // user-role message with its own turn id; the
+                                // `agent:message` echo inside `persist_user`
+                                // lets clients render it. The busy slot stays
+                                // held and this `continue` bypasses the queue
+                                // drain below, so queued messages can NOT jump
+                                // ahead of the warning turn.
+                                let warning = idle_timeout_warning_text(
+                                    intent_acp::session::prompt_idle_timeout(),
+                                );
+                                let warning_turn_id = new_message_id();
+                                user_persisted = persist_user(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &warning,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(&warning_turn_id),
+                                )
+                                .await;
+                                content = warning;
+                                options = TurnOptions {
+                                    turn_id: Some(warning_turn_id),
+                                    ..TurnOptions::default()
+                                };
+                                // New message → fresh silent-redrive budget
+                                // (monorepo#764).
+                                silent_redrive_used = false;
+                                // Fail closed (#547): a warning row that never
+                                // reached the transcript must not drive a turn.
+                                if !user_persisted {
+                                    handle_drain_persist_failure(
+                                        &mgr,
+                                        &agent_id,
+                                        &workspace_id,
+                                        &content,
+                                        &options,
+                                    )
+                                    .await;
+                                    mgr.release_in_flight_slot(&agent_id).await;
+                                    break 'outer;
+                                }
+                                continue 'outer;
+                            }
+                            // Cap exceeded: the 4th back-to-back silent
+                            // timeout takes today's terminal path.
+                            // `run_prompt_turn` suppressed `agent:failed` for
+                            // the timeout (its stream:end was the normal one),
+                            // so emit the failed half here —
+                            // `handle_terminal_turn_failure` skips its own
+                            // pair for the PROMPT_FAILED_PREFIX wrapper.
+                            tracing::warn!(
+                                agent = %agent_id,
+                                streak = consecutive_idle_timeouts,
+                                error = %e,
+                                "prompt idle timeout — consecutive-timeout cap spent, failing terminally"
+                            );
+                            let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
+                            if let Some(tid) = options.turn_id.as_deref() {
+                                data["turnId"] = json!(tid);
+                            }
+                            mgr.services
+                                .publish_agent_event(
+                                    &workspace_id,
+                                    &agent_id,
+                                    intent_core::events::AGENT_FAILED,
+                                    data,
+                                )
+                                .await;
+                            handle_terminal_turn_failure(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &content,
+                                &options,
+                                user_persisted,
+                                &e,
+                            )
+                            .await;
+                            mgr.release_in_flight_slot(&agent_id).await;
+                            break 'outer;
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt
@@ -6384,6 +6563,63 @@ fn pre_output_transport_failure(err: &Error) -> bool {
         err,
         Error::Internal(msg)
             if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
+}
+
+/// Whether a `run_turn` error is the `session/prompt` idle timeout
+/// (`AcpError::PromptIdleTimeout`: the whole idle window passed with no
+/// `session/update` traffic). The structured `AcpError` is flattened to a
+/// string at the wrap boundary (`session/prompt failed: {e}` in
+/// `run_prompt_turn`), so classification is prefix-anchored on
+/// [`intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX`] inside the
+/// [`PROMPT_FAILED_PREFIX`] wrapper — mirroring
+/// [`prompt_cancellation_error`]. The child process is typically still alive
+/// and healthy after this error (the turn merely went silent), which is what
+/// makes a warn-and-continue treatment possible.
+fn prompt_idle_timeout_error(err: &Error) -> bool {
+    let Error::Internal(msg) = err else {
+        return false;
+    };
+    let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
+        return false;
+    };
+    inner
+        .trim_start()
+        .starts_with(intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX)
+}
+
+/// Max consecutive idle-timeout warning redrives before the worker falls back
+/// to the terminal-failure path (user-confirmed cap of 3): the 1st–3rd
+/// back-to-back silent timeouts each get a warning turn; the 4th is terminal.
+const MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES: u32 = 3;
+
+/// Whether an idle-timeout error carries the streamed-output marker
+/// ([`crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX`]): the
+/// timed-out turn produced output before going silent, which counts as
+/// intervening activity for the consecutive-timeout accounting (the counter
+/// restarts at 1 instead of accumulating).
+fn idle_timeout_turn_streamed(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.ends_with(crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX)
+    )
+}
+
+/// Render the warn-and-continue message injected after an idle timeout. The
+/// window is the ACTUAL configured value ([`intent_acp::session::prompt_idle_timeout`],
+/// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
+/// literal.
+fn idle_timeout_warning_text(window: std::time::Duration) -> String {
+    let secs = window.as_secs_f64();
+    let rendered = if secs.fract() == 0.0 {
+        window.as_secs().to_string()
+    } else {
+        secs.to_string()
+    };
+    format!(
+        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
+         and was interrupted. Assess where you left off and continue the work."
     )
 }
 
@@ -7671,6 +7907,95 @@ mod turn_failure_tests {
     }
 
     #[test]
+    fn idle_timeout_marker_is_detected() {
+        // The structured AcpError::PromptIdleTimeout flattened at the wrap
+        // boundary: `session/prompt failed: ` + the Display rendering pinned
+        // to intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX.
+        let err = Error::Internal(
+            "session/prompt failed: session/prompt idle timeout (1800s of silence)".to_string(),
+        );
+        assert!(prompt_idle_timeout_error(&err));
+        // Compose from the exported consts so the contract cannot drift.
+        let err = Error::Internal(format!(
+            "{PROMPT_FAILED_PREFIX} {}",
+            intent_acp::AcpError::PromptIdleTimeout(std::time::Duration::from_secs(1800))
+        ));
+        assert!(prompt_idle_timeout_error(&err));
+    }
+
+    #[test]
+    fn non_idle_timeouts_are_not_idle_marked() {
+        // The 24h fallback timeout renders via AcpError::Timeout — a plain
+        // request timeout, NOT the idle marker.
+        let err = Error::Internal(
+            "session/prompt failed: request `session/prompt` timed out".to_string(),
+        );
+        assert!(!prompt_idle_timeout_error(&err));
+        // Mid-string mentions outside the prompt wrapper are inert.
+        let err =
+            Error::Internal("store: session/prompt idle timeout (1800s of silence)".to_string());
+        assert!(!prompt_idle_timeout_error(&err));
+        // The idle marker inside a different wrapper is inert too.
+        let err = Error::Internal(
+            "session/prompt transport closed before output: session/prompt idle timeout (1800s of silence)"
+                .to_string(),
+        );
+        assert!(!prompt_idle_timeout_error(&err));
+        // Non-Internal errors never classify.
+        let err = Error::NotFound("agent agent-x".to_string());
+        assert!(!prompt_idle_timeout_error(&err));
+    }
+
+    #[test]
+    fn idle_timeout_is_terminal_and_events_already_emitted() {
+        // The idle timeout is not benign (the worker's warn-and-continue arm
+        // classifies it FIRST via `prompt_idle_timeout_error`); when the
+        // consecutive cap routes it to the terminal path,
+        // `handle_terminal_turn_failure` must not re-emit the stream:end —
+        // run_prompt_turn already emitted the normal one (the worker emits
+        // the suppressed agent:failed half itself).
+        let err = Error::Internal(
+            "session/prompt failed: session/prompt idle timeout (1800s of silence)".to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+        assert!(turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn idle_timeout_streamed_suffix_is_detected() {
+        // The streamed-output marker rides INSIDE the ordinary wrapper: the
+        // error still classifies as an idle timeout AND reports streamed
+        // activity (the worker restarts its consecutive counter at 1).
+        let err = Error::Internal(format!(
+            "session/prompt failed: session/prompt idle timeout (1800s of silence) {}",
+            crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX
+        ));
+        assert!(prompt_idle_timeout_error(&err));
+        assert!(idle_timeout_turn_streamed(&err));
+        // A bare (silent) idle timeout carries no marker.
+        let err = Error::Internal(
+            "session/prompt failed: session/prompt idle timeout (1800s of silence)".to_string(),
+        );
+        assert!(!idle_timeout_turn_streamed(&err));
+    }
+
+    #[test]
+    fn idle_timeout_warning_text_includes_configured_window() {
+        let text = idle_timeout_warning_text(std::time::Duration::from_secs(1800));
+        assert_eq!(
+            text,
+            "[SYSTEM WARNING] Your turn exceeded the inactivity timeout (1800s of silence) and \
+             was interrupted. Assess where you left off and continue the work."
+        );
+        // The window is the actual configured value, not a hardcoded literal,
+        // and sub-second precision is preserved rather than truncated.
+        let text = idle_timeout_warning_text(std::time::Duration::from_millis(2500));
+        assert!(text.contains("(2.5s of silence)"), "{text}");
+        let text = idle_timeout_warning_text(std::time::Duration::from_millis(500));
+        assert!(text.contains("(0.5s of silence)"), "{text}");
+    }
+
+    #[test]
     fn store_append_failure_is_terminal() {
         let err = Error::Internal("store: database is locked".to_string());
         assert!(!is_benign_turn_error(&err));
@@ -7743,6 +8068,63 @@ mod turn_failure_tests {
             "store: session/prompt transport closed before output: logged".to_string(),
         );
         assert!(!pre_output_transport_failure(&err));
+    }
+}
+
+#[cfg(test)]
+mod cancel_and_settle_tests {
+    //! Unit tests for [`cancel_and_settle_idle_prompt`] over a duplex-backed
+    //! `Connection` (no real child): delivered vs transport-closed outcomes.
+
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    /// Live transport → the `session/cancel` notification is written to the
+    /// child's stdin and the helper reports it delivered.
+    #[tokio::test]
+    async fn delivers_cancel_on_live_transport() {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+        let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        let agent_id = AgentId::from("agent-idle-settle");
+
+        assert!(cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
+
+        // The cancel frame reached the agent side of the pipe.
+        let mut lines = BufReader::new(c2a_agent).lines();
+        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .expect("frame arrives")
+            .expect("read ok")
+            .expect("one frame");
+        let frame: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC frame");
+        assert_eq!(frame["method"], "session/cancel");
+        assert_eq!(frame["params"]["sessionId"], "acp-1");
+        assert!(frame.get("id").is_none(), "cancel is a notification");
+    }
+
+    /// Dead child (writer task exited on the broken pipe) → the helper
+    /// tolerates the transport-closed error and reports not delivered.
+    #[tokio::test]
+    async fn tolerates_transport_closed() {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+        let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        let agent_id = AgentId::from("agent-idle-settle-dead");
+
+        // Kill the writer: drop the child end of stdin, then poke the writer
+        // so it hits the broken pipe and exits, closing the channel.
+        drop(c2a_agent);
+        let _ = conn.notify("session/ping", serde_json::json!({})).await;
+        for _ in 0..200 {
+            if !conn.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!conn.is_alive(), "writer task exited on broken pipe");
+
+        assert!(!cancel_and_settle_idle_prompt(&conn, &agent_id, "acp-1").await);
     }
 }
 

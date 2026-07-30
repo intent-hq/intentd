@@ -265,6 +265,84 @@ fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
     vec![stale, chunk]
 }
 
+/// Shared crate-wide env guard (defined in `agent_manager::tests`): tests
+/// here that pin `INTENTD_PROMPT_IDLE_TIMEOUT_MS` must serialize with the
+/// worker-level tests that pin the same var.
+use crate::agent_manager::tests::EnvGuard;
+
+/// Mock agent that goes SILENT on `session/prompt`: it answers the lifecycle
+/// methods, streams the caller-supplied `session/update` burst, then never
+/// resolves the prompt — while keeping both pipe ends open (the child is
+/// alive, merely quiet). With a short `INTENTD_PROMPT_IDLE_TIMEOUT_MS` this
+/// drives the `AcpError::PromptIdleTimeout` return of `session::prompt`.
+fn spawn_silent_mock_agent<R, W>(read: R, write: W, updates: Vec<String>) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                write.flush().await.unwrap();
+                // Never resolve the prompt; keep reading so the pipes stay
+                // open (a `session/cancel` notification may still arrive).
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against the silent mock: `session/prompt` streams `updates`
+/// then never resolves, with the child pipes held open.
+fn connect_silent(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_silent_mock_agent(c2a_agent, a2c_agent, updates);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
 /// Mock agent that dies mid-`session/prompt`: it streams the caller-supplied
 /// `session/update` burst, then drops both pipe ends WITHOUT answering the
 /// prompt — the daemon's reader hits EOF and fails the pending request with
@@ -1952,6 +2030,205 @@ async fn post_output_transport_death_keeps_terminal_events() {
         .await
         .unwrap();
     assert_eq!(messages.len(), 1, "partial output persisted");
+}
+
+/// Warn-and-continue (idle timeout, silent turn): a prompt that goes the
+/// whole idle window with zero `session/update` traffic resolves with the
+/// idle-timeout error under the ORDINARY wrapper (no streamed-output suffix),
+/// emits a normal `agent:stream:end`, and SUPPRESSES `agent:failed` +
+/// `agent:idle` — the turn worker owns the warn/terminal decision.
+#[tokio::test]
+async fn idle_timeout_silent_turn_suppresses_agent_failed() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // The silent mock streams NOTHING and never resolves the prompt.
+    let (conn, mut note_rx, _agent) = connect_silent(Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-idle-1"),
+        )
+        .await
+        .expect_err("idle timeout fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with("session/prompt failed: session/prompt idle timeout"),
+        "idle timeout keeps the ordinary wrapper: {msg}"
+    );
+    assert!(
+        !msg.ends_with(crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX),
+        "a silent turn carries no streamed-output suffix: {msg}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["agent:stream:status", "agent:stream:end"],
+        "normal stream:end, no agent:failed / agent:idle on idle timeout"
+    );
+    // The stream:end is the NORMAL turn close (turn correlation intact, no
+    // messageId since nothing streamed).
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_eq!(end.data["turnId"], json!("turn-idle-1"));
+    assert!(end.data.get("messageId").is_none());
+    // Nothing streamed → no assistant row persisted.
+    assert!(
+        bus.store()
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no transcript row for a fully silent timed-out turn"
+    );
+}
+
+/// Warn-and-continue (idle timeout after streamed output): the partial
+/// assistant row is flushed to the transcript, the normal `agent:stream:end`
+/// carries its `messageId`, `agent:failed` stays suppressed, and the wrapped
+/// error carries the streamed-output suffix (the worker restarts its
+/// consecutive-timeout counter on it).
+#[tokio::test]
+async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "partial work" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_silent(vec![chunk]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("idle timeout fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with("session/prompt failed: session/prompt idle timeout"),
+        "idle timeout keeps the ordinary wrapper: {msg}"
+    );
+    assert!(
+        msg.ends_with(crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX),
+        "streamed output stamps the activity suffix: {msg}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "agent:stream:status",
+            "agent:stream:chunk",
+            "agent:stream:end"
+        ],
+        "partial streams, normal stream:end, no agent:failed / agent:idle"
+    );
+    // The partial persists as the turn's assistant row (interrupt-flush
+    // semantics) and the stream:end advertises it.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "partial output persisted");
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[0].content[0]["text"], json!("partial work"));
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+}
+
+/// Warn-and-continue (idle timeout after an UNMAPPED update): a
+/// `session/update` variant with no canonical turn mapping (here a thought
+/// chunk — same class as plan/mode/usage) still reset the idle timer, so it
+/// counts as intervening activity: the wrapped error carries the
+/// streamed-output suffix even though nothing was applied to the transcript.
+#[tokio::test]
+async fn idle_timeout_after_unmapped_update_marks_streamed() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let thought = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "thinking" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_silent(vec![thought]);
+    let _sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("idle timeout fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with("session/prompt failed: session/prompt idle timeout"),
+        "idle timeout keeps the ordinary wrapper: {msg}"
+    );
+    assert!(
+        msg.ends_with(crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX),
+        "an unmapped update still stamps the activity suffix: {msg}"
+    );
+    // Nothing mapped → no assistant row persisted.
+    assert!(
+        bus.store()
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no transcript row when only unmapped updates arrived"
+    );
 }
 
 /// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by

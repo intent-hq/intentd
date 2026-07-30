@@ -1177,6 +1177,16 @@ pub(crate) fn branch_prefix(settings: &SettingsFile) -> String {
     settings.workspace.branch_prefix.clone().unwrap_or_default()
 }
 
+/// The effective `workspace.worktreesLocation` (default empty = unset) — the
+/// parent directory `workspace.create` provisions new checkouts under.
+pub(crate) fn worktrees_location(settings: &SettingsFile) -> String {
+    settings
+        .workspace
+        .worktrees_location
+        .clone()
+        .unwrap_or_default()
+}
+
 /// The effective `agents.maxConcurrent` setting: a positive integer sets an
 /// explicit cap; 0 (the default) means "auto" (RAM-based cap via
 /// `default_process_cap`). The typed schema already rejects negative /

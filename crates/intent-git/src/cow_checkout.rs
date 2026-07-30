@@ -111,11 +111,13 @@ pub fn provision_cow_checkout_timed(
 ) -> Result<(String, CowProvisionTimings)> {
     let started = Instant::now();
     let mut timings = CowProvisionTimings::default();
-    // Canonicalize first: a symlinked `repo_path` would otherwise be cloned
-    // as the symlink itself (both the recursive clonefile and the best-effort
-    // walk preserve links without following the root), leaving `checkout_path`
-    // resolving THROUGH the link into the original repo — so the registration
-    // strip and hard reset below would operate on the user's source checkout.
+    // Canonicalize first: the whole-tree clonefile(2) follows a symlink
+    // root (materializing a real cloned tree), but the best-effort walk
+    // preserves links without following the root — a symlinked `repo_path`
+    // taking that path would be cloned as the symlink itself, leaving
+    // `checkout_path` resolving THROUGH the link into the original repo —
+    // so the registration strip and hard reset below would operate on the
+    // user's source checkout.
     let repo_path = repo_path.canonicalize().map_err(|e| {
         Error::InvalidInput(format!(
             "cannot canonicalize repository path {}: {e}",

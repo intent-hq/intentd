@@ -1,6 +1,15 @@
 //! Error type for the ACP client transport and handshake (§6.2–§6.4).
 
 use std::fmt;
+use std::time::Duration;
+
+/// Stable Display prefix of [`AcpError::PromptIdleTimeout`]. The service layer
+/// flattens prompt errors to strings at its wrap boundary
+/// (`session/prompt failed: …`), so downstream classification is
+/// prefix-anchored string matching — this const is the contract that survives
+/// the flatten (see `acp_error_prompt_idle_timeout_display_is_prefix_anchored`
+/// in `tests.rs`, which pins the Display rendering to it).
+pub const PROMPT_IDLE_TIMEOUT_PREFIX: &str = "session/prompt idle timeout";
 
 /// A JSON-RPC 2.0 error object returned by the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +76,15 @@ pub enum AcpError {
     /// A request did not receive a response within the timeout.
     #[error("request `{0}` timed out")]
     Timeout(String),
+
+    /// The `session/prompt` turn went the whole idle window with no
+    /// `session/update` traffic (activity-based idle timeout, distinct from
+    /// the per-request [`AcpError::Timeout`]). Carries the idle window that
+    /// elapsed. Structurally distinguishable so the turn worker can
+    /// warn-and-continue instead of failing the turn; the Display rendering
+    /// is pinned to [`PROMPT_IDLE_TIMEOUT_PREFIX`].
+    #[error("session/prompt idle timeout ({0:?} of silence)")]
+    PromptIdleTimeout(Duration),
 
     /// The agent returned a JSON-RPC error response.
     #[error("{0}")]

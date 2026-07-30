@@ -39,6 +39,23 @@ const WRITER_CHANNEL_CAPACITY: usize = 256;
 
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>>>;
 
+/// Removes a request's pending-map entry when the request future completes or
+/// is dropped, making [`Connection::request_timeout`] cancel-safe with respect
+/// to the correlation map: a caller that abandons the future mid-flight (e.g.
+/// `session::prompt`'s idle-timeout early return) no longer leaks the entry
+/// until the agent closes stdout. Removal after the reader task already
+/// dispatched the response is a harmless no-op.
+struct PendingEntryGuard {
+    pending: PendingMap,
+    id: i64,
+}
+
+impl Drop for PendingEntryGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// An agent→client request that must be served by a client-side handler
 /// (`fs/*`, `terminal/*`, `session/request_permission`). For M3.3 this is a
 /// plumbing hook; the handlers themselves land in M3.5.
@@ -406,10 +423,16 @@ impl Connection {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // Drop-guard cleanup: covers the error/timeout arms below AND the
+        // caller dropping this future mid-flight (cancel-safety for the
+        // pending map — see `PendingEntryGuard`).
+        let _guard = PendingEntryGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
 
         let line = encode_message(Some(id), method, &params)?;
         if self.writer_tx.send(line).await.is_err() {
-            self.pending.lock().unwrap().remove(&id);
             return Err(AcpError::Transport("writer task closed".to_string()));
         }
 
@@ -417,11 +440,15 @@ impl Connection {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(err))) => Err(AcpError::Rpc(err)),
             Ok(Err(_)) => Err(AcpError::Transport("response channel dropped".to_string())),
-            Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(AcpError::Timeout(method.to_string()))
-            }
+            Err(_) => Err(AcpError::Timeout(method.to_string())),
         }
+    }
+
+    /// Number of in-flight request correlation entries (test observability
+    /// for the pending-map cancel-safety guarantee).
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap().len()
     }
 
     /// Send a notification (no id, no response).

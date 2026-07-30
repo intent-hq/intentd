@@ -1,0 +1,25 @@
+# Steps injected into v-release.yml's build-local-artifacts job via the
+# `github-build-setup` dist setting (dist-workspace.toml). NOT a standalone
+# workflow. Needed because the self-hosted runners (tinybox / m1mac / 5090pc)
+# don't guarantee the preinstalled toolchain state of GitHub-hosted images:
+# tinybox has no rustup at all, and none of them necessarily have the pinned
+# toolchain or the cross targets (x86_64-apple-darwin on the arm64 Mac, musl
+# on Linux) installed.
+- name: Provision Rust toolchain and matrix targets (self-hosted runners)
+  shell: bash
+  run: |
+    if ! command -v rustup >/dev/null 2>&1; then
+      if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+      fi
+      echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+    channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+    rustup toolchain install "$channel" --profile minimal --no-self-update
+    rustup target add --toolchain "$channel" ${{ join(matrix.targets, ' ') }}
+    # dist's musl packages_install does a user-site `pip3 install
+    # cargo-zigbuild` on the Linux runner, which lands in ~/.local/bin —
+    # not on the runner service's PATH.
+    mkdir -p "$HOME/.local/bin"
+    echo "$HOME/.local/bin" >> "$GITHUB_PATH"

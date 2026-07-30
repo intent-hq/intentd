@@ -346,7 +346,7 @@ mod tests {
     }
 
     /// Whole-directory clone that leaves a partial destination behind before
-    /// failing as unsupported (a failed recursive copyfile does this).
+    /// failing as unsupported (a failed whole-tree clone may do this).
     fn partial_then_unsupported_clone_dir(_src: &Path, dst: &Path) -> Result<()> {
         fs::create_dir(dst).unwrap();
         fs::write(dst.join("junk-partial"), b"junk").unwrap();

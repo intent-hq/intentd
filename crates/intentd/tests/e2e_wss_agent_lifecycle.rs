@@ -10364,7 +10364,12 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
                     if e["block"]["type"] == "tool_use" && e["block"]["toolCallId"] == "tc_title" {
                         last_tool_block = Some(e["block"].clone());
                     }
-                    if e.get("streamingComplete") == Some(&Value::Bool(true)) {
+                    // Terminal = the ASSISTANT turn's reconcile; user-row
+                    // deltas also carry `streamingComplete: true` but arrive
+                    // before the turn streams.
+                    if e["role"] == "assistant"
+                        && e.get("streamingComplete") == Some(&Value::Bool(true))
+                    {
                         is_terminal = true;
                     }
                 }
@@ -10425,5 +10430,303 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
     assert_eq!(
         persisted_block, &live_block,
         "live and persisted tool_use blocks agree byte-for-byte (§7.1)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// chat.subscribe user-row deltas: persisted non-assistant rows (direct sends,
+// queue drains) surface as live `subscription.push` deltas carrying the row's
+// real role, so subscribed clients render new user messages with no refetch.
+// ---------------------------------------------------------------------------
+
+/// Scan chat-channel pushes for the next delta entity matching `pred`,
+/// returning the (entity, delta) pair. Bounded by one shared deadline.
+async fn await_chat_entity<S, F>(
+    chat: &mut WebSocketStream<S>,
+    secs: u64,
+    mut pred: F,
+) -> (Value, Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(&Value) -> bool,
+{
+    timeout(Duration::from_secs(secs), async {
+        loop {
+            let frame = wss_push(chat, secs).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| pred(e))
+            {
+                return (entity.clone(), delta);
+            }
+        }
+    })
+    .await
+    .expect("matching chat delta entity arrived in time")
+}
+
+/// Queue-drain path: client A queues a message behind a busy agent; when the
+/// first turn completes and the queue drains, client B's `chat.subscribe`
+/// receives the dequeued user row as a delta (role `user`, terminal fields)
+/// BEFORE the second turn's assistant chunks — no refetch needed.
+#[tokio::test]
+async fn queue_drain_user_row_delta_over_chat_subscribe() {
+    let Some(script) = gate("WSS queue-drain user-row chat delta E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // First turn is slow so the second send lands on a busy agent and queues.
+    let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Conn A (RPC) — create the agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "QueueDrainDelta", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Conn B (chat) — subscribe BEFORE any message so every delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    // Conn A — first message streams (idle agent), second queues (busy agent).
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first message" }),
+    )
+    .await;
+    assert_eq!(send1["queued"], false, "first send streams: {send1}");
+    sleep(Duration::from_millis(200)).await;
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "queued message" }),
+    )
+    .await;
+    assert_eq!(send2["queued"], true, "second send queues: {send2}");
+
+    // Conn B — the drained user row arrives as a delta with role "user" and
+    // the queued content, BEFORE the second turn's assistant chunks. The
+    // daemon does not order the drain's user-row emit against the FIRST
+    // turn's terminal frames (independent async paths, STAB-4 precedent), so
+    // the ordering gate keys off assistant message IDENTITY: any assistant
+    // entity with a second distinct messageId seen before the user row is a
+    // second-turn chunk that jumped the queue.
+    let mut assistant_message_ids: Vec<String> = Vec::new();
+    let mut second_turn_chunk_before_user = false;
+    let (user_entity, user_delta) = await_chat_entity(&mut chat, 30, |e| {
+        let role = e["role"].as_str().unwrap_or("");
+        let text = e["block"]["text"].as_str().unwrap_or("");
+        if role == "assistant" {
+            if let Some(mid) = e["messageId"].as_str() {
+                if !assistant_message_ids.iter().any(|m| m == mid) {
+                    assistant_message_ids.push(mid.to_string());
+                }
+                if assistant_message_ids.len() >= 2 {
+                    second_turn_chunk_before_user = true;
+                }
+            }
+        }
+        role == "user" && text == "queued message"
+    })
+    .await;
+    assert!(
+        !second_turn_chunk_before_user,
+        "the dequeued user row must arrive before the second turn's assistant \
+         chunks (assistant messageIds seen first: {assistant_message_ids:?})"
+    );
+    assert_eq!(user_entity["agentId"], json!(agent_id));
+    assert_eq!(user_entity["streamingComplete"], json!(true));
+    assert!(
+        user_entity["messageSeq"].is_u64(),
+        "user-row entity carries the authoritative seq: {user_entity}"
+    );
+    assert!(
+        user_entity["timestamp"].is_string(),
+        "user-row entity carries the row timestamp: {user_entity}"
+    );
+    assert_eq!(
+        user_delta["removedIds"],
+        json!([]),
+        "user-row delta removes nothing: {user_delta}"
+    );
+    let message_id = user_entity["messageId"].as_str().expect("messageId");
+    assert_eq!(
+        user_entity["block"]["id"],
+        json!(format!("{message_id}:0")),
+        "stable synthetic block id: {user_entity}"
+    );
+
+    // Byte-consistency with the persisted row: same id, role, seq, timestamp,
+    // and text as agent.getConversation reports.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(message_id))
+        .expect("dequeued user row persisted")
+        .clone();
+    assert_eq!(row["role"], "user");
+    assert_eq!(row["seq"], user_entity["messageSeq"]);
+    assert_eq!(row["timestamp"], user_entity["timestamp"]);
+    assert_eq!(
+        row["contentBlocks"][0]["text"], user_entity["block"]["text"],
+        "delta block text matches the persisted row"
+    );
+}
+
+/// Direct-send path: a plain `agent.sendMessage` from connection A (idle
+/// agent) surfaces as a user-row delta on connection B's `chat.subscribe`
+/// BEFORE any assistant chunk of the triggered turn.
+#[tokio::test]
+async fn direct_send_user_row_delta_over_chat_subscribe() {
+    let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "direct reply" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "DirectSendDelta", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from A" }),
+    )
+    .await;
+    assert_eq!(sent["queued"], false, "idle agent streams: {sent}");
+    let sent_row_id = sent["messageId"].as_str().expect("messageId").to_string();
+
+    // The user row is persisted (and its agent:message published) BEFORE the
+    // turn worker spawns, so it must be the first delta B sees — before any
+    // assistant chunk.
+    let mut saw_assistant_first = false;
+    let (user_entity, _) = await_chat_entity(&mut chat, 30, |e| {
+        let role = e["role"].as_str().unwrap_or("");
+        if role == "assistant" {
+            saw_assistant_first = true;
+        }
+        role == "user" && e["block"]["text"].as_str() == Some("hello from A")
+    })
+    .await;
+    assert!(
+        !saw_assistant_first,
+        "the user row precedes every assistant chunk of the triggered turn"
+    );
+    assert_eq!(user_entity["agentId"], json!(agent_id));
+    assert_eq!(
+        user_entity["messageId"],
+        json!(sent_row_id),
+        "delta names the exact persisted row the RPC result returned"
+    );
+    assert_eq!(user_entity["role"], "user");
+    assert_eq!(user_entity["streamingComplete"], json!(true));
+    assert_eq!(
+        user_entity["block"]["id"],
+        json!(format!("{sent_row_id}:0")),
+        "stable synthetic block id: {user_entity}"
     );
 }

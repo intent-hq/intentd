@@ -1,4 +1,5 @@
-//! macOS CoW implementation using copyfile(3) with COPYFILE_CLONE|COPYFILE_RECURSIVE.
+//! macOS CoW implementation: clonefile(2) for whole-tree clones, copyfile(3)
+//! with COPYFILE_CLONE for single-file clones (probe path).
 
 use intent_core::{Error, Result};
 use std::ffi::CString;
@@ -9,7 +10,6 @@ use super::{CowCloneStats, CowSupport};
 
 // copyfile(3) flags from copyfile.h
 const COPYFILE_CLONE: u32 = 1 << 24;
-const COPYFILE_RECURSIVE: u32 = 1 << 15;
 
 // getattrlist volume capability constants
 // TODO: Re-enable fast path once f_fsid comparison is fixed for APFS
@@ -27,6 +27,8 @@ extern "C" {
         state: *mut libc::c_void,
         flags: u32,
     ) -> libc::c_int;
+
+    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 
     #[allow(dead_code)]
     fn getattrlist(
@@ -250,11 +252,12 @@ pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneSta
             whole_tree: true,
             ..CowCloneStats::default()
         }),
-        // The whole-tree clonefile fails with ENOTSUP when the tree contains
-        // entries a reflink cannot carry (e.g. a live Unix socket or FIFO),
-        // even though the volume pair supports cloning. Retry with the
-        // best-effort per-entry walk, which skips only genuinely
-        // non-clonable entries.
+        // clonefile(2) clones special nodes (live Unix sockets, FIFOs) on
+        // APFS, so unlike the recursive copyfile(3) it replaced it does not
+        // fail on socket-bearing trees. The fallback remains for the cases
+        // where the whole-tree clone is still unsupported (e.g. older
+        // OS/filesystem combinations); retry with the best-effort per-entry
+        // walk, which skips only genuinely non-clonable entries.
         Err(Error::Unsupported(reason)) if src.is_dir() => {
             tracing::debug!(
                 src = %src.display(),
@@ -262,7 +265,7 @@ pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneSta
                 "cow_clone: whole-tree clonefile unsupported; retrying with best-effort per-entry clone"
             );
             if dst.exists() {
-                // A failed recursive copyfile leaves a partial destination
+                // A failed whole-tree clone may leave a partial destination
                 // tree behind; clear it before the walk. If the cleanup
                 // fails the walk would die on EEXIST and obscure the real
                 // failure, so surface the cleanup error directly.
@@ -287,21 +290,20 @@ fn walk(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
         .map(CowCloneStats::from)
 }
 
-/// Fast path: clone the whole tree with a single recursive copyfile(3).
+/// Fast path: clone the whole tree with a single kernel-side clonefile(2).
+/// The destination must not exist. On APFS clonefile clones special nodes
+/// (live Unix sockets, FIFOs) that the recursive copyfile(3) it replaced
+/// aborted on with ENOTSUP. Note that with flags 0 clonefile follows a
+/// symlink root (the clone materializes the target directory), whereas the
+/// recursive copyfile cloned the link itself; callers that must not follow
+/// a symlinked source should canonicalize first (as cow_checkout does).
 fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
     let src_cstr = CString::new(src.as_os_str().as_bytes())
         .map_err(|e| Error::Internal(format!("invalid src path: {e}")))?;
     let dst_cstr = CString::new(dst.as_os_str().as_bytes())
         .map_err(|e| Error::Internal(format!("invalid dst path: {e}")))?;
 
-    let ret = unsafe {
-        copyfile(
-            src_cstr.as_ptr(),
-            dst_cstr.as_ptr(),
-            std::ptr::null_mut(),
-            COPYFILE_CLONE | COPYFILE_RECURSIVE,
-        )
-    };
+    let ret = unsafe { clonefile(src_cstr.as_ptr(), dst_cstr.as_ptr(), 0) };
 
     if ret == 0 {
         Ok(())
@@ -311,7 +313,65 @@ fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
             libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV => {
                 Err(Error::Unsupported("CoW cloning not supported".to_string()))
             }
-            _ => Err(Error::Internal(format!("copyfile failed: errno {errno}"))),
+            _ => Err(Error::Internal(format!("clonefile failed: errno {errno}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    /// Regression test for the whole-tree fast path on socket-bearing trees
+    /// (intent-hq/monorepo#1125): a source tree containing a live Unix socket
+    /// must clone via the single whole-tree clone — `clonefile(2)` clones
+    /// socket nodes on APFS, where the previous recursive `copyfile(3)`
+    /// aborted with ENOTSUP and forced the best-effort walk fallback.
+    /// Gated like the other APFS-dependent cow tests: skipped when the
+    /// filesystem cannot CoW-clone.
+    #[test]
+    fn whole_tree_fast_path_clones_tree_with_live_unix_socket() {
+        let base = std::env::temp_dir().join(format!("cow_clonefile_sock_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/file.txt"), b"data").unwrap();
+
+        match probe(&src, &base) {
+            Ok(CowSupport::Supported) => {}
+            _ => {
+                eprintln!(
+                    "skipping whole_tree_fast_path_clones_tree_with_live_unix_socket: \
+                     CoW not supported on this filesystem"
+                );
+                let _ = fs::remove_dir_all(&base);
+                return;
+            }
+        }
+
+        let listener = UnixListener::bind(src.join("live.sock")).expect("bind unix socket");
+
+        let stats = clone(&src, &dst, &[]).unwrap();
+
+        assert!(
+            stats.whole_tree,
+            "socket-bearing tree must clone via the whole-tree fast path"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/file.txt")).unwrap(),
+            "data"
+        );
+        // clonefile(2) carries the socket node itself into the clone.
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(dst.join("live.sock"))
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -165,6 +165,40 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read the effective per-workspace auto-commit state (§5.1): the
+    /// persisted workspace override when set (mirrored from the global
+    /// `git.autoCommit` at create time), else the current global setting
+    /// (pre-migration rows have no override). Returns
+    /// `{ enabled, source: "workspace" | "global" }`. `NotFound` if the
+    /// workspace is absent (router maps it to `-32602`).
+    fn get_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::get_workspace_auto_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Persist the per-workspace auto-commit override (§5.1) and emit a
+    /// `workspace:updated` event carrying `{ autoCommitEnabled }` so live
+    /// clients mirror the toggle. `NotFound` if the workspace is absent.
+    fn set_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_workspace_auto_commit not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Read the durable worktree setup script for a workspace (§5.25). Returns a
     /// default (empty `script`, `updatedAt: 0`) record before the first save.
     /// `NotFound` if the workspace is absent (router maps it to `-32602`).

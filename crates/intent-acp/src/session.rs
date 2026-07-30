@@ -71,7 +71,22 @@ fn session_setup_timeout() -> Duration {
 /// all 30 minutes, so the daemon must not cut idle turns earlier than the FE
 /// stops waiting (STAB-49; the previous 15-minute default killed healthy
 /// long-running implementor turns).
-fn prompt_idle_timeout() -> Duration {
+///
+/// Do NOT raise this timeout (or advise bumping
+/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`) to accommodate one long-running silent
+/// turn. It applies to EVERY agent harness/provider driving a
+/// `session/prompt` turn through intentd — it is not per-agent or
+/// per-workload — so widening it affects all harnesses and breaks the FE
+/// 30-minute contract above. The remedy for long silent operations (e.g. an
+/// agent blocking on `sleep` / `gh pr checks --watch` loops for >30 min) is
+/// agent-side: emit periodic activity by polling in shorter intervals.
+/// Context: intent-hq/monorepo#1106 diagnosis (2026-07-29), where a
+/// 30-minute silent watch loop tripped this timeout.
+///
+/// Public so the service layer's warn-and-continue path can render the
+/// actual configured window in the timeout-warning message instead of a
+/// hardcoded literal.
+pub fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
             return Duration::from_millis(ms);
@@ -197,10 +212,10 @@ pub async fn prompt(
 
     // Use a very large fallback timeout (24h) to catch agent-died-without-
     // closing-stdout edge cases, but the idle timeout below provides the real
-    // bound. NOTE: returning early on idle timeout (below) drops req_fut before
-    // it reaches request_timeout's cleanup branch, so the pending-map entry
-    // leaks until the fallback expires or the agent closes stdout. This is a
-    // known limitation; fixing it requires Connection to expose a cancel(id) API.
+    // bound. Returning early on idle timeout (below) drops req_fut, whose
+    // pending-map entry is removed by the transport's drop guard (see
+    // `Connection::request_timeout`); a late response from the agent is then
+    // dispatched into the void harmlessly.
     let fallback_timeout = Duration::from_secs(24 * 60 * 60);
     let req_fut = conn.request_timeout("session/prompt", params, fallback_timeout);
     tokio::pin!(req_fut);
@@ -219,11 +234,9 @@ pub async fn prompt(
             _ = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
-                    // Return early without cleaning pending-map entry (see
-                    // fallback_timeout comment above for the leak rationale).
-                    return Err(AcpError::Timeout(format!(
-                        "session/prompt idle timeout ({idle_window:?} of silence)"
-                    )));
+                    // Early return drops req_fut; its pending-map entry is
+                    // cleaned by the transport's drop guard (comment above).
+                    return Err(AcpError::PromptIdleTimeout(idle_window));
                 }
             }
         }
@@ -689,17 +702,40 @@ mod tests {
     /// Default idle window is 30 minutes, matching the FE contract
     /// (`SESSION_TIMEOUT` / `abandonedStreamTimeout` / `inactiveThreshold` are
     /// all 30 min), and the `INTENTD_PROMPT_IDLE_TIMEOUT_MS` override still
-    /// applies (STAB-49). Default and override are checked in one test because
-    /// the env var is process-global and tests run in parallel.
-    #[test]
-    fn prompt_idle_timeout_default_and_env_override() {
+    /// applies (STAB-49). Default, override, and the structured idle-timeout
+    /// return of `prompt()` are checked in one test because the env var is
+    /// process-global and tests run in parallel.
+    #[tokio::test]
+    async fn prompt_idle_timeout_default_and_env_override() {
         let _guard = EnvGuard::new("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
 
         std::env::remove_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
         assert_eq!(prompt_idle_timeout(), Duration::from_secs(30 * 60));
 
-        std::env::set_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "5000");
-        assert_eq!(prompt_idle_timeout(), Duration::from_millis(5000));
+        std::env::set_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100");
+        assert_eq!(prompt_idle_timeout(), Duration::from_millis(100));
+
+        // A silent agent (remote duplex ends held open, never responding):
+        // `prompt()` must resolve with the structured `PromptIdleTimeout`
+        // variant and leave no leaked pending-map entry behind (the
+        // transport's drop guard cleans the abandoned correlation entry).
+        let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+        let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            crate::ConnectionHooks::default(),
+        );
+        let activity = ActivityTracker::new();
+        let err = prompt(&conn, "sess-1", Vec::new(), &activity)
+            .await
+            .expect_err("silent agent must idle-time-out");
+        assert!(
+            matches!(err, AcpError::PromptIdleTimeout(w) if w == Duration::from_millis(100)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(conn.pending_len(), 0, "abandoned prompt entry cleaned up");
 
         std::env::remove_var("INTENTD_PROMPT_IDLE_TIMEOUT_MS");
         assert_eq!(prompt_idle_timeout(), Duration::from_secs(30 * 60));
