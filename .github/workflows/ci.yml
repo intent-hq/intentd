@@ -310,13 +310,18 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      # Non-fatal + short retention: the lcov artifact is a debugging aid
+      # only, and an org artifact-quota outage must not fail the required
+      # check when all tests passed (monorepo#1163).
       - name: Upload coverage artifact
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: e2e-coverage-lcov
           path: lcov.info
           if-no-files-found: warn
+          retention-days: 3
 
   coverage-all:
     needs: route
@@ -386,13 +391,17 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      # Non-fatal + short retention — same rationale as coverage-e2e's
+      # upload step (monorepo#1163).
       - name: Upload coverage artifact
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: combined-coverage-lcov
           path: lcov.info
           if-no-files-found: warn
+          retention-days: 3
 
   pr-title:
     needs: route
