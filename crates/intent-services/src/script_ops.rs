@@ -106,6 +106,36 @@ pub(crate) struct ScriptManager {
     too_fast_ms: u128,
 }
 
+/// Cancellation guard for the `script.run` reservation window (reserve →
+/// `resolve_cwd` → `pty.spawn`): if the caller drops the `run()` future while
+/// armed — before a PTY exists and the detached completion task takes over —
+/// restore the pre-reservation status so the script is not stuck `running`
+/// forever. No `script:state` was emitted for the reservation, so the restore
+/// is silent.
+struct RunReservation {
+    mgr: ScriptManager,
+    key: (WorkspaceId, String),
+    prev: ScriptStatus,
+    armed: bool,
+}
+
+impl Drop for RunReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort restore: a poisoned registry mutex must not abort the
+        // process by panicking inside a drop during unwinding.
+        if let Ok(mut guard) = self.mgr.scripts.lock() {
+            if let Some(m) = guard.get_mut(&self.key) {
+                if m.state.status == ScriptStatus::Running {
+                    m.state.status = self.prev;
+                }
+            }
+        }
+    }
+}
+
 impl ScriptManager {
     /// Wire the manager over the shared host/bus/store/registry/bootstrap-locks.
     pub(crate) fn new(
@@ -510,7 +540,13 @@ impl ScriptManager {
 
     /// `script.run`: run a command-mode script to completion (optional timeout),
     /// returning its captured output + exit code; service scripts return a
-    /// `warning` directing callers to `script.start`. Scoped to `workspace_id`.
+    /// `warning` directing callers to `script.start`, and a script already
+    /// running warn-and-returns (mirrors `start()`'s guard) so a second run
+    /// can never overwrite `pty_id` and orphan the first run's PTY
+    /// (monorepo#1155). The `running` status is reserved under the same lock
+    /// acquisition as the guard check, so two concurrent entries cannot both
+    /// pass the guard during the pre-`mark_running` window (`resolve_cwd`
+    /// awaits in between). Scoped to `workspace_id`.
     pub(crate) async fn run(
         &self,
         workspace_id: &WorkspaceId,
@@ -518,41 +554,102 @@ impl ScriptManager {
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> Result<Value> {
-        let def = self
-            .scripts
-            .lock()
-            .unwrap()
-            .get(&(workspace_id.clone(), script_id.to_string()))
-            .map(|m| m.def.clone())
-            .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
-        if def.mode == ScriptMode::Service {
-            return Ok(json!({
-                "output": "",
-                "warning": "Script is a service; use script.start instead of script.run.",
-            }));
-        }
-        let ws = workspace_id.clone();
-        let cwd = self.resolve_cwd(&ws, &def).await?;
-        let pty_id = self.pty.spawn(self.build_spec(&ws, &def, &cwd))?;
-        self.mark_running(&ws, script_id, pty_id).await;
-        let timed_out = match timeout_seconds.filter(|s| *s > 0) {
-            Some(s) => {
-                let fut = self.run_one(&ws, script_id, pty_id, false);
-                match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
-                    Ok(_) => false,
-                    Err(_) => {
-                        self.pty.kill(pty_id).await;
-                        true
-                    }
-                }
+        let (def, prev_status) = {
+            let mut guard = self.scripts.lock().unwrap();
+            let m = guard
+                .get_mut(&(workspace_id.clone(), script_id.to_string()))
+                .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+            if m.def.mode == ScriptMode::Service {
+                return Ok(json!({
+                    "output": "",
+                    "warning": "Script is a service; use script.start instead of script.run.",
+                }));
             }
-            None => {
-                self.run_one(&ws, script_id, pty_id, false).await;
-                false
+            if m.state.status == ScriptStatus::Running {
+                return Ok(json!({
+                    "output": "",
+                    "warning": "Script is already running; wait for it to finish or use script.stop.",
+                }));
+            }
+            // Reserve the run before releasing the lock: a concurrent `run()`
+            // entering during the awaits below must hit the guard above.
+            // `mark_running` fills in pid/started_at once the PTY exists; a
+            // resolve/spawn failure resets via `fail()`, and a caller-side
+            // cancellation before the PTY exists restores the prior status
+            // via `reservation` (nothing to clean up yet, no event emitted).
+            // The previous run's `pid` is cleared here so the window never
+            // reports `running` with a stale pid; `script.stop` inside the
+            // window is a benign no-op (nothing spawned yet, one store read
+            // wide) and the run proceeds to its own timeout/exit.
+            let prev = m.state.status;
+            m.state.status = ScriptStatus::Running;
+            m.state.pid = None;
+            (m.def.clone(), prev)
+        };
+        let mut reservation = RunReservation {
+            mgr: self.clone(),
+            key: (workspace_id.clone(), script_id.to_string()),
+            prev: prev_status,
+            armed: true,
+        };
+        let ws = workspace_id.clone();
+        let cwd = match self.resolve_cwd(&ws, &def).await {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                reservation.armed = false;
+                self.fail(&ws, script_id, &e.to_string()).await;
+                return Err(e);
             }
         };
-        let exit = self.pty.try_exit(pty_id).ok().flatten();
-        self.mark_exited(&ws, script_id, exit.clone()).await;
+        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
+            Ok(id) => id,
+            Err(e) => {
+                reservation.armed = false;
+                self.fail(&ws, script_id, &e.to_string()).await;
+                return Err(e);
+            }
+        };
+        // The completion path (mark-running → stream → timeout kill →
+        // `mark_exited`) runs on a detached task spawned with no await point
+        // after `pty.spawn` (modeled on `host_exec_stream::run_wait_loop`), so
+        // dropping this future — e.g. an eval-level timeout cancelling the
+        // RPC — cannot orphan the PTY or skip the `script:state` teardown
+        // (monorepo#1155).
+        let mgr = self.clone();
+        let ws_task = ws.clone();
+        let sid = script_id.to_string();
+        reservation.armed = false;
+        let completion = tokio::spawn(async move {
+            // Removed concurrently (script.remove / create-upsert) between
+            // `pty.spawn` and here: the remover killed the *old* pty_id (or
+            // none), so reap the fresh PTY ourselves — mirrors `supervise()`.
+            if !mgr.mark_running(&ws_task, &sid, pty_id).await {
+                mgr.pty.kill(pty_id).await;
+                return (None, false);
+            }
+            let timed_out = match timeout_seconds.filter(|s| *s > 0) {
+                Some(s) => {
+                    let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
+                    match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
+                        Ok(_) => false,
+                        Err(_) => {
+                            mgr.pty.kill(pty_id).await;
+                            true
+                        }
+                    }
+                }
+                None => {
+                    mgr.run_one(&ws_task, &sid, pty_id, false).await;
+                    false
+                }
+            };
+            let exit = mgr.pty.try_exit(pty_id).ok().flatten();
+            mgr.mark_exited(&ws_task, &sid, exit.clone()).await;
+            (exit, timed_out)
+        });
+        let (exit, timed_out) = completion
+            .await
+            .map_err(|e| Error::Internal(format!("script.run completion task failed: {e}")))?;
         let bytes = self.pty.scrollback(pty_id).unwrap_or_default();
         let mut output = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(n) = max_lines.filter(|n| *n > 0) {
@@ -1869,6 +1966,238 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["timedOut"], true);
+    }
+
+    /// Regression (monorepo#1155): a second `script.run` while the script is
+    /// already running must not spawn a second PTY or overwrite `pty_id`
+    /// (which would orphan the first run's process on stop/remove); it
+    /// warn-and-returns with the service-mode warning shape.
+    #[tokio::test]
+    async fn script_run_while_running_warns_without_second_pty() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let first = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+
+        // Second run while the first is still running: warn-and-return, no
+        // second PTY spawn (bounded timeout so an unguarded second PTY fails
+        // the shape assertions instead of hanging the test).
+        let out = h
+            .services
+            .script_run(h.ws.clone(), id.clone(), None, Some(5))
+            .await
+            .expect("second run");
+        assert_eq!(out["output"], "", "warn-and-return shape: {out:?}");
+        assert!(
+            out["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already running"),
+            "warning says already running: {out:?}"
+        );
+
+        // `pty_id` was not overwritten: status still reports the first run's pid.
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "running");
+        assert_eq!(st["pid"], json!(pid), "pid unchanged: {st:?}");
+
+        // Stop kills the tracked (first) PTY and the first run completes.
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+        let res = first.await.expect("join").expect("first run");
+        assert_eq!(res["timedOut"], false);
+    }
+
+    /// Regression (monorepo#1155): dropping the `script.run` future mid-flight
+    /// (as an eval-level timeout cancelling the RPC does) must not skip
+    /// cleanup — the detached completion task still enforces the script-level
+    /// timeout, kills the PTY (child reaped, no orphan), and emits the
+    /// `exited` `script:state` transition.
+    #[tokio::test]
+    async fn script_run_dropped_future_still_reaps_and_marks_exited() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
+        // Drive `run` until the script is `running`, then drop the future
+        // mid-flight (caller-side cancellation).
+        let pid = {
+            let mut fut = Box::pin(
+                h.services
+                    .script_run(h.ws.clone(), id.clone(), None, Some(1)),
+            );
+            'running: loop {
+                tokio::select! {
+                    res = &mut fut => panic!("script.run finished before cancellation: {res:?}"),
+                    batch = tokio::time::timeout(LIVENESS, sub.recv()) => {
+                        let batch = batch
+                            .expect("event delivered before deadline")
+                            .expect("subscription open");
+                        for ev in &batch {
+                            let v = serde_json::to_value(ev).expect("serialize");
+                            if v["type"] == "script:state" && v["data"]["status"] == "running" {
+                                break 'running v["data"]["pid"].as_i64().expect("pid");
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // The detached completion task must still time the script out, kill
+        // the PTY, and flip the state to `exited`.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited");
+        // The child process must be reaped — no orphan (kill -0 fails).
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run kill -0")
+                .success();
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "script process {pid} still alive after dropped script.run"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
+    /// reservation must reset the status via `fail()` — the script ends up
+    /// `exited` with the error recorded, and a follow-up run hits the same
+    /// error instead of the already-running guard.
+    #[tokio::test]
+    async fn script_run_cwd_failure_resets_reservation_via_fail() {
+        let h = harness_with_worktree(true).await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "bad-cwd".into(),
+                command: "echo never".into(),
+                mode: ScriptMode::Command,
+                cwd: Some("../escape".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let err = h
+            .services
+            .script_run(h.ws.clone(), id.clone(), None, Some(5))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escapes workspace root"),
+            "got: {err:?}"
+        );
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(
+            st["status"], "exited",
+            "fail() reset the reservation: {st:?}"
+        );
+        assert!(
+            st["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("escapes workspace root"),
+            "error recorded on state: {st:?}"
+        );
+        let err2 = h
+            .services
+            .script_run(h.ws.clone(), id, None, Some(5))
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string().contains("escapes workspace root"),
+            "follow-up run hits the cwd error, not the running guard: {err2:?}"
+        );
+    }
+
+    /// Regression (monorepo#1155): the running reservation is taken under the
+    /// same lock acquisition as the guard check, so a concurrent `script.run`
+    /// entering during the pre-`mark_running` window (the `resolve_cwd`
+    /// await) hits the already-running guard instead of spawning a second
+    /// PTY — and a caller-side cancellation inside that window releases the
+    /// reservation instead of leaving the script stuck `running`.
+    #[tokio::test]
+    async fn script_run_reservation_blocks_concurrent_entry_and_cancel_releases_it() {
+        let h = harness().await;
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
+        {
+            let mut fut = Box::pin(
+                h.services
+                    .script_run(h.ws.clone(), id.clone(), None, Some(1)),
+            );
+            // One poll reserves the run (synchronously, before the first
+            // await) and parks the future inside the reservation window.
+            let pending = tokio::time::timeout(Duration::from_millis(0), &mut fut).await;
+            assert!(pending.is_err(), "run should still be in flight");
+            // A concurrent entry inside the window warn-and-returns.
+            let out = h
+                .services
+                .script_run(h.ws.clone(), id.clone(), None, Some(5))
+                .await
+                .expect("concurrent run");
+            assert_eq!(out["output"], "", "warn-and-return shape: {out:?}");
+            assert!(
+                out["warning"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("already running"),
+                "warning says already running: {out:?}"
+            );
+            // Dropping `fut` cancels the first run mid-window.
+        }
+        // Whether the drop landed pre-spawn (silent reservation restore) or
+        // post-spawn (the detached task kills at the 1s timeout), the script
+        // must not stay `running`…
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let st = h
+                .services
+                .script_status(h.ws.clone(), id.clone())
+                .await
+                .expect("status");
+            if st["status"] != "running" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "script stuck running after cancelled reservation: {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // …and a fresh run passes the guard again (real envelope, no warning).
+        let out = h
+            .services
+            .script_run(h.ws.clone(), id, None, Some(1))
+            .await
+            .expect("fresh run");
+        assert_eq!(out["timedOut"], true, "fresh run executed: {out:?}");
+        assert!(out.get("warning").is_none(), "no warning: {out:?}");
     }
 
     #[tokio::test]
