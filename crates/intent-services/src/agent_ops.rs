@@ -4259,8 +4259,9 @@ impl Services {
     /// register a oneShot caller→target watch UNLESS the caller is a
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
-    /// wakeup cards unrelated to their own task. Idempotent: reuses an
-    /// existing watch when one already exists.
+    /// wakeup cards unrelated to their own task — or the caller is a child
+    /// of the target (watches are auto-registered parent→child only).
+    /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
         workspace_id: WorkspaceId,
@@ -4277,6 +4278,32 @@ impl Services {
             .map(is_delegated_background_task_session)
             .unwrap_or(false);
         if skip {
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        // SUB-1 child→parent suppression: the auto-watch is one-directional
+        // (parent→child only). A child sending a coordination message to its
+        // own parent must never be subscribed to the parent's completion —
+        // otherwise the child is woken whenever the parent goes idle. Child
+        // linkage is read from the caller session's `parent_agent_id`,
+        // falling back to the metadata `createdByAgentId` the create/delegate
+        // writers populate.
+        let is_child_of_target = caller_session
+            .as_ref()
+            .map(|s| {
+                s.parent_agent_id.as_ref() == Some(&target_agent_id)
+                    || s.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("createdByAgentId"))
+                        .and_then(Value::as_str)
+                        == Some(target_agent_id.0.as_str())
+            })
+            .unwrap_or(false);
+        if is_child_of_target {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — caller is a child of the target"
+            );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         // SUB-1 delegation-group conflict suppression: skip ungrouped watch
@@ -4332,8 +4359,7 @@ impl Services {
     /// set of existing target agents — the subscription side of
     /// `agent.delegate` without creating children. Reuses the exact same
     /// registration/group helpers as the delegate call sites: `immediate`
-    /// (default) registers a oneShot watch per target (deduped against a live
-    /// ungrouped watch, like `agent.watchCompletion`); `after_all` enrolls
+    /// (default) registers a oneShot watch per target; `after_all` enrolls
     /// every target in the caller's open delegation group anchored in the
     /// caller's home workspace (sealed on the caller's idle, one aggregated
     /// wake, restart-safe through the existing group persistence). Targets
@@ -4341,6 +4367,12 @@ impl Services {
     /// callers — enforced by the shared `check_watch_scope` gate, which runs
     /// for every target BEFORE any side-effectful registration so a rejection
     /// leaves no partial group or watches behind.
+    ///
+    /// Pair uniqueness: as an EXPLICIT registration path, a target the caller
+    /// already watches (oneShot, non-oneShot, or grouped) is rejected with
+    /// `-32602` naming the target — run in the same up-front validation loop,
+    /// so the rejection is side-effect free. (Auto-subscribe paths silently
+    /// adopt the existing watch instead; see `register_completion_watch`.)
     ///
     /// After registration every target is reconciled against current agent
     /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
@@ -4428,6 +4460,20 @@ impl Services {
                 )));
             }
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            // Pair uniqueness: an explicit registration on a child the caller
+            // ALREADY watches (oneShot, non-oneShot, or grouped) is rejected
+            // up front — before any side-effectful registration — instead of
+            // silently adopting the existing watch like the auto-subscribe
+            // paths do, so a duplicate wait can never appear on the wire.
+            if self.pair_watch_exists(&caller_agent_id, &target) {
+                return Err(Error::InvalidParams(format!(
+                    "already waiting on agent {}: a completion watch for this \
+                     (caller, target) pair is already active — at most one \
+                     active watch per pair (cancel it via \
+                     agent.cancelSubscriptions to re-register)",
+                    target.0
+                )));
+            }
             resolved.push((target, session.name, session.workspace_id));
         }
         let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
