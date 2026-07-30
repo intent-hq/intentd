@@ -496,8 +496,9 @@ async fn handle_sub_fast_path(
         // subscribe-before-snapshot discipline as the note channel, but is
         // scoped by `agentId` (not `workspaceId`) and emits a `messages[]`
         // object snapshot from `agent.getConversation`. The bus subscription
-        // tails the `agent:stream:*` family; the forwarder isolates it to one
-        // agent by `sessionId == agentId`.
+        // tails the chat stream family (`chat:stream:delta` + tool/end/message
+        // signals); the forwarder isolates it to one agent by
+        // `sessionId == agentId`.
         SubFastPath::Subscribe {
             id,
             channel: Channel::Chat,
@@ -650,12 +651,13 @@ async fn forward_note_subscription(
 
 /// Per-subscription forwarder for the per-agent `chat` channel (CS-0). Pushes
 /// the seq-0 snapshot — the newest `agent.getConversation` page as the
-/// `messages[]` object (CS-0 D3) — then tails the `agent:stream:*` family
-/// FILTERED to this agent (`sessionId == agentId`, cross-agent isolation).
+/// `messages[]` object (CS-0 D3) — then tails the chat stream family
+/// (`chat:stream:delta` + tool/end/message signals) FILTERED to this agent
+/// (`sessionId == agentId`, cross-agent isolation).
 ///
 /// The forwarder owns the filtered-subscription lifecycle (aborted by
 /// [`ConnSub`] on unsubscribe / disconnect), the seq-0 snapshot, AND the
-/// monotonic per-subscription delta `seq` (1, 2, …). Each tailed `agent:stream:*`
+/// monotonic per-subscription delta `seq` (1, 2, …). Each tailed chat-family
 /// event is translated by the stateful [`subscriptions::ChatDeltaState`] mapper
 /// into a `{ added, updated, removedIds }` block delta (CS-0 D2/D4/D6) pushed in
 /// strict seq order; `stream:end` reconciles against the persisted message so the

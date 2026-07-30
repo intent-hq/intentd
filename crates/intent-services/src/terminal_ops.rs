@@ -465,7 +465,7 @@ fn drain_pending(
 /// Broadcast a `terminal:data` event carrying a base64 output `chunk`.
 ///
 /// Transient (broadcast-only, never persisted — same path as
-/// `agent:stream:chunk`): PTY output is high-volume and must not serialize
+/// `chat:stream:delta`): PTY output is high-volume and must not serialize
 /// behind a durable SQLite commit per chunk, which throttled paste echo to one
 /// chunk per writer-batch window. Scrollback replay reads the PTY host ring
 /// buffer via `terminal.getBuffer`, so nothing consumes persisted

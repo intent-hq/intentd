@@ -364,7 +364,7 @@ async fn wake_setup(script: &str, behavior: &str) -> WakeSetup {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -469,7 +469,7 @@ async fn harness_wake_burst_streams_as_agent_initiated_turn_over_wss() {
                 assert!(!mid.is_empty(), "wake messageId is non-empty");
                 wake_message_id = Some(mid);
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 // Ordering: no wake content may hit the wire before the
                 // stream:start that names the turn.
                 let mid = wake_message_id
@@ -634,7 +634,7 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
             continue;
         }
         match event["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 let data = serde_json::to_string(&event["data"]).unwrap_or_default();
                 if !saw_wake_end {
                     assert_eq!(

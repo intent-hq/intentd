@@ -138,7 +138,7 @@ fn chat_channel_tails_stream_family_and_message() {
     assert_eq!(
         chat,
         vec![
-            "agent:stream:chunk".to_string(),
+            "chat:stream:delta".to_string(),
             "agent:tool:call".to_string(),
             "agent:stream:end".to_string(),
             "agent:message".to_string(),
@@ -396,7 +396,7 @@ fn agent() -> AgentId {
 fn chunk_event(message_id: &str, block_id: &str, block_type: &str, content: Value) -> Event {
     Event {
         id: "evt-1".into(),
-        event_type: AGENT_STREAM_CHUNK.to_string(),
+        event_type: CHAT_STREAM_DELTA.to_string(),
         timestamp: now_iso(),
         workspace_id: WorkspaceId::from("w"),
         session_id: Some(message_id.to_string()),

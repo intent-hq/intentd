@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn type_glob_prefix_and_exact() {
         assert!(event_type_matches("agent:idle", "agent:*"));
-        assert!(event_type_matches("agent:stream:chunk", "agent:*"));
+        assert!(event_type_matches("agent:stream:activity", "agent:*"));
         assert!(!event_type_matches("file:changed", "agent:*"));
         assert!(event_type_matches("file:changed", "file:changed"));
         assert!(!event_type_matches("file:changed", "file:created"));
