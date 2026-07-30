@@ -1424,6 +1424,30 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         "unknown subscriptionId: {resp}"
     );
 
+    // Present-but-non-string `subscriptionId` → -32602 at the router; it must
+    // NOT be coerced to `None` (which would cancel everything).
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        36,
+        "agent.cancelSubscriptions",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "subscriptionId": 42,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "non-string subscriptionId: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["message"],
+        json!("subscriptionId must be a string"),
+        "non-string subscriptionId message: {resp}"
+    );
+
     // Scoped cancel removes EXACTLY the named watch; the other stays live.
     let resp = wss_rpc_envelope(
         &mut rpc,

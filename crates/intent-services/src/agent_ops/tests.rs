@@ -6159,8 +6159,10 @@ async fn get_subscriptions_lists_after_all_group() {
     assert_eq!(groups[0]["expectedAgentIds"], json!([child.0]));
 }
 
-/// `cancelSubscriptions` drops the parent's watches and groups; a second cancel
-/// with nothing left still returns `{ success: true }`.
+/// `cancelSubscriptions` drops the parent's watches and groups — including the
+/// persisted `delegation_group` rows, so cancelled groups can't rehydrate on
+/// restart — and a second cancel with nothing left still returns
+/// `{ success: true }`.
 #[tokio::test]
 async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
     let (_t, svc, ws) = setup().await;
@@ -6174,6 +6176,22 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
         )
         .await
         .expect("delegate");
+    // Wait for the group's spawned write-through persist so the delete sweep
+    // below provably removes the row (no upsert/delete race).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups")
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegation_group row never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let cancel = svc
         .agent_cancel_subscriptions(ws.clone(), parent.clone(), None, None)
@@ -6187,6 +6205,23 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
         .expect("subs");
     assert!(r["subscriptions"].as_array().expect("array").is_empty());
     assert!(r["delegationGroups"].as_array().expect("array").is_empty());
+
+    // The persisted delegation_group row is swept too (the delete is spawned
+    // — poll) so the cancelled group can't rehydrate on restart.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups")
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persisted delegation_group row never deleted by unscoped cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Idempotent: cancelling again with nothing left still succeeds.
     let again = svc

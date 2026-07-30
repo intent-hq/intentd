@@ -4502,6 +4502,14 @@ impl Services {
             None => None,
         };
 
+        // DURABLE-BEFORE-OBSERVABLE (mirrors `take_group_for_delivery`):
+        // commit the persisted delegation_group delete BEFORE any in-memory
+        // removal. If the delete fails, the call errors with the registry
+        // untouched — no cancelled-in-memory group can rehydrate on restart.
+        if let Some(group) = &target_group {
+            self.store.delete_delegation_group(&group.group_id).await?;
+        }
+
         // Parent home workspaces to publish `agent:subscriptions-changed` in
         // (deduped — a watch and its group share the same anchor).
         let mut anchors: Vec<WorkspaceId> = Vec::new();
@@ -4516,12 +4524,6 @@ impl Services {
                 }
             }
             self.remove_group_for_parent(&agent_id, &group.group_id);
-            if let Err(e) = self.store.delete_delegation_group(&group.group_id).await {
-                tracing::warn!(
-                    "delegation_group delete failed on scoped cancel {}: {e}",
-                    group.group_id
-                );
-            }
             if !anchors.contains(&group.workspace_id) {
                 anchors.push(group.workspace_id);
             }

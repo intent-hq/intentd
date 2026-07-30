@@ -917,15 +917,38 @@ impl Services {
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
     pub(crate) fn remove_groups_for_parent(&self, parent_id: &AgentId) -> usize {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let before = guard.delegation_groups.len();
-        guard
-            .delegation_groups
-            .retain(|g| &g.parent_agent_id != parent_id);
-        before - guard.delegation_groups.len()
+        let removed_ids: Vec<String> = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let mut ids = Vec::new();
+            guard.delegation_groups.retain(|g| {
+                if &g.parent_agent_id == parent_id {
+                    ids.push(g.group_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            ids
+        };
+        let removed = removed_ids.len();
+        if removed > 0 {
+            // Best-effort DB sweep (mirrors `remove_all_for_parent`): drop the
+            // persisted rows so cancelled groups don't rehydrate on restart. A
+            // failed delete self-heals — cancel is idempotent, so a repeat
+            // cancel (or group delivery) clears any resurrected group.
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for gid in removed_ids {
+                    if let Err(e) = store.delete_delegation_group(&gid).await {
+                        tracing::warn!("delegation_group parent sweep failed {gid}: {e}");
+                    }
+                }
+            });
+        }
+        removed
     }
 
     /// Remove ONE delegation group by id, only if it is parented by
