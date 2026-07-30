@@ -5979,8 +5979,15 @@ async fn idle_timeout_injects_warning_and_redrives() {
     .expect("send_message spawns the worker inline");
     // While the first turn hangs, queue a follow-up: the warning turn must
     // run BEFORE it.
-    mgr.services
-        .enqueue_message(&id, "queued follow-up".to_string(), None, None, None, None);
+    mgr.services.enqueue_message(
+        &id,
+        "queued follow-up".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
 
     // The warning redrive + queued drain complete: the agent settles idle.
     timeout(Duration::from_secs(30), async {
