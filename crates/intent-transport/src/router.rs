@@ -8,7 +8,7 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
     WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
@@ -1132,6 +1132,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
+            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
+            // ONLY user-originated entry point — user sends are never held
+            // (they supersede a pending Q&A by design).
             let result = api
                 .agent_send_message(
                     ws,
@@ -1145,6 +1148,7 @@ async fn dispatch(
                     stdin_context,
                     context_references,
                     message_metadata,
+                    MessageOrigin::User,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

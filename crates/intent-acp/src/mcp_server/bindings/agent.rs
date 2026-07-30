@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use intent_core::{
-    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, NoteId,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin,
+    NoteId, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -191,6 +191,7 @@ async fn create(
             None,
             None,
             kickoff_metadata,
+            MessageOrigin::Automatic,
         )
         .await
     {
@@ -252,6 +253,7 @@ async fn send(
             None,
             None,
             sender_metadata(api, ws, caller, args).await,
+            MessageOrigin::Automatic,
         )
         .await
         .map_err(map_err)?;

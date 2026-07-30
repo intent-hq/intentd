@@ -1875,6 +1875,33 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
+/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
+/// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
+/// user-originated entry point — which always delivers immediately (a user
+/// message supersedes any pending Q&A). Everything else (MCP front-door
+/// sends, reportToParent / completion-watch / event-subscription wakes,
+/// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
+/// `Automatic` and is held in the queue while the target agent's question
+/// hold is active. `Automatic` is the `Default` so unmarked internal paths
+/// fail closed (held) rather than dismissing a pending Q&A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageOrigin {
+    /// FE-originated `agent.sendMessage` (typed message or wizard answers):
+    /// never held by the question hold.
+    User,
+    /// System/agent-originated delivery: held while the question hold is
+    /// active.
+    #[default]
+    Automatic,
+}
+
+impl MessageOrigin {
+    /// `true` for [`MessageOrigin::User`].
+    pub fn is_user(self) -> bool {
+        matches!(self, MessageOrigin::User)
+    }
+}
+
 /// Maximum delegation depth to prevent unbounded recursive agent creation
 /// (port of the TS `MAX_DELEGATION_DEPTH` in `agent-interaction-tools.ts`).
 /// Depth 0 = user-created agents, depth 1 = their children, depth 2 =

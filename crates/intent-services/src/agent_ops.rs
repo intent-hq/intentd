@@ -262,6 +262,24 @@ pub(crate) struct QueuedMessage {
     /// Preempted message's file attachments, carried like `prepend_content`.
     #[serde(default)]
     pub prepend_file_blocks: Option<Value>,
+    /// `true` when this entry was enqueued with `priority: "interrupt"`
+    /// (question hold / PROTOCOL §5.5): interrupt entries ALWAYS enter the
+    /// queue ahead of all normal entries, preserving arrival order among
+    /// themselves ([`Services::enqueue_message`]). Persisted so the ordering
+    /// survives daemon restarts; `to_value` emits `interruptPriority: true`
+    /// so queue snapshots reflect the marker.
+    #[serde(default)]
+    pub interrupt_priority: bool,
+    /// `true` when the entry carries a USER-originated `agent.sendMessage`
+    /// that was parked by a queue-fallback path (busy race, quarantine,
+    /// append-failure). The question hold never blocks user messages
+    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
+    /// hold-gated drain paths deliver the first user-origin entry instead
+    /// of suspending — without this marker a user answer parked by the
+    /// turn-end busy race would deadlock against the hold it is supposed
+    /// to release. Persisted so the bypass survives daemon restarts.
+    #[serde(default)]
+    pub user_origin: bool,
 }
 
 impl QueuedMessage {
@@ -302,6 +320,9 @@ impl QueuedMessage {
         }
         if let Some(md) = &self.message_metadata {
             v["messageMetadata"] = md.clone();
+        }
+        if self.interrupt_priority {
+            v["interruptPriority"] = Value::Bool(true);
         }
         v
     }
@@ -912,9 +933,6 @@ pub(crate) fn user_message_blocks(
 /// question resource block (`application/vnd.intent.question+json` — the MIME
 /// type `ws.app.question.ask` emits; reused from `intent-acp` so hold
 /// detection cannot drift from the binding). Non-array content is `false`.
-// TODO(question-hold follow-up): drop the allow once the delivery/drain gates
-// consume `question_hold_active` outside tests.
-#[allow(dead_code)]
 pub(crate) fn has_question_blocks(content: &Value) -> bool {
     content.as_array().is_some_and(|blocks| {
         blocks.iter().any(|b| {
@@ -2559,8 +2577,15 @@ impl Services {
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
-        let (queued, position) =
-            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+        let (queued, position) = self.enqueue_message(
+            &agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            None,
+            None,
+            false,
+        );
         let result = json!({
             "success": true,
             "queuedMessage": queued.to_value(position),
@@ -2787,8 +2812,15 @@ impl Services {
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
                 // path's behavior.
-                let (queued, position) =
-                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+                let (queued, position) = self.enqueue_message(
+                    &agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    None,
+                    None,
+                    false,
+                );
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -2890,9 +2922,6 @@ impl Services {
     /// false; `agent.dismissQuestions` persists the marker for the same
     /// effect. Fails open (`false`) on store errors so a read failure can
     /// never wedge deliveries.
-    // TODO(question-hold follow-up): drop the allow once the delivery/drain
-    // gates consume this outside tests.
-    #[allow(dead_code)]
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
         let Ok(messages) = self.store.get_agent_messages(agent_id, Some(1)).await else {
             return false;
@@ -4817,20 +4846,44 @@ impl Services {
                     .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
-            (None, _) => {
+            (None, interrupt) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
                 // `agent_send_message` — plumb the metadata through the
                 // store-only append so attribution is consistent across
-                // deployments with and without a runtime manager.
-                self.agent_send_message_op(
-                    agent.clone(),
-                    message,
-                    None,
-                    None,
-                    None,
-                    options.message_metadata,
-                )
-                .await?
+                // deployments with and without a runtime manager. Question
+                // hold (PROTOCOL §5.5): sendToTask is automatic by
+                // definition, so an active hold parks the message instead
+                // of persisting the superseding user row.
+                if self.question_hold_active(&agent).await {
+                    let (queued, position) = self.enqueue_message(
+                        &agent,
+                        message,
+                        None,
+                        None,
+                        options.message_metadata,
+                        None,
+                        interrupt,
+                    );
+                    let held = json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.publish_queue_updated(&agent).await;
+                    held
+                } else {
+                    self.agent_send_message_op(
+                        agent.clone(),
+                        message,
+                        None,
+                        None,
+                        None,
+                        options.message_metadata,
+                    )
+                    .await?
+                }
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
@@ -5420,6 +5473,30 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
+        // Question hold (PROTOCOL §5.5): wakes are automatic by definition
+        // (`agent.wakeOrCreate` context messages, reportToParent /
+        // completion-watch wakes) — while the target's hold is active they
+        // park in the queue instead of claiming the slot, so the pending Q&A
+        // is never superseded. Checked BEFORE `try_begin_turn` so even an
+        // idle asking agent holds the wake.
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content_owned,
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            self.publish_queue_updated(agent_id).await;
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            }));
+        }
         if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
@@ -5431,6 +5508,7 @@ impl Services {
                 None,
                 message_metadata.cloned(),
                 None,
+                false,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -5456,6 +5534,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -5516,6 +5595,29 @@ impl Services {
     where
         F: Fn() -> Value,
     {
+        // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
+        // runtime path above — the store-only persist would append the user
+        // row that supersedes the pending Q&A, so park the wake in the queue
+        // instead (hermetic wiring keeps the hold contract testable).
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content.to_string(),
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            });
+            self.publish_queue_updated(agent_id).await;
+            return Ok(result);
+        }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -5551,6 +5653,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 let result = json!({
                     "success": true,
@@ -5616,6 +5719,14 @@ impl Services {
     /// a queue-fallback interrupt still delivers the preempted message ahead
     /// of the interrupt message on drain; sends without prepend content pass
     /// `None`.
+    ///
+    /// `interrupt` marks a `priority: "interrupt"` enqueue (question hold /
+    /// PROTOCOL §5.5): the entry is inserted AFTER the queue's leading
+    /// interrupt entries but AHEAD of all normal entries — arrival order is
+    /// preserved among interrupts, and every fallback path that parks an
+    /// interrupt (hold gate, busy race, quarantine park, append-failure
+    /// auto-queue) shares this ordering. Normal enqueues append at the tail.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -5624,6 +5735,38 @@ impl Services {
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+    ) -> (QueuedMessage, usize) {
+        self.enqueue_message_with_origin(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            false,
+        )
+    }
+
+    /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
+    /// `true` records that the entry carries a USER-originated
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure). The question-hold drain gates deliver
+    /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
+    /// answer supersedes the pending Q&A and must never deadlock against
+    /// the hold it releases).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_origin(
+        &self,
+        agent_id: &AgentId,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        user_origin: bool,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = new_message_id();
@@ -5641,14 +5784,23 @@ impl Services {
             prepend_content: prepend.content,
             prepend_image_blocks: prepend.image_blocks,
             prepend_file_blocks: prepend.file_blocks,
+            interrupt_priority: interrupt,
+            user_origin,
         };
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.entry(agent_id.clone()).or_default();
-        queue.push(queued.clone());
-        let position = queue.len() - 1;
+        let position = if interrupt {
+            // Behind earlier interrupts, ahead of every normal entry.
+            let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
+            queue.insert(idx, queued.clone());
+            idx
+        } else {
+            queue.push(queued.clone());
+            queue.len() - 1
+        };
         (queued, position)
     }
 
@@ -5664,6 +5816,22 @@ impl Services {
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
         let idx = queue.iter().position(|m| !m.editing)?;
+        Some(queue.remove(idx))
+    }
+
+    /// Pop the oldest ready-to-send **user-origin** queued message, if any
+    /// (question hold, PROTOCOL §5.5). While the hold is active the drain
+    /// paths deliver ONLY user-origin entries — a user answer parked by the
+    /// turn-end busy race must supersede the pending Q&A instead of
+    /// deadlocking behind the hold it is supposed to release; automatic
+    /// entries stay parked.
+    pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let idx = queue.iter().position(|m| !m.editing && m.user_origin)?;
         Some(queue.remove(idx))
     }
 
@@ -5708,6 +5876,18 @@ impl Services {
             .expect("agent queue registry poisoned")
             .get(agent_id)
             .map(|q| q.iter().any(|m| !m.editing))
+            .unwrap_or(false)
+    }
+
+    /// `true` iff at least one ready-to-send queued entry is user-origin
+    /// (question hold, PROTOCOL §5.5): the hold-gated drain paths use this
+    /// to decide whether a drain may proceed for the user entry alone.
+    pub(crate) fn has_user_origin_ready(&self, agent_id: &AgentId) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map(|q| q.iter().any(|m| !m.editing && m.user_origin))
             .unwrap_or(false)
     }
 
@@ -6469,7 +6649,9 @@ impl Services {
         let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 
         // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load)
+        // (lazily respawns provider and resumes via ACP session/load).
+        // Automatic origin: a resume continuation must not supersede a Q&A
+        // the agent had pending when the harness shut down (question hold).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),
@@ -6483,6 +6665,7 @@ impl Services {
                 None,
                 None,
                 None,
+                intent_core::MessageOrigin::Automatic,
             )
             .await
         {

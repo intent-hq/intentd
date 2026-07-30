@@ -4537,6 +4537,7 @@ mod send_message_payload_forwarding {
         stdin_context: Option<String>,
         context_references: Option<Value>,
         message_metadata: Option<Value>,
+        origin: Option<intent_core::MessageOrigin>,
     }
 
     #[derive(Default)]
@@ -4560,6 +4561,7 @@ mod send_message_payload_forwarding {
             stdin_context: Option<String>,
             context_references: Option<Value>,
             message_metadata: Option<Value>,
+            origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             let slot = self.send.clone();
             Box::pin(async move {
@@ -4575,6 +4577,7 @@ mod send_message_payload_forwarding {
                     stdin_context,
                     context_references,
                     message_metadata,
+                    origin: Some(origin),
                 };
                 Ok(json!({ "success": true, "queued": false, "messageId": "m-1" }))
             })

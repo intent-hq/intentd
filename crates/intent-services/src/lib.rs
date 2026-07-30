@@ -3399,6 +3399,29 @@ impl Services {
                     .await
             }
             None => {
+                // Question hold (PROTOCOL §5.5): parent wakes are automatic —
+                // an active hold parks the wake in the queue instead of
+                // appending the user row that would supersede the pending
+                // Q&A (mirrors the manager path's `send_message` gate).
+                if self.question_hold_active(&parent_agent_id).await {
+                    let (queued, position) = self.enqueue_message(
+                        &parent_agent_id,
+                        content,
+                        None,
+                        None,
+                        message_metadata,
+                        None,
+                        false,
+                    );
+                    let result = serde_json::json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                    });
+                    self.publish_queue_updated(&parent_agent_id).await;
+                    return Ok(result);
+                }
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
                 self.store
                     .append_agent_message_with_metadata(
@@ -15231,6 +15254,7 @@ impl WorkspaceApi for Services {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
@@ -15248,6 +15272,7 @@ impl WorkspaceApi for Services {
                         image_blocks,
                         file_blocks,
                         message_metadata,
+                        origin,
                         ..crate::agent_manager::TurnOptions::default()
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
@@ -15267,6 +15292,32 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
+                    // Question hold (PROTOCOL §5.5): the store-only fallback
+                    // must honor the automatic-delivery gate too — persisting
+                    // the row would supersede the pending Q&A. User-originated
+                    // sends pass through (a user answer/typed message is the
+                    // documented hold release).
+                    if !origin.is_user() && self.question_hold_active(&agent_id).await {
+                        self.require_agent_session(&agent_id).await?;
+                        let (queued, position) = self.enqueue_message(
+                            &agent_id,
+                            content,
+                            image_blocks,
+                            file_blocks,
+                            message_metadata,
+                            None,
+                            crate::agent_ops::is_interrupt_priority(priority.as_deref()),
+                        );
+                        let result = serde_json::json!({
+                            "success": true,
+                            "queued": true,
+                            "heldForQuestions": true,
+                            "queuedMessage": queued.to_value(position),
+                            "turnId": queued.turn_id,
+                        });
+                        self.publish_queue_updated(&agent_id).await;
+                        return Ok(result);
+                    }
                     // Read-only fallback (no `agent_manager` wired): plumb
                     // `messageMetadata` through the store-only append so the
                     // persisted row matches the production

@@ -10266,7 +10266,15 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
         "msg-live",
         vec![json!({ "type": "text", "text": "streaming…" })],
     );
-    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None, None, None);
+    svc.enqueue_message(
+        &c,
+        "queued follow-up".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
     assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
     assert!(svc.has_ready_to_send(&c), "queue seeded");
     assert_eq!(svc.find_watches_for_child(&b).len(), 1);
@@ -10744,6 +10752,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         prepend_content: None,
         prepend_image_blocks: None,
         prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
     };
 
     svc.requeue_front(&id, queued);
@@ -10797,6 +10807,7 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
         None,
         Some(metadata.clone()),
         None,
+        false,
     );
     assert_eq!(queued.to_value(position)["messageMetadata"], metadata);
     svc.publish_queue_updated(&id).await;
@@ -10819,7 +10830,8 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
     assert_eq!(evt.data["queue"][0]["messageMetadata"], metadata);
 
     // Legacy shape: an entry enqueued without metadata omits the key.
-    let (plain, plain_pos) = svc.enqueue_message(&id, "plain".to_string(), None, None, None, None);
+    let (plain, plain_pos) =
+        svc.enqueue_message(&id, "plain".to_string(), None, None, None, None, false);
     let v = plain.to_value(plain_pos);
     assert!(
         v.get("messageMetadata").is_none(),
@@ -11243,7 +11255,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     let id = create_agent(&svc, &ws, "TurnId").await;
 
     // Fresh enqueue: turn_id == id, surfaced as `turnId` on the wire.
-    let (queued, position) = svc.enqueue_message(&id, "fresh".to_string(), None, None, None, None);
+    let (queued, position) =
+        svc.enqueue_message(&id, "fresh".to_string(), None, None, None, None, false);
     assert_eq!(
         queued.turn_id, queued.id,
         "fresh enqueue mints turn_id = id"
@@ -11268,6 +11281,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             prepend_content: None,
             prepend_image_blocks: None,
             prepend_file_blocks: None,
+            interrupt_priority: false,
+            user_origin: false,
         },
     );
     svc.publish_queue_updated(&id).await;
@@ -11434,6 +11449,8 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         prepend_content: None,
         prepend_image_blocks: None,
         prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
     }
 }
 
@@ -11574,7 +11591,7 @@ async fn migrate_queue_missing_poisoned_session_is_idempotent() {
 async fn migrate_queue_rejects_unknown_target_without_draining() {
     let (_t, svc, ws) = setup().await;
     let poisoned = create_agent(&svc, &ws, "Poisoned").await;
-    svc.enqueue_message(&poisoned, "parked".into(), None, None, None, None);
+    svc.enqueue_message(&poisoned, "parked".into(), None, None, None, None, false);
     let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
 
     let err = svc
@@ -13465,4 +13482,172 @@ async fn dismiss_questions_fails_closed() {
         svc.agent_dismiss_questions_op(ws, id, oversized).await,
         Err(Error::InvalidParams(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Question hold: automatic deliveries and drains are gated (Task 2)
+// ---------------------------------------------------------------------------
+
+/// Seed an active question hold: append an assistant message whose trailing
+/// blocks carry a pending question resource.
+async fn arm_question_hold(svc: &Services, id: &AgentId) {
+    svc.store()
+        .append_agent_message(id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(svc.question_hold_active(id).await, "hold must be armed");
+}
+
+/// Store-only `agent_send_message` (Automatic origin) is held: no user row is
+/// appended, the message parks in the queue with `heldForQuestions: true`.
+/// A User-origin send passes through and releases the hold (superseded).
+#[tokio::test]
+async fn hold_gates_store_only_automatic_send_but_not_user_send() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    arm_question_hold(&svc, &id).await;
+
+    let r = svc
+        .agent_send_message(
+            ws.clone(),
+            id.clone(),
+            "automatic follow-up".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            intent_core::MessageOrigin::Automatic,
+        )
+        .await
+        .expect("held send succeeds");
+    assert_eq!(r["queued"], json!(true));
+    assert_eq!(r["heldForQuestions"], json!(true));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "no user row appended while held (only the question message)"
+    );
+    assert_eq!(svc.queue_snapshot(&id).len(), 1, "message parked in queue");
+
+    // User origin passes through — the answer supersedes the questions.
+    let r = svc
+        .agent_send_message(
+            ws.clone(),
+            id.clone(),
+            "user answer".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            intent_core::MessageOrigin::User,
+        )
+        .await
+        .expect("user send succeeds");
+    assert_eq!(r["queued"], json!(false), "user send is never held");
+    assert!(
+        !svc.question_hold_active(&id).await,
+        "user row supersedes the questions"
+    );
+}
+
+/// Store-only `agent_send_to_task_op` (automatic by definition) is held.
+#[tokio::test]
+async fn hold_gates_store_only_send_to_task() {
+    let (_t, svc, ws) = setup().await;
+    let agent_id = create_agent(&svc, &ws, "HeldTaskRecv").await;
+    let note_id = seed_task(&svc, &ws, "held task").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+        .await
+        .expect("assign");
+    arm_question_hold(&svc, &agent_id).await;
+
+    let r = svc
+        .agent_send_to_task_op(ws.clone(), note_id, "task follow-up".into(), None, None)
+        .await
+        .expect("send_to_task");
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["result"]["heldForQuestions"], json!(true));
+    let session = svc
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(session.messages.len(), 1, "no user row appended while held");
+    assert_eq!(svc.queue_snapshot(&agent_id).len(), 1);
+    assert!(svc.question_hold_active(&agent_id).await, "hold survives");
+}
+
+/// Store-only `deliver_parent_wake` (reportToParent / completion-watch /
+/// event-subscription wakes) is held.
+#[tokio::test]
+async fn hold_gates_store_only_parent_wake() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "HeldParent").await;
+    arm_question_hold(&svc, &parent).await;
+
+    let r = svc
+        .deliver_parent_wake(&ws, parent.clone(), "child done".into(), None)
+        .await
+        .expect("wake");
+    assert_eq!(r["queued"], json!(true));
+    assert_eq!(r["heldForQuestions"], json!(true));
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("session");
+    assert_eq!(session.messages.len(), 1, "no wake row appended while held");
+    assert_eq!(svc.queue_snapshot(&parent).len(), 1);
+}
+
+/// Interrupt-priority insertion: interrupts enter ahead of normal entries but
+/// behind earlier interrupts; the wire shape carries `interruptPriority`, and
+/// the ordering survives a daemon restart via the persisted snapshot.
+#[tokio::test]
+async fn interrupt_enqueue_orders_ahead_of_normal_and_persists() {
+    let (tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Interrupted").await;
+
+    svc.enqueue_message(&id, "normal-1".into(), None, None, None, None, false);
+    svc.enqueue_message(&id, "normal-2".into(), None, None, None, None, false);
+    let (int1, pos1) = svc.enqueue_message(&id, "int-1".into(), None, None, None, None, true);
+    assert_eq!(pos1, 0, "first interrupt jumps the whole queue");
+    let (_int2, pos2) = svc.enqueue_message(&id, "int-2".into(), None, None, None, None, true);
+    assert_eq!(pos2, 1, "second interrupt queues behind the first");
+
+    let snapshot = svc.queue_snapshot(&id);
+    let contents: Vec<_> = snapshot.iter().map(|v| v["content"].clone()).collect();
+    assert_eq!(
+        contents,
+        vec![
+            json!("int-1"),
+            json!("int-2"),
+            json!("normal-1"),
+            json!("normal-2")
+        ]
+    );
+    assert_eq!(snapshot[0]["interruptPriority"], json!(true));
+    assert!(
+        snapshot[2].get("interruptPriority").is_none(),
+        "normal entries omit the marker"
+    );
+    assert_eq!(int1.to_value(0)["interruptPriority"], json!(true));
+
+    // Ordering + marker survive restart.
+    svc.publish_queue_updated(&id).await;
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    let front = restarted.dequeue_message(&id).expect("dequeue");
+    assert_eq!(front.content, "int-1");
+    assert!(front.interrupt_priority, "marker survives restart");
 }

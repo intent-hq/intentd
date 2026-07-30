@@ -14,7 +14,7 @@ use crate::model::{
     ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
     FileActivity, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
     GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
@@ -1323,6 +1323,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// (reference-parity `acp-provider.ts`); the other two are threaded
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
+    ///
+    /// `origin` marks who originated the delivery (question hold, PROTOCOL
+    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
+    /// held); the MCP front door and every internal wake/continuation path
+    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
+    /// a turn while the target agent's question hold is active.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1337,6 +1343,7 @@ pub trait WorkspaceApi: Send + Sync {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -1350,6 +1357,7 @@ pub trait WorkspaceApi: Send + Sync {
             stdin_context,
             context_references,
             message_metadata,
+            origin,
         );
         Box::pin(async {
             Err(Error::Internal(
