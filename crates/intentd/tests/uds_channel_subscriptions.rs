@@ -387,6 +387,47 @@ async fn workspace_channel_snapshot_then_updated_delta() {
         ws_entry["rev"].is_null(),
         "workspace entities carry no rev (R3 scopes rev to Note/Task)"
     );
+    // The seq-0 lite snapshot is self-sufficient for client status rendering:
+    // rows carry taskStats + displayStatus + cowSupported while the heavy
+    // aggregates (agentSummary/diffSummary) stay omitted.
+    assert!(
+        ws_entry["taskStats"]["total"].is_number(),
+        "snapshot rows carry taskStats: {ws_entry}"
+    );
+    assert!(
+        ws_entry["displayStatus"].is_string(),
+        "snapshot rows carry displayStatus: {ws_entry}"
+    );
+    assert!(
+        ws_entry["cowSupported"].is_boolean(),
+        "snapshot rows carry cowSupported: {ws_entry}"
+    );
+    assert!(
+        ws_entry.get("agentSummary").is_none(),
+        "snapshot rows omit agentSummary: {ws_entry}"
+    );
+    assert!(
+        ws_entry.get("diffSummary").is_none(),
+        "snapshot rows omit diffSummary: {ws_entry}"
+    );
+    // The snapshot's displayStatus matches a subsequent enriched
+    // workspace.get for the same data (same derivation, no drift).
+    let got = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        13,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["workspace"]["displayStatus"], ws_entry["displayStatus"],
+        "lite snapshot displayStatus matches enriched workspace.get"
+    );
+    assert_eq!(
+        got["workspace"]["taskStats"], ws_entry["taskStats"],
+        "lite snapshot taskStats matches enriched workspace.get"
+    );
     let archived_entry = find(&snap, &archived_id).expect("archived workspace in snapshot");
     assert_eq!(
         archived_entry["status"], "Archived",

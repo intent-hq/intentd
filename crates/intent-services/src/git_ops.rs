@@ -188,6 +188,50 @@ pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) ->
     Value::Object(obj)
 }
 
+/// Cap on a single file's serialized hunks in `git.diffs`. Larger files are
+/// listed with empty `hunks` so the FE still sees the path (and can open via
+/// path-scoped `git.diffs`) without shipping tens of MB of line content.
+const MAX_DIFF_FILE_HUNKS_BYTES: usize = 512 * 1024;
+/// Cap on the whole `git.diffs` JSON payload. Observed failure: unscoped
+/// unstaged walk on a 5.8 GB worktree produced a **277 MiB** UDS frame and
+/// HOL'd the connection writer for ~38s (`frame_bytes=276998604`), timing out
+/// every interactive RPC. Prefer path-scoped calls for large trees.
+const MAX_DIFFS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approximate wire size of hunk JSON (content-dominated).
+fn approx_hunks_bytes(hunks: &[intent_git::diff::DiffHunk]) -> usize {
+    let mut n = 0usize;
+    for h in hunks {
+        for line in &h.lines {
+            // JSON escaping overhead is small vs content; content is the bulk.
+            n = n.saturating_add(line.content.len()).saturating_add(24);
+        }
+        n = n.saturating_add(64);
+    }
+    n
+}
+
+/// Build one `{ path, hunks }` entry, omitting hunk bodies that would blow the
+/// per-file budget. Returns `(value, included_bytes)`.
+fn file_diff_entry(path: &str, hunks: &[intent_git::diff::DiffHunk]) -> (Value, usize) {
+    let bytes = approx_hunks_bytes(hunks);
+    if bytes > MAX_DIFF_FILE_HUNKS_BYTES {
+        tracing::warn!(
+            path,
+            hunk_bytes = bytes,
+            limit = MAX_DIFF_FILE_HUNKS_BYTES,
+            "git.diffs: omitting oversize file hunks (path kept, empty hunks)"
+        );
+        (
+            json!({ "path": path, "hunks": [] }),
+            path.len().saturating_add(32),
+        )
+    } else {
+        let v = json!({ "path": path, "hunks": hunks_to_value(hunks) });
+        (v, bytes.saturating_add(path.len()).saturating_add(32))
+    }
+}
+
 /// Build the `git.diffs` wire result (`[{ path, hunks }]`) for a worktree.
 /// When `commit_hash` is set, returns hunks for `<commit_hash>^..<commit_hash>`
 /// and `staged` is ignored. Otherwise `staged` selects the HEAD→index diff
@@ -198,6 +242,9 @@ pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) ->
 /// pathspec-narrowed when `paths` is set) instead of one scan per changed file.
 /// Binary files yield an empty `hunks` array. A `commit_hash` that does not
 /// resolve degrades to an empty array.
+///
+/// Response size is hard-capped ([`MAX_DIFFS_RESPONSE_BYTES`]): further files
+/// are emitted as path-only rows with empty hunks once the budget is spent.
 pub(crate) fn build_diffs(
     worktree: &Path,
     paths: Option<&[String]>,
@@ -207,11 +254,38 @@ pub(crate) fn build_diffs(
     let paths = paths.filter(|p| !p.is_empty());
     let requested: Option<std::collections::HashSet<&str>> =
         paths.map(|p| p.iter().map(String::as_str).collect());
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    let mut truncated_files = 0usize;
+
+    let push = |out: &mut Vec<Value>,
+                total: &mut usize,
+                truncated_files: &mut usize,
+                path: &str,
+                hunks: &[intent_git::diff::DiffHunk]| {
+        if *total >= MAX_DIFFS_RESPONSE_BYTES {
+            // Budget exhausted: still surface the path so the FE can request
+            // a scoped `git.diffs` later.
+            *truncated_files += 1;
+            out.push(json!({ "path": path, "hunks": [] }));
+            *total = total.saturating_add(path.len().saturating_add(32));
+            return;
+        }
+        let (entry, n) = file_diff_entry(path, hunks);
+        if total.saturating_add(n) > MAX_DIFFS_RESPONSE_BYTES && *total > 0 {
+            *truncated_files += 1;
+            out.push(json!({ "path": path, "hunks": [] }));
+            *total = total.saturating_add(path.len().saturating_add(32));
+            return;
+        }
+        *total = total.saturating_add(n);
+        out.push(entry);
+    };
+
     if commit_hash.is_none() && !staged {
         let specs: Option<Vec<&str>> = paths.map(|p| p.iter().map(String::as_str).collect());
         let entries =
             intent_git::diff::diff_index_to_workdir_with_hunks(worktree, specs.as_deref())?;
-        let mut out = Vec::new();
         for entry in &entries {
             // The pathspec prunes the walk but can match more than the exact
             // paths; keep the strict equality filter the wire contract promises.
@@ -225,7 +299,22 @@ pub(crate) fn build_diffs(
             } else {
                 &entry.hunks
             };
-            out.push(json!({ "path": entry.file.path, "hunks": hunks_to_value(hunks) }));
+            push(
+                &mut out,
+                &mut total,
+                &mut truncated_files,
+                &entry.file.path,
+                hunks,
+            );
+        }
+        if truncated_files > 0 {
+            tracing::warn!(
+                worktree = %worktree.display(),
+                truncated_files,
+                approx_bytes = total,
+                limit = MAX_DIFFS_RESPONSE_BYTES,
+                "git.diffs: response truncated to stay under wire budget"
+            );
         }
         return Ok(Value::Array(out));
     }
@@ -238,7 +327,6 @@ pub(crate) fn build_diffs(
         },
         None => intent_git::diff::diff_head_to_index(worktree)?,
     };
-    let mut out = Vec::new();
     for fd in &files {
         if let Some(req) = &requested {
             if !req.contains(fd.path.as_str()) {
@@ -254,11 +342,19 @@ pub(crate) fn build_diffs(
                 fd.new_blob.as_deref(),
             )?
         };
-        out.push(json!({ "path": fd.path, "hunks": hunks_to_value(&hunks) }));
+        push(&mut out, &mut total, &mut truncated_files, &fd.path, &hunks);
+    }
+    if truncated_files > 0 {
+        tracing::warn!(
+            worktree = %worktree.display(),
+            truncated_files,
+            approx_bytes = total,
+            limit = MAX_DIFFS_RESPONSE_BYTES,
+            "git.diffs: response truncated to stay under wire budget"
+        );
     }
     Ok(Value::Array(out))
 }
-
 /// Build the `git.commitDetails` wire result for a single commit. Returns the
 /// flattened shape consumed by the FE ChangesTabType: metadata plus the
 /// per-file `fileDetails: [{ path, additions, deletions }]` array (`files` is

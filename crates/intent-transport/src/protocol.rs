@@ -18,3 +18,8 @@ pub const PROTOCOL_VERSION: &str = "2.7";
 /// JSON envelope overhead → 40 MiB. Anything larger is rejected without
 /// buffering the full payload (monorepo#472).
 pub const MAX_INBOUND_MESSAGE_BYTES: usize = 40 * 1024 * 1024;
+
+/// Maximum size of a single outbound frame. A full-tree git.diffs on a huge
+/// dirty worktree produced a 277 MiB response and HOL'd the UDS writer for
+/// ~38s. Cap matches inbound; producers should also size payloads down.
+pub const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAX_INBOUND_MESSAGE_BYTES;

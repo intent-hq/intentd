@@ -384,7 +384,10 @@ pub(crate) async fn channel_snapshot(
         // Archived workspaces are included so the snapshot agrees with the
         // deltas (which upsert archived workspaces as `updated`); clients
         // filter by `status` (intent-hq/monorepo#775).
-        Channel::Workspace => match api.list_workspaces(true).await {
+        // Lite list: cheap status aggregates (taskStats/displayStatus/
+        // cowSupported) only — no notes/sessions enrichment. Full list was
+        // multi-MB.
+        Channel::Workspace => match api.list_workspaces_lite(true).await {
             Ok(workspaces) => serde_json::to_value(workspaces).unwrap_or_else(|_| empty()),
             Err(_) => empty(),
         },
