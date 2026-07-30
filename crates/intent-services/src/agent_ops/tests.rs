@@ -7759,6 +7759,89 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
     );
 }
 
+/// Harness-owned commits: when the workspace's effective auto-commit is OFF,
+/// delegation derives `skip_auto_commit = caller arg OR !autoCommit` — the
+/// child gets the OFF commit instruction and the persisted session opt-out
+/// even without an explicit `skipAutoCommit` from the caller.
+#[tokio::test]
+async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
+    let (_t, svc, ws) = setup().await;
+    svc.store()
+        .set_workspace_auto_commit(&ws, false)
+        .await
+        .expect("set auto-commit off");
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Port frobnicator".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note");
+    let input = AgentDelegateInput {
+        task_note_id: Some(note.id.clone()),
+        agent_instructions: Some("do the work".into()),
+        skip_auto_commit: None,
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let first_message_text = child_session_first_message_text(&svc, &child).await;
+    assert!(
+        first_message_text.contains("**Auto-commit is OFF.**"),
+        "OFF instruction must be derived from the workspace setting: {first_message_text}"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("session");
+    assert!(
+        session.skip_auto_commit,
+        "session must opt out of the idle subscriber when auto-commit is off"
+    );
+}
+
+/// Harness-owned commits: the `agent.create` front door derives the same
+/// opt-out — a session created while the workspace's effective auto-commit is
+/// OFF persists `skip_auto_commit = true`.
+#[tokio::test]
+async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() {
+    let (_t, svc, ws) = setup().await;
+    svc.store()
+        .set_workspace_auto_commit(&ws, false)
+        .await
+        .expect("set auto-commit off");
+    let created = WorkspaceApi::agent_create(
+        &svc,
+        ws.clone(),
+        Some("Builder".into()),
+        None,
+        None,
+        None,
+        None,
+        Default::default(),
+    )
+    .await
+    .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("id"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(
+        session.skip_auto_commit,
+        "agent.create must opt the session out when auto-commit is off"
+    );
+}
+
 /// TASK-C: delegating with a linked task note but no explicit
 /// `agentInstructions` / `taskText` still injects the preamble (the note's
 /// body/title fallback slots in above it).

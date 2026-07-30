@@ -590,6 +590,29 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
+    /// §3b): the persisted per-workspace override when set (mirrored from the
+    /// global `git.autoCommit` at create time, toggled via
+    /// `workspace.setAutoCommit`), else the global `git.autoCommit` setting.
+    /// NULL rows (pre-migration workspaces, and Chief's seeded row — which is
+    /// excluded from reads and never seeded with an override) and lookup
+    /// failures fall back to the global value so the gate never hard-fails on
+    /// resolution.
+    pub(crate) async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
+        match self.store.workspace_auto_commit(workspace_id).await {
+            Ok(Some(enabled)) => enabled,
+            Ok(None) => self.effective_settings().git.auto_commit,
+            Err(e) => {
+                tracing::debug!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "effective_auto_commit: falling back to global git.autoCommit"
+                );
+                self.effective_settings().git.auto_commit
+            }
+        }
+    }
+
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
     /// The composition root keeps the env/HOME defaults; tests inject temp dirs
     /// so the 3-tier resolution is hermetic. The project tier always comes from
@@ -1178,6 +1201,29 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// The currently configured `workspace.worktreesLocation` directory for
+    /// teardown sweeps: `None` when the setting is empty or the startup pin
+    /// (`INTENTD_WORKSPACES_DIR`) keeps precedence, or when the expanded path
+    /// is not absolute. Unlike [`resolve_workspaces_parent`] this never
+    /// creates the directory — teardown must not mint new parents.
+    fn configured_worktrees_location(&self) -> Option<PathBuf> {
+        let pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
+        if pinned {
+            return None;
+        }
+        let location = settings::worktrees_location(&self.effective_settings());
+        let location = location.trim();
+        if location.is_empty() {
+            return None;
+        }
+        let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+        dir.is_absolute().then_some(dir)
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -4365,6 +4411,75 @@ fn derive_repo_name_from_path(path: &str) -> Option<String> {
     (!base.is_empty()).then(|| base.to_string())
 }
 
+/// Resolve the parent directory `workspace.create` provisions new checkouts
+/// under. Precedence: the startup-pinned `workspaces.root`
+/// (`INTENTD_WORKSPACES_DIR`) wins, then a non-empty
+/// `workspace.worktreesLocation` setting (tilde-expanded, created when
+/// missing — an invalid or uncreatable location fails the create rather than
+/// silently falling back), then the boot-time root.
+fn resolve_workspaces_parent(
+    boot_root: Option<PathBuf>,
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Result<PathBuf> {
+    let location = worktrees_location.trim();
+    if root_pinned || location.is_empty() {
+        return Ok(boot_root.unwrap_or_else(default_workspaces_root));
+    }
+    let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+    if !dir.is_absolute() {
+        return Err(Error::Internal(format!(
+            "workspace.worktreesLocation must be an absolute path, got `{location}`"
+        )));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        Error::Internal(format!(
+            "cannot create workspace.worktreesLocation directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+/// Candidate `<parent>/<id>` directories for a workspace's on-disk layout,
+/// deduplicated in priority order. Teardown paths (`workspace.delete`,
+/// `workspace.cleanup`) must not re-derive the parent from current settings
+/// only: a workspace created under `workspace.worktreesLocation` lives there
+/// even after the setting changes. The persisted worktree's parent wins (the
+/// location in force at create time); the boot root and the currently
+/// configured location are swept as well so worktree-less rows and
+/// setting-flips stay covered (all candidates are named after the workspace
+/// id, so removing a non-existent one is a harmless no-op).
+fn workspace_dir_candidates(
+    id: &WorkspaceId,
+    worktree_path: Option<&str>,
+    boot_root: &Path,
+    current_location: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = worktree_path
+        .filter(|p| !p.is_empty())
+        .and_then(|p| Path::new(p).parent())
+        .filter(|parent| {
+            parent
+                .file_name()
+                .map(|n| n == std::ffi::OsStr::new(id.as_str()))
+                .unwrap_or(false)
+        })
+    {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.push(boot_root.join(id.as_str()));
+    if let Some(loc) = current_location {
+        let dir = loc.join(id.as_str());
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.dedup();
+    dirs
+}
+
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
 /// override, else `~/intent/workspaces` — the FE's
 /// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
@@ -4973,14 +5088,21 @@ impl Services {
     /// Startup sweep entry point for [`sweep_orphaned_worktree_trash`]
     /// (monorepo#473). Resolves the workspaces root the same way the
     /// `workspace.*` operations do (injected root, else
-    /// [`default_workspaces_root`]) and runs the potentially multi-GB removal
+    /// [`default_workspaces_root`]), sweeps the currently configured
+    /// `workspace.worktreesLocation` as well (workspaces provisioned there
+    /// leave their trash there), and runs the potentially multi-GB removal
     /// on the blocking pool. Best-effort: a failed (or panicked) sweep task
     /// is logged and reported as 0 removals.
     pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
         let root = self.workspaces_root.clone();
+        let location = self.configured_worktrees_location();
         let task = tokio::task::spawn_blocking(move || {
             let root = root.unwrap_or_else(default_workspaces_root);
-            sweep_orphaned_worktree_trash(&root)
+            let mut removed = sweep_orphaned_worktree_trash(&root);
+            if let Some(location) = location.filter(|l| *l != root) {
+                removed += sweep_orphaned_worktree_trash(&location);
+            }
+            removed
         })
         .await;
         match task {
@@ -8500,6 +8622,18 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         let settings_branch_prefix = settings::branch_prefix(&self.effective_settings());
         let cow_isolation = self.effective_settings().workspace.cow_isolation;
+        let worktrees_location = settings::worktrees_location(&self.effective_settings());
+        // Mirror-at-creation seed for the per-workspace auto-commit override
+        // (spec Diagnosis §3b): the new row persists the global `git.autoCommit`
+        // in force when the workspace is created.
+        let global_auto_commit = self.effective_settings().git.auto_commit;
+        // Startup pin (`INTENTD_WORKSPACES_DIR` → pinned `workspaces.root`)
+        // keeps precedence over the `workspace.worktreesLocation` setting.
+        let workspaces_root_pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
         Box::pin(async move {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
@@ -8527,8 +8661,11 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
-                    let workspaces_root =
-                        workspaces_root.unwrap_or_else(default_workspaces_root);
+                    let workspaces_root = resolve_workspaces_parent(
+                        workspaces_root,
+                        workspaces_root_pinned,
+                        &worktrees_location,
+                    )?;
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
                     // random adjective-animal pair; uniquified with a `-N`
@@ -9125,7 +9262,14 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
-                    store.insert_workspace(&ws).await?;
+                    // Mirror-at-creation (spec Diagnosis §3b): persist the
+                    // global `git.autoCommit` as the workspace's own override
+                    // in the same INSERT so later global changes don't
+                    // retroactively flip existing workspaces — atomic, so the
+                    // row can never exist without its seed.
+                    store
+                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
+                        .await?;
                     // Write explicit setupScript to the workspace's worktree (AFTER provisioning
                     // so git_ops::worktree_path resolves correctly). Must land as a committable
                     // change in the workspace, visible in the workspace's diff view.
@@ -9288,6 +9432,12 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
+                        // Harness-owned commits: same derivation as
+                        // `agent.create` — the initial agent opts out of the
+                        // idle subscriber when the workspace's effective
+                        // auto-commit (just seeded above) is off.
+                        let skip_auto_commit =
+                            !services.effective_auto_commit(&ws.id).await;
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
@@ -9296,7 +9446,7 @@ impl WorkspaceApi for Services {
                                 nonempty_owned(agent.specialist),
                                 None,
                                 None,
-                                false,
+                                skip_auto_commit,
                                 extra,
                             )
                             .await?;
@@ -9765,6 +9915,11 @@ impl WorkspaceApi for Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(default_workspaces_root);
+        // Custom `workspace.worktreesLocation` sweep target: the workspace's
+        // actual parent is derived from its persisted worktree path below,
+        // but worktree-less rows created under a custom location need the
+        // currently configured location as a candidate too.
+        let worktrees_location = self.configured_worktrees_location();
         // Live-state teardown handles: cloned so the boxed future owns them
         // across the store cascade below. `agent_manager()` upgrades the weak
         // reference; read-only/test wiring with no manager attached simply
@@ -9988,6 +10143,7 @@ impl WorkspaceApi for Services {
             // `workspace.delete` of the recreated workspace will clean up any
             // mismatched leftovers.
             let workspaces_root_bg = workspaces_root.clone();
+            let worktrees_location_bg = worktrees_location.clone();
             let id_bg = id.clone();
             let store_bg = store.clone();
             let worktree_locks_bg = worktree_locks.clone();
@@ -10000,6 +10156,9 @@ impl WorkspaceApi for Services {
                 // `<workspaces_root>/<id>/` directory if it doesn't match the
                 // recreated workspace's path, for orphan-cleanup parity.
                 let recreated = store_bg.get_workspace(&id_bg).await.ok();
+                let deleted_worktree_path = ws_for_cleanup
+                    .as_ref()
+                    .and_then(|w| w.worktree_path.clone());
                 if let Some(ws_cleanup) = ws_for_cleanup {
                     // Only run the worktree cleanup if the workspace is still
                     // deleted (no recreate) or the recreate has a different
@@ -10101,26 +10260,39 @@ impl WorkspaceApi for Services {
                     }
                 }
                 // Final sweep of the daemon-owned workspace directory
-                // (`<workspaces_root>/<id>/`). The worktree cleanup's
-                // best-effort `remove_dir` (empty-only) leaves any residual
-                // content behind, and legacy pre-daemon workspaces have a
-                // directory but no worktree path at all. Recursive best-effort
-                // removal keeps the FE `FileSystemWorkspaceRepository.findAll`
-                // scan from re-surfacing the deleted id (ENOENT WARN spam) and
+                // (`<parent>/<id>/`). The worktree cleanup's best-effort
+                // `remove_dir` (empty-only) leaves any residual content
+                // behind, and legacy pre-daemon workspaces have a directory
+                // but no worktree path at all. Recursive best-effort removal
+                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
+                // from re-surfacing the deleted id (ENOENT WARN spam) and
                 // makes the delete idempotent for orphaned directories.
                 //
+                // Candidates cover every parent this workspace may live under
+                // (persisted worktree's parent — the location in force at
+                // create time — plus the boot root and the currently
+                // configured `workspace.worktreesLocation`), so deleting a
+                // workspace created under a custom location does not leak
+                // `<location>/<id>/`.
+                //
                 // If a same-slug recreate happened and uses the same
-                // `<workspaces_root>/<id>/` parent, skip the removal so we
-                // don't destroy the recreated workspace's directory tree.
-                let skip_dir = recreated
+                // `<parent>/<id>/` directory, skip that candidate so we don't
+                // destroy the recreated workspace's directory tree.
+                let recreated_parent = recreated
                     .as_ref()
                     .and_then(|r| r.worktree_path.as_deref())
                     .filter(|p| !p.is_empty())
                     .and_then(|wt_path| Path::new(wt_path).parent())
-                    .map(|parent| parent == workspaces_root_bg.join(id_bg.as_str()))
-                    .unwrap_or(false);
-                if !skip_dir {
-                    let dir = workspaces_root_bg.join(id_bg.as_str());
+                    .map(Path::to_path_buf);
+                for dir in workspace_dir_candidates(
+                    &id_bg,
+                    deleted_worktree_path.as_deref(),
+                    &workspaces_root_bg,
+                    worktrees_location_bg.as_deref(),
+                ) {
+                    if recreated_parent.as_deref() == Some(dir.as_path()) {
+                        continue;
+                    }
                     let cleanup =
                         tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
                             Ok(()) => Ok(()),
@@ -10239,11 +10411,16 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let worktree_locks = self.worktree_locks.clone();
         let this = self.clone();
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(default_workspaces_root);
+        let boot_workspaces_root = self.workspaces_root.clone();
         let cow_isolation = self.effective_settings().workspace.cow_isolation;
+        let worktrees_location = settings::worktrees_location(&self.effective_settings());
+        // Startup pin (`INTENTD_WORKSPACES_DIR` → pinned `workspaces.root`)
+        // keeps precedence over the `workspace.worktreesLocation` setting.
+        let workspaces_root_pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
         Box::pin(async move {
             // Chief is virtual and never carries user content; duplication is
             // not meaningful (TS parity: coverflow never exposes a duplicate
@@ -10253,6 +10430,14 @@ impl WorkspaceApi for Services {
                     "cannot duplicate chief workspace".to_string(),
                 ));
             }
+            // Same parent-dir precedence as `workspace.create`: startup pin >
+            // `workspace.worktreesLocation` > boot root — so a duplicate lands
+            // next to where a freshly created workspace would.
+            let workspaces_root = resolve_workspaces_parent(
+                boot_workspaces_root,
+                workspaces_root_pinned,
+                &worktrees_location,
+            )?;
             let source = store.get_workspace(&id).await?;
             // Fresh id: reuse the random adjective-animal slug generator and
             // uniquify against live rows, tombstones, and stray directories.
@@ -10625,7 +10810,14 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
-            store.insert_workspace(&ws).await?;
+            // Seed the duplicate's auto-commit override from the source's
+            // effective value (source override → global fallback) in the same
+            // INSERT, matching the atomic mirror-at-creation semantics of
+            // `workspace.create`.
+            let source_auto_commit = this.effective_auto_commit(&id).await;
+            store
+                .insert_workspace_with_auto_commit(&ws, Some(source_auto_commit))
+                .await?;
             // Record branch provenance so `workspace.delete` cleans up the
             // duplicated branch alongside its worktree (same guard as
             // `workspace.create`: only auto-generated branches are deleted).
@@ -10708,6 +10900,7 @@ impl WorkspaceApi for Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(default_workspaces_root);
+        let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
             // Chief is virtual: no on-disk cache and no worktree — TS parity's
             // `isVirtualWorkspace` guard.
@@ -10719,28 +10912,41 @@ impl WorkspaceApi for Services {
             // sweeping a random directory.
             let ws = store.get_workspace(&id).await?;
             // Best-effort recursive delete of the daemon-owned cache directory
-            // (`<workspaces_root>/<id>/cache`). Missing / non-existent is a
-            // success; other errors are logged and swallowed.
-            let cache_dir = workspaces_root.join(id.as_str()).join("cache");
-            let cache_task =
-                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&cache_dir) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                })
-                .await;
-            match cache_task {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %e,
-                    "workspace.cleanup: failed to remove cache directory"
-                ),
-                Err(join_err) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %join_err,
-                    "workspace.cleanup: cache cleanup task failed"
-                ),
+            // (`<parent>/<id>/cache`). The parent candidates cover the
+            // persisted worktree's parent (the location in force at create
+            // time) plus the boot root and the current
+            // `workspace.worktreesLocation`, so caches under a custom
+            // location are cleaned too. Missing / non-existent is a success;
+            // other errors are logged and swallowed.
+            for dir in workspace_dir_candidates(
+                &id,
+                ws.worktree_path.as_deref(),
+                &workspaces_root,
+                worktrees_location.as_deref(),
+            ) {
+                let cache_dir = dir.join("cache");
+                let cache_task =
+                    tokio::task::spawn_blocking(move || {
+                        match std::fs::remove_dir_all(&cache_dir) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .await;
+                match cache_task {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "workspace.cleanup: failed to remove cache directory"
+                    ),
+                    Err(join_err) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %join_err,
+                        "workspace.cleanup: cache cleanup task failed"
+                    ),
+                }
             }
             // Run `git gc` against the worktree when there is one — reclaims
             // loose objects and packs (TS `cleanupWorkspace` parity).
@@ -10911,6 +11117,59 @@ impl WorkspaceApi for Services {
             // `NotFound` propagates so the router maps it to `-32602` (§5.23).
             let ws = store.get_workspace(&id).await?;
             Ok(ws.token_usage.unwrap_or_default())
+        })
+    }
+
+    fn get_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            // Chief's seeded row is excluded from reads and never commits, so
+            // force `source: "global"` regardless of the row's column — without
+            // this guard a stray write to the seeded row would flip the source
+            // to "workspace". Real workspaces surface `NotFound` from the store
+            // so the router maps it to `-32602`.
+            if id.is_chief() {
+                return Ok(serde_json::json!({
+                    "enabled": this.effective_settings().git.auto_commit,
+                    "source": "global",
+                }));
+            }
+            let (enabled, source) = match store.workspace_auto_commit(&id).await? {
+                Some(v) => (v, "workspace"),
+                None => (this.effective_settings().git.auto_commit, "global"),
+            };
+            Ok(serde_json::json!({ "enabled": enabled, "source": source }))
+        })
+    }
+
+    fn set_workspace_auto_commit(
+        &self,
+        id: WorkspaceId,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            // Chief is virtual: nothing to persist and the toggle is not
+            // meaningful for a workspace that never commits.
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot set autoCommit on chief workspace".to_string(),
+                ));
+            }
+            store.set_workspace_auto_commit(&id, enabled).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5) so live
+            // clients mirror the toggle without a follow-up read.
+            publish_event(
+                &bus,
+                workspace_updated_event(&id, serde_json::json!({ "autoCommitEnabled": enabled })),
+            )
+            .await;
+            Ok(serde_json::json!({ "enabled": enabled, "source": "workspace" }))
         })
     }
 
@@ -14118,8 +14377,11 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
-        let settings = self.effective_settings();
+        let this = self.clone();
         Box::pin(async move {
+            // TS `ws.git.commit` gates on auto-commit (no userRequested
+            // bypass), resolved per-workspace (override → global fallback).
+            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let event_bus = bus.clone();
@@ -14131,8 +14393,7 @@ impl WorkspaceApi for Services {
                 "git.commit",
                 move || async move {
                     let store = op_store;
-                    // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-                    git_ops::assert_agent_commit_allowed(&settings, false)?;
+                    git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
                     // All commit failures surface as `-32603` (the TS handler wraps the
                     // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
                     let ws = store
@@ -14181,10 +14442,12 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
-        let settings = self.effective_settings();
+        let this = self.clone();
         Box::pin(async move {
-            // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(&settings, user_requested)?;
+            // userRequested bypasses the auto-commit gate (TS parity); the
+            // gate reads the per-workspace resolution (override → global).
+            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
+            git_ops::assert_agent_commit_allowed(auto_commit_enabled, user_requested)?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -14836,6 +15099,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
+            // Harness-owned commits: sessions created while the workspace's
+            // effective auto-commit is off opt out of the idle subscriber, so
+            // nothing commits unless the user explicitly asks.
+            let skip_auto_commit = !self.effective_auto_commit(&workspace_id).await;
             with_idempotency(
                 &self.store,
                 &ws_scope,
@@ -14849,7 +15116,7 @@ impl WorkspaceApi for Services {
                         specialist_id,
                         parent_agent_id,
                         None,
-                        false,
+                        skip_auto_commit,
                         extra,
                     )
                     .await
@@ -18142,7 +18409,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(&self.effective_settings(), true)?;
+        git_ops::assert_agent_commit_allowed(self.effective_auto_commit(workspace_id).await, true)?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;

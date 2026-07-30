@@ -4626,6 +4626,146 @@ mod change_event_parity {
         );
     }
 
+    /// Mirror-at-creation (spec Diagnosis §3b): `workspace.create` seeds the
+    /// per-workspace auto-commit override from the global `git.autoCommit` in
+    /// force at create time, so `workspace.getAutoCommit` reports
+    /// `source: "workspace"` and later global flips don't affect the row.
+    #[tokio::test]
+    async fn workspace_create_mirrors_global_auto_commit() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        // Default settings: git.autoCommit = true.
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("AC mirror".to_string()),
+                    branch: Some("feat/ac-mirror".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let persisted = h
+            .store
+            .workspace_auto_commit(&created.id)
+            .await
+            .expect("read override");
+        assert_eq!(persisted, Some(true), "mirrored from global at creation");
+        let resolved = h
+            .services
+            .get_workspace_auto_commit(created.id.clone())
+            .await
+            .expect("getAutoCommit");
+        assert_eq!(resolved["enabled"], json!(true));
+        assert_eq!(resolved["source"], json!("workspace"));
+    }
+
+    /// `workspace.duplicate` seeds the duplicate's auto-commit override from
+    /// the source's effective value (source override → global fallback), so
+    /// a source toggled OFF produces an OFF duplicate while the source's own
+    /// override is untouched.
+    #[tokio::test]
+    async fn workspace_duplicate_seeds_auto_commit_from_source() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let source = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("AC dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        h.services
+            .set_workspace_auto_commit(source.id.clone(), false)
+            .await
+            .expect("toggle source off");
+
+        let dup = h
+            .services
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+        assert_eq!(
+            h.store
+                .workspace_auto_commit(&dup.id)
+                .await
+                .expect("read dup override"),
+            Some(false),
+            "duplicate mirrors the source's effective auto-commit"
+        );
+        assert_eq!(
+            h.store
+                .workspace_auto_commit(&source.id)
+                .await
+                .expect("read source override"),
+            Some(false),
+            "source override untouched by duplication"
+        );
+    }
+
+    /// NULL fallback: a pre-migration row (no persisted override) resolves
+    /// `workspace.getAutoCommit` against the global setting with
+    /// `source: "global"`, and `effective_auto_commit` follows the global.
+    #[tokio::test]
+    async fn workspace_auto_commit_null_falls_back_to_global() {
+        let h = harness().await;
+        // The harness workspace is inserted directly (no create-time seed),
+        // so its auto_commit_enabled column is NULL.
+        let persisted = h
+            .store
+            .workspace_auto_commit(&h.ws)
+            .await
+            .expect("read override");
+        assert_eq!(persisted, None, "pre-migration row has no override");
+        let resolved = h
+            .services
+            .get_workspace_auto_commit(h.ws.clone())
+            .await
+            .expect("getAutoCommit");
+        assert_eq!(resolved["enabled"], json!(true), "schema default is true");
+        assert_eq!(resolved["source"], json!("global"));
+        assert!(h.services.effective_auto_commit(&h.ws).await);
+    }
+
+    /// `workspace.setAutoCommit` persists the override, emits a
+    /// `workspace:updated` delta carrying `autoCommitEnabled`, and the
+    /// effective resolution honors the override over the global default.
+    #[tokio::test]
+    async fn workspace_set_auto_commit_persists_and_emits() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let set = h
+            .services
+            .set_workspace_auto_commit(h.ws.clone(), false)
+            .await
+            .expect("setAutoCommit");
+        assert_eq!(set["enabled"], json!(false));
+        assert_eq!(set["source"], json!("workspace"));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"], json!({ "autoCommitEnabled": false }));
+        // Survives a fresh read and wins over the global default (true).
+        assert_eq!(
+            h.store.workspace_auto_commit(&h.ws).await.expect("read"),
+            Some(false)
+        );
+        assert!(!h.services.effective_auto_commit(&h.ws).await);
+        // Missing workspace → NotFound (router maps it to -32602).
+        let missing = h
+            .services
+            .set_workspace_auto_commit(WorkspaceId::from("ws-none"), true)
+            .await;
+        assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
+    }
+
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded
@@ -19470,6 +19610,298 @@ mod provider_discovery_payload {
             pick(&bad_payload),
             pick(&baseline),
             "invalid overrides must behave exactly like no overrides"
+        );
+    }
+}
+
+/// `workspace.create` parent-dir resolution: startup pin > non-empty
+/// `workspace.worktreesLocation` (created when missing, failure = error) >
+/// boot-time root (see `resolve_workspaces_parent`).
+mod worktrees_location {
+    use super::*;
+    use crate::{resolve_workspaces_parent, SettingsRegistry};
+    use intent_core::WorkspaceCreate;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolver_precedence_and_errors() {
+        let boot = tempfile::tempdir().expect("boot root");
+        let custom = tempfile::tempdir().expect("custom root");
+        let boot_path = boot.path().to_path_buf();
+
+        // Empty / whitespace setting → boot root fallback.
+        for loc in ["", "   "] {
+            let got = resolve_workspaces_parent(Some(boot_path.clone()), false, loc)
+                .expect("fallback resolves");
+            assert_eq!(got, boot_path, "empty setting falls back to boot root");
+        }
+
+        // Non-empty setting → the location, created when missing.
+        let nested = custom.path().join("nested").join("worktrees");
+        let got =
+            resolve_workspaces_parent(Some(boot_path.clone()), false, &nested.to_string_lossy())
+                .expect("setting resolves");
+        assert_eq!(got, nested, "setting wins over boot root");
+        assert!(nested.is_dir(), "missing location is created");
+
+        // Startup pin → boot root even when the setting is set.
+        let got =
+            resolve_workspaces_parent(Some(boot_path.clone()), true, &nested.to_string_lossy())
+                .expect("pinned resolves");
+        assert_eq!(got, boot_path, "startup pin keeps precedence");
+
+        // Relative location → clear error, no silent fallback.
+        let err = resolve_workspaces_parent(Some(boot_path.clone()), false, "relative/dir")
+            .expect_err("relative location rejected");
+        assert!(
+            err.to_string().contains("worktreesLocation"),
+            "error names the setting: {err}"
+        );
+
+        // Uncreatable location (path under a regular file) → clear error.
+        let file = custom.path().join("occupied");
+        std::fs::write(&file, "x").expect("write blocker file");
+        let bad = file.join("sub");
+        let err = resolve_workspaces_parent(Some(boot_path), false, &bad.to_string_lossy())
+            .expect_err("uncreatable location rejected");
+        assert!(
+            err.to_string().contains("worktreesLocation"),
+            "error names the setting: {err}"
+        );
+    }
+
+    /// Tilde form (`~/...`) — the shape users are most likely to type into
+    /// the setup UI — expands against `$HOME` before the absolute-path check,
+    /// so it resolves instead of being rejected as relative. Guarded by a
+    /// lock + drop-guard restore since env-var mutation is process-global.
+    #[tokio::test]
+    async fn resolver_expands_tilde_against_home() {
+        static ENV_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        struct HomeEnvGuard {
+            prior: Option<std::ffi::OsString>,
+        }
+        impl Drop for HomeEnvGuard {
+            fn drop(&mut self) {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let boot = tempfile::tempdir().expect("boot root");
+        let home = tempfile::tempdir().expect("fake home");
+        let got = {
+            let _lock = ENV_HOME_LOCK.lock().await;
+            let _env = HomeEnvGuard {
+                prior: std::env::var_os("HOME"),
+            };
+            std::env::set_var("HOME", home.path());
+            resolve_workspaces_parent(
+                Some(boot.path().to_path_buf()),
+                false,
+                "~/my-worktrees/nested",
+            )
+            .expect("tilde location resolves")
+        };
+        assert_eq!(
+            got,
+            home.path().join("my-worktrees").join("nested"),
+            "tilde expands against $HOME"
+        );
+        assert!(got.is_dir(), "expanded location is created");
+    }
+
+    /// End-to-end through `workspace.create`: with the setting present the
+    /// workspace lands under the configured location (metadata file proves
+    /// the resolved parent); cleared back to empty, the next create falls
+    /// back to the boot root.
+    #[tokio::test]
+    async fn create_workspace_honors_worktrees_location_setting() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let custom = tempfile::tempdir().expect("custom location");
+        let location = custom.path().join("my-worktrees");
+
+        let cfg_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(location.to_string_lossy()),
+            )])
+            .expect("apply worktreesLocation");
+
+        let svc = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(registry.clone());
+
+        let created = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some("/src/intent".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create with setting");
+        let id = created.workspace.id.as_str().to_string();
+        assert!(
+            location
+                .join(&id)
+                .join(".workspace/workspace.json")
+                .is_file(),
+            "workspace provisioned under workspace.worktreesLocation"
+        );
+        assert!(
+            !ws_root.path().join(&id).exists(),
+            "boot root untouched when the setting is set"
+        );
+
+        // Clear the setting → next create falls back to the boot root.
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(""),
+            )])
+            .expect("clear worktreesLocation");
+        let created = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some("/src/intent".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create with setting cleared");
+        let id = created.workspace.id.as_str().to_string();
+        assert!(
+            ws_root
+                .path()
+                .join(&id)
+                .join(".workspace/workspace.json")
+                .is_file(),
+            "empty setting falls back to the boot root"
+        );
+    }
+
+    /// `workspace.duplicate` resolves the same parent precedence as
+    /// `workspace.create`: with the setting present the duplicate lands under
+    /// the configured location, not the boot root.
+    #[tokio::test]
+    async fn duplicate_workspace_honors_worktrees_location_setting() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let custom = tempfile::tempdir().expect("custom location");
+        let location = custom.path().join("dup-worktrees");
+
+        let cfg_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(location.to_string_lossy()),
+            )])
+            .expect("apply worktreesLocation");
+
+        let svc = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(registry);
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some("/src/intent".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+        let dup_id = dup.id.as_str().to_string();
+        assert!(
+            location
+                .join(&dup_id)
+                .join(".workspace/workspace.json")
+                .is_file(),
+            "duplicate provisioned under workspace.worktreesLocation"
+        );
+        assert!(
+            !ws_root.path().join(&dup_id).exists(),
+            "boot root untouched when the setting is set"
+        );
+    }
+
+    /// `workspace.delete` sweeps the workspace's directory under the custom
+    /// `workspace.worktreesLocation` too — deleting a workspace created there
+    /// must not leak `<location>/<id>/` (metadata, cache, residual content).
+    #[tokio::test]
+    async fn delete_workspace_sweeps_custom_worktrees_location_dir() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let custom = tempfile::tempdir().expect("custom location");
+        let location = custom.path().join("del-worktrees");
+
+        let cfg_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(location.to_string_lossy()),
+            )])
+            .expect("apply worktreesLocation");
+
+        let svc = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(registry);
+
+        let created = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some("/src/intent".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create under custom location")
+            .workspace;
+        let id = created.id.as_str().to_string();
+        let ws_dir = location.join(&id);
+        assert!(
+            ws_dir.join(".workspace/workspace.json").is_file(),
+            "created under the custom location"
+        );
+
+        svc.delete_workspace(created.id.clone())
+            .await
+            .expect("delete");
+        // Fast-ack: poll for the background cleanup.
+        for _ in 0..100 {
+            if !ws_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !ws_dir.exists(),
+            "delete removes <location>/<id>/ under the custom worktrees location"
         );
     }
 }

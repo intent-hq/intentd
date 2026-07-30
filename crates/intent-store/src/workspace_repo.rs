@@ -19,9 +19,23 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
+        self.insert_workspace_with_auto_commit(ws, None).await
+    }
+
+    /// Insert a workspace row with the per-workspace `auto_commit_enabled`
+    /// override seeded in the same INSERT (mirror-at-creation, spec Diagnosis
+    /// §3b). Atomic: the row can never exist without its seed, so a created
+    /// workspace never silently degrades to global-tracking semantics.
+    /// `None` leaves the column NULL (resolves against the global at read
+    /// time).
+    pub async fn insert_workspace_with_auto_commit(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+    ) -> Result<()> {
         let sql = format!(
-            "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -56,6 +70,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
+            .bind(auto_commit.map(|v| v as i64))
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -307,6 +322,39 @@ impl Store {
             .map_err(|e| Error::Internal(format!("get branch_auto_generated failed: {e}")))?;
         match row {
             Some(r) => Ok(col::<i64>(&r, "branch_auto_generated")? != 0),
+            None => Err(Error::NotFound(format!("workspace {id}"))),
+        }
+    }
+
+    /// Set the persisted per-workspace auto-commit override (spec Diagnosis
+    /// §3b). Mirrored from the global `git.autoCommit` at create time and
+    /// toggled via `workspace.setAutoCommit`. Store-only column — the value
+    /// is surfaced through the dedicated getter RPC, not on [`Workspace`].
+    pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET auto_commit_enabled = ? WHERE id = ?")
+            .bind(enabled as i64)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set auto_commit_enabled failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// The persisted per-workspace auto-commit override. `Ok(None)` for
+    /// pre-migration rows (NULL column) — the caller resolves NULL against
+    /// the global `git.autoCommit` setting. `NotFound` when the workspace
+    /// does not exist.
+    pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
+        let row = sqlx::query("SELECT auto_commit_enabled FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get auto_commit_enabled failed: {e}")))?;
+        match row {
+            Some(r) => Ok(col::<Option<i64>>(&r, "auto_commit_enabled")?.map(|v| v != 0)),
             None => Err(Error::NotFound(format!("workspace {id}"))),
         }
     }

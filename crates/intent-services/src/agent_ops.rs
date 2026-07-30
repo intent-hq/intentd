@@ -3198,6 +3198,19 @@ impl Services {
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
         // and honor the opt-out without a reverse lookup on every idle event.
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
+        // Harness-owned commits: the effective opt-out is the caller's explicit
+        // `skipAutoCommit` OR the workspace's effective auto-commit being off,
+        // so delegated children get the OFF commit instruction (and the idle
+        // subscriber skip) whenever nothing would auto-commit anyway.
+        // Deliberately sticky: the derived opt-out is persisted on the
+        // session, so toggling the workspace back ON via
+        // `workspace.setAutoCommit` never re-enables idle commits for
+        // sessions created while it was OFF — their first-message commit
+        // instruction already told the agent commits are manual, and
+        // flipping the harness behavior mid-session would contradict it.
+        // New sessions created after the toggle pick up the ON state.
+        let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
+            || !self.effective_auto_commit(&workspace_id).await;
         // Resolve the child's first message up front so it can be persisted as
         // `metadata.initialMessage` on the created session (P3-1.2b; the FE
         // stored it so a wake-up can resume). Source priority mirrors the TS
@@ -3253,7 +3266,7 @@ impl Services {
                 title = title,
                 note_id = note_id,
             );
-            let commit_instruction = if input.skip_auto_commit.unwrap_or(false) {
+            let commit_instruction = if skip_auto_commit {
                 "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
             } else {
                 ""
@@ -3375,7 +3388,7 @@ impl Services {
                 input.specialist,
                 parent_agent_id.clone(),
                 session_task_note_id.clone(),
-                input.skip_auto_commit.unwrap_or(false),
+                skip_auto_commit,
                 extra,
             )
             .await?;
@@ -5080,9 +5093,13 @@ impl Services {
                 .clone()
                 .unwrap_or_else(|| format!("Task: {task_title}")),
         );
-        // B6: honor `create.skipAutoCommit` from the request; default `false`
-        // preserves the pre-widening behavior.
-        let skip_auto_commit = create_opts.skip_auto_commit.unwrap_or(false);
+        // B6: honor `create.skipAutoCommit` from the request; like
+        // `agent.delegate`, the effective opt-out is the caller's explicit
+        // flag OR the workspace's effective auto-commit being off, so
+        // wakeOrCreate-created task agents carry the same persisted opt-out
+        // (and OFF first-message instruction) as delegated children.
+        let skip_auto_commit = create_opts.skip_auto_commit.unwrap_or(false)
+            || !self.effective_auto_commit(&workspace_id).await;
         let metadata = build_create_metadata(
             &create_opts,
             &input,

@@ -334,6 +334,60 @@ async fn auto_commit_disabled_setting_is_silent_skip() {
 }
 
 #[tokio::test]
+async fn workspace_override_disabled_is_silent_skip() {
+    // Global git.autoCommit stays at its default (true); the persisted
+    // per-workspace override (false) must win at the idle-commit gate.
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    svc.store()
+        .set_workspace_auto_commit(&ws_id, false)
+        .await
+        .unwrap();
+    let agent = session("agent-w1", &ws_id, None, false, "X", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-w1").await;
+    let event = idle_event(&ws_id, "agent-w1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+    assert_eq!(
+        commits.len(),
+        1,
+        "workspace override=false blocks the commit"
+    );
+}
+
+#[tokio::test]
+async fn workspace_override_enabled_beats_global_disabled() {
+    // Global git.autoCommit=false, workspace override=true → commit proceeds.
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = std::sync::Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    registry
+        .apply(&[("git.autoCommit".to_string(), serde_json::json!(false))])
+        .unwrap();
+    let svc = svc.with_settings_registry(registry);
+    svc.store()
+        .set_workspace_auto_commit(&ws_id, true)
+        .await
+        .unwrap();
+    let agent = session("agent-w2", &ws_id, None, false, "Override Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-w2").await;
+    let event = idle_event(&ws_id, "agent-w2", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (agent_id, _, _) = last_commit_trailers(&repo.dir).await;
+    assert_eq!(
+        agent_id.as_deref(),
+        Some("agent-w2"),
+        "workspace override=true must beat global=false"
+    );
+}
+
+#[tokio::test]
 async fn session_skip_auto_commit_is_silent_skip() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
