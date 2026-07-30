@@ -81,6 +81,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: [self-hosted, Windows, X64]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     # Keeps the cargo-check steps free of debuginfo/incremental artifacts
     # (cheaper compile, smaller shared cache). Safe job-wide: the release
     # build is unaffected — these vars only touch the dev/test profiles, and
