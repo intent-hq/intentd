@@ -278,6 +278,7 @@ async fn agent_read_conversation_returns_messages() {
             None,
             None,
             None,
+            intent_core::MessageOrigin::User,
         )
         .await
         .expect("send message");

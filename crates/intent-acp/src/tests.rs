@@ -1587,6 +1587,7 @@ mod mcp_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             _message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.sent
                 .lock()
@@ -2399,6 +2400,104 @@ mod client_served_tests {
         handler.serve(&conn, req).await.unwrap();
         let resp = read_frame(&mut reader).await;
         assert_eq!(resp["result"]["content"], json!("hi there"));
+    }
+
+    /// Regression (intent-hq/monorepo#1144): `fs/write_text_file` must fully
+    /// await the `file:changed` sink publish BEFORE the write response is
+    /// sent, otherwise the agent can observe the write as done — and end its
+    /// turn — before the attribution pipeline (which the service-layer sink
+    /// awaits inside `publish`) records the change.
+    ///
+    /// Deterministic, no sleeps: a gated sink suspends `publish` mid-flight;
+    /// cooperative yields on the current-thread runtime give the connection's
+    /// background writer task every chance to flush anything already
+    /// enqueued, so a single poll of the reader proves whether a response
+    /// frame went out while the publish was still pending. Under the old
+    /// respond-then-emit order the frame is enqueued before `publish` starts,
+    /// the yields flush it, and the poll finds it — failing the test.
+    #[tokio::test]
+    async fn write_response_waits_for_file_changed_publish() {
+        use std::future::Future;
+
+        struct GatedSink {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            events: Mutex<Vec<SinkEvent>>,
+        }
+        impl EventSink for GatedSink {
+            fn publish(&self, event: SinkEvent) -> BoxFuture<'_, ()> {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    self.events.lock().unwrap().push(event);
+                })
+            }
+        }
+
+        let root = temp_dir();
+        let sink = Arc::new(GatedSink {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            events: Mutex::new(Vec::new()),
+        });
+        let handler = ClientRequestHandler::new(
+            WorkspaceId::from_string("ws-1"),
+            AgentId::from_string("agent-1"),
+            "auggie",
+            FileService::new(&root),
+            Arc::new(PermissionRegistry::new()),
+            PermissionPolicy::Interactive,
+            sink.clone(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let path = root.join("ordered.txt");
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            7,
+            "fs/write_text_file",
+            json!({ "sessionId": "acp-1", "path": path, "content": "attributed" }),
+        )
+        .await;
+        // Return `conn` so it outlives the serve future (dropping it closes
+        // the wire before the response flushes).
+        let serve = tokio::spawn(async move {
+            handler.serve(&conn, req).await.unwrap();
+            conn
+        });
+
+        // Wait until the handler is inside the (suspended) sink publish.
+        sink.entered.notified().await;
+        // Cooperative yields: let the connection's writer task flush anything
+        // that was enqueued before the publish started.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut line = String::new();
+        {
+            let read = reader.read_line(&mut line);
+            tokio::pin!(read);
+            let early =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                early.is_pending(),
+                "fs/write_text_file response was sent before the file:changed \
+                 publish completed (intent-hq/monorepo#1144): {line:?}"
+            );
+        }
+
+        // Release the publish; only now may the response go out.
+        sink.release.notify_one();
+        let _conn = serve.await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["id"], json!(7));
+        assert!(resp.get("result").is_some(), "write returns a result");
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one sink publish");
+        assert_eq!(events[0].event_type, "file:changed");
     }
 
     fn permission_params(title: &str) -> Value {
@@ -7319,6 +7418,7 @@ mod wsapi4_bindings_tests {
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
+                dismissed_questions_message_id: None,
             },
         }
     }
@@ -7360,6 +7460,7 @@ mod wsapi4_bindings_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_send_calls.lock().unwrap().push((
                 agent_id.as_str().to_string(),

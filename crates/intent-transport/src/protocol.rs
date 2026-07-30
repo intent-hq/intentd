@@ -2,14 +2,15 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.7 adds the
+//! `system.status` → `protocolVersion`. Version 2.8 adds the
 //! `workspace.getAutoCommit` / `workspace.setAutoCommit` router methods for
-//! the persisted per-workspace auto-commit override, covering 307
-//! dispatchable method names (271 router + 34 fast-path + 2 aliases) + 1
-//! notification + 4 reverse RPCs.
+//! the persisted per-workspace auto-commit override and the
+//! `agent.dismissQuestions` router method persisting the question-dismissal
+//! marker for the question hold, covering 308 dispatchable method names
+//! (272 router + 34 fast-path + 2 aliases) + 1 notification + 4 reverse RPCs.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.7";
+pub const PROTOCOL_VERSION: &str = "2.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
