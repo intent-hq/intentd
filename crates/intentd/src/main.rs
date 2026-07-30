@@ -1549,33 +1549,24 @@ impl intent_core::ServerControl for DaemonControl {
                 }
             }
 
-            // Read the persisted port from settings (fall back to env/default)
-            let desired_port = match runtime
+            // Read the persisted port from settings, then resolve against the
+            // env seam (see `resolve_ws_listener_port` for the precedence).
+            let settings_port = match runtime
                 .api
                 .settings_get("server.wsApi.port".to_string())
                 .await
             {
-                Ok(result) => {
-                    result
-                        .get("value")
-                        .and_then(|v| v.as_f64())
-                        .map(|p| p as u16)
-                        .unwrap_or_else(|| {
-                            // Fall back to env INTENTD_TCP_PORT / default 5181
-                            std::env::var("INTENTD_TCP_PORT")
-                                .ok()
-                                .and_then(|v| v.trim().parse::<u16>().ok())
-                                .unwrap_or(runtime.ws_options.base_port)
-                        })
-                }
-                Err(_) => {
-                    // Fall back to env INTENTD_TCP_PORT / default 5181
-                    std::env::var("INTENTD_TCP_PORT")
-                        .ok()
-                        .and_then(|v| v.trim().parse::<u16>().ok())
-                        .unwrap_or(runtime.ws_options.base_port)
-                }
+                Ok(result) => result
+                    .get("value")
+                    .and_then(|v| v.as_f64())
+                    .map(|p| p as u16),
+                Err(_) => None,
             };
+            let desired_port = resolve_ws_listener_port(
+                std::env::var("INTENTD_TCP_PORT").ok().as_deref(),
+                settings_port,
+                runtime.ws_options.base_port,
+            );
 
             // Clone ws_options and override the port
             let mut ws_options = runtime.ws_options.clone();
@@ -1809,6 +1800,29 @@ fn boot_ws_listener(insecure: bool, ws_api_enabled: bool) -> BootWsListener {
     } else {
         BootWsListener::None
     }
+}
+
+/// Resolve the port [`start_ws_listener`](DaemonControl) binds. Precedence:
+///
+/// 1. `INTENTD_TCP_PORT=0` — the E2E ephemeral-port seam (the same seam
+///    [`apply_startup_pins`] leaves unpinned): an OS-assigned bind (port 0)
+///    wins over any settings value, so a test daemon never races another
+///    process for a pre-reserved port (monorepo#1051).
+/// 2. The persisted `server.wsApi.port` settings value (a nonzero
+///    `INTENTD_TCP_PORT` is already pinned into settings by
+///    [`apply_startup_pins`], so settings-first keeps flag > file).
+/// 3. A parseable nonzero `INTENTD_TCP_PORT` when settings has no value.
+/// 4. The `fallback` default (5181).
+fn resolve_ws_listener_port(
+    env_port: Option<&str>,
+    settings_port: Option<u16>,
+    fallback: u16,
+) -> u16 {
+    let env_port = env_port.and_then(|v| v.trim().parse::<u16>().ok());
+    if env_port == Some(0) {
+        return 0;
+    }
+    settings_port.or(env_port).unwrap_or(fallback)
 }
 
 /// Build [`WsOptions`] from the production defaults plus an optional env seam:
@@ -3146,6 +3160,42 @@ mod tests {
     fn boot_ws_listener_follows_ws_api_enabled_when_secure() {
         assert_eq!(boot_ws_listener(false, true), BootWsListener::SecureWss);
         assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
+    }
+
+    // resolve_ws_listener_port is pure (the env value is a parameter), so the
+    // precedence is testable without process-env mutation races.
+    #[test]
+    fn ws_listener_port_env_zero_wins_over_settings() {
+        // The E2E ephemeral seam: env 0 beats a seeded settings port.
+        assert_eq!(resolve_ws_listener_port(Some("0"), Some(5999), 5181), 0);
+        assert_eq!(resolve_ws_listener_port(Some(" 0 "), Some(5999), 5181), 0);
+        assert_eq!(resolve_ws_listener_port(Some("0"), None, 5181), 0);
+    }
+
+    #[test]
+    fn ws_listener_port_absent_env_keeps_settings_first() {
+        assert_eq!(resolve_ws_listener_port(None, Some(5999), 5181), 5999);
+        assert_eq!(resolve_ws_listener_port(None, None, 5181), 5181);
+    }
+
+    #[test]
+    fn ws_listener_port_nonzero_env_unchanged() {
+        // Nonzero env is pinned into settings by apply_startup_pins, so
+        // settings-first stays correct; env is only a fallback without one.
+        assert_eq!(
+            resolve_ws_listener_port(Some("6000"), Some(5999), 5181),
+            5999
+        );
+        assert_eq!(resolve_ws_listener_port(Some("6000"), None, 5181), 6000);
+    }
+
+    #[test]
+    fn ws_listener_port_unparseable_env_ignored() {
+        assert_eq!(
+            resolve_ws_listener_port(Some("nope"), Some(5999), 5181),
+            5999
+        );
+        assert_eq!(resolve_ws_listener_port(Some(""), None, 5181), 5181);
     }
 
     #[cfg(unix)]
