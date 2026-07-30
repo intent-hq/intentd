@@ -275,6 +275,19 @@ impl Services {
                 } else if existing.group_id.is_none() {
                     existing.one_shot = existing.one_shot && one_shot;
                 }
+                // Refresh the parent display name and home-workspace anchor
+                // from the current registration (mirroring
+                // `find_and_refresh_ungrouped_watch`): a watch created with
+                // fallback data must not stay stale when a later
+                // registration carries the correct name/home. The anchor
+                // refresh is re-gated against the EXISTING watch's child
+                // workspace (which may differ from this call's).
+                existing.parent_agent_name = parent_agent_name;
+                if existing.parent_workspace_id != *parent_workspace_id
+                    && check_watch_scope(parent_workspace_id, &existing.child_workspace_id).is_ok()
+                {
+                    existing.parent_workspace_id = parent_workspace_id.clone();
+                }
                 existing.clone()
             } else {
                 let watch = CompletionWatch {

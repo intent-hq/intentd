@@ -6531,6 +6531,54 @@ async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
     );
 }
 
+/// An ungrouped registration (either mode) against an existing GROUPED
+/// watch for the pair is a true no-op: the grouped watch is returned
+/// unchanged — still grouped, still non-oneShot — because the group already
+/// provides the wake path and its settlement accounting owns the watch.
+#[tokio::test]
+async fn register_ungrouped_watch_noops_onto_existing_grouped_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    let grouped = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            false,
+            Some(gid.clone()),
+        )
+        .expect("grouped watch");
+
+    for one_shot in [true, false] {
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                parent.clone(),
+                "Parent".into(),
+                child.clone(),
+                one_shot,
+                None,
+            )
+            .expect("ungrouped registration");
+        assert_eq!(id, grouped, "grouped watch adopted (oneShot={one_shot})");
+        let watches = svc.list_watches_for_parent(&parent);
+        assert_eq!(watches.len(), 1, "no duplicate: {watches:?}");
+        assert_eq!(
+            watches[0].group_id.as_deref(),
+            Some(gid.as_str()),
+            "watch stays grouped"
+        );
+        assert!(!watches[0].one_shot, "watch stays non-oneShot");
+    }
+}
+
 /// Repeated ungrouped registrations for the same pair collapse onto one
 /// watch: same-mode re-registration returns the existing id; a non-oneShot
 /// request upgrades an existing oneShot watch in place (a queued wake must
