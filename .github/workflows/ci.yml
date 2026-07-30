@@ -69,6 +69,8 @@ jobs:
 
   build:
     strategy:
+      # Don't let one platform's failure cancel the other's required check.
+      fail-fast: false
       matrix:
         include:
           # temporarily disabled — re-enable when needed
@@ -89,6 +91,14 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
+      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
+      # runner's Windows-path step scripts. Prepend Git's bin dir so every
+      # later `shell: bash` step resolves Git Bash instead.
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\Git\bin'
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale; re-add swatinem/rust-cache, keyed
       # per target, if a GH-hosted matrix entry is re-enabled). On the Windows
