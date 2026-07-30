@@ -293,7 +293,10 @@ fn walk(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
 /// Fast path: clone the whole tree with a single kernel-side clonefile(2).
 /// The destination must not exist. On APFS clonefile clones special nodes
 /// (live Unix sockets, FIFOs) that the recursive copyfile(3) it replaced
-/// aborted on with ENOTSUP.
+/// aborted on with ENOTSUP. Note that with flags 0 clonefile follows a
+/// symlink root (the clone materializes the target directory), whereas the
+/// recursive copyfile cloned the link itself; callers that must not follow
+/// a symlinked source should canonicalize first (as cow_checkout does).
 fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
     let src_cstr = CString::new(src.as_os_str().as_bytes())
         .map_err(|e| Error::Internal(format!("invalid src path: {e}")))?;
@@ -362,7 +365,11 @@ mod tests {
             "data"
         );
         // clonefile(2) carries the socket node itself into the clone.
-        assert!(fs::symlink_metadata(dst.join("live.sock")).is_ok());
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(dst.join("live.sock"))
+            .unwrap()
+            .file_type()
+            .is_socket());
 
         drop(listener);
         let _ = fs::remove_dir_all(&base);
