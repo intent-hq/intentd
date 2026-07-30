@@ -46,6 +46,7 @@ jobs:
       actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
+      check_labels: ${{ steps.decide.outputs.check_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
     steps:
       - id: decide
@@ -62,7 +63,12 @@ jobs:
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
+            // The coverage jobs run the whole instrumented suite and are
+            // sized to 32 vCPUs; check (fmt + clippy + a couple of tests)
+            // doesn't come close to saturating that, so it bursts to a
+            // cheaper 16x runner instead.
             const burst = ["warp-ubuntu-latest-x64-32x"];
+            const checkBurst = ["warp-ubuntu-latest-x64-16x"];
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
             // Count self-hosted Linux jobs that are queued or running in
             // queued/in-progress runs: a running job occupies the single
@@ -88,11 +94,12 @@ jobs:
             const useBurst = depth > threshold;
             core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
+            core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
 
   check:
     needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
