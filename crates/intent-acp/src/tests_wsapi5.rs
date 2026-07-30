@@ -815,6 +815,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            dismissed_questions_message_id: None,
         },
     }
 }
