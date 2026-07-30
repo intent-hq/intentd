@@ -433,6 +433,21 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
+  // Idle-timeout warn-and-continue e2e: the first N turns go COMPLETELY silent
+  // — no session/update at all — and park until `session/cancel` resolves them
+  // (stopReason `cancelled`), modelling an agent whose turn hangs without any
+  // activity. Turn-count-gated (not prompt-matched) so the daemon's injected
+  // `[SYSTEM WARNING]` turns can be silenced too (the consecutive-timeout cap
+  // path). Turns past N respond normally, with the `turn=N` stamp below
+  // proving the daemon kept the SAME child alive across the timeouts.
+  const silentTurns = Number.isFinite(behavior.silentUntilCancelTurns)
+    ? behavior.silentUntilCancelTurns
+    : 0;
+  if (silentTurns > 0 && promptCount <= silentTurns) {
+    log(`going silent until cancel (turn ${promptCount}/${silentTurns})`);
+    pendingPromptIds.push(id);
+    return;
+  }
   // Per-prompt park: when this prompt's text contains the configured marker, the
   // session parks until `session/cancel`. Lets one MOCK_AGENT_BEHAVIOR drive both
   // a delegating parent (no match → fall through to `toolCall`) and a parked
@@ -538,7 +553,8 @@ async function handlePrompt(id, params) {
   // distinguishable from a fresh spawn (which would report `turn=1`).
   // With echoCwd, stamp the child's working directory so e2e tests can assert
   // the daemon's spawn cwd (e.g. the dedicated chief-cwd dir, STAB-50).
-  let text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  let text =
+    behavior.blockUntilCancel || silentTurns > 0 ? `${base} turn=${promptCount}` : base;
   if (behavior.echoCwd) {
     text = `${text} cwd=${process.cwd()}`;
   }
