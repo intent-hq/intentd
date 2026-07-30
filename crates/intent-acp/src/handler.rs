@@ -141,6 +141,15 @@ impl ClientRequestHandler {
         }
     }
 
+    /// Handle `fs/write_text_file`.
+    ///
+    /// Ordering invariant: on success the `file:changed` emit is fully awaited
+    /// BEFORE the response is sent (matching `handle_permission`'s
+    /// emit-before-respond order). The service-layer sink awaits the
+    /// attribution pipeline (`tracked_changes` INSERT) inside `publish`, so
+    /// responding first would let the agent observe the write as done — and
+    /// finish its turn — before attribution lands, losing the change from the
+    /// turn's auto-commit (intent-hq/monorepo#1144 TOCTOU).
     async fn handle_write(&self, conn: &Connection, id: Value, params: Value) -> AcpResult<()> {
         let parsed: WriteTextFileRequest = match serde_json::from_value(params) {
             Ok(p) => p,
@@ -149,7 +158,6 @@ impl ClientRequestHandler {
         match self.files.write(&parsed.path, &parsed.content).await {
             Ok(change) => {
                 let result = serde_json::to_value(WriteTextFileResponse::new())?;
-                conn.respond_result(id, result).await?;
                 self.emit(
                     FILE_CHANGED,
                     json!({
@@ -159,7 +167,7 @@ impl ClientRequestHandler {
                     }),
                 )
                 .await;
-                Ok(())
+                conn.respond_result(id, result).await
             }
             Err(e) => conn.respond_error(id, fs_error(&e)).await,
         }
