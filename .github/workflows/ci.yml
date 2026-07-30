@@ -135,10 +135,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # No oversubscription on the 64-core tinybox: 64 threads already covers
-      # the IO-blocked e2e tests without stacking 100+ daemons (flake retries
-      # are handled by .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 64
+      # 32 (not 64) on the 64-core tinybox: at 64 threads the latency-bound
+      # stress tests (e.g. e2e_wss_pool_contention_stress's <2s read assert)
+      # blow their wall-clock bounds under llvm-cov load on both nextest
+      # tries. 32 keeps the box saturated without the latency spikes.
+      NEXTEST_TEST_THREADS: 32
     steps:
       - uses: actions/checkout@v7
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
