@@ -28,14 +28,16 @@ concurrency:
 jobs:
   # Decides where the Linux-heavy jobs (check / coverage-e2e / coverage-all)
   # run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
-  # the probe never waits behind the very queue it is measuring. The probe
-  # fails open to tinybox on API errors; if the job itself fails (runner
-  # outage, action download failure, timeout), the routed jobs are skipped
-  # and need a re-run — a deliberate trade-off. The mac build is
-  # intentionally not routed — it stays pinned to m1mac.
+  # when the tinybox queue is backed up. Runs on tinybox itself (GitHub-
+  # hosted runners are disabled for this org): the probe can queue behind
+  # the backlog it measures, but it is a seconds-long job and self-hosted
+  # jobs are drained FIFO, so it adds one short hop rather than negating
+  # the burst. The probe fails open to tinybox on API errors; if the job
+  # itself fails (runner outage, timeout), the routed jobs are skipped and
+  # need a re-run — a deliberate trade-off. The mac build is intentionally
+  # not routed — it stays pinned to m1mac.
   route:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     permissions:
       contents: read
