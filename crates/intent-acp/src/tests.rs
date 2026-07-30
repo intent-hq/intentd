@@ -1601,6 +1601,7 @@ mod mcp_tests {
             _workspace_id: WorkspaceId,
             note_id: NoteId,
             agent_id: String,
+            _force: Option<bool>,
         ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
             self.assigned
                 .lock()
@@ -5688,6 +5689,7 @@ mod wsapi3_bindings_tests {
             _ws: WorkspaceId,
             note_id: NoteId,
             agent_id: String,
+            _force: Option<bool>,
         ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
             self.assign_agent_calls
                 .lock()

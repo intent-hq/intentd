@@ -719,8 +719,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let agent_id = require_str_param(params, "agentId")?;
+            let force = opt_bool(params, "force");
             let result = api
-                .assign_agent(ws, note_id, agent_id)
+                .assign_agent(ws, note_id, agent_id, force)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

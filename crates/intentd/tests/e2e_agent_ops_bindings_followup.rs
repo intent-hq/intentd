@@ -186,7 +186,12 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
     let assigned_id = AgentId::from(assigned_agent["agent"]["id"].as_str().unwrap());
 
     services
-        .assign_agent(ws.clone(), task_note.id.clone(), assigned_id.to_string())
+        .assign_agent(
+            ws.clone(),
+            task_note.id.clone(),
+            assigned_id.to_string(),
+            None,
+        )
         .await
         .expect("assign agent");
 
