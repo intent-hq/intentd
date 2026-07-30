@@ -65,7 +65,8 @@ pub(crate) fn prelude() -> String {
 /// that attribute their calls back to the spawning agent
 /// (`workspace.setAgentName` / `git.commit` / `git.agentCommit` /
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods — `create`,
-/// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`) can do so.
+/// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`,
+/// `requestDiscussion`, `reportBlocker`) can do so.
 /// `turn_attachments` threads the §7.1 turn-attachment registry to the
 /// bindings that register attachments mid-dispatch (`ws.app.question.ask`);
 /// `None` keeps those bindings inert (FE front door, tests).

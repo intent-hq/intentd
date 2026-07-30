@@ -48,6 +48,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Store-backed workspace rows plus live `activity` and the cheap status
+    /// aggregates (`taskStats` via a counting query, derived `displayStatus`,
+    /// lifetime-cached `cowSupported`) — no notes/sessions enrichment. Used by
+    /// the workspace subscription snapshot so seq-0 cannot emit multi-MB
+    /// enriched payloads that HOL the connection writer (observed ~4.5 MiB /
+    /// 80 workspaces) while staying self-sufficient for client status
+    /// rendering. The heavy card aggregates (`agentSummary`/`diffSummary`) are
+    /// omitted; clients treat missing fields as "derive locally / wait for
+    /// deltas" (same as a notes-read failure on list). Default falls back to
+    /// full `list_workspaces`.
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        self.list_workspaces(include_archived)
+    }
+
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let _ = id;
@@ -1802,6 +1819,33 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_report_to_parent not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.requestAttention`: an agent explicitly raises attention before
+    /// ending its turn — `kind` is `"discussion"` (`ws.agent.requestDiscussion`)
+    /// or `"blocker"` (`ws.agent.reportBlocker`), `reason` is required.
+    /// Persists the pending request on the session, appends a system-role
+    /// transcript notice, emits `agent:attention-requested`, transitions the
+    /// linked task (`discussion_needed` / `blocked`), and wakes a delegated
+    /// caller's parent. Available to all agents (delegated or not, with or
+    /// without a linked task).
+    ///
+    /// `caller_agent_id` is the agent invoking the tool: the MCP front door
+    /// passes `Some(caller)`; the FE/RPC front door passes `None`, which
+    /// surfaces `-32603` (there is no caller session to attach the request to).
+    fn agent_request_attention(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, kind, reason, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_request_attention not implemented".to_string(),
             ))
         })
     }

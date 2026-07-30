@@ -9,6 +9,15 @@ permissions:
   contents: read
   pull-requests: read
 
+env:
+  # Burst the Linux jobs to WarpBuild when more than this many Linux
+  # jobs are queued/running ahead of this run (see the route job). Note
+  # that jobs still blocked on `needs` are invisible to the jobs API, so
+  # a queued run ahead of us counts only its ~4 utility jobs — one fully
+  # queued PR run is already enough to clear this threshold, which is
+  # intended: it means tinybox is at least one full run behind.
+  LINUX_BURST_THRESHOLD: 2
+
 # The heavy jobs share a single self-hosted runner slot and serialize, so
 # cancel superseded PR runs instead of letting them back up the queue (push
 # to main and merge-queue runs are never cancelled).
@@ -17,8 +26,80 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
+  # Decides where the Linux-heavy jobs (check / coverage-e2e / coverage-all)
+  # run: the local tinybox runner normally, or WarpBuild ephemeral runners
+  # when the tinybox queue is backed up. Runs on tinybox itself (GitHub-
+  # hosted runners are disabled for this org): the probe can queue behind
+  # the backlog it measures, but it is a seconds-long job and self-hosted
+  # jobs are drained FIFO, so it adds one short hop rather than negating
+  # the burst. The probe fails open to tinybox on API errors; if the job
+  # itself fails (runner outage, timeout), the routed jobs are skipped and
+  # need a re-run — a deliberate trade-off. The mac build is intentionally
+  # not routed — it stays pinned to m1mac.
+  route:
     runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reads the Actions queue; job-level so the routed jobs (which run on
+      # third-party WarpBuild runners when bursting) don't inherit it.
+      actions: read
+    outputs:
+      linux_labels: ${{ steps.decide.outputs.linux_labels }}
+      check_labels: ${{ steps.decide.outputs.check_labels }}
+      linux_burst: ${{ steps.decide.outputs.linux_burst }}
+    steps:
+      - id: decide
+        uses: actions/github-script@v7
+        env:
+          THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+        with:
+          # tinybox serves several repos on one runner slot, so the probe
+          # wants to size the queue across all of them — but the default
+          # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
+          # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
+          # on the sibling repos) to enable cross-repo counting; without
+          # it those repos are skipped and contribute 0.
+          github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
+          script: |
+            const tinybox = ["self-hosted", "Linux", "X64"];
+            // The coverage jobs run the whole instrumented suite and are
+            // sized to 32 vCPUs; check (fmt + clippy + a couple of tests)
+            // doesn't come close to saturating that, so it bursts to a
+            // cheaper 16x runner instead.
+            const burst = ["warp-ubuntu-latest-x64-32x"];
+            const checkBurst = ["warp-ubuntu-latest-x64-16x"];
+            const threshold = parseInt(process.env.THRESHOLD || "2", 10);
+            // Count self-hosted Linux jobs that are queued or running in
+            // queued/in-progress runs: a running job occupies the single
+            // tinybox slot just as much as a queued one. WarpBuild jobs
+            // don't match the self-hosted+Linux label filter, so bursted
+            // jobs never inflate the depth.
+            const owner = context.repo.owner;
+            const repos = ["intentd", "cloudlands-fe", "monorepo"];
+            let depth = 0;
+            for (const repo of repos) {
+              try {
+                for (const status of ["queued", "in_progress"]) {
+                  const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
+                  for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
+                    const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
+                    depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                  }
+                }
+              } catch (e) {
+                core.info(`queue probe skipped ${repo}: ${e.message}`);
+              }
+            }
+            const useBurst = depth > threshold;
+            core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
+            core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
+            core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
+            core.setOutput("linux_burst", String(useBurst));
+
+  check:
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -44,6 +125,7 @@ jobs:
       # what makes builds warm across runs (and why swatinem/rust-cache was
       # dropped: GH cache save/restore would be pure overhead on top of it).
       - name: Point CARGO_TARGET_DIR outside the work dir
+        if: needs.route.outputs.linux_burst != 'true'
         run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -55,6 +137,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
+      # Ephemeral WarpBuild runners have no persistent target dir, so use
+      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      - name: Rust cache (burst runner only)
+        if: needs.route.outputs.linux_burst == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: warp-burst-check
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -143,7 +232,8 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    runs-on: [self-hosted, Linux, X64]
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -168,6 +258,7 @@ jobs:
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
       - name: Point CARGO_TARGET_DIR outside the work dir
+        if: needs.route.outputs.linux_burst != 'true'
         run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -179,6 +270,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Ephemeral WarpBuild runners have no persistent target dir, so use
+      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      - name: Rust cache (burst runner only)
+        if: needs.route.outputs.linux_burst == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: warp-burst-coverage-e2e
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
@@ -209,7 +307,8 @@ jobs:
           if-no-files-found: warn
 
   coverage-all:
-    runs-on: [self-hosted, Linux, X64]
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -235,6 +334,7 @@ jobs:
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
       - name: Point CARGO_TARGET_DIR outside the work dir
+        if: needs.route.outputs.linux_burst != 'true'
         run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -246,6 +346,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Ephemeral WarpBuild runners have no persistent target dir, so use
+      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      - name: Rust cache (burst runner only)
+        if: needs.route.outputs.linux_burst == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: warp-burst-coverage-all
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.

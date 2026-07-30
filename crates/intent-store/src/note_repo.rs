@@ -1,8 +1,10 @@
 //! Note repository: insert + list, mapping rows ↔ [`Note`] (§9.2).
 
+use std::collections::HashSet;
+
 use intent_core::{
     ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskMetadata,
-    WorkspaceId,
+    WorkspaceId, WorkspaceTaskStats,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -232,6 +234,66 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list tasks failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
+    }
+
+    /// Cheap per-workspace `taskStats` counting query (no note-body
+    /// hydration). Semantics mirror the enriched `compute_task_stats` in
+    /// intent-services (the canonical TS `computeTaskStats` port): count the
+    /// spec's direct child task notes, restricted to the spec-linked ids when
+    /// the spec body carries `intent://local/task/{id}` links (TS
+    /// backward-compat fallback: no links → all direct children with task
+    /// metadata count). `cancelled` is excluded from `total`, `complete`
+    /// counts as `completed`, and `in_progress`/`review_required` count as
+    /// `in_progress`.
+    ///
+    /// Reads only the spec note's `content` (needed for the linked-id filter)
+    /// plus `id` + `json_extract(task_json, '$.status')` for the spec's child
+    /// task rows — never the task notes' content bodies — so it stays cheap
+    /// on workspaces with large notes.
+    pub async fn count_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+        let spec_content: Option<String> =
+            sqlx::query_scalar("SELECT content FROM note WHERE workspace_id = ? AND id = 'spec'")
+                .bind(&workspace_id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("task stats spec read failed: {e}")))?;
+        let linked: HashSet<String> = spec_content
+            .as_deref()
+            .map(intent_core::extract_spec_task_ids)
+            .unwrap_or_default();
+        let has_links = !linked.is_empty();
+
+        let rows = sqlx::query(
+            "SELECT id, json_extract(task_json, '$.status') AS status FROM note \
+             WHERE workspace_id = ? AND task_json IS NOT NULL \
+               AND id != 'spec' AND parent_id = 'spec'",
+        )
+        .bind(&workspace_id.0)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("task stats count failed: {e}")))?;
+
+        let mut stats = WorkspaceTaskStats::default();
+        for row in &rows {
+            let id: String = col(row, "id")?;
+            if has_links && !linked.contains(&id) {
+                continue;
+            }
+            let status: Option<String> = col(row, "status")?;
+            match status.as_deref() {
+                Some("cancelled") => continue,
+                Some("complete") => {
+                    stats.total += 1;
+                    stats.completed += 1;
+                }
+                Some("in_progress") | Some("review_required") => {
+                    stats.total += 1;
+                    stats.in_progress += 1;
+                }
+                _ => stats.total += 1,
+            }
+        }
+        Ok(stats)
     }
 
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
