@@ -14,7 +14,7 @@ permissions:
 env:
   # Burst the Linux jobs to WarpBuild when more than this many Linux
   # runs/jobs are queued ahead of this run (see the route job).
-  LINUX_BURST_THRESHOLD: -1
+  LINUX_BURST_THRESHOLD: 2
 
 # The heavy jobs share a single self-hosted runner slot and serialize, so
 # cancel superseded PR runs instead of letting them back up the queue (push
