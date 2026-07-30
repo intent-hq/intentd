@@ -2913,20 +2913,35 @@ impl Services {
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
-    /// agent's LAST transcript message is an assistant message carrying at
-    /// least one `application/vnd.intent.question+json` resource block AND its
-    /// id differs from the session's persisted dismissal marker. Derived, not
-    /// stored: any later message (a user answer, a typed message, an explicit
-    /// `sendQueuedMessageNow`) supersedes the questions and flips the hold
-    /// false; `agent.dismissQuestions` persists the marker for the same
-    /// effect. Fails open (`false`) on store errors so a read failure can
-    /// never wedge deliveries.
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
+    /// walking back from the tail of the transcript past any trailing
+    /// `system` rows (e.g. the resume-interruption marker —
+    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
+    /// continuation), the first non-system message is an assistant message
+    /// carrying at least one `application/vnd.intent.question+json` resource
+    /// block AND its id differs from the session's persisted dismissal
+    /// marker. `system` rows are transparent to the derivation — same as the
+    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
+    /// `assistant` row — so a system marker can neither supersede nor rescue
+    /// a pending Q&A. Derived, not stored: any later user/assistant message
+    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
+    /// supersedes the questions and flips the hold false;
+    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Fails open (`false`) on store errors so a read failure can never wedge
+    /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
-        let Ok(messages) = self.store.get_agent_messages(agent_id, Some(1)).await else {
+        // Small tail, not just the last row: system markers (interruption
+        // notices) can trail a pending question message and must be walked
+        // past rather than mistaken for the transcript tail.
+        const HOLD_DERIVATION_TAIL: i64 = 10;
+        let Ok(messages) = self
+            .store
+            .get_agent_messages(agent_id, Some(HOLD_DERIVATION_TAIL))
+            .await
+        else {
             return false;
         };
-        let Some(last) = messages.last() else {
+        let Some(last) = messages.iter().rev().find(|m| m.role != "system") else {
             return false;
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {

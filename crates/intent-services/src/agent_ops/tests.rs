@@ -13364,6 +13364,59 @@ async fn question_hold_derivation_pending_superseded_dismissed_reask() {
     assert!(!svc.question_hold_active(&id).await);
 }
 
+/// Regression: a trailing `system` row (e.g. the resume-interruption marker
+/// `resume_interrupted_agent` appends before its `Automatic` continuation)
+/// must not defeat the hold — the derivation walks back past it to the
+/// still-pending question message, matching the FE's `derivePendingQuestions`
+/// (which only ever resolves on a `user`/`assistant` row).
+#[tokio::test]
+async fn question_hold_survives_trailing_system_row() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    svc.store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(svc.question_hold_active(&id).await, "hold armed");
+
+    // A system marker lands after the question message (the resume path's
+    // interruption notice) — hold must remain active.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "system",
+            &json!([{
+                "type": "text",
+                "text": "The previous turn was interrupted because the harness shut down. Continuing below.",
+                "meta": { "kind": "interruption" }
+            }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append system marker");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "trailing system row must not defeat the hold"
+    );
+
+    // A later USER message still supersedes the questions even past the
+    // system row.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "answers" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+    assert!(
+        !svc.question_hold_active(&id).await,
+        "user message past the system row must supersede"
+    );
+}
+
 #[tokio::test]
 async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
