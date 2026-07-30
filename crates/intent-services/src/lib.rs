@@ -3420,6 +3420,12 @@ impl Services {
                         "queuedMessage": queued.to_value(position),
                     });
                     self.publish_queue_updated(&parent_agent_id).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this branch is only taken
+                    // when no `AgentManager` is attached (see the `match`
+                    // above), so there is no drain to kick here — a manager
+                    // attaching later re-derives the hold on its own next
+                    // trigger.
                     return Ok(result);
                 }
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
@@ -15316,6 +15322,11 @@ impl WorkspaceApi for Services {
                             "turnId": queued.turn_id,
                         });
                         self.publish_queue_updated(&agent_id).await;
+                        // Race close (hold-check → enqueue vs a concurrent
+                        // `dismissQuestions`/answer): this `None` arm only
+                        // runs with no `AgentManager` attached, so there is
+                        // no drain to kick here — same as the other
+                        // store-only fallbacks.
                         return Ok(result);
                     }
                     // Read-only fallback (no `agent_manager` wired): plumb

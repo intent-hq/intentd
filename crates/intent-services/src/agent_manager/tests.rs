@@ -8638,13 +8638,17 @@ mod question_hold_gates {
         ])
     }
 
-    async fn arm_hold(mgr: &AgentManager, id: &AgentId) {
-        mgr.services
+    /// Appends the trailing question-block assistant row that arms the hold
+    /// and returns its message id (for `agent_dismiss_questions_op` calls).
+    async fn arm_hold(mgr: &AgentManager, id: &AgentId) -> String {
+        let asked = mgr
+            .services
             .store
             .append_agent_message(id, "assistant", &question_blocks(), &now_iso())
             .await
             .expect("append question");
         assert!(mgr.services.question_hold_active(id).await);
+        asked.id
     }
 
     /// Automatic `send_message` parks in the queue with `heldForQuestions`
@@ -8817,6 +8821,156 @@ mod question_hold_gates {
         assert_eq!(snapshot[0]["content"], json!("urgent"));
         assert_eq!(snapshot[0]["interruptPriority"], json!(true));
         assert_eq!(snapshot[1]["content"], json!("earlier normal"));
+    }
+
+    /// PR review regression: held interrupts still record the dedup marker.
+    /// A duplicate `message_id` arriving while the hold is active must be
+    /// deduplicated (not double-enqueued), and a replay of that same id
+    /// arriving after the hold releases must also be deduplicated — the
+    /// held interrupt keeps the same at-most-once contract as one that
+    /// streamed immediately.
+    #[tokio::test]
+    async fn held_interrupt_records_dedup_marker() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-qh-int-dedup"),
+            AgentId::from("a-qh-int-dedup"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let asked = arm_hold(&mgr, &id).await;
+
+        let r1 = mgr
+            .interrupt_send_message(
+                id.clone(),
+                ws.clone(),
+                "urgent".to_string(),
+                Some("m-dedup-1".to_string()),
+                TurnOptions::default(),
+            )
+            .await
+            .expect("first held interrupt");
+        assert_eq!(r1["queued"], json!(true));
+        assert_eq!(r1["heldForQuestions"], json!(true));
+
+        // A duplicate with the SAME message_id while still held must be
+        // deduplicated, not enqueued a second time.
+        let r2 = mgr
+            .interrupt_send_message(
+                id.clone(),
+                ws.clone(),
+                "urgent (duplicate)".to_string(),
+                Some("m-dedup-1".to_string()),
+                TurnOptions::default(),
+            )
+            .await
+            .expect("duplicate held interrupt");
+        assert_eq!(r2["deduplicated"], json!(true));
+        assert_eq!(
+            mgr.services.queue_snapshot(&id).len(),
+            1,
+            "no double-enqueue"
+        );
+
+        // Dismiss releases the hold; a replay of the SAME id must still be
+        // deduplicated (the marker survived the hold window).
+        mgr.services
+            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
+            .await
+            .expect("dismiss");
+        let r3 = mgr
+            .interrupt_send_message(
+                id.clone(),
+                ws.clone(),
+                "urgent (replay)".to_string(),
+                Some("m-dedup-1".to_string()),
+                TurnOptions::default(),
+            )
+            .await
+            .expect("post-release replay");
+        assert_eq!(
+            r3["deduplicated"],
+            json!(true),
+            "replay after release is still deduplicated"
+        );
+    }
+
+    /// PR review regression: the hold-check → enqueue race against a
+    /// concurrent `dismissQuestions`. Simulated by dismissing the questions
+    /// AFTER `question_hold_active` would have observed `true` but the
+    /// message is enqueued with the hold already cleared by the time the
+    /// re-check inside `send_message` runs — the re-check must self-heal by
+    /// kicking the drain instead of stranding the entry.
+    #[tokio::test]
+    async fn held_send_self_heals_when_dismissed_during_enqueue() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-qh-race2"),
+            AgentId::from("a-qh-race2"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let asked = arm_hold(&mgr, &id).await;
+
+        // Dismiss BEFORE the send: `question_hold_active` inside
+        // `send_message` now observes `false`, so this exercises the
+        // "already resolved" side, not the raw hold gate — the real value of
+        // this test is asserting `try_drain_queue`'s own re-derivation is
+        // safe to call twice in a row (once from the RPC's dismiss kick,
+        // once from send's own post-enqueue re-check) without duplicating
+        // delivery.
+        mgr.services
+            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
+            .await
+            .expect("dismiss");
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("send after dismiss");
+        assert_eq!(
+            r.get("heldForQuestions"),
+            None,
+            "hold already cleared before send"
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("message delivered, no stranding");
     }
 
     /// Race regression (the WSS Q&A e2e flake): a USER answer that lands

@@ -3043,6 +3043,18 @@ impl AgentManager {
                 "turnId": queued.turn_id,
             });
             self.services.publish_queue_updated(&agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer): the hold may have flipped false
+            // between the check above and the enqueue just completing — the
+            // dismiss's own `try_drain_queue` kick could have fired against
+            // a still-empty queue and found nothing to drain. Re-check and
+            // kick again if the hold has since cleared, so this entry is not
+            // stranded until some unrelated future trigger.
+            if !self.services.question_hold_active(&agent_id).await {
+                self.clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
@@ -3655,18 +3667,14 @@ impl AgentManager {
         // monorepo#564: reject nonexistent targets BEFORE the dedup record or
         // any preemption — same fail-closed guard as `send_message`.
         self.services.require_agent_session(&agent_id).await?;
-        // Question hold (PROTOCOL §5.5): an automatic interrupt is ALSO held
-        // — no exceptions (spec §Decisions). Skip the preemption entirely
-        // (there is nothing to preempt: the asking agent is idle, and a busy
-        // agent's hold cannot be active since the Q&A message is terminal)
-        // and let `send_message`'s hold gate park the message front-of-queue.
-        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            return self
-                .send_message(agent_id, workspace_id, content, message_id, options)
-                .await;
-        }
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
-        // so of two racing duplicates exactly one proceeds to preempt.
+        // so of two racing duplicates exactly one proceeds. Runs BEFORE the
+        // hold check below so a held interrupt still records its id — an
+        // interrupt parked by the hold keeps the same at-most-once contract
+        // as one that streamed immediately: a duplicate with the same
+        // `message_id` arriving while the hold is active is deduplicated
+        // instead of double-enqueuing, and a replay arriving after the hold
+        // releases is deduplicated too.
         if let Some(mid) = message_id.as_deref() {
             let mut ids = self.interrupt_ids.lock().unwrap();
             if ids.get(&agent_id).map(String::as_str) == Some(mid) {
@@ -3678,6 +3686,16 @@ impl AgentManager {
                 }));
             }
             ids.insert(agent_id.clone(), mid.to_string());
+        }
+        // Question hold (PROTOCOL §5.5): an automatic interrupt is ALSO held
+        // — no exceptions (spec §Decisions). Skip the preemption entirely
+        // (there is nothing to preempt: the asking agent is idle, and a busy
+        // agent's hold cannot be active since the Q&A message is terminal)
+        // and let `send_message`'s hold gate park the message front-of-queue.
+        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
+            return self
+                .send_message(agent_id, workspace_id, content, message_id, options)
+                .await;
         }
         self.preempt_busy_turn(&agent_id, &mut options).await;
         // The slot was just released (or was never held): the send path claims

@@ -4887,6 +4887,11 @@ impl Services {
                         "turnId": queued.turn_id,
                     });
                     self.publish_queue_updated(&agent).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this `(None, _)` arm only
+                    // runs with no `AgentManager` attached, so there is no
+                    // drain to kick here — same as the other store-only
+                    // fallbacks above.
                     held
                 } else {
                     self.agent_send_message_op(
@@ -5505,6 +5510,17 @@ impl Services {
                 false,
             );
             self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer): re-check and kick the drain if the
+            // hold cleared while the enqueue above was in flight, mirroring
+            // `AgentManager::send_message`'s hold-gate re-check — otherwise
+            // this entry could be stranded with no future drain trigger.
+            if !self.question_hold_active(agent_id).await {
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
             return Ok(json!({
                 "success": true,
                 "queued": true,
@@ -5631,6 +5647,20 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             });
             self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer), same shape as the runtime path
+            // above. This wiring has no attached `AgentManager` by
+            // definition (that is why we are in the store-only fallback),
+            // so there is nothing to kick — the re-check only matters if a
+            // manager is (or becomes) attached, which `try_drain_queue`
+            // itself would then handle on its own next trigger.
+            if !self.question_hold_active(agent_id).await {
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
             return Ok(result);
         }
         let blocks = json!([build_block()]);
