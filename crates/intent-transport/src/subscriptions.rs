@@ -11,11 +11,11 @@
 //! (`events.event`) is left intact and coexists (Risk R1).
 
 use intent_core::events::{
-    AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RENAMED,
-    AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK, AGENT_STREAM_END,
-    AGENT_TOOL_CALL, AGENT_UPDATED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED,
-    PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
+    AGENT_RENAMED, AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK,
+    AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
+    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
@@ -337,8 +337,17 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
         Channel::Comment => &[COMMENT_ADDED],
         // The chat channel is the one consumer of the `agent:stream:*` family
         // (CS-0); the forwarder additionally filters these to one agent by
-        // `sessionId == agentId`.
-        Channel::Chat => &[AGENT_STREAM_CHUNK, AGENT_TOOL_CALL, AGENT_STREAM_END],
+        // `sessionId == agentId`. `agent:message` is tailed for NON-assistant
+        // rows (user/system/tool persists — queue drains, direct sends, model
+        // switches) so subscribers render them live without a refetch;
+        // assistant echoes map to `None` (the stream + terminal reconcile
+        // owns assistant content).
+        Channel::Chat => &[
+            AGENT_STREAM_CHUNK,
+            AGENT_TOOL_CALL,
+            AGENT_STREAM_END,
+            AGENT_MESSAGE,
+        ],
     };
     types.iter().map(|s| s.to_string()).collect()
 }
@@ -573,17 +582,78 @@ impl ChatDeltaState {
         }
     }
 
-    /// Map one tailed `agent:stream:*` event to a chat block delta (or `None` for
+    /// Map one tailed chat-channel event to a chat block delta (or `None` for
     /// an unrelated/malformed event). `chunk`/`tool:call` build live block upserts
     /// from the payload; `stream:end` reconciles against the persisted message and
-    /// resets the per-turn state.
+    /// resets the per-turn state; `agent:message` re-reads a persisted
+    /// NON-assistant row and emits its blocks as authoritative entities.
     pub(crate) async fn delta(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
         match event.event_type.as_str() {
             AGENT_STREAM_CHUNK => self.chunk_delta(event),
             AGENT_TOOL_CALL => self.tool_delta(event),
             AGENT_STREAM_END => self.finalize(api).await,
+            AGENT_MESSAGE => self.message_row_delta(api, event).await,
             _ => None,
         }
+    }
+
+    /// Map an `agent:message` echo for a persisted NON-assistant row (user /
+    /// system / tool — queue drains, direct sends, wake deliveries, model
+    /// switches) to an authoritative block delta, so subscribers render the
+    /// row live with no refetch. Assistant echoes map to `None`: the stream +
+    /// terminal reconcile owns assistant content, and emitting here would
+    /// double-deliver. The payload is intentionally lean (`{ agentId,
+    /// messageId, role }`), so the row is re-read via the bounded newest
+    /// `agent.getConversation` page — the same source the seq-0 snapshot and
+    /// terminal reconcile use, preserving byte-parity. A re-read miss (row
+    /// outside the newest page, or a read error) maps to `None`; the
+    /// per-turn assistant accumulation state is not touched (a queue-drain
+    /// user row lands right before the turn's first chunk).
+    async fn message_row_delta(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+        let d = &event.data;
+        let role = d.get("role").and_then(Value::as_str)?;
+        if role == "assistant" {
+            return None;
+        }
+        let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
+        let conv = api
+            .agent_get_conversation(AgentId::from(self.agent_id.as_str()), None, None, None)
+            .await
+            .ok()?;
+        let messages = conv.get("messages").and_then(Value::as_array)?;
+        let msg = messages
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(message_id.as_str()))?;
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or(role);
+        let seq = msg.get("seq").and_then(Value::as_u64);
+        let ts = msg.get("timestamp").and_then(Value::as_str);
+        let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            // Persisted non-assistant blocks may lack a stored `id`; stamp the
+            // stable synthetic `{messageId}:{index}` (CS-0 D1) so re-delivery
+            // upserts by id instead of duplicating.
+            let mut block = block.clone();
+            let bid = match block.get("id").and_then(Value::as_str) {
+                Some(id) => id.to_string(),
+                None => {
+                    let id = format!("{message_id}:{index}");
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("id".to_string(), Value::String(id.clone()));
+                    }
+                    id
+                }
+            };
+            let is_added = !self.seen_ids.contains(&bid);
+            self.seen_ids.insert(bid.clone());
+            let entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
+            push_entity(&mut added, &mut updated, is_added, entity);
+        }
+        if added.is_empty() && updated.is_empty() {
+            return None;
+        }
+        Some(json!({ "added": added, "updated": updated, "removedIds": [] }))
     }
 
     /// Map an `agent:stream:chunk`: accumulate the chunk and emit the full block
@@ -775,13 +845,35 @@ impl ChatDeltaState {
         timestamp: Option<&str>,
         streaming_complete: bool,
     ) -> Value {
+        self.entity_with_role(
+            message_id,
+            "assistant",
+            block,
+            seq,
+            timestamp,
+            streaming_complete,
+        )
+    }
+
+    /// [`Self::entity`] with an explicit role: the stream family always wraps
+    /// assistant content, while the `agent:message` re-read path carries the
+    /// persisted row's real role (user/system/tool).
+    fn entity_with_role(
+        &self,
+        message_id: &str,
+        role: &str,
+        block: Value,
+        seq: Option<u64>,
+        timestamp: Option<&str>,
+        streaming_complete: bool,
+    ) -> Value {
         let mut e = Map::new();
         e.insert("agentId".to_string(), Value::String(self.agent_id.clone()));
         e.insert(
             "messageId".to_string(),
             Value::String(message_id.to_string()),
         );
-        e.insert("role".to_string(), Value::String("assistant".to_string()));
+        e.insert("role".to_string(), Value::String(role.to_string()));
         if let Some(seq) = seq {
             e.insert("messageSeq".to_string(), json!(seq));
         }

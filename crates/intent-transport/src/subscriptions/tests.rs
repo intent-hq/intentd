@@ -133,7 +133,7 @@ fn chat_params_require_agent_id() {
 }
 
 #[test]
-fn chat_channel_tails_only_stream_family() {
+fn chat_channel_tails_stream_family_and_message() {
     let chat = channel_event_types(Channel::Chat);
     assert_eq!(
         chat,
@@ -141,6 +141,7 @@ fn chat_channel_tails_only_stream_family() {
             "agent:stream:chunk".to_string(),
             "agent:tool:call".to_string(),
             "agent:stream:end".to_string(),
+            "agent:message".to_string(),
         ]
     );
     assert!(!channel_is_global(Channel::Chat));
@@ -1081,5 +1082,221 @@ mod chat_snapshot_bounded {
         assert_eq!(snap["totalMessages"], 121);
         assert_eq!(snap["truncated"], true);
         assert_eq!(snap["nextToken"], "tok-older");
+    }
+}
+
+// --- ChatDeltaState — agent:message user-row deltas ------------------------
+
+mod chat_message_delta {
+    use super::*;
+    use intent_core::events::AGENT_MESSAGE;
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal `WorkspaceApi` serving a pre-canned `agent.getConversation`
+    /// page and counting reads, standing in for the persisted transcript the
+    /// `agent:message` re-read path consults.
+    struct ConvApi {
+        calls: AtomicUsize,
+        conversation: Value,
+    }
+
+    impl ConvApi {
+        fn new(conversation: Value) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                conversation,
+            }
+        }
+    }
+
+    impl WorkspaceApi for ConvApi {
+        fn agent_get_conversation(
+            &self,
+            _agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conv = self.conversation.clone();
+            Box::pin(async move { Ok(conv) })
+        }
+    }
+
+    /// An `agent:message` bus event as `publish_agent_mutation_event` emits it
+    /// (payload from `agent_message_event_payload`; `session_id == agentId`).
+    fn message_event(agent_id: &str, message_id: &str, role: &str) -> Event {
+        Event {
+            id: "evt-3".into(),
+            event_type: AGENT_MESSAGE.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: Some(agent_id.to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({
+                "agentId": agent_id,
+                "messageId": message_id,
+                "role": role,
+            }),
+        }
+    }
+
+    fn user_row_conversation() -> Value {
+        json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "contentBlocks": [
+                        { "type": "text", "text": "queued message one" },
+                        { "type": "image", "data": "abc", "mimeType": "image/png" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        })
+    }
+
+    #[tokio::test]
+    async fn user_row_message_emits_added_entities_with_real_role() {
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1, "one bounded re-read");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 2, "one entity per persisted block: {d}");
+        for e in added {
+            assert_eq!(e["agentId"], "agent-1");
+            assert_eq!(e["messageId"], "user-msg-1");
+            assert_eq!(e["role"], "user", "entity carries the row's REAL role");
+            assert_eq!(e["messageSeq"], 4);
+            assert_eq!(e["timestamp"], "2026-07-30T00:00:00Z");
+            assert_eq!(e["streamingComplete"], true);
+        }
+        // Stable synthetic ids `{messageId}:{index}` stamped on blocks that
+        // persisted without one, so re-delivery upserts by id.
+        assert_eq!(added[0]["block"]["id"], "user-msg-1:0");
+        assert_eq!(added[0]["block"]["text"], "queued message one");
+        assert_eq!(added[1]["block"]["id"], "user-msg-1:1");
+        assert!(d["updated"].as_array().unwrap().is_empty());
+        assert!(d["removedIds"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assistant_row_message_maps_to_none_without_re_read() {
+        // Assistant rows are owned by the stream + terminal reconcile; an
+        // `agent:message` echo for one must NOT emit (double-emission guard)
+        // and must not even cost a conversation read.
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "asst-msg-1", "assistant"))
+            .await;
+        assert!(d.is_none());
+        assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_message_id_maps_to_none() {
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-GONE", "user"))
+            .await;
+        assert!(d.is_none(), "re-read miss must emit no frame");
+    }
+
+    #[tokio::test]
+    async fn redelivery_upserts_known_blocks_as_updated() {
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let e = message_event("agent-1", "user-msg-1", "user");
+        let first = s.delta(&api, &e).await.expect("first delivery");
+        assert_eq!(first["added"].as_array().unwrap().len(), 2);
+        let second = s.delta(&api, &e).await.expect("re-delivery");
+        assert!(
+            second["added"].as_array().unwrap().is_empty(),
+            "known block ids re-route to updated: {second}"
+        );
+        assert_eq!(second["updated"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_user_row_does_not_corrupt_assistant_accumulation() {
+        // In-flight assistant text is accumulating when an interrupt-priority
+        // user row lands. The user-row delta must not disturb the text
+        // accumulator, and the terminal reconcile must NOT remove the user
+        // blocks (they were never part of the assistant turn's emitted set).
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "contentBlocks": [ { "type": "text", "text": "interrupt!" } ]
+                },
+                {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "seq": 5,
+                    "timestamp": "2026-07-30T00:00:01Z",
+                    "contentBlocks": [
+                        { "type": "text", "id": "msg-1:0", "text": "Hello, world" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 6,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        // Turn in flight: first assistant chunk accumulated.
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("chunk 1");
+        // User row lands mid-turn.
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row delta");
+        assert_eq!(d["added"][0]["role"], "user");
+        // The next chunk still carries the FULL accumulated assistant text.
+        let d2 = s
+            .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+            .expect("chunk 2");
+        assert_eq!(
+            d2["updated"][0]["block"]["text"], "Hello, world",
+            "user-row emission must not reset the text accumulator"
+        );
+        // Terminal reconcile: user block ids are NOT orphan-removed.
+        let end = Event {
+            event_type: intent_core::events::AGENT_STREAM_END.to_string(),
+            ..message_event("agent-1", "msg-1", "assistant")
+        };
+        let terminal = s.delta(&api, &end).await.expect("terminal reconcile");
+        assert_eq!(
+            terminal["removedIds"],
+            json!([]),
+            "user-row block ids must never surface as orphans: {terminal}"
+        );
+        assert_eq!(terminal["updated"][0]["block"]["text"], "Hello, world");
+        assert_eq!(terminal["updated"][0]["role"], "assistant");
     }
 }
