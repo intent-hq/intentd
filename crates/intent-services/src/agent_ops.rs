@@ -3229,9 +3229,13 @@ impl Services {
     /// 4. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
     /// 5. wakes a delegated caller's parent with a kind-flavored message —
-    ///    skipped when the child is in an undelivered `after_all` delegation
-    ///    group (the group's aggregated wake folds the attention request in)
-    ///    and for non-delegated callers.
+    ///    delivered IMMEDIATELY even when the child is in an undelivered
+    ///    `after_all` delegation group (mirroring the STAB-160 immediate
+    ///    grouped-failure wake: an attention request is an alert the parent
+    ///    must hear now, not at group settlement). The group's later
+    ///    aggregated wake still annotates the child's line from the persisted
+    ///    session fields (the record); non-delegated callers have no parent
+    ///    to wake.
     ///
     /// Agent status and `stop_reason` are untouched: the turn ends normally
     /// (no retry/requeue interaction).
@@ -3355,57 +3359,57 @@ impl Services {
             )
             .await;
         }
-        // 5. Kind-flavored parent wake for delegated callers. Grouped children
-        // skip the immediate wake — the `after_all` group's aggregated wake
-        // folds the attention request in (the group-record sites annotate the
-        // child line from the persisted session fields). Non-delegated
-        // callers have no parent to wake.
+        // 5. Kind-flavored parent wake for delegated callers — delivered
+        // immediately even when the child is enrolled in an undelivered
+        // `after_all` delegation group (mirroring the STAB-160 immediate
+        // grouped-failure wake in `deliver_completion_to_watches`): the
+        // request is an alert the parent must hear now, not at group
+        // settlement. The group's later aggregated wake still annotates the
+        // child's line from the persisted session fields (the record).
+        // Non-delegated callers have no parent to wake.
         if let Some(parent) = parent {
-            let grouped = self.child_in_undelivered_group(&parent, &caller);
-            if !grouped {
-                let parent_home_ws = self
-                    .store
-                    .get_agent_session(&parent)
-                    .await
-                    .map(|s| s.workspace_id)
-                    .unwrap_or_else(|_| workspace_id.clone());
-                let wake_text = format!(
-                    "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
-                    session.name, caller.0, wake_verb, reason
+            let parent_home_ws = self
+                .store
+                .get_agent_session(&parent)
+                .await
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|_| workspace_id.clone());
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
+                session.name, caller.0, wake_verb, reason
+            );
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                    "timestamp": saved_at,
+                    "data": {
+                        "workspaceId": workspace_id.0,
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "kind": kind,
+                        "reason": reason,
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            if let Err(e) = self
+                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver attention-request wake to parent"
                 );
-                let metadata = json!({
-                    "type": "event_notification",
-                    "eventCount": 1,
-                    "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
-                    "events": [{
-                        "id": uuid::Uuid::new_v4().to_string(),
-                        "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
-                        "timestamp": saved_at,
-                        "data": {
-                            "workspaceId": workspace_id.0,
-                            "agentId": caller.0,
-                            "agentName": session.name.clone(),
-                            "kind": kind,
-                            "reason": reason,
-                        },
-                        "actor": {
-                            "type": "agent",
-                            "id": caller.0,
-                            "name": session.name.clone(),
-                        }
-                    }]
-                });
-                if let Err(e) = self
-                    .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        parent = %parent.0,
-                        child = %caller.0,
-                        "failed to deliver attention-request wake to parent"
-                    );
-                }
             }
         }
 

@@ -8821,9 +8821,10 @@ async fn request_attention_wakes_parent_for_delegated_agent() {
     );
 }
 
-/// A child enrolled in an undelivered `after_all` group skips the immediate
-/// wake; the aggregated group wake folds the attention request into that
-/// child's line.
+/// A child enrolled in an undelivered `after_all` group wakes the parent
+/// IMMEDIATELY (mirroring the STAB-160 immediate grouped-failure wake); the
+/// later aggregated group wake still folds the attention request into that
+/// child's line as the record.
 #[tokio::test]
 async fn request_attention_folds_into_after_all_group_wake() {
     let (_t, svc, ws) = setup().await;
@@ -8839,8 +8840,13 @@ async fn request_attention_folds_into_after_all_group_wake() {
     )
     .await
     .expect("request attention c1");
-    // Suppressed: no immediate parent send for the grouped child.
-    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    // Immediate kind-flavored wake for the grouped child (the alert).
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("requests a discussion: which schema version?"),
+        "grouped child must wake the parent immediately: {text}"
+    );
 
     // Settle the group: both children idle, then the parent idles.
     for c in [&c1, &c2] {
@@ -8860,12 +8866,42 @@ async fn request_attention_folds_into_after_all_group_wake() {
     ))
     .await;
 
-    // Exactly one aggregated wake; c1's line carries the attention fold.
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    // One aggregated wake on top of the immediate one; c1's line still
+    // carries the attention fold (the record).
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let text = parent_messages_text(&svc, &parent).await;
     assert!(
         text.contains("Requested a discussion: which schema version?"),
         "group wake must fold the attention request: {text}"
+    );
+}
+
+/// The immediate grouped attention wake carries the kind-flavored text and
+/// reason, and delivers BEFORE any group settlement — a blocker raised by an
+/// `after_all` child must not wait for its siblings.
+#[tokio::test]
+async fn request_attention_wakes_parent_immediately_in_after_all_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let _c2 = delegate_after_all(&svc, &ws, &parent).await;
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(c1.clone()),
+    )
+    .await
+    .expect("request attention c1");
+
+    // Delivered now — no sibling has settled and the group is still live.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("reports a blocker: sandbox exploded"),
+        "immediate grouped wake must be kind-flavored with the reason: {text}"
     );
 }
 

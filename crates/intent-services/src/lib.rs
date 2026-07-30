@@ -2536,9 +2536,9 @@ impl Services {
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,
                 // mirroring the TS event-notification formatter. A pending
-                // attention request (whose immediate wake is likewise
-                // suppressed for grouped children) is folded into the child's
-                // line + event data the same way.
+                // attention request (whose immediate wake already fired at
+                // raise time — the alert) is folded into the child's line +
+                // event data the same way (the record).
                 let child_session = self.store.get_agent_session(child_id).await.ok();
                 let attention = child_session.as_ref().and_then(|s| {
                     s.attention_request_kind
@@ -6623,10 +6623,11 @@ pub(crate) fn format_group_child_line(
             line.push_str(&format!(" Error: {err}"));
         }
     }
-    // Pending attention request (agent:attention-requested): a grouped child
-    // skips its immediate parent wake, so the aggregated line carries the
-    // kind-flavored attention text instead (annotated onto the event data by
-    // the group-record sites from the persisted session fields).
+    // Pending attention request (agent:attention-requested): the child's
+    // immediate parent wake already fired at raise time (the alert); the
+    // aggregated line carries the kind-flavored attention text as the record
+    // (annotated onto the event data by the group-record sites from the
+    // persisted session fields).
     if let Some(kind) = event
         .data
         .get("attentionRequestKind")
