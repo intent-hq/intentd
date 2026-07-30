@@ -4133,8 +4133,7 @@ impl Services {
     /// set of existing target agents — the subscription side of
     /// `agent.delegate` without creating children. Reuses the exact same
     /// registration/group helpers as the delegate call sites: `immediate`
-    /// (default) registers a oneShot watch per target (deduped against a live
-    /// ungrouped watch, like `agent.watchCompletion`); `after_all` enrolls
+    /// (default) registers a oneShot watch per target; `after_all` enrolls
     /// every target in the caller's open delegation group anchored in the
     /// caller's home workspace (sealed on the caller's idle, one aggregated
     /// wake, restart-safe through the existing group persistence). Targets
@@ -4142,6 +4141,12 @@ impl Services {
     /// callers — enforced by the shared `check_watch_scope` gate, which runs
     /// for every target BEFORE any side-effectful registration so a rejection
     /// leaves no partial group or watches behind.
+    ///
+    /// Pair uniqueness: as an EXPLICIT registration path, a target the caller
+    /// already watches (oneShot, non-oneShot, or grouped) is rejected with
+    /// `-32602` naming the target — run in the same up-front validation loop,
+    /// so the rejection is side-effect free. (Auto-subscribe paths silently
+    /// adopt the existing watch instead; see `register_completion_watch`.)
     ///
     /// After registration every target is reconciled against current agent
     /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
@@ -4229,6 +4234,20 @@ impl Services {
                 )));
             }
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            // Pair uniqueness: an explicit registration on a child the caller
+            // ALREADY watches (oneShot, non-oneShot, or grouped) is rejected
+            // up front — before any side-effectful registration — instead of
+            // silently adopting the existing watch like the auto-subscribe
+            // paths do, so a duplicate wait can never appear on the wire.
+            if self.pair_watch_exists(&caller_agent_id, &target) {
+                return Err(Error::InvalidParams(format!(
+                    "already waiting on agent {}: a completion watch for this \
+                     (caller, target) pair is already active — at most one \
+                     active watch per pair (cancel it via \
+                     agent.cancelSubscriptions to re-register)",
+                    target.0
+                )));
+            }
             resolved.push((target, session.name, session.workspace_id));
         }
         let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved

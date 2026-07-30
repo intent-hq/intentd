@@ -13,6 +13,15 @@
 //! workspace — enforced in [`Services::register_completion_watch`], the single
 //! shared registration path, not per-caller.
 //!
+//! Pair uniqueness: a parent holds AT MOST ONE active watch per child —
+//! across oneShot, non-oneShot, and grouped watches. The shared registration
+//! path enforces it by ADOPTING an existing watch for the pair instead of
+//! pushing a duplicate (a grouped request converts the watch to the group
+//! watch; a non-oneShot request upgrades a oneShot; a weaker request never
+//! degrades a stronger watch). Explicit registrations (`app.agents.waitFor`)
+//! reject an already-watched target up front instead; startup rehydration
+//! coalesces pre-existing duplicate persisted rows.
+//!
 //! A oneShot watch is registered when an agent delegates with `waitMode`
 //! `immediate` (default) over the MCP front door; the delivery worker that
 //! fires on child completion lands in AS-3 and the `after_all`
@@ -149,6 +158,10 @@ impl Services {
     /// delivered); `child_workspace_id` is where the child's completion events
     /// fire. Errs when the scope gate rejects the pair (non-chief parent
     /// watching a child outside its own workspace).
+    ///
+    /// Pair uniqueness: when the parent already holds a watch on this child,
+    /// the existing watch is ADOPTED (see [`Services::insert_watch_in_memory`])
+    /// and its id is returned — no duplicate is ever pushed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_completion_watch(
         &self,
@@ -170,7 +183,9 @@ impl Services {
             group_id,
         )?;
         // Write-through persist (best-effort) so the watch survives a daemon
-        // restart (rehydrated by `heal_completion_watches_on_startup`).
+        // restart (rehydrated by `heal_completion_watches_on_startup`). On the
+        // adopt path this upserts the existing row's mutable columns
+        // (one_shot / group_id) so the strengthened mode is restart-durable.
         let id = watch.id.clone();
         self.persist_completion_watch(&watch);
         Ok(id)
@@ -213,8 +228,22 @@ impl Services {
         Ok(id)
     }
 
-    /// Shared body of the two registration variants: build the watch, run
-    /// the scope gate, and push it into the in-memory registry.
+    /// Shared body of the two registration variants: run the scope gate,
+    /// then either ADOPT the parent's existing watch on this child (pair
+    /// uniqueness: at most one active watch per (parent, child)) or build a
+    /// fresh watch and push it into the in-memory registry.
+    ///
+    /// Adoption rules (strengthen-only, never weaken):
+    /// - A grouped request converts the existing watch into the group watch
+    ///   (`group_id` adopted, `one_shot` cleared) — group settlement
+    ///   accounting REQUIRES the grouped watch to exist, so the group always
+    ///   wins a collision (this is the footer duplicate-wake bug: a oneShot
+    ///   watch coexisting with after_all membership double-woke the parent).
+    /// - An ungrouped request against an existing grouped watch is a no-op
+    ///   (the group already provides the wake path).
+    /// - A non-oneShot ungrouped request upgrades an existing oneShot watch
+    ///   (a queued wake must survive the current `agent:idle`); a oneShot
+    ///   request never degrades a non-oneShot watch.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -227,30 +256,67 @@ impl Services {
         group_id: Option<String>,
     ) -> Result<CompletionWatch> {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
-        let watch = CompletionWatch {
-            id: Uuid::new_v4().to_string(),
-            parent_workspace_id: parent_workspace_id.clone(),
-            child_workspace_id: child_workspace_id.clone(),
-            parent_agent_id,
-            parent_agent_name,
-            child_agent_id,
-            one_shot,
-            group_id,
-            created_at: now_iso(),
-            cleanup_deadline: None,
-            report_delivered: false,
+        let watch = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if let Some(existing) = guard.subscriptions.iter_mut().find(|s| {
+                s.parent_agent_id == parent_agent_id && s.child_agent_id == child_agent_id
+            }) {
+                if let Some(gid) = group_id {
+                    existing.group_id = Some(gid);
+                    existing.one_shot = false;
+                    // Group settlement owns the watch's lifecycle now: disarm
+                    // any queued-wake leak-guard deadline so a stale cleanup
+                    // task cannot remove the grouped watch out from under the
+                    // group's completion accounting.
+                    existing.cleanup_deadline = None;
+                } else if existing.group_id.is_none() {
+                    existing.one_shot = existing.one_shot && one_shot;
+                }
+                existing.clone()
+            } else {
+                let watch = CompletionWatch {
+                    id: Uuid::new_v4().to_string(),
+                    parent_workspace_id: parent_workspace_id.clone(),
+                    child_workspace_id: child_workspace_id.clone(),
+                    parent_agent_id,
+                    parent_agent_name,
+                    child_agent_id,
+                    one_shot,
+                    group_id,
+                    created_at: now_iso(),
+                    cleanup_deadline: None,
+                    report_delivered: false,
+                };
+                guard.subscriptions.push(watch.clone());
+                watch
+            }
         };
-        self.agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned")
-            .subscriptions
-            .push(watch.clone());
         // monorepo#840: a fresh watch expresses fresh interest — drop any
         // stale failure-wake dedup record for this pair so the next failure
         // (even with unchanged error text) reaches the new watcher. Dedup
         // then only suppresses replays BETWEEN registrations.
         self.clear_failure_wake_dedup_pair(&watch.parent_agent_id, &watch.child_agent_id);
         Ok(watch)
+    }
+
+    /// Whether the parent already holds ANY active watch on this child —
+    /// oneShot, non-oneShot, or grouped (the pair-uniqueness pre-check used
+    /// by explicit registration paths that must reject duplicates instead of
+    /// silently adopting, e.g. `app.agents.waitFor`).
+    pub(crate) fn pair_watch_exists(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .any(|s| &s.parent_agent_id == parent_agent_id && &s.child_agent_id == child_agent_id)
     }
 
     /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup),
@@ -1013,8 +1079,26 @@ impl Services {
     /// reconciled against current agent state: a child that completed while
     /// the daemon was down delivers its (synthetic) completion immediately,
     /// so the parent is not left waiting forever.
+    ///
+    /// Pair uniqueness: rows are processed grouped-first (then non-oneShot,
+    /// then oneShot; older first within a rank), and a row whose
+    /// (parent, child) pair is already watched in memory is pruned — so
+    /// duplicate rows persisted by a pre-invariant daemon are coalesced onto
+    /// the single strongest watch on upgrade.
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
-        let persisted = self.store.list_completion_watches().await?;
+        let mut persisted = self.store.list_completion_watches().await?;
+        // Strongest-first: grouped (0) < non-oneShot (1) < oneShot (2), with
+        // the store's created_at ASC ordering as the tiebreaker (stable sort).
+        let rank = |p: &intent_store::PersistedCompletionWatch| -> u8 {
+            if p.group_id.is_some() {
+                0
+            } else if !p.one_shot {
+                1
+            } else {
+                2
+            }
+        };
+        persisted.sort_by_key(rank);
         let mut loaded = 0usize;
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
@@ -1068,24 +1152,51 @@ impl Services {
                 },
                 None => None,
             };
-            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = {
+            enum LoadOutcome {
+                Loaded(String, WorkspaceId, AgentId, AgentId, WorkspaceId),
+                AlreadyInMemory,
+                DuplicatePair,
+            }
+            let outcome = {
                 let mut guard = self
                     .agent_subscriptions
                     .lock()
                     .expect("agent subscription registry poisoned");
                 if guard.subscriptions.iter().any(|s| s.id == p.id) {
+                    LoadOutcome::AlreadyInMemory
+                } else if guard.subscriptions.iter().any(|s| {
+                    s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
+                }) {
+                    // Pair uniqueness: a stronger watch (grouped /
+                    // non-oneShot) for the same (parent, child) already
+                    // loaded — this row is a pre-invariant duplicate.
+                    LoadOutcome::DuplicatePair
+                } else {
+                    let watch = persisted_to_completion_watch(&p);
+                    let ids = LoadOutcome::Loaded(
+                        watch.id.clone(),
+                        watch.parent_workspace_id.clone(),
+                        watch.parent_agent_id.clone(),
+                        watch.child_agent_id.clone(),
+                        watch.child_workspace_id.clone(),
+                    );
+                    guard.subscriptions.push(watch);
+                    ids
+                }
+            };
+            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = match outcome {
+                LoadOutcome::Loaded(id, pws, pa, ca, cws) => (id, pws, pa, ca, cws),
+                LoadOutcome::AlreadyInMemory => continue,
+                LoadOutcome::DuplicatePair => {
+                    tracing::info!(
+                        watch = %p.id,
+                        parent = %p.parent_agent_id.0,
+                        child = %p.child_agent_id.0,
+                        "pruning persisted completion watch — duplicate (parent, child) pair"
+                    );
+                    let _ = self.store.delete_completion_watch(&p.id).await;
                     continue;
                 }
-                let watch = persisted_to_completion_watch(&p);
-                let ids = (
-                    watch.id.clone(),
-                    watch.parent_workspace_id.clone(),
-                    watch.parent_agent_id.clone(),
-                    watch.child_agent_id.clone(),
-                    watch.child_workspace_id.clone(),
-                );
-                guard.subscriptions.push(watch);
-                ids
             };
             loaded += 1;
             // Re-arm the leak-guard cleanup with the remaining wall-clock time.

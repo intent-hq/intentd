@@ -668,10 +668,12 @@ async fn app_agents_wait_immediate_wakes_from_two_workspaces() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
-/// Calling waitFor twice for the same target in immediate mode reuses the
-/// live oneShot watch (same subscription id) instead of stacking duplicates.
+/// Pair uniqueness on the explicit path: calling waitFor for a target the
+/// caller ALREADY watches is rejected with InvalidParams naming the target
+/// (for BOTH modes), side-effect free — the original watch survives
+/// unchanged and no group is created.
 #[tokio::test]
-async fn app_agents_wait_immediate_dedupes_live_watch() {
+async fn app_agents_wait_rejects_already_watched_target() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Caller").await;
     let target = create_agent(&svc, &ws, "Target").await;
@@ -685,15 +687,32 @@ async fn app_agents_wait_immediate_dedupes_live_watch() {
         )
         .await
         .expect("first waitFor");
-    let second = svc
-        .app_agents_wait_op(ws.clone(), caller.clone(), vec![target.0.clone()], None)
-        .await
-        .expect("second waitFor");
-    assert_eq!(
-        first["results"][0]["subscriptionId"], second["results"][0]["subscriptionId"],
-        "live ungrouped watch is reused, not duplicated"
+    let first_id = first["results"][0]["subscriptionId"]
+        .as_str()
+        .expect("subscription id")
+        .to_string();
+
+    for mode in [None, Some("after_all".to_string())] {
+        let err = svc
+            .app_agents_wait_op(ws.clone(), caller.clone(), vec![target.0.clone()], mode)
+            .await
+            .expect_err("duplicate waitFor must be rejected");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&target.0),
+                "error must name the already-watched target: {msg}"
+            ),
+            other => panic!("expected Error::InvalidParams, got {other:?}"),
+        }
+    }
+    let watches = svc.list_watches_for_parent(&caller);
+    assert_eq!(watches.len(), 1, "original watch survives: {watches:?}");
+    assert_eq!(watches[0].id, first_id, "original watch unchanged");
+    assert!(watches[0].one_shot);
+    assert!(
+        svc.delegation_group_for_parent(&caller).is_none(),
+        "rejected after_all attempt leaves no group"
     );
-    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 }
 
 /// Registration-time reconciliation (immediate mode): waitFor on a target
@@ -6434,6 +6453,192 @@ async fn completion_watch_registry_register_find_list_remove() {
     assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
+// ── (parent, child) watch uniqueness ────────────────────────────────────────
+
+/// Footer-bug regression: a oneShot watch and after_all group membership on
+/// the SAME child must not coexist as two watches. The grouped registration
+/// adopts the existing oneShot watch in place (same subscription id, now
+/// grouped and non-oneShot), so the child's completion routes ONLY into the
+/// group fan-in — one aggregated wake, no immediate duplicate.
+#[tokio::test]
+async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // 1) An earlier coordination message left a oneShot watch on the pair.
+    let first = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("oneshot watch");
+    // 2) The same child is then enrolled in the parent's after_all group.
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    let second = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            false,
+            Some(gid.clone()),
+        )
+        .expect("grouped watch");
+
+    assert_eq!(first, second, "existing watch adopted, not duplicated");
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(
+        watches.len(),
+        1,
+        "at most one watch per (parent, child): {watches:?}"
+    );
+    assert_eq!(watches[0].group_id.as_deref(), Some(gid.as_str()));
+    assert!(!watches[0].one_shot);
+
+    // The child's completion routes only into the group — no immediate wake.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no immediate duplicate wake alongside the group"
+    );
+    // The parent idling seals the (complete) group: one aggregated wake.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "single aggregated wake"
+    );
+}
+
+/// Repeated ungrouped registrations for the same pair collapse onto one
+/// watch: same-mode re-registration returns the existing id; a non-oneShot
+/// request upgrades an existing oneShot watch in place (a queued wake must
+/// survive the current agent:idle); a later oneShot request never degrades
+/// the non-oneShot watch back.
+#[tokio::test]
+async fn register_ungrouped_watch_for_same_pair_reuses_and_upgrades() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let register = |one_shot: bool| {
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            one_shot,
+            None,
+        )
+    };
+
+    let first = register(true).expect("first");
+    let second = register(true).expect("second");
+    assert_eq!(first, second, "same-mode re-registration reuses the watch");
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert!(watches[0].one_shot);
+
+    let third = register(false).expect("third");
+    assert_eq!(first, third, "upgrade adopts the same watch");
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1, "upgrade must not duplicate: {watches:?}");
+    assert!(!watches[0].one_shot, "oneShot upgraded to non-oneShot");
+
+    let fourth = register(true).expect("fourth");
+    assert_eq!(first, fourth);
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].one_shot,
+        "a oneShot request never degrades a non-oneShot watch"
+    );
+}
+
+/// Startup rehydration coalesces pre-invariant duplicate persisted rows for
+/// the same (parent, child) pair: exactly one row is loaded (grouped >
+/// non-oneShot > oneShot rank) and the duplicate rows are deleted.
+#[tokio::test]
+async fn rehydration_prunes_duplicate_pair_rows() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        (parent, child)
+    };
+
+    // Seed two persisted rows for the SAME pair directly (the pre-invariant
+    // daemon could accumulate these): a oneShot row and a non-oneShot row.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    for (id, one_shot, created_at) in [
+        ("watch-dup-oneshot", true, "2026-01-01T00:00:00Z"),
+        ("watch-dup-nononeshot", false, "2026-01-02T00:00:00Z"),
+    ] {
+        store
+            .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
+                id: id.to_string(),
+                parent_workspace_id: ws.clone(),
+                child_workspace_id: ws.clone(),
+                parent_agent_id: parent.clone(),
+                parent_agent_name: "Parent".into(),
+                child_agent_id: child.clone(),
+                one_shot,
+                group_id: None,
+                report_delivered: false,
+                deadline_at_ms: None,
+                created_at: created_at.to_string(),
+            })
+            .await
+            .expect("seed row");
+    }
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "exactly one row per pair rehydrated");
+    let watches = restarted.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1, "one in-memory watch: {watches:?}");
+    assert!(
+        !watches[0].one_shot,
+        "the higher-rank (non-oneShot) row wins the coalesce"
+    );
+    // The duplicate row was deleted, so the surviving row is the only one.
+    wait_for_persisted_watches(&restarted, 1).await;
+    let rows = restarted
+        .store()
+        .list_completion_watches()
+        .await
+        .expect("rows");
+    assert_eq!(rows[0].id, "watch-dup-nononeshot");
+}
+
 /// MCP front door (caller set), default wait mode: exactly one oneShot watch is
 /// registered linking the caller (parent) to the freshly created child.
 #[tokio::test]
@@ -6606,6 +6811,43 @@ async fn sender_watch_registers_oneshot_for_foreground_caller() {
     assert!(watches[0].one_shot);
     assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, target);
+}
+
+/// Pair uniqueness on the piggyback path: the sender auto-subscribe on a
+/// target the caller already watches (here via a live non-oneShot watch,
+/// which the oneShot reuse fast-path cannot match) silently no-ops onto the
+/// existing watch — same subscription id back, exactly one watch, the send
+/// itself unaffected, and the watch's stronger (non-oneShot) mode preserved.
+#[tokio::test]
+async fn sender_watch_silently_adopts_existing_watch_for_pair() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let existing = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            false,
+            None,
+        )
+        .expect("existing non-oneShot watch");
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
+        .await
+        .expect("sender watch must not fail on a duplicate");
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    assert_eq!(resp["subscriptionId"], serde_json::json!(existing));
+
+    let watches = svc.list_watches_for_parent(&caller);
+    assert_eq!(watches.len(), 1, "no duplicate stacked: {watches:?}");
+    assert!(
+        !watches[0].one_shot,
+        "a oneShot piggyback never degrades the existing non-oneShot watch"
+    );
 }
 
 /// A delegated background task sender (isBackground + metadata
@@ -7118,17 +7360,19 @@ async fn spawn_watch_cleanup_removes_watch_after_timeout() {
     panic!("cleanup did not remove the queued watch");
 }
 
-/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
-/// a queued wake must never reuse a pre-existing oneShot watch for the same
-/// caller/target pair, because a oneShot watch is removed on the first
+/// SUB-2 (PR #104 thread PRRT_kwDOS9Wxuc6QIRcq), updated for pair
+/// uniqueness: a queued wake must never LEAVE a oneShot watch as the
+/// caller's only wake path, because a oneShot watch is removed on the first
 /// `agent:idle` — which is precisely the idle that a queued message needs to
-/// survive. The queued path must therefore register a fresh non-oneShot
-/// watch alongside the existing oneShot one. A pre-seeded oneShot watch
-/// (registered via [`Services::register_completion_watch`] to sidestep
-/// runtime turn-starting side effects) drives the queued wake through the
-/// mode-mismatch fall-through in [`Services::agent_wake_or_create_op`].
+/// survive. Under the (parent, child) uniqueness invariant the queued path
+/// now ADOPTS the pre-existing oneShot watch and upgrades it in place to
+/// non-oneShot (same subscription id, exactly one watch) instead of stacking
+/// a second watch next to it. A pre-seeded oneShot watch (registered via
+/// [`Services::register_completion_watch`] to sidestep runtime turn-starting
+/// side effects) drives the queued wake through the mode-mismatch
+/// fall-through in [`Services::agent_wake_or_create_op`].
 #[tokio::test]
-async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
+async fn wake_or_create_queued_upgrades_existing_oneshot_watch() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
@@ -7173,34 +7417,27 @@ async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
         .expect("queued subscriptionId")
         .to_string();
 
-    assert_ne!(
+    assert_eq!(
         oneshot_sub_id, queued_sub_id,
-        "queued wake must not reuse the oneShot subscription id"
+        "queued wake adopts the existing watch for the pair"
     );
 
-    // Both watches now coexist: the oneShot watch is unchanged and a
-    // fresh non-oneShot watch was registered for the queued delivery.
+    // Exactly one watch for the pair, upgraded in place to non-oneShot so it
+    // survives the assignee's current agent:idle.
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(
         watches.len(),
-        2,
-        "queued must add a distinct watch: {watches:?}"
+        1,
+        "at most one watch per (caller, target): {watches:?}"
     );
-    let oneshot = watches
-        .iter()
-        .find(|w| w.id == oneshot_sub_id)
-        .expect("original oneShot watch still present");
+    assert_eq!(watches[0].id, oneshot_sub_id);
     assert!(
-        oneshot.one_shot,
-        "existing oneShot watch must remain oneShot"
+        !watches[0].one_shot,
+        "adopted watch must be upgraded to non-oneShot so it survives the current agent:idle"
     );
-    let queued_watch = watches
-        .iter()
-        .find(|w| w.id == queued_sub_id)
-        .expect("fresh queued watch present");
     assert!(
-        !queued_watch.one_shot,
-        "queued watch must be non-oneShot so it survives the current agent:idle"
+        watches[0].cleanup_deadline.is_some(),
+        "queued branch arms the 5-minute leak guard on the adopted watch"
     );
 
     manager.release_slot(&target).await;
