@@ -18,6 +18,10 @@ const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
+/// A serialized response exceeded [`crate::MAX_OUTBOUND_MESSAGE_BYTES`] and was
+/// replaced with this error so the client fails fast instead of timing out on
+/// a dropped frame.
+const OVERSIZED_RESPONSE: i32 = -32010;
 
 /// A JSON-RPC error to surface to the client.
 struct RpcErr {
@@ -155,7 +159,14 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         return None;
     }
     Some(match result {
-        Ok(v) => success_string(echo_id, v),
+        Ok(v) => {
+            let frame = success_string(echo_id.clone(), v);
+            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                oversized_response_string(echo_id, method, frame.len())
+            } else {
+                frame
+            }
+        }
         Err(e) => error_string(echo_id, e.code, &e.message, e.data),
     })
 }
@@ -3589,6 +3600,34 @@ fn error_string(id: Value, code: i32, message: &str, data: Option<Value>) -> Str
     }
     let resp = json!({ "jsonrpc": "2.0", "error": Value::Object(err), "id": id });
     serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+}
+
+/// Replace a serialized response that exceeds
+/// [`crate::MAX_OUTBOUND_MESSAGE_BYTES`] with an [`OVERSIZED_RESPONSE`] error
+/// echoing the request id, so the client fails fast instead of hitting its
+/// RPC timeout on a silently dropped frame. The writer-task cap remains as a
+/// last-resort backstop for non-response frames (subscription pushes/events).
+fn oversized_response_string(id: Value, method: &str, response_bytes: usize) -> String {
+    tracing::error!(
+        method,
+        response_bytes,
+        limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        "oversized JSON-RPC response replaced with error"
+    );
+    error_string(
+        id,
+        OVERSIZED_RESPONSE,
+        &format!(
+            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {} bytes",
+            crate::MAX_OUTBOUND_MESSAGE_BYTES
+        ),
+        Some(json!({
+            "code": "oversized-response",
+            "method": method,
+            "responseBytes": response_bytes,
+            "limit": crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        })),
+    )
 }
 
 /// Last-resort response if serialization itself fails (should never happen).

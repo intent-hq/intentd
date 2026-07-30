@@ -588,6 +588,10 @@ impl WsInner {
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
                 Some(frame) = app_rx.recv() => {
+                    // Last-resort backstop for non-response frames
+                    // (subscription pushes/events): oversized router
+                    // responses are already replaced with a `-32010` error
+                    // at serialization, where the request id is known.
                     if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
                         tracing::error!(
                             frame_bytes = frame.len(),

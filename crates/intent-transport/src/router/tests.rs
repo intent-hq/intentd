@@ -5360,3 +5360,70 @@ mod stats_get_usage {
         );
     }
 }
+
+/// A response whose serialized frame exceeds `MAX_OUTBOUND_MESSAGE_BYTES` is
+/// replaced at serialization with a `-32010` error echoing the request id —
+/// not dropped by the writer-task backstop (which would leave the client to
+/// hit its RPC timeout).
+mod oversized_response {
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::Value;
+
+    use super::super::handle_message;
+
+    struct HugeApi;
+
+    impl WorkspaceApi for HugeApi {
+        #[allow(clippy::too_many_arguments)]
+        fn agent_edit_and_regenerate(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: AgentId,
+            _message_id: String,
+            _content: String,
+            _image_blocks: Option<Value>,
+            _file_blocks: Option<Value>,
+            _model: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async {
+                Ok(Value::String(
+                    "x".repeat(crate::MAX_OUTBOUND_MESSAGE_BYTES + 1),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_result_yields_error_response_with_same_id() {
+        let msg = r#"{
+            "jsonrpc":"2.0","id":42,"method":"agent.editAndRegenerate",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"m1","content":"c"}
+        }"#;
+        let out = handle_message(&HugeApi, msg)
+            .await
+            .expect("an error response frame, not a dropped frame");
+        assert!(
+            out.len() <= crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            "replacement error frame must itself fit under the cap"
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["error"]["code"], -32010);
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("agent.editAndRegenerate"),
+            "message must name the method: {message}"
+        );
+        assert!(
+            message.contains("bytes"),
+            "message must carry the serialized size: {message}"
+        );
+        assert_eq!(v["error"]["data"]["code"], "oversized-response");
+        assert_eq!(v["error"]["data"]["method"], "agent.editAndRegenerate");
+        assert!(
+            v["error"]["data"]["responseBytes"].as_u64().unwrap()
+                > crate::MAX_OUTBOUND_MESSAGE_BYTES as u64,
+            "data.responseBytes must be the oversized serialized size"
+        );
+    }
+}
