@@ -50,11 +50,7 @@ pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 pub const AGENT_STREAM_PREFIX: &str = "agent:stream:";
 pub const AGENT_STREAM_START: &str = "agent:stream:start";
 pub const AGENT_STREAM_CHUNK: &str = "agent:stream:chunk";
-pub const AGENT_STREAM_CONTENT_BLOCKS: &str = "agent:stream:content-blocks";
 pub const AGENT_STREAM_END: &str = "agent:stream:end";
-pub const AGENT_STREAM_MESSAGE: &str = "agent:stream:message";
-pub const AGENT_STREAM_TOOL_USE: &str = "agent:stream:tool_use";
-pub const AGENT_STREAM_TOOL_RESULT: &str = "agent:stream:tool_result";
 // Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
 // §7). Emitted while an agent turn is starting so the chat spinner can show
 // the current phase (`launch` / `init` / `session-create` / `session-load` /
@@ -348,11 +344,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_MESSAGE_DELIVERY_FAILED,
     AGENT_STREAM_START,
     AGENT_STREAM_CHUNK,
-    AGENT_STREAM_CONTENT_BLOCKS,
     AGENT_STREAM_END,
-    AGENT_STREAM_MESSAGE,
-    AGENT_STREAM_TOOL_USE,
-    AGENT_STREAM_TOOL_RESULT,
     AGENT_STREAM_STATUS,
     AGENT_QUEUE_UPDATED,
     AGENT_QUEUE_PROCESSING,

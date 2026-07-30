@@ -124,6 +124,7 @@ async fn agent_send_message_persists_without_manager() {
             None,
             None,
             None,
+            intent_core::MessageOrigin::User,
         )
         .await
         .expect("agent send message");

@@ -197,6 +197,19 @@ pub struct TurnOptions {
     /// `persist_error_and_requeue` threads it onto the requeued entry so a
     /// retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
+    /// Who originated this delivery (question hold, PROTOCOL §5.5):
+    /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
+    /// is never held; the `Automatic` default fails closed — an automatic
+    /// send to an agent whose question hold is active enqueues instead of
+    /// claiming the turn slot, so a pending Q&A is never superseded by a
+    /// system/agent message.
+    pub origin: intent_core::MessageOrigin,
+    /// `true` when this delivery carries `priority: "interrupt"`. Every
+    /// fallback path that parks the message in the queue (question hold,
+    /// busy race, quarantine park, append-failure auto-queue, terminal-
+    /// failure requeue) inserts it with interrupt priority — front of the
+    /// queue, behind earlier interrupts (user decision, spec §Decisions).
+    pub interrupt_priority: bool,
 }
 
 impl TurnOptions {
@@ -3016,13 +3029,15 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message(
+            let (queued, position) = self.services.enqueue_message_with_origin(
                 &agent_id,
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
                 options.message_metadata.clone(),
                 options.queued_prepend(),
+                options.interrupt_priority,
+                options.origin.is_user(),
             );
             let result = json!({
                 "success": true,
@@ -3047,7 +3062,15 @@ impl AgentManager {
             }
             return Ok(result);
         }
-        if !self.try_begin(&agent_id, &workspace_id).await {
+        // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
+        // whose last assistant message carries un-dismissed question blocks
+        // must NOT start a turn — the resulting user row would supersede the
+        // pending Q&A and the wizard would silently vanish. Park the message
+        // in the queue instead (interrupt priority included — no exceptions,
+        // spec §Decisions); `agent.dismissQuestions` or a user answer flips
+        // the hold false and kicks the drain. Checked BEFORE `try_begin` so
+        // even an idle agent holds the delivery.
+        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
                 content,
@@ -3055,6 +3078,40 @@ impl AgentManager {
                 options.file_blocks.clone(),
                 options.message_metadata.clone(),
                 options.queued_prepend(),
+                options.interrupt_priority,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer): the hold may have flipped false
+            // between the check above and the enqueue just completing — the
+            // dismiss's own `try_drain_queue` kick could have fired against
+            // a still-empty queue and found nothing to drain. Re-check and
+            // kick again if the hold has since cleared, so this entry is not
+            // stranded until some unrelated future trigger.
+            if !self.services.question_hold_active(&agent_id).await {
+                self.clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
+            return Ok(result);
+        }
+        if !self.try_begin(&agent_id, &workspace_id).await {
+            let (queued, position) = self.services.enqueue_message_with_origin(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                options.origin.is_user(),
             );
             let result = json!({
                 "success": true,
@@ -3127,13 +3184,15 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message(
+                let (queued, position) = self.services.enqueue_message_with_origin(
                     &agent_id,
                     content,
                     options.image_blocks.clone(),
                     options.file_blocks.clone(),
                     options.message_metadata.clone(),
                     options.queued_prepend(),
+                    options.interrupt_priority,
+                    options.origin.is_user(),
                 );
                 let result = json!({
                     "success": true,
@@ -3187,6 +3246,27 @@ impl AgentManager {
         if !self.services.has_ready_to_send(&agent_id) {
             return;
         }
+        // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
+        // parked while the agent's last assistant message carries
+        // un-dismissed question blocks — draining one would append a user
+        // row that supersedes the pending Q&A. `agent.dismissQuestions` and
+        // the post-answer turn end both re-kick this drain once the hold
+        // derivation flips false (mirrors the STAB-52 Error gate below). A
+        // parked USER-origin entry (a user send that lost a busy race) is
+        // exempt — the user answer is the hold's documented release, so it
+        // drains and supersedes the questions (`hold_drain` below).
+        let hold_drain = if self.services.question_hold_active(&agent_id).await {
+            if !self.services.has_user_origin_ready(&agent_id) {
+                tracing::debug!(
+                    agent = %agent_id,
+                    "skipping queue drain: question hold active (awaiting answer or dismissQuestions)"
+                );
+                return;
+            }
+            true
+        } else {
+            false
+        };
         // A session parked in `Error` must NOT be auto-redriven (STAB-52): the
         // terminal spawn/turn-failure handler requeues the failed message and
         // persists `Error` so redriving it is a deliberate act — `agent.retry`
@@ -3224,7 +3304,14 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
-        let mut next = match self.services.dequeue_message(&agent_id) {
+        // Under an active hold only a user-origin entry may drain; the
+        // normal path pops the queue head as before.
+        let dequeued = if hold_drain {
+            self.services.dequeue_user_origin_message(&agent_id)
+        } else {
+            self.services.dequeue_message(&agent_id)
+        };
+        let mut next = match dequeued {
             Some(msg) => msg,
             None => {
                 // Raced with another mutation (e.g. remove) that emptied the
@@ -3290,6 +3377,7 @@ impl AgentManager {
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
             turn_id: Some(next.turn_id.clone()),
+            interrupt_priority: next.interrupt_priority,
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -3401,6 +3489,12 @@ impl AgentManager {
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
             prepend_file_blocks: entry.prepend_file_blocks.clone(),
+            // Explicit user action (question hold, PROTOCOL §5.5): "send
+            // now" bypasses the hold by design, and it delivers with
+            // interrupt priority — a terminal-failure requeue keeps the
+            // front-of-queue position.
+            origin: intent_core::MessageOrigin::User,
+            interrupt_priority: true,
             ..TurnOptions::default()
         };
         // Preempt a cancellable in-flight turn keep-alive (no-op when idle
@@ -3410,6 +3504,10 @@ impl AgentManager {
             // The slot is still held (turn startup, or a concurrent send won
             // the race): restore the entry at the FRONT so it is the next
             // message delivered, and report the queued outcome honestly.
+            // The explicit "send now" is a user action: mark the restored
+            // entry user-origin so the winner's end-of-turn drain delivers
+            // it even while the question hold is active (§5.5 bypass).
+            entry.user_origin = true;
             let restored = entry.to_value(0);
             self.services.requeue_front(&agent_id, entry);
             self.services.publish_queue_updated(&agent_id).await;
@@ -3506,7 +3604,7 @@ impl AgentManager {
         message_id: String,
         content: String,
         model: Option<String>,
-        options: TurnOptions,
+        mut options: TurnOptions,
     ) -> Result<Value> {
         self.services
             .agent_validate_edit_target_op(&agent_id, &message_id)
@@ -3551,6 +3649,9 @@ impl AgentManager {
         // Arm `recreated` AFTER `stop` (which clears it): it makes the next
         // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
+        // Explicit user action (question hold, PROTOCOL §5.5): the
+        // regenerated message deliberately supersedes any pending Q&A.
+        options.origin = intent_core::MessageOrigin::User;
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
             .await?;
@@ -3603,11 +3704,22 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        // Every queue fallback below (hold gate, busy race, quarantine park,
+        // append-failure auto-queue) must park this message at the FRONT of
+        // the queue (spec §Decisions: interrupts always enter ahead of
+        // normal entries, arrival-ordered among themselves).
+        options.interrupt_priority = true;
         // monorepo#564: reject nonexistent targets BEFORE the dedup record or
         // any preemption — same fail-closed guard as `send_message`.
         self.services.require_agent_session(&agent_id).await?;
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
-        // so of two racing duplicates exactly one proceeds to preempt.
+        // so of two racing duplicates exactly one proceeds. Runs BEFORE the
+        // hold check below so a held interrupt still records its id — an
+        // interrupt parked by the hold keeps the same at-most-once contract
+        // as one that streamed immediately: a duplicate with the same
+        // `message_id` arriving while the hold is active is deduplicated
+        // instead of double-enqueuing, and a replay arriving after the hold
+        // releases is deduplicated too.
         if let Some(mid) = message_id.as_deref() {
             let mut ids = self.interrupt_ids.lock().unwrap();
             if ids.get(&agent_id).map(String::as_str) == Some(mid) {
@@ -3619,6 +3731,16 @@ impl AgentManager {
                 }));
             }
             ids.insert(agent_id.clone(), mid.to_string());
+        }
+        // Question hold (PROTOCOL §5.5): an automatic interrupt is ALSO held
+        // — no exceptions (spec §Decisions). Skip the preemption entirely
+        // (there is nothing to preempt: the asking agent is idle, and a busy
+        // agent's hold cannot be active since the Q&A message is terminal)
+        // and let `send_message`'s hold gate park the message front-of-queue.
+        if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
+            return self
+                .send_message(agent_id, workspace_id, content, message_id, options)
+                .await;
         }
         self.preempt_busy_turn(&agent_id, &mut options).await;
         // The slot was just released (or was never held): the send path claims
@@ -3868,9 +3990,31 @@ impl AgentManager {
         if self.busy.lock().unwrap().contains(agent_id) {
             return true;
         }
+        // Perf (PR review, PROTOCOL §5.5): a non-consuming peek — in-memory,
+        // no store round-trip — so the two `question_hold_active` reads
+        // below only run once a notification is actually buffered. Without
+        // this, every idle agent with a live handle costs ~2 SQLite reads
+        // per `HARNESS_WAKE_POLL` tick (50ms) even when nothing is pending.
+        {
+            let Ok(peek) = notes.try_lock() else {
+                return true;
+            };
+            if peek.is_empty() {
+                return true;
+            }
+        }
+        // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
+        // append a fresh assistant message, superseding the pending Q&A the
+        // hold protects. Skip the tick (buffered notifications stay
+        // untouched) until the questions are answered or dismissed.
+        if self.services.question_hold_active(agent_id).await {
+            return true;
+        }
         // Owned lock so the claimed path below can move the receiver guard
         // into the spawned drive task with no unlock/relock gap another
-        // consumer could slip into.
+        // consumer could slip into. The notification observed by the peek
+        // above may already be gone (a concurrent consumer drained it) —
+        // `try_recv` below re-checks and this tick is a no-op either way.
         let Ok(mut guard) = notes.try_lock_owned() else {
             return true;
         };
@@ -5741,8 +5885,33 @@ async fn run_message_worker(
                 break 'outer;
             }
         }
-        // Drain the next queued message while still holding the in-flight slot.
-        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
+        // Question hold (PROTOCOL §5.5): the turn that just ended may have
+        // ASKED questions — draining the next AUTOMATIC queued message would
+        // append a user row that supersedes the pending Q&A. A parked
+        // USER-origin entry (a user answer that lost the busy race against
+        // this very turn) is exempt: it IS the hold's documented release, so
+        // it drains and supersedes the questions. Otherwise skip the
+        // pre-release drain (no `break 'outer` here!) and fall through to the
+        // post-`end_turn` raced re-check below, which repeats this same
+        // hold-aware `dequeue_user_origin_message` check AFTER the slot is
+        // actually released — closing the window where a user answer enqueued
+        // between `has_user_origin_ready` returning false and the slot's
+        // release would otherwise strand behind a gone worker with nothing to
+        // kick `try_drain_queue`.
+        let drained = if mgr.services.question_hold_active(&agent_id).await {
+            if mgr.services.has_user_origin_ready(&agent_id) {
+                mgr.services.dequeue_user_origin_message(&agent_id)
+            } else {
+                tracing::debug!(
+                    agent = %agent_id,
+                    "worker drain suspended: question hold active (awaiting answer or dismissQuestions)"
+                );
+                None
+            }
+        } else {
+            mgr.services.dequeue_message(&agent_id)
+        };
+        if let Some(mut next) = drained {
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -5793,6 +5962,7 @@ async fn run_message_worker(
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
                 turn_id: Some(next.turn_id.clone()),
+                interrupt_priority: next.interrupt_priority,
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5811,9 +5981,16 @@ async fn run_message_worker(
         // raced in just before / after the release. The re-check is wrapped in
         // the outer `'outer` loop (not its own inner loop) so the agent never
         // goes idle while ready-to-send messages remain — each re-claim of the
-        // slot continues `'outer` and re-enters the drain at the top.
+        // slot continues `'outer` and re-enters the drain at the top. Same
+        // question-hold contract as the pre-release arm: while the hold is
+        // active only a user-origin entry may drain.
         mgr.end_turn(&agent_id).await;
-        let Some(mut next) = mgr.services.dequeue_message(&agent_id) else {
+        let raced = if mgr.services.question_hold_active(&agent_id).await {
+            mgr.services.dequeue_user_origin_message(&agent_id)
+        } else {
+            mgr.services.dequeue_message(&agent_id)
+        };
+        let Some(mut next) = raced else {
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
@@ -5862,6 +6039,7 @@ async fn run_message_worker(
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
                 turn_id: Some(next.turn_id.clone()),
+                interrupt_priority: next.interrupt_priority,
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -6381,6 +6559,8 @@ async fn persist_error_and_requeue(
         prepend_content: options.prepend_content.clone(),
         prepend_image_blocks: options.prepend_image_blocks.clone(),
         prepend_file_blocks: options.prepend_file_blocks.clone(),
+        interrupt_priority: options.interrupt_priority,
+        user_origin: options.origin.is_user(),
     };
     mgr.services.requeue_front(agent_id, queued);
 
@@ -8279,8 +8459,15 @@ mod agent_retry_tests {
         let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         // A requeued message is waiting (the persist_error_and_requeue path).
-        mgr.services
-            .enqueue_message(&agent_id, "requeued".to_string(), None, None, None, None);
+        mgr.services.enqueue_message(
+            &agent_id,
+            "requeued".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -8323,6 +8510,7 @@ mod agent_retry_tests {
                     None,
                     None,
                     None,
+                    false,
                 );
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())
