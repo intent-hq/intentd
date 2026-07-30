@@ -15414,6 +15414,21 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let limit = usage_rate::parse_limit(limit)?;
+            let now = time::OffsetDateTime::now_utc();
+            let rows = self
+                .store
+                .list_usage_rate_since(&usage_rate::window_start(now, limit))
+                .await?;
+            Ok(usage_rate::rate_history_json(&rows, limit, now))
+        })
+    }
+
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -19709,6 +19724,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_rate;
 pub mod usage_stats;
 pub mod usage_stats_read;
 pub mod session_stats {}

@@ -1263,6 +1263,23 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "stats.getRateHistory" => {
+            // Global per-minute token-rate history behind the HUD TOK/MIN
+            // chart (§5.39); no workspaceId. `limit` (default 60, max 1440)
+            // is the number of trailing minute samples returned.
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_i64()
+                        .ok_or_else(|| rpc(INVALID_PARAMS, "limit must be an integer"))?,
+                ),
+            };
+            let result = api
+                .stats_get_rate_history(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.enhancePrompt" => {
             // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
             let prompt = require_str_param(params, "prompt")?;
