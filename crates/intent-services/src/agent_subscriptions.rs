@@ -649,10 +649,12 @@ impl Services {
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
-    /// group parented by `parent_id`. Retained for tests and future callers;
-    /// the immediate-mode `reportToParent` suppression has moved to SUB-2
-    /// (the child's `agent:idle` drives the single wake, so grouped children
-    /// no longer need the pre-persist branch this predicate used to gate).
+    /// group parented by `parent_id`. Gates the immediate `reportToParent`
+    /// wake in `agent_report_to_parent_op` (grouped children defer to the
+    /// group's aggregated wake) and the SUB-1 auto-watch registration
+    /// (grouped children are already covered by the grouped watch). Attention
+    /// requests (`agent_request_attention_op`) intentionally bypass it — that
+    /// wake is delivered immediately regardless of grouping.
     pub(crate) fn child_in_undelivered_group(
         &self,
         parent_id: &AgentId,
@@ -1535,7 +1537,9 @@ impl Services {
 /// event's `data`, so `format_group_child_line` can fold the kind-flavored
 /// attention text into the aggregated group wake as the record (the immediate
 /// parent wake already fired at raise time — the alert). No-op when no request
-/// is pending. Shared by all group-record annotation sites (including the
+/// is pending — including when a parent reply before settlement already
+/// cleared the child's session fields. Shared by all group-record annotation
+/// sites (including the
 /// completion-watch path in `lib.rs`) so the payload shape and empty-kind
 /// guard cannot drift.
 pub(crate) fn annotate_attention_request(

@@ -3233,9 +3233,11 @@ impl Services {
     ///    `after_all` delegation group (mirroring the STAB-160 immediate
     ///    grouped-failure wake: an attention request is an alert the parent
     ///    must hear now, not at group settlement). The group's later
-    ///    aggregated wake still annotates the child's line from the persisted
-    ///    session fields (the record); non-delegated callers have no parent
-    ///    to wake.
+    ///    aggregated wake also annotates the child's line from the persisted
+    ///    session fields (the record) while the request is still pending —
+    ///    the fields are cleared when the child next receives a message, so
+    ///    a parent reply before settlement retires the fold. Non-delegated
+    ///    callers have no parent to wake.
     ///
     /// Agent status and `stop_reason` are untouched: the turn ends normally
     /// (no retry/requeue interaction).
@@ -3364,9 +3366,11 @@ impl Services {
         // `after_all` delegation group (mirroring the STAB-160 immediate
         // grouped-failure wake in `deliver_completion_to_watches`): the
         // request is an alert the parent must hear now, not at group
-        // settlement. The group's later aggregated wake still annotates the
-        // child's line from the persisted session fields (the record).
-        // Non-delegated callers have no parent to wake.
+        // settlement. The group's later aggregated wake also annotates the
+        // child's line from the persisted session fields (the record) while
+        // the request is still pending — a parent reply before settlement
+        // clears the fields and retires the fold. Non-delegated callers have
+        // no parent to wake.
         if let Some(parent) = parent {
             let parent_home_ws = self
                 .store
