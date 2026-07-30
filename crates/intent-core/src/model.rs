@@ -502,6 +502,31 @@ pub struct WorkspaceTaskStats {
     pub in_progress: usize,
 }
 
+/// Extract the spec-linked task-note ids from a spec note's markdown body
+/// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
+/// (`TASK_LINK_REGEX_FLEXIBLE`). Shared by the enriched `taskStats` path
+/// (intent-services `compute_task_stats`) and the cheap store-level counting
+/// query (`Store::count_task_stats`) so the two stay in lock-step.
+pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String> {
+    const MARKER: &str = "(intent://local/task/";
+    let mut ids = std::collections::HashSet::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find(MARKER) {
+        let after = &rest[pos + MARKER.len()..];
+        match after.find(')') {
+            Some(end) => {
+                let id = &after[..end];
+                if !id.is_empty() {
+                    ids.insert(id.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    ids
+}
+
 /// One entry of [`WorkspaceAgentSummary::agents`] (§5.5 card; TS
 /// `WorkspaceAgentInfo`). The live iOS `WorkspaceStore.parseWorkspace` decodes
 /// `id`/`name`/`status`/`isStreaming`/`isResponding` as non-optional and

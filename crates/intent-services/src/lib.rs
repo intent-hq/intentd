@@ -433,11 +433,11 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
-    /// Shared cache + offload gates for the git-derived workspace card
-    /// aggregates (`diffSummary` rollups, CoW support probes) so the
-    /// `workspace.list` / `workspace.get` emit paths never run blocking
-    /// libgit2/FS work inline on the async runtime (§9.1). Shared across
-    /// clones so concurrent list calls single-flight the same worktree.
+    /// Shared cache + offload gates for git-derived aggregates that are still
+    /// computed on demand (`diffSummary` for explicit callers, CoW support
+    /// probes on list/get). Diff rollups are **not** attached to the high-
+    /// frequency list/get emit path; the cache is invalidated from file/git
+    /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
@@ -916,19 +916,20 @@ impl Services {
     }
 
     /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
-    /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
-    /// Each is computed from live state (notes / agents / git worktree) and
+    /// `cowSupported`) for the `workspace.list` / `workspace.get` emit path (§9.1).
+    /// Each is computed from live state (notes / agents / FS capability) and
     /// omitted when not computable; a read failure degrades to an absent
     /// aggregate rather than failing the whole call. `lastActivity` is derived
     /// inline from the same notes/sessions scan (mirrors
     /// [`Services::derive_last_activity`] so list/get callers get both in one
     /// round-trip); keep the two derivations in lock-step when the rules or
-    /// underlying store queries change. The git/FS-derived aggregates
-    /// (`diffSummary`, `cowSupported`) go through the shared
-    /// [`workspace_aggregates::WorkspaceAggregateCache`]: computed on the
-    /// blocking pool with bounded concurrency, cached, and degraded to the
-    /// last known value / omission when over budget, so a slow worktree can
-    /// never stall the async runtime or blow past FE RPC timeouts.
+    /// underlying store queries change.
+    ///
+    /// `diffSummary` is intentionally **not** computed here. Full worktree
+    /// rollups are too expensive for the high-frequency list/get/subscription
+    /// re-read path; desktop FE already treats the field as deprecated and
+    /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
+    /// every workspace re-read pinned the blocking pool.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -954,14 +955,8 @@ impl Services {
             }
             ws.agent_summary = Some(build_agent_summary(&sessions));
         }
-        ws.diff_summary = match ws.worktree_path.as_deref().filter(|p| !p.is_empty()) {
-            Some(worktree) => {
-                self.workspace_aggregates
-                    .diff_summary(ws.id.as_str(), PathBuf::from(worktree))
-                    .await
-            }
-            None => None,
-        };
+        // diffSummary: omitted on list/get/subscription re-reads (see method docs).
+        ws.diff_summary = None;
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
@@ -988,6 +983,16 @@ impl Services {
             }
             ws.display_status = Some(display_status);
         }
+    }
+
+    /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
+    /// the store-level counting query ([`Store::count_task_stats`]) which
+    /// hydrates only the spec note's content (for the linked-id filter) — no
+    /// other note bodies — and matches [`compute_task_stats`] semantics
+    /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
+    /// seq-0 snapshot is self-sufficient for client status rendering.
+    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+        self.store.count_task_stats(workspace_id).await
     }
 
     /// Recompute a workspace's derived `displayStatus` and publish
@@ -4070,25 +4075,10 @@ async fn append_primitive(
 
 /// Extract the spec-linked task-note ids from a spec note's markdown body
 /// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
-/// (`TASK_LINK_REGEX_FLEXIBLE`).
+/// (`TASK_LINK_REGEX_FLEXIBLE`). Canonical implementation lives in
+/// intent-core so the store's cheap `count_task_stats` query shares it.
 fn extract_spec_task_ids(content: &str) -> HashSet<String> {
-    const MARKER: &str = "(intent://local/task/";
-    let mut ids = HashSet::new();
-    let mut rest = content;
-    while let Some(pos) = rest.find(MARKER) {
-        let after = &rest[pos + MARKER.len()..];
-        match after.find(')') {
-            Some(end) => {
-                let id = &after[..end];
-                if !id.is_empty() {
-                    ids.insert(id.to_string());
-                }
-                rest = &after[end + 1..];
-            }
-            None => break,
-        }
-    }
-    ids
+    intent_core::extract_spec_task_ids(content)
 }
 
 /// Compute a workspace's `taskStats` card aggregate from its notes, porting the
@@ -8627,6 +8617,55 @@ impl WorkspaceApi for Services {
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
             this.spawn_repository_owner_backfill(&list);
+            Ok(list)
+        })
+    }
+
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let store = self.store.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            // Store rows + live activity + cheap status aggregates only. No
+            // notes/sessions enrichment so workspace.subscribe seq-0 stays
+            // tens of KB instead of ~4.5 MiB for ~80 workspaces (that frame
+            // HOL'd the UDS writer for hundreds of ms and stranded interactive
+            // replies until the FE 30s timeout). The snapshot must still be
+            // self-sufficient for client status rendering, so each row carries
+            // `taskStats` (counting query, no note-body hydration),
+            // `displayStatus` (same derivation as the enriched path), and
+            // `cowSupported` (lifetime-cached probe, effectively free).
+            let mut list = store.list_workspaces(include_archived).await?;
+            let cow_supported = this.compute_cow_supported().await;
+            for ws in &mut list {
+                ws.activity = this.workspace_activity(&ws.id);
+                ws.agent_summary = None;
+                ws.diff_summary = None;
+                ws.cow_supported = cow_supported;
+                // Keep PR fields if already on the row (cheap, already stored);
+                // do not fetch/refresh them here.
+                // A stats-read failure degrades to absent taskStats +
+                // displayStatus (clients fall back to local derivation on a
+                // missing field), mirroring `enrich_workspace_aggregates`.
+                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
+                if ws.task_stats.is_some() {
+                    let display_status = compute_display_status(
+                        ws.active_pull_request.as_ref(),
+                        ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.task_stats.as_ref(),
+                    );
+                    // Seed the last-observed cache when absent so the first
+                    // post-boot mutation compares against this baseline (a
+                    // seed never emits; see
+                    // [`Services::maybe_emit_display_status_changed`]).
+                    if let Ok(mut map) = this.last_display_statuses.lock() {
+                        map.entry(ws.id.clone()).or_insert(display_status);
+                    }
+                    ws.display_status = Some(display_status);
+                }
+            }
             Ok(list)
         })
     }
@@ -14712,8 +14751,14 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            let status = intent_git::status::status(&path)?;
-            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
+            // libgit2 status on the blocking pool (same as git_status).
+            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
+                .await
+                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
+            match status {
+                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -14741,7 +14786,28 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
+            // Full worktree hunk diffs can run for many seconds of pure libgit2
+            // CPU. Never do that on a Tokio worker: it holds a bulk permit and
+            // can freeze the whole runtime so host.status never runs (seen as
+            // bulk permit held 5-40s with "nothing else" making progress).
+            let started = std::time::Instant::now();
+            let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() >= 250 {
+                tracing::warn!(
+                    workspace_id = %workspace_id.as_str(),
+                    total_ms = elapsed.as_millis() as u64,
+                    staged,
+                    path_count,
+                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
+                );
+            }
+            result
         })
     }
 
@@ -14767,9 +14833,15 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            match git_ops::build_commit_details(&worktree, &commit_hash) {
+            let empty_for_err = empty.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_commit_details(&worktree, &commit_hash)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.commitDetails task failed: {e}")))?;
+            match result {
                 Ok(value) => Ok(value),
-                Err(Error::NotFound(_)) => Ok(empty),
+                Err(Error::NotFound(_)) => Ok(empty_for_err),
                 Err(e) => Err(e),
             }
         })

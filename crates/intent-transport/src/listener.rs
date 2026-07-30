@@ -156,6 +156,20 @@ async fn handle_connection(
     let writer = tokio::spawn(async move {
         let mut write_half = write_half;
         while let Some(frame) = out_rx.recv().await {
+            // Hard cap: never write multi-hundred-MB frames (observed git.diffs
+            // at 277 MiB HOL'd the writer for ~38s and timed out host.status).
+            // Last-resort backstop for non-response frames (subscription
+            // pushes/events): oversized router responses are already replaced
+            // with a `-32010` error at serialization, where the request id is
+            // known.
+            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                tracing::error!(
+                    frame_bytes = frame.len(),
+                    limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                    "dropping oversized outbound UDS frame"
+                );
+                continue;
+            }
             if write_half.write_all(frame.as_bytes()).await.is_err()
                 || write_half.write_all(b"\n").await.is_err()
                 || write_half.flush().await.is_err()
