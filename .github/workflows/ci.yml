@@ -45,19 +45,26 @@ jobs:
             const tinybox = ["self-hosted", "Linux", "X64"];
             const burst = ["warp-ubuntu-latest-x64-32x"];
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
+            // tinybox serves several repos on a single runner slot, so the
+            // queue must be sized across all of them: count queued Linux
+            // self-hosted jobs of queued/in-progress runs in each repo. A
+            // repo the token can't read (GITHUB_TOKEN is repo-scoped)
+            // contributes 0 rather than failing the probe.
+            const owner = context.repo.owner;
+            const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
-            try {
-              const { owner, repo } = context.repo;
-              const queued = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: "ci.yml", status: "queued", per_page: 50 });
-              depth += queued.data.workflow_runs.filter(r => r.id !== context.runId).length;
-              const inprog = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: "ci.yml", status: "in_progress", per_page: 20 });
-              for (const run of inprog.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
-                const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                depth += jobs.data.jobs.filter(j => j.status === "queued" && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+            for (const repo of repos) {
+              try {
+                for (const status of ["queued", "in_progress"]) {
+                  const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
+                  for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
+                    const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
+                    depth += jobs.data.jobs.filter(j => j.status === "queued" && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                  }
+                }
+              } catch (e) {
+                core.warning(`queue probe skipped ${repo}: ${e.message}`);
               }
-            } catch (e) {
-              core.warning("queue probe failed, staying on tinybox: " + e.message);
-              depth = 0; // fail-open to tinybox
             }
             const useBurst = depth > threshold;
             core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
