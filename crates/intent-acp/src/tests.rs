@@ -7198,6 +7198,7 @@ mod wsapi4_bindings_tests {
     type DelegateCall = (Option<String>, Option<String>);
     type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
     type DirCall = (String, Option<i64>);
+    type AttentionCall = (String, String, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
@@ -7212,6 +7213,7 @@ mod wsapi4_bindings_tests {
         event_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
+        request_attention_calls: Mutex<Vec<AttentionCall>>,
         event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         event_dir_calls: Mutex<Vec<DirCall>>,
@@ -7445,6 +7447,28 @@ mod wsapi4_bindings_tests {
                 .push(caller.as_ref().map(|c| c.as_str().to_string()));
             let _ = report;
             Box::pin(async move { Ok(json!({ "success": true })) })
+        }
+
+        fn agent_request_attention(
+            &self,
+            _ws: WorkspaceId,
+            kind: String,
+            reason: String,
+            caller: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.request_attention_calls.lock().unwrap().push((
+                kind.clone(),
+                reason.clone(),
+                caller.as_ref().map(|c| c.as_str().to_string()),
+            ));
+            Box::pin(async move {
+                Ok(json!({
+                    "ok": true,
+                    "kind": kind,
+                    "reason": reason,
+                    "savedAt": "2026-01-01T00:00:00Z",
+                }))
+            })
         }
 
         fn event_recent_files(
@@ -7916,6 +7940,70 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.reportToParent();").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("report is required"));
+    }
+
+    #[tokio::test]
+    async fn agent_request_discussion_threads_caller_kind_and_reason() {
+        let (srv, api) = server_with_caller("child-7");
+        let resp = call(
+            &srv,
+            "return await ws.agent.requestDiscussion('need input');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["kind"], json!("discussion"));
+        assert_eq!(v["reason"], json!("need input"));
+        assert_eq!(
+            api.request_attention_calls.lock().unwrap()[0],
+            (
+                "discussion".to_string(),
+                "need input".to_string(),
+                Some("child-7".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_report_blocker_threads_caller_kind_and_reason() {
+        let (srv, api) = server_with_caller("child-8");
+        let resp = call(
+            &srv,
+            "return await ws.agent.reportBlocker('sandbox is broken');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["kind"], json!("blocker"));
+        assert_eq!(v["reason"], json!("sandbox is broken"));
+        assert_eq!(
+            api.request_attention_calls.lock().unwrap()[0],
+            (
+                "blocker".to_string(),
+                "sandbox is broken".to_string(),
+                Some("child-8".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_request_discussion_missing_reason_errors() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.requestDiscussion();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("reason is required"));
+        assert!(api.request_attention_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_report_blocker_missing_reason_errors() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.reportBlocker();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("reason is required"));
+        assert!(api.request_attention_calls.lock().unwrap().is_empty());
     }
 
     // ================================================================

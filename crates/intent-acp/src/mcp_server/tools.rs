@@ -165,6 +165,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise completion/update report to the parent agent. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
   ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
   ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
@@ -350,6 +352,8 @@ API:
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise completion/update report to the parent agent. Only works for delegated agents; user-created agents will get an error.
+  ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
+  ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
   ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
   ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
