@@ -14,7 +14,7 @@ use crate::model::{
     ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
     FileActivity, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
     GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
@@ -1323,6 +1323,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// (reference-parity `acp-provider.ts`); the other two are threaded
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
+    ///
+    /// `origin` marks who originated the delivery (question hold, PROTOCOL
+    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
+    /// held); the MCP front door and every internal wake/continuation path
+    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
+    /// a turn while the target agent's question hold is active.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1337,6 +1343,7 @@ pub trait WorkspaceApi: Send + Sync {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -1350,6 +1357,7 @@ pub trait WorkspaceApi: Send + Sync {
             stdin_context,
             context_references,
             message_metadata,
+            origin,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -1374,6 +1382,25 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_queued_message_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.dismissQuestions`: persist the question-dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session, emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume
+    /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_dismiss_questions not implemented".to_string(),
             ))
         })
     }
