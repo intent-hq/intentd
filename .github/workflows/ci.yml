@@ -69,6 +69,8 @@ jobs:
 
   build:
     strategy:
+      # Don't let one platform's failure cancel the other's required check.
+      fail-fast: false
       matrix:
         include:
           # temporarily disabled — re-enable when needed
@@ -76,10 +78,10 @@ jobs:
           #   os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: [self-hosted, macOS, ARM64, m1mac]
-          # temporarily disabled — re-enable when needed
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
+          - target: x86_64-pc-windows-msvc
+            os: [self-hosted, Windows, X64]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     # Keeps the cargo-check steps free of debuginfo/incremental artifacts
     # (cheaper compile, smaller shared cache). Safe job-wide: the release
     # build is unaffected — these vars only touch the dev/test profiles, and
@@ -90,11 +92,23 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
+      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
+      # runner's Windows-path step scripts. Prepend Git's bin dir so every
+      # later `shell: bash` step resolves Git Bash instead.
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale; re-add swatinem/rust-cache, keyed
-      # per target, if a GH-hosted matrix entry is re-enabled).
+      # per target, if a GH-hosted matrix entry is re-enabled). On the Windows
+      # runner this runs under Git Bash, where $HOME is an MSYS-style path
+      # cargo (spawned from the default pwsh shell) can't use — $USERPROFILE
+      # carries the native C:\Users\... form, so prefer it when set.
       - name: Point CARGO_TARGET_DIR outside the work dir
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
