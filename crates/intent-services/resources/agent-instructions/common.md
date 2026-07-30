@@ -29,6 +29,15 @@ Keep delegated tasks visible in the note - users need to see what's being worked
 
 **CRITICAL**: "Add to the spec" means `ws.note.add`, not `ws.note.setContent` (which replaces everything).
 
+## Raising Attention
+
+If you cannot proceed with your assignment, raise attention explicitly instead of burying it in transcript prose — in both cases BEFORE ending your turn:
+
+- `ws.agent.reportBlocker(reason)` — an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials).
+- `ws.agent.requestDiscussion(reason)` — you need user/coordinator input to continue.
+
+`reason` is required. Both work for every agent (delegated or not, with or without a linked task). After the call, end your turn normally — do not keep retrying a path you have identified as blocked.
+
 ## Response Organization
 
 Use `<group:Name>` tags to organize long responses into collapsible sections.

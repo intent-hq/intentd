@@ -852,6 +852,10 @@ pub enum TaskStatus {
     NotStarted,
     Waiting,
     DiscussionNeeded,
+    /// Agent reported a blocker it cannot resolve (`ws.agent.reportBlocker`).
+    /// Non-terminal; excluded from `inProgress` in task-stats rollups, like
+    /// `discussion_needed`.
+    Blocked,
     InProgress,
     ReviewRequired,
     Complete,
@@ -1974,6 +1978,19 @@ pub struct AgentSession {
     /// `metadata.completionReportTimestamp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report_timestamp: Option<String>,
+    /// Pending attention request raised by `ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker`: `"discussion"` or `"blocker"`. Cleared when
+    /// the agent next receives a message. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_kind: Option<String>,
+    /// The reason supplied with the pending attention request. Omitted when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_reason: Option<String>,
+    /// ISO timestamp the pending attention request was raised at. Omitted
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_timestamp: Option<String>,
     /// Delegation-chain depth (FE `metadata.delegationDepth`): 0/absent for
     /// user-created agents, parent depth + 1 for delegated children. Gates
     /// runaway delegation loops.
@@ -2077,6 +2094,14 @@ pub struct AgentMetadata {
     pub completion_report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report_timestamp: Option<String>,
+    /// Pending attention request (`"discussion"` / `"blocker"`); omitted when
+    /// absent. Mirrors [`AgentSession::attention_request_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2225,6 +2250,9 @@ impl AgentLite {
             task_note_id: session.task_note_id.clone(),
             completion_report: session.completion_report,
             completion_report_timestamp: session.completion_report_timestamp,
+            attention_request_kind: session.attention_request_kind,
+            attention_request_reason: session.attention_request_reason,
+            attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
             initial_message: session.initial_message,
             sandbox_id: session.sandbox_id.clone(),
@@ -3420,6 +3448,9 @@ mod tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -3492,6 +3523,9 @@ mod tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,

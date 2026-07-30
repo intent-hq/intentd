@@ -1761,6 +1761,9 @@ impl Services {
             skip_auto_commit,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth,
             initial_message,
             context_references,
@@ -3305,6 +3308,34 @@ impl Services {
         task_note_id: NoteId,
         caller: AgentId,
     ) {
+        self.transition_linked_task_status(
+            workspace_id,
+            task_note_id,
+            caller,
+            intent_core::TaskStatus::ReviewRequired,
+            "review_required",
+        )
+        .await;
+    }
+
+    /// Shared best-effort linked-task transition (TASK-B shape): move the
+    /// caller's linked task note to `target` iff its current status is
+    /// non-terminal (not `complete`/`cancelled`) and not already `target`
+    /// (the writer always persists — bumping `updated_at` and `rev` — before
+    /// its own no-op-when-unchanged check, so repeated calls would otherwise
+    /// churn the note). Uses the same `task.updateNoteStatus` writer the
+    /// router path uses, so it publishes `task:status-changed` +
+    /// `notes:ready-tasks-changed` with the caller as `agentId`. All errors
+    /// are logged and swallowed — the calling op's own persistence is the
+    /// contract; the FE-facing status update is best-effort.
+    async fn transition_linked_task_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_note_id: NoteId,
+        caller: AgentId,
+        target: intent_core::TaskStatus,
+        target_word: &str,
+    ) {
         let note = match crate::fetch_note(&self.store, workspace_id, &task_note_id).await {
             Ok(note) => note,
             // A missing or out-of-workspace linked note is the expected shape
@@ -3314,7 +3345,7 @@ impl Services {
             Err(Error::NotFound(_)) => {
                 tracing::debug!(
                     note = %task_note_id,
-                    "report_to_parent: linked task note not found in this workspace; skipping status transition"
+                    "linked task note not found in this workspace; skipping status transition"
                 );
                 return;
             }
@@ -3322,7 +3353,7 @@ impl Services {
                 tracing::warn!(
                     error = %e,
                     note = %task_note_id,
-                    "report_to_parent: failed to load linked task note for status transition"
+                    "failed to load linked task note for status transition"
                 );
                 return;
             }
@@ -3331,24 +3362,19 @@ impl Services {
             return;
         };
         // Terminal statuses must not be downgraded (parity with the router
-        // path's own no-op-when-unchanged branch), and a task already in
-        // `review_required` must skip the writer entirely: TASK-B's
-        // `task_update_note_status` always persists (bumping `updated_at` and
-        // `rev`) before checking `previous_status != new_status`, so repeated
-        // `reportToParent` calls would otherwise churn the note on every hop.
+        // path's own no-op-when-unchanged branch).
         if matches!(
             task.status,
-            intent_core::TaskStatus::Complete
-                | intent_core::TaskStatus::Cancelled
-                | intent_core::TaskStatus::ReviewRequired
-        ) {
+            intent_core::TaskStatus::Complete | intent_core::TaskStatus::Cancelled
+        ) || task.status == target
+        {
             return;
         }
         if let Err(e) = WorkspaceApi::task_update_note_status(
             self,
             workspace_id.clone(),
             task_note_id.clone(),
-            "review_required".into(),
+            target_word.into(),
             None,
             Some(caller),
         )
@@ -3357,9 +3383,215 @@ impl Services {
             tracing::warn!(
                 error = %e,
                 note = %task_note_id,
-                "report_to_parent: failed to transition linked task to review_required"
+                target = target_word,
+                "failed to transition linked task status"
             );
         }
+    }
+
+    /// Shared services op behind `ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker` (`kind`: `"discussion" | "blocker"`). Modeled
+    /// on [`Self::agent_report_to_parent_op`], but available to ALL agents —
+    /// delegated or not, with or without a linked task:
+    /// 1. persists the pending attention request (kind/reason/timestamp) on
+    ///    the caller's session (cleared when the agent next receives a
+    ///    message) and emits `agent:updated`;
+    /// 2. appends a system-role transcript notice with
+    ///    `meta.kind = "discussion-request"` / `"blocker-report"` (emits
+    ///    `agent:message`) so the conversation renders a distinct card that
+    ///    survives rehydration;
+    /// 3. emits the self-sufficient `agent:attention-requested` event
+    ///    `{ workspaceId, agentId, agentName, kind, reason }` (FE sticky
+    ///    toast);
+    /// 4. transitions the linked task to `discussion_needed` / `blocked`
+    ///    (terminal statuses untouched; no linked task = skip);
+    /// 5. wakes a delegated caller's parent with a kind-flavored message —
+    ///    skipped when the child is in an undelivered `after_all` delegation
+    ///    group (the group's aggregated wake folds the attention request in)
+    ///    and for non-delegated callers.
+    ///
+    /// Agent status and `stop_reason` are untouched: the turn ends normally
+    /// (no retry/requeue interaction).
+    pub(crate) async fn agent_request_attention_op(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        let caller = caller_agent_id.ok_or_else(|| {
+            Error::Internal("requestAttention is only available to agents".to_string())
+        })?;
+        let (meta_kind, task_target, task_target_word, wake_verb) = match kind.as_str() {
+            "discussion" => (
+                "discussion-request",
+                intent_core::TaskStatus::DiscussionNeeded,
+                "discussion_needed",
+                "requests a discussion",
+            ),
+            "blocker" => (
+                "blocker-report",
+                intent_core::TaskStatus::Blocked,
+                "blocked",
+                "reports a blocker",
+            ),
+            other => {
+                return Err(Error::InvalidParams(format!(
+                    "invalid attention kind: {other} (must be \"discussion\" or \"blocker\")"
+                )));
+            }
+        };
+        let reason = reason.trim().to_string();
+        if reason.is_empty() {
+            return Err(Error::InvalidParams("reason is required".to_string()));
+        }
+        let mut session = self.load_session_internal(&caller).await?;
+        // Scope-guard the caller-supplied `workspace_id` (same shape as
+        // `agent_report_to_parent_op`): reject a cross-workspace mismatch with
+        // `NotFound` before any state changes.
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {caller}")));
+        }
+        // 1. Persist the pending attention request on the session.
+        let saved_at = now_iso();
+        session.attention_request_kind = Some(kind.clone());
+        session.attention_request_reason = Some(reason.clone());
+        session.attention_request_timestamp = Some(saved_at.clone());
+        session.updated_at = saved_at.clone();
+        let workspace_id = session.workspace_id.clone();
+        let task_note_id = session.task_note_id.clone();
+        let parent = session.parent_agent_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({
+                "agentId": caller.0,
+                "attentionRequestKind": kind,
+                "attentionRequestTimestamp": saved_at,
+            }),
+        )
+        .await;
+        // 2. Persist the transcript notice (system role + structured
+        // meta.kind, the InterruptionNotice shape) and emit agent:message.
+        // Best-effort: the session fields above are the durable contract.
+        let notice_content = json!([{
+            "type": "text",
+            "text": reason,
+            "meta": { "kind": meta_kind }
+        }]);
+        match self
+            .store
+            .append_agent_message(&caller, "system", &notice_content, &saved_at)
+            .await
+        {
+            Ok(message) => {
+                self.publish_agent_mutation_event(
+                    &workspace_id,
+                    &caller,
+                    intent_core::events::AGENT_MESSAGE,
+                    json!({ "agentId": caller.0, "messageId": message.id, "role": "system" }),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %caller.0,
+                    error = %e,
+                    "request_attention: failed to append transcript notice"
+                );
+            }
+        }
+        // 3. Self-sufficient toast-driving event.
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_ATTENTION_REQUESTED,
+            json!({
+                "workspaceId": workspace_id.0,
+                "agentId": caller.0,
+                "agentName": session.name.clone(),
+                "kind": kind,
+                "reason": reason,
+            }),
+        )
+        .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
+        // 4. Linked-task transition (no linked task = skip).
+        if let Some(note_id) = task_note_id {
+            self.transition_linked_task_status(
+                &workspace_id,
+                note_id,
+                caller.clone(),
+                task_target,
+                task_target_word,
+            )
+            .await;
+        }
+        // 5. Kind-flavored parent wake for delegated callers. Grouped children
+        // skip the immediate wake — the `after_all` group's aggregated wake
+        // folds the attention request in (the group-record sites annotate the
+        // child line from the persisted session fields). Non-delegated
+        // callers have no parent to wake.
+        if let Some(parent) = parent {
+            let grouped = self.child_in_undelivered_group(&parent, &caller);
+            if !grouped {
+                let parent_home_ws = self
+                    .store
+                    .get_agent_session(&parent)
+                    .await
+                    .map(|s| s.workspace_id)
+                    .unwrap_or_else(|_| workspace_id.clone());
+                let wake_text = format!(
+                    "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
+                    session.name, caller.0, wake_verb, reason
+                );
+                let metadata = json!({
+                    "type": "event_notification",
+                    "eventCount": 1,
+                    "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                    "events": [{
+                        "id": uuid::Uuid::new_v4().to_string(),
+                        "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                        "timestamp": saved_at,
+                        "data": {
+                            "workspaceId": workspace_id.0,
+                            "agentId": caller.0,
+                            "agentName": session.name.clone(),
+                            "kind": kind,
+                            "reason": reason,
+                        },
+                        "actor": {
+                            "type": "agent",
+                            "id": caller.0,
+                            "name": session.name.clone(),
+                        }
+                    }]
+                });
+                if let Err(e) = self
+                    .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %parent.0,
+                        child = %caller.0,
+                        "failed to deliver attention-request wake to parent"
+                    );
+                }
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "kind": kind,
+            "reason": reason,
+            "savedAt": saved_at,
+        }))
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the

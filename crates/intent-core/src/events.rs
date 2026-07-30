@@ -100,6 +100,14 @@ pub const AGENT_PERMISSION_RESOLVED: &str = "agent:permission:resolved";
 // re-renders without a follow-up `agent.getSessionStats`.
 pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 
+// Agent attention request (new in intentd). Emitted by
+// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` when an agent
+// explicitly raises attention before ending its turn. Self-sufficient payload
+// `{ workspaceId, agentId, agentName, kind, reason }` (`kind`:
+// `"discussion" | "blocker"`) drives the FE sticky "Switch To" toast without
+// a follow-up fetch.
+pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
+
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
 // refresh deltas over Electron IPC (`workspace:background-enrichment-complete`,
 // renderer-only); a wire backend instead emits `pr:*` WorkspaceEvents so the
@@ -357,6 +365,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
     AGENT_SESSION_STATS_CHANGED,
+    AGENT_ATTENTION_REQUESTED,
     PR_LINKED,
     PR_UPDATED,
     PR_UNLINKED,

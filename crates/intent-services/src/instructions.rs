@@ -7,7 +7,10 @@
 //! aliases). The bundled bodies are the verbatim `instructions/*.ts` template
 //! literals, extracted to `resources/agent-instructions/*.md` and compiled in via
 //! [`include_str!`] (no file I/O, no env override needed — they ship with the
-//! binary, mirroring the TS "bundled with code" rationale).
+//! binary, mirroring the TS "bundled with code" rationale). One intentd-only
+//! addendum: `common.md` gains a "Raising Attention" section covering the
+//! `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` bindings, which do
+//! not exist in the TS reference.
 //!
 //! The base-system-prompt bundled default (`getBaseInstruction`) is intentionally
 //! **not** ported here — it is a separate prompt slot (§18.1 layer 1).
