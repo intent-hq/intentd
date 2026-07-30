@@ -25,9 +25,40 @@ tag-namespace = "v"
 install-updater = false
 # Post-announce: publish/update the stable.json / beta.json channel manifests
 post-announce-jobs = ["./publish-channel-manifest"]
+# Injected into build-local-artifacts: provisions rustup/toolchain/targets on
+# the self-hosted runners, which don't have the hosted images' preinstalled
+# toolchains (see the file header for details).
+github-build-setup = "dist-build-setup.yml"
 
-# aarch64 linux would default to the `ubuntu-22.04-arm` runner, which is only
-# available on public repos. Build it on x86_64 instead (dist cross-compiles
-# musl via cargo-zigbuild) so releases work while the repo is still private.
+# All release jobs run on the org's self-hosted runners (GH-hosted billing is
+# unavailable): tinybox (Linux x64, Ubuntu 22.04), m1mac (macOS arm64), 5090pc
+# (Windows x64). Runner values must be single labels here (the generated
+# workflow interpolates them as strings), and each machine exposes its
+# hostname as a label.
+#
+# `host` overrides tell dist the actual host triple where it differs from the
+# runner-name heuristic, so it picks the right cross strategy:
+# - m1mac is arm64, so x86_64-apple-darwin is a cross build (rustup target).
+# - tinybox runs the musl builds as cross builds from the glibc host triple,
+#   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
+#   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-aarch64-unknown-linux-musl = "ubuntu-22.04"
+global = "tinybox"
+
+[dist.github-custom-runners.aarch64-apple-darwin]
+runner = "m1mac"
+
+[dist.github-custom-runners.x86_64-apple-darwin]
+runner = "m1mac"
+host = "aarch64-apple-darwin"
+
+[dist.github-custom-runners.x86_64-unknown-linux-musl]
+runner = "tinybox"
+host = "x86_64-unknown-linux-gnu"
+
+[dist.github-custom-runners.aarch64-unknown-linux-musl]
+runner = "tinybox"
+host = "x86_64-unknown-linux-gnu"
+
+[dist.github-custom-runners.x86_64-pc-windows-msvc]
+runner = "5090pc"
