@@ -9,9 +9,16 @@ permissions:
   contents: read
   pull-requests: read
 
+# The heavy jobs share a single self-hosted runner slot and serialize, so
+# cancel superseded PR runs instead of letting them back up the queue (push
+# to main and merge-queue runs are never cancelled).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -19,8 +26,16 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
-      # this job's target dir stays small; the stock ~16G headroom is plenty.
+      # this job's target dir stays small, and the self-hosted Mac has ~500G free.
       - uses: actions/checkout@v7
+      # Keep the target dir OUTSIDE the runner work dir: checkout's default
+      # clean (git clean -ffdx) wipes ignored files — including target/ — at
+      # the start of every job, and all jobs on this runner share one work
+      # dir. A per-job CARGO_TARGET_DIR under $HOME survives both, which is
+      # what makes builds warm across runs (and why swatinem/rust-cache was
+      # dropped: GH cache save/restore would be pure overhead on top of it).
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -31,9 +46,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      - uses: swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -63,7 +75,7 @@ jobs:
           # - target: x86_64-unknown-linux-gnu
           #   os: ubuntu-latest
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64, m1mac]
           # temporarily disabled — re-enable when needed
           # - target: x86_64-pc-windows-msvc
           #   os: windows-latest
@@ -78,6 +90,11 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale; re-add swatinem/rust-cache, keyed
+      # per target, if a GH-hosted matrix entry is re-enabled).
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -88,16 +105,10 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: build-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       # On PRs a cheap `cargo check` proves per-target compilation; the full
       # `--release` build (the expensive part, esp. on Windows) only runs on
-      # push to main and in the merge queue. The cache key stays shared: only
-      # main saves it (save-if above), and main also runs the check step below
-      # so the cache PRs restore contains warm check artifacts alongside the
-      # release ones.
+      # push to main and in the merge queue. The "Warm PR check cache" step
+      # keeps the persistent target dir warm for PR checks after main builds.
       - name: Check (PR compilation proof)
         if: github.event_name == 'pull_request'
         run: cargo check --workspace --target ${{ matrix.target }}
@@ -109,25 +120,24 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 4-vCPU runner: the e2e tests spend most of their
-      # time blocked on daemon startup/IO, not CPU (flake retries are handled
-      # by .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 8
+      # Oversubscribe the 8-core M1: the e2e tests spend most of their time
+      # blocked on daemon startup/IO, not CPU (flake retries are handled by
+      # .config/nextest.toml).
+      NEXTEST_TEST_THREADS: 16
     steps:
-      # Non-blocking cleanup: coverage runs accumulate profraw files, so keep
-      # the extra ~19G of headroom, but reclaim it in the background instead of
-      # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
-      - name: Free disk space (background)
-        run: |
-          sudo -n true
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale). cargo llvm-cov honors it, and the
+      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
+      # crates + profraw, so dependency artifacts stay warm across runs.
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -138,11 +148,15 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Node is required (not preinstalled on the self-hosted Mac, unlike
+      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
+      # and silently self-skip without it, which silently drops coverage below
+      # the floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      - uses: swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run e2e coverage
         run: |
           cd ${{ github.workspace }}
@@ -165,25 +179,24 @@ jobs:
           if-no-files-found: warn
 
   coverage-all:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 4-vCPU runner: much of the suite is blocked on
-      # daemon startup/IO/timeouts, not CPU (flake retries are handled by
+      # Oversubscribe the 8-core M1: much of the suite is blocked on daemon
+      # startup/IO/timeouts, not CPU (flake retries are handled by
       # .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 8
+      NEXTEST_TEST_THREADS: 16
     steps:
-      # Non-blocking cleanup: coverage runs accumulate profraw files, so keep
-      # the extra ~19G of headroom, but reclaim it in the background instead of
-      # stalling the job for ~60s (baseline: ~16G free, ~35G after cleanup).
-      - name: Free disk space (background)
-        run: |
-          sudo -n true
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale). cargo llvm-cov honors it, and the
+      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
+      # crates + profraw, so dependency artifacts stay warm across runs.
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -194,11 +207,15 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Node is required (not preinstalled on the self-hosted Mac, unlike
+      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
+      # and silently self-skip without it, which silently drops coverage below
+      # the floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      - uses: swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run combined coverage
         run: |
           cd ${{ github.workspace }}
@@ -221,7 +238,7 @@ jobs:
           if-no-files-found: warn
 
   pr-title:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.event_name == 'pull_request'
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -246,7 +263,7 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
@@ -287,8 +304,10 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
+  # Runs on the self-hosted Linux runner (Ubuntu 22.04), which has the
+  # required dpkg-deb / tar+xz toolchain preinstalled.
   deb-packaging:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
