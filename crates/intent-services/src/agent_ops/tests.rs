@@ -6176,7 +6176,7 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
         .expect("delegate");
 
     let cancel = svc
-        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), None, None)
         .await
         .expect("cancel");
     assert_eq!(cancel, json!({ "success": true }));
@@ -6190,10 +6190,182 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
 
     // Idempotent: cancelling again with nothing left still succeeds.
     let again = svc
-        .agent_cancel_subscriptions(ws, parent)
+        .agent_cancel_subscriptions(ws, parent, None, None)
         .await
         .expect("cancel again");
     assert_eq!(again, json!({ "success": true }));
+}
+
+/// Scoped cancel by `subscriptionId` removes ONLY the named one-shot watch —
+/// the delegation group and its grouped watch stay intact — deletes the
+/// persisted `completion_watch` row, and publishes
+/// `agent:subscriptions-changed` with the parent's refreshed waiting flags.
+#[tokio::test]
+async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let grouped = delegate_after_all(&svc, &ws, &parent).await;
+    let _one_shot = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("immediate delegate");
+    wait_for_persisted_watches(&svc, 2).await;
+    let sid = svc
+        .list_watches_for_parent(&parent)
+        .into_iter()
+        .find(|w| w.group_id.is_none())
+        .expect("one-shot watch")
+        .id;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), Some(sid), None)
+        .await
+        .expect("scoped cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after scoped cancel")
+        .expect("batch");
+    let ev = batch.last().expect("event");
+    assert_eq!(ev.data["agentId"], json!(parent.0));
+    assert_eq!(ev.data["isWaitingForOtherAgents"], json!(true));
+    assert_eq!(ev.data["waitingForAgentIds"], json!([grouped.0]));
+
+    // The grouped watch + its group survive; the one-shot row is gone from
+    // memory and (polled — the delete is spawned) from the store.
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1, "grouped watch survives");
+    assert!(
+        watches[0].group_id.is_some(),
+        "survivor is the grouped watch"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+    wait_for_persisted_watches(&svc, 1).await;
+}
+
+/// Scoped cancel by `groupId` removes the delegation group and its grouped
+/// watch (in-memory + persisted rows) while an ungrouped one-shot watch
+/// survives untouched.
+#[tokio::test]
+async fn scoped_cancel_by_group_id_leaves_one_shot_intact() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let _grouped = delegate_after_all(&svc, &ws, &parent).await;
+    let _one_shot = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("immediate delegate");
+    wait_for_persisted_watches(&svc, 2).await;
+    // The group's write-through persist is spawned; wait for the row so the
+    // awaited scoped delete provably removes it (no upsert/delete race).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while svc
+        .store()
+        .list_undelivered_groups(&ws)
+        .await
+        .expect("groups")
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delegation_group row never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let gid = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group")
+        .group_id;
+
+    let cancel = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), None, Some(gid))
+        .await
+        .expect("scoped group cancel");
+    assert_eq!(cancel, json!({ "success": true }));
+
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1, "one-shot watch survives");
+    assert!(watches[0].group_id.is_none(), "survivor is the one-shot");
+    assert!(
+        svc.store()
+            .list_undelivered_groups(&ws)
+            .await
+            .expect("groups")
+            .is_empty(),
+        "persisted delegation_group row deleted"
+    );
+    wait_for_persisted_watches(&svc, 1).await;
+}
+
+/// Unknown scoped ids — including another parent's valid watch id — are
+/// rejected with `-32602` BEFORE anything is removed; a combined call where
+/// only one id is valid is all-or-nothing, leaving the registry untouched.
+#[tokio::test]
+async fn scoped_cancel_unknown_ids_error_and_remove_nothing() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let _grouped = delegate_after_all(&svc, &ws, &parent).await;
+    let sid = svc.list_watches_for_parent(&parent)[0].id.clone();
+
+    let err = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), Some("nope".into()), None)
+        .await
+        .expect_err("unknown subscription id");
+    assert!(
+        err.to_string().contains("unknown subscription id: nope"),
+        "{err}"
+    );
+
+    let err = svc
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), None, Some("nope".into()))
+        .await
+        .expect_err("unknown group id");
+    assert!(
+        err.to_string()
+            .contains("unknown delegation group id: nope"),
+        "{err}"
+    );
+
+    // Combined call: a valid subscriptionId does not survive an unknown
+    // groupId — nothing is removed.
+    let err = svc
+        .agent_cancel_subscriptions(
+            ws.clone(),
+            parent.clone(),
+            Some(sid.clone()),
+            Some("nope".into()),
+        )
+        .await
+        .expect_err("combined unknown group id");
+    assert!(
+        err.to_string().contains("unknown delegation group id"),
+        "{err}"
+    );
+
+    // Another agent cannot cancel the parent's watch by id.
+    let other = create_agent(&svc, &ws, "Other").await;
+    let err = svc
+        .agent_cancel_subscriptions(ws.clone(), other, Some(sid), None)
+        .await
+        .expect_err("foreign subscription id");
+    assert!(err.to_string().contains("unknown subscription id"), "{err}");
+
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 1);
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
 }
 
 /// A delegate through the MCP front door (caller set) stamps the child's
@@ -9079,7 +9251,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
     assert_eq!(subs["subscriptions"].as_array().expect("array").len(), 1);
 
     let cancel = svc
-        .agent_cancel_subscriptions(ws.clone(), parent.clone())
+        .agent_cancel_subscriptions(ws.clone(), parent.clone(), None, None)
         .await
         .expect("cancel");
     assert_eq!(cancel, json!({ "success": true }));

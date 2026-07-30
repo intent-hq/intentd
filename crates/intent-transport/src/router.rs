@@ -1450,8 +1450,12 @@ async fn dispatch(
         "agent.cancelSubscriptions" => {
             let ws = require_ws_note(params)?;
             let agent_id = require_agent_id(params)?;
+            // Optional scoping (additive): cancel one watch and/or one
+            // delegation group instead of everything.
+            let subscription_id = opt_str(params, "subscriptionId");
+            let group_id = opt_str(params, "groupId");
             let result = api
-                .agent_cancel_subscriptions(ws, agent_id)
+                .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

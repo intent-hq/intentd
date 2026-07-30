@@ -4451,18 +4451,84 @@ impl Services {
         }))
     }
 
-    /// `agent.cancelSubscriptions`: remove every completion watch registered by
-    /// `agent_id`, drop any delegation groups it parents, and drop its event
-    /// subscriptions (monorepo#937). Idempotent — always returns
-    /// `{ "success": true }` (TS shape).
+    /// `agent.cancelSubscriptions`: with no scoping params, remove every
+    /// completion watch registered by `agent_id`, drop any delegation groups
+    /// it parents, and drop its event subscriptions (monorepo#937).
+    /// Idempotent — always returns `{ "success": true }` (TS shape).
+    ///
+    /// Scoped cancel (additive, monorepo): an optional `subscriptionId`
+    /// cancels exactly that completion watch, an optional `groupId` cancels
+    /// that delegation group plus its grouped watches; each removal deletes
+    /// the matching persisted `completion_watch` / `delegation_group` row(s)
+    /// and publishes the same `agent:subscriptions-changed` snapshot event as
+    /// the other watch-set mutation paths (§6.5), anchored in the parent's
+    /// home workspace. An id not owned by `agent_id` is rejected with
+    /// `-32602` BEFORE anything is removed (mirroring the unknown-id guards
+    /// elsewhere in §5.5), so a combined call is all-or-nothing. Scoped
+    /// cancel never touches event subscriptions.
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> Result<Value> {
-        self.remove_all_for_parent(&agent_id);
-        self.remove_groups_for_parent(&agent_id);
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        if subscription_id.is_none() && group_id.is_none() {
+            self.remove_all_for_parent(&agent_id);
+            self.remove_groups_for_parent(&agent_id);
+            self.remove_event_subscriptions_for_agent(&agent_id).await;
+            return Ok(json!({ "success": true }));
+        }
+
+        // Resolve BOTH ids against the caller's own watches/groups before
+        // removing anything, so an unknown id leaves the registry untouched.
+        let watches = self.list_watches_for_parent(&agent_id);
+        let target_watch =
+            match &subscription_id {
+                Some(sid) => Some(watches.iter().find(|w| &w.id == sid).cloned().ok_or_else(
+                    || Error::InvalidParams(format!("unknown subscription id: {sid}")),
+                )?),
+                None => None,
+            };
+        let target_group = match &group_id {
+            Some(gid) => Some(
+                self.list_groups_for_parent(&agent_id)
+                    .into_iter()
+                    .find(|g| &g.group_id == gid)
+                    .ok_or_else(|| {
+                        Error::InvalidParams(format!("unknown delegation group id: {gid}"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        // Parent home workspaces to publish `agent:subscriptions-changed` in
+        // (deduped — a watch and its group share the same anchor).
+        let mut anchors: Vec<WorkspaceId> = Vec::new();
+        if let Some(watch) = target_watch {
+            self.remove_watch(&watch.id);
+            anchors.push(watch.parent_workspace_id);
+        }
+        if let Some(group) = target_group {
+            for w in &watches {
+                if w.group_id.as_deref() == Some(group.group_id.as_str()) {
+                    self.remove_watch(&w.id);
+                }
+            }
+            self.remove_group_for_parent(&agent_id, &group.group_id);
+            if let Err(e) = self.store.delete_delegation_group(&group.group_id).await {
+                tracing::warn!(
+                    "delegation_group delete failed on scoped cancel {}: {e}",
+                    group.group_id
+                );
+            }
+            if !anchors.contains(&group.workspace_id) {
+                anchors.push(group.workspace_id);
+            }
+        }
+        for anchor in &anchors {
+            self.publish_subscriptions_changed(anchor, &agent_id).await;
+        }
         Ok(json!({ "success": true }))
     }
 

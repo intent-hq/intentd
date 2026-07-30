@@ -1933,14 +1933,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
+    /// `agent.cancelSubscriptions`: cancel an agent's subscriptions —
+    /// everything when unscoped, or just the named completion watch
+    /// (`subscription_id`) / delegation group (`group_id`) when scoped;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id);
+        let _ = (workspace_id, agent_id, subscription_id, group_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_cancel_subscriptions not implemented".to_string(),

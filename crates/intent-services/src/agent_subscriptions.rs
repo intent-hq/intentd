@@ -928,6 +928,26 @@ impl Services {
         before - guard.delegation_groups.len()
     }
 
+    /// Remove ONE delegation group by id, only if it is parented by
+    /// `parent_id`; returns the removed snapshot or `None` when no such group
+    /// exists. In-memory only — the caller owns the persisted-row delete
+    /// (the scoped `agent.cancelSubscriptions` path).
+    pub(crate) fn remove_group_for_parent(
+        &self,
+        parent_id: &AgentId,
+        group_id: &str,
+    ) -> Option<DelegationGroup> {
+        let mut guard = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned");
+        let idx = guard
+            .delegation_groups
+            .iter()
+            .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
+        Some(guard.delegation_groups.remove(idx))
+    }
+
     /// Test-only snapshot of a parent's delegation group, if one exists.
     #[cfg(test)]
     pub(crate) fn delegation_group_for_parent(
