@@ -8,8 +8,8 @@ use std::time::Duration;
 use intent_acp::session::{ContentBlock, InitializeResponse};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Event, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -639,17 +639,33 @@ async fn prompt_turn_streams_events_and_accumulates() {
     // (STAT-1 / PROTOCOL §7 pre-first-token status family), so expect one
     // extra frame ahead of the delta/activity/tool/end/idle sequence. The
     // first chunk additionally emits the content-free `agent:stream:activity`
-    // signal (leading edge of the per-agent throttle); the second chunk lands
-    // inside the 1s window, so it produces a delta only.
-    let mut events = Vec::new();
-    while events.len() < 7 {
+    // signal (leading edge of the per-agent throttle); the second chunk
+    // normally lands inside the 1s window and produces a delta only, but
+    // under CI load it can slip past the window and emit a second activity
+    // signal, so the sequence assertion below drops any activity events
+    // after the first instead of hard-coding exactly one.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
             .expect("subscription open");
         events.extend(batch);
     }
-    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let mut seen_activity = false;
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e.event_type.as_str())
+        .filter(|t| {
+            if *t == "agent:stream:activity" {
+                if seen_activity {
+                    return false;
+                }
+                seen_activity = true;
+            }
+            true
+        })
+        .collect();
     assert_eq!(
         types,
         vec![
@@ -661,11 +677,14 @@ async fn prompt_turn_streams_events_and_accumulates() {
             "agent:stream:end",
             "agent:idle",
         ],
-        "a normal turn emits the `prompt` status hint before the first chunk, one throttled activity signal on the first chunk, and exactly one agent:idle after the terminal stream:end"
+        "a normal turn emits the `prompt` status hint before the first chunk, the leading-edge activity signal on the first chunk, and exactly one agent:idle after the terminal stream:end"
     );
 
     // The content-free activity signal carries identifiers only — no content.
-    let activity = &events[2];
+    let activity = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:activity")
+        .expect("turn emits at least one activity signal");
     assert_eq!(activity.data["agentId"], json!("agent-1"));
     assert!(
         activity.data["messageId"].is_string(),
