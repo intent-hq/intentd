@@ -1372,6 +1372,8 @@ mod session_tests {
 /// Agent→BE MCP server, config conversions, env baseline/redaction, and the
 /// per-agent-type tool denylist (§6.8 / §18.4 DoD).
 mod mcp_tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
@@ -1382,9 +1384,10 @@ mod mcp_tests {
     use serde_json::{json, Value};
 
     use crate::mcp_config::{
-        apply_baseline_env_to_stdio_servers, normalize_mcp_servers, to_acp_mcp_servers,
-        to_acp_session_mcp_servers, to_auggie_mcp_config, to_claude_mcp_json,
-        to_codex_mcp_overrides, to_opencode_mcp_config, NormalizedMcpServer,
+        apply_baseline_env_to_stdio_servers, normalize_mcp_servers,
+        normalize_spaced_bridge_command, to_acp_mcp_servers, to_acp_session_mcp_servers,
+        to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides, to_opencode_mcp_config,
+        NormalizedMcpServer,
     };
     use crate::mcp_env::{
         build_baseline_mcp_env, is_likely_secret_env_key, merge_mcp_env,
@@ -2049,6 +2052,83 @@ mod mcp_tests {
             injected.get("remote"),
             Some(NormalizedMcpServer::Sse { .. })
         ));
+    }
+
+    /// Spaced bridge path (monorepo#1049): the command becomes the basename
+    /// and the PATH override prepends the parent dir to the inherited PATH so
+    /// the server-env-wins baseline merge never loses the inherited PATH.
+    #[test]
+    fn spaced_bridge_path_uses_basename_and_prepends_parent_to_path() {
+        let inherited = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("/opt/App Support/bin/intentd"),
+            Some(inherited.as_os_str()),
+        );
+        assert_eq!(command, "intentd");
+        let expected = std::env::join_paths([
+            Path::new("/opt/App Support/bin"),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap();
+        assert_eq!(path.as_deref(), Some(&*expected.to_string_lossy()));
+    }
+
+    #[test]
+    fn spaced_bridge_path_without_inherited_path_is_parent_only() {
+        let (command, path) =
+            normalize_spaced_bridge_command(Path::new("/opt/App Support/bin/intentd"), None);
+        assert_eq!(command, "intentd");
+        assert_eq!(path.as_deref(), Some("/opt/App Support/bin"));
+    }
+
+    /// Empty inherited-PATH segments (e.g. an empty `PATH` string) must be
+    /// dropped, not joined as trailing separators that would implicitly add
+    /// the current directory to lookup on Unix.
+    #[test]
+    fn spaced_bridge_path_drops_empty_inherited_path_segments() {
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("/opt/App Support/bin/intentd"),
+            Some(OsStr::new("")),
+        );
+        assert_eq!(command, "intentd");
+        assert_eq!(path.as_deref(), Some("/opt/App Support/bin"));
+    }
+
+    /// Whitespace-free bridge path stays verbatim with no PATH override.
+    #[test]
+    fn unspaced_bridge_path_is_left_verbatim() {
+        let inherited = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("/usr/local/bin/intentd"),
+            Some(inherited.as_os_str()),
+        );
+        assert_eq!(command, "/usr/local/bin/intentd");
+        assert_eq!(path, None);
+    }
+
+    /// A relative spaced path can't be normalized: the prepended parent dir
+    /// would resolve against the launcher child's cwd, not the daemon's.
+    #[test]
+    fn relative_spaced_bridge_path_falls_back_to_verbatim_command() {
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("my dir/intentd"),
+            Some(OsStr::new("/usr/bin")),
+        );
+        assert_eq!(command, "my dir/intentd");
+        assert_eq!(path, None);
+    }
+
+    /// A spaced basename can't be fixed by PATH lookup — keep the absolute
+    /// path verbatim rather than emitting a still-broken command.
+    #[test]
+    fn spaced_basename_falls_back_to_verbatim_command() {
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("/usr/local/bin/intent daemon"),
+            Some(OsStr::new("/usr/bin")),
+        );
+        assert_eq!(command, "/usr/local/bin/intent daemon");
+        assert_eq!(path, None);
     }
 }
 

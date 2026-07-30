@@ -22,11 +22,12 @@ use intent_acp::handshake::try_bypass_permissions_mode;
 use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
-    normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_acp_session_mcp_servers,
-    to_auggie_mcp_config, to_opencode_mcp_config, ClientRequestHandler, Connection,
-    ConnectionHooks, EnvMap, EventSink, FileService, IncomingNotification, IncomingRequest,
-    McpBridge, NormalizedMcpServer, NormalizedMcpServers, PermissionOutcome, PermissionPolicy,
-    PermissionRegistry, PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
+    normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
+    spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
+    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
+    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
+    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
+    SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -1474,16 +1475,27 @@ impl AgentManager {
     /// `workspace-mcp` is reserved and never overridden.
     async fn normalized_mcp_servers(&self, connect_addr: String) -> Result<NormalizedMcpServers> {
         let mut servers = NormalizedMcpServers::new();
+        // A whitespace-containing bridge path breaks provider launchers that
+        // shell-split the stdio command (monorepo#1049): emit the basename and
+        // a PATH override (parent dir + inherited PATH) instead.
+        let (command, path_override) = normalize_spaced_bridge_command(
+            &self.mcp_bridge_exe,
+            std::env::var_os("PATH").as_deref(),
+        );
+        let mut env = EnvMap::new();
+        if let Some(path) = path_override {
+            env.insert("PATH".to_string(), path);
+        }
         servers.insert(
             "workspace-mcp".to_string(),
             NormalizedMcpServer::Stdio {
-                command: self.mcp_bridge_exe.to_string_lossy().into_owned(),
+                command,
                 args: vec![
                     "mcp-bridge".to_string(),
                     "--connect".to_string(),
                     connect_addr,
                 ],
-                env: EnvMap::new(),
+                env,
             },
         );
         self.merge_user_mcp_servers(&mut servers).await?;
