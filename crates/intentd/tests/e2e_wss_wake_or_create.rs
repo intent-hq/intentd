@@ -656,6 +656,87 @@ This note is your workspace for this task. Update it with your progress, finding
     );
 }
 
+/// monorepo#1150: `agent.diagnostics` with a `taskNoteId` filter matches the
+/// agents actually associated with the task (here the delegated assignee)
+/// instead of returning an all-zero snapshot, over the real WSS wire. An
+/// unrelated agent stays out of scope, and a nonexistent note id yields an
+/// empty (not erroring) snapshot. Hermetic — no ACP provider is spawned.
+#[tokio::test]
+async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
+    let (_daemon, ws_id, task_note_id, port, fp) =
+        boot_daemon_with_task("Diagnostics filter task").await;
+    let cfg = client_config(&fp);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let delegated = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "do the delegated body",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let child_id = delegated["agentId"]
+        .as_str()
+        .expect("child agent id")
+        .to_string();
+
+    // An unrelated agent that the filter must exclude.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Unrelated" }),
+    )
+    .await;
+    let unrelated_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let diag = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id, "taskNoteId": task_note_id }),
+    )
+    .await;
+    let d = &diag["diagnostics"];
+    assert_eq!(d["filters"]["taskNoteId"], json!(task_note_id));
+    assert!(
+        d["summary"]["agents"].as_u64().expect("agents count") >= 1,
+        "task filter must match the delegated agent: {d}"
+    );
+    let agents = d["agents"].as_array().expect("agents array");
+    assert!(
+        agents.iter().any(|r| r["id"] == json!(child_id)),
+        "delegated agent row present: {d}"
+    );
+    assert!(
+        !agents.iter().any(|r| r["id"] == json!(unrelated_id)),
+        "unrelated agent filtered out: {d}"
+    );
+
+    // Nonexistent note id: empty snapshot, not an error.
+    let empty = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id, "taskNoteId": "note-does-not-exist" }),
+    )
+    .await;
+    assert_eq!(
+        empty["diagnostics"]["summary"]["agents"],
+        json!(0),
+        "unknown note id yields an empty snapshot: {empty}"
+    );
+}
+
 /// TASK-C2: `agent.delegate` with `taskNoteId` + `skipAutoCommit=true` appends
 /// the reference `**Auto-commit is OFF.**` instruction after the scope
 /// directive, byte-for-byte, over the real WSS wire.
