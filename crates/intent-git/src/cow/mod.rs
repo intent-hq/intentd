@@ -2,9 +2,9 @@
 //!
 //! Provides `cow_probe` (capability check per volume pair) and `cow_clone` (clone
 //! a directory tree with CoW). Platform-specific implementations: macOS uses
-//! `copyfile(3)` `COPYFILE_CLONE|COPYFILE_RECURSIVE`, Linux uses per-file `FICLONE`
-//! ioctl with a tree walk, Windows uses ReFS block cloning. Never falls back to a
-//! byte copy — returns `Unsupported` instead.
+//! `clonefile(2)`, Linux uses per-file `FICLONE` ioctl with a tree walk, Windows
+//! uses ReFS block cloning. Never falls back to a byte copy — returns
+//! `Unsupported` instead.
 
 use intent_core::{Error, Result};
 use std::collections::HashMap;
@@ -136,9 +136,9 @@ fn get_volume_pair(_src: &Path, _dst: &Path) -> Option<(u64, u64)> {
 
 /// Clone a directory tree from `src` to `dst` using CoW.
 ///
-/// - macOS: `copyfile(3)` with `COPYFILE_CLONE|COPYFILE_RECURSIVE`, falling
-///   back to a best-effort per-entry walk when the whole-tree clone fails as
-///   unsupported (e.g. the tree contains sockets/FIFOs)
+/// - macOS: a single whole-tree `clonefile(2)` (clones socket/FIFO nodes on
+///   APFS), falling back to a best-effort per-entry walk when the whole-tree
+///   clone fails as unsupported
 /// - Linux: best-effort tree walk + per-file `FICLONE` ioctl
 /// - Windows: ReFS block cloning via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 ///
@@ -397,7 +397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_cow_clone_skips_sockets_and_fifos() {
+    fn test_cow_clone_handles_sockets_and_fifos() {
         use std::os::unix::net::UnixListener;
 
         let tmpdir = std::env::temp_dir();
@@ -435,16 +435,25 @@ mod tests {
             return;
         }
 
-        // The clone must succeed, carrying the regular files and skipping
-        // the socket and FIFO instead of failing the whole clone.
+        // The clone must succeed despite the special files. On macOS the
+        // whole-tree clonefile(2) carries the socket and FIFO nodes into the
+        // clone; the per-entry walk (Linux) skips them instead of failing.
         cow_clone(&src, &dst).unwrap();
         assert_eq!(fs::read_to_string(dst.join("regular.txt")).unwrap(), "data");
         assert_eq!(
             fs::read_to_string(dst.join("sub/nested.txt")).unwrap(),
             "nested"
         );
-        assert!(!dst.join("sub/live.sock").exists());
-        assert!(!dst.join("pipe.fifo").exists());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(dst.join("sub/live.sock").exists());
+            assert!(dst.join("pipe.fifo").exists());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!dst.join("sub/live.sock").exists());
+            assert!(!dst.join("pipe.fifo").exists());
+        }
 
         // Cleanup
         let _ = fs::remove_dir_all(&src);
