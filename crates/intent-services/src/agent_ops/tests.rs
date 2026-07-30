@@ -7300,6 +7300,136 @@ async fn sender_watch_skips_delegated_background_caller() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
+/// SUB-1 child→parent suppression: a child sender (session
+/// `parent_agent_id` = target) is NOT subscribed to its own parent's
+/// completion — `ok: false`, no subscription id, no watch. Watches are
+/// auto-registered parent→child only.
+#[tokio::test]
+async fn sender_watch_skips_child_sending_to_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Coordinator").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), child.clone(), parent)
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
+    assert!(svc.list_watches_for_parent(&child).is_empty());
+}
+
+/// SUB-1 child→parent suppression falls back to the metadata
+/// `createdByAgentId` linkage when the session's `parent_agent_id` is
+/// unset (e.g. a child created through a path that only persists the
+/// metadata blob).
+#[tokio::test]
+async fn sender_watch_skips_child_via_created_by_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Coordinator").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert!(session.parent_agent_id.is_none());
+    session.metadata = Some(json!({ "createdByAgentId": parent.0 }));
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("set createdByAgentId");
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), child.clone(), parent)
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
+    assert!(svc.list_watches_for_parent(&child).is_empty());
+}
+
+/// The child→parent suppression is one-directional: a child sending to a
+/// NON-parent target (an unrelated sibling) still gets the SUB-1 oneShot
+/// caller→target watch.
+#[tokio::test]
+async fn sender_watch_still_registers_for_child_sending_to_non_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Coordinator").await;
+    let sibling = create_agent(&svc, &ws, "Sibling").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), child.clone(), sibling.clone())
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+    let watches = svc.list_watches_for_parent(&child);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert_eq!(watches[0].child_agent_id, sibling);
+}
+
+/// The parent→child direction keeps today's SUB-1 behavior: a parent
+/// sending a coordination message to its own child is still subscribed.
+#[tokio::test]
+async fn sender_watch_still_registers_for_parent_sending_to_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Coordinator").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert_eq!(watches[0].child_agent_id, child);
+}
+
 /// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a oneShot
 /// watch on the woken assignee; the response carries `subscriptionId` and the
 /// reference tool's notification text.

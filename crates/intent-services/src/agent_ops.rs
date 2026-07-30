@@ -4245,8 +4245,9 @@ impl Services {
     /// register a oneShot caller→target watch UNLESS the caller is a
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
-    /// wakeup cards unrelated to their own task. Idempotent: reuses an
-    /// existing watch when one already exists.
+    /// wakeup cards unrelated to their own task — or the caller is a child
+    /// of the target (watches are auto-registered parent→child only).
+    /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
         workspace_id: WorkspaceId,
@@ -4263,6 +4264,32 @@ impl Services {
             .map(is_delegated_background_task_session)
             .unwrap_or(false);
         if skip {
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        // SUB-1 child→parent suppression: the auto-watch is one-directional
+        // (parent→child only). A child sending a coordination message to its
+        // own parent must never be subscribed to the parent's completion —
+        // otherwise the child is woken whenever the parent goes idle. Child
+        // linkage is read from the caller session's `parent_agent_id`,
+        // falling back to the metadata `createdByAgentId` the create/delegate
+        // writers populate.
+        let is_child_of_target = caller_session
+            .as_ref()
+            .map(|s| {
+                s.parent_agent_id.as_ref() == Some(&target_agent_id)
+                    || s.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("createdByAgentId"))
+                        .and_then(Value::as_str)
+                        == Some(target_agent_id.0.as_str())
+            })
+            .unwrap_or(false);
+        if is_child_of_target {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — caller is a child of the target"
+            );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         // SUB-1 delegation-group conflict suppression: skip ungrouped watch
