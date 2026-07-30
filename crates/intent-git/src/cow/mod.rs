@@ -446,8 +446,15 @@ mod tests {
         );
         #[cfg(target_os = "macos")]
         {
-            assert!(dst.join("sub/live.sock").exists());
-            assert!(dst.join("pipe.fifo").exists());
+            use std::os::unix::fs::FileTypeExt;
+            assert!(fs::symlink_metadata(dst.join("sub/live.sock"))
+                .unwrap()
+                .file_type()
+                .is_socket());
+            assert!(fs::symlink_metadata(dst.join("pipe.fifo"))
+                .unwrap()
+                .file_type()
+                .is_fifo());
         }
         #[cfg(not(target_os = "macos"))]
         {
