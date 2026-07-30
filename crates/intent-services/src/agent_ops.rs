@@ -4636,18 +4636,107 @@ impl Services {
         }))
     }
 
-    /// `agent.cancelSubscriptions`: remove every completion watch registered by
-    /// `agent_id`, drop any delegation groups it parents, and drop its event
+    /// `agent.cancelSubscriptions`: with no scoping params, remove every
+    /// completion watch registered by `agent_id`, drop any delegation groups
+    /// it parents (persisted rows swept best-effort), and drop its event
     /// subscriptions (monorepo#937). Idempotent — always returns
     /// `{ "success": true }` (TS shape).
+    ///
+    /// Scoped cancel (additive, monorepo): an optional `subscriptionId`
+    /// cancels exactly that completion watch, an optional `groupId` cancels
+    /// that delegation group plus its grouped watches; each removal deletes
+    /// the matching persisted `completion_watch` / `delegation_group` row(s)
+    /// and publishes the same `agent:subscriptions-changed` snapshot event as
+    /// the other watch-set mutation paths (§6.5), anchored in the parent's
+    /// home workspace. Cancelling a GROUPED watch by `subscriptionId` also
+    /// drops that child from its delegation group's expected set — group
+    /// settlement is driven exclusively by the grouped watch, so leaving the
+    /// child expected would stall the group (and the surviving siblings'
+    /// aggregated wake) forever — and then attempts `try_fire_group`, since
+    /// the shrunk group may now be sealed AND complete. The group-row delete
+    /// is durable-before-observable (awaited before any in-memory removal; a
+    /// failed delete errors the call with the registry untouched). An id not
+    /// owned by `agent_id` is rejected with `-32602` BEFORE anything is
+    /// removed (mirroring the unknown-id guards elsewhere in §5.5), so a
+    /// combined call is all-or-nothing. Scoped cancel never touches event
+    /// subscriptions.
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> Result<Value> {
-        self.remove_all_for_parent(&agent_id);
-        self.remove_groups_for_parent(&agent_id);
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        if subscription_id.is_none() && group_id.is_none() {
+            self.remove_all_for_parent(&agent_id);
+            self.remove_groups_for_parent(&agent_id);
+            self.remove_event_subscriptions_for_agent(&agent_id).await;
+            return Ok(json!({ "success": true }));
+        }
+
+        // Resolve BOTH ids against the caller's own watches/groups before
+        // removing anything, so an unknown id leaves the registry untouched.
+        let watches = self.list_watches_for_parent(&agent_id);
+        let target_watch =
+            match &subscription_id {
+                Some(sid) => Some(watches.iter().find(|w| &w.id == sid).cloned().ok_or_else(
+                    || Error::InvalidParams(format!("unknown subscription id: {sid}")),
+                )?),
+                None => None,
+            };
+        let target_group = match &group_id {
+            Some(gid) => Some(
+                self.list_groups_for_parent(&agent_id)
+                    .into_iter()
+                    .find(|g| &g.group_id == gid)
+                    .ok_or_else(|| {
+                        Error::InvalidParams(format!("unknown delegation group id: {gid}"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        // DURABLE-BEFORE-OBSERVABLE (mirrors `take_group_if_ready`): commit
+        // the persisted delegation_group delete BEFORE any in-memory removal.
+        // If the delete fails, the call errors with the registry untouched —
+        // no cancelled-in-memory group can rehydrate on restart. (A concurrent
+        // `try_fire_group` racing this delete is benign: both deletes are
+        // idempotent, and whichever removes the in-memory group first wins.)
+        if let Some(group) = &target_group {
+            self.store.delete_delegation_group(&group.group_id).await?;
+        }
+
+        // Parent home workspaces to publish `agent:subscriptions-changed` in
+        // (deduped — a watch and its group share the same anchor). A grouped
+        // watch cancelled by id must also stop gating its group's completion,
+        // and the shrunk group may thereby become ready — fire it (skipped
+        // when the group itself is being cancelled in the same call).
+        let mut anchors: Vec<WorkspaceId> = Vec::new();
+        let mut group_to_refire: Option<String> = None;
+        if let Some(watch) = target_watch {
+            self.remove_watch(&watch.id);
+            if let Some(gid) = &watch.group_id {
+                let cancelled_with_group =
+                    target_group.as_ref().is_some_and(|g| &g.group_id == gid);
+                if !cancelled_with_group && self.remove_child_from_group(gid, &watch.child_agent_id)
+                {
+                    group_to_refire = Some(gid.clone());
+                }
+            }
+            anchors.push(watch.parent_workspace_id);
+        }
+        if let Some(group) = target_group {
+            self.remove_group_with_watches(&agent_id, &group.group_id);
+            if !anchors.contains(&group.workspace_id) {
+                anchors.push(group.workspace_id);
+            }
+        }
+        if let Some(gid) = group_to_refire {
+            self.try_fire_group(&gid).await;
+        }
+        for anchor in &anchors {
+            self.publish_subscriptions_changed(anchor, &agent_id).await;
+        }
         Ok(json!({ "success": true }))
     }
 

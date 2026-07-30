@@ -1464,8 +1464,22 @@ async fn dispatch(
         "agent.cancelSubscriptions" => {
             let ws = require_ws_note(params)?;
             let agent_id = require_agent_id(params)?;
+            // Optional scoping (additive): cancel one watch and/or one
+            // delegation group instead of everything. A present-but-non-string
+            // id is rejected — falling back to `None` would silently turn a
+            // malformed scoped request into an unscoped cancel-everything.
+            let subscription_id = match params.get("subscriptionId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "subscriptionId must be a string")),
+            };
+            let group_id = match params.get("groupId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "groupId must be a string")),
+            };
             let result = api
-                .agent_cancel_subscriptions(ws, agent_id)
+                .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

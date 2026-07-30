@@ -15904,9 +15904,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_cancel_subscriptions_op(workspace_id, agent_id)
+            self.agent_cancel_subscriptions_op(workspace_id, agent_id, subscription_id, group_id)
                 .await
         })
     }
