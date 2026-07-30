@@ -48,10 +48,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Store-backed workspace rows plus live `activity` only — no notes/
-    /// sessions/cow enrichment. Used by the workspace subscription snapshot so
-    /// seq-0 cannot emit multi-MB enriched payloads that HOL the connection
-    /// writer (observed ~4.5 MiB / 80 workspaces). Optional card aggregates are
+    /// Store-backed workspace rows plus live `activity` and the cheap status
+    /// aggregates (`taskStats` via a counting query, derived `displayStatus`,
+    /// lifetime-cached `cowSupported`) — no notes/sessions enrichment. Used by
+    /// the workspace subscription snapshot so seq-0 cannot emit multi-MB
+    /// enriched payloads that HOL the connection writer (observed ~4.5 MiB /
+    /// 80 workspaces) while staying self-sufficient for client status
+    /// rendering. The heavy card aggregates (`agentSummary`/`diffSummary`) are
     /// omitted; clients treat missing fields as "derive locally / wait for
     /// deltas" (same as a notes-read failure on list). Default falls back to
     /// full `list_workspaces`.

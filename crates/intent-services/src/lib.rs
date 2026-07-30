@@ -992,7 +992,8 @@ impl Services {
     /// the store-level counting query ([`Store::count_task_stats`]) which
     /// hydrates only the spec note's content (for the linked-id filter) — no
     /// other note bodies — and matches [`compute_task_stats`] semantics
-    /// exactly. Not yet wired into `list_workspaces_lite` (follow-up).
+    /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
+    /// seq-0 snapshot is self-sufficient for client status rendering.
     pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
     }
@@ -8593,19 +8594,43 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let this = self.clone();
         Box::pin(async move {
-            // Store rows + live activity only. No notes/sessions/cow/PR rollups
-            // so workspace.subscribe seq-0 stays tens of KB instead of ~4.5 MiB
-            // for ~80 workspaces (that frame HOL'd the UDS writer for hundreds
-            // of ms and stranded interactive replies until the FE 30s timeout).
+            // Store rows + live activity + cheap status aggregates only. No
+            // notes/sessions enrichment so workspace.subscribe seq-0 stays
+            // tens of KB instead of ~4.5 MiB for ~80 workspaces (that frame
+            // HOL'd the UDS writer for hundreds of ms and stranded interactive
+            // replies until the FE 30s timeout). The snapshot must still be
+            // self-sufficient for client status rendering, so each row carries
+            // `taskStats` (counting query, no note-body hydration),
+            // `displayStatus` (same derivation as the enriched path), and
+            // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
+            let cow_supported = this.compute_cow_supported().await;
             for ws in &mut list {
                 ws.activity = this.workspace_activity(&ws.id);
-                ws.task_stats = None;
                 ws.agent_summary = None;
                 ws.diff_summary = None;
-                ws.cow_supported = None;
+                ws.cow_supported = cow_supported;
                 // Keep PR fields if already on the row (cheap, already stored);
                 // do not fetch/refresh them here.
+                // A stats-read failure degrades to absent taskStats +
+                // displayStatus (clients fall back to local derivation on a
+                // missing field), mirroring `enrich_workspace_aggregates`.
+                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
+                if ws.task_stats.is_some() {
+                    let display_status = compute_display_status(
+                        ws.active_pull_request.as_ref(),
+                        ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.task_stats.as_ref(),
+                    );
+                    // Seed the last-observed cache when absent so the first
+                    // post-boot mutation compares against this baseline (a
+                    // seed never emits; see
+                    // [`Services::maybe_emit_display_status_changed`]).
+                    if let Ok(mut map) = this.last_display_statuses.lock() {
+                        map.entry(ws.id.clone()).or_insert(display_status);
+                    }
+                    ws.display_status = Some(display_status);
+                }
             }
             Ok(list)
         })

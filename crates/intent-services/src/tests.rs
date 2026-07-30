@@ -434,6 +434,72 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
     assert_eq!((s3.total, s3.completed, s3.in_progress), (0, 0, 0));
 }
 
+/// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
+/// for client status rendering: rows carry `taskStats` (cheap counting query),
+/// `displayStatus` (same derivation as the enriched path — a subsequent
+/// enriched `workspace.get` must agree for the same data), and `cowSupported`,
+/// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
+/// seeds the `last_display_statuses` baseline (a seed never emits).
+#[tokio::test]
+async fn lite_list_is_self_sufficient_for_status_rendering() {
+    use intent_core::{TaskMetadata, TaskStatus, WorkspaceDisplayStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    store
+        .insert_note(&note(&ws, "spec", "no task links here"))
+        .await
+        .expect("spec");
+    for (id, status) in [
+        ("t-progress", TaskStatus::InProgress),
+        ("t-complete", TaskStatus::Complete),
+        ("t-open", TaskStatus::NotStarted),
+    ] {
+        let mut tn = note(&ws, id, "body");
+        tn.parent_id = Some(NoteId::from("spec"));
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        store.insert_note(&tn).await.expect("task note");
+    }
+
+    let list = svc.list_workspaces_lite(true).await.expect("lite list");
+    let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
+    let stats = row.task_stats.as_ref().expect("taskStats populated");
+    assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
+    assert_eq!(row.display_status, Some(WorkspaceDisplayStatus::InProgress));
+    assert!(row.cow_supported.is_some(), "cowSupported populated");
+    assert!(row.agent_summary.is_none(), "agentSummary omitted");
+    assert!(row.diff_summary.is_none(), "diffSummary omitted");
+
+    // Parity with the enriched read for the same data.
+    let enriched = svc.get_workspace(ws.clone()).await.expect("enriched get");
+    assert_eq!(row.display_status, enriched.display_status);
+    assert_eq!(row.task_stats, enriched.task_stats);
+
+    // Wire shape: cheap aggregates present, heavy aggregates absent.
+    let v = serde_json::to_value(row).unwrap();
+    assert_eq!(v["displayStatus"], "in_progress");
+    assert_eq!(v["taskStats"]["total"], 3);
+    assert!(v["cowSupported"].is_boolean());
+    assert!(v.get("agentSummary").is_none());
+    assert!(v.get("diffSummary").is_none());
+
+    // The lite read seeded the displayStatus baseline map.
+    let seeded = svc
+        .last_display_statuses
+        .lock()
+        .expect("lock cache")
+        .contains_key(&ws);
+    assert!(seeded, "lite list must seed the displayStatus baseline");
+}
+
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
 /// (self filtered out, other-repo filtered out) with the PascalCase status.
 #[tokio::test]
@@ -19491,6 +19557,50 @@ mod display_status_events {
         // Repeat recompute with no underlying change: still silent.
         h.services.maybe_emit_display_status_changed(&h.ws).await;
         assert_silent(&mut sub).await;
+    }
+
+    /// The lite list path (workspace.subscribe seq-0 snapshot) seeds the
+    /// last-observed baseline the same way the enriched path does — a seed
+    /// never emits — so the first post-boot mutation emits the transition
+    /// against that baseline.
+    #[tokio::test]
+    async fn lite_list_seeds_baseline_then_first_mutation_emits() {
+        let h = harness().await;
+        // Hermetic root: the lite path probes the workspaces root for
+        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        let root = super::WorkspacesRoot::new();
+        let services = h
+            .services
+            .clone()
+            .with_workspaces_root(root.path().to_path_buf());
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+
+        let mut sub = subscribe(&h);
+        let list = services.list_workspaces_lite(true).await.expect("lite");
+        let row = list.iter().find(|w| w.id == h.ws).expect("row");
+        assert!(row.display_status.is_some(), "lite row carries the status");
+        assert_silent(&mut sub).await;
+
+        // First post-boot mutation transitions against the seeded baseline.
+        services
+            .task_update_note_status(
+                h.ws.clone(),
+                NoteId::from("t1"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("update status");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
     }
 
     /// Deleting an open spec-child task note that moves the derived rollup
