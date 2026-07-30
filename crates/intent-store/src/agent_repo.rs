@@ -20,7 +20,8 @@ use crate::{enum_from_db, enum_to_db, Store};
 const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
-    completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
+    completion_report_timestamp, attention_request_kind, attention_request_reason, \
+    attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason";
 
 /// One agent session's usage inputs for the workspace token-usage tally
@@ -310,7 +311,7 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
     .transpose()
 }
 
-/// Bind the full 29-column `agent_session` insert value list onto `query`, in
+/// Bind the full 32-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
@@ -338,6 +339,9 @@ fn bind_session_insert<'q>(
         .bind(s.skip_auto_commit as i64)
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
+        .bind(&s.attention_request_kind)
+        .bind(&s.attention_request_reason)
+        .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
@@ -362,7 +366,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -420,7 +424,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1222,7 +1226,8 @@ impl Store {
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
-             completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
+             completion_report=?, completion_report_timestamp=?, attention_request_kind=?, \
+             attention_request_reason=?, attention_request_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
              metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=? \
              WHERE id=? AND workspace_id=?",
@@ -1243,6 +1248,9 @@ impl Store {
         .bind(s.skip_auto_commit as i64)
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
+        .bind(&s.attention_request_kind)
+        .bind(&s.attention_request_reason)
+        .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
@@ -1440,6 +1448,49 @@ impl Store {
                 return Err(Error::NotFound(format!("agent session {id}")));
             }
             // Session exists but no report was set — the common case.
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Clear the pending attention request (`attention_request_kind` /
+    /// `..._reason` / `..._timestamp`) when the agent next receives a message.
+    /// Returns `true` if a request was present and cleared, `false` if none
+    /// was set (the common case — no write, no event). Scoped to
+    /// `workspace_id` (defense-in-depth); `updated_at` is refreshed to the
+    /// supplied timestamp. `NotFound` if the session is absent or the
+    /// workspace does not match. Mirrors [`Store::clear_completion_report`].
+    pub async fn clear_attention_request(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=NULL, \
+             attention_request_reason=NULL, attention_request_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND attention_request_kind IS NOT NULL",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear attention request failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists but no request was pending — the common case.
             return Ok(false);
         }
         Ok(true)
@@ -1700,6 +1751,9 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         skip_auto_commit: col::<i64>(row, "skip_auto_commit")? != 0,
         completion_report: col(row, "completion_report")?,
         completion_report_timestamp: col(row, "completion_report_timestamp")?,
+        attention_request_kind: col(row, "attention_request_kind")?,
+        attention_request_reason: col(row, "attention_request_reason")?,
+        attention_request_timestamp: col(row, "attention_request_timestamp")?,
         delegation_depth: col(row, "delegation_depth")?,
         initial_message: col(row, "initial_message")?,
         context_references: json_col_from_db(
@@ -2305,6 +2359,9 @@ mod tests {
             stats: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -2413,6 +2470,9 @@ mod tests {
             stats: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -2559,6 +2619,9 @@ mod tests {
             stats: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -3654,6 +3717,9 @@ mod tests {
             stats: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -3795,6 +3861,9 @@ mod tests {
             stats: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -4010,6 +4079,9 @@ mod tests {
                 stats: None,
                 completion_report: None,
                 completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
                 delegation_depth: None,
                 initial_message: None,
                 context_references: None,

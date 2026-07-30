@@ -2748,6 +2748,51 @@ impl AgentManager {
         }
     }
 
+    /// Clear a pending attention request when a new turn begins — the request
+    /// (`ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) is a pending
+    /// state that retires as soon as the agent next receives a message, on
+    /// ANY delivery path (sendMessage, queue drain, parent/subscription wake —
+    /// all turns start here). Skips the store write and event when no request
+    /// is pending (the common case). Emits `agent:updated` with
+    /// `attentionRequestCleared: true` when one was present and cleared so
+    /// clients retire the sidebar/footer indicator.
+    async fn clear_attention_request_if_present(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        let ts = now_iso();
+        match self
+            .services
+            .store
+            .clear_attention_request(workspace_id, agent_id, &ts)
+            .await
+        {
+            Ok(true) => {
+                self.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_UPDATED,
+                        json!({ "agentId": agent_id.0, "attentionRequestCleared": true }),
+                    )
+                    .await;
+            }
+            Ok(false) => {
+                // No request was pending — skip the event.
+            }
+            Err(e) => {
+                // Store error (session not found, workspace mismatch) — log
+                // and swallow so the turn can proceed.
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "clear attention request failed"
+                );
+            }
+        }
+    }
+
     /// Stale queued-message redrive detection (#576). A dequeued message is
     /// STALE for a delegated agent (`parent_agent_id` set) when its
     /// `queued_at` predates the session's `completion_report_timestamp` —
@@ -5453,6 +5498,11 @@ async fn run_message_worker(
                     mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
                         .await;
                 }
+                // A pending attention request retires on ANY new message
+                // (stale redrives included — the delivery itself is the
+                // "agent was next messaged" signal the indicator keys off).
+                mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
+                    .await;
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
@@ -6705,6 +6755,9 @@ mod role_reminder_tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -8155,6 +8208,9 @@ mod agent_retry_tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,

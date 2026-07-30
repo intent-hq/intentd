@@ -1823,6 +1823,33 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.requestAttention`: an agent explicitly raises attention before
+    /// ending its turn — `kind` is `"discussion"` (`ws.agent.requestDiscussion`)
+    /// or `"blocker"` (`ws.agent.reportBlocker`), `reason` is required.
+    /// Persists the pending request on the session, appends a system-role
+    /// transcript notice, emits `agent:attention-requested`, transitions the
+    /// linked task (`discussion_needed` / `blocked`), and wakes a delegated
+    /// caller's parent. Available to all agents (delegated or not, with or
+    /// without a linked task).
+    ///
+    /// `caller_agent_id` is the agent invoking the tool: the MCP front door
+    /// passes `Some(caller)`; the FE/RPC front door passes `None`, which
+    /// surfaces `-32603` (there is no caller session to attach the request to).
+    fn agent_request_attention(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, kind, reason, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_request_attention not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSubscriptions`: `{ subscriptions, delegationGroups, agentStatuses }`
     /// (PROTOCOL §5.5).
     fn agent_get_subscriptions(

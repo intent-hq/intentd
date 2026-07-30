@@ -2535,13 +2535,31 @@ impl Services {
                 // Prefer the child's persisted completionReport (set by
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,
-                // mirroring the TS event-notification formatter.
-                let report = self
-                    .store
-                    .get_agent_session(child_id)
-                    .await
-                    .ok()
-                    .and_then(|s| s.completion_report);
+                // mirroring the TS event-notification formatter. A pending
+                // attention request (whose immediate wake is likewise
+                // suppressed for grouped children) is folded into the child's
+                // line + event data the same way.
+                let child_session = self.store.get_agent_session(child_id).await.ok();
+                let attention = child_session.as_ref().and_then(|s| {
+                    s.attention_request_kind
+                        .clone()
+                        .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
+                });
+                let report = child_session.and_then(|s| s.completion_report);
+                let attention_annotated;
+                let event = match &attention {
+                    Some((kind, reason)) => {
+                        let mut e = event.clone();
+                        agent_subscriptions::annotate_attention_request(
+                            &mut e.data,
+                            Some(kind),
+                            Some(reason),
+                        );
+                        attention_annotated = e;
+                        &attention_annotated
+                    }
+                    None => event,
+                };
                 let summary =
                     format_group_child_line(child_id, event, report.as_deref(), stall.as_ref());
                 let newly_recorded = self
@@ -4066,7 +4084,8 @@ fn extract_spec_task_ids(content: &str) -> HashSet<String> {
 /// Compute a workspace's `taskStats` card aggregate from its notes, porting the
 /// canonical `computeTaskStats` (`task-stats.ts`) over the spec-linked direct
 /// child task notes: `cancelled` is excluded from `total`, `complete` counts as
-/// `completed`, and `in_progress`/`review_required` count as `inProgress`. When
+/// `completed`, and `in_progress`/`review_required` count as `inProgress`
+/// (`blocked` is excluded from `inProgress`, like `discussion_needed`). When
 /// the spec body has no task links, all direct children with task metadata count
 /// (TS backward-compat fallback).
 fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
@@ -4267,11 +4286,14 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     }
 }
 
-/// The seven valid task-note statuses, in the order the TS validator lists them.
-const TASK_STATUS_WORDS: [&str; 7] = [
+/// The valid task-note statuses, in the order the TS validator lists them —
+/// plus `blocked` (new in intentd; set by `ws.agent.reportBlocker`), slotted
+/// after its sibling `discussion_needed`.
+const TASK_STATUS_WORDS: [&str; 8] = [
     "not_started",
     "waiting",
     "discussion_needed",
+    "blocked",
     "in_progress",
     "review_required",
     "complete",
@@ -6600,6 +6622,28 @@ pub(crate) fn format_group_child_line(
         if !err.is_empty() {
             line.push_str(&format!(" Error: {err}"));
         }
+    }
+    // Pending attention request (agent:attention-requested): a grouped child
+    // skips its immediate parent wake, so the aggregated line carries the
+    // kind-flavored attention text instead (annotated onto the event data by
+    // the group-record sites from the persisted session fields).
+    if let Some(kind) = event
+        .data
+        .get("attentionRequestKind")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.is_empty())
+    {
+        let verb = if kind == "blocker" {
+            "Reported a blocker"
+        } else {
+            "Requested a discussion"
+        };
+        let reason = event
+            .data
+            .get("attentionRequestReason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        line.push_str(&format!(" {verb}: {reason}"));
     }
     if let Some(stall) = stall {
         line.push_str(&stall.annotation_suffix());
@@ -15623,6 +15667,19 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_request_attention(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
+                .await
+        })
+    }
+
     fn agent_get_subscriptions(
         &self,
         workspace_id: WorkspaceId,
@@ -19737,6 +19794,7 @@ fn status_word(status: TaskStatus) -> &'static str {
         TaskStatus::NotStarted => "not_started",
         TaskStatus::Waiting => "waiting",
         TaskStatus::DiscussionNeeded => "discussion_needed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::InProgress => "in_progress",
         TaskStatus::ReviewRequired => "review_required",
         TaskStatus::Complete => "complete",
