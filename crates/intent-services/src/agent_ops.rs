@@ -3419,9 +3419,15 @@ impl Services {
     /// 4. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
     /// 5. wakes a delegated caller's parent with a kind-flavored message —
-    ///    skipped when the child is in an undelivered `after_all` delegation
-    ///    group (the group's aggregated wake folds the attention request in)
-    ///    and for non-delegated callers.
+    ///    delivered IMMEDIATELY even when the child is in an undelivered
+    ///    `after_all` delegation group (mirroring the STAB-160 immediate
+    ///    grouped-failure wake: an attention request is an alert the parent
+    ///    must hear now, not at group settlement). The group's later
+    ///    aggregated wake also annotates the child's line from the persisted
+    ///    session fields (the record) while the request is still pending —
+    ///    the fields are cleared when the child next receives a message, so
+    ///    a parent reply before settlement retires the fold. Non-delegated
+    ///    callers have no parent to wake.
     ///
     /// Agent status and `stop_reason` are untouched: the turn ends normally
     /// (no retry/requeue interaction).
@@ -3545,57 +3551,59 @@ impl Services {
             )
             .await;
         }
-        // 5. Kind-flavored parent wake for delegated callers. Grouped children
-        // skip the immediate wake — the `after_all` group's aggregated wake
-        // folds the attention request in (the group-record sites annotate the
-        // child line from the persisted session fields). Non-delegated
-        // callers have no parent to wake.
+        // 5. Kind-flavored parent wake for delegated callers — delivered
+        // immediately even when the child is enrolled in an undelivered
+        // `after_all` delegation group (mirroring the STAB-160 immediate
+        // grouped-failure wake in `deliver_completion_to_watches`): the
+        // request is an alert the parent must hear now, not at group
+        // settlement. The group's later aggregated wake also annotates the
+        // child's line from the persisted session fields (the record) while
+        // the request is still pending — a parent reply before settlement
+        // clears the fields and retires the fold. Non-delegated callers have
+        // no parent to wake.
         if let Some(parent) = parent {
-            let grouped = self.child_in_undelivered_group(&parent, &caller);
-            if !grouped {
-                let parent_home_ws = self
-                    .store
-                    .get_agent_session(&parent)
-                    .await
-                    .map(|s| s.workspace_id)
-                    .unwrap_or_else(|_| workspace_id.clone());
-                let wake_text = format!(
-                    "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
-                    session.name, caller.0, wake_verb, reason
+            let parent_home_ws = self
+                .store
+                .get_agent_session(&parent)
+                .await
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|_| workspace_id.clone());
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
+                session.name, caller.0, wake_verb, reason
+            );
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                    "timestamp": saved_at,
+                    "data": {
+                        "workspaceId": workspace_id.0,
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "kind": kind,
+                        "reason": reason,
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            if let Err(e) = self
+                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver attention-request wake to parent"
                 );
-                let metadata = json!({
-                    "type": "event_notification",
-                    "eventCount": 1,
-                    "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
-                    "events": [{
-                        "id": uuid::Uuid::new_v4().to_string(),
-                        "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
-                        "timestamp": saved_at,
-                        "data": {
-                            "workspaceId": workspace_id.0,
-                            "agentId": caller.0,
-                            "agentName": session.name.clone(),
-                            "kind": kind,
-                            "reason": reason,
-                        },
-                        "actor": {
-                            "type": "agent",
-                            "id": caller.0,
-                            "name": session.name.clone(),
-                        }
-                    }]
-                });
-                if let Err(e) = self
-                    .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        parent = %parent.0,
-                        child = %caller.0,
-                        "failed to deliver attention-request wake to parent"
-                    );
-                }
             }
         }
 
@@ -4676,18 +4684,107 @@ impl Services {
         }))
     }
 
-    /// `agent.cancelSubscriptions`: remove every completion watch registered by
-    /// `agent_id`, drop any delegation groups it parents, and drop its event
+    /// `agent.cancelSubscriptions`: with no scoping params, remove every
+    /// completion watch registered by `agent_id`, drop any delegation groups
+    /// it parents (persisted rows swept best-effort), and drop its event
     /// subscriptions (monorepo#937). Idempotent — always returns
     /// `{ "success": true }` (TS shape).
+    ///
+    /// Scoped cancel (additive, monorepo): an optional `subscriptionId`
+    /// cancels exactly that completion watch, an optional `groupId` cancels
+    /// that delegation group plus its grouped watches; each removal deletes
+    /// the matching persisted `completion_watch` / `delegation_group` row(s)
+    /// and publishes the same `agent:subscriptions-changed` snapshot event as
+    /// the other watch-set mutation paths (§6.5), anchored in the parent's
+    /// home workspace. Cancelling a GROUPED watch by `subscriptionId` also
+    /// drops that child from its delegation group's expected set — group
+    /// settlement is driven exclusively by the grouped watch, so leaving the
+    /// child expected would stall the group (and the surviving siblings'
+    /// aggregated wake) forever — and then attempts `try_fire_group`, since
+    /// the shrunk group may now be sealed AND complete. The group-row delete
+    /// is durable-before-observable (awaited before any in-memory removal; a
+    /// failed delete errors the call with the registry untouched). An id not
+    /// owned by `agent_id` is rejected with `-32602` BEFORE anything is
+    /// removed (mirroring the unknown-id guards elsewhere in §5.5), so a
+    /// combined call is all-or-nothing. Scoped cancel never touches event
+    /// subscriptions.
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> Result<Value> {
-        self.remove_all_for_parent(&agent_id);
-        self.remove_groups_for_parent(&agent_id);
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        if subscription_id.is_none() && group_id.is_none() {
+            self.remove_all_for_parent(&agent_id);
+            self.remove_groups_for_parent(&agent_id);
+            self.remove_event_subscriptions_for_agent(&agent_id).await;
+            return Ok(json!({ "success": true }));
+        }
+
+        // Resolve BOTH ids against the caller's own watches/groups before
+        // removing anything, so an unknown id leaves the registry untouched.
+        let watches = self.list_watches_for_parent(&agent_id);
+        let target_watch =
+            match &subscription_id {
+                Some(sid) => Some(watches.iter().find(|w| &w.id == sid).cloned().ok_or_else(
+                    || Error::InvalidParams(format!("unknown subscription id: {sid}")),
+                )?),
+                None => None,
+            };
+        let target_group = match &group_id {
+            Some(gid) => Some(
+                self.list_groups_for_parent(&agent_id)
+                    .into_iter()
+                    .find(|g| &g.group_id == gid)
+                    .ok_or_else(|| {
+                        Error::InvalidParams(format!("unknown delegation group id: {gid}"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        // DURABLE-BEFORE-OBSERVABLE (mirrors `take_group_if_ready`): commit
+        // the persisted delegation_group delete BEFORE any in-memory removal.
+        // If the delete fails, the call errors with the registry untouched —
+        // no cancelled-in-memory group can rehydrate on restart. (A concurrent
+        // `try_fire_group` racing this delete is benign: both deletes are
+        // idempotent, and whichever removes the in-memory group first wins.)
+        if let Some(group) = &target_group {
+            self.store.delete_delegation_group(&group.group_id).await?;
+        }
+
+        // Parent home workspaces to publish `agent:subscriptions-changed` in
+        // (deduped — a watch and its group share the same anchor). A grouped
+        // watch cancelled by id must also stop gating its group's completion,
+        // and the shrunk group may thereby become ready — fire it (skipped
+        // when the group itself is being cancelled in the same call).
+        let mut anchors: Vec<WorkspaceId> = Vec::new();
+        let mut group_to_refire: Option<String> = None;
+        if let Some(watch) = target_watch {
+            self.remove_watch(&watch.id);
+            if let Some(gid) = &watch.group_id {
+                let cancelled_with_group =
+                    target_group.as_ref().is_some_and(|g| &g.group_id == gid);
+                if !cancelled_with_group && self.remove_child_from_group(gid, &watch.child_agent_id)
+                {
+                    group_to_refire = Some(gid.clone());
+                }
+            }
+            anchors.push(watch.parent_workspace_id);
+        }
+        if let Some(group) = target_group {
+            self.remove_group_with_watches(&agent_id, &group.group_id);
+            if !anchors.contains(&group.workspace_id) {
+                anchors.push(group.workspace_id);
+            }
+        }
+        if let Some(gid) = group_to_refire {
+            self.try_fire_group(&gid).await;
+        }
+        for anchor in &anchors {
+            self.publish_subscriptions_changed(anchor, &agent_id).await;
+        }
         Ok(json!({ "success": true }))
     }
 

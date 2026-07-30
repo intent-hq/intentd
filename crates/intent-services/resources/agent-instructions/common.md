@@ -38,6 +38,8 @@ If you cannot proceed with your assignment, raise attention explicitly instead o
 
 `reason` is required. Both work for every agent (delegated or not, with or without a linked task). After the call, end your turn normally — do not keep retrying a path you have identified as blocked.
 
+Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work.
+
 ## Response Organization
 
 Use `<group:Name>` tags to organize long responses into collapsible sections.
