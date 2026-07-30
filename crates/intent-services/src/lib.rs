@@ -988,6 +988,15 @@ impl Services {
         }
     }
 
+    /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
+    /// the store-level counting query ([`Store::count_task_stats`]) which
+    /// hydrates only the spec note's content (for the linked-id filter) — no
+    /// other note bodies — and matches [`compute_task_stats`] semantics
+    /// exactly. Not yet wired into `list_workspaces_lite` (follow-up).
+    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+        self.store.count_task_stats(workspace_id).await
+    }
+
     /// Recompute a workspace's derived `displayStatus` and publish
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
@@ -4057,25 +4066,10 @@ async fn append_primitive(
 
 /// Extract the spec-linked task-note ids from a spec note's markdown body
 /// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
-/// (`TASK_LINK_REGEX_FLEXIBLE`).
+/// (`TASK_LINK_REGEX_FLEXIBLE`). Canonical implementation lives in
+/// intent-core so the store's cheap `count_task_stats` query shares it.
 fn extract_spec_task_ids(content: &str) -> HashSet<String> {
-    const MARKER: &str = "(intent://local/task/";
-    let mut ids = HashSet::new();
-    let mut rest = content;
-    while let Some(pos) = rest.find(MARKER) {
-        let after = &rest[pos + MARKER.len()..];
-        match after.find(')') {
-            Some(end) => {
-                let id = &after[..end];
-                if !id.is_empty() {
-                    ids.insert(id.to_string());
-                }
-                rest = &after[end + 1..];
-            }
-            None => break,
-        }
-    }
-    ids
+    intent_core::extract_spec_task_ids(content)
 }
 
 /// Compute a workspace's `taskStats` card aggregate from its notes, porting the

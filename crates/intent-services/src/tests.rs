@@ -324,6 +324,116 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diffSummary").is_none());
 }
 
+/// Parity: the cheap store-level `count_task_stats` query (no note-body
+/// hydration) must match the enriched `compute_task_stats` over hydrated
+/// notes for the same seeded data, across the spec-linked filter, the
+/// no-links backward-compat fallback, and the missing-spec case.
+#[tokio::test]
+async fn cheap_task_stats_matches_enriched_compute_task_stats() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk_task = |ws: &WorkspaceId, id: &str, parent: Option<&str>, status: TaskStatus| {
+        let mut tn = note(ws, id, "body");
+        tn.parent_id = parent.map(NoteId::from);
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+
+    // Case 1: spec with links — one status per bucket, plus rows the filter
+    // must exclude (unlinked child, non-spec parent, no parent, non-task
+    // child, and a linked id with no matching note).
+    let ws1 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
+    let spec = note(
+        &ws1,
+        "spec",
+        "- [A](intent://local/task/t-complete)\n- [B](intent://local/task/t-progress)\n\
+         - [C](intent://local/task/t-review)\n- [D](intent://local/task/t-cancelled)\n\
+         - [E](intent://local/task/t-open)\n- [G](intent://local/task/t-ghost)",
+    );
+    store.insert_note(&spec).await.expect("spec");
+    for (id, status) in [
+        ("t-complete", TaskStatus::Complete),
+        ("t-progress", TaskStatus::InProgress),
+        ("t-review", TaskStatus::ReviewRequired),
+        ("t-cancelled", TaskStatus::Cancelled),
+        ("t-open", TaskStatus::NotStarted),
+        ("t-unlinked", TaskStatus::Complete), // spec child but not linked
+    ] {
+        store
+            .insert_note(&mk_task(&ws1, id, Some("spec"), status))
+            .await
+            .unwrap();
+    }
+    store
+        .insert_note(&mk_task(&ws1, "t-orphan", None, TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task(
+            &ws1,
+            "t-other-parent",
+            Some("t-open"),
+            TaskStatus::Complete,
+        ))
+        .await
+        .unwrap();
+    let mut plain_child = note(&ws1, "n-plain", "no task metadata");
+    plain_child.parent_id = Some(NoteId::from("spec"));
+    store.insert_note(&plain_child).await.unwrap();
+
+    // Case 2: spec without links — backward-compat fallback counts all direct
+    // children with task metadata.
+    let ws2 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
+    store
+        .insert_note(&note(&ws2, "spec", "no task links here"))
+        .await
+        .unwrap();
+    for (id, status) in [
+        ("u-complete", TaskStatus::Complete),
+        ("u-waiting", TaskStatus::Waiting),
+        ("u-cancelled", TaskStatus::Cancelled),
+        ("u-review", TaskStatus::ReviewRequired),
+    ] {
+        store
+            .insert_note(&mk_task(&ws2, id, Some("spec"), status))
+            .await
+            .unwrap();
+    }
+
+    // Case 3: no spec note at all — direct spec children can't exist, so both
+    // paths must report zeros even with a stray task note present.
+    let ws3 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws3)).await.expect("ws3");
+    store
+        .insert_note(&mk_task(&ws3, "v-stray", None, TaskStatus::Complete))
+        .await
+        .unwrap();
+
+    for ws in [&ws1, &ws2, &ws3] {
+        let notes = store.list_notes(ws).await.expect("list notes");
+        let enriched = crate::compute_task_stats(&notes);
+        let cheap = store.count_task_stats(ws).await.expect("cheap stats");
+        assert_eq!(cheap, enriched, "parity failed for workspace {ws:?}");
+    }
+
+    // Spot-check the expected counts and the services-side helper.
+    let svc = Services::new(store);
+    let s1 = svc.cheap_task_stats(&ws1).await.expect("ws1 stats");
+    assert_eq!((s1.total, s1.completed, s1.in_progress), (4, 1, 2));
+    let s2 = svc.cheap_task_stats(&ws2).await.expect("ws2 stats");
+    assert_eq!((s2.total, s2.completed, s2.in_progress), (3, 1, 1));
+    let s3 = svc.cheap_task_stats(&ws3).await.expect("ws3 stats");
+    assert_eq!((s3.total, s3.completed, s3.in_progress), (0, 0, 0));
+}
+
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
 /// (self filtered out, other-repo filtered out) with the PascalCase status.
 #[tokio::test]
