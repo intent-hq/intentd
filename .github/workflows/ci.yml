@@ -28,21 +28,22 @@ concurrency:
 jobs:
   # Decides where the Linux-heavy jobs (check / coverage-e2e / coverage-all)
   # run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. Runs on tinybox itself (GitHub-
-  # hosted runners are disabled for this org): the probe can queue behind
-  # the backlog it measures, but it is a seconds-long job and self-hosted
-  # jobs are drained FIFO, so it adds one short hop rather than negating
-  # the burst. The probe fails open to tinybox on API errors; if the job
-  # itself fails (runner outage, timeout), the routed jobs are skipped and
-  # need a re-run — a deliberate trade-off. The mac build is intentionally
-  # not routed — it stays pinned to m1mac.
+  # when the tinybox queue is backed up. Runs on a small WarpBuild ephemeral
+  # runner so the burst decision is independent of the tinybox queue: when
+  # the probe ran on tinybox it queued behind the very backlog it measures
+  # (and deadlocked entirely with tinybox offline). The probe fails open to
+  # tinybox on API errors; if the job itself fails (runner outage, timeout),
+  # the routed jobs are skipped and need a re-run — a deliberate trade-off.
+  # The mac build is intentionally not routed — it stays pinned to m1mac.
   route:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: warp-ubuntu-latest-x64-2x
     timeout-minutes: 5
     permissions:
       contents: read
-      # Reads the Actions queue; job-level so the routed jobs (which run on
-      # third-party WarpBuild runners when bursting) don't inherit it.
+      # Reads the Actions queue; job-level so the other jobs don't inherit
+      # it. The probe (and the optional cross-repo CI_QUEUE_READ_TOKEN)
+      # now runs on third-party WarpBuild ephemeral runners — an accepted
+      # trade-off.
       actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
@@ -72,9 +73,10 @@ jobs:
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
             // Count self-hosted Linux jobs that are queued or running in
             // queued/in-progress runs: a running job occupies the single
-            // tinybox slot just as much as a queued one. WarpBuild jobs
-            // don't match the self-hosted+Linux label filter, so bursted
-            // jobs never inflate the depth.
+            // tinybox slot just as much as a queued one. WarpBuild jobs —
+            // including this route job and bursted heavy jobs — don't match
+            // the self-hosted+Linux label filter, so they never inflate the
+            // depth.
             const owner = context.repo.owner;
             const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
