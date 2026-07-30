@@ -510,7 +510,10 @@ impl ScriptManager {
 
     /// `script.run`: run a command-mode script to completion (optional timeout),
     /// returning its captured output + exit code; service scripts return a
-    /// `warning` directing callers to `script.start`. Scoped to `workspace_id`.
+    /// `warning` directing callers to `script.start`, and a script already
+    /// running warn-and-returns (mirrors `start()`'s guard) so a second run
+    /// can never overwrite `pty_id` and orphan the first run's PTY
+    /// (monorepo#1155). Scoped to `workspace_id`.
     pub(crate) async fn run(
         &self,
         workspace_id: &WorkspaceId,
@@ -518,13 +521,19 @@ impl ScriptManager {
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> Result<Value> {
-        let def = self
-            .scripts
-            .lock()
-            .unwrap()
-            .get(&(workspace_id.clone(), script_id.to_string()))
-            .map(|m| m.def.clone())
-            .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+        let def = {
+            let guard = self.scripts.lock().unwrap();
+            let m = guard
+                .get(&(workspace_id.clone(), script_id.to_string()))
+                .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
+            if m.state.status == ScriptStatus::Running {
+                return Ok(json!({
+                    "output": "",
+                    "warning": "Script is already running; wait for it to finish or use script.stop.",
+                }));
+            }
+            m.def.clone()
+        };
         if def.mode == ScriptMode::Service {
             return Ok(json!({
                 "output": "",
@@ -1884,6 +1893,57 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["timedOut"], true);
+    }
+
+    /// Regression (monorepo#1155): a second `script.run` while the script is
+    /// already running must not spawn a second PTY or overwrite `pty_id`
+    /// (which would orphan the first run's process on stop/remove); it
+    /// warn-and-returns with the service-mode warning shape.
+    #[tokio::test]
+    async fn script_run_while_running_warns_without_second_pty() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let first = tokio::spawn(async move { services.script_run(ws, sid, None, None).await });
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let pid = running["data"]["pid"].as_i64().expect("pid");
+
+        // Second run while the first is still running: warn-and-return, no
+        // second PTY spawn (bounded timeout so an unguarded second PTY fails
+        // the shape assertions instead of hanging the test).
+        let out = h
+            .services
+            .script_run(h.ws.clone(), id.clone(), None, Some(5))
+            .await
+            .expect("second run");
+        assert_eq!(out["output"], "", "warn-and-return shape: {out:?}");
+        assert!(
+            out["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already running"),
+            "warning says already running: {out:?}"
+        );
+
+        // `pty_id` was not overwritten: status still reports the first run's pid.
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "running");
+        assert_eq!(st["pid"], json!(pid), "pid unchanged: {st:?}");
+
+        // Stop kills the tracked (first) PTY and the first run completes.
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+        let res = first.await.expect("join").expect("first run");
+        assert_eq!(res["timedOut"], false);
     }
 
     /// Regression (monorepo#1155): dropping the `script.run` future mid-flight
