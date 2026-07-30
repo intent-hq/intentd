@@ -4517,8 +4517,24 @@ impl Services {
                     task_agent_ids.insert(s.id.0.clone());
                 }
             }
-            if let Ok(task) = self.get_my_task(workspace_id.clone(), tid.clone()).await {
-                task_agent_ids.extend(task.assigned_agents.into_iter().map(|a| a.0));
+            match self.get_my_task(workspace_id.clone(), tid.clone()).await {
+                Ok(task) => {
+                    task_agent_ids.extend(task.assigned_agents.into_iter().map(|a| a.0));
+                }
+                // `get_my_task` maps a missing note / non-task note to these
+                // `Internal` messages — the expected empty-note-scope shape,
+                // kept silent. Anything else is a real store failure worth
+                // surfacing before we fall back to session-side matches only.
+                Err(Error::Internal(msg))
+                    if msg == "Task note not found" || msg == "Note is not a task" => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        note = %tid,
+                        "agent.diagnostics: task note lookup failed; \
+                         scoping to session-side matches only"
+                    );
+                }
             }
         }
 
@@ -4541,8 +4557,8 @@ impl Services {
         }
         if agent_filter.is_none() {
             // Note-side assignees without a session row still scope the
-            // snapshot (union semantics).
-            matching.extend(task_agent_ids.iter().cloned());
+            // snapshot (union semantics). Last use — the set is moved.
+            matching.extend(task_agent_ids);
         }
         if let Some(aid) = &agent_filter {
             matching.insert(aid.clone());

@@ -9226,6 +9226,61 @@ async fn diagnostics_task_filter_includes_note_side_assignees() {
     assert_eq!(agents[0]["id"], json!(assignee.0));
 }
 
+/// monorepo#1150: a session whose persisted `task_note_id` matches the
+/// filter is in scope even when the agent is NOT in the note's
+/// `assigned_agents` — the session-side branch of the union stands on its
+/// own. (`agent.delegate` sets both sides, so the note-side assignment is
+/// stripped store-side to isolate the branch.)
+#[tokio::test]
+async fn diagnostics_task_filter_matches_session_side_only() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "session-side only task").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("work the task".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let delegated = resp["agentId"].as_str().expect("agentId").to_string();
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    // Strip the note-side assignment so only the session's `task_note_id`
+    // links the agent to the task.
+    let mut note = svc
+        .store
+        .get_note(&ws, &note_id)
+        .await
+        .expect("get task note");
+    let mut task = note.metadata.task.clone().expect("task metadata");
+    assert_eq!(
+        task.assigned_agent_ids,
+        vec![AgentId::from(delegated.as_str())],
+        "delegate assigned the agent note-side"
+    );
+    task.assigned_agent_ids.clear();
+    note.metadata.task = Some(task);
+    svc.store.update_note(&note).await.expect("update note");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents.len(),
+        1,
+        "session-side match alone keeps the agent in scope: {diag}"
+    );
+    assert_eq!(agents[0]["id"], json!(delegated));
+}
+
 /// monorepo#1150: a nonexistent `taskNoteId` yields an empty snapshot, not
 /// an error.
 #[tokio::test]
