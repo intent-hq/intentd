@@ -645,6 +645,11 @@ impl ChatDeltaState {
         }
         let seq = msg.get("seq").and_then(Value::as_u64);
         let ts = msg.get("timestamp").and_then(Value::as_str);
+        // Lift the persisted row's `metadata` onto each entity (additive) so
+        // subscribers can render metadata-driven affordances live — e.g. the
+        // sender attribution chip on an `agent_message`-tagged row — without
+        // a refetch. Rows without metadata keep the lean entity shape.
+        let metadata = msg.get("metadata").filter(|m| !m.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -665,7 +670,10 @@ impl ChatDeltaState {
             };
             let is_added = !self.seen_ids.contains(&bid);
             self.seen_ids.insert(bid.clone());
-            let entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
+            let mut entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
+            if let (Some(md), Some(obj)) = (metadata, entity.as_object_mut()) {
+                obj.insert("metadata".to_string(), md.clone());
+            }
             push_entity(&mut added, &mut updated, is_added, entity);
         }
         if added.is_empty() && updated.is_empty() {

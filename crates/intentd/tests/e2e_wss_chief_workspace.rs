@@ -1158,8 +1158,12 @@ where
 /// Asserts:
 /// - the persisted tool result carries the documented `{ ok, waitMode,
 ///   results }` shape with a `subscriptionId` and `groupId: null` per target,
+/// - a SECOND waitFor on the already-watched targets (same turn) is rejected
+///   with the pair-uniqueness `-32602` error naming the target — the wire
+///   contract for the duplicate-registration rejection,
 /// - `agent.getSubscriptions` reports both oneShot watches anchored under
-///   `__chief__` BEFORE the targets settle,
+///   `__chief__` BEFORE the targets settle (the rejected duplicate added
+///   nothing),
 /// - registration publishes `agent:subscriptions-changed` in `__chief__`,
 /// - each target's completion delivers a `[WORKSPACE EVENTS]` wake into the
 ///   chief transcript and the consumed oneShot watches drain the registry,
@@ -1174,10 +1178,16 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
 
     let data_dir = temp_data_dir();
     // The REGISTER_WAITS turn discovers the seeded targets by their
-    // test-controlled names, then registers immediate-mode waits on both.
+    // test-controlled names, registers immediate-mode waits on both, then
+    // immediately retries the same registration — the duplicate must be
+    // rejected (pair uniqueness) without disturbing the live watches.
     let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
               const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
-              return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'immediate' });";
+              const first = await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'immediate' });\n\
+              let duplicateError = null;\n\
+              try { await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'immediate' }); }\n\
+              catch (error) { duplicateError = error.message; }\n\
+              return { ...first, duplicateError };";
     let behavior = json!({
         "response": "ok",
         "rules": [{
@@ -1297,6 +1307,20 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         );
         assert!(entry["groupId"].is_null(), "immediate ⇒ ungrouped: {entry}");
     }
+    // Pair uniqueness over the wire: the same-turn duplicate waitFor was
+    // rejected with the `-32602` InvalidParams error naming an
+    // already-watched target (`already waiting on agent …`).
+    let duplicate_error = wait_result["duplicateError"]
+        .as_str()
+        .expect("duplicate waitFor must surface an error message");
+    assert!(
+        duplicate_error.contains("already waiting on agent"),
+        "pair-uniqueness rejection: {duplicate_error}"
+    );
+    assert!(
+        duplicate_error.contains(t1_id.as_str()) || duplicate_error.contains(t2_id.as_str()),
+        "rejection names the target: {duplicate_error}"
+    );
 
     // Registration published `agent:subscriptions-changed` in the PARENT's
     // home workspace (`__chief__`), for the chief caller.

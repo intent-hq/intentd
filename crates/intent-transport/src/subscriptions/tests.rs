@@ -1198,6 +1198,64 @@ mod chat_message_delta {
     }
 
     #[tokio::test]
+    async fn user_row_message_entities_carry_row_metadata() {
+        // A child→coordinator send persists the user row with
+        // `metadata: { type: "agent_message", fromAgentId, fromAgentName }`
+        // (sender attribution). The live delta entities must lift that row
+        // metadata so subscribers render the sender chip with no refetch —
+        // rows without metadata keep the pre-existing entity shape (additive).
+        let metadata = json!({
+            "type": "agent_message",
+            "fromAgentId": "agent-child",
+            "fromAgentName": "Child Agent",
+        });
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "metadata": metadata,
+                    "contentBlocks": [ { "type": "text", "text": "child report" } ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added[0]["metadata"], metadata,
+            "entity must carry the persisted row metadata: {d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_row_message_without_metadata_omits_the_field() {
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        for e in d["added"].as_array().unwrap() {
+            assert!(
+                e.get("metadata").is_none(),
+                "rows without metadata keep the lean entity shape: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn assistant_row_message_maps_to_none_without_re_read() {
         // Assistant rows are owned by the stream + terminal reconcile; an
         // `agent:message` echo for one must NOT emit (double-emission guard)
