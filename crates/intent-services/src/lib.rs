@@ -928,11 +928,8 @@ impl Services {
     /// `diffSummary` is intentionally **not** computed here. Full worktree
     /// rollups are too expensive for the high-frequency list/get/subscription
     /// re-read path; desktop FE already treats the field as deprecated and
-    /// fetches on demand via `GET_DIFF_SUMMARY`, and embedding the rollup on
-    /// every workspace re-read pinned the blocking pool. The
-    /// [`workspace_aggregates::WorkspaceAggregateCache`] remains for optional
-    /// on-demand callers and is invalidated from `file:*` /
-    /// `changes:git-status` events.
+    /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
+    /// every workspace re-read pinned the blocking pool.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -1677,14 +1674,7 @@ impl Services {
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
-        self.event_bus = Some(bus.clone());
-        // Keep the on-demand diffSummary cache coherent with the worktree:
-        // invalidate when files change or git status is published. No-op when
-        // there is no tokio runtime (some unit-test constructors).
-        workspace_aggregates::spawn_diff_cache_invalidation(
-            bus,
-            Arc::clone(&self.workspace_aggregates),
-        );
+        self.event_bus = Some(bus);
         self
     }
 
