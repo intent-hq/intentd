@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -26,8 +26,17 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
-      # this job's target dir stays small, and the self-hosted Mac has ~500G free.
+      # this job's target dir stays small, and tinybox has ~380G free.
       - uses: actions/checkout@v7
+      # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
+      # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
+      # relies on the runner user's passwordless sudo.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
       # the start of every job, and all jobs on this runner share one work
@@ -134,18 +143,26 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 8-core M1: the e2e tests spend most of their time
-      # blocked on daemon startup/IO, not CPU (flake retries are handled by
-      # .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 16
+      # 32 (not 64) on the 64-core tinybox: at 64 threads the latency-bound
+      # stress tests (e.g. e2e_wss_pool_contention_stress's <2s read assert)
+      # blow their wall-clock bounds under llvm-cov load on both nextest
+      # tries. 32 keeps the box saturated without the latency spikes.
+      NEXTEST_TEST_THREADS: 32
     steps:
       - uses: actions/checkout@v7
+      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
@@ -162,10 +179,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Node is required (not preinstalled on the self-hosted Mac, unlike
-      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
-      # and silently self-skip without it, which silently drops coverage below
-      # the floor.
+      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
+      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
+      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -193,18 +209,27 @@ jobs:
           if-no-files-found: warn
 
   coverage-all:
-    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Oversubscribe the 8-core M1: much of the suite is blocked on daemon
-      # startup/IO/timeouts, not CPU (flake retries are handled by
-      # .config/nextest.toml).
-      NEXTEST_TEST_THREADS: 16
+      # 32 (not 64) on the 64-core tinybox: at 64 threads the full workspace
+      # suite thrashes SQLite/WAL and wall-clock-timeout tests hard enough
+      # that even the nextest retry fails (concurrent_writes_no_sqlite_busy
+      # hit "database is locked" on both tries, bridge/auto-commit timing
+      # tests timed out). 32 keeps the box saturated without the lock storms.
+      NEXTEST_TEST_THREADS: 32
     steps:
       - uses: actions/checkout@v7
+      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
@@ -221,10 +246,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Node is required (not preinstalled on the self-hosted Mac, unlike
-      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
-      # and silently self-skip without it, which silently drops coverage below
-      # the floor.
+      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
+      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
+      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
