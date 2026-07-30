@@ -281,7 +281,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
 
     // Get the actual bound port from system.status (INTENTD_TCP_PORT=0 seam:
     // every listener start binds a fresh OS-assigned ephemeral port)
-    let status = common::await_wss_status(&socket).await;
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let initial_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set at boot") as u16;
@@ -323,7 +323,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     );
 
     // Verify system.status shows no listener (poll — teardown is async)
-    common::await_wss_stopped(&socket).await;
+    common::await_wss_stopped_logged(&socket, &data_dir.join("daemon.log")).await;
 
     // Verify new WSS connections are refused (TCP listener should be closed)
     await_tcp_refused(initial_port).await;
@@ -346,7 +346,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // ephemeral port, so re-read it rather than expecting the boot port
     // (settings-port reuse on re-enable is covered seam-free by
     // runtime_toggled_wss_serves_system_status below).
-    let status = common::await_wss_status(&socket).await;
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
@@ -446,7 +446,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     );
 
     // Verify system.status shows the WSS listener is running (poll — start is async)
-    let status = common::await_wss_status(&socket).await;
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let first_boot_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after enable") as u16;
@@ -522,7 +522,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     // REGRESSION TEST: Verify system.status shows the WSS listener is running
     // (before the fix, port would be null because persisted setting was
     // ignored). Poll — the boot auto-start is async relative to UDS readiness.
-    let status2 = common::await_wss_status(&socket).await;
+    let status2 = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let reboot_port = status2["result"]["port"]
         .as_u64()
         .expect("port should be set at reboot with persisted enabled=true")
@@ -605,7 +605,7 @@ async fn batch_hook_ordering_port_before_enable() {
 
     // Verify system.status shows the listener bound to the NEW port (poll —
     // the runtime listener start is async)
-    let status = common::await_wss_status(&socket).await;
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after batch enable") as u16;
@@ -646,7 +646,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Get status over UDS to find WSS port + fingerprint
-    let status = common::await_wss_status(&socket).await;
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
@@ -720,7 +720,7 @@ async fn runtime_toggled_wss_serves_system_status() {
     );
 
     // Verify WSS is now running (poll — the runtime listener start is async)
-    let status_after = common::await_wss_status(&socket).await;
+    let status_after = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
     let runtime_port = status_after["result"]["port"]
         .as_u64()
         .expect("port after toggle") as u16;
