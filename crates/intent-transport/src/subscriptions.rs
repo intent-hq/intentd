@@ -621,10 +621,25 @@ impl ChatDeltaState {
             .await
             .ok()?;
         let messages = conv.get("messages").and_then(Value::as_array)?;
-        let msg = messages
+        let Some(msg) = messages
             .iter()
-            .find(|m| m.get("id").and_then(Value::as_str) == Some(message_id.as_str()))?;
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(message_id.as_str()))
+        else {
+            tracing::debug!(
+                agent = %self.agent_id,
+                message = %message_id,
+                "agent:message re-read miss; delta dropped"
+            );
+            return None;
+        };
         let role = msg.get("role").and_then(Value::as_str).unwrap_or(role);
+        // Defense-in-depth: the role above is re-resolved from the persisted
+        // row, so a row reporting `assistant` despite a non-assistant event
+        // payload must still map to `None` (the stream + terminal reconcile
+        // owns assistant content).
+        if role == "assistant" {
+            return None;
+        }
         let seq = msg.get("seq").and_then(Value::as_u64);
         let ts = msg.get("timestamp").and_then(Value::as_str);
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;

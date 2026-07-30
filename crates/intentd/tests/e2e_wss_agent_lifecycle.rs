@@ -9981,27 +9981,34 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
     assert_eq!(send2["queued"], true, "second send queues: {send2}");
 
     // Conn B — the drained user row arrives as a delta with role "user" and
-    // the queued content, BEFORE the second turn's assistant chunks. Frames
-    // observed while waiting are checked: after the first turn's terminal
-    // reconcile, no assistant chunk may precede the queued user row.
-    let mut turn1_done = false;
-    let mut assistant_after_turn1 = false;
+    // the queued content, BEFORE the second turn's assistant chunks. The
+    // daemon does not order the drain's user-row emit against the FIRST
+    // turn's terminal frames (independent async paths, STAB-4 precedent), so
+    // the ordering gate keys off assistant message IDENTITY: any assistant
+    // entity with a second distinct messageId seen before the user row is a
+    // second-turn chunk that jumped the queue.
+    let mut assistant_message_ids: Vec<String> = Vec::new();
+    let mut second_turn_chunk_before_user = false;
     let (user_entity, user_delta) = await_chat_entity(&mut chat, 30, |e| {
         let role = e["role"].as_str().unwrap_or("");
         let text = e["block"]["text"].as_str().unwrap_or("");
         if role == "assistant" {
-            if e.get("streamingComplete") == Some(&Value::Bool(true)) {
-                turn1_done = true;
-            } else if turn1_done {
-                assistant_after_turn1 = true;
+            if let Some(mid) = e["messageId"].as_str() {
+                if !assistant_message_ids.iter().any(|m| m == mid) {
+                    assistant_message_ids.push(mid.to_string());
+                }
+                if assistant_message_ids.len() >= 2 {
+                    second_turn_chunk_before_user = true;
+                }
             }
         }
         role == "user" && text == "queued message"
     })
     .await;
     assert!(
-        !assistant_after_turn1,
-        "the dequeued user row must arrive before the second turn's assistant chunks"
+        !second_turn_chunk_before_user,
+        "the dequeued user row must arrive before the second turn's assistant \
+         chunks (assistant messageIds seen first: {assistant_message_ids:?})"
     );
     assert_eq!(user_entity["agentId"], json!(agent_id));
     assert_eq!(user_entity["streamingComplete"], json!(true));
