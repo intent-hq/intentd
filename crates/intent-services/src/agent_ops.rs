@@ -2930,19 +2930,27 @@ impl Services {
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
-        // Small tail, not just the last row: system markers (interruption
-        // notices) can trail a pending question message and must be walked
-        // past rather than mistaken for the transcript tail.
-        const HOLD_DERIVATION_TAIL: i64 = 10;
-        let Ok(messages) = self
-            .store
-            .get_agent_messages(agent_id, Some(HOLD_DERIVATION_TAIL))
-            .await
-        else {
-            return false;
-        };
-        let Some(last) = messages.iter().rev().find(|m| m.role != "system") else {
-            return false;
+        // Page back over the tail, growing the window while every fetched
+        // row is `system`-role, so an arbitrarily long run of trailing
+        // system markers (e.g. repeated interruption notices) can never hide
+        // a still-pending question underneath it. Stops as soon as a
+        // non-system row is found, the fetched page comes back shorter than
+        // requested (the whole transcript was system rows or empty — no
+        // hold), or the safety cap is hit (fails open to `false`).
+        const HOLD_DERIVATION_TAIL_START: i64 = 10;
+        const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
+        let mut tail = HOLD_DERIVATION_TAIL_START;
+        let last = loop {
+            let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
+                return false;
+            };
+            if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
+                break last.clone();
+            }
+            if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
+                return false;
+            }
+            tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {
             return false;
@@ -2981,9 +2989,24 @@ impl Services {
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {agent_id}")));
         }
+        // Preserve non-object metadata verbatim under a side key rather than
+        // discarding it: the column is documented/typed as a free-form
+        // object today, but silently replacing a non-object value (should
+        // one ever land there) would drop data (monorepo#751 review).
         let mut metadata = match session.metadata.take() {
             Some(Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
+            Some(other) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    "agent_session.metadata was a non-object JSON value; \
+                     preserving it under `priorNonObjectMetadata` while adding the \
+                     dismissal marker"
+                );
+                let mut map = serde_json::Map::new();
+                map.insert("priorNonObjectMetadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
         };
         metadata.insert(
             intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),

@@ -13417,6 +13417,60 @@ async fn question_hold_survives_trailing_system_row() {
     );
 }
 
+/// Regression (PR #751 review): the hold derivation must page back past an
+/// arbitrarily long run of trailing `system` rows — not just a small fixed
+/// tail — so repeated interruption markers can never bury a still-pending
+/// question and let an automatic delivery supersede it.
+#[tokio::test]
+async fn question_hold_survives_many_trailing_system_rows() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    svc.store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(svc.question_hold_active(&id).await, "hold armed");
+
+    // Pile up more system rows than the original fixed 10-row tail so a
+    // naive small-window derivation would miss the question underneath.
+    for i in 0..25 {
+        svc.store()
+            .append_agent_message(
+                &id,
+                "system",
+                &json!([{
+                    "type": "text",
+                    "text": format!("interruption marker {i}"),
+                    "meta": { "kind": "interruption" }
+                }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append system marker");
+    }
+    assert!(
+        svc.question_hold_active(&id).await,
+        "hold must survive 25 trailing system rows"
+    );
+
+    // A later user message still supersedes the questions past all the
+    // system rows.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "answers" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+    assert!(
+        !svc.question_hold_active(&id).await,
+        "user message past many system rows must supersede"
+    );
+}
+
 #[tokio::test]
 async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -13472,6 +13526,52 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         .await
         .expect("re-dismiss");
     assert_eq!(again["success"], json!(true));
+}
+
+/// Regression (PR #751 review): if `agent_session.metadata` ever holds a
+/// non-object JSON value, dismissing questions must not silently discard it —
+/// it should be preserved (nested under a side key) alongside the new
+/// dismissal marker rather than replaced outright.
+#[tokio::test]
+async fn dismiss_questions_preserves_non_object_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    // Force the session's metadata column into a non-object shape — not
+    // reachable through the normal `agent.*` API, but defensively possible
+    // if the column is ever written to by another code path.
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!("legacy-string-metadata"));
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("force non-object metadata");
+
+    let r = svc
+        .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    assert_eq!(r["success"], json!(true));
+
+    let after = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        after.dismissed_questions_message_id(),
+        Some(asked.id.as_str()),
+        "dismissal marker still persisted"
+    );
+    assert_eq!(
+        after
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("priorNonObjectMetadata")),
+        Some(&json!("legacy-string-metadata")),
+        "prior non-object metadata must be preserved, not dropped"
+    );
 }
 
 #[tokio::test]

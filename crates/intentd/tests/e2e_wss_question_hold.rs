@@ -87,9 +87,13 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
-        if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+        // Only dump the (potentially large) daemon log on test failure — cuts
+        // CI noise on the common green-run path.
+        if std::thread::panicking() {
+            let log_path = self.data_dir.join("daemon.log");
+            if let Ok(log) = std::fs::read_to_string(&log_path) {
+                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
