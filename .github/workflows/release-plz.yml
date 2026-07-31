@@ -25,14 +25,25 @@ on:
   push:
     branches: [main]
 
-# Coalesce superseded runs: only the newest queued run per ref matters —
-# release-plz derives everything from the current repo/tag state, so the
-# newest run does all the work any superseded queued run would have done.
-# `cancel-in-progress: false` is load-bearing: a run that is mid-flight on a
-# Release-PR merge commit must never be cancelled between computing the next
-# version and pushing the tag.
+# Coalesce superseded ordinary-push runs: only the newest queued run per ref
+# matters — `release-plz release-pr` derives the Release PR from the current
+# repo/tag state, so the newest run does all the work any superseded queued
+# run would have done.
+#
+# Release-PR merge pushes get their own group and are never coalesced: with
+# `release_always = false`, `release-plz release` only pushes the tag when
+# the *latest* commit is a Release-PR merge, so if a queued merge-commit run
+# were superseded by an ordinary push, the newer run would silently skip the
+# tag. Merge commits are detected by the Release PR's squash title
+# (release-plz's `chore: release vX.Y.Z` pr_name). Two Release-PR merges
+# can't coalesce with each other in practice: the next Release PR only
+# exists after the previous merge's release-pr job has run.
+#
+# `cancel-in-progress: false` is load-bearing in both groups: a run that is
+# mid-flight on a Release-PR merge commit must never be cancelled between
+# computing the next version and pushing the tag.
 concurrency:
-  group: release-plz-${{ github.ref }}
+  group: "release-plz-${{ github.ref }}-${{ startsWith(github.event.head_commit.message, 'chore: release') && 'release-merge' || 'push' }}"
   cancel-in-progress: false
 
 jobs:
@@ -82,6 +93,15 @@ jobs:
     # release job no-ops quickly, so the ordering costs nothing.
     needs: release-plz-release
     if: ${{ github.repository_owner == 'intent-hq' }}
+    # The workflow-level groups split release-merge and ordinary pushes, so
+    # two runs can be in flight at once. Serialize their release-pr jobs:
+    # concurrent `release-plz release-pr` executions would race on updating
+    # the release-plz-* branch and the Release PR. Coalescing a pending pr
+    # job here is safe — the tag work happened in the run's release job, and
+    # a newer pr job recomputes the Release PR from current state.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       # Pinned to v5 for the same release-plz temp-dir auth reason as above
       # (release-plz/release-plz#2957, intent-hq/monorepo#1037).
@@ -89,15 +109,16 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      # openssl-sys needs the OpenSSL headers; WarpBuild's ubuntu images
-      # preinstall libssl-dev (like ubuntu-latest), so this is normally a
-      # no-op — kept as an idempotent guard against image changes (same
-      # pattern as ci.yml).
-      - name: Install libssl-dev if missing
+      # openssl-sys needs the OpenSSL headers (found via pkg-config);
+      # WarpBuild's ubuntu images preinstall pkg-config and libssl-dev (like
+      # ubuntu-latest), so this is normally a no-op — kept as an idempotent
+      # guard against image changes (ci.yml's guard, extended to also cover
+      # a missing pkg-config).
+      - name: Install pkg-config/libssl-dev if missing
         run: |
-          if ! pkg-config --exists openssl; then
+          if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
             sudo -n apt-get update -qq
-            sudo -n apt-get install -y -qq libssl-dev
+            sudo -n apt-get install -y -qq pkg-config libssl-dev
           fi
       - name: Resolve pinned Rust channel
         id: toolchain
