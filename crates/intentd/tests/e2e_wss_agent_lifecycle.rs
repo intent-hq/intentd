@@ -11506,7 +11506,10 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
 /// BEFORE any assistant chunk of the triggered turn. The send carries a
 /// client-minted `userAppMessageId`, so the delta entity must lift it as
 /// `appMessageId` (monorepo#1157) and the served conversation row must carry
-/// the same serve-time stamped block id as the delta (monorepo#1114).
+/// the same serve-time stamped block id as the delta (monorepo#1114). A fresh
+/// `chat.subscribe` afterwards must serve a seq-0 snapshot whose user row
+/// carries the same `appMessageId` (snapshot/delta parity, the intentd#780
+/// review note).
 #[tokio::test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
@@ -11646,5 +11649,40 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         row["appMessageId"],
         json!("app-msg-delta-e2e"),
         "persisted row surfaces the appMessageId on reads: {row}"
+    );
+
+    // Re-subscribe on a fresh connection: the seq-0 snapshot reuses the
+    // `agent.getConversation` read shape verbatim, so its user row must echo
+    // the same lifted `appMessageId` the delta carried (snapshot/delta
+    // parity, the intentd#780 review note).
+    let mut chat2 = connect_ws(port, cfg.clone()).await;
+    let resub = wss_rpc(
+        &mut chat2,
+        30,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        resub["subscriptionId"].is_string(),
+        "re-subscribed: {resub}"
+    );
+    let snap2 = wss_push(&mut chat2, 15).await;
+    assert_eq!(snap2["params"]["kind"], "snapshot", "push: {snap2}");
+    let snap_row = snap2["params"]["snapshot"]["messages"]
+        .as_array()
+        .expect("snapshot messages")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&sent_row_id))
+        .unwrap_or_else(|| panic!("user row present in fresh snapshot: {snap2}"))
+        .clone();
+    assert_eq!(
+        snap_row["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "fresh snapshot user row carries the send's appMessageId: {snap_row}"
+    );
+    assert_eq!(
+        snap_row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "fresh snapshot block id matches the delta's block id"
     );
 }
