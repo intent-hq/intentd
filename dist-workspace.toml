@@ -30,11 +30,16 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # toolchains (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# All release jobs run on the org's self-hosted runners (GH-hosted billing is
+# Build jobs run on the org's self-hosted runners (GH-hosted billing is
 # unavailable): tinybox (Linux x64, Ubuntu 22.04), m1mac (macOS arm64), 5090pc
 # (Windows x64). Runner values must be single labels here (the generated
 # workflow interpolates them as strings), and each machine exposes its
 # hostname as a label.
+#
+# The global jobs (plan / build-global-artifacts / host / announce) run on
+# WarpBuild ephemeral runners instead: `plan` runs on every PR and the rest
+# fire at release time, so keeping them off tinybox isolates them from its
+# single-slot queue — the same rationale as ci.yml's route/burst pattern.
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
@@ -43,7 +48,7 @@ github-build-setup = "../dist-build-setup.yml"
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "tinybox"
+global = "warp-ubuntu-latest-x64-2x"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "m1mac"
