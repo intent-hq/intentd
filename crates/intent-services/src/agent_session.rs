@@ -695,6 +695,22 @@ impl Services {
         self.live_turns.lock().ok()?.get(agent_id).cloned()
     }
 
+    /// Read just the text of the live-turn slot's `type: "text"` blocks
+    /// without cloning the full slot — the `AgentLite` preview overlay only
+    /// needs the text strings, so `tool_use`/`tool_result` payloads (which can
+    /// be large mid-turn) stay untouched under the lock. `None` when no slot
+    /// is open; `Some(vec![])` when a slot is open but has no text blocks yet.
+    pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<Vec<String>> {
+        self.live_turns.lock().ok()?.get(agent_id).map(|live| {
+            live.blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+    }
+
     /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
     /// without cloning the streamed blocks — the liveness reads
     /// (`agent.get`/`agent.list`/`agent.getConversation`/snapshot overlay) poll
