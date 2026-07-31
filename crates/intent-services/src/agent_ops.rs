@@ -465,19 +465,27 @@ pub(crate) fn last_response_and_digest_from_blocks(
 
 /// Live/mid-turn variant of [`last_response_and_digest_from_blocks`] for the
 /// in-flight preview surfaces (`agent:stream:activity` and the `AgentLite`
-/// live-turn overlay): the final block is still streaming, so its trailing
-/// partial line (text after the last newline) is clipped before the last-line
-/// extraction — the preview advances on newline boundaries and never surfaces
-/// a partially-streamed line. A turn that has not completed any non-empty
-/// line yet yields `None` (same as the pre-first-token case). The digest is
-/// derived from the UNCLIPPED text: its capture already requires the closing
-/// tag, so a fully-streamed `<agent_digest>…</agent_digest>` surfaces
-/// immediately while a partial span never leaks (the cleaning strips an
-/// unclosed opener to end-of-text). Terminal/persisted callers keep using
+/// live-turn overlay): when the final text block is still streaming
+/// (`final_block_open`), its trailing partial line (text after the last
+/// newline) is clipped before the last-line extraction — the preview advances
+/// on newline boundaries and never surfaces a partially-streamed line. A turn
+/// that has not completed any non-empty line yet yields `None` (same as the
+/// pre-first-token case). A final text block CLOSED by a non-text block
+/// boundary (e.g. a tool call flushed it and no new text has streamed since)
+/// is complete even without a trailing newline, so the caller passes
+/// `final_block_open: false` and no clipping applies. The digest is derived
+/// from the UNCLIPPED text: its capture already requires the closing tag, so
+/// a fully-streamed `<agent_digest>…</agent_digest>` surfaces immediately
+/// while a partial span never leaks (the cleaning strips an unclosed opener
+/// to end-of-text). Terminal/persisted callers keep using
 /// [`last_response_and_digest_from_blocks`] unchanged.
 pub(crate) fn live_response_and_digest_from_blocks(
     blocks: &[String],
+    final_block_open: bool,
 ) -> (Option<String>, Option<String>) {
+    if !final_block_open {
+        return last_response_and_digest_from_blocks(blocks);
+    }
     let (_, digest) = last_response_and_digest_from_blocks(blocks);
     let (last_response, _) =
         last_response_and_digest_from_blocks(&clip_trailing_partial_line(blocks));
@@ -485,7 +493,7 @@ pub(crate) fn live_response_and_digest_from_blocks(
 }
 
 /// Drop the still-streaming trailing partial line from live-turn text blocks:
-/// only the FINAL block can be mid-stream (earlier blocks were closed by a
+/// only the FINAL block is mid-stream (earlier blocks were closed by a
 /// non-text block boundary and pass through unchanged), so its text is
 /// clipped at the last newline (inclusive); a final block with no newline at
 /// all is dropped entirely.
@@ -1343,7 +1351,7 @@ impl Services {
         // value is kept.
         let live_overlay = if is_responding {
             self.live_turn_text_blocks(&session.id)
-                .map(|blocks| live_response_and_digest_from_blocks(&blocks))
+                .map(|(blocks, open)| live_response_and_digest_from_blocks(&blocks, open))
         } else {
             None
         };
