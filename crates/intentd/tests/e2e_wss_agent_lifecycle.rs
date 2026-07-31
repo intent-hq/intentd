@@ -1197,7 +1197,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1227,7 +1227,9 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // First turn streams its chunk and parks at session/cancel. Hard deadline:
+    // First turn streams its chunk and parks at session/cancel. The broadcast
+    // carrying content is `chat:stream:delta` (the `agent:stream:activity`
+    // rename left the agent:* family content-free). Hard deadline:
     // `wss_event`'s per-read window resets on every frame (heartbeat pings
     // included), which can spin past the runner's test budget on a slow
     // coverage machine instead of failing fast. On timeout, surface every
@@ -1247,7 +1249,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
                  daemon.log tail:\n{tail}"
             );
         };
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
