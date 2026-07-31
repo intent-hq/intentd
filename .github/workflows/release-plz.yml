@@ -10,6 +10,12 @@
 # tags and PRs created with GITHUB_TOKEN do not trigger other workflows, and
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
+#
+# Both jobs run on WarpBuild ephemeral runners, not the self-hosted tinybox
+# slot: every push to main triggers this workflow, and queueing behind the
+# single tinybox slot (shared with CI's heavy jobs) ballooned wall clock to
+# hours (intent-hq/monorepo#1221). See intentd#749/#787 for the runner
+# placement history.
 
 name: Release-plz
 
@@ -19,17 +25,27 @@ on:
   push:
     branches: [main]
 
+# Coalesce superseded runs: only the newest queued run per ref matters —
+# release-plz derives everything from the current repo/tag state, so the
+# newest run does all the work any superseded queued run would have done.
+# `cancel-in-progress: false` is load-bearing: a run that is mid-flight on a
+# Release-PR merge commit must never be cancelled between computing the next
+# version and pushing the tag.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
   # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
   # and the implicit token stays powerless.
+  # A 2x runner is plenty: on ordinary commits this job is a ~15s no-op, and
+  # on Release-PR merges it only does git/tag work (releases are git-tag-only
+  # per release-plz.toml — nothing is compiled or published).
   release-plz-release:
     name: Release-plz release
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: warp-ubuntu-latest-x64-2x
     if: ${{ github.repository_owner == 'intent-hq' }}
-    concurrency:
-      group: release-plz-release-${{ github.ref }}
-      cancel-in-progress: false
     steps:
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
       # config scoped to the workspace, which release-plz's temp-dir copy of the
@@ -55,18 +71,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
+  # Sized like ci.yml's check burst runner (16x): this job runs
+  # `cargo package --workspace`, which compiles the workspace.
   release-plz-pr:
     name: Release-plz PR
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: warp-ubuntu-latest-x64-16x
     # Run after the release job: on a Release-PR merge commit the tag must be
     # pushed before release-pr computes the next version, or it races on tag
     # visibility and can open a spurious Release PR. On ordinary commits the
     # release job no-ops quickly, so the ordering costs nothing.
     needs: release-plz-release
     if: ${{ github.repository_owner == 'intent-hq' }}
-    concurrency:
-      group: release-plz-pr-${{ github.ref }}
-      cancel-in-progress: false
     steps:
       # Pinned to v5 for the same release-plz temp-dir auth reason as above
       # (release-plz/release-plz#2957, intent-hq/monorepo#1037).
@@ -74,6 +89,16 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # openssl-sys needs the OpenSSL headers; WarpBuild's ubuntu images
+      # preinstall libssl-dev (like ubuntu-latest), so this is normally a
+      # no-op — kept as an idempotent guard against image changes (same
+      # pattern as ci.yml).
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq libssl-dev
+          fi
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -103,7 +128,11 @@ jobs:
         run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
       # Cross-run build cache for the `cargo package --workspace` compiles;
       # without it every run cold-compiles the whole workspace (~30-45 min).
+      # The shared-key follows ci.yml's `warp-burst-*` pattern so ephemeral
+      # WarpBuild runners restore the same cache across runs.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: warp-release-plz-pr
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
