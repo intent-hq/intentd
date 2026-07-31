@@ -310,6 +310,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// a read landing right after the event can still see the previous status on a
 /// loaded host — poll with a hard deadline instead of asserting the first
 /// snapshot. Fresh JSON-RPC ids per iteration: `wss_rpc` matches replies by id.
+/// Total time stays bounded even past the deadline: `wss_rpc` itself panics
+/// after its own 15s receive timeout, so worst case is one in-flight RPC over.
 async fn await_session_status<S>(
     ws: &mut WebSocketStream<S>,
     ws_id: &str,
