@@ -6184,9 +6184,18 @@ impl Services {
         }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
+        // Row-level metadata rides along with the in-block fold (monorepo#1217)
+        // so wake deliveries match the direct-send and queue-drain persists —
+        // the FE attribution chip reads the row's `metadata` column.
         let message = match self
             .store
-            .append_agent_message(agent_id, "user", &blocks, &created_at)
+            .append_agent_message_with_metadata(
+                agent_id,
+                "user",
+                &blocks,
+                message_metadata,
+                &created_at,
+            )
             .await
         {
             Ok(msg) => {
@@ -6302,9 +6311,16 @@ impl Services {
         }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
+        // Row-level metadata parity with the runtime branch (monorepo#1217).
         match self
             .store
-            .append_agent_message(agent_id, "user", &blocks, &created_at)
+            .append_agent_message_with_metadata(
+                agent_id,
+                "user",
+                &blocks,
+                message_metadata,
+                &created_at,
+            )
             .await
         {
             Ok(message) => {

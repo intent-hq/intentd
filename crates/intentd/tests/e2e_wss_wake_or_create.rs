@@ -524,6 +524,37 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     )
     .await;
     assert_eq!(got["agent"]["id"], new_agent_id);
+
+    // (6) monorepo#1217: the `messageMetadata` from step (3) is persisted as
+    //     ROW-LEVEL metadata on the delivered wake user message (not just
+    //     folded onto the content block) — the FE attribution chip reads the
+    //     row's `metadata` via `agent.getConversation` / `chat.subscribe`.
+    let convo = wss_rpc(
+        &mut rpc,
+        7,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": new_agent_id }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let wake_row = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("reboot"))
+        })
+        .unwrap_or_else(|| panic!("wake user row persisted: {convo}"));
+    assert_eq!(
+        wake_row["metadata"],
+        json!({ "type": "task_wake", "source": "wake" }),
+        "wake row carries row-level messageMetadata (monorepo#1217): {wake_row}"
+    );
+    assert_eq!(
+        wake_row["contentBlocks"][0]["messageMetadata"]["type"], "task_wake",
+        "in-block fold preserved alongside the row-level copy: {wake_row}"
+    );
 }
 
 /// monorepo#926: the create branch auto-subscribes the caller. A
