@@ -1006,13 +1006,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.assignAgent`: append an agent to a task's assignee list (§5.4).
+    /// Assigning a NEW agent to a task that already has a live assigned agent
+    /// is rejected unless `force` is `Some(true)`; re-assigning an
+    /// already-assigned id stays idempotent-ok.
     fn assign_agent(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
-        let _ = (workspace_id, note_id, agent_id);
+        let _ = (workspace_id, note_id, agent_id, force);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::assign_agent not implemented".to_string(),

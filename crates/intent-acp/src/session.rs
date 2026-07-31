@@ -298,11 +298,12 @@ pub fn supports_load_session(init: &InitializeResponse) -> bool {
 /// canonical `WorkspaceEvent` and accumulate the assistant transcript (§6.6).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MappedUpdate {
-    /// `agent_message_chunk` → `agent:stream:chunk` + transcript accumulation.
-    /// `content` is the event payload (`content: any`); `text` is the extracted
-    /// text for text blocks (used to coalesce the accumulated transcript).
+    /// `agent_message_chunk` → `chat:stream:delta` (+ the throttled
+    /// `agent:stream:activity` signal) + transcript accumulation. `content` is
+    /// the event payload (`content: any`); `text` is the extracted text for
+    /// text blocks (used to coalesce the accumulated transcript).
     Chunk {
-        /// The `data.content` carried on the `agent:stream:chunk` event.
+        /// The `data.content` carried on the `chat:stream:delta` event.
         content: Value,
         /// Extracted text for text blocks; `None` for non-text content.
         text: Option<String>,

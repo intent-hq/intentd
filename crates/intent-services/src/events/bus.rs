@@ -5,7 +5,7 @@
 //! persists the event first (so the durable log is the source of truth), then
 //! fans it out to live subscribers. [`EventBus::publish_transient`] mints an
 //! event id and broadcasts WITHOUT persisting (for high-volume ephemeral events
-//! like `agent:stream:chunk`). [`EventBus::subscribe`] returns a
+//! like `chat:stream:delta`). [`EventBus::subscribe`] returns a
 //! [`Subscription`] whose per-subscriber delivery task applies the
 //! [`SubscriptionFilter`] and coalesces matched events within `batch_window`
 //! (the TS `batchFlushWorker`: the timer starts on the first matched event).
@@ -115,7 +115,7 @@ impl EventBus {
 
     /// Mint an event id (UUIDv7) + timestamp and broadcast to live subscribers
     /// WITHOUT persisting. Used for high-volume ephemeral events (e.g.
-    /// `agent:stream:chunk`) that do not need durable storage. The wire shape
+    /// `chat:stream:delta`) that do not need durable storage. The wire shape
     /// matches persisted events exactly (same id/timestamp minting as
     /// `Store::insert_event`), so subscribers see identical structure.
     ///

@@ -1990,6 +1990,132 @@ async fn get_conversation_strips_anonymous_tool_use_pairs() {
     assert_eq!(blocks[2]["tool_use_id"], "real-1");
 }
 
+/// monorepo#1114 helper: only id-less object blocks are stamped with the
+/// stable synthetic `{messageId}:{index}`; existing ids are never overwritten,
+/// non-object blocks pass through, and the index counts ALL blocks so it
+/// matches the delta path's enumeration. An empty-string id is treated as
+/// missing (it can't serve as a stable upsert key). Non-array content is
+/// untouched.
+#[test]
+fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
+    use crate::agent_ops::stamp_synthetic_block_ids;
+    let msg = |content: serde_json::Value| intent_core::AgentMessage {
+        id: "m-1".to_string(),
+        agent_id: AgentId::from("agent-x"),
+        seq: 1,
+        role: "user".to_string(),
+        content,
+        metadata: None,
+        app_message_id: None,
+        created_at: now_iso(),
+    };
+    let stamped = stamp_synthetic_block_ids(msg(json!([
+        { "type": "text", "text": "no id" },
+        { "type": "text", "id": "kept", "text": "has id" },
+        "not-an-object",
+        { "type": "image", "data": "x", "mimeType": "image/png" },
+        { "type": "text", "id": "", "text": "empty id" },
+    ])));
+    let blocks = stamped.content.as_array().unwrap();
+    assert_eq!(blocks[0]["id"], "m-1:0");
+    assert_eq!(
+        blocks[1]["id"], "kept",
+        "existing ids are never overwritten"
+    );
+    assert_eq!(blocks[2], json!("not-an-object"));
+    assert_eq!(
+        blocks[3]["id"], "m-1:3",
+        "index counts ALL blocks, matching the delta path's enumeration"
+    );
+    assert_eq!(
+        blocks[4]["id"], "m-1:4",
+        "an empty-string id is treated as missing and re-stamped"
+    );
+    let passthrough = stamp_synthetic_block_ids(msg(json!("raw")));
+    assert_eq!(passthrough.content, json!("raw"));
+}
+
+/// monorepo#1114 strip→stamp composition: when `strip_anonymous_tool_blocks`
+/// removes leading blocks, a surviving id-less block is stamped with its
+/// POST-strip index — the invariant that makes the served array's ids match
+/// the delta path's enumeration of the same served blocks.
+#[test]
+fn stamp_after_strip_uses_post_strip_indices() {
+    use crate::agent_ops::{stamp_synthetic_block_ids, strip_anonymous_tool_blocks};
+    let message = intent_core::AgentMessage {
+        id: "m-2".to_string(),
+        agent_id: AgentId::from("agent-x"),
+        seq: 1,
+        role: "assistant".to_string(),
+        content: json!([
+            { "type": "tool_use", "toolCallId": "anon-1", "name": "", "input": {} },
+            { "type": "tool_result", "tool_use_id": "anon-1", "content": [] },
+            { "type": "text", "text": "survives without an id" },
+        ]),
+        metadata: None,
+        app_message_id: None,
+        created_at: now_iso(),
+    };
+    let served = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+    let blocks = served.content.as_array().unwrap();
+    assert_eq!(blocks.len(), 1, "anonymous pair stripped: {blocks:?}");
+    assert_eq!(
+        blocks[0]["id"], "m-2:0",
+        "synthetic id reflects the post-strip index, not the original position"
+    );
+}
+
+/// monorepo#1114: `agent.getConversation` stamps the stable synthetic
+/// `{messageId}:{index}` id onto blocks that persisted without one, so the
+/// snapshot paths serve the same block identity the §7.1 delta path stamps.
+/// Blocks persisted WITH an id (assistant content) are untouched, and the
+/// stored rows are never mutated (the read is idempotent).
+#[tokio::test]
+async fn get_conversation_stamps_synthetic_block_ids() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Stamped").await;
+    // Non-assistant rows persist id-less blocks (queue drains, direct sends).
+    let user_blocks = json!([
+        { "type": "text", "text": "hello" },
+        { "type": "image", "data": "abc", "mimeType": "image/png" },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "user", &user_blocks, &now_iso())
+        .await
+        .expect("append user");
+    let assistant_blocks = json!([{ "type": "text", "id": "msg:0", "text": "hi" }]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &assistant_blocks, &now_iso())
+        .await
+        .expect("append assistant");
+
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    let messages = res["messages"].as_array().unwrap();
+    let row_id = messages[0]["id"].as_str().expect("row id");
+    assert_eq!(
+        messages[0]["contentBlocks"][0]["id"],
+        json!(format!("{row_id}:0"))
+    );
+    assert_eq!(
+        messages[0]["contentBlocks"][1]["id"],
+        json!(format!("{row_id}:1"))
+    );
+    assert_eq!(
+        messages[1]["contentBlocks"][0]["id"], "msg:0",
+        "blocks persisted with an id keep it"
+    );
+    // Serve-time only: a second read re-derives the same ids from unmutated
+    // stored rows.
+    let again = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv again");
+    assert_eq!(again["messages"], res["messages"]);
+}
+
 #[tokio::test]
 async fn rename_and_set_model_persist() {
     let (_t, svc, ws) = setup().await;
@@ -3767,7 +3893,7 @@ async fn wake_or_create_reuses_existing_watch_no_duplicate() {
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-2 dedupe").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -3810,7 +3936,7 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
     let caller = create_agent(&svc, &ws, "OldName").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-2 rename").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -3861,7 +3987,7 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-2 reuse-after-removal").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -4494,7 +4620,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     let (_t, svc, ws) = setup().await;
     let agent_id = create_agent(&svc, &ws, "TaskMetaRecv").await;
     let note_id = seed_task(&svc, &ws, "metadata fallback task").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
     let metadata = json!({
@@ -7439,7 +7565,7 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-1 wake").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -7520,7 +7646,7 @@ async fn wake_or_create_without_caller_registers_no_watch() {
     let (_t, svc, ws) = setup().await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-1 no caller").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -7601,7 +7727,7 @@ async fn wake_or_create_scope_gate_rejection_wake_branch_is_side_effect_free() {
     let caller = create_agent(&svc, &ws_a, "Out-of-scope caller").await;
     let target = create_agent(&svc, &ws_b, "Assignee").await;
     let note_id = seed_task(&svc, &ws_b, "Cross-ws wake").await;
-    svc.assign_agent(ws_b.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws_b.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -7712,7 +7838,7 @@ async fn wake_or_create_skips_watch_when_caller_deleted_wake_branch() {
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "Deleted caller wake").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
     flag_agent_deleted(&svc, &caller).await;
@@ -7770,7 +7896,7 @@ async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
     let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
     let target = create_agent(&svc, &ws, "Busy assignee").await;
     let note_id = seed_task(&svc, &ws, "Deleted caller queued").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
     flag_agent_deleted(&svc, &caller).await;
@@ -7835,7 +7961,7 @@ async fn wake_or_create_queued_registers_non_oneshot_watch() {
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Busy assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-1 queued").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
     // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
@@ -7924,7 +8050,7 @@ async fn wake_or_create_queued_upgrades_existing_oneshot_watch() {
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
     let note_id = seed_task(&svc, &ws, "SUB-2 mode mismatch").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
         .await
         .expect("assign");
 
@@ -9990,6 +10116,133 @@ async fn diagnostics_agent_filter_narrows_scope() {
     assert_eq!(diag["filters"]["agentId"], json!(a.0));
 }
 
+/// monorepo#1150: the `taskNoteId` filter matches the agents actually
+/// associated with the task — the union of sessions persisting
+/// `task_note_id` (`agent.delegate`) and the note-side `assigned_agents`
+/// (`task.assignAgent`) — instead of matching nothing.
+#[tokio::test]
+async fn diagnostics_task_filter_matches_task_agents() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "diagnostics filter task").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("work the task".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let delegated = resp["agentId"].as_str().expect("agentId").to_string();
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["filters"]["taskNoteId"], json!(note_id.as_str()));
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1, "only the task's agent is in scope: {diag}");
+    assert_eq!(agents[0]["id"], json!(delegated));
+    assert_eq!(diag["summary"]["agents"], json!(1));
+}
+
+/// monorepo#1150: an agent assigned note-side only (`task.assignAgent`; its
+/// session's `task_note_id` is unset) is still in the `taskNoteId` scope.
+#[tokio::test]
+async fn diagnostics_task_filter_includes_note_side_assignees() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "note-side assignment task").await;
+    let assignee = create_agent(&svc, &ws, "Assignee").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), assignee.0.clone(), None)
+        .await
+        .expect("assign");
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None)
+        .await
+        .expect("diagnostics");
+    let agents = result["diagnostics"]["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 1, "note-side assignee is in scope: {result}");
+    assert_eq!(agents[0]["id"], json!(assignee.0));
+}
+
+/// monorepo#1150: a session whose persisted `task_note_id` matches the
+/// filter is in scope even when the agent is NOT in the note's
+/// `assigned_agents` — the session-side branch of the union stands on its
+/// own. (`agent.delegate` sets both sides, so the note-side assignment is
+/// stripped store-side to isolate the branch.)
+#[tokio::test]
+async fn diagnostics_task_filter_matches_session_side_only() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "session-side only task").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_note_id: Some(note_id.clone()),
+                agent_instructions: Some("work the task".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let delegated = resp["agentId"].as_str().expect("agentId").to_string();
+    let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
+
+    // Strip the note-side assignment so only the session's `task_note_id`
+    // links the agent to the task.
+    let mut note = svc
+        .store
+        .get_note(&ws, &note_id)
+        .await
+        .expect("get task note");
+    let mut task = note.metadata.task.clone().expect("task metadata");
+    assert_eq!(
+        task.assigned_agent_ids,
+        vec![AgentId::from(delegated.as_str())],
+        "delegate assigned the agent note-side"
+    );
+    task.assigned_agent_ids.clear();
+    note.metadata.task = Some(task);
+    svc.store.update_note(&note).await.expect("update note");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let agents = diag["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents.len(),
+        1,
+        "session-side match alone keeps the agent in scope: {diag}"
+    );
+    assert_eq!(agents[0]["id"], json!(delegated));
+}
+
+/// monorepo#1150: a nonexistent `taskNoteId` yields an empty snapshot, not
+/// an error.
+#[tokio::test]
+async fn diagnostics_task_filter_unknown_note_yields_empty_snapshot() {
+    let (_t, svc, ws) = setup().await;
+    let _agent = create_agent(&svc, &ws, "Someone").await;
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, Some(NoteId::from("note-missing")), None)
+        .await
+        .expect("diagnostics must not error on an unknown note");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["summary"]["agents"], json!(0));
+    assert_eq!(diag["agents"], json!([]));
+}
+
 /// A completion watch whose parent has no live session surfaces an
 /// `orphaned-subscription` stuck-risk signal.
 #[tokio::test]
@@ -10650,10 +10903,10 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
         .expect("create new");
     let old_id = old["agent"]["id"].as_str().unwrap().to_string();
     let new_id = new["agent"]["id"].as_str().unwrap().to_string();
-    svc.assign_agent(ws.clone(), note_id.clone(), old_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), old_id.clone(), None)
         .await
         .expect("assign old");
-    svc.assign_agent(ws.clone(), note_id.clone(), new_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), new_id.clone(), Some(true))
         .await
         .expect("assign new");
 
@@ -10704,10 +10957,10 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
         .expect("create stale");
     let live_id = live["agent"]["id"].as_str().unwrap().to_string();
     let stale_id = stale["agent"]["id"].as_str().unwrap().to_string();
-    svc.assign_agent(ws.clone(), note_id.clone(), live_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), live_id.clone(), None)
         .await
         .expect("assign live");
-    svc.assign_agent(ws.clone(), note_id.clone(), stale_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), stale_id.clone(), Some(true))
         .await
         .expect("assign stale");
     // Wipe the stale session so its assignment becomes NotFound-stale.
@@ -10813,7 +11066,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
         .await
         .expect("create prev");
     let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
-    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
         .await
         .expect("assign prev");
     // Flip the previous session to `Deleted` (row stays, marked as
@@ -11064,7 +11317,7 @@ async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
     let (_t, svc, manager, bus, ws) = setup_with_manager().await;
     let agent_id = create_agent(&svc, &ws, "Follow-up target").await;
     let note_id = seed_task(&svc, &ws, "DELIV-1 send-to-task").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
 
@@ -13222,7 +13475,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
         .await
         .expect("create prev");
     let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
-    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
         .await
         .expect("assign prev");
     // Park the session poisoned: Error + session-fatal provider block.
@@ -13279,7 +13532,7 @@ async fn wake_or_create_skips_streak_poisoned_session() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Streak").await;
     let prev = create_agent(&svc, &ws, "prev").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
         .await
         .expect("assign prev");
     svc.store()
@@ -13336,7 +13589,7 @@ async fn wake_or_create_migrates_poisoned_queue_to_created_agent() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Migrate Create").await;
     let prev = create_agent(&svc, &ws, "Poisoned").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
         .await
         .expect("assign prev");
     poison_session(&svc, &ws, &prev).await;
@@ -13393,10 +13646,10 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     // poisoned sibling, then falls through to the live agent.
     let live = create_agent(&svc, &ws, "Live").await;
     let bad = create_agent(&svc, &ws, "Poisoned").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), live.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), live.0.clone(), None)
         .await
         .expect("assign live");
-    svc.assign_agent(ws.clone(), note_id.clone(), bad.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), bad.0.clone(), Some(true))
         .await
         .expect("assign poisoned");
     poison_session(&svc, &ws, &bad).await;
@@ -13436,7 +13689,7 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     let soft = create_agent(&svc, &ws, "Soft").await;
     let gone = create_agent(&svc, &ws, "Gone").await;
     for id in [&live, &soft, &gone] {
-        svc.assign_agent(ws.clone(), note_id.clone(), id.0.clone())
+        svc.assign_agent(ws.clone(), note_id.clone(), id.0.clone(), Some(true))
             .await
             .expect("assign");
     }
@@ -13494,7 +13747,7 @@ async fn wake_or_create_survives_failed_queue_migration() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "Migrate Fail").await;
     let prev = create_agent(&svc, &ws, "Poisoned").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
         .await
         .expect("assign prev");
     poison_session(&svc, &ws, &prev).await;
@@ -15069,7 +15322,7 @@ async fn hold_gates_store_only_send_to_task() {
     let (_t, svc, ws) = setup().await;
     let agent_id = create_agent(&svc, &ws, "HeldTaskRecv").await;
     let note_id = seed_task(&svc, &ws, "held task").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
     arm_question_hold(&svc, &agent_id).await;
@@ -15154,4 +15407,194 @@ async fn interrupt_enqueue_orders_ahead_of_normal_and_persists() {
     let front = restarted.dequeue_message(&id).expect("dequeue");
     assert_eq!(front.content, "int-1");
     assert!(front.interrupt_priority, "marker survives restart");
+}
+
+// ---------------------------------------------------------------------------
+// Occupancy guard: agent.delegate / task.assignAgent refuse to silently
+// double-assign a task that already has a live assigned agent.
+// ---------------------------------------------------------------------------
+
+fn delegate_input(note_id: &NoteId, force: Option<bool>) -> AgentDelegateInput {
+    AgentDelegateInput {
+        task_note_id: Some(note_id.clone()),
+        agent_instructions: Some("do the work".into()),
+        force,
+        ..Default::default()
+    }
+}
+
+/// Unoccupied task → first delegate succeeds without `force`.
+#[tokio::test]
+async fn delegate_unoccupied_task_succeeds_without_force() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Fresh").await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect("first delegate must pass the guard");
+    assert_eq!(resp["ok"], true);
+}
+
+/// Occupied task (live assigned agent) → second delegate is rejected with
+/// `-32602` naming the existing agent; `force: true` allows it.
+#[tokio::test]
+async fn delegate_occupied_task_rejected_unless_forced() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Busy").await;
+    let first = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect("first delegate");
+    let first_id = first["agentId"].as_str().expect("agentId").to_string();
+
+    let err = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect_err("second delegate must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains(&first_id), "error names the agent id: {msg}");
+            assert!(
+                msg.contains("already being worked"),
+                "error states occupancy: {msg}"
+            );
+            assert!(
+                msg.contains("force: true"),
+                "error mentions override: {msg}"
+            );
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    // Rejection is side-effect free: only the first child exists.
+    let note = svc
+        .get_note(ws.clone(), note_id.clone())
+        .await
+        .expect("note");
+    let task = note.metadata.task.expect("task");
+    assert_eq!(task.assigned_agent_ids.len(), 1);
+
+    let forced = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id, Some(true)), None)
+        .await
+        .expect("force: true must bypass the guard");
+    assert_ne!(forced["agentId"].as_str().unwrap(), first_id);
+    let note = svc.get_note(ws, note_id).await.expect("note");
+    assert_eq!(
+        note.metadata.task.expect("task").assigned_agent_ids.len(),
+        2
+    );
+}
+
+/// Stale (NotFound), soft-Deleted, and poisoned assignees do NOT count as
+/// occupancy — a new delegate still succeeds without `force`.
+#[tokio::test]
+async fn delegate_with_only_dead_assignees_succeeds_without_force() {
+    // NotFound-stale: a validly-formatted id with no session row.
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Stale").await;
+    let ghost = format!("agent-{}", uuid::Uuid::new_v4());
+    svc.assign_agent(ws.clone(), note_id.clone(), ghost, Some(true))
+        .await
+        .expect("assign ghost");
+    svc.agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect("stale assignee must not block delegation");
+
+    // Soft-Deleted assignee.
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Deleted").await;
+    let prev = create_agent(&svc, &ws, "prev").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
+        .await
+        .expect("assign prev");
+    flag_agent_deleted(&svc, &prev).await;
+    svc.agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect("deleted assignee must not block delegation");
+
+    // Poisoned assignee (monorepo#840 predicate).
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Poisoned").await;
+    let prev = create_agent(&svc, &ws, "prev").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
+        .await
+        .expect("assign prev");
+    poison_session(&svc, &ws, &prev).await;
+    svc.agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+        .await
+        .expect("poisoned assignee must not block delegation");
+}
+
+/// A task whose status is `complete` or `cancelled` is not workable — its
+/// assignments never count as occupancy, so delegation passes without `force`.
+#[tokio::test]
+async fn delegate_completed_or_cancelled_task_succeeds_without_force() {
+    for status in ["complete", "cancelled"] {
+        let (_t, svc, ws) = setup().await;
+        let note_id = seed_task(&svc, &ws, "Done").await;
+        let prev = create_agent(&svc, &ws, "prev").await;
+        svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone(), None)
+            .await
+            .expect("assign prev");
+        WorkspaceApi::task_update_note_status(
+            &svc,
+            ws.clone(),
+            note_id.clone(),
+            status.into(),
+            None,
+            None,
+        )
+        .await
+        .expect("finish task");
+        svc.agent_delegate_op(ws.clone(), delegate_input(&note_id, None), None)
+            .await
+            .unwrap_or_else(|e| panic!("{status} task must not block delegation: {e:?}"));
+    }
+}
+
+/// `task.assignAgent`: a NEW agent on an occupied task is rejected without
+/// `force` and allowed with it; re-assigning the already-assigned id stays
+/// idempotent-ok either way.
+#[tokio::test]
+async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Guarded").await;
+    let live = create_agent(&svc, &ws, "live").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), live.0.clone(), None)
+        .await
+        .expect("first assign on unoccupied task");
+
+    // Same-id re-assign stays idempotent-ok, no force needed.
+    let r = svc
+        .assign_agent(ws.clone(), note_id.clone(), live.0.clone(), None)
+        .await
+        .expect("idempotent re-assign");
+    assert!(r.ok);
+
+    let second = create_agent(&svc, &ws, "second").await;
+    let err = svc
+        .assign_agent(ws.clone(), note_id.clone(), second.0.clone(), None)
+        .await
+        .expect_err("new agent on occupied task must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains(live.0.as_str()), "error names occupant: {msg}");
+            assert!(
+                msg.contains("force: true"),
+                "error mentions override: {msg}"
+            );
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    let r = svc
+        .assign_agent(ws.clone(), note_id.clone(), second.0.clone(), Some(true))
+        .await
+        .expect("force: true must bypass the guard");
+    assert!(r.ok);
+    let note = svc.get_note(ws, note_id).await.expect("note");
+    assert_eq!(
+        note.metadata.task.expect("task").assigned_agent_ids.len(),
+        2
+    );
 }

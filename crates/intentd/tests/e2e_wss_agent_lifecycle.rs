@@ -438,7 +438,7 @@ async fn mock_agent_full_turn_over_wss() {
     // note:updated (from the MCP tool's domain event). Also record every
     // `agent:stream:status` frame (STAT-1 / PROTOCOL §6.5) with its arrival
     // ordinal so we can assert the pre-first-token status hints land on the
-    // real WSS transport AND arrive before the first `agent:stream:chunk`.
+    // real WSS transport AND arrive before the first `agent:stream:activity`.
     let mut chunks = 0u32;
     let mut ends = 0u32;
     let mut saw_note_updated = false;
@@ -447,7 +447,7 @@ async fn mock_agent_full_turn_over_wss() {
     for i in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 chunks += 1;
                 if first_chunk_at.is_none() {
                     first_chunk_at = Some(i);
@@ -464,7 +464,7 @@ async fn mock_agent_full_turn_over_wss() {
             _ => {}
         }
     }
-    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
     assert!(
         saw_note_updated,
@@ -472,7 +472,7 @@ async fn mock_agent_full_turn_over_wss() {
     );
 
     // STAT-1 — pre-first-token status hints must reach the FE over the real
-    // WSS transport and MUST all arrive before the first `agent:stream:chunk`
+    // WSS transport and MUST all arrive before the first `agent:stream:activity`
     // (that's the whole point: they populate the spinner *before* streaming
     // starts, then the chunk-reducer clears them). The daemon emits at four
     // real turn-startup transitions for a brand-new agent's first turn:
@@ -480,7 +480,7 @@ async fn mock_agent_full_turn_over_wss() {
     // `prompt` (session/prompt). At least the last one — `prompt` — MUST land
     // before the first chunk on the same subscription.
     let first_chunk_at =
-        first_chunk_at.expect("at least one agent:stream:chunk observed to anchor ordering");
+        first_chunk_at.expect("at least one agent:stream:activity observed to anchor ordering");
     assert!(
         !status_frames.is_empty(),
         "expected >=1 agent:stream:status frame over WSS before the first chunk"
@@ -488,7 +488,7 @@ async fn mock_agent_full_turn_over_wss() {
     for (ord, ev) in &status_frames {
         assert!(
             *ord < first_chunk_at,
-            "agent:stream:status at ordinal {ord} arrived AT/AFTER first agent:stream:chunk \
+            "agent:stream:status at ordinal {ord} arrived AT/AFTER first agent:stream:activity \
              (ordinal {first_chunk_at}) -- startup hints MUST precede streaming: {ev}"
         );
         let data = &ev["data"];
@@ -948,7 +948,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -982,7 +982,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1100,7 +1100,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1198,7 +1198,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1232,7 +1232,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1297,7 +1297,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
                 );
                 saw_preempt_end = true;
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1361,7 +1361,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1424,7 +1424,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1475,7 +1475,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1520,7 +1520,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
             Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1591,7 +1591,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1624,7 +1624,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1672,7 +1672,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
             Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1739,7 +1739,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1816,7 +1816,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1859,7 +1859,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     let mut parked = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -2137,7 +2137,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
 /// `taskText` so the child gets a task-derived `name` (NAME-1); the wire
 /// contract exposes the derived name in the `agent.delegate` result. Asserts:
 /// a non-empty `agentId` in the result, `name == taskText` (task-derived, not
-/// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:chunk` + exactly one
+/// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:activity` + exactly one
 /// terminal `agent:stream:end` + an `agent:idle` all carrying the child id, and
 /// the child transcript carrying the delivered instructions + an assistant reply.
 #[tokio::test]
@@ -2242,7 +2242,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         match ev["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 assert_eq!(ev_agent, child_id, "chunk scoped to the child: {ev}");
                 chunks += 1;
             }
@@ -2290,7 +2290,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
 /// and completes. Asserts (PROTOCOL §5.5/§6.5):
 /// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake with
 ///   BOTH child reports aggregated, and zero individual report deliveries;
-/// - the wake runs a REAL parent turn — `agent:stream:chunk` + one
+/// - the wake runs a REAL parent turn — `agent:stream:activity` + one
 ///   `agent:stream:end` + a trailing `agent:idle`, all keyed by the parent;
 /// - `isWaitingForOtherAgents` is true (with both child ids) while waiting and
 ///   false after delivery, with `agent:subscriptions-changed` watch-change
@@ -2484,7 +2484,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
             {
                 saw_waiting_false_event = true;
             }
-            Some("agent:stream:chunk") => wake_chunks += 1,
+            Some("agent:stream:activity") => wake_chunks += 1,
             Some("agent:stream:end") => wake_ends += 1,
             Some("agent:idle") => {
                 parent_idle_again = true;
@@ -2756,7 +2756,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         // Learn the child id from the first non-parent stream chunk (the
         // child's own turn keys every stream event by its agent id).
         if child_id.is_none()
-            && ev_type == "agent:stream:chunk"
+            && ev_type == "agent:stream:activity"
             && !ev_agent.is_empty()
             && ev_agent != parent_id
         {
@@ -4229,7 +4229,7 @@ async fn subscription_filter_branches_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub_agents, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => agent_chunks += 1,
+            Some("agent:stream:activity") => agent_chunks += 1,
             Some("agent:stream:end") => {
                 agent_end = true;
                 break;
@@ -4343,7 +4343,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
     let mut saw_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub_a, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+        if frame["params"]["event"]["type"] == "agent:stream:activity" {
             saw_chunk = true;
             break;
         }
@@ -5138,7 +5138,7 @@ async fn send_queued_message_now_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -5166,7 +5166,7 @@ async fn send_queued_message_now_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -5250,7 +5250,7 @@ async fn send_queued_message_now_over_wss() {
             Some("agent:stream:end") if !saw_preempt_end => {
                 saw_preempt_end = true;
             }
-            Some("agent:stream:chunk")
+            Some("chat:stream:delta")
                 if evt["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -5656,7 +5656,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
                 assert_eq!(ev["data"]["agentId"], agent_id.as_str());
                 saw_agent_created = true;
             }
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 assert_eq!(
                     ev["data"]["agentId"],
                     agent_id.as_str(),
@@ -6483,7 +6483,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         let ev_type = ev["type"].as_str().unwrap_or_default();
         // Learn child IDs from stream chunks.
-        if ev_type == "agent:stream:chunk" && !ev_agent.is_empty() && ev_agent != parent_id {
+        if ev_type == "agent:stream:activity" && !ev_agent.is_empty() && ev_agent != parent_id {
             if child_a_id.is_none() {
                 child_a_id = Some(ev_agent.to_string());
             } else if child_b_id.is_none() && ev_agent != child_a_id.as_deref().unwrap() {
@@ -7953,7 +7953,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -7981,7 +7981,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
     let mut saw_chunk = false;
     for _ in 0..30 {
         if let Some(frame) = wss_event_opt(&mut sub, 3).await {
-            if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            if frame["params"]["event"]["type"] == "chat:stream:delta"
                 && frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -8207,7 +8207,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -8272,7 +8272,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
             break;
         };
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -9522,7 +9522,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
 
@@ -9606,7 +9606,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
         match event["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -9901,7 +9901,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     timeout(Duration::from_secs(30), async {
         loop {
             let frame = wss_event(&mut sub, 30).await;
-            if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+            if frame["params"]["event"]["type"] == "agent:stream:activity" {
                 return;
             }
         }
@@ -11010,11 +11010,27 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         row["contentBlocks"][0]["text"], user_entity["block"]["text"],
         "delta block text matches the persisted row"
     );
+    // monorepo#1114: the snapshot path stamps the same synthetic id at serve
+    // time, so `agent.getConversation` and the delta agree byte-for-byte on
+    // block identity.
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "serve-time stamped snapshot id matches the delta's block id"
+    );
+    // monorepo#1157 omission side: this send carried no userAppMessageId, so
+    // the delta entity must omit `appMessageId` entirely (no null).
+    assert!(
+        user_entity.get("appMessageId").is_none(),
+        "rows without a client id omit appMessageId: {user_entity}"
+    );
 }
 
 /// Direct-send path: a plain `agent.sendMessage` from connection A (idle
 /// agent) surfaces as a user-row delta on connection B's `chat.subscribe`
-/// BEFORE any assistant chunk of the triggered turn.
+/// BEFORE any assistant chunk of the triggered turn. The send carries a
+/// client-minted `userAppMessageId`, so the delta entity must lift it as
+/// `appMessageId` (monorepo#1157) and the served conversation row must carry
+/// the same serve-time stamped block id as the delta (monorepo#1114).
 #[tokio::test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
@@ -11076,7 +11092,12 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from A" }),
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "hello from A",
+            "userAppMessageId": "app-msg-delta-e2e",
+        }),
     )
     .await;
     assert_eq!(sent["queued"], false, "idle agent streams: {sent}");
@@ -11110,5 +11131,44 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         user_entity["block"]["id"],
         json!(format!("{sent_row_id}:0")),
         "stable synthetic block id: {user_entity}"
+    );
+    // monorepo#1157: the delta entity lifts the client-minted id so the FE
+    // can dedup its optimistic row on the delta path — no refetch needed.
+    assert_eq!(
+        user_entity["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "delta entity carries the send's appMessageId: {user_entity}"
+    );
+
+    // monorepo#1114: the served conversation row carries the same serve-time
+    // stamped `{messageId}:{index}` block id the delta emitted, so snapshot
+    // and delta agree byte-for-byte on block identity.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&sent_row_id))
+        .expect("sent user row persisted")
+        .clone();
+    assert_eq!(
+        row["contentBlocks"][0]["id"],
+        json!(format!("{sent_row_id}:0")),
+        "agent.getConversation serves the stamped synthetic block id: {row}"
+    );
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "snapshot block id matches the delta's block id"
+    );
+    assert_eq!(
+        row["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "persisted row surfaces the appMessageId on reads: {row}"
     );
 }

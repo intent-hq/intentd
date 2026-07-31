@@ -2350,6 +2350,10 @@ pub struct AgentDelegateInput {
     /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
     /// the workspace directory. Falls back to shared mode if CoW is unsupported.
     pub isolation: Option<String>,
+    /// Occupancy override: a task that already has a live assigned agent
+    /// rejects a second delegation unless `force: true` is passed to
+    /// intentionally add another agent.
+    pub force: Option<bool>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the

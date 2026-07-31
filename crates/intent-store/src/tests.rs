@@ -2202,7 +2202,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
     let seed = vec![
         // Old ephemeral families (should be deleted by the sweep).
         typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
-        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
         typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, old, events::FILE_CREATED, agent.clone()),
@@ -2213,7 +2213,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::HOST_EXEC_EXIT, agent.clone()),
         typed_event(&ws, old, events::SCRIPT_OUTPUT, agent.clone()),
         // New ephemeral events (within TTL — must survive).
-        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, new, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, new, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, new, events::TERMINAL_DATA, agent.clone()),
         typed_event(&ws, new, events::HOST_EXEC_STDOUT, agent.clone()),
@@ -2254,7 +2254,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
 
     // New ephemeral events survive.
     for t in [
-        events::AGENT_STREAM_CHUNK,
+        events::AGENT_STREAM_ACTIVITY,
         events::FILE_CHANGED,
         events::TERMINAL_DATA,
         events::HOST_EXEC_STDOUT,
@@ -2442,10 +2442,10 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
     let seed = vec![
         // Old stream chunks (should be deleted by the sweep).
         typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
-        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
-        // New stream chunk (within TTL — must survive).
-        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        // New stream event (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         // Old non-stream families (must NEVER be deleted regardless of age).
         typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
         typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
@@ -2544,7 +2544,7 @@ async fn stream_retention_sweep_disabled_is_noop_in_practice() {
         .insert_event(&typed_event(
             &ws,
             "2026-06-01T00:00:00Z",
-            events::AGENT_STREAM_CHUNK,
+            events::AGENT_STREAM_ACTIVITY,
             agent,
         ))
         .await

@@ -20,8 +20,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, PullRequestStatus, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
@@ -343,8 +343,9 @@ struct Fixture {
 /// Boot a TLS + bearer-auth WSS listener over a seeded workspace. When
 /// `linkable` is true the workspace carries repo info on branch `feature`
 /// (unlinked) so the stub forge can discover the open PR; otherwise it has no
-/// repo info at all (PR paths inert for the task-driven test).
-async fn boot(forge: StubForge, linkable: bool) -> Fixture {
+/// repo info at all (PR paths inert for the task-driven test). `pr_status`
+/// seeds only the persisted `prStatus` column (no rich PR objects).
+async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestStatus>) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-display-status-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -386,7 +387,7 @@ async fn boot(forge: StubForge, linkable: bool) -> Fixture {
         default_model: None,
         pr_number: None,
         pr_url: None,
-        pr_status: None,
+        pr_status,
         active_pull_request: None,
         pull_requests: None,
         archived: false,
@@ -517,7 +518,7 @@ async fn assert_no_display_status_event(ws: &mut TlsWs) {
 /// repeat no-op status write emits nothing.
 #[tokio::test]
 async fn task_completion_transition_over_wss() {
-    let fx = boot(StubForge::default(), false).await;
+    let fx = boot(StubForge::default(), false, None).await;
 
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
     // Seed a spec-child task note (in_progress) over the wire.
@@ -610,6 +611,7 @@ async fn pr_linkage_transition_over_wss() {
             open_pr_number: Some(300),
         },
         true,
+        None,
     )
     .await;
 
@@ -675,4 +677,36 @@ async fn pr_linkage_transition_over_wss() {
     .await;
     assert_eq!(again["outcome"], "unchanged", "second refresh: {again}");
     assert_no_display_status_event(&mut sub).await;
+}
+
+/// Persisted-column-only derivation over the wire: a workspace whose
+/// `prStatus` column is `Open` but which carries no rich PR objects
+/// (`activePullRequest` / `pullRequests` unset) reports
+/// `displayStatus: "pr_open"` on both `workspace.get` and `workspace.list`.
+#[tokio::test]
+async fn persisted_pr_status_only_is_pr_open_over_wss() {
+    let fx = boot(StubForge::default(), false, Some(PullRequestStatus::Open)).await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(
+        got["workspace"]["activePullRequest"].is_null(),
+        "no rich PR objects seeded: {got}"
+    );
+    assert_eq!(got["workspace"]["displayStatus"], "pr_open");
+
+    let listed = wss_rpc(&mut rpc, 2, "workspace.list", json!({})).await;
+    let ws_row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == fx.ws_id.as_str())
+        .expect("seeded workspace listed");
+    assert_eq!(ws_row["displayStatus"], "pr_open");
 }

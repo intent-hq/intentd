@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use intent_acp::{EventSink, SpawnOptions};
-use intent_core::events::{AGENT_STREAM_CHUNK, AGENT_STREAM_END};
+use intent_core::events::{AGENT_STREAM_ACTIVITY, AGENT_STREAM_END, CHAT_STREAM_DELTA};
 use intent_core::{
     now_iso, AgentId, NoteCreate, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
     WorkspaceId, WorkspaceStatus,
@@ -222,12 +222,12 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         .count();
     let chunks = events
         .iter()
-        .filter(|e| e.event_type == AGENT_STREAM_CHUNK)
+        .filter(|e| e.event_type == CHAT_STREAM_DELTA || e.event_type == AGENT_STREAM_ACTIVITY)
         .count();
     assert_eq!(ends, 1, "exactly one stream:end per turn");
     assert_eq!(
         chunks, 0,
-        "chunks are transient (broadcast-only, never persisted)"
+        "stream deltas/activity are transient (broadcast-only, never persisted)"
     );
 
     manager.shutdown().await;

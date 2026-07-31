@@ -152,8 +152,17 @@ async fn create(
         .unwrap_or_default()
         .to_string();
     if let Some(tn) = task_note_id {
+        // `ws.agent.create` with a taskNoteId is an explicit "create and
+        // assign in one step" — keep the assignment best-effort and
+        // unguarded (`force`) as before; the occupancy guard applies to
+        // `agent.delegate` / `task.assignAgent`.
         let _ = api
-            .assign_agent(ws.clone(), NoteId::from_string(tn), agent_id.clone())
+            .assign_agent(
+                ws.clone(),
+                NoteId::from_string(tn),
+                agent_id.clone(),
+                Some(true),
+            )
             .await;
     }
     let child = AgentId::from(agent_id.as_str());
@@ -230,6 +239,7 @@ async fn delegate(
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
+        force: opt_bool(args, "force"),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())

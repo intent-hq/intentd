@@ -20,8 +20,8 @@ use intent_acp::session::{
 };
 use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
-    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_START,
-    AGENT_STREAM_STATUS, AGENT_TOOL_CALL,
+    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_ACTIVITY, AGENT_STREAM_END, AGENT_STREAM_START,
+    AGENT_STREAM_STATUS, AGENT_TOOL_CALL, CHAT_STREAM_DELTA,
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId,
@@ -380,7 +380,18 @@ pub(crate) struct LiveTurn {
     /// [`update_live_turn`](Services::update_live_turn), so pollers can tell a
     /// long-but-alive turn from a wedged agent even before anything persists.
     pub(crate) last_activity_at: String,
+    /// Leading-edge throttle state for the external `agent:stream:activity`
+    /// broadcast: the instant of the last emission, `None` until the turn's
+    /// first activity (which therefore emits immediately). Lives in the
+    /// live-turn slot so the throttle resets with the slot on stream
+    /// end/failure/abort — the next turn's first activity is immediate again.
+    pub(crate) last_activity_emit: Option<std::time::Instant>,
 }
+
+/// Minimum spacing between `agent:stream:activity` emissions per agent
+/// (leading-edge throttle, PROTOCOL §7): the first activity of a turn emits
+/// immediately, then at most one per window.
+pub(crate) const ACTIVITY_THROTTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Per-agent map of live turn slots, shared across [`Services`] clones so the
 /// `chat.subscribe` read door and the [`run_prompt_turn`](Services::run_prompt_turn)
@@ -629,6 +640,7 @@ impl Services {
                     message_id: message_id.to_string(),
                     blocks,
                     last_activity_at: now_iso(),
+                    last_activity_emit: None,
                 },
             );
         }
@@ -651,6 +663,30 @@ impl Services {
     pub fn clear_live_turn(&self, agent_id: &AgentId) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.remove(agent_id);
+        }
+    }
+
+    /// Leading-edge throttle gate for the external `agent:stream:activity`
+    /// broadcast (PROTOCOL §7): returns `true` (and stamps the slot) when the
+    /// turn's live slot has never emitted or the last emission is at least
+    /// [`ACTIVITY_THROTTLE`] ago — the first activity of a turn is therefore
+    /// immediate, subsequent ones are at most one per window. The state lives
+    /// in the live-turn slot, so it resets when the slot clears on stream
+    /// end/failure/abort. `false` with no slot open (no turn to signal for).
+    pub(crate) fn should_emit_activity(&self, agent_id: &AgentId) -> bool {
+        let Ok(mut slots) = self.live_turns.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(agent_id) else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        match slot.last_activity_emit {
+            Some(last) if now.duration_since(last) < ACTIVITY_THROTTLE => false,
+            _ => {
+                slot.last_activity_emit = Some(now);
+                true
+            }
         }
     }
 
@@ -1083,7 +1119,7 @@ impl Services {
     /// notifications written to the wire *before* `session/load` returns, so they
     /// buffer in the agent handle's unbounded channel. Left in place they would
     /// leak into the next [`run_prompt_turn`](Self::run_prompt_turn), re-emitting
-    /// old messages as live `agent:stream:chunk` events and re-accumulating them
+    /// old messages as live `chat:stream:delta` events and re-accumulating them
     /// into the transcript. Draining them here mirrors TS's "drop `session/update`
     /// when there is no active streaming handler" gate (acp-provider.ts).
     ///
@@ -1144,7 +1180,7 @@ impl Services {
         // before `stream:end` — so subscribers never see a stale in-flight turn.
         let _live_guard = self.begin_live_turn(agent_id, &message_id);
         // Pre-first-token turn-startup hint: the FE renders "Sent prompt…" next
-        // to the spinner until the first `agent:stream:chunk` clears it. Emitted
+        // to the spinner until the first `agent:stream:activity` clears it. Emitted
         // exactly once per turn immediately before dispatching `session/prompt`.
         self.publish_status_event(
             workspace_id,
@@ -1770,11 +1806,13 @@ impl Services {
                         (transcript.push_block(content.clone()), block_type)
                     }
                 };
-                // D4: enrich additively — keep `content`, add block identity.
+                // Internal chat-channel delta (§7.1): the full content-bearing
+                // payload the per-agent `chat.subscribe` forwarder accumulates
+                // into block deltas (D4 block identity kept).
                 self.publish_agent_event(
                     workspace_id,
                     agent_id,
-                    AGENT_STREAM_CHUNK,
+                    CHAT_STREAM_DELTA,
                     json!({
                         "agentId": agent_id.0,
                         "content": content,
@@ -1785,6 +1823,22 @@ impl Services {
                     }),
                 )
                 .await;
+                // External content-free activity signal (§7): leading-edge
+                // throttled per agent — the first chunk of a turn emits
+                // immediately (preserves the FE's pre-first-token status-hint
+                // clearing latency), then at most one per second.
+                if self.should_emit_activity(agent_id) {
+                    self.publish_agent_event(
+                        workspace_id,
+                        agent_id,
+                        AGENT_STREAM_ACTIVITY,
+                        json!({
+                            "agentId": agent_id.0,
+                            "messageId": message_id,
+                        }),
+                    )
+                    .await;
+                }
             }
             MappedUpdate::ToolCall(tc) => {
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
@@ -1910,9 +1964,10 @@ impl Services {
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).
     /// `pub(crate)` so the [`AgentManager`] stop path can emit the terminal
     /// `agent:stream:end` when it interrupts a turn (the worker that would
-    /// otherwise emit it is aborted). Routes `agent:stream:chunk` through the
-    /// transient (broadcast-only, never persisted) path; all other event types
-    /// persist durably.
+    /// otherwise emit it is aborted). Routes the high-volume stream signals
+    /// (`chat:stream:delta`, `agent:stream:activity`) through the transient
+    /// (broadcast-only, never persisted) path; all other event types persist
+    /// durably.
     pub(crate) async fn publish_agent_event(
         &self,
         workspace_id: &WorkspaceId,
@@ -1931,10 +1986,10 @@ impl Services {
             metadata: None,
             data,
         };
-        // Route stream chunks through the transient path (broadcast-only);
-        // persist all other agent events (stream:status, stream:end, tool:call,
-        // lifecycle, etc.) for durable audit trail.
-        if event_type == AGENT_STREAM_CHUNK {
+        // Route the stream firehose through the transient path (broadcast-
+        // only); persist all other agent events (stream:status, stream:end,
+        // tool:call, lifecycle, etc.) for durable audit trail.
+        if event_type == CHAT_STREAM_DELTA || event_type == AGENT_STREAM_ACTIVITY {
             crate::publish_event_transient(&self.event_bus, event);
         } else {
             crate::publish_event(&self.event_bus, event).await;

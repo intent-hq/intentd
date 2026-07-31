@@ -982,6 +982,7 @@ impl Services {
             let display_status = compute_display_status(
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.pr_status,
                 ws.task_stats.as_ref(),
             );
             if let Ok(mut map) = self.last_display_statuses.lock() {
@@ -1022,6 +1023,7 @@ impl Services {
         let status = compute_display_status(
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
+            ws.pr_status,
             Some(&task_stats),
         );
         let transitioned = match self.last_display_statuses.lock() {
@@ -4172,10 +4174,14 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// 1. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+///    When neither carries an open/draft entry but the workspace `prStatus`
+///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
+///    and yields `pr_open` (never `pr_ready`: the column carries no
+///    mergeable info).
 /// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged →
-///    `pr_merged`.
+/// 3. Latest PR (linked, else most recently updated entry) merged — or
+///    `prStatus == Merged` — → `pr_merged`.
 /// 4. All tasks complete → `complete`; else `not_started`.
 ///
 /// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
@@ -4183,6 +4189,7 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 fn compute_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     let is_open = |pr: &&PullRequestInfo| {
@@ -4205,6 +4212,12 @@ fn compute_display_status(
             WorkspaceDisplayStatus::PrOpen
         };
     }
+    if matches!(
+        pr_status,
+        Some(PullRequestStatus::Open | PullRequestStatus::Draft)
+    ) {
+        return WorkspaceDisplayStatus::PrOpen;
+    }
     let (total, completed, in_progress) = task_stats
         .map(|s| (s.total, s.completed, s.in_progress))
         .unwrap_or_default();
@@ -4220,7 +4233,9 @@ fn compute_display_status(
             .iter()
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
-    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
+        || pr_status == Some(PullRequestStatus::Merged)
+    {
         return WorkspaceDisplayStatus::PrMerged;
     }
     if total > 0 && completed == total {
@@ -6312,7 +6327,7 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
-/// `agent:stream:chunk` that do not need durable storage.
+/// `chat:stream:delta` that do not need durable storage.
 pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
     bus.as_ref().map(|b| b.publish_transient(&event))
 }
@@ -8691,6 +8706,7 @@ impl WorkspaceApi for Services {
                     let display_status = compute_display_status(
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.pr_status,
                         ws.task_stats.as_ref(),
                     );
                     // Seed the last-observed cache when absent so the first
@@ -12748,6 +12764,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -12778,6 +12795,29 @@ impl WorkspaceApi for Services {
                     note_id,
                     agent_id: agent,
                 });
+            }
+            // Occupancy guard: assigning a NEW agent to a task that already
+            // has a live assigned agent needs `force: true`; re-assigning an
+            // already-assigned id stays idempotent-ok (handled above). Same
+            // predicate as `agent_delegate_op`'s pre-gate: newest live
+            // (loadable, not Deleted, not poisoned) assignee while the task
+            // is still workable (status not complete/cancelled).
+            if !already_assigned
+                && force != Some(true)
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+            {
+                if let Some(existing) = services
+                    .scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "Task is already being worked by agent {} (\"{}\"). \
+                         Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                         or pass force: true to intentionally assign a second agent.",
+                        existing.id, existing.name
+                    )));
+                }
             }
             let now = now_iso();
             let previous_status = task.status;
