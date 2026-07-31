@@ -7,7 +7,8 @@
 //! counter sums. Rates aggregate globally: there is deliberately no
 //! workspace / model / provider dimension. The table is capped by retention:
 //! [`Store::delete_usage_rate_before`] (driven by the hourly reaper) removes
-//! buckets older than 24h, bounding the table at ≤ 1440 rows.
+//! buckets at or older than the 24h cutoff (inclusive), bounding the table
+//! at ≤ 1440 rows even when a sweep lands exactly on a minute boundary.
 
 use intent_core::{Error, Result};
 use sqlx::Row;
@@ -98,11 +99,13 @@ impl Store {
             .collect())
     }
 
-    /// Retention sweep: delete minute buckets with `bucket_utc < cutoff`
+    /// Retention sweep: delete minute buckets with `bucket_utc <= cutoff`
     /// (an RFC-3339 UTC string) and return the number of rows removed.
+    /// Inclusive so a sweep landing exactly on a minute boundary still leaves
+    /// at most 1440 buckets (cutoff bucket removed, cutoff+1 .. now retained).
     /// Idempotent — a re-run with the same cutoff removes nothing more.
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM usage_rate_minutely WHERE bucket_utc < ?")
+        let result = sqlx::query("DELETE FROM usage_rate_minutely WHERE bucket_utc <= ?")
             .bind(cutoff)
             .execute(self.write_pool())
             .await
@@ -221,8 +224,9 @@ mod tests {
         assert_eq!(rows[1].bucket_utc, "2026-07-30T14:09:00Z");
     }
 
-    /// Retention sweep removes only buckets strictly older than the cutoff
-    /// and reports the removed count; a re-run is a no-op.
+    /// Retention sweep removes buckets at or older than the cutoff (inclusive,
+    /// so a boundary-aligned sweep keeps ≤ 1440 buckets) and reports the
+    /// removed count; a re-run is a no-op.
     #[tokio::test]
     async fn prune_deletes_before_cutoff_and_is_idempotent() {
         let tmp = TempDb::new();
@@ -247,10 +251,13 @@ mod tests {
             .delete_usage_rate_before("2026-07-29T14:00:00Z")
             .await
             .expect("prune");
-        assert_eq!(removed, 1, "only the strictly-older bucket is removed");
+        assert_eq!(
+            removed, 2,
+            "cutoff bucket removed too (inclusive predicate)"
+        );
         let rows = store.list_usage_rate_since("").await.expect("list");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].bucket_utc, "2026-07-29T14:00:00Z");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bucket_utc, "2026-07-30T14:00:00Z");
         let removed_again = store
             .delete_usage_rate_before("2026-07-29T14:00:00Z")
             .await
