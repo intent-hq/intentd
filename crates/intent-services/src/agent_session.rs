@@ -1784,6 +1784,21 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
+        // Same clamped per-turn delta, folded into the per-minute rate
+        // history behind `stats.getRateHistory` (§5.39). All-zero deltas are
+        // skipped — they add nothing and would only churn the capped table.
+        let rate_delta = intent_store::UsageRateDelta {
+            input_tokens: tokens.input_tokens,
+            output_tokens: tokens.output_tokens,
+            cache_read_tokens: tokens.cache_read_tokens,
+            cache_creation_tokens: tokens.cache_creation_tokens,
+        };
+        if !rate_delta.is_zero() {
+            let minute = crate::usage_rate::minute_bucket_utc(now);
+            if let Err(e) = self.store.add_usage_rate(&minute, &rate_delta).await {
+                tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+            }
+        }
     }
 
     /// Map one `session/update` notification and publish/accumulate its

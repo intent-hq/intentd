@@ -4335,6 +4335,9 @@ fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
 /// (`{ count, agents, agentIds }`). `isStreaming`/`isResponding` are always
 /// `false` (the headless backend has no live stream state; `status` carries
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
+/// `parentAgentId` (v2.9) carries the session's delegation parent (the value
+/// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
+/// root agents.
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let agents: Vec<WorkspaceAgentInfo> = sessions
         .iter()
@@ -4346,6 +4349,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             last_activity: Some(s.updated_at.clone()),
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
     let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -15671,6 +15675,21 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let limit = usage_rate::parse_limit(limit)?;
+            let now = time::OffsetDateTime::now_utc();
+            let rows = self
+                .store
+                .list_usage_rate_since(&usage_rate::window_start(now, limit))
+                .await?;
+            Ok(usage_rate::rate_history_json(&rows, limit, now))
+        })
+    }
+
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -19982,6 +20001,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_rate;
 pub mod usage_stats;
 pub mod usage_stats_read;
 pub mod session_stats {}
