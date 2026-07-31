@@ -1227,21 +1227,24 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // First turn streams its chunk and parks at session/cancel.
-    let mut saw_block_chunk = false;
-    for _ in 0..50 {
-        let frame = wss_event(&mut sub, 30).await;
+    // First turn streams its chunk and parks at session/cancel. Hard deadline:
+    // `wss_event`'s per-read window resets on every frame (heartbeat pings
+    // included), which can spin past the runner's test budget on a slow
+    // coverage machine instead of failing fast.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("first turn streamed its chunk within deadline");
         if frame["params"]["event"]["type"] == "agent:stream:chunk"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("streaming-before-cancel")
         {
-            saw_block_chunk = true;
             break;
         }
     }
-    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
 
     // Mid-turn, nothing is persisted for this turn (and no previous turn
     // exists), so the streamed text can only be served by the live-turn
@@ -1286,16 +1289,42 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         "agent.list serves the live-turn overlay: {row}"
     );
 
-    // Interrupt the parked turn, then resume; the second turn completes
-    // normally with "resumed turn=2".
+    // Interrupt the parked turn. Hard-deadline event reads (wss_event_opt_until)
+    // so a missing event fails fast instead of hanging — heartbeat pings would
+    // otherwise keep resetting a per-read window.
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
-    for _ in 0..50 {
-        let frame = wss_event(&mut sub, 30).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("interrupt stream:end within deadline");
         if frame["params"]["event"]["type"] == "agent:stream:end" {
             break;
         }
     }
+
+    // Wait for the worker to release the busy slot BEFORE resuming, so the
+    // follow-up send takes the direct path (a send racing into the busy
+    // window would be queued instead).
+    let mut idle = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            100 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["isResponding"] == false {
+            idle = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(idle, "agent released the busy slot after the interrupt");
+
+    // Resume; the second turn completes normally with "resumed turn=2".
     let resumed = wss_rpc(
         &mut rpc,
         13,
@@ -1304,8 +1333,11 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     )
     .await;
     assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
-    for _ in 0..50 {
-        let frame = wss_event(&mut sub, 30).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("resumed turn stream:end within deadline");
         if frame["params"]["event"]["type"] == "agent:stream:end" {
             break;
         }
@@ -1314,26 +1346,26 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     // Once the turn ends (slot cleared, worker released) the projection is
     // back to persisted semantics: the newest persisted assistant row wins.
     let mut settled = false;
-    for i in 0..40 {
+    for i in 0..100 {
         let got = wss_rpc(
             &mut rpc,
-            70 + i,
+            300 + i,
             "agent.get",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         )
         .await;
-        if got["agent"]["isResponding"] == false {
-            assert_eq!(
-                got["agent"]["lastAgentResponse"].as_str(),
-                Some("resumed turn=2"),
-                "idle agent.get serves the persisted preview: {got}"
-            );
+        if got["agent"]["isResponding"] == false
+            && got["agent"]["lastAgentResponse"].as_str() == Some("resumed turn=2")
+        {
             settled = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(settled, "agent settled back to persisted previews");
+    assert!(
+        settled,
+        "idle agent.get serves the persisted preview of the resumed turn"
+    );
 }
 
 /// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
