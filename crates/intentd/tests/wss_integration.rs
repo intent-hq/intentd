@@ -5061,6 +5061,172 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     srv.ws.stop().await;
 }
 
+/// monorepo#1157 over the real WSS transport: a user row persisted with a
+/// client-minted `userAppMessageId` round-trips the lifted `appMessageId`
+/// through `chat.subscribe` on `/ws` — the non-assistant row delta stamps it
+/// on every entity, and a fresh subscription's seq-0 snapshot row carries it
+/// too (snapshot/delta parity). A send without the id emits entities without
+/// the key (additive, backward compatible).
+#[tokio::test]
+async fn wss_chat_user_row_delta_and_snapshot_carry_app_message_id() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"AppMsg"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"AppMsg"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Subscribe over a persistent WSS connection and drain the seq-0 snapshot.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+    )))
+    .await
+    .expect("send subscribe");
+    let mut got_resp = false;
+    let mut got_snap = false;
+    while !got_resp || !got_snap {
+        let v = next_push_or_response(&mut sub).await;
+        if v["method"] == "subscription.push" {
+            assert_eq!(v["params"]["kind"], "snapshot");
+            got_snap = true;
+        } else if v["id"] == 3 {
+            assert!(v["result"]["subscriptionId"].as_str().is_some());
+            got_resp = true;
+        }
+    }
+
+    // Direct send (store-only path) with a client-minted userAppMessageId.
+    let sent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hello","messageId":"user-msg-wss-1","userAppMessageId":"app-msg-wss-1"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(sent["result"]["messageId"], "user-msg-wss-1");
+
+    let push = next_subscription_push(&mut sub).await;
+    assert_eq!(push["params"]["kind"], "delta");
+    let delta = &push["params"]["delta"];
+    let added = delta["added"].as_array().expect("added entities");
+    assert!(
+        !added.is_empty(),
+        "user-row delta must carry entities: {delta}"
+    );
+    for e in added {
+        assert_eq!(e["messageId"], "user-msg-wss-1");
+        assert_eq!(e["role"], "user");
+        assert_eq!(
+            e["appMessageId"], "app-msg-wss-1",
+            "delta entity mirrors the lifted appMessageId: {e}"
+        );
+    }
+
+    // A send WITHOUT the id emits entities without the key.
+    let _ = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"plain","messageId":"user-msg-wss-2"}}}}"#
+        ),
+    )
+    .await;
+    let push2 = next_subscription_push(&mut sub).await;
+    let delta2 = &push2["params"]["delta"];
+    for e in delta2["added"].as_array().expect("added entities") {
+        assert_eq!(e["messageId"], "user-msg-wss-2");
+        assert!(
+            e.get("appMessageId").is_none(),
+            "no appMessageId key without a client id: {e}"
+        );
+    }
+    drop(sub);
+
+    // Snapshot parity: a fresh subscription's seq-0 snapshot serves the same
+    // rows — the tagged one with the lifted appMessageId, the plain one
+    // without the key.
+    let mut sub2 = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub2.send(Message::Text(format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+    )))
+    .await
+    .expect("send subscribe");
+    let snap2 = next_subscription_push(&mut sub2).await;
+    assert_eq!(snap2["params"]["kind"], "snapshot");
+    let messages = snap2["params"]["snapshot"]["messages"]
+        .as_array()
+        .expect("snapshot messages");
+    let tagged = messages
+        .iter()
+        .find(|m| m["id"] == "user-msg-wss-1")
+        .expect("tagged row in snapshot");
+    assert_eq!(
+        tagged["appMessageId"], "app-msg-wss-1",
+        "seq-0 snapshot row carries the lifted appMessageId"
+    );
+    let plain = messages
+        .iter()
+        .find(|m| m["id"] == "user-msg-wss-2")
+        .expect("plain row in snapshot");
+    assert!(plain.get("appMessageId").is_none());
+    drop(sub2);
+
+    srv.ws.stop().await;
+}
+
+/// Read frames until the next `subscription.push` notification (answering
+/// pings, skipping unrelated frames).
+async fn next_subscription_push(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Value {
+    loop {
+        let v = next_push_or_response(ws).await;
+        if v["method"] == "subscription.push" {
+            return v;
+        }
+    }
+}
+
+/// Read the next text frame as JSON (answering pings, skipping binary).
+async fn next_push_or_response(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+) -> Value {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("frame timed out");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(&text).expect("json frame")
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
