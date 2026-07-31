@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_ops::last_response_and_digest_from_blocks;
+use crate::agent_ops::{
+    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
+};
 use crate::{token_usage, usage_stats, Services};
 
 #[cfg(test)]
@@ -483,15 +485,28 @@ pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
 /// [`last_response_summary`]).
 const PREVIEW_RESPONSE_CAP: usize = 500;
 
-/// Stamp the server-derived live preview onto an event payload: derive
-/// `(lastAgentResponse, digest)` from `text_blocks` via the same helper the
-/// `AgentLite` live-turn overlay uses and set only the fields that derived to
-/// `Some` — a turn that has produced no text (or no digest) yet omits that
-/// field rather than sending an empty string. Mid-turn a chunk boundary can
-/// split a marker (`<agent_dig…`), letting the partial tag text surface for
-/// up to one throttle window; the next derivation strips the completed tag.
+/// Stamp the server-derived preview onto a TERMINAL event payload
+/// (`agent:stream:end`): derive `(lastAgentResponse, digest)` from the full
+/// turn's `text_blocks` — complete by definition — and set only the fields
+/// that derived to `Some`; a turn that produced no text (or no digest) omits
+/// that field rather than sending an empty string.
 pub(crate) fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
-    let (last_response, digest) = last_response_and_digest_from_blocks(text_blocks);
+    stamp_preview(data, last_response_and_digest_from_blocks(text_blocks));
+}
+
+/// [`stamp_preview_fields`] for MID-TURN frames (`agent:stream:activity`):
+/// derives via the live variant, which clips the still-streaming trailing
+/// partial line — the preview advances on newline boundaries, a turn that has
+/// not completed a non-empty line yet omits `lastAgentResponse`, and a
+/// partially-streamed `<agent_digest>` span (or split marker at a chunk
+/// boundary) never surfaces.
+pub(crate) fn stamp_live_preview_fields(data: &mut Value, text_blocks: &[String]) {
+    stamp_preview(data, live_response_and_digest_from_blocks(text_blocks));
+}
+
+/// Shared stamping core for [`stamp_preview_fields`] /
+/// [`stamp_live_preview_fields`].
+fn stamp_preview(data: &mut Value, (last_response, digest): (Option<String>, Option<String>)) {
     if let Some(r) = last_response {
         let chars: Vec<char> = r.chars().collect();
         let capped = if chars.len() > PREVIEW_RESPONSE_CAP {
@@ -1932,7 +1947,7 @@ impl Services {
                         "agentId": agent_id.0,
                         "messageId": message_id,
                     });
-                    stamp_preview_fields(&mut activity_data, &transcript.text_block_strings());
+                    stamp_live_preview_fields(&mut activity_data, &transcript.text_block_strings());
                     self.publish_agent_event(
                         workspace_id,
                         agent_id,

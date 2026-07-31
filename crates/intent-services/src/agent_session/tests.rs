@@ -682,8 +682,10 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
     // The activity signal carries identifiers plus the server-derived live
     // preview — never the raw transcript content. The first activity fires
-    // after the first chunk ("Hello ") landed, so its preview reflects the
-    // streamed-so-far text.
+    // after the first chunk ("Hello ") landed, but that text has no newline
+    // yet, so the mid-turn preview clips it as a still-streaming partial line
+    // and omits `lastAgentResponse` entirely (it surfaces on the terminal
+    // stream:end below instead).
     let activity = events
         .iter()
         .find(|e| e.event_type == "agent:stream:activity")
@@ -697,10 +699,9 @@ async fn prompt_turn_streams_events_and_accumulates() {
         activity.data.get("content").is_none(),
         "activity payload never carries transcript content"
     );
-    assert_eq!(
-        activity.data["lastAgentResponse"],
-        json!("Hello"),
-        "first activity carries the preview derived from the first chunk"
+    assert!(
+        activity.data.get("lastAgentResponse").is_none(),
+        "mid-turn preview omitted until a completed (newline-terminated) line streams"
     );
     assert!(
         activity.data.get("digest").is_none(),
@@ -829,6 +830,107 @@ async fn prompt_turn_streams_events_and_accumulates() {
         end.data["lastAgentResponse"],
         json!("Hello world"),
         "terminal stream:end carries the final preview from the full turn text"
+    );
+}
+
+/// Mid-turn `agent:stream:activity` clips the preview at the last newline:
+/// the first chunk carries a completed line plus the start of the next one,
+/// so the activity serves only the completed line; a partial
+/// `<agent_digest>` opener streamed later never surfaces mid-turn. The
+/// terminal `agent:stream:end` re-derives from the full (complete) turn text
+/// and is unaffected by the clipping.
+#[tokio::test]
+async fn prompt_turn_activity_preview_clips_partial_line_and_digest() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = |text: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }
+        })
+        .to_string()
+    };
+    let updates = vec![
+        chunk("Completed line\nNext par"),
+        chunk("tial\n<agent_digest>sum"),
+        chunk("mary</agent_digest>"),
+    ];
+    let (conn, mut note_rx, _agent) = connect_with(updates);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // First activity fires on the first chunk: the trailing "Next par" is a
+    // still-streaming partial line and is excluded.
+    let activity = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:activity")
+        .expect("turn emits at least one activity signal");
+    assert_eq!(
+        activity.data["lastAgentResponse"],
+        json!("Completed line"),
+        "activity preview serves only the completed (newline-terminated) line"
+    );
+    assert!(
+        activity.data.get("digest").is_none(),
+        "no digest streamed by the first chunk"
+    );
+    // No mid-turn frame ever surfaces a partially-streamed digest span.
+    for ev in events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+    {
+        if let Some(d) = ev.data.get("digest").and_then(|d| d.as_str()) {
+            assert_eq!(d, "summary", "only a fully-streamed digest may surface");
+        }
+        if let Some(r) = ev.data.get("lastAgentResponse").and_then(|r| r.as_str()) {
+            assert!(
+                !r.contains("<agent_digest>"),
+                "digest markup never leaks into the preview: {r}"
+            );
+        }
+    }
+
+    // The terminal stream:end derives from the full turn text: the final line
+    // is complete by definition and the completed digest is extracted.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(
+        end.data["lastAgentResponse"],
+        json!("Next partial"),
+        "terminal preview keeps the turn-end (unclipped) semantics"
+    );
+    assert_eq!(
+        end.data["digest"],
+        json!("summary"),
+        "terminal frame carries the completed digest"
     );
 }
 

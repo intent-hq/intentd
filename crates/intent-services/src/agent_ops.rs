@@ -463,6 +463,42 @@ pub(crate) fn last_response_and_digest_from_blocks(
     (last_response, digest)
 }
 
+/// Live/mid-turn variant of [`last_response_and_digest_from_blocks`] for the
+/// in-flight preview surfaces (`agent:stream:activity` and the `AgentLite`
+/// live-turn overlay): the final block is still streaming, so its trailing
+/// partial line (text after the last newline) is clipped before the last-line
+/// extraction — the preview advances on newline boundaries and never surfaces
+/// a partially-streamed line. A turn that has not completed any non-empty
+/// line yet yields `None` (same as the pre-first-token case). The digest is
+/// derived from the UNCLIPPED text: its capture already requires the closing
+/// tag, so a fully-streamed `<agent_digest>…</agent_digest>` surfaces
+/// immediately while a partial span never leaks (the cleaning strips an
+/// unclosed opener to end-of-text). Terminal/persisted callers keep using
+/// [`last_response_and_digest_from_blocks`] unchanged.
+pub(crate) fn live_response_and_digest_from_blocks(
+    blocks: &[String],
+) -> (Option<String>, Option<String>) {
+    let (_, digest) = last_response_and_digest_from_blocks(blocks);
+    let (last_response, _) =
+        last_response_and_digest_from_blocks(&clip_trailing_partial_line(blocks));
+    (last_response, digest)
+}
+
+/// Drop the still-streaming trailing partial line from live-turn text blocks:
+/// only the FINAL block can be mid-stream (earlier blocks were closed by a
+/// non-text block boundary and pass through unchanged), so its text is
+/// clipped at the last newline (inclusive); a final block with no newline at
+/// all is dropped entirely.
+fn clip_trailing_partial_line(blocks: &[String]) -> Vec<String> {
+    let mut out = blocks.to_vec();
+    if let Some(last) = out.pop() {
+        if let Some(i) = last.rfind('\n') {
+            out.push(last[..=i].to_string());
+        }
+    }
+    out
+}
+
 /// Derive `lastUserMessage` from the most-recent `user` message's text blocks
 /// (joined), porting the TS `agent.list`/`agent.get` activity field.
 pub(crate) fn last_user_message(messages: &[AgentMessage]) -> Option<String> {
@@ -1300,12 +1336,14 @@ impl Services {
         // derive `lastAgentResponse`/`digest` from the live slot's streamed
         // text blocks so `agent.get`/`agent.list` track the
         // turn instead of staying pinned on the previous turn's persisted
-        // preview. Per-field: a turn that has streamed no text yet (or no
+        // preview. The live variant clips the still-streaming trailing
+        // partial line, so the overlay only ever surfaces completed lines.
+        // Per-field: a turn that has streamed no completed line yet (or no
         // digest yet) yields `None` for that field and the persisted-preview
         // value is kept.
         let live_overlay = if is_responding {
             self.live_turn_text_blocks(&session.id)
-                .map(|blocks| last_response_and_digest_from_blocks(&blocks))
+                .map(|blocks| live_response_and_digest_from_blocks(&blocks))
         } else {
             None
         };

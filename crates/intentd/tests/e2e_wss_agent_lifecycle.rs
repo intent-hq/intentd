@@ -356,12 +356,15 @@ async fn mock_agent_full_turn_over_wss() {
         json!(note_id),
         json!(MARKER),
     );
+    // The response's first line completes (newline) while its second line
+    // never gets one: the mid-turn activity preview must clip at the newline
+    // and the terminal stream:end must carry the full-text derivation.
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
             "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
         },
-        "response": "added via mcp over wss",
+        "response": "first line done\nadded via mcp over wss",
     })
     .to_string();
     let env: [(&str, &str); 4] = [
@@ -477,8 +480,10 @@ async fn mock_agent_full_turn_over_wss() {
 
     // Live-preview enrichment: the activity signal carries the server-derived
     // `lastAgentResponse` (the mock streams its text response before the
-    // first activity emit) but never raw transcript `content`; the terminal
-    // stream:end carries the final preview values.
+    // first activity emit) but never raw transcript `content`. Mid-turn the
+    // preview is clipped at the last newline — only the completed first line
+    // surfaces, never the still-streaming second line; the terminal
+    // stream:end carries the final (full-text) preview values.
     let activity = first_activity_frame.expect("first activity frame captured");
     let activity_data = &activity["data"];
     assert_eq!(
@@ -490,17 +495,15 @@ async fn mock_agent_full_turn_over_wss() {
         activity_data.get("content").is_none(),
         "activity payload never carries transcript content: {activity}"
     );
-    assert!(
-        activity_data["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "activity carries a non-empty lastAgentResponse preview: {activity}"
+    assert_eq!(
+        activity_data["lastAgentResponse"].as_str(),
+        Some("first line done"),
+        "mid-turn activity preview clips at the last newline: {activity}"
     );
     let end = end_frame.expect("terminal stream:end frame captured");
-    assert!(
-        end["data"]["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
+    assert_eq!(
+        end["data"]["lastAgentResponse"].as_str(),
+        Some("added via mcp over wss"),
         "terminal stream:end carries the final lastAgentResponse: {end}"
     );
 
