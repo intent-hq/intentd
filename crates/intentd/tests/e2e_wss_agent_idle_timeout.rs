@@ -304,6 +304,69 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
+/// Bounded poll: wait until `agent.getSession` reports `status == "idle"`,
+/// returning the final response for follow-up assertions. The `agent:idle`
+/// event is emitted by the turn worker BEFORE `end_turn` persists the
+/// runtime-idle status, so a single read right after the event can race the
+/// write (monorepo#1164).
+async fn await_session_idle<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    agent_id: &str,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut last = Value::Null;
+    for i in 0..100 {
+        last = wss_rpc(
+            ws,
+            id_base + i,
+            "agent.getSession",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if last["session"]["status"] == "idle" {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("agent session never settled to idle; last: {last}");
+}
+
+/// Bounded poll: wait until `agent.getQueue` reports exactly `expected` queued
+/// messages, returning the final response for follow-up assertions. The
+/// terminal-failure requeue (`persist_error_and_requeue`) lands AFTER the
+/// `agent:failed` / `agent:status-changed(error)` events are published, so a
+/// single read right after those events can race the write (monorepo#1164).
+async fn await_queue_len<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    agent_id: &str,
+    expected: usize,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut last = Value::Null;
+    for i in 0..100 {
+        last = wss_rpc(
+            ws,
+            id_base + i,
+            "agent.getQueue",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if last["queue"].as_array().map(Vec::len) == Some(expected) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("agent queue never reached {expected} entries; last: {last}");
+}
+
 /// Serialize the messages of an `agent.getConversation` result into
 /// per-message `(role, contentBlocks-as-string)` pairs for text assertions.
 fn conversation_texts(conv: &Value) -> Vec<(String, String)> {
@@ -505,17 +568,10 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     );
 
     // The session settled idle with no stop reason, and nothing was requeued.
-    let session = wss_rpc(
-        &mut rpc,
-        13,
-        "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(
-        session["session"]["status"], "idle",
-        "session idle after warn-and-continue: {session}"
-    );
+    // Poll for idle: `agent:idle` is emitted BEFORE `end_turn` persists the
+    // runtime-idle status, so a single read here can race the write
+    // (monorepo#1164).
+    let session = await_session_idle(&mut rpc, 100, &ws_id, &agent_id).await;
     assert!(
         session["session"]["stopReason"].is_null(),
         "no stopReason after warn-and-continue: {session}"
@@ -931,6 +987,9 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
     );
 
     // Persisted terminal state: status=error with the idle-timeout stopReason.
+    // A single read is safe here: the status + stopReason store write
+    // completes BEFORE `agent:status-changed(error)` is published
+    // (durable-before-observable), and the loop above waited for that event.
     let session = wss_rpc(
         &mut rpc,
         13,
@@ -951,16 +1010,11 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
     );
 
     // The failing message — the LAST warning turn's content — was requeued
-    // for agent.retry, not silently dropped.
-    let queue = wss_rpc(
-        &mut rpc,
-        14,
-        "agent.getQueue",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
+    // for agent.retry, not silently dropped. Poll: the requeue lands AFTER
+    // the `agent:status-changed(error)` publish the loop above waited on, so
+    // a single read here can race the write (monorepo#1164).
+    let queue = await_queue_len(&mut rpc, 100, &ws_id, &agent_id, 1).await;
     let messages = queue["queue"].as_array().expect("queue array");
-    assert_eq!(messages.len(), 1, "terminal failure requeued: {queue}");
     assert!(
         messages[0]["content"]
             .as_str()
