@@ -8032,6 +8032,11 @@ mod harness_wake_tests {
             .collect();
         assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
         assert_eq!(ends[0].data["messageId"], json!(message_id));
+        assert_eq!(
+            ends[0].data["lastAgentResponse"],
+            json!("Hello world"),
+            "harness-wake terminal stream:end carries the final preview"
+        );
         let idle = events
             .iter()
             .find(|e| e.event_type == "agent:idle")
@@ -8160,6 +8165,11 @@ mod harness_wake_tests {
             .collect();
         assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
         assert_eq!(ends[0].data["stopReason"], json!("interrupted"));
+        assert_eq!(
+            ends[0].data["lastAgentResponse"],
+            json!("partial wake output"),
+            "interrupt terminal stream:end carries the flushed partial preview"
+        );
         let message_id = ends[0].data["messageId"]
             .as_str()
             .expect("interrupt flush persisted the partial row");

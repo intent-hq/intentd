@@ -466,7 +466,7 @@ fn last_response_summary(blocks: &[Value]) -> Option<String> {
 
 /// Extract the `type: "text"` block strings from content blocks — the input
 /// shape [`last_response_and_digest_from_blocks`] expects.
-fn text_block_strings(blocks: &[Value]) -> Vec<String> {
+pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
     blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
@@ -475,15 +475,32 @@ fn text_block_strings(blocks: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Cap on the stamped `lastAgentResponse` preview (chars). The helper's
+/// last-line extraction is unbounded for a response without newlines — that
+/// is tolerable on the pull path (`agent.list`), but the event payload is
+/// re-broadcast up to 1/s and persisted on `agent:stream:end`, so the stamp
+/// keeps only the trailing slice (same tail-wins convention as
+/// [`last_response_summary`]).
+const PREVIEW_RESPONSE_CAP: usize = 500;
+
 /// Stamp the server-derived live preview onto an event payload: derive
 /// `(lastAgentResponse, digest)` from `text_blocks` via the same helper the
 /// `AgentLite` live-turn overlay uses and set only the fields that derived to
 /// `Some` — a turn that has produced no text (or no digest) yet omits that
-/// field rather than sending an empty string.
-fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
+/// field rather than sending an empty string. Mid-turn a chunk boundary can
+/// split a marker (`<agent_dig…`), letting the partial tag text surface for
+/// up to one throttle window; the next derivation strips the completed tag.
+pub(crate) fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
     let (last_response, digest) = last_response_and_digest_from_blocks(text_blocks);
     if let Some(r) = last_response {
-        data["lastAgentResponse"] = Value::String(r);
+        let chars: Vec<char> = r.chars().collect();
+        let capped = if chars.len() > PREVIEW_RESPONSE_CAP {
+            let tail: String = chars[chars.len() - PREVIEW_RESPONSE_CAP..].iter().collect();
+            format!("...{tail}")
+        } else {
+            r
+        };
+        data["lastAgentResponse"] = Value::String(capped);
     }
     if let Some(d) = digest {
         data["digest"] = Value::String(d);

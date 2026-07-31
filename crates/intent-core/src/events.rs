@@ -58,11 +58,13 @@ pub const AGENT_STREAM_START: &str = "agent:stream:start";
 // a turn emits immediately, then at most one per second). Full transcript
 // content flows on the internal chat channel (`CHAT_STREAM_DELTA`) instead.
 pub const AGENT_STREAM_ACTIVITY: &str = "agent:stream:activity";
-// Terminal stream frame. Also carries the final `lastAgentResponse` /
-// `digest` preview values (same optional fields as the activity signal,
-// derived from the full turn text) so a client tracking the live preview
-// lands on the turn's true final state — the last throttled activity may
-// have missed the response tail.
+// Terminal stream frame. The transcript-bearing terminal paths — normal
+// prompt-turn completion, harness-wake finalize, and the user-interrupt
+// flush — also carry the final `lastAgentResponse` / `digest` preview values
+// (same optional fields as the activity signal, derived from the turn's full
+// text) so a client tracking the live preview lands on the turn's true final
+// state; the last throttled activity may have missed the response tail. The
+// pre-output terminal-failure emit has no transcript, so it carries neither.
 pub const AGENT_STREAM_END: &str = "agent:stream:end";
 // Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
 // §7). Emitted while an agent turn is starting so the chat spinner can show
