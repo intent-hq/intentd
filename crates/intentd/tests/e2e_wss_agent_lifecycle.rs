@@ -1230,14 +1230,28 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     // First turn streams its chunk and parks at session/cancel. Hard deadline:
     // `wss_event`'s per-read window resets on every frame (heartbeat pings
     // included), which can spin past the runner's test budget on a slow
-    // coverage machine instead of failing fast. On timeout, surface the
-    // daemon log tail so a CI-only failure is diagnosable.
+    // coverage machine instead of failing fast. On timeout, surface every
+    // event observed while waiting, an `agent.get` snapshot, and the daemon
+    // log tail so a CI-only failure is diagnosable from the runner output.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut seen_events: Vec<Value> = Vec::new();
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            let snapshot = wss_rpc(
+                &mut rpc,
+                19,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
             let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
             let tail = &log[log.len().saturating_sub(4000)..];
-            panic!("first turn did not stream its chunk within deadline; daemon.log tail:\n{tail}");
+            panic!(
+                "first turn did not stream its chunk within deadline;\n\
+                 events seen while waiting: {seen_events:?}\n\
+                 agent.get at timeout: {snapshot}\n\
+                 daemon.log tail:\n{tail}"
+            );
         };
         if frame["params"]["event"]["type"] == "agent:stream:chunk"
             && frame["params"]["event"]["data"]["content"]
@@ -1247,6 +1261,7 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
         {
             break;
         }
+        seen_events.push(frame["params"]["event"].clone());
     }
 
     // Mid-turn, nothing is persisted for this turn (and no previous turn
