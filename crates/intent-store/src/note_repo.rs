@@ -76,14 +76,21 @@ impl Store {
     /// composite (`(id, workspace_id)`, migration 0030) so callers must supply
     /// both halves; bare-id lookups would silently match a same-id note owned
     /// by another workspace.
+    ///
+    /// The query runs under [`crate::with_read_retry`]: this is the exact read
+    /// that surfaced a transient "get note failed: ... (code: 5) database is
+    /// locked" to a production client under heavy write load (monorepo#1139).
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
-        let row = sqlx::query(&sql)
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .fetch_optional(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("get note failed: {e}")))?;
+        let row = crate::with_read_retry(|| async {
+            sqlx::query(&sql)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get note failed: {e}")))
+        })
+        .await?;
         match row {
             Some(r) => map_note_row(&r),
             None => Err(Error::NotFound(format!("note {id}"))),

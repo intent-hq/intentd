@@ -55,10 +55,72 @@ pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 
+/// Total retry window for the SQLITE_BUSY retry helpers (monorepo#1139).
+const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// True when an error message carries a SQLITE_BUSY-family result code.
+/// sqlx formats SQLite errors as `(code: {extended_code}) …` where the code
+/// is always the extended result code, so match the busy family explicitly:
+/// 5 (SQLITE_BUSY), 261 (SQLITE_BUSY_RECOVERY), 517 (SQLITE_BUSY_SNAPSHOT),
+/// 773 (SQLITE_BUSY_TIMEOUT). A bare `code: 5` substring would false-positive
+/// on unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK) and miss the
+/// extended busy variants.
+fn is_busy_message(msg: &str) -> bool {
+    ["(code: 5)", "(code: 261)", "(code: 517)", "(code: 773)"]
+        .iter()
+        .any(|code| msg.contains(code))
+}
+
+/// Shared SQLITE_BUSY retry loop backing [`with_write_txn_retry`] and
+/// [`with_read_retry`]. Executes the given async closure, retrying only when
+/// the error is a transient SQLITE_BUSY (`Error::Internal` whose message
+/// carries a busy-family result code, see [`is_busy_message`]). Backoff is
+/// jittered exponential: ~50ms base doubling per attempt (±25% jitter), with
+/// each sleep capped at 5s and clamped to the remaining `deadline` so the
+/// loop degrades to steady polling until `deadline` is exhausted, at which
+/// point the last error is returned. Non-busy errors are returned
+/// immediately.
+async fn with_busy_retry<F, Fut, T>(f: F, deadline: Duration) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const BASE_DELAY_MS: u64 = 50;
+    const MAX_DELAY_MS: u64 = 5_000;
+
+    let start = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                // Only retry on SQLITE_BUSY-family errors (database is locked)
+                let busy = matches!(&e, Error::Internal(msg) if is_busy_message(msg));
+                if !busy || start.elapsed() >= deadline {
+                    return Err(e);
+                }
+
+                // Exponential backoff with symmetric ±25% jitter: 50ms,
+                // 100ms, 200ms, ..., capped at MAX_DELAY_MS per sleep and
+                // clamped to the remaining deadline.
+                let delay_ms = (BASE_DELAY_MS << attempt.min(16)).min(MAX_DELAY_MS);
+                let jitter_ms = delay_ms / 4; // ±25% jitter
+                let jittered_delay = (delay_ms - jitter_ms
+                    + rand::random::<u64>() % (2 * jitter_ms + 1))
+                    .min(MAX_DELAY_MS);
+                let remaining = deadline.saturating_sub(start.elapsed());
+                let sleep = Duration::from_millis(jittered_delay).min(remaining);
+                tokio::time::sleep(sleep).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Retry helper for write transactions that may hit SQLITE_BUSY during lock upgrade
-/// (STAB-7). Executes the given async transaction closure up to MAX_ATTEMPTS times,
-/// with jittered exponential backoff between attempts. Returns the result on success
-/// or the last error after exhausting retries.
+/// (STAB-7). Executes the given async transaction closure via the shared
+/// [`with_busy_retry`] loop (~30s total window, monorepo#1139). Returns the
+/// result on success or the last error after the retry window is exhausted.
 ///
 /// Use this for any write transaction that uses .begin() (DEFERRED mode) to eliminate
 /// the intermittent "database is locked" (code 5) failures that occur when multiple
@@ -68,35 +130,21 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    const MAX_ATTEMPTS: u32 = 10;
-    const BASE_DELAY_MS: u64 = 50;
+    with_busy_retry(f, BUSY_RETRY_DEADLINE).await
+}
 
-    let mut last_error = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match f().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                // Only retry on SQLITE_BUSY (code 5: database is locked)
-                let should_retry = matches!(&e, Error::Internal(msg) if msg.contains("code: 5"));
-
-                if !should_retry || attempt == MAX_ATTEMPTS - 1 {
-                    return Err(e);
-                }
-
-                last_error = Some(e);
-
-                // Exponential backoff with jitter: 50ms, 100ms, 200ms, 400ms, ...
-                let delay_ms = BASE_DELAY_MS * (1 << attempt);
-                let jitter_ms = (delay_ms / 4) as i64; // ±25% jitter
-                let jittered_delay =
-                    delay_ms as i64 + (rand::random::<i64>() % (2 * jitter_ms + 1)) - jitter_ms;
-                tokio::time::sleep(Duration::from_millis(jittered_delay.max(0) as u64)).await;
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| Error::Internal("retry exhausted".to_string())))
+/// Retry helper for single-shot idempotent reads that may hit transient
+/// SQLITE_BUSY under heavy write load (monorepo#1139: "get note failed:
+/// ... (code: 5) database is locked" surfaced to a production client).
+/// Same shared [`with_busy_retry`] loop as [`with_write_txn_retry`]:
+/// retries only `code: 5` errors, jittered exponential backoff, ~30s total
+/// window, last error surfaced.
+async fn with_read_retry<F, Fut, T>(f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    with_busy_retry(f, BUSY_RETRY_DEADLINE).await
 }
 
 /// Roll back the transaction open on `conn` after a failed statement or
