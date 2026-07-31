@@ -1160,6 +1160,39 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// monorepo#1114: stamp the stable synthetic `{messageId}:{index}` id onto any
+/// content block that persisted without one, so `agent.getConversation`, the
+/// seq-0 chat snapshot, and the §7.1 delta path (which re-reads through this
+/// op) agree byte-for-byte on block identity. Assistant blocks always persist
+/// with ids, so the pass is a no-op for them; non-assistant rows (user /
+/// system / tool) gain the same id the delta path stamps. Serve-time only —
+/// the stored rows are untouched, so the read stays idempotent. Runs AFTER
+/// [`strip_anonymous_tool_blocks`] so indices match the served array.
+fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
+    let message_id = message.id.clone();
+    let Some(blocks) = message.content.as_array_mut() else {
+        return message;
+    };
+    for (index, block) in blocks.iter_mut().enumerate() {
+        // An empty-string id is treated as missing — it can't serve as a
+        // stable upsert key, so it gets the synthetic id like an absent one.
+        if block
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert(
+                "id".to_string(),
+                Value::String(format!("{message_id}:{index}")),
+            );
+        }
+    }
+    message
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
@@ -1371,6 +1404,11 @@ impl Services {
     /// non-destructively — the stored rows are untouched, so the read is
     /// idempotent and covers old rows and restored backups alike.
     ///
+    /// monorepo#1114: the served page also stamps the stable synthetic
+    /// `{messageId}:{index}` id onto blocks that persisted without one
+    /// ([`stamp_synthetic_block_ids`]), so snapshot and delta consumers see
+    /// identical block identities.
+    ///
     /// Pagination happens SQL-side (monorepo#958): the window is resolved
     /// against the row count and only the requested page is selected and
     /// decoded, so a `limit=N` read touches at most N rows regardless of
@@ -1409,6 +1447,7 @@ impl Services {
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
+            .map(stamp_synthetic_block_ids)
             .collect();
         Ok(json!({
             "agentId": agent_id,
