@@ -17,8 +17,9 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use intent_core::events::{
-    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_RENAMED,
-    AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED, AGENT_UPDATED,
+    AGENT_ATTENTION_REQUESTED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE,
+    AGENT_MESSAGE, AGENT_RENAMED, AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED,
+    AGENT_UPDATED,
 };
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
@@ -9957,6 +9958,163 @@ async fn request_attention_wakes_parent_immediately_in_after_all_group() {
     assert!(
         text.contains("reports a blocker: sandbox exploded"),
         "immediate grouped wake must be kind-flavored with the reason: {text}"
+    );
+}
+
+/// `agent:attention-requested` from a delegated child carries the optional
+/// `parentAgentId` (the delegating parent) so subscribers can attribute the
+/// request without a follow-up `agent.get`.
+#[tokio::test]
+async fn attention_requested_event_carries_parent_agent_id_for_delegated_child() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["agentId"].as_str(), Some(child.0.as_str()));
+    assert_eq!(
+        data["parentAgentId"].as_str(),
+        Some(parent.0.as_str()),
+        "delegated child's attention event carries the parent id: {data}"
+    );
+}
+
+/// A non-delegated caller's `agent:attention-requested` OMITS `parentAgentId`
+/// entirely — the key must be absent, never `null`.
+#[tokio::test]
+async fn attention_requested_event_omits_parent_agent_id_for_non_delegated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["agentId"].as_str(), Some(agent.0.as_str()));
+    assert!(
+        data.get("parentAgentId").is_none(),
+        "parentAgentId must be OMITTED (not null) for a parentless agent: {data}"
+    );
+}
+
+/// `agent:failed` for a delegated child is enriched centrally (in
+/// `publish_agent_event`) with the child's `parentAgentId`, covering every
+/// terminal-failure emit site.
+#[tokio::test]
+async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("doomed work".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_FAILED.to_string()],
+        ..Default::default()
+    });
+    svc.publish_agent_event(
+        &ws,
+        &child,
+        AGENT_FAILED,
+        json!({ "agentId": child.0, "error": "boom" }),
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["error"].as_str(), Some("boom"));
+    assert_eq!(
+        data["parentAgentId"].as_str(),
+        Some(parent.0.as_str()),
+        "delegated child's agent:failed carries the parent id: {data}"
+    );
+}
+
+/// `agent:failed` for a parentless agent OMITS `parentAgentId` entirely —
+/// the key must be absent, never `null`.
+#[tokio::test]
+async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_FAILED.to_string()],
+        ..Default::default()
+    });
+    svc.publish_agent_event(
+        &ws,
+        &agent,
+        AGENT_FAILED,
+        json!({ "agentId": agent.0, "error": "boom" }),
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert!(
+        data.get("parentAgentId").is_none(),
+        "parentAgentId must be OMITTED (not null) for a parentless agent: {data}"
     );
 }
 

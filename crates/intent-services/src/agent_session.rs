@@ -2004,8 +2004,23 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         event_type: &str,
-        data: Value,
+        mut data: Value,
     ) {
+        // `agent:failed` carries the failing agent's delegation parentage so
+        // subscribers (parent coordinators, FE grouping) can attribute a child
+        // failure without a follow-up `agent.get`. Optional: OMITTED entirely
+        // for parentless agents — never `null`. Enriched centrally here so
+        // every terminal-failure emit site (prompt turn, idle-timeout cap,
+        // spawn/turn terminal pair) carries it. Best-effort: a store error —
+        // or a non-object payload (guarded via `as_object_mut` so a malformed
+        // `data` can't panic the index-assign) — leaves the payload untouched.
+        if event_type == AGENT_FAILED && data.get("parentAgentId").is_none() {
+            if let Ok(session) = self.store.get_agent_session(agent_id).await {
+                if let (Some(parent), Some(map)) = (session.parent_agent_id, data.as_object_mut()) {
+                    map.insert("parentAgentId".to_string(), Value::String(parent.0));
+                }
+            }
+        }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
