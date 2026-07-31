@@ -12757,6 +12757,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -12787,6 +12788,29 @@ impl WorkspaceApi for Services {
                     note_id,
                     agent_id: agent,
                 });
+            }
+            // Occupancy guard: assigning a NEW agent to a task that already
+            // has a live assigned agent needs `force: true`; re-assigning an
+            // already-assigned id stays idempotent-ok (handled above). Same
+            // predicate as `agent_delegate_op`'s pre-gate: newest live
+            // (loadable, not Deleted, not poisoned) assignee while the task
+            // is still workable (status not complete/cancelled).
+            if !already_assigned
+                && force != Some(true)
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+            {
+                if let Some(existing) = services
+                    .scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "Task is already being worked by agent {} (\"{}\"). \
+                         Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                         or pass force: true to intentionally assign a second agent.",
+                        existing.id, existing.name
+                    )));
+                }
             }
             let now = now_iso();
             let previous_status = task.status;

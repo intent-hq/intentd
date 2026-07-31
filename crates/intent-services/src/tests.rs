@@ -1409,13 +1409,13 @@ async fn assign_agent_validates_and_starts_task() {
         .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
-        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into())
+        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
         .await
         .is_err());
     // Valid agent id → assigned and status flips to in_progress.
     let agent = "agent-b0a8044a-5eac-4b52-8456-15d3b784decb";
     let r = svc
-        .assign_agent(ws.clone(), id.clone(), agent.into())
+        .assign_agent(ws.clone(), id.clone(), agent.into(), None)
         .await
         .expect("assignAgent");
     assert_eq!(r.agent_id.0, agent);

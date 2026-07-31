@@ -16,7 +16,8 @@ use intent_core::events::{
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
+    MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -46,6 +47,18 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// Outcome of [`Services::scan_assigned_agents`]: the newest live/resumable
+/// session (occupancy), the newest known session (inheritance source), plus
+/// the stale (`cleaned_up`) and poisoned assignment ids the wakeOrCreate
+/// branches prune/migrate.
+#[derive(Debug, Default)]
+pub(crate) struct AssignedAgentScan {
+    pub(crate) live_session: Option<AgentSession>,
+    pub(crate) inheritance_source: Option<AgentSession>,
+    pub(crate) cleaned_up: Vec<AgentId>,
+    pub(crate) poisoned: Vec<AgentId>,
+}
 
 #[cfg(test)]
 mod tests;
@@ -3810,6 +3823,33 @@ impl Services {
                 )?;
             }
         }
+        // Occupancy pre-gate: a task note that already has a live assigned
+        // agent cannot be silently double-delegated. Runs BEFORE any
+        // side-effectful work (child creation, group enrollment), alongside
+        // the depth/scope gates above, so a rejection leaves no orphaned
+        // child. "Occupied" reuses the same live/resumable predicate as
+        // `agent_wake_or_create_op`'s newest-first scan (loadable, not
+        // Deleted, not poisoned) and only applies while the task itself is
+        // still workable (status not complete/cancelled). `force: true`
+        // deliberately adds a second agent.
+        if input.force != Some(true) {
+            if let Some(task) = task_note.as_ref().and_then(|n| n.metadata.task.as_ref()) {
+                if !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+                    if let Some(existing) = self
+                        .scan_assigned_agents(&task.assigned_agent_ids)
+                        .await?
+                        .live_session
+                    {
+                        return Err(Error::InvalidParams(format!(
+                            "Task is already being worked by agent {} (\"{}\"). \
+                             Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                             or pass force: true to intentionally add a second agent.",
+                            existing.id, existing.name
+                        )));
+                    }
+                }
+            }
+        }
         let delegation_depth = parent_agent_id.as_ref().map(|_| {
             parent_session
                 .as_ref()
@@ -3950,8 +3990,16 @@ impl Services {
         }
 
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+            // Occupancy was already resolved by the pre-gate above (or
+            // deliberately overridden), so this internal assignment must not
+            // be re-blocked by `assign_agent`'s own guard.
             let _ = self
-                .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
+                .assign_agent(
+                    workspace_id.clone(),
+                    task_note_id,
+                    agent_id.clone(),
+                    Some(true),
+                )
                 .await;
         }
         // Auto-subscribe the delegating caller to the child's completion (AS-2).
@@ -5382,6 +5430,81 @@ impl Services {
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
     }
 
+    /// Newest-first probe over a task's `assignedAgentIds` (B1 + B2;
+    /// `Vec::push` append-order means newest is the tail). Shared by
+    /// `agent_wake_or_create_op`'s live/resumable scan and the occupancy
+    /// guards in `agent_delegate_op` / `assign_agent`. Probe each session:
+    ///   * NotFound / Deleted → stale, queue for cleanup.
+    ///   * Poisoned (monorepo#840: Error + session-fatal provider block or
+    ///     an identical-failure streak) → NOT resumable: waking it would
+    ///     replay the provider-blocked turn ("start a new session" means a
+    ///     fresh session). Queue for cleanup so a fresh agent is created,
+    ///     keeping it as the inheritance source for specialist/model.
+    ///     Poisoned ids are ALSO tracked separately: their parked queues
+    ///     are migrated onto the wake/create target and the dead session
+    ///     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+    ///     cleanup-only behavior.
+    ///   * Otherwise → treat as resumable; the newest live session wins.
+    ///
+    /// Once the newest live session is found, older candidates are left
+    /// untouched EXCEPT poisoned ones: a failed queue migration keeps the
+    /// poisoned assignment in place (now older than the live winner), so
+    /// the scan keeps probing for poisoned ids to retry the migration + GC
+    /// on this wake (monorepo#847).
+    /// `inheritance_source` captures the newest **known** previous session
+    /// (live, poisoned, or deleted) so wakeOrCreate's create branch can still
+    /// inherit specialist/model when no live agent is available.
+    pub(crate) async fn scan_assigned_agents(
+        &self,
+        assigned: &[AgentId],
+    ) -> Result<AssignedAgentScan> {
+        let mut scan = AssignedAgentScan::default();
+        for candidate in assigned.iter().rev().cloned() {
+            if scan.live_session.is_some() {
+                match self.store.get_agent_session(&candidate).await {
+                    Ok(session)
+                        if session.status != AgentStatus::Deleted
+                            && self.session_poisoned(&session) =>
+                    {
+                        scan.poisoned.push(candidate.clone());
+                        scan.cleaned_up.push(candidate);
+                    }
+                    Ok(_) | Err(Error::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+            match self.store.get_agent_session(&candidate).await {
+                Ok(session)
+                    if session.status != AgentStatus::Deleted
+                        && !self.session_poisoned(&session) =>
+                {
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(session.clone());
+                    }
+                    scan.live_session = Some(session);
+                }
+                Ok(unusable_session) => {
+                    if unusable_session.status != AgentStatus::Deleted {
+                        tracing::warn!(
+                            agent = %candidate,
+                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
+                            "assigned-agent scan skipping poisoned session; not resumable (monorepo#840)"
+                        );
+                        scan.poisoned.push(candidate.clone());
+                    }
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(unusable_session);
+                    }
+                    scan.cleaned_up.push(candidate);
+                }
+                Err(Error::NotFound(_)) => scan.cleaned_up.push(candidate),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(scan)
+    }
+
     /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
     /// newest live/resumable agent assigned to the task, or — when none is
     /// found — create a new one with specialist/model inheritance from the
@@ -5450,74 +5573,15 @@ impl Services {
             .await?;
         let task_title = task.title.clone();
 
-        // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
-        // append-order means newest is the tail). Probe each session:
-        //   * NotFound / Deleted → stale, queue for cleanup.
-        //   * Poisoned (monorepo#840: Error + session-fatal provider block or
-        //     an identical-failure streak) → NOT resumable: waking it would
-        //     replay the provider-blocked turn ("start a new session" means a
-        //     fresh session). Queue for cleanup so a fresh agent is created,
-        //     keeping it as the inheritance source for specialist/model.
-        //     Poisoned ids are ALSO tracked separately: their parked queues
-        //     are migrated onto the wake/create target and the dead session
-        //     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
-        //     cleanup-only behavior.
-        //   * Otherwise → treat as resumable; the newest live session wins.
-        // Once the newest live session is found, older candidates are left
-        // untouched EXCEPT poisoned ones: a failed queue migration keeps the
-        // poisoned assignment in place (now older than the live winner), so
-        // the scan keeps probing for poisoned ids to retry the migration + GC
-        // on this wake (monorepo#847).
-        // `inheritance_source` captures the newest **known** previous session
-        // (live, poisoned, or deleted) so the create branch can still inherit
-        // specialist/model when no live agent is available.
-        let mut cleaned_up: Vec<AgentId> = Vec::new();
-        let mut poisoned: Vec<AgentId> = Vec::new();
-        let mut live_session: Option<AgentSession> = None;
-        let mut inheritance_source: Option<AgentSession> = None;
-        for candidate in task.assigned_agents.iter().rev().cloned() {
-            if live_session.is_some() {
-                match self.store.get_agent_session(&candidate).await {
-                    Ok(session)
-                        if session.status != AgentStatus::Deleted
-                            && self.session_poisoned(&session) =>
-                    {
-                        poisoned.push(candidate.clone());
-                        cleaned_up.push(candidate);
-                    }
-                    Ok(_) | Err(Error::NotFound(_)) => {}
-                    Err(e) => return Err(e),
-                }
-                continue;
-            }
-            match self.store.get_agent_session(&candidate).await {
-                Ok(session)
-                    if session.status != AgentStatus::Deleted
-                        && !self.session_poisoned(&session) =>
-                {
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(session.clone());
-                    }
-                    live_session = Some(session);
-                }
-                Ok(unusable_session) => {
-                    if unusable_session.status != AgentStatus::Deleted {
-                        tracing::warn!(
-                            agent = %candidate,
-                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
-                            "wakeOrCreate skipping poisoned session; a fresh agent will be created (monorepo#840)"
-                        );
-                        poisoned.push(candidate.clone());
-                    }
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(unusable_session);
-                    }
-                    cleaned_up.push(candidate);
-                }
-                Err(Error::NotFound(_)) => cleaned_up.push(candidate),
-                Err(e) => return Err(e),
-            }
-        }
+        // B1 + B2: the newest-first live/resumable probe over the task's
+        // assignments (see `scan_assigned_agents` for the full contract —
+        // stale/poisoned tracking, inheritance source, newest live winner).
+        let AssignedAgentScan {
+            live_session,
+            inheritance_source,
+            mut cleaned_up,
+            poisoned,
+        } = self.scan_assigned_agents(&task.assigned_agents).await?;
 
         // B7: `messageMetadata` is applied to the delivered context message on
         // BOTH branches via `deliver_wake_message`.
@@ -5798,8 +5862,11 @@ impl Services {
             .unwrap_or_default()
             .to_string();
         let agent = AgentId::from(agent_id_str.as_str());
+        // The scan above already established there is no live assigned agent
+        // (create branch), so this internal assignment bypasses
+        // `assign_agent`'s occupancy guard.
         let _ = self
-            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str)
+            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str, Some(true))
             .await;
         // monorepo#847: same ordering contract as the wake branch — migrate
         // the poisoned siblings' parked queues BEFORE `deliver_wake_message`
