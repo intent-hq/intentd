@@ -2780,8 +2780,11 @@ impl AgentManager {
     /// `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`, or a drained
     /// user-origin queue entry). Automatic deliveries (A2A sends, parent /
     /// subscription wakes, `agent.sendToTask`, `agent.wakeOrCreate`, stale
-    /// redrives) never retire it — the call site gates on
-    /// `TurnOptions::origin.is_user()`. Skips the store write and event when
+    /// redrives of automatic entries) never retire it — the call site gates
+    /// on `TurnOptions::origin.is_user()`. A stale redrive of a USER-ORIGIN
+    /// entry still clears: the drain handoff restores `origin = User`, unlike
+    /// the completion-report clear, which staleness suppresses regardless of
+    /// origin (`suppress_report_clear`). Skips the store write and event when
     /// no request is pending (the common case). Emits `agent:updated` with
     /// `attentionRequestCleared: true` when one was present and cleared so
     /// clients retire the sidebar/footer indicator.
