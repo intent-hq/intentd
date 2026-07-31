@@ -14,7 +14,7 @@ use crate::model::{
     ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
     FileActivity, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
     GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
@@ -46,6 +46,23 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
             ))
         })
+    }
+
+    /// Store-backed workspace rows plus live `activity` and the cheap status
+    /// aggregates (`taskStats` via a counting query, derived `displayStatus`,
+    /// lifetime-cached `cowSupported`) — no notes/sessions enrichment. Used by
+    /// the workspace subscription snapshot so seq-0 cannot emit multi-MB
+    /// enriched payloads that HOL the connection writer (observed ~4.5 MiB /
+    /// 80 workspaces) while staying self-sufficient for client status
+    /// rendering. The heavy card aggregates (`agentSummary`/`diffSummary`) are
+    /// omitted; clients treat missing fields as "derive locally / wait for
+    /// deltas" (same as a notes-read failure on list). Default falls back to
+    /// full `list_workspaces`.
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        self.list_workspaces(include_archived)
     }
 
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
@@ -989,13 +1006,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.assignAgent`: append an agent to a task's assignee list (§5.4).
+    /// Assigning a NEW agent to a task that already has a live assigned agent
+    /// is rejected unless `force` is `Some(true)`; re-assigning an
+    /// already-assigned id stays idempotent-ok.
     fn assign_agent(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
-        let _ = (workspace_id, note_id, agent_id);
+        let _ = (workspace_id, note_id, agent_id, force);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::assign_agent not implemented".to_string(),
@@ -1306,6 +1327,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// (reference-parity `acp-provider.ts`); the other two are threaded
     /// through to the prompt builder for downstream note-image /
     /// context-reference resolution.
+    ///
+    /// `origin` marks who originated the delivery (question hold, PROTOCOL
+    /// §5.5): the FE RPC front door passes [`MessageOrigin::User`] (never
+    /// held); the MCP front door and every internal wake/continuation path
+    /// pass [`MessageOrigin::Automatic`], which enqueues instead of starting
+    /// a turn while the target agent's question hold is active.
     #[allow(clippy::too_many_arguments)]
     fn agent_send_message(
         &self,
@@ -1320,6 +1347,7 @@ pub trait WorkspaceApi: Send + Sync {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -1333,6 +1361,7 @@ pub trait WorkspaceApi: Send + Sync {
             stdin_context,
             context_references,
             message_metadata,
+            origin,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -1357,6 +1386,25 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_queued_message_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.dismissQuestions`: persist the question-dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session, emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume
+    /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_dismiss_questions not implemented".to_string(),
             ))
         })
     }
@@ -1823,6 +1871,33 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.requestAttention`: an agent explicitly raises attention before
+    /// ending its turn — `kind` is `"discussion"` (`ws.agent.requestDiscussion`)
+    /// or `"blocker"` (`ws.agent.reportBlocker`), `reason` is required.
+    /// Persists the pending request on the session, appends a system-role
+    /// transcript notice, emits `agent:attention-requested`, transitions the
+    /// linked task (`discussion_needed` / `blocked`), and wakes a delegated
+    /// caller's parent. Available to all agents (delegated or not, with or
+    /// without a linked task).
+    ///
+    /// `caller_agent_id` is the agent invoking the tool: the MCP front door
+    /// passes `Some(caller)`; the FE/RPC front door passes `None`, which
+    /// surfaces `-32603` (there is no caller session to attach the request to).
+    fn agent_request_attention(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, kind, reason, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_request_attention not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSubscriptions`: `{ subscriptions, delegationGroups, agentStatuses }`
     /// (PROTOCOL §5.5).
     fn agent_get_subscriptions(
@@ -1906,14 +1981,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
+    /// `agent.cancelSubscriptions`: cancel an agent's subscriptions —
+    /// everything when unscoped, or just the named completion watch
+    /// (`subscription_id`) / delegation group (`group_id`) when scoped;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id);
+        let _ = (workspace_id, agent_id, subscription_id, group_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_cancel_subscriptions not implemented".to_string(),

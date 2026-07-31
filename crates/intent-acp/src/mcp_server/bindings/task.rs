@@ -10,7 +10,7 @@ use std::sync::Arc;
 use intent_core::{AgentId, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
-use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
+use super::{map_err, opt_bool, opt_str, opt_vec_str, req_i64, req_str};
 
 /// Canonical `TaskStatus` values accepted by the daemon. Kept in one place so
 /// pre-flight validation stays consistent between `updateNoteStatus` and
@@ -20,6 +20,7 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "not_started",
     "waiting",
     "discussion_needed",
+    "blocked",
     "in_progress",
     "review_required",
     "complete",
@@ -46,8 +47,8 @@ pub(crate) const PRELUDE: &str = r#"
                 method: 'task.createPrerequisite',
                 args: { dependentNoteId, title, ...(options || {}) },
             }),
-        assignAgent: (noteId, agentId) =>
-            host({ method: 'task.assignAgent', args: { noteId, agentId } }),
+        assignAgent: (noteId, agentId, force) =>
+            host({ method: 'task.assignAgent', args: { noteId, agentId, force } }),
     };
 "#;
 
@@ -250,7 +251,12 @@ async fn assign_agent(
         ));
     }
     let r = api
-        .assign_agent(ws.clone(), NoteId::from_string(&note_id), agent_id)
+        .assign_agent(
+            ws.clone(),
+            NoteId::from_string(&note_id),
+            agent_id,
+            opt_bool(args, "force"),
+        )
         .await
         .map_err(map_err)?;
     // Return the daemon's canonical `TaskAssignAgentResult`; its serde

@@ -362,7 +362,7 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -541,7 +541,7 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
                 );
                 saw_processing = true;
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()

@@ -502,6 +502,31 @@ pub struct WorkspaceTaskStats {
     pub in_progress: usize,
 }
 
+/// Extract the spec-linked task-note ids from a spec note's markdown body
+/// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
+/// (`TASK_LINK_REGEX_FLEXIBLE`). Shared by the enriched `taskStats` path
+/// (intent-services `compute_task_stats`) and the cheap store-level counting
+/// query (`Store::count_task_stats`) so the two stay in lock-step.
+pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String> {
+    const MARKER: &str = "(intent://local/task/";
+    let mut ids = std::collections::HashSet::new();
+    let mut rest = content;
+    while let Some(pos) = rest.find(MARKER) {
+        let after = &rest[pos + MARKER.len()..];
+        match after.find(')') {
+            Some(end) => {
+                let id = &after[..end];
+                if !id.is_empty() {
+                    ids.insert(id.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    ids
+}
+
 /// One entry of [`WorkspaceAgentSummary::agents`] (§5.5 card; TS
 /// `WorkspaceAgentInfo`). The live iOS `WorkspaceStore.parseWorkspace` decodes
 /// `id`/`name`/`status`/`isStreaming`/`isResponding` as non-optional and
@@ -832,6 +857,10 @@ pub enum TaskStatus {
     NotStarted,
     Waiting,
     DiscussionNeeded,
+    /// Agent reported a blocker it cannot resolve (`ws.agent.reportBlocker`).
+    /// Non-terminal; excluded from `inProgress` in task-stats rollups, like
+    /// `discussion_needed`.
+    Blocked,
     InProgress,
     ReviewRequired,
     Complete,
@@ -1847,6 +1876,41 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Metadata key under which the question-dismissal marker is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// assistant message whose trailing question resource blocks the user
+/// dismissed via `agent.dismissQuestions`. No schema migration — the marker
+/// rides the existing free-form `metadata` column and survives daemon
+/// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
+pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
+
+/// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
+/// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
+/// user-originated entry point — which always delivers immediately (a user
+/// message supersedes any pending Q&A). Everything else (MCP front-door
+/// sends, reportToParent / completion-watch / event-subscription wakes,
+/// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
+/// `Automatic` and is held in the queue while the target agent's question
+/// hold is active. `Automatic` is the `Default` so unmarked internal paths
+/// fail closed (held) rather than dismissing a pending Q&A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageOrigin {
+    /// FE-originated `agent.sendMessage` (typed message or wizard answers):
+    /// never held by the question hold.
+    User,
+    /// System/agent-originated delivery: held while the question hold is
+    /// active.
+    #[default]
+    Automatic,
+}
+
+impl MessageOrigin {
+    /// `true` for [`MessageOrigin::User`].
+    pub fn is_user(self) -> bool {
+        matches!(self, MessageOrigin::User)
+    }
+}
+
 /// Maximum delegation depth to prevent unbounded recursive agent creation
 /// (port of the TS `MAX_DELEGATION_DEPTH` in `agent-interaction-tools.ts`).
 /// Depth 0 = user-created agents, depth 1 = their children, depth 2 =
@@ -1919,6 +1983,19 @@ pub struct AgentSession {
     /// `metadata.completionReportTimestamp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report_timestamp: Option<String>,
+    /// Pending attention request raised by `ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker`: `"discussion"` or `"blocker"`. Cleared when
+    /// the agent next receives a message. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_kind: Option<String>,
+    /// The reason supplied with the pending attention request. Omitted when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_reason: Option<String>,
+    /// ISO timestamp the pending attention request was raised at. Omitted
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_timestamp: Option<String>,
     /// Delegation-chain depth (FE `metadata.delegationDepth`): 0/absent for
     /// user-created agents, parent depth + 1 for delegated children. Gates
     /// runaway delegation loops.
@@ -1984,6 +2061,22 @@ pub struct AgentSession {
     pub updated_at: String,
 }
 
+impl AgentSession {
+    /// The question-dismissal marker persisted under
+    /// [`DISMISSED_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
+    /// `metadata`: `Some` only when the metadata is an object carrying a
+    /// non-empty string under that key. The question-hold derivation compares
+    /// this against the last assistant message id — a match means the user
+    /// dismissed that message's questions and automatic deliveries resume.
+    pub fn dismissed_questions_message_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(DISMISSED_QUESTIONS_MESSAGE_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
 /// of the TS `AgentMetadata` the iOS `AgentSession.parseAgent` reads:
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
@@ -2006,6 +2099,14 @@ pub struct AgentMetadata {
     pub completion_report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report_timestamp: Option<String>,
+    /// Pending attention request (`"discussion"` / `"blocker"`); omitted when
+    /// absent. Mirrors [`AgentSession::attention_request_kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2019,6 +2120,13 @@ pub struct AgentMetadata {
     /// Sandbox branch name when this agent runs in a sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_branch: Option<String>,
+    /// Question-dismissal marker (PROTOCOL §5.5, question hold): the id of the
+    /// assistant message whose trailing question resource blocks the user
+    /// dismissed via `agent.dismissQuestions`. Clients gate the Q&A wizard on
+    /// it so a dismissed question set never re-surfaces (including after
+    /// reload). Omitted when nothing was dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_questions_message_id: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -2138,6 +2246,8 @@ impl AgentLite {
         last_user_message: Option<String>,
         digest: Option<String>,
     ) -> Self {
+        let dismissed_questions_message_id =
+            session.dismissed_questions_message_id().map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -2145,11 +2255,15 @@ impl AgentLite {
             task_note_id: session.task_note_id.clone(),
             completion_report: session.completion_report,
             completion_report_timestamp: session.completion_report_timestamp,
+            attention_request_kind: session.attention_request_kind,
+            attention_request_reason: session.attention_request_reason,
+            attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
             initial_message: session.initial_message,
             sandbox_id: session.sandbox_id.clone(),
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
+            dismissed_questions_message_id,
         };
         Self {
             id: session.id,
@@ -2241,6 +2355,10 @@ pub struct AgentDelegateInput {
     /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
     /// the workspace directory. Falls back to shared mode if CoW is unsupported.
     pub isolation: Option<String>,
+    /// Occupancy override: a task that already has a live assigned agent
+    /// rejects a second delegation unless `force: true` is passed to
+    /// intentionally add another agent.
+    pub force: Option<bool>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -3345,12 +3463,17 @@ mod tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
             image_blocks: None,
             is_background: true,
-            metadata: None,
+            metadata: Some(json!({
+                DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
+            })),
             stop_reason: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
@@ -3362,6 +3485,9 @@ mod tests {
         let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
+        // The question-dismissal marker is lifted out of the free-form session
+        // metadata into the AgentLite metadata projection.
+        assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
         // The persisted session value is served, not a hard-coded `false`
         // (G-A1/P3-1.2c).
         assert_eq!(v["metadata"]["isBackground"], true);
@@ -3412,6 +3538,9 @@ mod tests {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,

@@ -16,7 +16,8 @@ use intent_core::events::{
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
+    MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -46,6 +47,18 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// Outcome of [`Services::scan_assigned_agents`]: the newest live/resumable
+/// session (occupancy), the newest known session (inheritance source), plus
+/// the stale (`cleaned_up`) and poisoned assignment ids the wakeOrCreate
+/// branches prune/migrate.
+#[derive(Debug, Default)]
+pub(crate) struct AssignedAgentScan {
+    pub(crate) live_session: Option<AgentSession>,
+    pub(crate) inheritance_source: Option<AgentSession>,
+    pub(crate) cleaned_up: Vec<AgentId>,
+    pub(crate) poisoned: Vec<AgentId>,
+}
 
 #[cfg(test)]
 mod tests;
@@ -262,6 +275,24 @@ pub(crate) struct QueuedMessage {
     /// Preempted message's file attachments, carried like `prepend_content`.
     #[serde(default)]
     pub prepend_file_blocks: Option<Value>,
+    /// `true` when this entry was enqueued with `priority: "interrupt"`
+    /// (question hold / PROTOCOL §5.5): interrupt entries ALWAYS enter the
+    /// queue ahead of all normal entries, preserving arrival order among
+    /// themselves ([`Services::enqueue_message`]). Persisted so the ordering
+    /// survives daemon restarts; `to_value` emits `interruptPriority: true`
+    /// so queue snapshots reflect the marker.
+    #[serde(default)]
+    pub interrupt_priority: bool,
+    /// `true` when the entry carries a USER-originated `agent.sendMessage`
+    /// that was parked by a queue-fallback path (busy race, quarantine,
+    /// append-failure). The question hold never blocks user messages
+    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
+    /// hold-gated drain paths deliver the first user-origin entry instead
+    /// of suspending — without this marker a user answer parked by the
+    /// turn-end busy race would deadlock against the hold it is supposed
+    /// to release. Persisted so the bypass survives daemon restarts.
+    #[serde(default)]
+    pub user_origin: bool,
 }
 
 impl QueuedMessage {
@@ -302,6 +333,9 @@ impl QueuedMessage {
         }
         if let Some(md) = &self.message_metadata {
             v["messageMetadata"] = md.clone();
+        }
+        if self.interrupt_priority {
+            v["interruptPriority"] = Value::Bool(true);
         }
         v
     }
@@ -908,6 +942,20 @@ pub(crate) fn user_message_blocks(
     Value::Array(blocks)
 }
 
+/// `true` iff a message's content-block array carries at least one pending
+/// question resource block (`application/vnd.intent.question+json` — the MIME
+/// type `ws.app.question.ask` emits; reused from `intent-acp` so hold
+/// detection cannot drift from the binding). Non-array content is `false`.
+pub(crate) fn has_question_blocks(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+    })
+}
+
 /// Build the persisted `agent_session.metadata` blob for the create branch of
 /// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
 /// `create.metadata` object (or `{}`), overlays the FE provenance fields the
@@ -1112,6 +1160,39 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// monorepo#1114: stamp the stable synthetic `{messageId}:{index}` id onto any
+/// content block that persisted without one, so `agent.getConversation`, the
+/// seq-0 chat snapshot, and the §7.1 delta path (which re-reads through this
+/// op) agree byte-for-byte on block identity. Assistant blocks always persist
+/// with ids, so the pass is a no-op for them; non-assistant rows (user /
+/// system / tool) gain the same id the delta path stamps. Serve-time only —
+/// the stored rows are untouched, so the read stays idempotent. Runs AFTER
+/// [`strip_anonymous_tool_blocks`] so indices match the served array.
+fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
+    let message_id = message.id.clone();
+    let Some(blocks) = message.content.as_array_mut() else {
+        return message;
+    };
+    for (index, block) in blocks.iter_mut().enumerate() {
+        // An empty-string id is treated as missing — it can't serve as a
+        // stable upsert key, so it gets the synthetic id like an absent one.
+        if block
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert(
+                "id".to_string(),
+                Value::String(format!("{message_id}:{index}")),
+            );
+        }
+    }
+    message
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
@@ -1123,9 +1204,12 @@ impl Services {
             .store
             .list_agent_session_summaries(&workspace_id)
             .await?;
+        // Message projections are the expensive half (full-workspace COUNT
+        // aggregate + preview columns). Cache per workspace; invalidated on
+        // transcript writes and session create/delete.
         let mut projections = self
-            .store
-            .get_agent_session_message_projections(&workspace_id)
+            .agent_list_cache
+            .get_or_load(&self.store, &workspace_id)
             .await?;
         Ok(sessions
             .into_iter()
@@ -1134,6 +1218,13 @@ impl Services {
                 self.project_lite_with_flags_from_projection(s, &projection)
             })
             .collect())
+    }
+
+    /// Drop the cached agent.list message projections for `workspace_id`.
+    /// Call after any successful agent_message write or session create/delete
+    /// in this workspace so the next list reloads from SQLite.
+    pub(crate) fn invalidate_agent_list_cache(&self, workspace_id: &WorkspaceId) {
+        self.agent_list_cache.invalidate(&workspace_id.0);
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
@@ -1323,6 +1414,11 @@ impl Services {
     /// non-destructively — the stored rows are untouched, so the read is
     /// idempotent and covers old rows and restored backups alike.
     ///
+    /// monorepo#1114: the served page also stamps the stable synthetic
+    /// `{messageId}:{index}` id onto blocks that persisted without one
+    /// ([`stamp_synthetic_block_ids`]), so snapshot and delta consumers see
+    /// identical block identities.
+    ///
     /// Pagination happens SQL-side (monorepo#958): the window is resolved
     /// against the row count and only the requested page is selected and
     /// decoded, so a `limit=N` read touches at most N rows regardless of
@@ -1361,6 +1457,7 @@ impl Services {
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
+            .map(stamp_synthetic_block_ids)
             .collect();
         Ok(json!({
             "agentId": agent_id,
@@ -1726,6 +1823,9 @@ impl Services {
             skip_auto_commit,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth,
             initial_message,
             context_references,
@@ -1741,6 +1841,7 @@ impl Services {
             sandbox_branch: None,
         };
         self.store.insert_agent_session(&session).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
         // falling back to the provider id when no model is resolved yet;
@@ -1919,6 +2020,7 @@ impl Services {
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
+            self.invalidate_agent_list_cache(session_ws);
         }
         self.agent_queues
             .lock()
@@ -2181,6 +2283,7 @@ impl Services {
                 &created_at,
             )
             .await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -2286,6 +2389,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let replaced_count = inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2366,6 +2470,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2542,8 +2647,15 @@ impl Services {
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
-        let (queued, position) =
-            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+        let (queued, position) = self.enqueue_message(
+            &agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            None,
+            None,
+            false,
+        );
         let result = json!({
             "success": true,
             "queuedMessage": queued.to_value(position),
@@ -2734,6 +2846,7 @@ impl Services {
         };
         match message {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&session.workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Reuses the session validated above; best-effort (logged on error).
@@ -2770,8 +2883,15 @@ impl Services {
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
                 // path's behavior.
-                let (queued, position) =
-                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
+                let (queued, position) = self.enqueue_message(
+                    &agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    None,
+                    None,
+                    false,
+                );
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -2841,6 +2961,7 @@ impl Services {
                 return Err(e);
             }
         };
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -2862,6 +2983,134 @@ impl Services {
         )
         .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
+    }
+
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
+    /// walking back from the tail of the transcript past any trailing
+    /// `system` rows (e.g. the resume-interruption marker —
+    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
+    /// continuation), the first non-system message is an assistant message
+    /// carrying at least one `application/vnd.intent.question+json` resource
+    /// block AND its id differs from the session's persisted dismissal
+    /// marker. `system` rows are transparent to the derivation — same as the
+    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
+    /// `assistant` row — so a system marker can neither supersede nor rescue
+    /// a pending Q&A. Derived, not stored: any later user/assistant message
+    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
+    /// supersedes the questions and flips the hold false;
+    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Fails open (`false`) on store errors so a read failure can never wedge
+    /// deliveries.
+    pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        // Page back over the tail, growing the window while every fetched
+        // row is `system`-role, so an arbitrarily long run of trailing
+        // system markers (e.g. repeated interruption notices) can never hide
+        // a still-pending question underneath it. Stops as soon as a
+        // non-system row is found, the fetched page comes back shorter than
+        // requested (the whole transcript was system rows or empty — no
+        // hold), or the safety cap is hit (fails open to `false`).
+        const HOLD_DERIVATION_TAIL_START: i64 = 10;
+        const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
+        let mut tail = HOLD_DERIVATION_TAIL_START;
+        let last = loop {
+            let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
+                return false;
+            };
+            if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
+                break last.clone();
+            }
+            if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
+                return false;
+            }
+            tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
+        };
+        if last.role != "assistant" || !has_question_blocks(&last.content) {
+            return false;
+        }
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        session.dismissed_questions_message_id() != Some(last.id.as_str())
+    }
+
+    /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session so the dismissed
+    /// question set never re-surfaces (survives reload), emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume.
+    /// Idempotent: re-dismissing the same message succeeds. Fails closed on a
+    /// nonexistent target or a workspace mismatch (`NotFound`).
+    pub(crate) async fn agent_dismiss_questions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            return Err(Error::InvalidParams("messageId is required".to_string()));
+        }
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (defense-in-depth against bare-id probes).
+        let mut session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        // Preserve non-object metadata verbatim under a side key rather than
+        // discarding it: the column is documented/typed as a free-form
+        // object today, but silently replacing a non-object value (should
+        // one ever land there) would drop data (monorepo#751 review).
+        let mut metadata = match session.metadata.take() {
+            Some(Value::Object(map)) => map,
+            Some(other) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    "agent_session.metadata was a non-object JSON value; \
+                     preserving it under `priorNonObjectMetadata` while adding the \
+                     dismissal marker"
+                );
+                let mut map = serde_json::Map::new();
+                map.insert("priorNonObjectMetadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
+            Value::String(message_id.clone()),
+        );
+        session.metadata = Some(Value::Object(metadata));
+        session.updated_at = now_iso();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "dismissedQuestionsMessageId": message_id,
+            }),
+        )
+        .await;
+        // The hold (if it was gating this message's questions) is now released:
+        // kick the drain so held queue entries resume without waiting for the
+        // next end-of-turn drain.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(agent_id.clone(), workspace_id)
+                .await;
+        }
+        Ok(json!({
+            "success": true,
+            "dismissedQuestionsMessageId": message_id,
+        }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -3128,6 +3377,34 @@ impl Services {
         task_note_id: NoteId,
         caller: AgentId,
     ) {
+        self.transition_linked_task_status(
+            workspace_id,
+            task_note_id,
+            caller,
+            intent_core::TaskStatus::ReviewRequired,
+            "review_required",
+        )
+        .await;
+    }
+
+    /// Shared best-effort linked-task transition (TASK-B shape): move the
+    /// caller's linked task note to `target` iff its current status is
+    /// non-terminal (not `complete`/`cancelled`) and not already `target`
+    /// (the writer always persists — bumping `updated_at` and `rev` — before
+    /// its own no-op-when-unchanged check, so repeated calls would otherwise
+    /// churn the note). Uses the same `task.updateNoteStatus` writer the
+    /// router path uses, so it publishes `task:status-changed` +
+    /// `notes:ready-tasks-changed` with the caller as `agentId`. All errors
+    /// are logged and swallowed — the calling op's own persistence is the
+    /// contract; the FE-facing status update is best-effort.
+    async fn transition_linked_task_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        task_note_id: NoteId,
+        caller: AgentId,
+        target: intent_core::TaskStatus,
+        target_word: &str,
+    ) {
         let note = match crate::fetch_note(&self.store, workspace_id, &task_note_id).await {
             Ok(note) => note,
             // A missing or out-of-workspace linked note is the expected shape
@@ -3137,7 +3414,7 @@ impl Services {
             Err(Error::NotFound(_)) => {
                 tracing::debug!(
                     note = %task_note_id,
-                    "report_to_parent: linked task note not found in this workspace; skipping status transition"
+                    "linked task note not found in this workspace; skipping status transition"
                 );
                 return;
             }
@@ -3145,7 +3422,7 @@ impl Services {
                 tracing::warn!(
                     error = %e,
                     note = %task_note_id,
-                    "report_to_parent: failed to load linked task note for status transition"
+                    "failed to load linked task note for status transition"
                 );
                 return;
             }
@@ -3154,24 +3431,19 @@ impl Services {
             return;
         };
         // Terminal statuses must not be downgraded (parity with the router
-        // path's own no-op-when-unchanged branch), and a task already in
-        // `review_required` must skip the writer entirely: TASK-B's
-        // `task_update_note_status` always persists (bumping `updated_at` and
-        // `rev`) before checking `previous_status != new_status`, so repeated
-        // `reportToParent` calls would otherwise churn the note on every hop.
+        // path's own no-op-when-unchanged branch).
         if matches!(
             task.status,
-            intent_core::TaskStatus::Complete
-                | intent_core::TaskStatus::Cancelled
-                | intent_core::TaskStatus::ReviewRequired
-        ) {
+            intent_core::TaskStatus::Complete | intent_core::TaskStatus::Cancelled
+        ) || task.status == target
+        {
             return;
         }
         if let Err(e) = WorkspaceApi::task_update_note_status(
             self,
             workspace_id.clone(),
             task_note_id.clone(),
-            "review_required".into(),
+            target_word.into(),
             None,
             Some(caller),
         )
@@ -3180,9 +3452,224 @@ impl Services {
             tracing::warn!(
                 error = %e,
                 note = %task_note_id,
-                "report_to_parent: failed to transition linked task to review_required"
+                target = target_word,
+                "failed to transition linked task status"
             );
         }
+    }
+
+    /// Shared services op behind `ws.agent.requestDiscussion` /
+    /// `ws.agent.reportBlocker` (`kind`: `"discussion" | "blocker"`). Modeled
+    /// on [`Self::agent_report_to_parent_op`], but available to ALL agents —
+    /// delegated or not, with or without a linked task:
+    /// 1. persists the pending attention request (kind/reason/timestamp) on
+    ///    the caller's session (cleared when the agent next receives a
+    ///    message) and emits `agent:updated`;
+    /// 2. appends a system-role transcript notice with
+    ///    `meta.kind = "discussion-request"` / `"blocker-report"` (emits
+    ///    `agent:message`) so the conversation renders a distinct card that
+    ///    survives rehydration;
+    /// 3. emits the self-sufficient `agent:attention-requested` event
+    ///    `{ workspaceId, agentId, agentName, kind, reason }` (FE sticky
+    ///    toast);
+    /// 4. transitions the linked task to `discussion_needed` / `blocked`
+    ///    (terminal statuses untouched; no linked task = skip);
+    /// 5. wakes a delegated caller's parent with a kind-flavored message —
+    ///    delivered IMMEDIATELY even when the child is in an undelivered
+    ///    `after_all` delegation group (mirroring the STAB-160 immediate
+    ///    grouped-failure wake: an attention request is an alert the parent
+    ///    must hear now, not at group settlement). The group's later
+    ///    aggregated wake also annotates the child's line from the persisted
+    ///    session fields (the record) while the request is still pending —
+    ///    the fields are cleared when the child next receives a message, so
+    ///    a parent reply before settlement retires the fold. Non-delegated
+    ///    callers have no parent to wake.
+    ///
+    /// Agent status and `stop_reason` are untouched: the turn ends normally
+    /// (no retry/requeue interaction).
+    pub(crate) async fn agent_request_attention_op(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        let caller = caller_agent_id.ok_or_else(|| {
+            Error::Internal("requestAttention is only available to agents".to_string())
+        })?;
+        let (meta_kind, task_target, task_target_word, wake_verb) = match kind.as_str() {
+            "discussion" => (
+                "discussion-request",
+                intent_core::TaskStatus::DiscussionNeeded,
+                "discussion_needed",
+                "requests a discussion",
+            ),
+            "blocker" => (
+                "blocker-report",
+                intent_core::TaskStatus::Blocked,
+                "blocked",
+                "reports a blocker",
+            ),
+            other => {
+                return Err(Error::InvalidParams(format!(
+                    "invalid attention kind: {other} (must be \"discussion\" or \"blocker\")"
+                )));
+            }
+        };
+        let reason = reason.trim().to_string();
+        if reason.is_empty() {
+            return Err(Error::InvalidParams("reason is required".to_string()));
+        }
+        let mut session = self.load_session_internal(&caller).await?;
+        // Scope-guard the caller-supplied `workspace_id` (same shape as
+        // `agent_report_to_parent_op`): reject a cross-workspace mismatch with
+        // `NotFound` before any state changes.
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {caller}")));
+        }
+        // 1. Persist the pending attention request on the session.
+        let saved_at = now_iso();
+        session.attention_request_kind = Some(kind.clone());
+        session.attention_request_reason = Some(reason.clone());
+        session.attention_request_timestamp = Some(saved_at.clone());
+        session.updated_at = saved_at.clone();
+        let workspace_id = session.workspace_id.clone();
+        let task_note_id = session.task_note_id.clone();
+        let parent = session.parent_agent_id.clone();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({
+                "agentId": caller.0,
+                "attentionRequestKind": kind,
+                "attentionRequestTimestamp": saved_at,
+            }),
+        )
+        .await;
+        // 2. Persist the transcript notice (system role + structured
+        // meta.kind, the InterruptionNotice shape) and emit agent:message.
+        // Best-effort: the session fields above are the durable contract.
+        let notice_content = json!([{
+            "type": "text",
+            "text": reason,
+            "meta": { "kind": meta_kind }
+        }]);
+        match self
+            .store
+            .append_agent_message(&caller, "system", &notice_content, &saved_at)
+            .await
+        {
+            Ok(message) => {
+                self.invalidate_agent_list_cache(&workspace_id);
+                self.publish_agent_mutation_event(
+                    &workspace_id,
+                    &caller,
+                    intent_core::events::AGENT_MESSAGE,
+                    json!({ "agentId": caller.0, "messageId": message.id, "role": "system" }),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %caller.0,
+                    error = %e,
+                    "request_attention: failed to append transcript notice"
+                );
+            }
+        }
+        // 3. Self-sufficient toast-driving event.
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_ATTENTION_REQUESTED,
+            json!({
+                "workspaceId": workspace_id.0,
+                "agentId": caller.0,
+                "agentName": session.name.clone(),
+                "kind": kind,
+                "reason": reason,
+            }),
+        )
+        .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
+        // 4. Linked-task transition (no linked task = skip).
+        if let Some(note_id) = task_note_id {
+            self.transition_linked_task_status(
+                &workspace_id,
+                note_id,
+                caller.clone(),
+                task_target,
+                task_target_word,
+            )
+            .await;
+        }
+        // 5. Kind-flavored parent wake for delegated callers — delivered
+        // immediately even when the child is enrolled in an undelivered
+        // `after_all` delegation group (mirroring the STAB-160 immediate
+        // grouped-failure wake in `deliver_completion_to_watches`): the
+        // request is an alert the parent must hear now, not at group
+        // settlement. The group's later aggregated wake also annotates the
+        // child's line from the persisted session fields (the record) while
+        // the request is still pending — a parent reply before settlement
+        // clears the fields and retires the fold. Non-delegated callers have
+        // no parent to wake.
+        if let Some(parent) = parent {
+            let parent_home_ws = self
+                .store
+                .get_agent_session(&parent)
+                .await
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|_| workspace_id.clone());
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
+                session.name, caller.0, wake_verb, reason
+            );
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                    "timestamp": saved_at,
+                    "data": {
+                        "workspaceId": workspace_id.0,
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "kind": kind,
+                        "reason": reason,
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            if let Err(e) = self
+                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver attention-request wake to parent"
+                );
+            }
+        }
+
+        Ok(json!({
+            "ok": true,
+            "kind": kind,
+            "reason": reason,
+            "savedAt": saved_at,
+        }))
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the
@@ -3354,6 +3841,33 @@ impl Services {
                 )?;
             }
         }
+        // Occupancy pre-gate: a task note that already has a live assigned
+        // agent cannot be silently double-delegated. Runs BEFORE any
+        // side-effectful work (child creation, group enrollment), alongside
+        // the depth/scope gates above, so a rejection leaves no orphaned
+        // child. "Occupied" reuses the same live/resumable predicate as
+        // `agent_wake_or_create_op`'s newest-first scan (loadable, not
+        // Deleted, not poisoned) and only applies while the task itself is
+        // still workable (status not complete/cancelled). `force: true`
+        // deliberately adds a second agent.
+        if input.force != Some(true) {
+            if let Some(task) = task_note.as_ref().and_then(|n| n.metadata.task.as_ref()) {
+                if !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+                    if let Some(existing) = self
+                        .scan_assigned_agents(&task.assigned_agent_ids)
+                        .await?
+                        .live_session
+                    {
+                        return Err(Error::InvalidParams(format!(
+                            "Task is already being worked by agent {} (\"{}\"). \
+                             Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                             or pass force: true to intentionally add a second agent.",
+                            existing.id, existing.name
+                        )));
+                    }
+                }
+            }
+        }
         let delegation_depth = parent_agent_id.as_ref().map(|_| {
             parent_session
                 .as_ref()
@@ -3494,8 +4008,16 @@ impl Services {
         }
 
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+            // Occupancy was already resolved by the pre-gate above (or
+            // deliberately overridden), so this internal assignment must not
+            // be re-blocked by `assign_agent`'s own guard.
             let _ = self
-                .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
+                .assign_agent(
+                    workspace_id.clone(),
+                    task_note_id,
+                    agent_id.clone(),
+                    Some(true),
+                )
                 .await;
         }
         // Auto-subscribe the delegating caller to the child's completion (AS-2).
@@ -3828,8 +4350,9 @@ impl Services {
     /// register a oneShot caller→target watch UNLESS the caller is a
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
-    /// wakeup cards unrelated to their own task. Idempotent: reuses an
-    /// existing watch when one already exists.
+    /// wakeup cards unrelated to their own task — or the caller is a child
+    /// of the target (watches are auto-registered parent→child only).
+    /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
         workspace_id: WorkspaceId,
@@ -3846,6 +4369,32 @@ impl Services {
             .map(is_delegated_background_task_session)
             .unwrap_or(false);
         if skip {
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        // SUB-1 child→parent suppression: the auto-watch is one-directional
+        // (parent→child only). A child sending a coordination message to its
+        // own parent must never be subscribed to the parent's completion —
+        // otherwise the child is woken whenever the parent goes idle. Child
+        // linkage is read from the caller session's `parent_agent_id`,
+        // falling back to the metadata `createdByAgentId` the create/delegate
+        // writers populate.
+        let is_child_of_target = caller_session
+            .as_ref()
+            .map(|s| {
+                s.parent_agent_id.as_ref() == Some(&target_agent_id)
+                    || s.metadata
+                        .as_ref()
+                        .and_then(|m| m.get("createdByAgentId"))
+                        .and_then(Value::as_str)
+                        == Some(target_agent_id.0.as_str())
+            })
+            .unwrap_or(false);
+        if is_child_of_target {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — caller is a child of the target"
+            );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         // SUB-1 delegation-group conflict suppression: skip ungrouped watch
@@ -3901,8 +4450,7 @@ impl Services {
     /// set of existing target agents — the subscription side of
     /// `agent.delegate` without creating children. Reuses the exact same
     /// registration/group helpers as the delegate call sites: `immediate`
-    /// (default) registers a oneShot watch per target (deduped against a live
-    /// ungrouped watch, like `agent.watchCompletion`); `after_all` enrolls
+    /// (default) registers a oneShot watch per target; `after_all` enrolls
     /// every target in the caller's open delegation group anchored in the
     /// caller's home workspace (sealed on the caller's idle, one aggregated
     /// wake, restart-safe through the existing group persistence). Targets
@@ -3910,6 +4458,12 @@ impl Services {
     /// callers — enforced by the shared `check_watch_scope` gate, which runs
     /// for every target BEFORE any side-effectful registration so a rejection
     /// leaves no partial group or watches behind.
+    ///
+    /// Pair uniqueness: as an EXPLICIT registration path, a target the caller
+    /// already watches (oneShot, non-oneShot, or grouped) is rejected with
+    /// `-32602` naming the target — run in the same up-front validation loop,
+    /// so the rejection is side-effect free. (Auto-subscribe paths silently
+    /// adopt the existing watch instead; see `register_completion_watch`.)
     ///
     /// After registration every target is reconciled against current agent
     /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
@@ -3997,6 +4551,20 @@ impl Services {
                 )));
             }
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            // Pair uniqueness: an explicit registration on a child the caller
+            // ALREADY watches (oneShot, non-oneShot, or grouped) is rejected
+            // up front — before any side-effectful registration — instead of
+            // silently adopting the existing watch like the auto-subscribe
+            // paths do, so a duplicate wait can never appear on the wire.
+            if self.pair_watch_exists(&caller_agent_id, &target) {
+                return Err(Error::InvalidParams(format!(
+                    "already waiting on agent {}: a completion watch for this \
+                     (caller, target) pair is already active — at most one \
+                     active watch per pair (cancel it via \
+                     agent.cancelSubscriptions to re-register)",
+                    target.0
+                )));
+            }
             resolved.push((target, session.name, session.workspace_id));
         }
         let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
@@ -4219,18 +4787,107 @@ impl Services {
         }))
     }
 
-    /// `agent.cancelSubscriptions`: remove every completion watch registered by
-    /// `agent_id`, drop any delegation groups it parents, and drop its event
+    /// `agent.cancelSubscriptions`: with no scoping params, remove every
+    /// completion watch registered by `agent_id`, drop any delegation groups
+    /// it parents (persisted rows swept best-effort), and drop its event
     /// subscriptions (monorepo#937). Idempotent — always returns
     /// `{ "success": true }` (TS shape).
+    ///
+    /// Scoped cancel (additive, monorepo): an optional `subscriptionId`
+    /// cancels exactly that completion watch, an optional `groupId` cancels
+    /// that delegation group plus its grouped watches; each removal deletes
+    /// the matching persisted `completion_watch` / `delegation_group` row(s)
+    /// and publishes the same `agent:subscriptions-changed` snapshot event as
+    /// the other watch-set mutation paths (§6.5), anchored in the parent's
+    /// home workspace. Cancelling a GROUPED watch by `subscriptionId` also
+    /// drops that child from its delegation group's expected set — group
+    /// settlement is driven exclusively by the grouped watch, so leaving the
+    /// child expected would stall the group (and the surviving siblings'
+    /// aggregated wake) forever — and then attempts `try_fire_group`, since
+    /// the shrunk group may now be sealed AND complete. The group-row delete
+    /// is durable-before-observable (awaited before any in-memory removal; a
+    /// failed delete errors the call with the registry untouched). An id not
+    /// owned by `agent_id` is rejected with `-32602` BEFORE anything is
+    /// removed (mirroring the unknown-id guards elsewhere in §5.5), so a
+    /// combined call is all-or-nothing. Scoped cancel never touches event
+    /// subscriptions.
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> Result<Value> {
-        self.remove_all_for_parent(&agent_id);
-        self.remove_groups_for_parent(&agent_id);
-        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        if subscription_id.is_none() && group_id.is_none() {
+            self.remove_all_for_parent(&agent_id);
+            self.remove_groups_for_parent(&agent_id);
+            self.remove_event_subscriptions_for_agent(&agent_id).await;
+            return Ok(json!({ "success": true }));
+        }
+
+        // Resolve BOTH ids against the caller's own watches/groups before
+        // removing anything, so an unknown id leaves the registry untouched.
+        let watches = self.list_watches_for_parent(&agent_id);
+        let target_watch =
+            match &subscription_id {
+                Some(sid) => Some(watches.iter().find(|w| &w.id == sid).cloned().ok_or_else(
+                    || Error::InvalidParams(format!("unknown subscription id: {sid}")),
+                )?),
+                None => None,
+            };
+        let target_group = match &group_id {
+            Some(gid) => Some(
+                self.list_groups_for_parent(&agent_id)
+                    .into_iter()
+                    .find(|g| &g.group_id == gid)
+                    .ok_or_else(|| {
+                        Error::InvalidParams(format!("unknown delegation group id: {gid}"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        // DURABLE-BEFORE-OBSERVABLE (mirrors `take_group_if_ready`): commit
+        // the persisted delegation_group delete BEFORE any in-memory removal.
+        // If the delete fails, the call errors with the registry untouched —
+        // no cancelled-in-memory group can rehydrate on restart. (A concurrent
+        // `try_fire_group` racing this delete is benign: both deletes are
+        // idempotent, and whichever removes the in-memory group first wins.)
+        if let Some(group) = &target_group {
+            self.store.delete_delegation_group(&group.group_id).await?;
+        }
+
+        // Parent home workspaces to publish `agent:subscriptions-changed` in
+        // (deduped — a watch and its group share the same anchor). A grouped
+        // watch cancelled by id must also stop gating its group's completion,
+        // and the shrunk group may thereby become ready — fire it (skipped
+        // when the group itself is being cancelled in the same call).
+        let mut anchors: Vec<WorkspaceId> = Vec::new();
+        let mut group_to_refire: Option<String> = None;
+        if let Some(watch) = target_watch {
+            self.remove_watch(&watch.id);
+            if let Some(gid) = &watch.group_id {
+                let cancelled_with_group =
+                    target_group.as_ref().is_some_and(|g| &g.group_id == gid);
+                if !cancelled_with_group && self.remove_child_from_group(gid, &watch.child_agent_id)
+                {
+                    group_to_refire = Some(gid.clone());
+                }
+            }
+            anchors.push(watch.parent_workspace_id);
+        }
+        if let Some(group) = target_group {
+            self.remove_group_with_watches(&agent_id, &group.group_id);
+            if !anchors.contains(&group.workspace_id) {
+                anchors.push(group.workspace_id);
+            }
+        }
+        if let Some(gid) = group_to_refire {
+            self.try_fire_group(&gid).await;
+        }
+        for anchor in &anchors {
+            self.publish_subscriptions_changed(anchor, &agent_id).await;
+        }
         Ok(json!({ "success": true }))
     }
 
@@ -4270,10 +4927,41 @@ impl Services {
         let groups = self.all_groups(&workspace_id);
 
         let agent_filter = agent_id.as_ref().map(|a| a.0.clone());
-        // Sessions carry no taskNoteId in the daemon model, so a taskNoteId
-        // filter matches nothing (mirrors `agent.metadata?.taskNoteId` undefined).
+        // A taskNoteId filter matches the agents actually associated with the
+        // task (monorepo#1150): sessions persist `task_note_id` (set by
+        // `agent.delegate`) and the note side tracks `assigned_agents`
+        // (`task.assignAgent`) — the scope is the union of both, mirroring
+        // `agent.sendToTask`'s note-side resolution. A missing or non-task
+        // note yields an empty scope (empty snapshot), never an error.
         let task_filter = task_note_id.as_ref().map(|n| n.0.clone());
         let has_filter = agent_filter.is_some() || task_filter.is_some();
+        let mut task_agent_ids: HashSet<String> = HashSet::new();
+        if let Some(tid) = &task_note_id {
+            for s in &sessions {
+                if s.task_note_id.as_ref() == Some(tid) {
+                    task_agent_ids.insert(s.id.0.clone());
+                }
+            }
+            match self.get_my_task(workspace_id.clone(), tid.clone()).await {
+                Ok(task) => {
+                    task_agent_ids.extend(task.assigned_agents.into_iter().map(|a| a.0));
+                }
+                // `get_my_task` maps a missing note / non-task note to these
+                // `Internal` messages — the expected empty-note-scope shape,
+                // kept silent. Anything else is a real store failure worth
+                // surfacing before we fall back to session-side matches only.
+                Err(Error::Internal(msg))
+                    if msg == "Task note not found" || msg == "Note is not a task" => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        note = %tid,
+                        "agent.diagnostics: task note lookup failed; \
+                         scoping to session-side matches only"
+                    );
+                }
+            }
+        }
 
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
         let session_by_id: std::collections::HashMap<String, &AgentSession> =
@@ -4287,10 +4975,15 @@ impl Services {
                     continue;
                 }
             }
-            if task_filter.is_some() {
+            if task_filter.is_some() && !task_agent_ids.contains(&s.id.0) {
                 continue;
             }
             matching.insert(s.id.0.clone());
+        }
+        if agent_filter.is_none() {
+            // Note-side assignees without a session row still scope the
+            // snapshot (union semantics). Last use — the set is moved.
+            matching.extend(task_agent_ids);
         }
         if let Some(aid) = &agent_filter {
             matching.insert(aid.clone());
@@ -4707,23 +5400,127 @@ impl Services {
                     .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
-            (None, _) => {
+            (None, interrupt) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
                 // `agent_send_message` — plumb the metadata through the
                 // store-only append so attribution is consistent across
-                // deployments with and without a runtime manager.
-                self.agent_send_message_op(
-                    agent.clone(),
-                    message,
-                    None,
-                    None,
-                    None,
-                    options.message_metadata,
-                )
-                .await?
+                // deployments with and without a runtime manager. Question
+                // hold (PROTOCOL §5.5): sendToTask is automatic by
+                // definition, so an active hold parks the message instead
+                // of persisting the superseding user row.
+                if self.question_hold_active(&agent).await {
+                    let (queued, position) = self.enqueue_message(
+                        &agent,
+                        message,
+                        None,
+                        None,
+                        options.message_metadata,
+                        None,
+                        interrupt,
+                    );
+                    let held = json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.publish_queue_updated(&agent).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this `(None, _)` arm only
+                    // runs with no `AgentManager` attached, so there is no
+                    // drain to kick here — same as the other store-only
+                    // fallbacks above.
+                    held
+                } else {
+                    self.agent_send_message_op(
+                        agent.clone(),
+                        message,
+                        None,
+                        None,
+                        None,
+                        options.message_metadata,
+                    )
+                    .await?
+                }
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
+    }
+
+    /// Newest-first probe over a task's `assignedAgentIds` (B1 + B2;
+    /// `Vec::push` append-order means newest is the tail). Shared by
+    /// `agent_wake_or_create_op`'s live/resumable scan and the occupancy
+    /// guards in `agent_delegate_op` / `assign_agent`. Probe each session:
+    ///   * NotFound / Deleted → stale, queue for cleanup.
+    ///   * Poisoned (monorepo#840: Error + session-fatal provider block or
+    ///     an identical-failure streak) → NOT resumable: waking it would
+    ///     replay the provider-blocked turn ("start a new session" means a
+    ///     fresh session). Queue for cleanup so a fresh agent is created,
+    ///     keeping it as the inheritance source for specialist/model.
+    ///     Poisoned ids are ALSO tracked separately: their parked queues
+    ///     are migrated onto the wake/create target and the dead session
+    ///     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+    ///     cleanup-only behavior.
+    ///   * Otherwise → treat as resumable; the newest live session wins.
+    ///
+    /// Once the newest live session is found, older candidates are left
+    /// untouched EXCEPT poisoned ones: a failed queue migration keeps the
+    /// poisoned assignment in place (now older than the live winner), so
+    /// the scan keeps probing for poisoned ids to retry the migration + GC
+    /// on this wake (monorepo#847).
+    /// `inheritance_source` captures the newest **known** previous session
+    /// (live, poisoned, or deleted) so wakeOrCreate's create branch can still
+    /// inherit specialist/model when no live agent is available.
+    pub(crate) async fn scan_assigned_agents(
+        &self,
+        assigned: &[AgentId],
+    ) -> Result<AssignedAgentScan> {
+        let mut scan = AssignedAgentScan::default();
+        for candidate in assigned.iter().rev().cloned() {
+            if scan.live_session.is_some() {
+                match self.store.get_agent_session(&candidate).await {
+                    Ok(session)
+                        if session.status != AgentStatus::Deleted
+                            && self.session_poisoned(&session) =>
+                    {
+                        scan.poisoned.push(candidate.clone());
+                        scan.cleaned_up.push(candidate);
+                    }
+                    Ok(_) | Err(Error::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+            match self.store.get_agent_session(&candidate).await {
+                Ok(session)
+                    if session.status != AgentStatus::Deleted
+                        && !self.session_poisoned(&session) =>
+                {
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(session.clone());
+                    }
+                    scan.live_session = Some(session);
+                }
+                Ok(unusable_session) => {
+                    if unusable_session.status != AgentStatus::Deleted {
+                        tracing::warn!(
+                            agent = %candidate,
+                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
+                            "assigned-agent scan skipping poisoned session; not resumable (monorepo#840)"
+                        );
+                        scan.poisoned.push(candidate.clone());
+                    }
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(unusable_session);
+                    }
+                    scan.cleaned_up.push(candidate);
+                }
+                Err(Error::NotFound(_)) => scan.cleaned_up.push(candidate),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(scan)
     }
 
     /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
@@ -4794,74 +5591,15 @@ impl Services {
             .await?;
         let task_title = task.title.clone();
 
-        // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
-        // append-order means newest is the tail). Probe each session:
-        //   * NotFound / Deleted → stale, queue for cleanup.
-        //   * Poisoned (monorepo#840: Error + session-fatal provider block or
-        //     an identical-failure streak) → NOT resumable: waking it would
-        //     replay the provider-blocked turn ("start a new session" means a
-        //     fresh session). Queue for cleanup so a fresh agent is created,
-        //     keeping it as the inheritance source for specialist/model.
-        //     Poisoned ids are ALSO tracked separately: their parked queues
-        //     are migrated onto the wake/create target and the dead session
-        //     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
-        //     cleanup-only behavior.
-        //   * Otherwise → treat as resumable; the newest live session wins.
-        // Once the newest live session is found, older candidates are left
-        // untouched EXCEPT poisoned ones: a failed queue migration keeps the
-        // poisoned assignment in place (now older than the live winner), so
-        // the scan keeps probing for poisoned ids to retry the migration + GC
-        // on this wake (monorepo#847).
-        // `inheritance_source` captures the newest **known** previous session
-        // (live, poisoned, or deleted) so the create branch can still inherit
-        // specialist/model when no live agent is available.
-        let mut cleaned_up: Vec<AgentId> = Vec::new();
-        let mut poisoned: Vec<AgentId> = Vec::new();
-        let mut live_session: Option<AgentSession> = None;
-        let mut inheritance_source: Option<AgentSession> = None;
-        for candidate in task.assigned_agents.iter().rev().cloned() {
-            if live_session.is_some() {
-                match self.store.get_agent_session(&candidate).await {
-                    Ok(session)
-                        if session.status != AgentStatus::Deleted
-                            && self.session_poisoned(&session) =>
-                    {
-                        poisoned.push(candidate.clone());
-                        cleaned_up.push(candidate);
-                    }
-                    Ok(_) | Err(Error::NotFound(_)) => {}
-                    Err(e) => return Err(e),
-                }
-                continue;
-            }
-            match self.store.get_agent_session(&candidate).await {
-                Ok(session)
-                    if session.status != AgentStatus::Deleted
-                        && !self.session_poisoned(&session) =>
-                {
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(session.clone());
-                    }
-                    live_session = Some(session);
-                }
-                Ok(unusable_session) => {
-                    if unusable_session.status != AgentStatus::Deleted {
-                        tracing::warn!(
-                            agent = %candidate,
-                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
-                            "wakeOrCreate skipping poisoned session; a fresh agent will be created (monorepo#840)"
-                        );
-                        poisoned.push(candidate.clone());
-                    }
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(unusable_session);
-                    }
-                    cleaned_up.push(candidate);
-                }
-                Err(Error::NotFound(_)) => cleaned_up.push(candidate),
-                Err(e) => return Err(e),
-            }
-        }
+        // B1 + B2: the newest-first live/resumable probe over the task's
+        // assignments (see `scan_assigned_agents` for the full contract —
+        // stale/poisoned tracking, inheritance source, newest live winner).
+        let AssignedAgentScan {
+            live_session,
+            inheritance_source,
+            mut cleaned_up,
+            poisoned,
+        } = self.scan_assigned_agents(&task.assigned_agents).await?;
 
         // B7: `messageMetadata` is applied to the delivered context message on
         // BOTH branches via `deliver_wake_message`.
@@ -5142,8 +5880,11 @@ impl Services {
             .unwrap_or_default()
             .to_string();
         let agent = AgentId::from(agent_id_str.as_str());
+        // The scan above already established there is no live assigned agent
+        // (create branch), so this internal assignment bypasses
+        // `assign_agent`'s occupancy guard.
         let _ = self
-            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str)
+            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str, Some(true))
             .await;
         // monorepo#847: same ordering contract as the wake branch — migrate
         // the poisoned siblings' parked queues BEFORE `deliver_wake_message`
@@ -5310,6 +6051,41 @@ impl Services {
         //   3. Spawn the worker with the same content in-memory (the worker
         //      path does not re-persist).
         let content_owned = content.to_string();
+        // Question hold (PROTOCOL §5.5): wakes are automatic by definition
+        // (`agent.wakeOrCreate` context messages, reportToParent /
+        // completion-watch wakes) — while the target's hold is active they
+        // park in the queue instead of claiming the slot, so the pending Q&A
+        // is never superseded. Checked BEFORE `try_begin_turn` so even an
+        // idle asking agent holds the wake.
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content_owned,
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer): re-check and kick the drain if the
+            // hold cleared while the enqueue above was in flight, mirroring
+            // `AgentManager::send_message`'s hold-gate re-check — otherwise
+            // this entry could be stranded with no future drain trigger.
+            if !self.question_hold_active(agent_id).await {
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            }));
+        }
         if !manager.try_begin_turn(agent_id, workspace_id).await {
             // Fast enqueue branch: the manager is already draining a turn. The
             // metadata rides along on the queue entry so the drain re-persist
@@ -5321,6 +6097,7 @@ impl Services {
                 None,
                 message_metadata.cloned(),
                 None,
+                false,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -5336,7 +6113,10 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(msg) => msg,
+            Ok(msg) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                msg
+            }
             Err(_) => {
                 manager.release_slot(agent_id).await;
                 let (queued, position) = self.enqueue_message(
@@ -5346,6 +6126,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -5406,6 +6187,43 @@ impl Services {
     where
         F: Fn() -> Value,
     {
+        // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
+        // runtime path above — the store-only persist would append the user
+        // row that supersedes the pending Q&A, so park the wake in the queue
+        // instead (hermetic wiring keeps the hold contract testable).
+        if self.question_hold_active(agent_id).await {
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content.to_string(),
+                None,
+                None,
+                message_metadata.cloned(),
+                None,
+                false,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "heldForQuestions": true,
+                "queuedMessage": queued.to_value(position),
+            });
+            self.publish_queue_updated(agent_id).await;
+            // Race close (hold-check → enqueue vs a concurrent
+            // `dismissQuestions`/answer), same shape as the runtime path
+            // above. This wiring has no attached `AgentManager` by
+            // definition (that is why we are in the store-only fallback),
+            // so there is nothing to kick — the re-check only matters if a
+            // manager is (or becomes) attached, which `try_drain_queue`
+            // itself would then handle on its own next trigger.
+            if !self.question_hold_active(agent_id).await {
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
+            return Ok(result);
+        }
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -5414,6 +6232,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -5441,6 +6260,7 @@ impl Services {
                     None,
                     message_metadata.cloned(),
                     None,
+                    false,
                 );
                 let result = json!({
                     "success": true,
@@ -5506,6 +6326,14 @@ impl Services {
     /// a queue-fallback interrupt still delivers the preempted message ahead
     /// of the interrupt message on drain; sends without prepend content pass
     /// `None`.
+    ///
+    /// `interrupt` marks a `priority: "interrupt"` enqueue (question hold /
+    /// PROTOCOL §5.5): the entry is inserted AFTER the queue's leading
+    /// interrupt entries but AHEAD of all normal entries — arrival order is
+    /// preserved among interrupts, and every fallback path that parks an
+    /// interrupt (hold gate, busy race, quarantine park, append-failure
+    /// auto-queue) shares this ordering. Normal enqueues append at the tail.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -5514,6 +6342,38 @@ impl Services {
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
         prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+    ) -> (QueuedMessage, usize) {
+        self.enqueue_message_with_origin(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            false,
+        )
+    }
+
+    /// [`Services::enqueue_message`] with an explicit `user_origin` marker:
+    /// `true` records that the entry carries a USER-originated
+    /// `agent.sendMessage` parked by a queue-fallback path (busy race,
+    /// quarantine, append-failure). The question-hold drain gates deliver
+    /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
+    /// answer supersedes the pending Q&A and must never deadlock against
+    /// the hold it releases).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_origin(
+        &self,
+        agent_id: &AgentId,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        user_origin: bool,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = new_message_id();
@@ -5531,14 +6391,23 @@ impl Services {
             prepend_content: prepend.content,
             prepend_image_blocks: prepend.image_blocks,
             prepend_file_blocks: prepend.file_blocks,
+            interrupt_priority: interrupt,
+            user_origin,
         };
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.entry(agent_id.clone()).or_default();
-        queue.push(queued.clone());
-        let position = queue.len() - 1;
+        let position = if interrupt {
+            // Behind earlier interrupts, ahead of every normal entry.
+            let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
+            queue.insert(idx, queued.clone());
+            idx
+        } else {
+            queue.push(queued.clone());
+            queue.len() - 1
+        };
         (queued, position)
     }
 
@@ -5554,6 +6423,22 @@ impl Services {
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
         let idx = queue.iter().position(|m| !m.editing)?;
+        Some(queue.remove(idx))
+    }
+
+    /// Pop the oldest ready-to-send **user-origin** queued message, if any
+    /// (question hold, PROTOCOL §5.5). While the hold is active the drain
+    /// paths deliver ONLY user-origin entries — a user answer parked by the
+    /// turn-end busy race must supersede the pending Q&A instead of
+    /// deadlocking behind the hold it is supposed to release; automatic
+    /// entries stay parked.
+    pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let idx = queue.iter().position(|m| !m.editing && m.user_origin)?;
         Some(queue.remove(idx))
     }
 
@@ -5598,6 +6483,18 @@ impl Services {
             .expect("agent queue registry poisoned")
             .get(agent_id)
             .map(|q| q.iter().any(|m| !m.editing))
+            .unwrap_or(false)
+    }
+
+    /// `true` iff at least one ready-to-send queued entry is user-origin
+    /// (question hold, PROTOCOL §5.5): the hold-gated drain paths use this
+    /// to decide whether a drain may proceed for the user entry alone.
+    pub(crate) fn has_user_origin_ready(&self, agent_id: &AgentId) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map(|q| q.iter().any(|m| !m.editing && m.user_origin))
             .unwrap_or(false)
     }
 
@@ -6337,6 +7234,7 @@ impl Services {
                     return Err(e);
                 }
             };
+            self.invalidate_agent_list_cache(&workspace_id);
 
             // Emit agent:message + agent:updated so live UIs render the marker.
             self.publish_agent_mutation_event(
@@ -6359,7 +7257,9 @@ impl Services {
         let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 
         // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load)
+        // (lazily respawns provider and resumes via ACP session/load).
+        // Automatic origin: a resume continuation must not supersede a Q&A
+        // the agent had pending when the harness shut down (question hold).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),
@@ -6373,6 +7273,7 @@ impl Services {
                 None,
                 None,
                 None,
+                intent_core::MessageOrigin::Automatic,
             )
             .await
         {
@@ -6465,6 +7366,7 @@ impl Services {
             .store
             .append_agent_message(agent_id, "system", &content, &now_iso())
             .await?;
+        self.invalidate_agent_list_cache(&workspace_id);
 
         // Mark the interrupted_agent row as resolved
         let updated = self

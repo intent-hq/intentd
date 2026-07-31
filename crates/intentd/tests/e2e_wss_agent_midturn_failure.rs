@@ -565,7 +565,7 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
                     saw_clearing_status_changed = true;
                 }
             }
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 saw_chunk = true;
             }
             Some("agent:stream:end") => {
@@ -582,7 +582,10 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         saw_clearing_status_changed,
         "agent:status-changed with stopReason: null emitted during retry"
     );
-    assert!(saw_chunk, "agent:stream:chunk emitted after retry redrive");
+    assert!(
+        saw_chunk,
+        "agent:stream:activity emitted after retry redrive"
+    );
     assert!(
         saw_retry_end,
         "agent:stream:end emitted after retry redrive"
@@ -915,7 +918,7 @@ async fn agent_dead_while_idle_respawns_transparently_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -955,7 +958,7 @@ async fn agent_dead_while_idle_respawns_transparently_over_wss() {
         }
         match event["type"].as_str() {
             Some("agent:failed") => panic!("agent:failed during the healthy first turn: {frame}"),
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1019,7 +1022,7 @@ async fn agent_dead_while_idle_respawns_transparently_over_wss() {
             Some("agent:status-changed") if event["data"]["status"] == "error" => {
                 panic!("dead-while-idle recovery must not park the agent in error: {frame}")
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1139,7 +1142,7 @@ async fn agent_pre_token_transport_failure_redrives_silently_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1186,7 +1189,7 @@ async fn agent_pre_token_transport_failure_redrives_silently_over_wss() {
             Some("agent:status-changed") if event["data"]["status"] == "error" => {
                 panic!("silent redrive must not park the agent in error: {frame}")
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()

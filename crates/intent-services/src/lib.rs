@@ -74,6 +74,7 @@ mod github_ops;
 mod github_auth_ops;
 mod github_browse_ops;
 
+mod agent_list_cache;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
@@ -295,6 +296,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
+    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
+    /// teardown races are deterministic. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
+    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -433,12 +439,16 @@ pub struct Services {
     /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
-    /// Shared cache + offload gates for the git-derived workspace card
-    /// aggregates (`diffSummary` rollups, CoW support probes) so the
-    /// `workspace.list` / `workspace.get` emit paths never run blocking
-    /// libgit2/FS work inline on the async runtime (§9.1). Shared across
-    /// clones so concurrent list calls single-flight the same worktree.
+    /// Shared cache + offload gates for git-derived aggregates that are still
+    /// computed on demand (`diffSummary` for explicit callers, CoW support
+    /// probes on list/get). Diff rollups are **not** attached to the high-
+    /// frequency list/get emit path; the cache is invalidated from file/git
+    /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Cached agent.list message projections per workspace. Invalidated on
+    /// message append / session create+delete so focus-time list bursts hit
+    /// memory instead of re-running the SQLite JSON window.
+    agent_list_cache: Arc<agent_list_cache::AgentListProjectionCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
     /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
@@ -499,6 +509,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
+            script_supervise_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -523,6 +534,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -740,6 +752,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
+            self.script_supervise_park.clone(),
         )
     }
 
@@ -749,6 +762,18 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
+        self
+    }
+
+    /// Test seam (monorepo#1180): park `script.*` supervisors in their
+    /// pre-registration window so teardown-vs-registration races are
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_supervise_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_supervise_park = Some(park);
         self
     }
 
@@ -916,19 +941,20 @@ impl Services {
     }
 
     /// Populate a workspace's card aggregates (`taskStats`/`agentSummary`/
-    /// `diffSummary`) for the `workspace.list` / `workspace.get` emit path (§9.1).
-    /// Each is computed from live state (notes / agents / git worktree) and
+    /// `cowSupported`) for the `workspace.list` / `workspace.get` emit path (§9.1).
+    /// Each is computed from live state (notes / agents / FS capability) and
     /// omitted when not computable; a read failure degrades to an absent
     /// aggregate rather than failing the whole call. `lastActivity` is derived
     /// inline from the same notes/sessions scan (mirrors
     /// [`Services::derive_last_activity`] so list/get callers get both in one
     /// round-trip); keep the two derivations in lock-step when the rules or
-    /// underlying store queries change. The git/FS-derived aggregates
-    /// (`diffSummary`, `cowSupported`) go through the shared
-    /// [`workspace_aggregates::WorkspaceAggregateCache`]: computed on the
-    /// blocking pool with bounded concurrency, cached, and degraded to the
-    /// last known value / omission when over budget, so a slow worktree can
-    /// never stall the async runtime or blow past FE RPC timeouts.
+    /// underlying store queries change.
+    ///
+    /// `diffSummary` is intentionally **not** computed here. Full worktree
+    /// rollups are too expensive for the high-frequency list/get/subscription
+    /// re-read path; desktop FE already treats the field as deprecated and
+    /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
+    /// every workspace re-read pinned the blocking pool.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -954,14 +980,8 @@ impl Services {
             }
             ws.agent_summary = Some(build_agent_summary(&sessions));
         }
-        ws.diff_summary = match ws.worktree_path.as_deref().filter(|p| !p.is_empty()) {
-            Some(worktree) => {
-                self.workspace_aggregates
-                    .diff_summary(ws.id.as_str(), PathBuf::from(worktree))
-                    .await
-            }
-            None => None,
-        };
+        // diffSummary: omitted on list/get/subscription re-reads (see method docs).
+        ws.diff_summary = None;
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
@@ -981,6 +1001,7 @@ impl Services {
             let display_status = compute_display_status(
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.pr_status,
                 ws.task_stats.as_ref(),
             );
             if let Ok(mut map) = self.last_display_statuses.lock() {
@@ -988,6 +1009,16 @@ impl Services {
             }
             ws.display_status = Some(display_status);
         }
+    }
+
+    /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
+    /// the store-level counting query ([`Store::count_task_stats`]) which
+    /// hydrates only the spec note's content (for the linked-id filter) — no
+    /// other note bodies — and matches [`compute_task_stats`] semantics
+    /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
+    /// seq-0 snapshot is self-sufficient for client status rendering.
+    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+        self.store.count_task_stats(workspace_id).await
     }
 
     /// Recompute a workspace's derived `displayStatus` and publish
@@ -1011,6 +1042,7 @@ impl Services {
         let status = compute_display_status(
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
+            ws.pr_status,
             Some(&task_stats),
         );
         let transitioned = match self.last_display_statuses.lock() {
@@ -2530,13 +2562,31 @@ impl Services {
                 // Prefer the child's persisted completionReport (set by
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,
-                // mirroring the TS event-notification formatter.
-                let report = self
-                    .store
-                    .get_agent_session(child_id)
-                    .await
-                    .ok()
-                    .and_then(|s| s.completion_report);
+                // mirroring the TS event-notification formatter. A pending
+                // attention request (whose immediate wake already fired at
+                // raise time — the alert) is folded into the child's line +
+                // event data the same way (the record).
+                let child_session = self.store.get_agent_session(child_id).await.ok();
+                let attention = child_session.as_ref().and_then(|s| {
+                    s.attention_request_kind
+                        .clone()
+                        .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
+                });
+                let report = child_session.and_then(|s| s.completion_report);
+                let attention_annotated;
+                let event = match &attention {
+                    Some((kind, reason)) => {
+                        let mut e = event.clone();
+                        agent_subscriptions::annotate_attention_request(
+                            &mut e.data,
+                            Some(kind),
+                            Some(reason),
+                        );
+                        attention_annotated = e;
+                        &attention_annotated
+                    }
+                    None => event,
+                };
                 let summary =
                     format_group_child_line(child_id, event, report.as_deref(), stall.as_ref());
                 let newly_recorded = self
@@ -3394,6 +3444,35 @@ impl Services {
                     .await
             }
             None => {
+                // Question hold (PROTOCOL §5.5): parent wakes are automatic —
+                // an active hold parks the wake in the queue instead of
+                // appending the user row that would supersede the pending
+                // Q&A (mirrors the manager path's `send_message` gate).
+                if self.question_hold_active(&parent_agent_id).await {
+                    let (queued, position) = self.enqueue_message(
+                        &parent_agent_id,
+                        content,
+                        None,
+                        None,
+                        message_metadata,
+                        None,
+                        false,
+                    );
+                    let result = serde_json::json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                    });
+                    self.publish_queue_updated(&parent_agent_id).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this branch is only taken
+                    // when no `AgentManager` is attached (see the `match`
+                    // above), so there is no drain to kick here — a manager
+                    // attaching later re-derives the hold on its own next
+                    // trigger.
+                    return Ok(result);
+                }
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
                 self.store
                     .append_agent_message_with_metadata(
@@ -3404,6 +3483,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await?;
+                self.invalidate_agent_list_cache(workspace_id);
                 Ok(serde_json::json!({ "success": true, "queued": false }))
             }
         }
@@ -4052,31 +4132,17 @@ async fn append_primitive(
 
 /// Extract the spec-linked task-note ids from a spec note's markdown body
 /// (`[text](intent://local/task/{id})`), mirroring the TS `extractSpecTaskIds`
-/// (`TASK_LINK_REGEX_FLEXIBLE`).
+/// (`TASK_LINK_REGEX_FLEXIBLE`). Canonical implementation lives in
+/// intent-core so the store's cheap `count_task_stats` query shares it.
 fn extract_spec_task_ids(content: &str) -> HashSet<String> {
-    const MARKER: &str = "(intent://local/task/";
-    let mut ids = HashSet::new();
-    let mut rest = content;
-    while let Some(pos) = rest.find(MARKER) {
-        let after = &rest[pos + MARKER.len()..];
-        match after.find(')') {
-            Some(end) => {
-                let id = &after[..end];
-                if !id.is_empty() {
-                    ids.insert(id.to_string());
-                }
-                rest = &after[end + 1..];
-            }
-            None => break,
-        }
-    }
-    ids
+    intent_core::extract_spec_task_ids(content)
 }
 
 /// Compute a workspace's `taskStats` card aggregate from its notes, porting the
 /// canonical `computeTaskStats` (`task-stats.ts`) over the spec-linked direct
 /// child task notes: `cancelled` is excluded from `total`, `complete` counts as
-/// `completed`, and `in_progress`/`review_required` count as `inProgress`. When
+/// `completed`, and `in_progress`/`review_required` count as `inProgress`
+/// (`blocked` is excluded from `inProgress`, like `discussion_needed`). When
 /// the spec body has no task links, all direct children with task metadata count
 /// (TS backward-compat fallback).
 fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
@@ -4127,10 +4193,14 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// 1. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+///    When neither carries an open/draft entry but the workspace `prStatus`
+///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
+///    and yields `pr_open` (never `pr_ready`: the column carries no
+///    mergeable info).
 /// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged →
-///    `pr_merged`.
+/// 3. Latest PR (linked, else most recently updated entry) merged — or
+///    `prStatus == Merged` — → `pr_merged`.
 /// 4. All tasks complete → `complete`; else `not_started`.
 ///
 /// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
@@ -4138,6 +4208,7 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 fn compute_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     let is_open = |pr: &&PullRequestInfo| {
@@ -4160,6 +4231,12 @@ fn compute_display_status(
             WorkspaceDisplayStatus::PrOpen
         };
     }
+    if matches!(
+        pr_status,
+        Some(PullRequestStatus::Open | PullRequestStatus::Draft)
+    ) {
+        return WorkspaceDisplayStatus::PrOpen;
+    }
     let (total, completed, in_progress) = task_stats
         .map(|s| (s.total, s.completed, s.in_progress))
         .unwrap_or_default();
@@ -4175,7 +4252,9 @@ fn compute_display_status(
             .iter()
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
-    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
+        || pr_status == Some(PullRequestStatus::Merged)
+    {
         return WorkspaceDisplayStatus::PrMerged;
     }
     if total > 0 && completed == total {
@@ -4281,11 +4360,14 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     }
 }
 
-/// The seven valid task-note statuses, in the order the TS validator lists them.
-const TASK_STATUS_WORDS: [&str; 7] = [
+/// The valid task-note statuses, in the order the TS validator lists them —
+/// plus `blocked` (new in intentd; set by `ws.agent.reportBlocker`), slotted
+/// after its sibling `discussion_needed`.
+const TASK_STATUS_WORDS: [&str; 8] = [
     "not_started",
     "waiting",
     "discussion_needed",
+    "blocked",
     "in_progress",
     "review_required",
     "complete",
@@ -6268,7 +6350,7 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
-/// `agent:stream:chunk` that do not need durable storage.
+/// `chat:stream:delta` that do not need durable storage.
 pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
     bus.as_ref().map(|b| b.publish_transient(&event))
 }
@@ -6614,6 +6696,29 @@ pub(crate) fn format_group_child_line(
         if !err.is_empty() {
             line.push_str(&format!(" Error: {err}"));
         }
+    }
+    // Pending attention request (agent:attention-requested): the child's
+    // immediate parent wake already fired at raise time (the alert); the
+    // aggregated line carries the kind-flavored attention text as the record
+    // (annotated onto the event data by the group-record sites from the
+    // persisted session fields).
+    if let Some(kind) = event
+        .data
+        .get("attentionRequestKind")
+        .and_then(|v| v.as_str())
+        .filter(|k| !k.is_empty())
+    {
+        let verb = if kind == "blocker" {
+            "Reported a blocker"
+        } else {
+            "Requested a discussion"
+        };
+        let reason = event
+            .data
+            .get("attentionRequestReason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        line.push_str(&format!(" {verb}: {reason}"));
     }
     if let Some(stall) = stall {
         line.push_str(&stall.annotation_suffix());
@@ -8587,6 +8692,56 @@ impl WorkspaceApi for Services {
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
             this.spawn_repository_owner_backfill(&list);
+            Ok(list)
+        })
+    }
+
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let store = self.store.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            // Store rows + live activity + cheap status aggregates only. No
+            // notes/sessions enrichment so workspace.subscribe seq-0 stays
+            // tens of KB instead of ~4.5 MiB for ~80 workspaces (that frame
+            // HOL'd the UDS writer for hundreds of ms and stranded interactive
+            // replies until the FE 30s timeout). The snapshot must still be
+            // self-sufficient for client status rendering, so each row carries
+            // `taskStats` (counting query, no note-body hydration),
+            // `displayStatus` (same derivation as the enriched path), and
+            // `cowSupported` (lifetime-cached probe, effectively free).
+            let mut list = store.list_workspaces(include_archived).await?;
+            let cow_supported = this.compute_cow_supported().await;
+            for ws in &mut list {
+                ws.activity = this.workspace_activity(&ws.id);
+                ws.agent_summary = None;
+                ws.diff_summary = None;
+                ws.cow_supported = cow_supported;
+                // Keep PR fields if already on the row (cheap, already stored);
+                // do not fetch/refresh them here.
+                // A stats-read failure degrades to absent taskStats +
+                // displayStatus (clients fall back to local derivation on a
+                // missing field), mirroring `enrich_workspace_aggregates`.
+                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
+                if ws.task_stats.is_some() {
+                    let display_status = compute_display_status(
+                        ws.active_pull_request.as_ref(),
+                        ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.pr_status,
+                        ws.task_stats.as_ref(),
+                    );
+                    // Seed the last-observed cache when absent so the first
+                    // post-boot mutation compares against this baseline (a
+                    // seed never emits; see
+                    // [`Services::maybe_emit_display_status_changed`]).
+                    if let Ok(mut map) = this.last_display_statuses.lock() {
+                        map.entry(ws.id.clone()).or_insert(display_status);
+                    }
+                    ws.display_status = Some(display_status);
+                }
+            }
             Ok(list)
         })
     }
@@ -12632,6 +12787,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -12662,6 +12818,29 @@ impl WorkspaceApi for Services {
                     note_id,
                     agent_id: agent,
                 });
+            }
+            // Occupancy guard: assigning a NEW agent to a task that already
+            // has a live assigned agent needs `force: true`; re-assigning an
+            // already-assigned id stays idempotent-ok (handled above). Same
+            // predicate as `agent_delegate_op`'s pre-gate: newest live
+            // (loadable, not Deleted, not poisoned) assignee while the task
+            // is still workable (status not complete/cancelled).
+            if !already_assigned
+                && force != Some(true)
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+            {
+                if let Some(existing) = services
+                    .scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "Task is already being worked by agent {} (\"{}\"). \
+                         Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                         or pass force: true to intentionally assign a second agent.",
+                        existing.id, existing.name
+                    )));
+                }
             }
             let now = now_iso();
             let previous_status = task.status;
@@ -14672,8 +14851,14 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            let status = intent_git::status::status(&path)?;
-            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
+            // libgit2 status on the blocking pool (same as git_status).
+            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
+                .await
+                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
+            match status {
+                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -14701,7 +14886,28 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
+            // Full worktree hunk diffs can run for many seconds of pure libgit2
+            // CPU. Never do that on a Tokio worker: it holds a bulk permit and
+            // can freeze the whole runtime so host.status never runs (seen as
+            // bulk permit held 5-40s with "nothing else" making progress).
+            let started = std::time::Instant::now();
+            let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() >= 250 {
+                tracing::warn!(
+                    workspace_id = %workspace_id.as_str(),
+                    total_ms = elapsed.as_millis() as u64,
+                    staged,
+                    path_count,
+                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
+                );
+            }
+            result
         })
     }
 
@@ -14727,9 +14933,15 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            match git_ops::build_commit_details(&worktree, &commit_hash) {
+            let empty_for_err = empty.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_commit_details(&worktree, &commit_hash)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.commitDetails task failed: {e}")))?;
+            match result {
                 Ok(value) => Ok(value),
-                Err(Error::NotFound(_)) => Ok(empty),
+                Err(Error::NotFound(_)) => Ok(empty_for_err),
                 Err(e) => Err(e),
             }
         })
@@ -15163,6 +15375,7 @@ impl WorkspaceApi for Services {
         stdin_context: Option<String>,
         context_references: Option<serde_json::Value>,
         message_metadata: Option<serde_json::Value>,
+        origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // When the runtime manager is attached, drive a real spawn/turn loop;
@@ -15180,6 +15393,7 @@ impl WorkspaceApi for Services {
                         image_blocks,
                         file_blocks,
                         message_metadata,
+                        origin,
                         ..crate::agent_manager::TurnOptions::default()
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
@@ -15199,6 +15413,37 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
+                    // Question hold (PROTOCOL §5.5): the store-only fallback
+                    // must honor the automatic-delivery gate too — persisting
+                    // the row would supersede the pending Q&A. User-originated
+                    // sends pass through (a user answer/typed message is the
+                    // documented hold release).
+                    if !origin.is_user() && self.question_hold_active(&agent_id).await {
+                        self.require_agent_session(&agent_id).await?;
+                        let (queued, position) = self.enqueue_message(
+                            &agent_id,
+                            content,
+                            image_blocks,
+                            file_blocks,
+                            message_metadata,
+                            None,
+                            crate::agent_ops::is_interrupt_priority(priority.as_deref()),
+                        );
+                        let result = serde_json::json!({
+                            "success": true,
+                            "queued": true,
+                            "heldForQuestions": true,
+                            "queuedMessage": queued.to_value(position),
+                            "turnId": queued.turn_id,
+                        });
+                        self.publish_queue_updated(&agent_id).await;
+                        // Race close (hold-check → enqueue vs a concurrent
+                        // `dismissQuestions`/answer): this `None` arm only
+                        // runs with no `AgentManager` attached, so there is
+                        // no drain to kick here — same as the other
+                        // store-only fallbacks.
+                        return Ok(result);
+                    }
                     // Read-only fallback (no `agent_manager` wired): plumb
                     // `messageMetadata` through the store-only append so the
                     // persisted row matches the production
@@ -15239,6 +15484,18 @@ impl WorkspaceApi for Services {
                         .await
                 }
             }
+        })
+    }
+
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
+                .await
         })
     }
 
@@ -15570,6 +15827,19 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_request_attention(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: String,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
+                .await
+        })
+    }
+
     fn agent_get_subscriptions(
         &self,
         workspace_id: WorkspaceId,
@@ -15719,9 +15989,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_cancel_subscriptions_op(workspace_id, agent_id)
+            self.agent_cancel_subscriptions_op(workspace_id, agent_id, subscription_id, group_id)
                 .await
         })
     }
@@ -19684,6 +19956,7 @@ fn status_word(status: TaskStatus) -> &'static str {
         TaskStatus::NotStarted => "not_started",
         TaskStatus::Waiting => "waiting",
         TaskStatus::DiscussionNeeded => "discussion_needed",
+        TaskStatus::Blocked => "blocked",
         TaskStatus::InProgress => "in_progress",
         TaskStatus::ReviewRequired => "review_required",
         TaskStatus::Complete => "complete",

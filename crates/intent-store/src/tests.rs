@@ -94,7 +94,8 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+            69
         ]
     );
     assert_eq!(
@@ -102,7 +103,8 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+            69
         ]
     );
 }
@@ -2202,7 +2204,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
     let seed = vec![
         // Old ephemeral families (should be deleted by the sweep).
         typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
-        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
         typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, old, events::FILE_CREATED, agent.clone()),
@@ -2213,7 +2215,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::HOST_EXEC_EXIT, agent.clone()),
         typed_event(&ws, old, events::SCRIPT_OUTPUT, agent.clone()),
         // New ephemeral events (within TTL — must survive).
-        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, new, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, new, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, new, events::TERMINAL_DATA, agent.clone()),
         typed_event(&ws, new, events::HOST_EXEC_STDOUT, agent.clone()),
@@ -2254,7 +2256,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
 
     // New ephemeral events survive.
     for t in [
-        events::AGENT_STREAM_CHUNK,
+        events::AGENT_STREAM_ACTIVITY,
         events::FILE_CHANGED,
         events::TERMINAL_DATA,
         events::HOST_EXEC_STDOUT,
@@ -2442,10 +2444,10 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
     let seed = vec![
         // Old stream chunks (should be deleted by the sweep).
         typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
-        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
-        // New stream chunk (within TTL — must survive).
-        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        // New stream event (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_STREAM_ACTIVITY, agent.clone()),
         // Old non-stream families (must NEVER be deleted regardless of age).
         typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
         typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
@@ -2544,7 +2546,7 @@ async fn stream_retention_sweep_disabled_is_noop_in_practice() {
         .insert_event(&typed_event(
             &ws,
             "2026-06-01T00:00:00Z",
-            events::AGENT_STREAM_CHUNK,
+            events::AGENT_STREAM_ACTIVITY,
             agent,
         ))
         .await
@@ -2974,6 +2976,9 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         skip_auto_commit: false,
         completion_report: None,
         completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
         delegation_depth: None,
         initial_message: None,
         context_references: None,
@@ -3057,6 +3062,87 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
+}
+
+/// Attention-request fields (`attention_request_kind` / `..._reason` /
+/// `..._timestamp`) round-trip through insert → update → get, and
+/// `clear_attention_request` clears them exactly once: `true` when a request
+/// was pending, `false` on the no-op repeat, `NotFound` for a missing session
+/// or workspace mismatch.
+#[tokio::test]
+async fn agent_session_attention_request_round_trip_and_clear() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-eeeeeeee-1111-2222-3333-555555555555");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // No request pending: the clear is a no-op returning false.
+    assert!(!store
+        .clear_attention_request(&ws, &agent_id, "t-clear-0")
+        .await
+        .expect("noop clear"));
+
+    // Persist a pending request via the full-session UPDATE writer.
+    let mut session = store.get_agent_session(&agent_id).await.expect("get");
+    session.attention_request_kind = Some("blocker".to_string());
+    session.attention_request_reason = Some("sandbox is broken".to_string());
+    session.attention_request_timestamp = Some("t-attn".to_string());
+    store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("update session");
+
+    let loaded = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(loaded.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(
+        loaded.attention_request_reason.as_deref(),
+        Some("sandbox is broken")
+    );
+    assert_eq!(
+        loaded.attention_request_timestamp.as_deref(),
+        Some("t-attn")
+    );
+
+    // Workspace mismatch → NotFound, and the pending request survives.
+    let other_ws = WorkspaceId::new();
+    assert!(matches!(
+        store
+            .clear_attention_request(&other_ws, &agent_id, "t-clear-x")
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Present → cleared (true), fields NULLed, updated_at refreshed.
+    assert!(store
+        .clear_attention_request(&ws, &agent_id, "t-clear-1")
+        .await
+        .expect("clear"));
+    let cleared = store.get_agent_session(&agent_id).await.expect("cleared");
+    assert_eq!(cleared.attention_request_kind, None);
+    assert_eq!(cleared.attention_request_reason, None);
+    assert_eq!(cleared.attention_request_timestamp, None);
+    assert_eq!(cleared.updated_at, "t-clear-1");
+
+    // Repeat is the no-op false again; a missing session is NotFound.
+    assert!(!store
+        .clear_attention_request(&ws, &agent_id, "t-clear-2")
+        .await
+        .expect("noop clear 2"));
+    assert!(matches!(
+        store
+            .clear_attention_request(&ws, &AgentId::from("agent-missing"), "t")
+            .await,
+        Err(Error::NotFound(_))
+    ));
 }
 
 /// `insert_agent_session_with_messages` persists the session and its whole
@@ -4867,6 +4953,150 @@ async fn agent_queue_load_defaults_null_turn_id_to_row_id() {
         loaded[0].turn_id, "legacy-row",
         "NULL turn_id must default to the row id"
     );
+}
+
+/// A transient SQLITE_BUSY error as surfaced by the repositories
+/// (monorepo#1139: "get note failed: ... (code: 5) database is locked").
+fn busy_error() -> Error {
+    Error::Internal(
+        "get note failed: error returned from database: (code: 5) database is locked".to_string(),
+    )
+}
+
+/// `with_read_retry` retries a closure that fails with a `code: 5` Internal
+/// error N times before succeeding, and returns the eventual Ok
+/// (monorepo#1139).
+#[tokio::test]
+async fn read_retry_retries_busy_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result = crate::with_read_retry(|| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            Err(busy_error())
+        } else {
+            Ok(42u32)
+        }
+    })
+    .await;
+    assert_eq!(result.expect("busy failures should be retried"), 42);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// Non-busy errors are NOT retried: the closure runs exactly once and the
+/// error is surfaced immediately.
+#[tokio::test]
+async fn read_retry_does_not_retry_non_busy_errors() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal("boom".to_string()))
+    })
+    .await;
+    match result {
+        Err(Error::Internal(msg)) => assert_eq!(msg, "boom"),
+        other => panic!("expected Internal(boom), got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Extended busy-family codes (261 SQLITE_BUSY_RECOVERY, 517
+/// SQLITE_BUSY_SNAPSHOT, 773 SQLITE_BUSY_TIMEOUT) are retried like the base
+/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK)
+/// are not.
+#[tokio::test]
+async fn read_retry_classifies_busy_family_codes() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    for code in [261u32, 517, 773] {
+        let calls = AtomicU32::new(0);
+        let result = crate::with_read_retry(|| async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 1 {
+                Err(Error::Internal(format!(
+                    "error returned from database: (code: {code}) database is locked"
+                )))
+            } else {
+                Ok(code)
+            }
+        })
+        .await;
+        assert_eq!(result.expect("busy-family code should be retried"), code);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "code {code}");
+    }
+
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal(
+            "error returned from database: (code: 516) abort due to ROLLBACK".to_string(),
+        ))
+    })
+    .await;
+    assert!(matches!(result, Err(Error::Internal(_))));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "non-busy 5xx code must not be retried"
+    );
+}
+
+/// `NotFound` is not a busy error: it passes through without retries.
+#[tokio::test]
+async fn read_retry_passes_through_not_found() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::NotFound("note spec".to_string()))
+    })
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The shared loop returns the last error once the deadline is exhausted.
+/// Uses a small injected deadline so the test stays fast (the production
+/// wrappers use a ~30s window).
+#[tokio::test]
+async fn busy_retry_returns_last_error_after_deadline() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_busy_retry(
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(busy_error())
+        },
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+    match result {
+        Err(Error::Internal(msg)) => assert!(msg.contains("code: 5"), "unexpected error: {msg}"),
+        other => panic!("expected Internal busy error, got {other:?}"),
+    }
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "expected at least one retry before the deadline"
+    );
+}
+
+/// `with_write_txn_retry` (STAB-7) shares the same loop: busy failures are
+/// retried until success.
+#[tokio::test]
+async fn write_txn_retry_retries_busy_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result = crate::with_write_txn_retry(|| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 1 {
+            Err(busy_error())
+        } else {
+            Ok("done")
+        }
+    })
+    .await;
+    assert_eq!(result.expect("busy failures should be retried"), "done");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// Guard against duplicate migration version numbers: two files sharing a

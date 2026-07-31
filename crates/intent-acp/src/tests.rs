@@ -1587,6 +1587,7 @@ mod mcp_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             _message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.sent
                 .lock()
@@ -1600,6 +1601,7 @@ mod mcp_tests {
             _workspace_id: WorkspaceId,
             note_id: NoteId,
             agent_id: String,
+            _force: Option<bool>,
         ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
             self.assigned
                 .lock()
@@ -2399,6 +2401,104 @@ mod client_served_tests {
         handler.serve(&conn, req).await.unwrap();
         let resp = read_frame(&mut reader).await;
         assert_eq!(resp["result"]["content"], json!("hi there"));
+    }
+
+    /// Regression (intent-hq/monorepo#1144): `fs/write_text_file` must fully
+    /// await the `file:changed` sink publish BEFORE the write response is
+    /// sent, otherwise the agent can observe the write as done — and end its
+    /// turn — before the attribution pipeline (which the service-layer sink
+    /// awaits inside `publish`) records the change.
+    ///
+    /// Deterministic, no sleeps: a gated sink suspends `publish` mid-flight;
+    /// cooperative yields on the current-thread runtime give the connection's
+    /// background writer task every chance to flush anything already
+    /// enqueued, so a single poll of the reader proves whether a response
+    /// frame went out while the publish was still pending. Under the old
+    /// respond-then-emit order the frame is enqueued before `publish` starts,
+    /// the yields flush it, and the poll finds it — failing the test.
+    #[tokio::test]
+    async fn write_response_waits_for_file_changed_publish() {
+        use std::future::Future;
+
+        struct GatedSink {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            events: Mutex<Vec<SinkEvent>>,
+        }
+        impl EventSink for GatedSink {
+            fn publish(&self, event: SinkEvent) -> BoxFuture<'_, ()> {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    self.events.lock().unwrap().push(event);
+                })
+            }
+        }
+
+        let root = temp_dir();
+        let sink = Arc::new(GatedSink {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            events: Mutex::new(Vec::new()),
+        });
+        let handler = ClientRequestHandler::new(
+            WorkspaceId::from_string("ws-1"),
+            AgentId::from_string("agent-1"),
+            "auggie",
+            FileService::new(&root),
+            Arc::new(PermissionRegistry::new()),
+            PermissionPolicy::Interactive,
+            sink.clone(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let path = root.join("ordered.txt");
+
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            7,
+            "fs/write_text_file",
+            json!({ "sessionId": "acp-1", "path": path, "content": "attributed" }),
+        )
+        .await;
+        // Return `conn` so it outlives the serve future (dropping it closes
+        // the wire before the response flushes).
+        let serve = tokio::spawn(async move {
+            handler.serve(&conn, req).await.unwrap();
+            conn
+        });
+
+        // Wait until the handler is inside the (suspended) sink publish.
+        sink.entered.notified().await;
+        // Cooperative yields: let the connection's writer task flush anything
+        // that was enqueued before the publish started.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut line = String::new();
+        {
+            let read = reader.read_line(&mut line);
+            tokio::pin!(read);
+            let early =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                early.is_pending(),
+                "fs/write_text_file response was sent before the file:changed \
+                 publish completed (intent-hq/monorepo#1144): {line:?}"
+            );
+        }
+
+        // Release the publish; only now may the response go out.
+        sink.release.notify_one();
+        let _conn = serve.await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["id"], json!(7));
+        assert!(resp.get("result").is_some(), "write returns a result");
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one sink publish");
+        assert_eq!(events[0].event_type, "file:changed");
     }
 
     fn permission_params(title: &str) -> Value {
@@ -5687,6 +5787,7 @@ mod wsapi3_bindings_tests {
             _ws: WorkspaceId,
             note_id: NoteId,
             agent_id: String,
+            _force: Option<bool>,
         ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
             self.assign_agent_calls
                 .lock()
@@ -7248,6 +7349,7 @@ mod wsapi4_bindings_tests {
     type DelegateCall = (Option<String>, Option<String>);
     type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
     type DirCall = (String, Option<i64>);
+    type AttentionCall = (String, String, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
@@ -7262,6 +7364,7 @@ mod wsapi4_bindings_tests {
         event_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
+        request_attention_calls: Mutex<Vec<AttentionCall>>,
         event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         event_dir_calls: Mutex<Vec<DirCall>>,
@@ -7309,11 +7412,15 @@ mod wsapi4_bindings_tests {
                 task_note_id: None,
                 completion_report: None,
                 completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
                 delegation_depth: None,
                 initial_message: None,
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
+                dismissed_questions_message_id: None,
             },
         }
     }
@@ -7355,6 +7462,7 @@ mod wsapi4_bindings_tests {
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
             message_metadata: Option<Value>,
+            _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_send_calls.lock().unwrap().push((
                 agent_id.as_str().to_string(),
@@ -7492,6 +7600,28 @@ mod wsapi4_bindings_tests {
                 .push(caller.as_ref().map(|c| c.as_str().to_string()));
             let _ = report;
             Box::pin(async move { Ok(json!({ "success": true })) })
+        }
+
+        fn agent_request_attention(
+            &self,
+            _ws: WorkspaceId,
+            kind: String,
+            reason: String,
+            caller: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.request_attention_calls.lock().unwrap().push((
+                kind.clone(),
+                reason.clone(),
+                caller.as_ref().map(|c| c.as_str().to_string()),
+            ));
+            Box::pin(async move {
+                Ok(json!({
+                    "ok": true,
+                    "kind": kind,
+                    "reason": reason,
+                    "savedAt": "2026-01-01T00:00:00Z",
+                }))
+            })
         }
 
         fn event_recent_files(
@@ -7963,6 +8093,70 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.reportToParent();").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("report is required"));
+    }
+
+    #[tokio::test]
+    async fn agent_request_discussion_threads_caller_kind_and_reason() {
+        let (srv, api) = server_with_caller("child-7");
+        let resp = call(
+            &srv,
+            "return await ws.agent.requestDiscussion('need input');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["kind"], json!("discussion"));
+        assert_eq!(v["reason"], json!("need input"));
+        assert_eq!(
+            api.request_attention_calls.lock().unwrap()[0],
+            (
+                "discussion".to_string(),
+                "need input".to_string(),
+                Some("child-7".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_report_blocker_threads_caller_kind_and_reason() {
+        let (srv, api) = server_with_caller("child-8");
+        let resp = call(
+            &srv,
+            "return await ws.agent.reportBlocker('sandbox is broken');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["kind"], json!("blocker"));
+        assert_eq!(v["reason"], json!("sandbox is broken"));
+        assert_eq!(
+            api.request_attention_calls.lock().unwrap()[0],
+            (
+                "blocker".to_string(),
+                "sandbox is broken".to_string(),
+                Some("child-8".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_request_discussion_missing_reason_errors() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.requestDiscussion();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("reason is required"));
+        assert!(api.request_attention_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_report_blocker_missing_reason_errors() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.reportBlocker();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("reason is required"));
+        assert!(api.request_attention_calls.lock().unwrap().is_empty());
     }
 
     // ================================================================

@@ -13,6 +13,15 @@
 //! workspace — enforced in [`Services::register_completion_watch`], the single
 //! shared registration path, not per-caller.
 //!
+//! Pair uniqueness: a parent holds AT MOST ONE active watch per child —
+//! across oneShot, non-oneShot, and grouped watches. The shared registration
+//! path enforces it by ADOPTING an existing watch for the pair instead of
+//! pushing a duplicate (a grouped request converts the watch to the group
+//! watch; a non-oneShot request upgrades a oneShot; a weaker request never
+//! degrades a stronger watch). Explicit registrations (`app.agents.waitFor`)
+//! reject an already-watched target up front instead; startup rehydration
+//! coalesces pre-existing duplicate persisted rows.
+//!
 //! A oneShot watch is registered when an agent delegates with `waitMode`
 //! `immediate` (default) over the MCP front door; the delivery worker that
 //! fires on child completion lands in AS-3 and the `after_all`
@@ -149,6 +158,10 @@ impl Services {
     /// delivered); `child_workspace_id` is where the child's completion events
     /// fire. Errs when the scope gate rejects the pair (non-chief parent
     /// watching a child outside its own workspace).
+    ///
+    /// Pair uniqueness: when the parent already holds a watch on this child,
+    /// the existing watch is ADOPTED (see [`Services::insert_watch_in_memory`])
+    /// and its id is returned — no duplicate is ever pushed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_completion_watch(
         &self,
@@ -170,7 +183,9 @@ impl Services {
             group_id,
         )?;
         // Write-through persist (best-effort) so the watch survives a daemon
-        // restart (rehydrated by `heal_completion_watches_on_startup`).
+        // restart (rehydrated by `heal_completion_watches_on_startup`). On the
+        // adopt path this upserts the existing row's mutable columns
+        // (one_shot / group_id) so the strengthened mode is restart-durable.
         let id = watch.id.clone();
         self.persist_completion_watch(&watch);
         Ok(id)
@@ -213,8 +228,22 @@ impl Services {
         Ok(id)
     }
 
-    /// Shared body of the two registration variants: build the watch, run
-    /// the scope gate, and push it into the in-memory registry.
+    /// Shared body of the two registration variants: run the scope gate,
+    /// then either ADOPT the parent's existing watch on this child (pair
+    /// uniqueness: at most one active watch per (parent, child)) or build a
+    /// fresh watch and push it into the in-memory registry.
+    ///
+    /// Adoption rules (strengthen-only, never weaken):
+    /// - A grouped request converts the existing watch into the group watch
+    ///   (`group_id` adopted, `one_shot` cleared) — group settlement
+    ///   accounting REQUIRES the grouped watch to exist, so the group always
+    ///   wins a collision (this is the footer duplicate-wake bug: a oneShot
+    ///   watch coexisting with after_all membership double-woke the parent).
+    /// - An ungrouped request against an existing grouped watch is a no-op
+    ///   (the group already provides the wake path).
+    /// - A non-oneShot ungrouped request upgrades an existing oneShot watch
+    ///   (a queued wake must survive the current `agent:idle`); a oneShot
+    ///   request never degrades a non-oneShot watch.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -227,30 +256,80 @@ impl Services {
         group_id: Option<String>,
     ) -> Result<CompletionWatch> {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
-        let watch = CompletionWatch {
-            id: Uuid::new_v4().to_string(),
-            parent_workspace_id: parent_workspace_id.clone(),
-            child_workspace_id: child_workspace_id.clone(),
-            parent_agent_id,
-            parent_agent_name,
-            child_agent_id,
-            one_shot,
-            group_id,
-            created_at: now_iso(),
-            cleanup_deadline: None,
-            report_delivered: false,
+        let watch = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if let Some(existing) = guard.subscriptions.iter_mut().find(|s| {
+                s.parent_agent_id == parent_agent_id && s.child_agent_id == child_agent_id
+            }) {
+                if let Some(gid) = group_id {
+                    existing.group_id = Some(gid);
+                    existing.one_shot = false;
+                    // Group settlement owns the watch's lifecycle now: disarm
+                    // any queued-wake leak-guard deadline so a stale cleanup
+                    // task cannot remove the grouped watch out from under the
+                    // group's completion accounting.
+                    existing.cleanup_deadline = None;
+                } else if existing.group_id.is_none() {
+                    existing.one_shot = existing.one_shot && one_shot;
+                }
+                // Refresh the parent display name and home-workspace anchor
+                // from the current registration (mirroring
+                // `find_and_refresh_ungrouped_watch`): a watch created with
+                // fallback data must not stay stale when a later
+                // registration carries the correct name/home. The anchor
+                // refresh is re-gated against the EXISTING watch's child
+                // workspace (which may differ from this call's).
+                existing.parent_agent_name = parent_agent_name;
+                if existing.parent_workspace_id != *parent_workspace_id
+                    && check_watch_scope(parent_workspace_id, &existing.child_workspace_id).is_ok()
+                {
+                    existing.parent_workspace_id = parent_workspace_id.clone();
+                }
+                existing.clone()
+            } else {
+                let watch = CompletionWatch {
+                    id: Uuid::new_v4().to_string(),
+                    parent_workspace_id: parent_workspace_id.clone(),
+                    child_workspace_id: child_workspace_id.clone(),
+                    parent_agent_id,
+                    parent_agent_name,
+                    child_agent_id,
+                    one_shot,
+                    group_id,
+                    created_at: now_iso(),
+                    cleanup_deadline: None,
+                    report_delivered: false,
+                };
+                guard.subscriptions.push(watch.clone());
+                watch
+            }
         };
-        self.agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned")
-            .subscriptions
-            .push(watch.clone());
         // monorepo#840: a fresh watch expresses fresh interest — drop any
         // stale failure-wake dedup record for this pair so the next failure
         // (even with unchanged error text) reaches the new watcher. Dedup
         // then only suppresses replays BETWEEN registrations.
         self.clear_failure_wake_dedup_pair(&watch.parent_agent_id, &watch.child_agent_id);
         Ok(watch)
+    }
+
+    /// Whether the parent already holds ANY active watch on this child —
+    /// oneShot, non-oneShot, or grouped (the pair-uniqueness pre-check used
+    /// by explicit registration paths that must reject duplicates instead of
+    /// silently adopting, e.g. `app.agents.waitFor`).
+    pub(crate) fn pair_watch_exists(
+        &self,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+    ) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .any(|s| &s.parent_agent_id == parent_agent_id && &s.child_agent_id == child_agent_id)
     }
 
     /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup),
@@ -649,10 +728,12 @@ impl Services {
     }
 
     /// Whether `child_id` is enrolled in an undelivered `after_all` delegation
-    /// group parented by `parent_id`. Retained for tests and future callers;
-    /// the immediate-mode `reportToParent` suppression has moved to SUB-2
-    /// (the child's `agent:idle` drives the single wake, so grouped children
-    /// no longer need the pre-persist branch this predicate used to gate).
+    /// group parented by `parent_id`. Gates the immediate `reportToParent`
+    /// wake in `agent_report_to_parent_op` (grouped children defer to the
+    /// group's aggregated wake) and the SUB-1 auto-watch registration
+    /// (grouped children are already covered by the grouped watch). Attention
+    /// requests (`agent_request_attention_op`) intentionally bypass it — that
+    /// wake is delivered immediately regardless of grouping.
     pub(crate) fn child_in_undelivered_group(
         &self,
         parent_id: &AgentId,
@@ -917,15 +998,137 @@ impl Services {
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
     pub(crate) fn remove_groups_for_parent(&self, parent_id: &AgentId) -> usize {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let before = guard.delegation_groups.len();
-        guard
-            .delegation_groups
-            .retain(|g| &g.parent_agent_id != parent_id);
-        before - guard.delegation_groups.len()
+        let removed_ids: Vec<String> = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let mut ids = Vec::new();
+            guard.delegation_groups.retain(|g| {
+                if &g.parent_agent_id == parent_id {
+                    ids.push(g.group_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            ids
+        };
+        let removed = removed_ids.len();
+        if removed > 0 {
+            // Best-effort DB sweep (mirrors `remove_all_for_parent`): drop the
+            // persisted rows so cancelled groups don't rehydrate on restart. A
+            // failed delete self-heals — cancel is idempotent, so a repeat
+            // cancel (or group delivery) clears any resurrected group.
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for gid in removed_ids {
+                    if let Err(e) = store.delete_delegation_group(&gid).await {
+                        tracing::warn!("delegation_group parent sweep failed {gid}: {e}");
+                    }
+                }
+            });
+        }
+        removed
+    }
+
+    /// Remove ONE delegation group by id together with EVERY watch carrying
+    /// its `group_id`, in a single registry critical section — closing the
+    /// window in which a concurrently registered grouped watch could survive
+    /// as an orphan pointing at a deleted group. Only removes a group
+    /// parented by `parent_id`; returns the removed snapshot or `None` when
+    /// no such group exists. The persisted watch rows are swept best-effort
+    /// (spawned, like every other watch-delete path); the caller owns the
+    /// persisted GROUP row delete (durable-before-observable in the scoped
+    /// `agent.cancelSubscriptions` path).
+    pub(crate) fn remove_group_with_watches(
+        &self,
+        parent_id: &AgentId,
+        group_id: &str,
+    ) -> Option<DelegationGroup> {
+        let (group, watch_ids) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let idx = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id && &g.parent_agent_id == parent_id)?;
+            let group = guard.delegation_groups.remove(idx);
+            let mut watch_ids = Vec::new();
+            guard.subscriptions.retain(|s| {
+                if s.group_id.as_deref() == Some(group_id) {
+                    watch_ids.push(s.id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            (group, watch_ids)
+        };
+        if !watch_ids.is_empty() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for id in watch_ids {
+                    if let Err(e) = store.delete_completion_watch(&id).await {
+                        tracing::warn!("completion_watch delete failed {id}: {e}");
+                    }
+                }
+            });
+        }
+        Some(group)
+    }
+
+    /// Drop `child_id` from a group's expected/completed/deleted sets (the
+    /// scoped `agent.cancelSubscriptions` of a grouped watch). At steady
+    /// state group settlement is driven exclusively by the grouped watch, so
+    /// a cancelled child must also stop gating `is_group_complete` or the
+    /// group would stall forever — the surviving siblings' aggregated wake
+    /// included. The shrunk group is persisted write-through (best-effort,
+    /// like `enroll_child_in_group`); when the expected set becomes empty the
+    /// group can never fire, so it is removed outright and its persisted row
+    /// swept (best-effort). Returns `true` when the group still exists
+    /// afterwards — the caller should `try_fire_group` it, since the shrunk
+    /// group may now be sealed AND complete.
+    pub(crate) fn remove_child_from_group(&self, group_id: &str, child_id: &AgentId) -> bool {
+        let (shrunk, emptied) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(idx) = guard
+                .delegation_groups
+                .iter()
+                .position(|g| g.group_id == group_id)
+            else {
+                return false;
+            };
+            let g = &mut guard.delegation_groups[idx];
+            g.expected_agent_ids.retain(|id| id != child_id);
+            g.completed_agent_ids.retain(|id| id != child_id);
+            g.deleted_agent_ids.retain(|id| id != child_id);
+            if g.expected_agent_ids.is_empty() {
+                guard.delegation_groups.remove(idx);
+                (None, true)
+            } else {
+                (Some(g.clone()), false)
+            }
+        };
+        if let Some(g) = shrunk {
+            self.persist_delegation_group(&g);
+            return true;
+        }
+        if emptied {
+            let store = self.store.clone();
+            let gid = group_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store.delete_delegation_group(&gid).await {
+                    tracing::warn!("delegation_group delete failed {gid}: {e}");
+                }
+            });
+        }
+        false
     }
 
     /// Test-only snapshot of a parent's delegation group, if one exists.
@@ -1013,8 +1216,26 @@ impl Services {
     /// reconciled against current agent state: a child that completed while
     /// the daemon was down delivers its (synthetic) completion immediately,
     /// so the parent is not left waiting forever.
+    ///
+    /// Pair uniqueness: rows are processed grouped-first (then non-oneShot,
+    /// then oneShot; older first within a rank), and a row whose
+    /// (parent, child) pair is already watched in memory is pruned — so
+    /// duplicate rows persisted by a pre-invariant daemon are coalesced onto
+    /// the single strongest watch on upgrade.
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
-        let persisted = self.store.list_completion_watches().await?;
+        let mut persisted = self.store.list_completion_watches().await?;
+        // Strongest-first: grouped (0) < non-oneShot (1) < oneShot (2), with
+        // the store's created_at ASC ordering as the tiebreaker (stable sort).
+        let rank = |p: &intent_store::PersistedCompletionWatch| -> u8 {
+            if p.group_id.is_some() {
+                0
+            } else if !p.one_shot {
+                1
+            } else {
+                2
+            }
+        };
+        persisted.sort_by_key(rank);
         let mut loaded = 0usize;
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
@@ -1068,24 +1289,51 @@ impl Services {
                 },
                 None => None,
             };
-            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = {
+            enum LoadOutcome {
+                Loaded(String, WorkspaceId, AgentId, AgentId, WorkspaceId),
+                AlreadyInMemory,
+                DuplicatePair,
+            }
+            let outcome = {
                 let mut guard = self
                     .agent_subscriptions
                     .lock()
                     .expect("agent subscription registry poisoned");
                 if guard.subscriptions.iter().any(|s| s.id == p.id) {
+                    LoadOutcome::AlreadyInMemory
+                } else if guard.subscriptions.iter().any(|s| {
+                    s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
+                }) {
+                    // Pair uniqueness: a stronger watch (grouped /
+                    // non-oneShot) for the same (parent, child) already
+                    // loaded — this row is a pre-invariant duplicate.
+                    LoadOutcome::DuplicatePair
+                } else {
+                    let watch = persisted_to_completion_watch(&p);
+                    let ids = LoadOutcome::Loaded(
+                        watch.id.clone(),
+                        watch.parent_workspace_id.clone(),
+                        watch.parent_agent_id.clone(),
+                        watch.child_agent_id.clone(),
+                        watch.child_workspace_id.clone(),
+                    );
+                    guard.subscriptions.push(watch);
+                    ids
+                }
+            };
+            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = match outcome {
+                LoadOutcome::Loaded(id, pws, pa, ca, cws) => (id, pws, pa, ca, cws),
+                LoadOutcome::AlreadyInMemory => continue,
+                LoadOutcome::DuplicatePair => {
+                    tracing::info!(
+                        watch = %p.id,
+                        parent = %p.parent_agent_id.0,
+                        child = %p.child_agent_id.0,
+                        "pruning persisted completion watch — duplicate (parent, child) pair"
+                    );
+                    let _ = self.store.delete_completion_watch(&p.id).await;
                     continue;
                 }
-                let watch = persisted_to_completion_watch(&p);
-                let ids = (
-                    watch.id.clone(),
-                    watch.parent_workspace_id.clone(),
-                    watch.parent_agent_id.clone(),
-                    watch.child_agent_id.clone(),
-                    watch.child_workspace_id.clone(),
-                );
-                guard.subscriptions.push(watch);
-                ids
             };
             loaded += 1;
             // Re-arm the leak-guard cleanup with the remaining wall-clock time.
@@ -1370,6 +1618,11 @@ impl Services {
                         if let Some(s) = &stall {
                             s.annotate_event_data(&mut data);
                         }
+                        annotate_attention_request(
+                            &mut data,
+                            session.attention_request_kind.as_deref(),
+                            session.attention_request_reason.as_deref(),
+                        );
                         let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
@@ -1483,10 +1736,19 @@ impl Services {
                 Some(s) => self.stall_suspicion_for_session(s).await,
                 None => None,
             };
+            let attention = session.as_ref().map(|s| {
+                (
+                    s.attention_request_kind.clone(),
+                    s.attention_request_reason.clone(),
+                )
+            });
             let report = session.and_then(|s| s.completion_report);
             let mut data = event_data.clone();
             if let Some(s) = &stall {
                 s.annotate_event_data(&mut data);
+            }
+            if let Some((kind, reason)) = &attention {
+                annotate_attention_request(&mut data, kind.as_deref(), reason.as_deref());
             }
             let event = Event {
                 id: String::new(),
@@ -1513,6 +1775,33 @@ impl Services {
             )
             .await;
         }
+    }
+}
+
+/// Merge a child's pending attention request (persisted session fields set by
+/// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) into a group-record
+/// event's `data`, so `format_group_child_line` can fold the kind-flavored
+/// attention text into the aggregated group wake as the record (the immediate
+/// parent wake already fired at raise time — the alert). No-op when no request
+/// is pending — including when a parent reply before settlement already
+/// cleared the child's session fields. Shared by all group-record annotation
+/// sites (including the
+/// completion-watch path in `lib.rs`) so the payload shape and empty-kind
+/// guard cannot drift.
+pub(crate) fn annotate_attention_request(
+    data: &mut serde_json::Value,
+    kind: Option<&str>,
+    reason: Option<&str>,
+) {
+    let Some(kind) = kind.filter(|k| !k.is_empty()) else {
+        return;
+    };
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("attentionRequestKind".to_string(), serde_json::json!(kind));
+        obj.insert(
+            "attentionRequestReason".to_string(),
+            serde_json::json!(reason.unwrap_or("")),
+        );
     }
 }
 

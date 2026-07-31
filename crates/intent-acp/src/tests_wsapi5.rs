@@ -807,11 +807,15 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             task_note_id: None,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            dismissed_questions_message_id: None,
         },
     }
 }

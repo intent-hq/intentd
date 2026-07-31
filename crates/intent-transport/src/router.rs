@@ -8,7 +8,7 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, NoteAddInput, NoteCreate, NoteEditInput,
+    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
     WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
@@ -18,6 +18,10 @@ const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
+/// A serialized response exceeded [`crate::MAX_OUTBOUND_MESSAGE_BYTES`] and was
+/// replaced with this error so the client fails fast instead of timing out on
+/// a dropped frame.
+const OVERSIZED_RESPONSE: i32 = -32010;
 
 /// A JSON-RPC error to surface to the client.
 struct RpcErr {
@@ -155,7 +159,14 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         return None;
     }
     Some(match result {
-        Ok(v) => success_string(echo_id, v),
+        Ok(v) => {
+            let frame = success_string(echo_id.clone(), v);
+            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                oversized_response_string(echo_id, method, frame.len())
+            } else {
+                frame
+            }
+        }
         Err(e) => error_string(echo_id, e.code, &e.message, e.data),
     })
 }
@@ -708,8 +719,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let agent_id = require_str_param(params, "agentId")?;
+            let force = opt_bool(params, "force");
             let result = api
-                .assign_agent(ws, note_id, agent_id)
+                .assign_agent(ws, note_id, agent_id, force)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1121,6 +1133,9 @@ async fn dispatch(
             // unconsumed: assistant rows are keyed on the server-minted
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
+            // Question hold (PROTOCOL §5.5): the FE RPC front door is the
+            // ONLY user-originated entry point — user sends are never held
+            // (they supersede a pending Q&A by design).
             let result = api
                 .agent_send_message(
                     ws,
@@ -1134,6 +1149,7 @@ async fn dispatch(
                     stdin_context,
                     context_references,
                     message_metadata,
+                    MessageOrigin::User,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -1145,6 +1161,16 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .agent_send_queued_message_now(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.dismissQuestions" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_dismiss_questions(ws, agent_id, message_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1456,8 +1482,22 @@ async fn dispatch(
         "agent.cancelSubscriptions" => {
             let ws = require_ws_note(params)?;
             let agent_id = require_agent_id(params)?;
+            // Optional scoping (additive): cancel one watch and/or one
+            // delegation group instead of everything. A present-but-non-string
+            // id is rejected — falling back to `None` would silently turn a
+            // malformed scoped request into an unscoped cancel-everything.
+            let subscription_id = match params.get("subscriptionId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "subscriptionId must be a string")),
+            };
+            let group_id = match params.get("groupId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "groupId must be a string")),
+            };
             let result = api
-                .agent_cancel_subscriptions(ws, agent_id)
+                .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -3606,6 +3646,34 @@ fn error_string(id: Value, code: i32, message: &str, data: Option<Value>) -> Str
     }
     let resp = json!({ "jsonrpc": "2.0", "error": Value::Object(err), "id": id });
     serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+}
+
+/// Replace a serialized response that exceeds
+/// [`crate::MAX_OUTBOUND_MESSAGE_BYTES`] with an [`OVERSIZED_RESPONSE`] error
+/// echoing the request id, so the client fails fast instead of hitting its
+/// RPC timeout on a silently dropped frame. The writer-task cap remains as a
+/// last-resort backstop for non-response frames (subscription pushes/events).
+fn oversized_response_string(id: Value, method: &str, response_bytes: usize) -> String {
+    tracing::error!(
+        method,
+        response_bytes,
+        limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        "oversized JSON-RPC response replaced with error"
+    );
+    error_string(
+        id,
+        OVERSIZED_RESPONSE,
+        &format!(
+            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {} bytes",
+            crate::MAX_OUTBOUND_MESSAGE_BYTES
+        ),
+        Some(json!({
+            "code": "oversized-response",
+            "method": method,
+            "responseBytes": response_bytes,
+            "limit": crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        })),
+    )
 }
 
 /// Last-resort response if serialization itself fails (should never happen).

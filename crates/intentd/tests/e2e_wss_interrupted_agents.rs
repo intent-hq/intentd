@@ -292,6 +292,9 @@ async fn interrupted_agents_persisted_across_restart() {
             skip_auto_commit: false,
             completion_report: None,
             completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
             delegation_depth: None,
             initial_message: None,
             context_references: None,
@@ -527,11 +530,11 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Wait for the agent to be observably in-flight: blockUntilCancel streams a chunk
-    // then parks, so seeing agent:stream:chunk means the agent is in the busy set.
+    // then parks, so seeing agent:stream:activity means the agent is in the busy set.
     let mut saw_chunk = false;
     for _ in 0..20 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+        if frame["params"]["event"]["type"] == "agent:stream:activity" {
             saw_chunk = true;
             break;
         }

@@ -124,6 +124,7 @@ async fn agent_send_message_persists_without_manager() {
             None,
             None,
             None,
+            intent_core::MessageOrigin::User,
         )
         .await
         .expect("agent send message");
@@ -185,7 +186,12 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
     let assigned_id = AgentId::from(assigned_agent["agent"]["id"].as_str().unwrap());
 
     services
-        .assign_agent(ws.clone(), task_note.id.clone(), assigned_id.to_string())
+        .assign_agent(
+            ws.clone(),
+            task_note.id.clone(),
+            assigned_id.to_string(),
+            None,
+        )
         .await
         .expect("assign agent");
 
@@ -232,14 +238,14 @@ async fn agent_cancel_subscriptions_idempotent() {
 
     // Cancel subscriptions (should be idempotent even when empty)
     let result = services
-        .agent_cancel_subscriptions(ws.clone(), agent_id.clone())
+        .agent_cancel_subscriptions(ws.clone(), agent_id.clone(), None, None)
         .await
         .expect("cancel subscriptions");
     assert_eq!(result["success"], true);
 
     // Call again - should still work
     let result2 = services
-        .agent_cancel_subscriptions(ws.clone(), agent_id)
+        .agent_cancel_subscriptions(ws.clone(), agent_id, None, None)
         .await
         .expect("cancel subscriptions again");
     assert_eq!(result2["success"], true);

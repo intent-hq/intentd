@@ -329,7 +329,7 @@ fn conversation_texts(conv: &Value) -> Vec<(String, String)> {
 /// - an `agent:message` (role=user) lands AFTER that stream:end — the
 ///   persisted warning row, `[SYSTEM WARNING] … (1.5s of silence) …` with the
 ///   ACTUAL configured window (sub-second precision preserved);
-/// - the recovery turn streams and completes normally (`agent:stream:chunk`,
+/// - the recovery turn streams and completes normally (`agent:stream:activity`,
 ///   `agent:stream:end` with `messageId`, trailing `agent:idle`);
 /// - the assistant reply carries `turn=2` — the mock's per-process turn
 ///   counter — proving the daemon resumed the SAME child (keep-alive), not a
@@ -408,7 +408,7 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Event sequence: stream:end #1 (the timed-out turn, no messageId) →
-    // agent:message role=user (the warning row) → stream:chunk + stream:end #2
+    // agent:message role=user (the warning row) → stream:activity + stream:end #2
     // (with messageId) → agent:idle. NEVER an agent:failed, and NEVER an
     // agent:idle before the recovery turn's stream:end.
     let mut ends = 0u32;
@@ -447,7 +447,7 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
                 assert_eq!(ends, 1, "warning row precedes the recovery turn: {ev}");
                 user_messages_after_first_end += 1;
             }
-            Some("agent:stream:chunk") if ends >= 1 => recovery_chunks += 1,
+            Some("agent:stream:activity") if ends >= 1 => recovery_chunks += 1,
             Some("agent:idle") => {
                 assert_eq!(
                     ends, 2,

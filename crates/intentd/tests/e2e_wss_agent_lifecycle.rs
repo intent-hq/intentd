@@ -438,7 +438,7 @@ async fn mock_agent_full_turn_over_wss() {
     // note:updated (from the MCP tool's domain event). Also record every
     // `agent:stream:status` frame (STAT-1 / PROTOCOL §6.5) with its arrival
     // ordinal so we can assert the pre-first-token status hints land on the
-    // real WSS transport AND arrive before the first `agent:stream:chunk`.
+    // real WSS transport AND arrive before the first `agent:stream:activity`.
     let mut chunks = 0u32;
     let mut ends = 0u32;
     let mut saw_note_updated = false;
@@ -447,7 +447,7 @@ async fn mock_agent_full_turn_over_wss() {
     for i in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 chunks += 1;
                 if first_chunk_at.is_none() {
                     first_chunk_at = Some(i);
@@ -464,7 +464,7 @@ async fn mock_agent_full_turn_over_wss() {
             _ => {}
         }
     }
-    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
     assert!(
         saw_note_updated,
@@ -472,7 +472,7 @@ async fn mock_agent_full_turn_over_wss() {
     );
 
     // STAT-1 — pre-first-token status hints must reach the FE over the real
-    // WSS transport and MUST all arrive before the first `agent:stream:chunk`
+    // WSS transport and MUST all arrive before the first `agent:stream:activity`
     // (that's the whole point: they populate the spinner *before* streaming
     // starts, then the chunk-reducer clears them). The daemon emits at four
     // real turn-startup transitions for a brand-new agent's first turn:
@@ -480,7 +480,7 @@ async fn mock_agent_full_turn_over_wss() {
     // `prompt` (session/prompt). At least the last one — `prompt` — MUST land
     // before the first chunk on the same subscription.
     let first_chunk_at =
-        first_chunk_at.expect("at least one agent:stream:chunk observed to anchor ordering");
+        first_chunk_at.expect("at least one agent:stream:activity observed to anchor ordering");
     assert!(
         !status_frames.is_empty(),
         "expected >=1 agent:stream:status frame over WSS before the first chunk"
@@ -488,7 +488,7 @@ async fn mock_agent_full_turn_over_wss() {
     for (ord, ev) in &status_frames {
         assert!(
             *ord < first_chunk_at,
-            "agent:stream:status at ordinal {ord} arrived AT/AFTER first agent:stream:chunk \
+            "agent:stream:status at ordinal {ord} arrived AT/AFTER first agent:stream:activity \
              (ordinal {first_chunk_at}) -- startup hints MUST precede streaming: {ev}"
         );
         let data = &ev["data"];
@@ -948,7 +948,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -982,7 +982,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1100,7 +1100,7 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1198,7 +1198,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1232,7 +1232,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1297,7 +1297,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
                 );
                 saw_preempt_end = true;
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1361,7 +1361,7 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1424,7 +1424,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1475,7 +1475,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1520,7 +1520,7 @@ async fn interrupt_priority_send_to_task_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
             Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1591,7 +1591,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1624,7 +1624,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -1672,7 +1672,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
             Some("agent:stream:end") if !saw_preempt_end => saw_preempt_end = true,
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1739,7 +1739,7 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -1816,7 +1816,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -1859,7 +1859,7 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     let mut parked = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -2137,7 +2137,7 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
 /// `taskText` so the child gets a task-derived `name` (NAME-1); the wire
 /// contract exposes the derived name in the `agent.delegate` result. Asserts:
 /// a non-empty `agentId` in the result, `name == taskText` (task-derived, not
-/// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:chunk` + exactly one
+/// the generic `Agent xxxxxx` fallback), ≥1 `agent:stream:activity` + exactly one
 /// terminal `agent:stream:end` + an `agent:idle` all carrying the child id, and
 /// the child transcript carrying the delivered instructions + an assistant reply.
 #[tokio::test]
@@ -2242,7 +2242,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         match ev["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 assert_eq!(ev_agent, child_id, "chunk scoped to the child: {ev}");
                 chunks += 1;
             }
@@ -2290,7 +2290,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
 /// and completes. Asserts (PROTOCOL §5.5/§6.5):
 /// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake with
 ///   BOTH child reports aggregated, and zero individual report deliveries;
-/// - the wake runs a REAL parent turn — `agent:stream:chunk` + one
+/// - the wake runs a REAL parent turn — `agent:stream:activity` + one
 ///   `agent:stream:end` + a trailing `agent:idle`, all keyed by the parent;
 /// - `isWaitingForOtherAgents` is true (with both child ids) while waiting and
 ///   false after delivery, with `agent:subscriptions-changed` watch-change
@@ -2484,7 +2484,7 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
             {
                 saw_waiting_false_event = true;
             }
-            Some("agent:stream:chunk") => wake_chunks += 1,
+            Some("agent:stream:activity") => wake_chunks += 1,
             Some("agent:stream:end") => wake_ends += 1,
             Some("agent:idle") => {
                 parent_idle_again = true;
@@ -2756,7 +2756,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         // Learn the child id from the first non-parent stream chunk (the
         // child's own turn keys every stream event by its agent id).
         if child_id.is_none()
-            && ev_type == "agent:stream:chunk"
+            && ev_type == "agent:stream:activity"
             && !ev_agent.is_empty()
             && ev_agent != parent_id
         {
@@ -2854,6 +2854,634 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         child_got["agent"]["metadata"]["completionReport"].as_str(),
         Some(REPORT),
         "child's persisted completionReport matches: {child_got}"
+    );
+}
+
+/// Agent attention requests over WSS — discussion kind, task-linked caller.
+/// A parentless delegated agent linked to an `in_progress` task note calls
+/// `ws.agent.requestDiscussion(reason)` mid-turn. Asserts over the real wire
+/// (PROTOCOL §5.5/§6.5):
+///  - the self-sufficient `agent:attention-requested` event carries
+///    `{ workspaceId, agentId, agentName, kind: "discussion", reason }`;
+///  - the raise `agent:updated` carries `attentionRequestKind` +
+///    `attentionRequestTimestamp`, and the system-role transcript notice's
+///    persist emits `agent:message` with `role: "system"`;
+///  - the linked task moves to `discussion_needed` (`task:status-changed`
+///    attributed to the caller, read back via `task.get`);
+///  - `agent.getSession` serves the pending `attentionRequest*` session
+///    fields and the persisted notice with `meta.kind = "discussion-request"`,
+///    and the agent's status is NOT `error` (the turn ended normally);
+///  - an AUTOMATIC delivery (`agent.sendToTask`, the A2A/system path) does
+///    NOT retire the request: no `attentionRequestCleared` fires and
+///    `agent.getSession` still serves the pending fields;
+///  - the next USER message (`agent.sendMessage` front door) retires the
+///    request: `agent:updated` with `attentionRequestCleared: true`, and the
+///    session fields are gone.
+#[tokio::test]
+async fn attention_request_discussion_over_wss() {
+    let Some(script) = gate("WSS attention-request discussion E2E") else {
+        return;
+    };
+
+    const CHILD_MARKER: &str = "ATTN_DISCUSS_CHILD";
+    const REASON: &str = "ATTN_WSS need a decision on the migration approach";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": CHILD_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": request_js, "summary": "raise discussion request" }
+            },
+            "response": "turn ended after requestDiscussion",
+        }],
+        "response": "follow-up acknowledged",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent + task events, registered BEFORE the turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // Task-linked parentless delegate (router front door): sets the child
+    // session's `taskNoteId` so the attention op can transition the task.
+    let delegated = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "agentInstructions": format!("{CHILD_MARKER} raise a discussion request"),
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let agent_id = delegated["agentId"].as_str().expect("agent id").to_string();
+    let agent_name = delegated["name"].as_str().expect("agent name").to_string();
+
+    // Order-insensitive milestones under one hard deadline (the attention
+    // events fire DURING the child's turn, racing its terminal idle).
+    let mut attention: Option<Value> = None;
+    let mut raise_updated = false;
+    let mut system_message = false;
+    let mut task_changed: Option<Value> = None;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some()
+        && raise_updated
+        && system_message
+        && task_changed.is_some()
+        && idle)
+    {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} raise_updated={raise_updated} \
+                 system_message={system_message} task_changed={t} idle={idle}",
+                a = attention.is_some(),
+                t = task_changed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(agent_id) => {
+                attention = Some(data.clone());
+            }
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                assert_eq!(
+                    data["attentionRequestKind"], "discussion",
+                    "raise agent:updated kind: {data}"
+                );
+                assert!(
+                    data["attentionRequestTimestamp"].is_string(),
+                    "raise agent:updated carries the timestamp: {data}"
+                );
+                raise_updated = true;
+            }
+            "agent:message" if data["agentId"] == json!(agent_id) && data["role"] == "system" => {
+                assert!(
+                    data["messageId"].is_string(),
+                    "system notice agent:message carries messageId: {data}"
+                );
+                system_message = true;
+            }
+            "task:status-changed" if data["noteId"] == json!(note_id) => {
+                task_changed = Some(data.clone());
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("attention event captured");
+    assert_eq!(
+        attention["workspaceId"],
+        json!(ws_id),
+        "attention event carries workspaceId: {attention}"
+    );
+    assert_eq!(
+        attention["agentName"],
+        json!(agent_name),
+        "attention event carries agentName: {attention}"
+    );
+    assert_eq!(
+        attention["kind"], "discussion",
+        "attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], REASON,
+        "attention event reason: {attention}"
+    );
+    let task_changed = task_changed.expect("task:status-changed captured");
+    assert_eq!(
+        task_changed["previousStatus"], "in_progress",
+        "task transition source: {task_changed}"
+    );
+    assert_eq!(
+        task_changed["newStatus"], "discussion_needed",
+        "task transition target: {task_changed}"
+    );
+    assert_eq!(
+        task_changed["agentId"],
+        json!(agent_id),
+        "task transition attributed to the caller: {task_changed}"
+    );
+
+    // task.get reads the transitioned status back over the wire.
+    let got_task = wss_rpc(
+        &mut rpc,
+        12,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        got_task["task"]["status"], "discussion_needed",
+        "linked task persisted at discussion_needed: {got_task}"
+    );
+
+    // agent.getSession serves the pending attentionRequest* fields, the
+    // persisted meta.kind notice, and a non-error status.
+    let got = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "session attentionRequestReason"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "session attentionRequestTimestamp present"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "turn ended normally, status is NOT error: {}",
+        session["status"]
+    );
+    let messages = session["messages"].as_array().expect("messages array");
+    let notice = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == "discussion-request"
+        })
+        .expect("persisted discussion-request notice");
+    assert_eq!(
+        notice["contentBlocks"][0]["type"], "text",
+        "notice block is a text block: {notice}"
+    );
+    assert_eq!(
+        notice["contentBlocks"][0]["text"], REASON,
+        "notice carries the reason: {notice}"
+    );
+
+    // An AUTOMATIC delivery (agent.sendToTask — same default-origin path as
+    // A2A sends and system wakes) must NOT retire the pending request: the
+    // turn runs to idle without an attentionRequestCleared, and getSession
+    // still serves the fields afterwards.
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the automatic turn's idle"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        assert!(
+            !(ev["type"] == "agent:updated"
+                && data["agentId"] == json!(agent_id)
+                && data["attentionRequestCleared"] == true),
+            "automatic delivery must not clear the attention request"
+        );
+        if ev["type"] == "agent:idle" && data["agentId"] == json!(agent_id) {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "attentionRequestKind survives the automatic delivery"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "attentionRequestReason survives the automatic delivery"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "attentionRequestTimestamp survives the automatic delivery"
+    );
+
+    // The next USER message retires the pending request: agent:updated
+    // with attentionRequestCleared, and the session fields are gone.
+    let sent = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for attentionRequestCleared"),
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"] == json!(agent_id)
+            && ev["data"]["attentionRequestCleared"] == true
+        {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = got["session"].as_object().expect("session object");
+    assert!(
+        !session.contains_key("attentionRequestKind"),
+        "attentionRequestKind cleared on next message"
+    );
+    assert!(
+        !session.contains_key("attentionRequestReason"),
+        "attentionRequestReason cleared on next message"
+    );
+    assert!(
+        !session.contains_key("attentionRequestTimestamp"),
+        "attentionRequestTimestamp cleared on next message"
+    );
+}
+
+/// Agent attention requests over WSS — blocker kind + the taskless-caller
+/// path. Phase 1: a task-linked delegated agent calls
+/// `ws.agent.reportBlocker(reason)` → `agent:attention-requested` with
+/// `kind: "blocker"`, the linked task moves to `blocked`, the transcript
+/// notice persists with `meta.kind = "blocker-report"`, and the agent's
+/// status is NOT `error`. Phase 2: a plain user-created agent (non-delegated,
+/// no linked task) calls `ws.agent.requestDiscussion(reason)` — the call
+/// succeeds, the session fields persist, and NO `task:status-changed` fires
+/// (no linked task = the transition is skipped).
+#[tokio::test]
+async fn attention_request_blocker_and_taskless_caller_over_wss() {
+    let Some(script) = gate("WSS attention-request blocker/taskless E2E") else {
+        return;
+    };
+
+    const BLOCKER_MARKER: &str = "ATTN_BLOCKER_CHILD";
+    const TASKLESS_MARKER: &str = "ATTN_TASKLESS_AGENT";
+    const BLOCK_REASON: &str = "ATTN_WSS sandbox filesystem is read-only";
+    const TASKLESS_REASON: &str = "ATTN_WSS which provider should I target?";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let blocker_js = format!(
+        "return await ws.agent.reportBlocker({});",
+        json!(BLOCK_REASON)
+    );
+    let taskless_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(TASKLESS_REASON)
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": BLOCKER_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": blocker_js, "summary": "report blocker" }
+                },
+                "response": "turn ended after reportBlocker",
+            },
+            {
+                "ifPromptContains": TASKLESS_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": taskless_js, "summary": "taskless requestDiscussion" }
+                },
+                "response": "turn ended after taskless requestDiscussion",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // --- Phase 1: task-linked blocker ------------------------------------
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let delegated = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "agentInstructions": format!("{BLOCKER_MARKER} report an environment blocker"),
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let blocker_id = delegated["agentId"].as_str().expect("agent id").to_string();
+
+    let mut attention: Option<Value> = None;
+    let mut task_changed: Option<Value> = None;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some() && task_changed.is_some() && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} task_changed={t} idle={idle}",
+                a = attention.is_some(),
+                t = task_changed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(blocker_id) => {
+                attention = Some(data.clone());
+            }
+            "task:status-changed" if data["noteId"] == json!(note_id) => {
+                task_changed = Some(data.clone());
+            }
+            "agent:idle" if data["agentId"] == json!(blocker_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("blocker attention event");
+    assert_eq!(
+        attention["kind"], "blocker",
+        "attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], BLOCK_REASON,
+        "attention event reason: {attention}"
+    );
+    let task_changed = task_changed.expect("task:status-changed captured");
+    assert_eq!(
+        task_changed["newStatus"], "blocked",
+        "task transition target: {task_changed}"
+    );
+    let got_task = wss_rpc(
+        &mut rpc,
+        12,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        got_task["task"]["status"], "blocked",
+        "linked task persisted at blocked: {got_task}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getSession",
+        json!({ "agentId": blocker_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "blocker",
+        "session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], BLOCK_REASON,
+        "session attentionRequestReason"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "blocker turn ended normally: {}",
+        session["status"]
+    );
+    let messages = session["messages"].as_array().expect("messages array");
+    let notice = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "system" && m["contentBlocks"][0]["meta"]["kind"] == "blocker-report"
+        })
+        .expect("persisted blocker-report notice");
+    assert_eq!(
+        notice["contentBlocks"][0]["text"], BLOCK_REASON,
+        "notice carries the reason: {notice}"
+    );
+
+    // --- Phase 2: taskless caller -----------------------------------------
+    let created = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Taskless", "model": "mock:default" }),
+    )
+    .await;
+    let taskless_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": taskless_id, "content": TASKLESS_MARKER }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut attention: Option<Value> = None;
+    let mut idle = false;
+    let mut task_events = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(attention.is_some() && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} idle={idle}",
+                a = attention.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["agentId"] == json!(taskless_id) => {
+                attention = Some(data.clone());
+            }
+            "task:status-changed" => task_events += 1,
+            "agent:idle" if data["agentId"] == json!(taskless_id) => idle = true,
+            _ => {}
+        }
+    }
+    let attention = attention.expect("taskless attention event");
+    assert_eq!(
+        attention["kind"], "discussion",
+        "taskless attention event kind: {attention}"
+    );
+    assert_eq!(
+        attention["reason"], TASKLESS_REASON,
+        "taskless attention event reason: {attention}"
+    );
+    assert_eq!(
+        task_events, 0,
+        "no task:status-changed for a taskless caller"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        22,
+        "agent.getSession",
+        json!({ "agentId": taskless_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "taskless session attentionRequestKind"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], TASKLESS_REASON,
+        "taskless session attentionRequestReason"
+    );
+    assert_ne!(
+        session["status"], "error",
+        "taskless turn ended normally: {}",
+        session["status"]
     );
 }
 
@@ -3656,7 +4284,7 @@ async fn subscription_filter_branches_over_wss() {
     for _ in 0..80 {
         let frame = wss_event(&mut sub_agents, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => agent_chunks += 1,
+            Some("agent:stream:activity") => agent_chunks += 1,
             Some("agent:stream:end") => {
                 agent_end = true;
                 break;
@@ -3770,7 +4398,7 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
     let mut saw_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub_a, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+        if frame["params"]["event"]["type"] == "agent:stream:activity" {
             saw_chunk = true;
             break;
         }
@@ -4565,7 +5193,7 @@ async fn send_queued_message_now_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -4593,7 +5221,7 @@ async fn send_queued_message_now_over_wss() {
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -4677,7 +5305,7 @@ async fn send_queued_message_now_over_wss() {
             Some("agent:stream:end") if !saw_preempt_end => {
                 saw_preempt_end = true;
             }
-            Some("agent:stream:chunk")
+            Some("chat:stream:delta")
                 if evt["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -5083,7 +5711,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
                 assert_eq!(ev["data"]["agentId"], agent_id.as_str());
                 saw_agent_created = true;
             }
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 assert_eq!(
                     ev["data"]["agentId"],
                     agent_id.as_str(),
@@ -5910,7 +6538,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         let ev_type = ev["type"].as_str().unwrap_or_default();
         // Learn child IDs from stream chunks.
-        if ev_type == "agent:stream:chunk" && !ev_agent.is_empty() && ev_agent != parent_id {
+        if ev_type == "agent:stream:activity" && !ev_agent.is_empty() && ev_agent != parent_id {
             if child_a_id.is_none() {
                 child_a_id = Some(ev_agent.to_string());
             } else if child_b_id.is_none() && ev_agent != child_a_id.as_deref().unwrap() {
@@ -7380,7 +8008,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -7408,7 +8036,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
     let mut saw_chunk = false;
     for _ in 0..30 {
         if let Some(frame) = wss_event_opt(&mut sub, 3).await {
-            if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            if frame["params"]["event"]["type"] == "chat:stream:delta"
                 && frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -7634,7 +8262,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -7699,7 +8327,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
             break;
         };
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -8312,6 +8940,388 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     );
 }
 
+/// SUB-1 child→parent watch suppression + §7.1 delta metadata over the real
+/// WSS transport (regression for intentd#773).
+///
+/// A parent spawns a child through `ws.agent.create` (persisting the
+/// `parent_agent_id` linkage), the child sends a coordination message back to
+/// its parent through `ws.agent.send`, and:
+/// - the child's persisted send tool result carries NO `subscriptionId` (the
+///   SUB-1 sender auto-watch is suppressed for child→parent sends), while a
+///   parentless bystander's identical send DOES get one — and only the
+///   bystander is later woken by the parent's completion;
+/// - the parent's `chat.subscribe` delta for the delivered row lifts the
+///   persisted `agent_message` sender-attribution `metadata` onto the wire
+///   entity (§7.1), while a human `agent.sendMessage` row keeps the lean
+///   metadata-free entity shape.
+#[tokio::test]
+async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_wss() {
+    let Some(script) = gate("WSS child→parent watch suppression + delta metadata E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Rule 1 (parent kickoff): spawn the child through the real MCP
+    // `workspace_api` binding so the session persists `parent_agent_id`.
+    // Rule 2 (child kickoff + bystander kickoff): find the parent by name and
+    // send to it — same code path for both callers; only the caller's parent
+    // linkage differs. `emitToolBlocks` persists the tool results so the
+    // suppression (no `subscriptionId`) is asserted from the transcript.
+    let spawn_code = "return await ws.agent.create('ChildC', 'please MESSAGE_PARENT now', \
+                      { model: 'mock:default' });";
+    let send_code = "const agents = await ws.agent.list(true); \
+                     const target = agents.find(a => a.name === 'Coordinator'); \
+                     return await ws.agent.send(target.id, 'child says hi');";
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "SPAWN_CHILD",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_code, "summary": "spawn child e2e" }
+                },
+                "response": "child spawned",
+                "emitToolBlocks": true
+            },
+            {
+                "ifPromptContains": "MESSAGE_PARENT",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "send to parent e2e" }
+                },
+                "response": "sent upward",
+                "emitToolBlocks": true
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Coordinator", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"].as_str().unwrap().to_string();
+
+    // CHAT conn on the PARENT — subscribed BEFORE any turn so the delivered
+    // child→parent row's delta is observed live.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    // Kick off: the parent's turn spawns the child (MCP create → the session
+    // persists `parent_agent_id`), whose kickoff turn sends back upward.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "please SPAWN_CHILD" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // Wait for the parent's spawn turn, resolve the child by name, then wait
+    // for the child's kickoff turn (which performed the upward send).
+    let mut done: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        if done.contains(&parent_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(done.contains(&parent_id), "parent turn completed: {done:?}");
+    let list = wss_rpc(&mut rpc, 12, "agent.list", json!({ "workspaceId": &ws_id })).await;
+    let child_id = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["name"] == "ChildC")
+        .and_then(|a| a["id"].as_str())
+        .unwrap_or_else(|| panic!("child listed: {list}"))
+        .to_string();
+    for _ in 0..200 {
+        if done.contains(&child_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(done.contains(&child_id), "child turn completed: {done:?}");
+
+    // Extract a caller's persisted `ws.agent.send` tool result (the JSON the
+    // MCP binding returned) from its transcript.
+    let send_tool_result = |conv: &Value, target: &str| -> Value {
+        conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["contentBlocks"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_result")
+            .filter_map(|b| b["output"].as_array().and_then(|arr| arr.first()))
+            .filter_map(|item| item["text"].as_str())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .find(|v| v["agentId"] == json!(target))
+            .unwrap_or_else(|| panic!("send tool result persisted: {conv}"))
+    };
+
+    // THE SUB-1 assertion: the child's send to its own parent registered NO
+    // sender auto-watch — the tool result has no `subscriptionId`.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &child_id }),
+    )
+    .await;
+    let result = send_tool_result(&conv, &parent_id);
+    assert_eq!(result["ok"], json!(true), "child send ok: {result}");
+    assert!(
+        result.get("subscriptionId").is_none(),
+        "child→parent send must NOT register a sender watch: {result}"
+    );
+
+    // THE §7.1 assertion: the delivered row's delta entity on the parent's
+    // chat channel carries the persisted `agent_message` metadata.
+    let tagged = timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("child says hi"))
+                })
+            {
+                return entity.clone();
+            }
+        }
+    })
+    .await
+    .expect("child→parent delivered row reached the chat channel");
+    assert_eq!(
+        tagged["role"], "user",
+        "delivered row is a user row: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["type"],
+        json!("agent_message"),
+        "delta entity lifts the persisted sender-attribution metadata: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["fromAgentId"],
+        json!(child_id),
+        "attribution names the child sender: {tagged}"
+    );
+    assert_eq!(
+        tagged["metadata"]["fromAgentName"],
+        json!("ChildC"),
+        "attribution carries the sender name: {tagged}"
+    );
+
+    // Lean-shape control: a human send's delta entity carries NO metadata.
+    let human = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &parent_id, "content": "human hello" }),
+    )
+    .await;
+    assert_eq!(human["success"], true, "human sendMessage ok: {human}");
+    let lean = timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("human hello"))
+                })
+            {
+                return entity.clone();
+            }
+        }
+    })
+    .await
+    .expect("human row reached the chat channel");
+    assert!(
+        lean.get("metadata").is_none(),
+        "a metadata-free row keeps the lean entity shape: {lean}"
+    );
+
+    // Contrast: a parentless BYSTANDER running the identical send DOES get
+    // the SUB-1 sender watch — and is later woken by the parent's completion.
+    let bystander = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "Bystander", "model": "mock:default" }),
+    )
+    .await;
+    let bystander_id = bystander["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_PARENT now" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "bystander kickoff ok: {sent}");
+    for _ in 0..200 {
+        if done.contains(&bystander_id) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(
+        done.contains(&bystander_id),
+        "bystander turn completed: {done:?}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
+    )
+    .await;
+    let result = send_tool_result(&conv, &parent_id);
+    assert!(
+        result["subscriptionId"].is_string(),
+        "a non-child sender still gets the SUB-1 watch: {result}"
+    );
+
+    // The parent's post-send idle fires the bystander's oneShot watch — the
+    // wake lands in the bystander transcript. The CHILD, whose watch was
+    // suppressed, has no wake despite the parent idling multiple times since
+    // its earlier send.
+    let mut woken = false;
+    for attempt in 0..120i64 {
+        let conv = wss_rpc(
+            &mut rpc,
+            100 + attempt,
+            "agent.getConversation",
+            json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
+        )
+        .await;
+        let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
+        if text.contains("[WORKSPACE EVENTS]") {
+            woken = true;
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert!(woken, "bystander received the parent-completion wake");
+    let conv = wss_rpc(
+        &mut rpc,
+        300,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &child_id }),
+    )
+    .await;
+    let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
+    assert!(
+        !text.contains("[WORKSPACE EVENTS]"),
+        "the child must NOT be woken by its own parent's completion: {text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // agent.editAndRegenerate (PROTOCOL §5.5 extension)
 // ---------------------------------------------------------------------------
@@ -8567,7 +9577,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
 
@@ -8651,7 +9661,7 @@ async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
         match event["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
@@ -8946,7 +9956,7 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     timeout(Duration::from_secs(30), async {
         loop {
             let frame = wss_event(&mut sub, 30).await;
-            if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+            if frame["params"]["event"]["type"] == "agent:stream:activity" {
                 return;
             }
         }
@@ -10055,11 +11065,27 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         row["contentBlocks"][0]["text"], user_entity["block"]["text"],
         "delta block text matches the persisted row"
     );
+    // monorepo#1114: the snapshot path stamps the same synthetic id at serve
+    // time, so `agent.getConversation` and the delta agree byte-for-byte on
+    // block identity.
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "serve-time stamped snapshot id matches the delta's block id"
+    );
+    // monorepo#1157 omission side: this send carried no userAppMessageId, so
+    // the delta entity must omit `appMessageId` entirely (no null).
+    assert!(
+        user_entity.get("appMessageId").is_none(),
+        "rows without a client id omit appMessageId: {user_entity}"
+    );
 }
 
 /// Direct-send path: a plain `agent.sendMessage` from connection A (idle
 /// agent) surfaces as a user-row delta on connection B's `chat.subscribe`
-/// BEFORE any assistant chunk of the triggered turn.
+/// BEFORE any assistant chunk of the triggered turn. The send carries a
+/// client-minted `userAppMessageId`, so the delta entity must lift it as
+/// `appMessageId` (monorepo#1157) and the served conversation row must carry
+/// the same serve-time stamped block id as the delta (monorepo#1114).
 #[tokio::test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
@@ -10121,7 +11147,12 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from A" }),
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "hello from A",
+            "userAppMessageId": "app-msg-delta-e2e",
+        }),
     )
     .await;
     assert_eq!(sent["queued"], false, "idle agent streams: {sent}");
@@ -10155,5 +11186,44 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         user_entity["block"]["id"],
         json!(format!("{sent_row_id}:0")),
         "stable synthetic block id: {user_entity}"
+    );
+    // monorepo#1157: the delta entity lifts the client-minted id so the FE
+    // can dedup its optimistic row on the delta path — no refetch needed.
+    assert_eq!(
+        user_entity["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "delta entity carries the send's appMessageId: {user_entity}"
+    );
+
+    // monorepo#1114: the served conversation row carries the same serve-time
+    // stamped `{messageId}:{index}` block id the delta emitted, so snapshot
+    // and delta agree byte-for-byte on block identity.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&sent_row_id))
+        .expect("sent user row persisted")
+        .clone();
+    assert_eq!(
+        row["contentBlocks"][0]["id"],
+        json!(format!("{sent_row_id}:0")),
+        "agent.getConversation serves the stamped synthetic block id: {row}"
+    );
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "snapshot block id matches the delta's block id"
+    );
+    assert_eq!(
+        row["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "persisted row surfaces the appMessageId on reads: {row}"
     );
 }

@@ -4,14 +4,15 @@
 //! the Rust dispatch here routes to the shared [`WorkspaceApi`]. Caller
 //! attribution (parent auto-subscribe on `create`, SUB-1 sender watch on
 //! `send`/`sendToTask`, depth guard on `create`/`wakeOrCreate`, and the
-//! `-32603` gate on `reportToParent`) is threaded through the
-//! `caller_agent_id` argument that WSAPI-2 already carries on the MCP seam.
+//! `-32603` gate on `reportToParent`/`requestDiscussion`/`reportBlocker`) is
+//! threaded through the `caller_agent_id` argument that WSAPI-2 already
+//! carries on the MCP seam.
 
 use std::sync::Arc;
 
 use intent_core::{
-    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, NoteId,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin,
+    NoteId, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -48,6 +49,10 @@ pub(crate) const PRELUDE: &str = r#"
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
+        requestDiscussion: (reason) =>
+            host({ method: 'agent.requestDiscussion', args: { reason } }),
+        reportBlocker: (reason) =>
+            host({ method: 'agent.reportBlocker', args: { reason } }),
     };
 "#;
 
@@ -72,6 +77,8 @@ pub(crate) async fn dispatch(
         "readConversation" => read_conversation(api, ws, args).await,
         "summary" => summary(api, ws, args).await,
         "reportToParent" => report_to_parent(api, ws, caller, args).await,
+        "requestDiscussion" => request_attention(api, ws, caller, "discussion", args).await,
+        "reportBlocker" => request_attention(api, ws, caller, "blocker", args).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }
 }
@@ -145,8 +152,17 @@ async fn create(
         .unwrap_or_default()
         .to_string();
     if let Some(tn) = task_note_id {
+        // `ws.agent.create` with a taskNoteId is an explicit "create and
+        // assign in one step" — keep the assignment best-effort and
+        // unguarded (`force`) as before; the occupancy guard applies to
+        // `agent.delegate` / `task.assignAgent`.
         let _ = api
-            .assign_agent(ws.clone(), NoteId::from_string(tn), agent_id.clone())
+            .assign_agent(
+                ws.clone(),
+                NoteId::from_string(tn),
+                agent_id.clone(),
+                Some(true),
+            )
             .await;
     }
     let child = AgentId::from(agent_id.as_str());
@@ -191,6 +207,7 @@ async fn create(
             None,
             None,
             kickoff_metadata,
+            MessageOrigin::Automatic,
         )
         .await
     {
@@ -222,6 +239,7 @@ async fn delegate(
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
+        force: opt_bool(args, "force"),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())
@@ -252,6 +270,7 @@ async fn send(
             None,
             None,
             sender_metadata(api, ws, caller, args).await,
+            MessageOrigin::Automatic,
         )
         .await
         .map_err(map_err)?;
@@ -467,6 +486,24 @@ async fn report_to_parent(
         .ok_or_else(|| "report is required".to_string())?;
     let v = api
         .agent_report_to_parent(ws.clone(), report, caller.cloned())
+        .await
+        .map_err(map_err)?;
+    Ok(merge_ok(v))
+}
+
+/// Shared handler behind `ws.agent.requestDiscussion` (`kind = "discussion"`)
+/// and `ws.agent.reportBlocker` (`kind = "blocker"`). Available to ALL agents
+/// (delegated or not, with or without a linked task); `reason` is required.
+async fn request_attention(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    kind: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let reason = req_str(args, "reason").map_err(|_| "reason is required".to_string())?;
+    let v = api
+        .agent_request_attention(ws.clone(), kind.to_string(), reason, caller.cloned())
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))

@@ -366,7 +366,7 @@ pub async fn start_stream(
 
 /// Spawn a per-pipe reader that chunks bytes into base64 and broadcasts them as
 /// `event_type` frames until the pipe closes. Chunks are transient
-/// (broadcast-only, never persisted — same path as `agent:stream:chunk`):
+/// (broadcast-only, never persisted — same path as `chat:stream:delta`):
 /// streamed output is consumed live by the correlated subscriber and has no
 /// event-table readback, so a chatty child must not serialize behind a durable
 /// SQLite commit per chunk. The terminal `host:exec:exit` stays durable but is
