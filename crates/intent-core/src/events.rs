@@ -45,21 +45,46 @@ pub const AGENT_SUBSCRIPTIONS_CHANGED: &str = "agent:subscriptions-changed";
 pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 
 // Agent streaming events (for the WebSocket API). All share the
-// `agent:stream:` prefix — the high-volume chunk family the §10.2
+// `agent:stream:` prefix — the high-volume stream family the §10.2
 // retention/compaction sweep is allowed to trim.
 pub const AGENT_STREAM_PREFIX: &str = "agent:stream:";
 pub const AGENT_STREAM_START: &str = "agent:stream:start";
-pub const AGENT_STREAM_CHUNK: &str = "agent:stream:chunk";
+// Per-agent activity signal (renamed from `agent:stream:chunk`): broadcast
+// while a turn streams so clients can tick busy/stall state and update
+// watched-agent preview rows without receiving the transcript firehose.
+// Payload is `{ agentId, messageId }` plus the server-derived live preview
+// (`lastAgentResponse` / `digest`, each omitted until derivable from the
+// streamed-so-far text); leading-edge throttled per agent (first activity of
+// a turn emits immediately, then at most one per second). Full transcript
+// content flows on the internal chat channel (`CHAT_STREAM_DELTA`) instead.
+pub const AGENT_STREAM_ACTIVITY: &str = "agent:stream:activity";
+// Terminal stream frame. The transcript-bearing terminal paths — normal
+// prompt-turn completion, harness-wake finalize, and the user-interrupt
+// flush — also carry the final `lastAgentResponse` / `digest` preview values
+// (same optional fields as the activity signal, derived from the turn's full
+// text) so a client tracking the live preview lands on the turn's true final
+// state; the last throttled activity may have missed the response tail. The
+// pre-output terminal-failure emit has no transcript, so it carries neither.
 pub const AGENT_STREAM_END: &str = "agent:stream:end";
 // Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
 // §7). Emitted while an agent turn is starting so the chat spinner can show
 // the current phase (`launch` / `init` / `session-create` / `session-load` /
-// `prompt`) before the first `agent:stream:chunk` arrives; cleared by the FE
-// on the first chunk / `agent:stream:end` / `agent:failed`. Self-sufficient
-// payload `{ agentId, workspaceId, phase, message, level, timestamp }` so a
-// thin client renders the hint directly without a follow-up fetch. Mirrors
-// the TS reference `acp-provider.ts` `emitStatus()` call sites.
+// `prompt`) before the first `agent:stream:activity` arrives; cleared by the
+// FE on the first activity / `agent:stream:end` / `agent:failed`.
+// Self-sufficient payload `{ agentId, workspaceId, phase, message, level,
+// timestamp }` so a thin client renders the hint directly without a
+// follow-up fetch. Mirrors the TS reference `acp-provider.ts` `emitStatus()`
+// call sites.
 pub const AGENT_STREAM_STATUS: &str = "agent:stream:status";
+
+// Internal chat-channel content delta (PROTOCOL §7.1). Carries the full
+// incremental transcript payload (`content` + block identity) that the
+// per-agent `chat.subscribe` forwarder accumulates into block deltas.
+// Deliberately OUTSIDE the `agent:*` family so `agent:*` (and bare-`*`)
+// `events.subscribe` filters never receive the high-volume content firehose —
+// external subscribers get the throttled `AGENT_STREAM_ACTIVITY` signal
+// instead. Transient / broadcast-only, like the activity event.
+pub const CHAT_STREAM_DELTA: &str = "chat:stream:delta";
 
 // Agent queue events (for the WebSocket API).
 pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
@@ -99,9 +124,12 @@ pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 // Agent attention request (new in intentd). Emitted by
 // `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` when an agent
 // explicitly raises attention before ending its turn. Self-sufficient payload
-// `{ workspaceId, agentId, agentName, kind, reason }` (`kind`:
+// `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }` (`kind`:
 // `"discussion" | "blocker"`) drives the FE sticky "Switch To" toast without
-// a follow-up fetch.
+// a follow-up fetch. `parentAgentId` is present only when the caller is a
+// delegated child — omitted entirely (never `null`) for parentless agents;
+// `agent:failed` carries the same optional field (enriched centrally in
+// `publish_agent_event`).
 pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
 
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
@@ -343,9 +371,10 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_SUBSCRIPTIONS_CHANGED,
     AGENT_MESSAGE_DELIVERY_FAILED,
     AGENT_STREAM_START,
-    AGENT_STREAM_CHUNK,
+    AGENT_STREAM_ACTIVITY,
     AGENT_STREAM_END,
     AGENT_STREAM_STATUS,
+    CHAT_STREAM_DELTA,
     AGENT_QUEUE_UPDATED,
     AGENT_QUEUE_PROCESSING,
     AGENT_QUEUE_PROCESSING_CANCELLED,

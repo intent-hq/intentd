@@ -457,7 +457,7 @@ async fn poisoned_session_retry_recreates_instead_of_resuming_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -648,7 +648,7 @@ async fn poisoned_session_retry_recreates_instead_of_resuming_over_wss() {
             Some("agent:failed") => {
                 panic!("agent:failed AGAIN after the recreate retry (resume loop — the #940 regression): {frame}")
             }
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()

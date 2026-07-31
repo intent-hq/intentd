@@ -285,15 +285,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         ))
         .await
         .unwrap();
-    store
-        .insert_agent_session(&mk_agent(
-            "agent-2",
-            "Verifier",
-            None,
-            "2026-01-01T00:00:02Z",
-        ))
-        .await
-        .unwrap();
+    // agent-2 is delegated by agent-1: `agentSummary` surfaces the session's
+    // delegation parent as `parentAgentId` (v2.9, additive).
+    let mut delegated = mk_agent("agent-2", "Verifier", None, "2026-01-01T00:00:02Z");
+    delegated.parent_agent_id = Some(AgentId::from("agent-1"));
+    store.insert_agent_session(&delegated).await.unwrap();
 
     // Hermetic root: the get/list enrichment probes the workspaces root for
     // `cowSupported`, and tests must never touch `~/intent/workspaces`.
@@ -311,7 +307,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(summary.agents.iter().any(|a| a.name == "Builder"
         && a.specialist.as_deref() == Some("implementor")
         && !a.is_streaming
-        && !a.is_responding));
+        && !a.is_responding
+        && a.parent_agent_id.is_none()));
+    // The delegated agent carries its parent's id (root agents omit it).
+    assert!(summary.agents.iter().any(|a| a.name == "Verifier"
+        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")));
     // `agentIds` mirrors the agents used to build `agents` (forward-compat).
     let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
     let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
@@ -328,6 +328,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["taskStats"]["inProgress"], 2);
     assert_eq!(v["agentSummary"]["count"], 2);
     assert_eq!(v["agentSummary"]["agents"][0]["id"], "agent-1");
+    // `parentAgentId` wire shape: omitted (not null) on roots, camelCased when set.
+    assert!(v["agentSummary"]["agents"][0]
+        .get("parentAgentId")
+        .is_none());
+    assert_eq!(v["agentSummary"]["agents"][1]["parentAgentId"], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
@@ -482,7 +487,8 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
-    assert_eq!(row.display_status, Some(WorkspaceDisplayStatus::InProgress));
+    // No agent is running, so the task-stage rollup demotes to idle.
+    assert_eq!(row.display_status, Some(WorkspaceDisplayStatus::Idle));
     assert!(row.cow_supported.is_some(), "cowSupported populated");
     assert!(row.agent_summary.is_none(), "agentSummary omitted");
     assert!(row.diff_summary.is_none(), "diffSummary omitted");
@@ -494,7 +500,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
 
     // Wire shape: cheap aggregates present, heavy aggregates absent.
     let v = serde_json::to_value(row).unwrap();
-    assert_eq!(v["displayStatus"], "in_progress");
+    assert_eq!(v["displayStatus"], "idle");
     assert_eq!(v["taskStats"]["total"], 3);
     assert!(v["cowSupported"].is_boolean());
     assert!(v.get("agentSummary").is_none());
@@ -1409,13 +1415,13 @@ async fn assign_agent_validates_and_starts_task() {
         .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
-        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into())
+        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
         .await
         .is_err());
     // Valid agent id → assigned and status flips to in_progress.
     let agent = "agent-b0a8044a-5eac-4b52-8456-15d3b784decb";
     let r = svc
-        .assign_agent(ws.clone(), id.clone(), agent.into())
+        .assign_agent(ws.clone(), id.clone(), agent.into(), None)
         .await
         .expect("assignAgent");
     assert_eq!(r.agent_id.0, agent);
@@ -9727,6 +9733,130 @@ mod file_tracking {
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
     }
 
+    /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Regression (single-flight coalescing): two concurrent identical
+    /// full-tree `git.diffs` calls run the underlying walk once and both get
+    /// the result. The probe parks the leader's walk on the blocking pool
+    /// until the second call has provably joined as a follower, so the
+    /// overlap is deterministic.
+    #[tokio::test]
+    async fn git_diffs_concurrent_identical_calls_coalesce_into_one_walk() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        // The leader is inside the walk (flight registered, probe parked).
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        // The identical call joined the in-flight walk as a follower.
+        let key = (ws_id.clone(), None, false, None);
+        wait_until("second call to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert!(
+            a.as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["path"] == "seed.txt"),
+            "shared result carries the real diff"
+        );
+    }
+
+    /// Concurrent `git.diffs` calls with different identities (here: `staged`)
+    /// never coalesce — each runs its own walk.
+    #[tokio::test]
+    async fn git_diffs_concurrent_distinct_calls_run_their_own_walks() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let unstaged = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
+        let staged = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, true, None).await }
+        });
+        // The non-identical request must start its own walk while the first
+        // is still parked.
+        wait_until("second independent walk", || {
+            walks.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        unstaged.await.unwrap().unwrap();
+        staged.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 2, "no coalescing across keys");
+    }
+
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
     #[tokio::test]
@@ -10151,6 +10281,213 @@ mod file_tracking {
         assert_eq!(arr.len(), 1, "only the literal path matches: {arr:?}");
         assert_eq!(arr[0]["path"], "a[1].txt");
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
+    /// Defense-in-depth: an absolute `paths` entry under the worktree root is
+    /// normalized to its worktree-relative form, so it narrows exactly like
+    /// the relative request (unstaged and staged) and the wire result keeps
+    /// worktree-relative `path` values.
+    #[tokio::test]
+    async fn git_diffs_absolute_paths_under_worktree_narrow_like_relative() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let relative = svc
+            .git_diffs(ws_id.clone(), Some(vec!["b.txt".to_string()]), false, None)
+            .await
+            .unwrap();
+        let abs = repo.dir.join("b.txt").to_string_lossy().into_owned();
+        let absolute = svc
+            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None)
+            .await
+            .unwrap();
+        assert_eq!(absolute, relative, "absolute form narrows like relative");
+        let arr = absolute.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "b.txt", "result path stays relative");
+
+        // Staged walk applies the same normalization.
+        let relative = svc
+            .git_diffs(
+                ws_id.clone(),
+                Some(vec!["seed.txt".to_string()]),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
+        let absolute = svc
+            .git_diffs(ws_id, Some(vec![abs]), true, None)
+            .await
+            .unwrap();
+        assert_eq!(absolute, relative);
+        assert_eq!(absolute.as_array().unwrap()[0]["path"], "seed.txt");
+    }
+
+    /// An absolute `paths` entry outside the worktree root passes through
+    /// verbatim and matches nothing, exactly as before the normalization.
+    #[tokio::test]
+    async fn git_diffs_absolute_path_outside_worktree_matches_nothing() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(
+                ws_id,
+                Some(vec!["/no/such/root/b.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(diffs, serde_json::json!([]));
+    }
+
+    /// Normalization happens BEFORE the single-flight key is computed:
+    /// concurrent `git.diffs` calls naming the same file in relative and
+    /// absolute form coalesce onto one walk.
+    #[tokio::test]
+    async fn git_diffs_absolute_and_relative_requests_coalesce() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None)
+                    .await
+            }
+        });
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, Some(vec![abs]), false, None).await }
+        });
+        // The absolute request normalized onto the relative request's key and
+        // joined the in-flight walk as a follower.
+        let key = (
+            ws_id.clone(),
+            Some(vec!["seed.txt".to_string()]),
+            false,
+            None,
+        );
+        wait_until("absolute request to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
+    }
+
+    /// The single-flight identity is order-insensitive and duplicate-free:
+    /// concurrent `git.diffs` calls naming the same path set in a different
+    /// order (one with a duplicate entry) coalesce onto one walk.
+    #[tokio::test]
+    async fn git_diffs_reordered_and_duplicated_paths_coalesce() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec![
+                        "other.txt".to_string(),
+                        "seed.txt".to_string(),
+                        "seed.txt".to_string(),
+                    ]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        // The reordered/duplicated request sorted+deduped onto the same key
+        // and joined the in-flight walk as a follower.
+        let key = (
+            ws_id.clone(),
+            Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
+            false,
+            None,
+        );
+        wait_until("reordered request to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
     }
 
     /// Regression (monorepo#1061): `diffs::compute_and_store` (single
@@ -18480,7 +18817,9 @@ mod last_activity_events {
 
     /// Regression for STAB-N: busy→idle transition debounce (test b). An
     /// `agent_activity_end` with no re-begin MUST emit exactly one
-    /// `workspace:activity-changed { idle }` event after the debounce window.
+    /// `workspace:activity-changed { idle }` event after the debounce window
+    /// (accompanied by exactly one `workspace:displayStatus-changed { idle }`
+    /// — the derived-status demotion rides the same debounced flip).
     #[tokio::test]
     async fn idle_debounce_emits_after_window() {
         let _guard = DebounceEnvGuard::new("100");
@@ -18505,13 +18844,41 @@ mod last_activity_events {
             "no idle event before debounce window expires"
         );
 
-        // After the window expires, exactly one idle event.
+        // After the window expires, the flip lands: exactly one idle
+        // activity event plus exactly one displayStatus demotion to idle
+        // (batching/order agnostic).
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let ev_idle = recv_one(&mut sub).await;
-        assert_envelope(&ev_idle, &h.ws.0, "workspace:activity-changed");
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            let batch = timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("debounced events delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                events.push(serde_json::to_value(ev).expect("serialize event"));
+            }
+        }
+        assert_eq!(events.len(), 2, "exactly two debounced events: {events:?}");
+        for ev in &events {
+            assert_eq!(ev["workspaceId"], h.ws.0);
+        }
         assert_eq!(
-            ev_idle["data"]["activity"], "idle",
-            "idle event emitted after debounce window"
+            events
+                .iter()
+                .filter(|ev| ev["type"] == "workspace:activity-changed"
+                    && ev["data"]["activity"] == "idle")
+                .count(),
+            1,
+            "one idle activity event after debounce window: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev["type"] == "workspace:displayStatus-changed"
+                    && ev["data"]["displayStatus"] == "idle")
+                .count(),
+            1,
+            "one displayStatus idle demotion after debounce window: {events:?}"
         );
 
         // workspace_activity() now reports Idle.
@@ -19293,33 +19660,80 @@ mod display_status {
     }
 
     #[test]
-    fn no_prs_no_tasks_is_not_started() {
+    fn no_prs_no_tasks_is_idle() {
         assert_eq!(
-            compute_display_status(None, &[], None),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, None),
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(0, 0, 0))),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, Some(&stats(0, 0, 0))),
+            WorkspaceDisplayStatus::Idle
         );
     }
 
     #[test]
-    fn no_prs_uses_pure_task_logic() {
+    fn no_prs_task_stage_demotes_to_idle_without_agent() {
+        // The base rollup is in_progress / not_started, but without a
+        // running agent the task-stage statuses demote to idle.
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 0))),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 0))),
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 1))),
+            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 1))),
+            WorkspaceDisplayStatus::Idle
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(3, 1, 0))),
+            WorkspaceDisplayStatus::Idle
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+    }
+
+    #[test]
+    fn running_agent_promotes_to_in_progress_unconditionally() {
+        // A live agent wins over every PR/task rollup.
+        assert_eq!(
+            compute_display_status(true, None, &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 1, 0))),
+            compute_display_status(true, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::InProgress
         );
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 3, 0))),
+            compute_display_status(true, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(true, Some(&merged), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn pr_stages_and_complete_pass_through_without_agent() {
+        // The idle demotion only applies to the task-stage rollups; PR
+        // stages and complete are untouched.
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(false, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::PrReady
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(false, Some(&merged), &[], None, None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19329,7 +19743,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&open), &[], Some(&stats(2, 0, 1))),
+            compute_display_status(false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19338,42 +19752,48 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&open), &[], None),
+            compute_display_status(false, Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&draft), &[], None),
+            compute_display_status(false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(Some(&flagged), &[], None),
+            compute_display_status(false, Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
 
     #[test]
     fn merged_pr_never_masks_open_tasks() {
+        // Open tasks keep the rollup off pr_merged; without a running agent
+        // the resulting task-stage status reads as idle.
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
             compute_display_status(
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 1, 1))
             ),
-            WorkspaceDisplayStatus::InProgress
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
             compute_display_status(
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 0, 0))
             ),
-            WorkspaceDisplayStatus::NotStarted
+            WorkspaceDisplayStatus::Idle
         );
     }
 
@@ -19383,14 +19803,14 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19402,7 +19822,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(false, None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19411,11 +19831,11 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&merged), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(Some(&merged), &[], None),
+            compute_display_status(false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19426,7 +19846,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(false, None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19435,12 +19855,115 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&closed), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&closed), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(Some(&closed), &[], None),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, Some(&closed), &[], None, None),
+            WorkspaceDisplayStatus::Idle
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
+        assert_eq!(
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Open), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Draft), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_wins_over_open_tasks() {
+        // The pr_status fallback is a step-1 PR-stage signal: it precedes the
+        // open-tasks check, so in-progress or not-started tasks never mask it.
+        assert_eq!(
+            compute_display_status(
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_participates_in_merged_check() {
+        assert_eq!(
+            compute_display_status(
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_never_masks_open_tasks() {
+        // Open tasks keep the rollup off pr_merged; without a running agent
+        // the task-stage status reads as idle.
+        assert_eq!(
+            compute_display_status(
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::Idle
+        );
+    }
+
+    #[test]
+    fn pr_info_objects_take_precedence_over_pr_status() {
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(
+                false,
+                Some(&ready),
+                &[],
+                Some(PullRequestStatus::Merged),
+                None
+            ),
+            WorkspaceDisplayStatus::PrReady
+        );
+        let list = vec![ready];
+        assert_eq!(
+            compute_display_status(false, None, &list, Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrReady
         );
     }
 }
@@ -19460,7 +19983,7 @@ mod display_status_events {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{workspace, TempDb};
+    use super::{workspace, DebounceEnvGuard, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
@@ -19663,15 +20186,15 @@ mod display_status_events {
         );
     }
 
-    /// Deleting an open spec-child task note that moves the derived rollup
-    /// (in_progress → not_started once the last open task is gone) emits the
+    /// Deleting a spec-child task note that moves the derived rollup
+    /// (complete → idle once the only completed task is gone) emits the
     /// transition event: `note.delete` goes through the same
     /// recompute+maybe-emit hook as the task-status mutations.
     #[tokio::test]
     async fn task_note_delete_transition_emits() {
         let h = harness().await;
         h.store
-            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
             .await
             .expect("insert task");
         // Seed the last-observed cache (first observation never emits).
@@ -19686,7 +20209,47 @@ mod display_status_events {
         assert_eq!(ev["type"], "workspace:displayStatus-changed");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "not_started" })
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Agent activity folds into the derivation: `agent_activity_begin`
+    /// promotes the rollup to `in_progress` and emits the transition
+    /// immediately; the debounced idle flip after `agent_activity_end`
+    /// demotes it back to `idle` and emits again — in lockstep with the
+    /// `workspace:activity-changed` debounce (no early idle emission).
+    #[tokio::test]
+    async fn agent_activity_transitions_emit() {
+        let _guard = DebounceEnvGuard::new("500");
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache: no agent running → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+
+        // End the run: during the grace window the status stays in_progress
+        // (workspace_activity still reports AgentRunning) — no event yet
+        // (assert_silent's 300ms watch sits inside the 500ms window).
+        h.services.agent_activity_end(&h.ws).await;
+        assert_silent(&mut sub).await;
+
+        // After the debounce window the demotion to idle emits.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
     }
 

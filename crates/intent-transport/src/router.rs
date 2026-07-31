@@ -719,8 +719,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let agent_id = require_str_param(params, "agentId")?;
+            let force = opt_bool(params, "force");
             let result = api
-                .assign_agent(ws, note_id, agent_id)
+                .assign_agent(ws, note_id, agent_id, force)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1288,6 +1289,23 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "stats.getRateHistory" => {
+            // Global per-minute token-rate history behind the HUD TOK/MIN
+            // chart (§5.39); no workspaceId. `limit` (default 60, max 1440)
+            // is the number of trailing minute samples returned.
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_i64()
+                        .ok_or_else(|| rpc(INVALID_PARAMS, "limit must be an integer"))?,
+                ),
+            };
+            let result = api
+                .stats_get_rate_history(limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.enhancePrompt" => {
             // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
             let prompt = require_str_param(params, "prompt")?;
@@ -1464,8 +1482,22 @@ async fn dispatch(
         "agent.cancelSubscriptions" => {
             let ws = require_ws_note(params)?;
             let agent_id = require_agent_id(params)?;
+            // Optional scoping (additive): cancel one watch and/or one
+            // delegation group instead of everything. A present-but-non-string
+            // id is rejected — falling back to `None` would silently turn a
+            // malformed scoped request into an unscoped cancel-everything.
+            let subscription_id = match params.get("subscriptionId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "subscriptionId must be a string")),
+            };
+            let group_id = match params.get("groupId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(rpc(INVALID_PARAMS, "groupId must be a string")),
+            };
             let result = api
-                .agent_cancel_subscriptions(ws, agent_id)
+                .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

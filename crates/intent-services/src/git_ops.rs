@@ -59,6 +59,25 @@ pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Normalize `git.diffs` `paths` entries against the worktree root
+/// (defense-in-depth, mirroring `git.showFile`'s absolute→relative
+/// conversion): an entry under `<worktree>/` is stripped to its
+/// worktree-relative form; every other entry — already relative, equal to
+/// the root, or outside it — passes through verbatim (an absolute path
+/// outside the worktree matches nothing, exactly as before). Callers must
+/// normalize BEFORE computing the single-flight key so equivalent
+/// absolute/relative requests coalesce onto one walk.
+pub(crate) fn normalize_diff_paths(worktree: &Path, paths: Vec<String>) -> Vec<String> {
+    let prefix = format!("{}/", worktree.to_string_lossy());
+    paths
+        .into_iter()
+        .map(|p| match p.strip_prefix(&prefix) {
+            Some(rel) => rel.to_string(),
+            None => p,
+        })
+        .collect()
+}
+
 /// Parse the `git.stage` `paths` param and enforce the stage-all rejection,
 /// mirroring the TS builder exactly. Rejections and an empty result surface as
 /// [`Error::Internal`] (→ `-32603`).
@@ -539,6 +558,37 @@ fn line_to_value(l: &intent_git::diff::DiffLine) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalize_diff_paths_strips_absolute_entries_under_the_worktree() {
+        let worktree = Path::new("/ws/root");
+        let normalized = normalize_diff_paths(
+            worktree,
+            vec![
+                "/ws/root/src/a.rs".to_string(),
+                "/ws/root/deep/nested/b.txt".to_string(),
+            ],
+        );
+        assert_eq!(
+            normalized,
+            vec!["src/a.rs".to_string(), "deep/nested/b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_diff_paths_passes_other_entries_verbatim() {
+        let worktree = Path::new("/ws/root");
+        // Relative entries, the root itself, a sibling that shares the root's
+        // string prefix without the directory boundary, and paths outside the
+        // root all pass through unchanged.
+        let entries = vec![
+            "src/a.rs".to_string(),
+            "/ws/root".to_string(),
+            "/ws/rootbeer/c.txt".to_string(),
+            "/elsewhere/d.txt".to_string(),
+        ];
+        assert_eq!(normalize_diff_paths(worktree, entries.clone()), entries);
+    }
 
     #[test]
     fn rejects_stage_all_forms() {

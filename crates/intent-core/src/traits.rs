@@ -1006,13 +1006,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.assignAgent`: append an agent to a task's assignee list (§5.4).
+    /// Assigning a NEW agent to a task that already has a live assigned agent
+    /// is rejected unless `force` is `Some(true)`; re-assigning an
+    /// already-assigned id stays idempotent-ok.
     fn assign_agent(
         &self,
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
-        let _ = (workspace_id, note_id, agent_id);
+        let _ = (workspace_id, note_id, agent_id, force);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::assign_agent not implemented".to_string(),
@@ -1613,6 +1617,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `stats.getRateHistory`: the global per-minute token-rate history
+    /// behind the HUD TOK/MIN chart, read from the capped
+    /// `usage_rate_minutely` store; no `workspaceId`. Returns the trailing
+    /// `limit` minute samples (default 60, max 1440) ending at the current
+    /// UTC minute, zero-filled and in chronological order.
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::stats_get_rate_history not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
@@ -1960,14 +1981,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
+    /// `agent.cancelSubscriptions`: cancel an agent's subscriptions —
+    /// everything when unscoped, or just the named completion watch
+    /// (`subscription_id`) / delegation group (`group_id`) when scoped;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
+        subscription_id: Option<String>,
+        group_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id);
+        let _ = (workspace_id, agent_id, subscription_id, group_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_cancel_subscriptions not implemented".to_string(),

@@ -21,6 +21,8 @@
 //!   migrated onto the replacement agent (id + content preserved) and the
 //!   poisoned session is hard-deleted (`agent:deleted`, `agent.getSession`
 //!   → `-32602`).
+//! - Occupancy guard: second `agent.delegate` / new-id `task.assignAgent` on
+//!   a task with a live assigned agent → `-32602` unless `force: true`.
 
 #![cfg(unix)]
 
@@ -656,6 +658,87 @@ This note is your workspace for this task. Update it with your progress, finding
     );
 }
 
+/// monorepo#1150: `agent.diagnostics` with a `taskNoteId` filter matches the
+/// agents actually associated with the task (here the delegated assignee)
+/// instead of returning an all-zero snapshot, over the real WSS wire. An
+/// unrelated agent stays out of scope, and a nonexistent note id yields an
+/// empty (not erroring) snapshot. Hermetic — no ACP provider is spawned.
+#[tokio::test]
+async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
+    let (_daemon, ws_id, task_note_id, port, fp) =
+        boot_daemon_with_task("Diagnostics filter task").await;
+    let cfg = client_config(&fp);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let delegated = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "do the delegated body",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(delegated["ok"], true, "delegate ok: {delegated}");
+    let child_id = delegated["agentId"]
+        .as_str()
+        .expect("child agent id")
+        .to_string();
+
+    // An unrelated agent that the filter must exclude.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Unrelated" }),
+    )
+    .await;
+    let unrelated_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let diag = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id, "taskNoteId": task_note_id }),
+    )
+    .await;
+    let d = &diag["diagnostics"];
+    assert_eq!(d["filters"]["taskNoteId"], json!(task_note_id));
+    assert!(
+        d["summary"]["agents"].as_u64().expect("agents count") >= 1,
+        "task filter must match the delegated agent: {d}"
+    );
+    let agents = d["agents"].as_array().expect("agents array");
+    assert!(
+        agents.iter().any(|r| r["id"] == json!(child_id)),
+        "delegated agent row present: {d}"
+    );
+    assert!(
+        !agents.iter().any(|r| r["id"] == json!(unrelated_id)),
+        "unrelated agent filtered out: {d}"
+    );
+
+    // Nonexistent note id: empty snapshot, not an error.
+    let empty = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id, "taskNoteId": "note-does-not-exist" }),
+    )
+    .await;
+    assert_eq!(
+        empty["diagnostics"]["summary"]["agents"],
+        json!(0),
+        "unknown note id yields an empty snapshot: {empty}"
+    );
+}
+
 /// TASK-C2: `agent.delegate` with `taskNoteId` + `skipAutoCommit=true` appends
 /// the reference `**Auto-commit is OFF.**` instruction after the scope
 /// directive, byte-for-byte, over the real WSS wire.
@@ -710,6 +793,134 @@ This note is your workspace for this task. Update it with your progress, finding
         initial, expected,
         "child first message must be byte-exact when skipAutoCommit=true: {initial:?}"
     );
+}
+
+/// Occupancy guard over the wire: a task note with a live assigned agent
+/// rejects a second `agent.delegate` / a new-id `task.assignAgent` with a
+/// JSON-RPC `-32602` envelope (PROTOCOL §9) naming the existing agent, and
+/// `force: true` deliberately overrides on both methods. Same-id re-assign
+/// stays idempotent-ok. Hermetic — no ACP provider is spawned; the guard
+/// fires before any turn starts.
+#[tokio::test]
+async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
+    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("Occupied Task").await;
+    let cfg = client_config(&fp);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // (1) First delegate on the unoccupied task succeeds without `force`.
+    let first = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "start the work",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(first["ok"], true, "first delegate ok: {first}");
+    let first_id = first["agentId"].as_str().expect("agentId").to_string();
+
+    // (2) Second delegate without `force` → `-32602` error envelope naming
+    //     the occupant and pointing at the override / reach-existing paths.
+    let err_env = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "double delegate",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(err_env["jsonrpc"], "2.0");
+    assert_eq!(err_env["id"], 2);
+    assert!(err_env.get("result").is_none(), "must be error envelope");
+    assert_eq!(err_env["error"]["code"], -32602);
+    let msg = err_env["error"]["message"].as_str().expect("message");
+    assert!(msg.contains(&first_id), "error names the occupant: {msg}");
+    assert!(
+        msg.contains("already being worked"),
+        "error states occupancy: {msg}"
+    );
+    assert!(
+        msg.contains("force: true"),
+        "error mentions override: {msg}"
+    );
+
+    // (3) Second delegate WITH `force: true` succeeds and adds a second agent.
+    let forced = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "agentInstructions": "intentional second agent",
+            "model": "mock:default",
+            "force": true,
+        }),
+    )
+    .await;
+    assert_eq!(forced["ok"], true, "forced delegate ok: {forced}");
+    assert_ne!(forced["agentId"].as_str().unwrap(), first_id);
+
+    // (4) `task.assignAgent` of a NEW agent to the occupied task → same
+    //     `-32602` guard without `force`.
+    let created = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Third" }),
+    )
+    .await;
+    let third_id = created["agent"]["id"]
+        .as_str()
+        .expect("third id")
+        .to_string();
+    let err_env = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": task_note_id, "agentId": third_id }),
+    )
+    .await;
+    assert!(err_env.get("result").is_none(), "must be error envelope");
+    assert_eq!(err_env["error"]["code"], -32602);
+    let msg = err_env["error"]["message"].as_str().expect("message");
+    assert!(
+        msg.contains("force: true"),
+        "error mentions override: {msg}"
+    );
+
+    // (5) Same call with `force: true` succeeds.
+    let assigned = wss_rpc(
+        &mut rpc,
+        6,
+        "task.assignAgent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": task_note_id,
+            "agentId": third_id,
+            "force": true,
+        }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "forced assign ok: {assigned}");
+
+    // (6) Re-assigning an already-assigned id stays idempotent-ok, no force.
+    let reassigned = wss_rpc(
+        &mut rpc,
+        7,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": task_note_id, "agentId": third_id }),
+    )
+    .await;
+    assert_eq!(reassigned["ok"], true, "idempotent re-assign: {reassigned}");
 }
 
 /// monorepo#847: messages parked on a poisoned session survive an
