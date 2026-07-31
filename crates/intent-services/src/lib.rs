@@ -65,6 +65,7 @@ mod event_ops;
 mod event_subscriptions;
 pub mod events;
 mod file_ops;
+mod git_diff_singleflight;
 mod git_ops;
 pub mod host_exec;
 pub mod host_exec_stream;
@@ -468,6 +469,22 @@ pub struct Services {
     /// so the [`AgentManager`]'s turn worker and the delegate front doors
     /// observe the same gates.
     sandbox_provisioning: Arc<Mutex<HashMap<AgentId, tokio::sync::watch::Receiver<()>>>>,
+    /// Single-flight registry for in-flight `git.diffs` walks: concurrent
+    /// calls with an identical `(workspace_id, paths, staged, commit_hash)`
+    /// identity coalesce onto one blocking-pool libgit2 walk and share its
+    /// result; non-identical requests run independently. Shared across clones
+    /// so every service handle observes the same in-flight set.
+    git_diffs_inflight: Arc<git_diff_singleflight::DiffSingleFlight>,
+    /// Per-workspace rate limiter for the `git.diffs` "slow worktree hunk
+    /// walk" WARN: at most one WARN per workspace per 60s; further slow walks
+    /// within the window log at DEBUG so a busy workspace cannot flood
+    /// stderr. Shared across clones.
+    git_diffs_slow_warns: Arc<git_diff_singleflight::SlowWalkWarnLimiter>,
+    /// Test seam: when set, invoked on the blocking pool immediately before
+    /// each underlying `git.diffs` walk (counting + parking for coalescing
+    /// tests). Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
+    git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -537,6 +554,9 @@ impl Services {
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
+            git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
+            git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
+            git_diffs_walk_probe: None,
         }
     }
 
@@ -775,6 +795,22 @@ impl Services {
     ) -> Self {
         self.script_supervise_park = Some(park);
         self
+    }
+
+    /// Test seam: observe/park the underlying `git.diffs` walk on the
+    /// blocking pool so single-flight coalescing tests are deterministic.
+    /// Production wiring keeps `None`.
+    #[cfg(test)]
+    pub(crate) fn with_git_diffs_walk_probe(mut self, probe: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.git_diffs_walk_probe = Some(probe);
+        self
+    }
+
+    /// Test seam: number of followers currently awaiting the in-flight
+    /// `git.diffs` walk for `key`.
+    #[cfg(test)]
+    pub(crate) fn git_diffs_waiters(&self, key: &git_diff_singleflight::DiffKey) -> usize {
+        self.git_diffs_inflight.waiters(key)
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -14870,6 +14906,9 @@ impl WorkspaceApi for Services {
         commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let inflight = Arc::clone(&self.git_diffs_inflight);
+        let slow_warns = Arc::clone(&self.git_diffs_slow_warns);
+        let walk_probe = self.git_diffs_walk_probe.clone();
         Box::pin(async move {
             let empty = serde_json::json!([]);
             let ws = match store.get_workspace(&workspace_id).await {
@@ -14886,28 +14925,123 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            // Full worktree hunk diffs can run for many seconds of pure libgit2
-            // CPU. Never do that on a Tokio worker: it holds a bulk permit and
-            // can freeze the whole runtime so host.status never runs (seen as
-            // bulk permit held 5-40s with "nothing else" making progress).
-            let started = std::time::Instant::now();
-            let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
-            let result = tokio::task::spawn_blocking(move || {
-                git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
-            let elapsed = started.elapsed();
-            if elapsed.as_millis() >= 250 {
-                tracing::warn!(
-                    workspace_id = %workspace_id.as_str(),
-                    total_ms = elapsed.as_millis() as u64,
-                    staged,
-                    path_count,
-                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
-                );
+            // Defense-in-depth: absolute `paths` entries under the worktree
+            // root are stripped to their worktree-relative form so a client
+            // sending absolute paths still narrows the walk (entries outside
+            // the root pass through verbatim and match nothing, as before).
+            // This runs BEFORE the single-flight key is computed so
+            // equivalent absolute/relative requests coalesce.
+            // Sorting + deduping makes the identity order-insensitive, so
+            // clients naming the same path set in a different order (or with
+            // duplicates) still coalesce; `build_diffs` matches pathspecs as
+            // a set, so the walk itself is unaffected.
+            let paths = paths.map(|p| {
+                let mut p = git_ops::normalize_diff_paths(&worktree, p);
+                p.sort();
+                p.dedup();
+                p
+            });
+            // Concurrent calls with an identical request identity coalesce
+            // onto one walk (single-flight). `Some([])` behaves exactly like
+            // `None` in `build_diffs`, so both normalize onto the same key.
+            let paths = paths.filter(|p| !p.is_empty());
+            let key: git_diff_singleflight::DiffKey = (
+                workspace_id.clone(),
+                paths.clone(),
+                staged,
+                commit_hash.clone(),
+            );
+            loop {
+                match inflight.join(&key) {
+                    git_diff_singleflight::Join::Leader(flight) => {
+                        // Full worktree hunk diffs can run for many seconds of
+                        // pure libgit2 CPU. Never do that on a Tokio worker: it
+                        // holds a bulk permit and can freeze the whole runtime
+                        // so host.status never runs (seen as bulk permit held
+                        // 5-40s with "nothing else" making progress).
+                        let started = std::time::Instant::now();
+                        let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let walk_worktree = worktree.clone();
+                        let walk_paths = paths.clone();
+                        let walk_commit = commit_hash.clone();
+                        let probe = walk_probe.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            if let Some(probe) = &probe {
+                                probe();
+                            }
+                            git_ops::build_diffs(
+                                &walk_worktree,
+                                walk_paths.as_deref(),
+                                staged,
+                                walk_commit.as_deref(),
+                            )
+                        })
+                        .await
+                        .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
+                        let elapsed = started.elapsed();
+                        if elapsed.as_millis() >= 250 {
+                            // At most one WARN per workspace per 60s; further
+                            // slow walks within the window drop to DEBUG so a
+                            // busy workspace cannot flood stderr.
+                            if slow_warns.should_warn(&workspace_id) {
+                                tracing::warn!(
+                                    workspace_id = %workspace_id.as_str(),
+                                    total_ms = elapsed.as_millis() as u64,
+                                    staged,
+                                    path_count,
+                                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    workspace_id = %workspace_id.as_str(),
+                                    total_ms = elapsed.as_millis() as u64,
+                                    staged,
+                                    path_count,
+                                    "git.diffs: slow worktree hunk walk (WARN rate-limited; offloaded to blocking pool)"
+                                );
+                            }
+                        }
+                        return match result {
+                            Ok(value) => {
+                                flight.finish(Ok(Arc::new(value.clone())));
+                                Ok(value)
+                            }
+                            Err(e) => {
+                                // Publish the inner message: every walk error
+                                // is `Error::Internal` (map_git_err), and the
+                                // follower re-wraps as `Error::Internal`, so
+                                // coalesced callers observe the same variant
+                                // and message (no double "internal error:"
+                                // prefix).
+                                flight.finish(Err(match &e {
+                                    Error::Internal(msg) => msg.clone(),
+                                    other => other.to_string(),
+                                }));
+                                Err(e)
+                            }
+                        };
+                    }
+                    git_diff_singleflight::Join::Follower(mut rx) => {
+                        tracing::debug!(
+                            workspace_id = %workspace_id.as_str(),
+                            staged,
+                            "git.diffs: coalesced into identical in-flight walk"
+                        );
+                        match rx.wait_for(|slot| slot.is_some()).await {
+                            Ok(slot) => {
+                                return match slot.clone().expect("wait_for guarantees Some") {
+                                    Ok(shared) => Ok((*shared).clone()),
+                                    Err(msg) => Err(Error::Internal(msg)),
+                                };
+                            }
+                            // The leader vanished without publishing
+                            // (cancelled RPC / panicked walk): retry — the
+                            // next join elects a new leader.
+                            Err(_) => continue,
+                        }
+                    }
+                }
             }
-            result
         })
     }
 

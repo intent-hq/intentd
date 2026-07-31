@@ -9732,6 +9732,130 @@ mod file_tracking {
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
     }
 
+    /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Regression (single-flight coalescing): two concurrent identical
+    /// full-tree `git.diffs` calls run the underlying walk once and both get
+    /// the result. The probe parks the leader's walk on the blocking pool
+    /// until the second call has provably joined as a follower, so the
+    /// overlap is deterministic.
+    #[tokio::test]
+    async fn git_diffs_concurrent_identical_calls_coalesce_into_one_walk() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        // The leader is inside the walk (flight registered, probe parked).
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        // The identical call joined the in-flight walk as a follower.
+        let key = (ws_id.clone(), None, false, None);
+        wait_until("second call to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert!(
+            a.as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["path"] == "seed.txt"),
+            "shared result carries the real diff"
+        );
+    }
+
+    /// Concurrent `git.diffs` calls with different identities (here: `staged`)
+    /// never coalesce — each runs its own walk.
+    #[tokio::test]
+    async fn git_diffs_concurrent_distinct_calls_run_their_own_walks() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let unstaged = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, false, None).await }
+        });
+        wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
+        let staged = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, None, true, None).await }
+        });
+        // The non-identical request must start its own walk while the first
+        // is still parked.
+        wait_until("second independent walk", || {
+            walks.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        unstaged.await.unwrap().unwrap();
+        staged.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 2, "no coalescing across keys");
+    }
+
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
     #[tokio::test]
@@ -10156,6 +10280,213 @@ mod file_tracking {
         assert_eq!(arr.len(), 1, "only the literal path matches: {arr:?}");
         assert_eq!(arr[0]["path"], "a[1].txt");
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
+    /// Defense-in-depth: an absolute `paths` entry under the worktree root is
+    /// normalized to its worktree-relative form, so it narrows exactly like
+    /// the relative request (unstaged and staged) and the wire result keeps
+    /// worktree-relative `path` values.
+    #[tokio::test]
+    async fn git_diffs_absolute_paths_under_worktree_narrow_like_relative() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let relative = svc
+            .git_diffs(ws_id.clone(), Some(vec!["b.txt".to_string()]), false, None)
+            .await
+            .unwrap();
+        let abs = repo.dir.join("b.txt").to_string_lossy().into_owned();
+        let absolute = svc
+            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None)
+            .await
+            .unwrap();
+        assert_eq!(absolute, relative, "absolute form narrows like relative");
+        let arr = absolute.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "b.txt", "result path stays relative");
+
+        // Staged walk applies the same normalization.
+        let relative = svc
+            .git_diffs(
+                ws_id.clone(),
+                Some(vec!["seed.txt".to_string()]),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
+        let absolute = svc
+            .git_diffs(ws_id, Some(vec![abs]), true, None)
+            .await
+            .unwrap();
+        assert_eq!(absolute, relative);
+        assert_eq!(absolute.as_array().unwrap()[0]["path"], "seed.txt");
+    }
+
+    /// An absolute `paths` entry outside the worktree root passes through
+    /// verbatim and matches nothing, exactly as before the normalization.
+    #[tokio::test]
+    async fn git_diffs_absolute_path_outside_worktree_matches_nothing() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc
+            .git_diffs(
+                ws_id,
+                Some(vec!["/no/such/root/b.txt".to_string()]),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(diffs, serde_json::json!([]));
+    }
+
+    /// Normalization happens BEFORE the single-flight key is computed:
+    /// concurrent `git.diffs` calls naming the same file in relative and
+    /// absolute form coalesce onto one walk.
+    #[tokio::test]
+    async fn git_diffs_absolute_and_relative_requests_coalesce() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None)
+                    .await
+            }
+        });
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_diffs(ws, Some(vec![abs]), false, None).await }
+        });
+        // The absolute request normalized onto the relative request's key and
+        // joined the in-flight walk as a follower.
+        let key = (
+            ws_id.clone(),
+            Some(vec!["seed.txt".to_string()]),
+            false,
+            None,
+        );
+        wait_until("absolute request to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
+    }
+
+    /// The single-flight identity is order-insensitive and duplicate-free:
+    /// concurrent `git.diffs` calls naming the same path set in a different
+    /// order (one with a duplicate entry) coalesce onto one walk.
+    #[tokio::test]
+    async fn git_diffs_reordered_and_duplicated_paths_coalesce() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec![
+                        "other.txt".to_string(),
+                        "seed.txt".to_string(),
+                        "seed.txt".to_string(),
+                    ]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        // The reordered/duplicated request sorted+deduped onto the same key
+        // and joined the in-flight walk as a follower.
+        let key = (
+            ws_id.clone(),
+            Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
+            false,
+            None,
+        );
+        wait_until("reordered request to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
     }
 
     /// Regression (monorepo#1061): `diffs::compute_and_store` (single
