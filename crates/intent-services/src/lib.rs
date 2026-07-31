@@ -296,6 +296,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
+    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
+    /// teardown races are deterministic. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
+    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -504,6 +509,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
+            script_supervise_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -746,6 +752,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
+            self.script_supervise_park.clone(),
         )
     }
 
@@ -755,6 +762,18 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
+        self
+    }
+
+    /// Test seam (monorepo#1180): park `script.*` supervisors in their
+    /// pre-registration window so teardown-vs-registration races are
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_supervise_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_supervise_park = Some(park);
         self
     }
 
@@ -4316,6 +4335,9 @@ fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
 /// (`{ count, agents, agentIds }`). `isStreaming`/`isResponding` are always
 /// `false` (the headless backend has no live stream state; `status` carries
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
+/// `parentAgentId` (v2.9) carries the session's delegation parent (the value
+/// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
+/// root agents.
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let agents: Vec<WorkspaceAgentInfo> = sessions
         .iter()
@@ -4327,6 +4349,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             last_activity: Some(s.updated_at.clone()),
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
     let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -15652,6 +15675,21 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let limit = usage_rate::parse_limit(limit)?;
+            let now = time::OffsetDateTime::now_utc();
+            let rows = self
+                .store
+                .list_usage_rate_since(&usage_rate::window_start(now, limit))
+                .await?;
+            Ok(usage_rate::rate_history_json(&rows, limit, now))
+        })
+    }
+
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -19963,6 +20001,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_rate;
 pub mod usage_stats;
 pub mod usage_stats_read;
 pub mod session_stats {}

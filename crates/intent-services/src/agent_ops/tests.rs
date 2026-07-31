@@ -17,8 +17,9 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use intent_core::events::{
-    AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_RENAMED,
-    AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED, AGENT_UPDATED,
+    AGENT_ATTENTION_REQUESTED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE,
+    AGENT_MESSAGE, AGENT_RENAMED, AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED,
+    AGENT_UPDATED,
 };
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
@@ -1650,6 +1651,151 @@ async fn agent_lite_surfaces_turn_liveness_from_live_turn_slot() {
     let v = serde_json::to_value(svc.agent_get_op(id, None).await.expect("get")).unwrap();
     assert_eq!(v["turnInFlight"], false);
     assert!(v.get("lastStreamActivityAt").is_none());
+}
+
+/// Live-turn overlay: while a worker streams a turn, `agent.get`/`agent.list`
+/// derive `lastAgentResponse`/`digest` from the live-turn slot's text blocks
+/// instead of staying pinned on the previous turn's persisted preview.
+#[tokio::test]
+async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+    // The previous turn's persisted preview.
+    let content = json!([{
+        "type": "text",
+        "text": "Old line\nOld final line\n<agent_digest>old digest</agent_digest>",
+    }]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &content, &now_iso())
+        .await
+        .expect("append");
+
+    // Mid-turn (busy worker + slot with streamed text): the overlay wins and
+    // the last non-empty line of the live text is served.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "Working on it\nLatest streamed line",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Latest streamed line")
+    );
+    // No digest streamed yet → the persisted digest is retained (per-field
+    // fallback).
+    assert_eq!(got.digest.as_deref(), Some("old digest"));
+    // `agent.list` serves the same overlay.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert_eq!(
+        agents[0].last_agent_response.as_deref(),
+        Some("Latest streamed line")
+    );
+
+    // A digest inside the live text is extracted and wins too.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "Working on it\nDone now\n<agent_digest>live digest</agent_digest>",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some("Done now"));
+    assert_eq!(got.digest.as_deref(), Some("live digest"));
+
+    // Mirror per-field case: live text that is ONLY a digest span (cleaned
+    // text empty) overlays the digest but retains the persisted
+    // lastAgentResponse.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "<agent_digest>digest only</agent_digest>",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
+    assert_eq!(got.digest.as_deref(), Some("digest only"));
+
+    // Turn end (slot cleared, worker released): back to persisted semantics.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
+    assert_eq!(got.digest.as_deref(), Some("old digest"));
+}
+
+/// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
+/// turn, tool-only so far) must NOT blank out the persisted preview; a busy
+/// worker with no slot and an orphan slot with no busy worker are both
+/// served unchanged.
+#[tokio::test]
+async fn agent_lite_live_turn_overlay_keeps_persisted_preview_without_text() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Tooler").await;
+    let content = json!([{
+        "type": "text",
+        "text": "Persisted final line\n<agent_digest>persisted digest</agent_digest>",
+    }]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &content, &now_iso())
+        .await
+        .expect("append");
+
+    // Busy worker + slot with ONLY tool_use blocks: no live text → both
+    // persisted previews retained.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "tool_use",
+            "id": "msg-live:0",
+            "name": "read_file",
+            "input": {},
+            "toolCallId": "call-1",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Persisted final line")
+    );
+    assert_eq!(got.digest.as_deref(), Some("persisted digest"));
+
+    // Busy worker with NO slot: unchanged.
+    svc.clear_live_turn(&id);
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Persisted final line")
+    );
+    assert_eq!(got.digest.as_deref(), Some("persisted digest"));
+
+    // Orphan slot with no busy worker: ignored (same busy gate as the
+    // chat-snapshot merge and turn-liveness reads).
+    svc.set_test_busy(&id, false);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({ "type": "text", "id": "msg-live:0", "text": "orphan text" })],
+    );
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Persisted final line")
+    );
+    assert_eq!(got.digest.as_deref(), Some("persisted digest"));
 }
 
 /// STAB-125: `agent.getConversation` carries the same turn-liveness fields, so
@@ -9812,6 +9958,163 @@ async fn request_attention_wakes_parent_immediately_in_after_all_group() {
     assert!(
         text.contains("reports a blocker: sandbox exploded"),
         "immediate grouped wake must be kind-flavored with the reason: {text}"
+    );
+}
+
+/// `agent:attention-requested` from a delegated child carries the optional
+/// `parentAgentId` (the delegating parent) so subscribers can attribute the
+/// request without a follow-up `agent.get`.
+#[tokio::test]
+async fn attention_requested_event_carries_parent_agent_id_for_delegated_child() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["agentId"].as_str(), Some(child.0.as_str()));
+    assert_eq!(
+        data["parentAgentId"].as_str(),
+        Some(parent.0.as_str()),
+        "delegated child's attention event carries the parent id: {data}"
+    );
+}
+
+/// A non-delegated caller's `agent:attention-requested` OMITS `parentAgentId`
+/// entirely — the key must be absent, never `null`.
+#[tokio::test]
+async fn attention_requested_event_omits_parent_agent_id_for_non_delegated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_ATTENTION_REQUESTED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck".into(),
+        Some(agent.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["agentId"].as_str(), Some(agent.0.as_str()));
+    assert!(
+        data.get("parentAgentId").is_none(),
+        "parentAgentId must be OMITTED (not null) for a parentless agent: {data}"
+    );
+}
+
+/// `agent:failed` for a delegated child is enriched centrally (in
+/// `publish_agent_event`) with the child's `parentAgentId`, covering every
+/// terminal-failure emit site.
+#[tokio::test]
+async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("doomed work".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_FAILED.to_string()],
+        ..Default::default()
+    });
+    svc.publish_agent_event(
+        &ws,
+        &child,
+        AGENT_FAILED,
+        json!({ "agentId": child.0, "error": "boom" }),
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert_eq!(data["error"].as_str(), Some("boom"));
+    assert_eq!(
+        data["parentAgentId"].as_str(),
+        Some(parent.0.as_str()),
+        "delegated child's agent:failed carries the parent id: {data}"
+    );
+}
+
+/// `agent:failed` for a parentless agent OMITS `parentAgentId` entirely —
+/// the key must be absent, never `null`.
+#[tokio::test]
+async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let agent = create_agent(&svc, &ws, "Solo").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_FAILED.to_string()],
+        ..Default::default()
+    });
+    svc.publish_agent_event(
+        &ws,
+        &agent,
+        AGENT_FAILED,
+        json!({ "agentId": agent.0, "error": "boom" }),
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    let data = &batch[0].data;
+    assert!(
+        data.get("parentAgentId").is_none(),
+        "parentAgentId must be OMITTED (not null) for a parentless agent: {data}"
     );
 }
 

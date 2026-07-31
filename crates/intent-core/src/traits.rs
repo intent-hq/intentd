@@ -1617,6 +1617,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `stats.getRateHistory`: the global per-minute token-rate history
+    /// behind the HUD TOK/MIN chart, read from the capped
+    /// `usage_rate_minutely` store; no `workspaceId`. Returns the trailing
+    /// `limit` minute samples (default 60, max 1440) ending at the current
+    /// UTC minute, zero-filled and in chronological order.
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = limit;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::stats_get_rate_history not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).

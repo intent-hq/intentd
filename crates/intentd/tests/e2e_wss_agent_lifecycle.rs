@@ -1155,6 +1155,233 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     assert!(reset, "turn-liveness fields reset after the turn ends");
 }
 
+/// Live-turn preview overlay over WSS: while a turn is in flight, `agent.get`
+/// and `agent.list` derive `lastAgentResponse` from the live-turn slot's
+/// streamed text instead of the persisted preview. The mock's first turn
+/// streams "streaming-before-cancel" and parks with NOTHING persisted for the
+/// turn, so a non-null `lastAgentResponse` mid-turn can only come from the
+/// overlay. After the interrupted flush + a resumed turn completes, the
+/// projection falls back to the newest persisted preview.
+#[tokio::test]
+async fn agent_lite_live_turn_preview_overlay_over_wss() {
+    let Some(script) = gate("WSS live-turn preview overlay E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // First turn streams its chunk and parks at session/cancel. The broadcast
+    // carrying content is `chat:stream:delta` (the `agent:stream:activity`
+    // rename left the agent:* family content-free). Hard deadline:
+    // `wss_event`'s per-read window resets on every frame (heartbeat pings
+    // included), which can spin past the runner's test budget on a slow
+    // coverage machine instead of failing fast. On timeout, surface every
+    // event observed while waiting plus the daemon log tail so a CI-only
+    // failure is diagnosable from the runner output alone. No RPC in the
+    // diagnostic path: after 120s of not reading `rpc` its heartbeat pongs
+    // stopped, so the server may have dropped that connection already.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut seen_events: Vec<Value> = Vec::new();
+    loop {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
+            let tail = &log[log.len().saturating_sub(4000)..];
+            panic!(
+                "first turn did not stream its chunk within deadline;\n\
+                 events seen while waiting: {seen_events:#?}\n\
+                 daemon.log tail:\n{tail}"
+            );
+        };
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            break;
+        }
+        seen_events.push(frame["params"]["event"].clone());
+    }
+
+    // Mid-turn, nothing is persisted for this turn (and no previous turn
+    // exists), so the streamed text can only be served by the live-turn
+    // overlay. Poll briefly: the slot is stamped on the chunk path.
+    let mut mid_turn: Option<Value> = None;
+    for i in 0..40 {
+        let got = wss_rpc(
+            &mut rpc,
+            20 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["lastAgentResponse"].as_str() == Some("streaming-before-cancel") {
+            mid_turn = Some(got["agent"].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mid_turn = mid_turn.expect("mid-turn agent.get served the live-turn overlay");
+    assert_eq!(
+        mid_turn["isResponding"], true,
+        "overlay only applies while responding: {mid_turn}"
+    );
+    // No digest streamed and none persisted → omitted.
+    assert!(
+        mid_turn.get("digest").is_none(),
+        "no digest mid-turn: {mid_turn}"
+    );
+
+    // `agent.list` serves the same overlay.
+    let list = wss_rpc(&mut rpc, 60, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let row = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == agent_id.as_str())
+        .unwrap_or_else(|| panic!("agent row in list: {list}"));
+    assert_eq!(
+        row["lastAgentResponse"].as_str(),
+        Some("streaming-before-cancel"),
+        "agent.list serves the live-turn overlay: {row}"
+    );
+
+    // Interrupt the parked turn. Hard-deadline event reads (wss_event_opt_until)
+    // so a missing event fails fast instead of hanging — heartbeat pings would
+    // otherwise keep resetting a per-read window.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("interrupt stream:end within deadline");
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            break;
+        }
+    }
+
+    // Wait for the worker to release the busy slot BEFORE resuming, so the
+    // follow-up send takes the direct path (a send racing into the busy
+    // window would be queued instead).
+    let mut idle = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            100 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["isResponding"] == false {
+            idle = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(idle, "agent released the busy slot after the interrupt");
+
+    // Resume; the second turn completes normally with "resumed turn=2".
+    let resumed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("resumed turn stream:end within deadline");
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            break;
+        }
+    }
+
+    // Once the turn ends (slot cleared, worker released) the projection is
+    // back to persisted semantics: the newest persisted assistant row wins.
+    let mut settled = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            300 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["isResponding"] == false
+            && got["agent"]["lastAgentResponse"].as_str() == Some("resumed turn=2")
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        settled,
+        "idle agent.get serves the persisted preview of the resumed turn"
+    );
+}
+
 /// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
 /// `priority: "interrupt"` preempts a mid-turn agent instead of queueing —
 /// the current turn is cancelled keep-alive (terminal `agent:stream:end`,
@@ -2871,8 +3098,12 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///  - `agent.getSession` serves the pending `attentionRequest*` session
 ///    fields and the persisted notice with `meta.kind = "discussion-request"`,
 ///    and the agent's status is NOT `error` (the turn ended normally);
-///  - the next received message retires the request: `agent:updated` with
-///    `attentionRequestCleared: true`, and the session fields are gone.
+///  - an AUTOMATIC delivery (`agent.sendToTask`, the A2A/system path) does
+///    NOT retire the request: no `attentionRequestCleared` fires and
+///    `agent.getSession` still serves the pending fields;
+///  - the next USER message (`agent.sendMessage` front door) retires the
+///    request: `agent:updated` with `attentionRequestCleared: true`, and the
+///    session fields are gone.
 #[tokio::test]
 async fn attention_request_discussion_over_wss() {
     let Some(script) = gate("WSS attention-request discussion E2E") else {
@@ -3026,6 +3257,12 @@ async fn attention_request_discussion_over_wss() {
         json!(ws_id),
         "attention event carries workspaceId: {attention}"
     );
+    // The RPC front-door delegate is parentless, so the optional
+    // `parentAgentId` must be OMITTED entirely — never `null`.
+    assert!(
+        attention.get("parentAgentId").is_none(),
+        "parentAgentId omitted for a parentless caller: {attention}"
+    );
     assert_eq!(
         attention["agentName"],
         json!(agent_name),
@@ -3110,11 +3347,62 @@ async fn attention_request_discussion_over_wss() {
         "notice carries the reason: {notice}"
     );
 
-    // The next received message retires the pending request: agent:updated
+    // An AUTOMATIC delivery (agent.sendToTask — same default-origin path as
+    // A2A sends and system wakes) must NOT retire the pending request: the
+    // turn runs to idle without an attentionRequestCleared, and getSession
+    // still serves the fields afterwards.
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the automatic turn's idle"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        assert!(
+            !(ev["type"] == "agent:updated"
+                && data["agentId"] == json!(agent_id)
+                && data["attentionRequestCleared"] == true),
+            "automatic delivery must not clear the attention request"
+        );
+        if ev["type"] == "agent:idle" && data["agentId"] == json!(agent_id) {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "attentionRequestKind survives the automatic delivery"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "attentionRequestReason survives the automatic delivery"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "attentionRequestTimestamp survives the automatic delivery"
+    );
+
+    // The next USER message retires the pending request: agent:updated
     // with attentionRequestCleared, and the session fields are gone.
     let sent = wss_rpc(
         &mut rpc,
-        14,
+        16,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up" }),
     )
@@ -3136,7 +3424,7 @@ async fn attention_request_discussion_over_wss() {
     }
     let got = wss_rpc(
         &mut rpc,
-        15,
+        17,
         "agent.getSession",
         json!({ "agentId": agent_id, "workspaceId": ws_id }),
     )
@@ -3427,6 +3715,194 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         session["status"], "error",
         "taskless turn ended normally: {}",
         session["status"]
+    );
+}
+
+/// Delegated (parented) children carry the optional `parentAgentId` on both
+/// `agent:attention-requested` and `agent:failed` over WSS. A parent agent
+/// delegates TWO children through the MCP front door (`ws.agent.delegate`,
+/// which records the caller as `parent_agent_id`):
+///  - child A raises `ws.agent.requestDiscussion(reason)` →
+///    `agent:attention-requested` with `parentAgentId` == the parent's id;
+///  - child B's prompt carries the mock's `exitIfPromptContains` marker, so
+///    every attempt dies mid-`session/prompt` — the one-shot silent redrive
+///    (monorepo#764) is spent and the terminal `agent:failed` fires with
+///    `parentAgentId` == the parent's id (enriched centrally in
+///    `publish_agent_event`).
+/// The parentless-omission halves are covered by
+/// `attention_request_discussion_over_wss` (attention) and the MIDTURN-1
+/// suite in `e2e_wss_agent_midturn_failure.rs` (failed).
+#[tokio::test]
+async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() {
+    let Some(script) = gate("WSS parented attention/failed parentAgentId E2E") else {
+        return;
+    };
+
+    const PARENT_GO: &str = "PARENTID_PARENT_GO";
+    const CHILD_ATTN: &str = "PARENTID_CHILD_ATTN";
+    const CHILD_DIE: &str = "PARENTID_CHILD_DIE";
+    const REASON: &str = "PARENTID need a decision from the coordinator";
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let delegate_attn_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(format!("{CHILD_ATTN} raise a discussion request")),
+    );
+    let delegate_die_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(format!("{CHILD_DIE} this child dies mid-prompt")),
+    );
+    let behavior = json!({
+        // Child B: every prompt carrying the marker dies mid-`session/prompt`
+        // (checked before rule selection), so the silent redrive's fresh
+        // child dies again and the failure goes terminal.
+        "exitIfPromptContains": CHILD_DIE,
+        "rules": [
+            {
+                "ifPromptContains": CHILD_ATTN,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": request_js, "summary": "raise discussion request" }
+                },
+                "response": "child A ended after requestDiscussion",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_attn_js, "summary": "delegate attention child" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_die_js, "summary": "delegate dying child" }
+                    },
+                ],
+                "response": "parent delegated two children",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — registered BEFORE the parent's delegating turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Both milestones under one hard deadline, order-insensitive: child A's
+    // attention event and child B's terminal agent:failed. The failed path
+    // includes a full silent-redrive cycle (kill + respawn + re-prompt), so
+    // the window is generous.
+    let mut attention: Option<Value> = None;
+    let mut failed: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !(attention.is_some() && failed.is_some()) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} failed={f}",
+                a = attention.is_some(),
+                f = failed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["reason"] == json!(REASON) => {
+                attention = Some(data.clone());
+            }
+            "agent:failed" if data["agentId"] != json!(parent_id) => {
+                failed = Some(data.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Child A's attention event names the delegating parent.
+    let attention = attention.expect("attention event captured");
+    let attn_child = attention["agentId"].as_str().expect("attention agentId");
+    assert_ne!(attn_child, parent_id, "attention came from the child");
+    assert_eq!(
+        attention["parentAgentId"],
+        json!(parent_id),
+        "delegated child's attention event carries parentAgentId: {attention}"
+    );
+
+    // Child B's terminal agent:failed names the delegating parent too.
+    let failed = failed.expect("failed event captured");
+    let failed_child = failed["agentId"].as_str().expect("failed agentId");
+    assert_ne!(
+        failed_child, attn_child,
+        "the dying child is a distinct agent"
+    );
+    let err = failed["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("agent stdout closed"),
+        "agent:failed carries the mid-turn prompt error, got: {err}"
+    );
+    assert_eq!(
+        failed["parentAgentId"],
+        json!(parent_id),
+        "delegated child's agent:failed carries parentAgentId: {failed}"
     );
 }
 
@@ -11030,7 +11506,10 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
 /// BEFORE any assistant chunk of the triggered turn. The send carries a
 /// client-minted `userAppMessageId`, so the delta entity must lift it as
 /// `appMessageId` (monorepo#1157) and the served conversation row must carry
-/// the same serve-time stamped block id as the delta (monorepo#1114).
+/// the same serve-time stamped block id as the delta (monorepo#1114). A fresh
+/// `chat.subscribe` afterwards must serve a seq-0 snapshot whose user row
+/// carries the same `appMessageId` (snapshot/delta parity, the intentd#780
+/// review note).
 #[tokio::test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
@@ -11170,5 +11649,40 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         row["appMessageId"],
         json!("app-msg-delta-e2e"),
         "persisted row surfaces the appMessageId on reads: {row}"
+    );
+
+    // Re-subscribe on a fresh connection: the seq-0 snapshot reuses the
+    // `agent.getConversation` read shape verbatim, so its user row must echo
+    // the same lifted `appMessageId` the delta carried (snapshot/delta
+    // parity, the intentd#780 review note).
+    let mut chat2 = connect_ws(port, cfg.clone()).await;
+    let resub = wss_rpc(
+        &mut chat2,
+        30,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        resub["subscriptionId"].is_string(),
+        "re-subscribed: {resub}"
+    );
+    let snap2 = wss_push(&mut chat2, 15).await;
+    assert_eq!(snap2["params"]["kind"], "snapshot", "push: {snap2}");
+    let snap_row = snap2["params"]["snapshot"]["messages"]
+        .as_array()
+        .expect("snapshot messages")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&sent_row_id))
+        .unwrap_or_else(|| panic!("user row present in fresh snapshot: {snap2}"))
+        .clone();
+    assert_eq!(
+        snap_row["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "fresh snapshot user row carries the send's appMessageId: {snap_row}"
+    );
+    assert_eq!(
+        snap_row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "fresh snapshot block id matches the delta's block id"
     );
 }

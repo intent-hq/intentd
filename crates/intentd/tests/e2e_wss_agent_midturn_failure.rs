@@ -411,6 +411,14 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
                     err.contains("agent stdout closed"),
                     "agent:failed carries the mid-turn prompt error, got: {err}"
                 );
+                // This agent was created via the RPC front door (parentless):
+                // the optional `parentAgentId` must be OMITTED — never `null`.
+                assert!(
+                    frame["params"]["event"]["data"]
+                        .get("parentAgentId")
+                        .is_none(),
+                    "parentAgentId omitted on agent:failed for a parentless agent: {frame}"
+                );
                 saw_failed = true;
             }
             Some("agent:stream:end") => {

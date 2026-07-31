@@ -1293,6 +1293,19 @@ impl Services {
         // rehydrating via agent.list/agent.get after the failure event still
         // sees the corrupted flag.
         let session_corrupted = self.session_poisoned(&session);
+        // Live-turn overlay: while a worker is draining an in-flight turn,
+        // derive `lastAgentResponse`/`digest` from the live slot's streamed
+        // text blocks so `agent.get`/`agent.list` track the
+        // turn instead of staying pinned on the previous turn's persisted
+        // preview. Per-field: a turn that has streamed no text yet (or no
+        // digest yet) yields `None` for that field and the persisted-preview
+        // value is kept.
+        let live_overlay = if is_responding {
+            self.live_turn_text_blocks(&session.id)
+                .map(|blocks| last_response_and_digest_from_blocks(&blocks))
+        } else {
+            None
+        };
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1301,6 +1314,14 @@ impl Services {
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
         lite.session_corrupted = session_corrupted;
+        if let Some((live_response, live_digest)) = live_overlay {
+            if live_response.is_some() {
+                lite.last_agent_response = live_response;
+            }
+            if live_digest.is_some() {
+                lite.digest = live_digest;
+            }
+        }
         lite
     }
 
@@ -3470,8 +3491,9 @@ impl Services {
     ///    `agent:message`) so the conversation renders a distinct card that
     ///    survives rehydration;
     /// 3. emits the self-sufficient `agent:attention-requested` event
-    ///    `{ workspaceId, agentId, agentName, kind, reason }` (FE sticky
-    ///    toast);
+    ///    `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }`
+    ///    (FE sticky toast; `parentAgentId` is present only for delegated
+    ///    callers — omitted entirely, never `null`, when there is no parent);
     /// 4. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
     /// 5. wakes a delegated caller's parent with a kind-flavored message —
@@ -3581,18 +3603,25 @@ impl Services {
                 );
             }
         }
-        // 3. Self-sufficient toast-driving event.
+        // 3. Self-sufficient toast-driving event. `parentAgentId` rides along
+        // for delegated callers so subscribers can attribute the request to
+        // the delegation tree without a follow-up `agent.get`; OMITTED
+        // entirely (never `null`) for parentless agents.
+        let mut attention_data = json!({
+            "workspaceId": workspace_id.0,
+            "agentId": caller.0,
+            "agentName": session.name.clone(),
+            "kind": kind,
+            "reason": reason,
+        });
+        if let Some(parent) = &parent {
+            attention_data["parentAgentId"] = json!(parent.0);
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &caller,
             intent_core::events::AGENT_ATTENTION_REQUESTED,
-            json!({
-                "workspaceId": workspace_id.0,
-                "agentId": caller.0,
-                "agentName": session.name.clone(),
-                "kind": kind,
-                "reason": reason,
-            }),
+            attention_data.clone(),
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -3637,13 +3666,10 @@ impl Services {
                     "id": uuid::Uuid::new_v4().to_string(),
                     "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
                     "timestamp": saved_at,
-                    "data": {
-                        "workspaceId": workspace_id.0,
-                        "agentId": caller.0,
-                        "agentName": session.name.clone(),
-                        "kind": kind,
-                        "reason": reason,
-                    },
+                    // Same enriched payload as the published event (including
+                    // `parentAgentId` — the wake only fires for delegated
+                    // callers, so it is always present here).
+                    "data": attention_data,
                     "actor": {
                         "type": "agent",
                         "id": caller.0,

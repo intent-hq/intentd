@@ -2193,6 +2193,15 @@ fn spawn_idempotency_reap_loop(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "idempotency reaper sweep failed"),
             }
+            // Same cadence caps the per-minute token-rate history (§5.39) at
+            // 24h — at most 1440 minute rows survive a sweep.
+            match store.delete_usage_rate_before(&cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(removed, cutoff, "usage-rate reaper trimmed minute buckets");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "usage-rate reaper sweep failed"),
+            }
             let sweep_result = tokio::task::spawn_blocking({
                 let root = agent_log_root.clone();
                 move || {
