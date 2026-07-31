@@ -19459,6 +19459,39 @@ mod display_status {
     }
 
     #[test]
+    fn pr_status_open_or_draft_wins_over_open_tasks() {
+        // The pr_status fallback is a step-1 PR-stage signal: it precedes the
+        // open-tasks check, so in-progress or not-started tasks never mask it.
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
     fn pr_status_merged_participates_in_merged_check() {
         assert_eq!(
             compute_display_status(
