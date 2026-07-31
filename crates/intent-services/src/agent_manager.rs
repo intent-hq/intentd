@@ -3159,7 +3159,10 @@ impl AgentManager {
             )
             .await
         {
-            Ok(message) => message,
+            Ok(message) => {
+                self.services.invalidate_agent_list_cache(&workspace_id);
+                message
+            }
             Err(append_err) => {
                 // Store write failed on a validated agent (e.g. duplicate
                 // client-supplied messageId) → auto-queue, matching the
@@ -3542,7 +3545,10 @@ impl AgentManager {
                 )
                 .await
             {
-                Ok(message) => message,
+                Ok(message) => {
+                    self.services.invalidate_agent_list_cache(&workspace_id);
+                    message
+                }
                 Err(append_err) => {
                     // Transactional guarantee: release the slot and restore
                     // the entry at the FRONT (`persisted: false`, so a retry
@@ -4339,6 +4345,7 @@ impl AgentManager {
                 .await
             {
                 Ok(message) => {
+                    self.services.invalidate_agent_list_cache(workspace_id);
                     self.services
                         .publish_agent_mutation_event(
                             workspace_id,
@@ -6136,7 +6143,10 @@ async fn persist_user(
             )
             .await
         {
-            Ok(message) => break message,
+            Ok(message) => {
+                mgr.services.invalidate_agent_list_cache(workspace_id);
+                break message;
+            }
             Err(e) => {
                 let Some(&delay_ms) = backoff.get(attempt) else {
                     tracing::warn!(

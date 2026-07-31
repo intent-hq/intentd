@@ -1204,9 +1204,12 @@ impl Services {
             .store
             .list_agent_session_summaries(&workspace_id)
             .await?;
+        // Message projections are the expensive half (full-workspace COUNT
+        // aggregate + preview columns). Cache per workspace; invalidated on
+        // transcript writes and session create/delete.
         let mut projections = self
-            .store
-            .get_agent_session_message_projections(&workspace_id)
+            .agent_list_cache
+            .get_or_load(&self.store, &workspace_id)
             .await?;
         Ok(sessions
             .into_iter()
@@ -1215,6 +1218,13 @@ impl Services {
                 self.project_lite_with_flags_from_projection(s, &projection)
             })
             .collect())
+    }
+
+    /// Drop the cached agent.list message projections for `workspace_id`.
+    /// Call after any successful agent_message write or session create/delete
+    /// in this workspace so the next list reloads from SQLite.
+    pub(crate) fn invalidate_agent_list_cache(&self, workspace_id: &WorkspaceId) {
+        self.agent_list_cache.invalidate(&workspace_id.0);
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
@@ -1831,6 +1841,7 @@ impl Services {
             sandbox_branch: None,
         };
         self.store.insert_agent_session(&session).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
         // falling back to the provider id when no model is resolved yet;
@@ -2009,6 +2020,7 @@ impl Services {
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
+            self.invalidate_agent_list_cache(session_ws);
         }
         self.agent_queues
             .lock()
@@ -2271,6 +2283,7 @@ impl Services {
                 &created_at,
             )
             .await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -2376,6 +2389,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let replaced_count = inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2456,6 +2470,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2831,6 +2846,7 @@ impl Services {
         };
         match message {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&session.workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Reuses the session validated above; best-effort (logged on error).
@@ -2945,6 +2961,7 @@ impl Services {
                 return Err(e);
             }
         };
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -3547,6 +3564,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&workspace_id);
                 self.publish_agent_mutation_event(
                     &workspace_id,
                     &caller,
@@ -6095,7 +6113,10 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(msg) => msg,
+            Ok(msg) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                msg
+            }
             Err(_) => {
                 manager.release_slot(agent_id).await;
                 let (queued, position) = self.enqueue_message(
@@ -6211,6 +6232,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -7212,6 +7234,7 @@ impl Services {
                     return Err(e);
                 }
             };
+            self.invalidate_agent_list_cache(&workspace_id);
 
             // Emit agent:message + agent:updated so live UIs render the marker.
             self.publish_agent_mutation_event(
@@ -7343,6 +7366,7 @@ impl Services {
             .store
             .append_agent_message(agent_id, "system", &content, &now_iso())
             .await?;
+        self.invalidate_agent_list_cache(&workspace_id);
 
         // Mark the interrupted_agent row as resolved
         let updated = self
