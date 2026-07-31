@@ -10032,7 +10032,7 @@ async fn diagnostics_task_filter_includes_note_side_assignees() {
     let (_t, svc, ws) = setup().await;
     let note_id = seed_task(&svc, &ws, "note-side assignment task").await;
     let assignee = create_agent(&svc, &ws, "Assignee").await;
-    svc.assign_agent(ws.clone(), note_id.clone(), assignee.0.clone())
+    svc.assign_agent(ws.clone(), note_id.clone(), assignee.0.clone(), None)
         .await
         .expect("assign");
     let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
