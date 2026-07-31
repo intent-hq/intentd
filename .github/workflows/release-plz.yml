@@ -34,16 +34,20 @@ on:
 # `release_always = false`, `release-plz release` only pushes the tag when
 # the *latest* commit is a Release-PR merge, so if a queued merge-commit run
 # were superseded by an ordinary push, the newer run would silently skip the
-# tag. Merge commits are detected by the Release PR's squash title
-# (release-plz's `chore: release vX.Y.Z` pr_name). Two Release-PR merges
-# can't coalesce with each other in practice: the next Release PR only
-# exists after the previous merge's release-pr job has run.
+# tag. Merge commits are detected by the Release PR's squash title: both
+# release-plz pr_name forms this repo has produced — `chore: release vX.Y.Z`
+# (multi-package version_group cycles, v0.2.10+) and `chore(intentd):
+# release vX.Y.Z` (single-package cycles, v0.2.2–v0.2.9). A false positive
+# only costs coalescing; a false negative would reopen the dropped-tag bug.
+# Two Release-PR merges can't coalesce with each other in practice: the
+# next Release PR only exists after the previous merge's release-pr job has
+# run.
 #
 # `cancel-in-progress: false` is load-bearing in both groups: a run that is
 # mid-flight on a Release-PR merge commit must never be cancelled between
 # computing the next version and pushing the tag.
 concurrency:
-  group: "release-plz-${{ github.ref }}-${{ startsWith(github.event.head_commit.message, 'chore: release') && 'release-merge' || 'push' }}"
+  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release')) && 'release-merge' || 'push' }}"
   cancel-in-progress: false
 
 jobs:
@@ -98,7 +102,11 @@ jobs:
     # concurrent `release-plz release-pr` executions would race on updating
     # the release-plz-* branch and the Release PR. Coalescing a pending pr
     # job here is safe — the tag work happened in the run's release job, and
-    # a newer pr job recomputes the Release PR from current state.
+    # a newer pr job recomputes the Release PR from current state. Residual
+    # cross-group race (accepted): an ordinary run's pr job can grab this
+    # group during a merge run's ~15s release job and compute before the tag
+    # is visible, briefly leaving a stale Release PR — it self-heals on the
+    # next push to main.
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
