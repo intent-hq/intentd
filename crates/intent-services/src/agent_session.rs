@@ -379,6 +379,15 @@ impl Transcript {
         }
         out
     }
+
+    /// Whether the FINAL text block is still open (text pending in the
+    /// coalescing buffer, not yet flushed by a non-text block boundary). The
+    /// live preview derivation only clips the trailing partial line of an
+    /// OPEN final block — a text block closed by e.g. a tool call is complete
+    /// even without a trailing newline.
+    fn final_text_block_open(&self) -> bool {
+        !self.text.is_empty()
+    }
 }
 
 /// The per-agent in-flight ("live") turn slot (CS-0 D5): the assistant message
@@ -391,6 +400,11 @@ impl Transcript {
 pub(crate) struct LiveTurn {
     pub(crate) message_id: String,
     pub(crate) blocks: Vec<Value>,
+    /// Whether the snapshot's FINAL text block was still open (mid-stream) at
+    /// capture time — see [`Transcript::final_text_block_open`]. Drives
+    /// whether the `AgentLite` live-preview derivation clips the trailing
+    /// partial line.
+    pub(crate) final_text_block_open: bool,
     /// RFC-3339 timestamp of the most recent stream event observed for this
     /// turn (STAB-125): set when the slot opens and refreshed on every
     /// [`update_live_turn`](Services::update_live_turn), so pollers can tell a
@@ -496,12 +510,21 @@ pub(crate) fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
 
 /// [`stamp_preview_fields`] for MID-TURN frames (`agent:stream:activity`):
 /// derives via the live variant, which clips the still-streaming trailing
-/// partial line — the preview advances on newline boundaries, a turn that has
-/// not completed a non-empty line yet omits `lastAgentResponse`, and a
-/// partially-streamed `<agent_digest>` span (or split marker at a chunk
-/// boundary) never surfaces.
-pub(crate) fn stamp_live_preview_fields(data: &mut Value, text_blocks: &[String]) {
-    stamp_preview(data, live_response_and_digest_from_blocks(text_blocks));
+/// partial line when the final text block is open (`final_block_open`) — the
+/// preview advances on newline boundaries, a turn that has not completed a
+/// non-empty line yet omits `lastAgentResponse`, and a partially-streamed
+/// `<agent_digest>` span (or split marker at a chunk boundary) never
+/// surfaces. A final text block CLOSED by a non-text block boundary (e.g. a
+/// tool call) is complete and serves its last line unclipped.
+pub(crate) fn stamp_live_preview_fields(
+    data: &mut Value,
+    text_blocks: &[String],
+    final_block_open: bool,
+) {
+    stamp_preview(
+        data,
+        live_response_and_digest_from_blocks(text_blocks, final_block_open),
+    );
 }
 
 /// Shared stamping core for [`stamp_preview_fields`] /
@@ -704,13 +727,40 @@ impl Services {
     /// Set/replace an agent's live-turn slot. The streaming path drives this via
     /// [`update_live_turn`](Self::update_live_turn); it is also a test seam for
     /// simulating a mid-turn snapshot without spinning up a real ACP turn.
+    /// Marks the final text block as OPEN (mid-stream) — the common case; use
+    /// [`set_live_turn_closed_final_block`](Self::set_live_turn_closed_final_block)
+    /// to simulate a snapshot whose final text block was closed by a non-text
+    /// block boundary.
     pub fn set_live_turn(&self, agent_id: &AgentId, message_id: &str, blocks: Vec<Value>) {
+        self.insert_live_turn(agent_id, message_id, blocks, true);
+    }
+
+    /// Test seam: [`set_live_turn`](Self::set_live_turn) with the final text
+    /// block marked CLOSED (e.g. flushed by a tool call, no new text since) —
+    /// the live preview derivation must not clip it.
+    pub fn set_live_turn_closed_final_block(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        blocks: Vec<Value>,
+    ) {
+        self.insert_live_turn(agent_id, message_id, blocks, false);
+    }
+
+    fn insert_live_turn(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        blocks: Vec<Value>,
+        final_text_block_open: bool,
+    ) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.insert(
                 agent_id.clone(),
                 LiveTurn {
                     message_id: message_id.to_string(),
                     blocks,
+                    final_text_block_open,
                     last_activity_at: now_iso(),
                     last_activity_emit: None,
                 },
@@ -725,6 +775,7 @@ impl Services {
         if let Ok(mut slots) = self.live_turns.lock() {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
+                slot.final_text_block_open = transcript.final_text_block_open();
                 slot.last_activity_at = now_iso();
             }
         }
@@ -768,16 +819,17 @@ impl Services {
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
-    /// without cloning the full slot — the `AgentLite` preview overlay only
-    /// needs the text strings, so `tool_use`/`tool_result` payloads (which can
-    /// be large mid-turn) stay untouched under the lock. `None` when no slot
-    /// is open; `Some(vec![])` when a slot is open but has no text blocks yet.
-    pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<Vec<String>> {
+    /// (plus the slot's final-text-block-open flag) without cloning the full
+    /// slot — the `AgentLite` preview overlay only needs the text strings, so
+    /// `tool_use`/`tool_result` payloads (which can be large mid-turn) stay
+    /// untouched under the lock. `None` when no slot is open;
+    /// `Some((vec![], _))` when a slot is open but has no text blocks yet.
+    pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<(Vec<String>, bool)> {
         self.live_turns
             .lock()
             .ok()?
             .get(agent_id)
-            .map(|live| text_block_strings(&live.blocks))
+            .map(|live| (text_block_strings(&live.blocks), live.final_text_block_open))
     }
 
     /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
@@ -1947,7 +1999,11 @@ impl Services {
                         "agentId": agent_id.0,
                         "messageId": message_id,
                     });
-                    stamp_live_preview_fields(&mut activity_data, &transcript.text_block_strings());
+                    stamp_live_preview_fields(
+                        &mut activity_data,
+                        &transcript.text_block_strings(),
+                        transcript.final_text_block_open(),
+                    );
                     self.publish_agent_event(
                         workspace_id,
                         agent_id,
