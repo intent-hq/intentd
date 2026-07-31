@@ -1710,6 +1710,22 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
     assert_eq!(got.last_agent_response.as_deref(), Some("Done now"));
     assert_eq!(got.digest.as_deref(), Some("live digest"));
 
+    // Mirror per-field case: live text that is ONLY a digest span (cleaned
+    // text empty) overlays the digest but retains the persisted
+    // lastAgentResponse.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "<agent_digest>digest only</agent_digest>",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
+    assert_eq!(got.digest.as_deref(), Some("digest only"));
+
     // Turn end (slot cleared, worker released): back to persisted semantics.
     svc.clear_live_turn(&id);
     svc.set_test_busy(&id, false);

@@ -1301,9 +1301,8 @@ impl Services {
         // digest yet) yields `None` for that field and the persisted-preview
         // value is kept.
         let live_overlay = if is_responding {
-            self.live_turn(&session.id).map(|live| {
-                last_response_and_digest_from_blocks(&text_blocks(&Value::Array(live.blocks)))
-            })
+            self.live_turn_text_blocks(&session.id)
+                .map(|blocks| last_response_and_digest_from_blocks(&blocks))
         } else {
             None
         };
