@@ -297,11 +297,12 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
-    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
-    /// teardown races are deterministic. `None` in production wiring; tests
-    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
-    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
+    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
+    /// All `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_script_supervise_park` /
+    /// `with_script_start_registration_park`.
+    script_parks: script_ops::ScriptParks,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -526,7 +527,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
-            script_supervise_park: None,
+            script_parks: script_ops::ScriptParks::default(),
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -772,7 +773,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
-            self.script_supervise_park.clone(),
+            self.script_parks.clone(),
         )
     }
 
@@ -793,7 +794,20 @@ impl Services {
         mut self,
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
-        self.script_supervise_park = Some(park);
+        self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam (monorepo#1194): park `script.start` between spawning the
+    /// supervisor task and taking the registration lock so remove+recreate
+    /// races inside that window are deterministic. Production wiring keeps
+    /// `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_start_registration_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.start_registration = Some(park);
         self
     }
 
