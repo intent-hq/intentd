@@ -104,6 +104,23 @@ pub(crate) struct ScriptManager {
     /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `supervise()` parks in its
+    /// pre-registration window — after `pty.spawn`, before `mark_running`
+    /// records the id — so teardown races are reproducible deterministically.
+    /// `None` in production wiring.
+    supervise_park: Option<Arc<SupervisePark>>,
+}
+
+/// Test seam for the teardown-vs-registration race (monorepo#1180): lets a
+/// test hold `supervise()` inside the window where a fresh PTY exists but the
+/// registry does not yet record its id.
+#[derive(Default)]
+pub(crate) struct SupervisePark {
+    /// Signaled by `supervise()` on entering the window (PTY spawned, not yet
+    /// recorded).
+    pub(crate) entered: tokio::sync::Notify,
+    /// Held by `supervise()` inside the window until the test releases it.
+    pub(crate) release: tokio::sync::Notify,
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -145,6 +162,7 @@ impl ScriptManager {
         scripts: ScriptRegistry,
         bootstrap_locks: WorkspaceScriptLocks,
         too_fast_ms: u128,
+        supervise_park: Option<Arc<SupervisePark>>,
     ) -> Self {
         Self {
             pty,
@@ -153,6 +171,7 @@ impl ScriptManager {
             scripts,
             bootstrap_locks,
             too_fast_ms,
+            supervise_park,
         }
     }
 
@@ -186,11 +205,17 @@ impl ScriptManager {
             None => ("user".to_string(), now_iso(), None),
         };
         if let Some(mut old) = existing {
-            if let Some(handle) = old.supervisor.take() {
-                handle.abort();
-            }
+            // Cooperative teardown (monorepo#1180): kill the recorded PTY,
+            // then *await* the supervisor instead of aborting it. An abort
+            // could land in the pre-registration window (after `pty.spawn`,
+            // before `mark_running` records the id) and orphan the fresh PTY;
+            // awaited, the supervisor sees the entry gone and reaps it itself.
+            let handle = old.supervisor.take();
             if let Some(pty_id) = old.pty_id {
                 self.pty.kill(pty_id).await;
+            }
+            if let Some(handle) = handle {
+                let _ = handle.await;
             }
         }
         let def = Script {
@@ -386,11 +411,18 @@ impl ScriptManager {
         let Some(mut managed) = removed else {
             return Err(Error::NotFound(format!("script {script_id}")));
         };
-        if let Some(handle) = managed.supervisor.take() {
-            handle.abort();
-        }
+        // Cooperative teardown (monorepo#1180): kill the recorded PTY, then
+        // *await* the supervisor instead of aborting it. An abort could land
+        // in the pre-registration window (after `pty.spawn`, before
+        // `mark_running` records the id) and orphan the fresh PTY; awaited,
+        // the supervisor sees the entry gone and reaps it itself. No lock is
+        // held across these awaits (the entry was already taken above).
+        let handle = managed.supervisor.take();
         if let Some(pty_id) = managed.pty_id {
             self.pty.kill(pty_id).await;
+        }
+        if let Some(handle) = handle {
+            let _ = handle.await;
         }
         self.store.remove_script(script_id).await?;
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -478,10 +510,22 @@ impl ScriptManager {
         let ws = workspace_id.clone();
         let sid = script_id.to_string();
         let handle = tokio::spawn(async move { mgr.supervise(ws, sid, def).await });
-        if let Some(m) = self.scripts.lock().unwrap().get_mut(&key) {
-            m.supervisor = Some(handle);
-        } else {
-            handle.abort();
+        let orphan = {
+            let mut guard = self.scripts.lock().unwrap();
+            match guard.get_mut(&key) {
+                Some(m) => {
+                    m.supervisor = Some(handle);
+                    None
+                }
+                None => Some(handle),
+            }
+        };
+        // Removed concurrently between spawn and registration: *await* the
+        // supervisor (outside the lock) instead of aborting it (monorepo#1180)
+        // — `mark_running` finds the entry gone and the supervisor reaps any
+        // PTY it spawned before returning.
+        if let Some(handle) = orphan {
+            let _ = handle.await;
         }
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
@@ -688,6 +732,12 @@ impl ScriptManager {
                 }
             };
             prev = Some(pty_id);
+            // Test seam (monorepo#1180): park here so a test can drive a
+            // concurrent teardown while the fresh PTY is not yet recorded.
+            if let Some(park) = &self.supervise_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
             let started = Instant::now();
             if !self.mark_running(&ws, &script_id, pty_id).await {
                 self.pty.kill(pty_id).await;
@@ -2284,6 +2334,186 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    // ---- teardown vs. pre-registration window (monorepo#1180) --------------
+
+    /// Removes the pidfile a parked script wrote once the test drops it.
+    struct PidFile(PathBuf);
+    impl Drop for PidFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A service script parked in `supervise()`'s pre-registration window:
+    /// its PTY is spawned (pid captured via the pidfile) but the registry does
+    /// not yet record the `PtyId`.
+    struct ParkedScript {
+        services: Services,
+        park: Arc<SupervisePark>,
+        id: String,
+        pid: i64,
+        _pidfile: PidFile,
+    }
+
+    /// Start a service through park-enabled services and hold `supervise()`
+    /// inside the window after `pty.spawn`, before `mark_running`.
+    async fn start_parked_service(h: &Harness) -> ParkedScript {
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let pidfile = std::env::temp_dir().join(format!(
+            "intentd-scriptops-pid-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let cmd = format!("echo $$ > \"{}\" && exec sleep 3600", pidfile.display());
+        let id = create_simple(h, "parked", &cmd, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("supervise entered the pre-registration window");
+        let pid = read_pid(&pidfile).await;
+        ParkedScript {
+            services,
+            park,
+            id,
+            pid,
+            _pidfile: PidFile(pidfile),
+        }
+    }
+
+    /// Poll the pidfile until the spawned shell has written its pid.
+    async fn read_pid(path: &std::path::Path) -> i64 {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if let Ok(pid) = s.trim().parse::<i64>() {
+                    return pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pidfile never written"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn pid_alive(pid: i64) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// The process spawned inside the window must die — no orphan (kill -0
+    /// eventually fails; hard-fails at the liveness bound on a leak).
+    async fn assert_reaped(pid: i64, context: &str) {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while pid_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "script process {pid} still alive {context}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until the teardown under test has taken the registry entry (or,
+    /// pre-fix, already finished outright) before releasing the park.
+    async fn await_entry_taken<T>(
+        h: &Harness,
+        p: &ParkedScript,
+        task: &tokio::task::JoinHandle<T>,
+    ) {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let gone = matches!(
+                p.services.script_status(h.ws.clone(), p.id.clone()).await,
+                Err(Error::NotFound(_))
+            );
+            if gone || task.is_finished() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "teardown never took the registry entry"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Regression (monorepo#1180): `script.remove` racing `supervise()`'s
+    /// pre-registration window (PTY spawned, id not yet recorded) must still
+    /// reap the fresh PTY. Pre-fix, `remove()` aborted the supervisor at that
+    /// await point and the process leaked forever.
+    #[tokio::test]
+    async fn script_remove_in_pre_registration_window_reaps_fresh_pty() {
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let rm = tokio::spawn(async move { services.script_remove(ws, sid).await });
+        await_entry_taken(&h, &p, &rm).await;
+        p.park.release.notify_one();
+        let res = tokio::time::timeout(LIVENESS, rm)
+            .await
+            .expect("remove returned before deadline")
+            .expect("join")
+            .expect("remove ok");
+        assert_eq!(res["ok"], true);
+        assert_reaped(p.pid, "after script.remove in the pre-registration window").await;
+        assert!(
+            h.services.pty().list_scope(h.ws.as_str()).is_empty(),
+            "no PTY session left registered for the workspace"
+        );
+    }
+
+    /// Regression (monorepo#1180): a `script.create` upsert racing the same
+    /// window must also reap the old supervisor's fresh PTY before installing
+    /// the new definition.
+    #[tokio::test]
+    async fn script_create_upsert_in_pre_registration_window_reaps_fresh_pty() {
+        let h = harness().await;
+        let p = start_parked_service(&h).await;
+        let services = p.services.clone();
+        let ws = h.ws.clone();
+        let sid = p.id.clone();
+        let up = tokio::spawn(async move {
+            services
+                .script_create(
+                    ws,
+                    ScriptCreateParams {
+                        name: "replaced".into(),
+                        command: "echo hi".into(),
+                        mode: ScriptMode::Command,
+                        script_id: Some(sid),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        await_entry_taken(&h, &p, &up).await;
+        p.park.release.notify_one();
+        let v = tokio::time::timeout(LIVENESS, up)
+            .await
+            .expect("upsert returned before deadline")
+            .expect("join")
+            .expect("upsert ok");
+        assert_eq!(v["id"].as_str(), Some(p.id.as_str()), "upsert keeps the id");
+        assert_reaped(p.pid, "after create-upsert in the pre-registration window").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), p.id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle", "fresh entry starts idle");
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently

@@ -296,6 +296,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
+    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
+    /// teardown races are deterministic. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
+    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -504,6 +509,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
+            script_supervise_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -746,6 +752,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
+            self.script_supervise_park.clone(),
         )
     }
 
@@ -755,6 +762,18 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
+        self
+    }
+
+    /// Test seam (monorepo#1180): park `script.*` supervisors in their
+    /// pre-registration window so teardown-vs-registration races are
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_supervise_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_supervise_park = Some(park);
         self
     }
 
