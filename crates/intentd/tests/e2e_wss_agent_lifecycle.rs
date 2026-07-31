@@ -2871,8 +2871,12 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///  - `agent.getSession` serves the pending `attentionRequest*` session
 ///    fields and the persisted notice with `meta.kind = "discussion-request"`,
 ///    and the agent's status is NOT `error` (the turn ended normally);
-///  - the next received message retires the request: `agent:updated` with
-///    `attentionRequestCleared: true`, and the session fields are gone.
+///  - an AUTOMATIC delivery (`agent.sendToTask`, the A2A/system path) does
+///    NOT retire the request: no `attentionRequestCleared` fires and
+///    `agent.getSession` still serves the pending fields;
+///  - the next USER message (`agent.sendMessage` front door) retires the
+///    request: `agent:updated` with `attentionRequestCleared: true`, and the
+///    session fields are gone.
 #[tokio::test]
 async fn attention_request_discussion_over_wss() {
     let Some(script) = gate("WSS attention-request discussion E2E") else {
@@ -3110,11 +3114,62 @@ async fn attention_request_discussion_over_wss() {
         "notice carries the reason: {notice}"
     );
 
-    // The next received message retires the pending request: agent:updated
+    // An AUTOMATIC delivery (agent.sendToTask — same default-origin path as
+    // A2A sends and system wakes) must NOT retire the pending request: the
+    // turn runs to idle without an attentionRequestCleared, and getSession
+    // still serves the fields afterwards.
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the automatic turn's idle"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        assert!(
+            !(ev["type"] == "agent:updated"
+                && data["agentId"] == json!(agent_id)
+                && data["attentionRequestCleared"] == true),
+            "automatic delivery must not clear the attention request"
+        );
+        if ev["type"] == "agent:idle" && data["agentId"] == json!(agent_id) {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "attentionRequestKind survives the automatic delivery"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "attentionRequestReason survives the automatic delivery"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "attentionRequestTimestamp survives the automatic delivery"
+    );
+
+    // The next USER message retires the pending request: agent:updated
     // with attentionRequestCleared, and the session fields are gone.
     let sent = wss_rpc(
         &mut rpc,
-        14,
+        16,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up" }),
     )
@@ -3136,7 +3191,7 @@ async fn attention_request_discussion_over_wss() {
     }
     let got = wss_rpc(
         &mut rpc,
-        15,
+        17,
         "agent.getSession",
         json!({ "agentId": agent_id, "workspaceId": ws_id }),
     )
