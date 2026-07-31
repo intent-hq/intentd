@@ -10,16 +10,13 @@ permissions:
   pull-requests: read
 
 env:
-  # Burst the Linux jobs to WarpBuild when more than this many Linux
-  # jobs are queued/running ahead of this run (see the route job). Note
-  # that jobs still blocked on `needs` are invisible to the jobs API, so
-  # a queued run ahead of us counts only its utility jobs (pr-title /
-  # conflict-markers / deb-packaging when routed to tinybox) — one fully
-  # queued PR run is already enough to clear this threshold, which is
-  # intended: it means tinybox is at least one full run behind. Bursted
-  # jobs (utility included) don't carry the self-hosted+Linux labels and
-  # stop counting toward the depth, so the system naturally falls back
-  # to tinybox as it frees up.
+  # Burst the Linux jobs to GitHub-hosted larger runners when more than
+  # this many Linux jobs are queued/running ahead of this run (see the
+  # route job). Note that jobs still blocked on `needs` are invisible to
+  # the jobs API, so only check/coverage jobs already released to tinybox
+  # (queued or running there) count toward the depth. Bursted jobs don't
+  # carry the self-hosted+Linux labels and stop counting toward the
+  # depth, so the system naturally falls back to tinybox as it frees up.
   LINUX_BURST_THRESHOLD: 2
 
 # The heavy jobs share a single self-hosted runner slot and serialize, so
@@ -30,30 +27,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the Linux jobs — heavy (check / coverage-e2e /
-  # coverage-all) and utility (pr-title / conflict-markers / deb-packaging)
-  # — run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. Runs on a small WarpBuild ephemeral
-  # runner so the burst decision is independent of the tinybox queue: when
-  # the probe ran on tinybox it queued behind the very backlog it measures
-  # (and deadlocked entirely with tinybox offline). The probe fails open to
+  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all)
+  # run: the local tinybox runner normally, or GitHub-hosted larger runners
+  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
+  # the burst decision is independent of the tinybox queue: when the probe
+  # ran on tinybox it queued behind the very backlog it measures (and
+  # deadlocked entirely with tinybox offline). The probe fails open to
   # tinybox on API errors; if the job itself fails (runner outage, timeout),
   # the routed jobs are skipped and need a re-run — a deliberate trade-off.
   # The mac build is intentionally not routed — it stays pinned to m1mac.
   route:
-    runs-on: warp-ubuntu-latest-x64-2x
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
       # Reads the Actions queue; job-level so the other jobs don't inherit
-      # it. The probe (and the optional cross-repo CI_QUEUE_READ_TOKEN)
-      # now runs on third-party WarpBuild ephemeral runners — an accepted
-      # trade-off.
+      # it (the optional cross-repo CI_QUEUE_READ_TOKEN is likewise only
+      # exposed to this job).
       actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
-      utility_labels: ${{ steps.decide.outputs.utility_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
     steps:
       - id: decide
@@ -70,22 +64,20 @@ jobs:
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
-            // The coverage jobs run the whole instrumented suite and are
-            // sized to 32 vCPUs; check (fmt + clippy + a couple of tests)
-            // doesn't come close to saturating that, so it bursts to a
-            // cheaper 16x runner instead.
-            const burst = ["warp-ubuntu-latest-x64-32x"];
-            const checkBurst = ["warp-ubuntu-latest-x64-16x"];
-            // The utility jobs (pr-title / conflict-markers / deb-packaging)
-            // are seconds-long; a 2x runner is plenty when bursting.
-            const utilityBurst = ["warp-ubuntu-latest-x64-2x"];
+            // The coverage jobs run the whole instrumented suite, so they
+            // burst to the biggest GH-hosted Linux runner (16-core); check
+            // (fmt + clippy + a couple of tests) doesn't come close to
+            // saturating that, so it bursts to a cheaper 8-core runner
+            // instead.
+            const burst = ["gh-linux-16x"];
+            const checkBurst = ["gh-linux-8x"];
             const threshold = parseInt(process.env.THRESHOLD || "2", 10);
             // Count self-hosted Linux jobs that are queued or running in
             // queued/in-progress runs: a running job occupies the single
-            // tinybox slot just as much as a queued one. WarpBuild jobs —
-            // including this route job and bursted heavy jobs — don't match
-            // the self-hosted+Linux label filter, so they never inflate the
-            // depth.
+            // tinybox slot just as much as a queued one. GitHub-hosted jobs
+            // — including this route job and bursted heavy jobs — don't
+            // match the self-hosted+Linux label filter, so they never
+            // inflate the depth.
             const owner = context.repo.owner;
             const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
@@ -106,7 +98,6 @@ jobs:
             core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
-            core.setOutput("utility_labels", JSON.stringify(useBurst ? utilityBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
 
   check:
@@ -149,13 +140,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-check
+          shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -254,8 +245,9 @@ jobs:
       # 32 (not 64) on the 64-core tinybox: at 64 threads the latency-bound
       # stress tests (e.g. e2e_wss_pool_contention_stress's <2s read assert)
       # blow their wall-clock bounds under llvm-cov load on both nextest
-      # tries. 32 keeps the box saturated without the latency spikes.
-      NEXTEST_TEST_THREADS: 32
+      # tries. 32 keeps the box saturated without the latency spikes. When
+      # bursting, match the 16-core gh-linux-16x runner instead.
+      NEXTEST_TEST_THREADS: ${{ needs.route.outputs.linux_burst == 'true' && '16' || '32' }}
     steps:
       - uses: actions/checkout@v7
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -282,13 +274,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-coverage-e2e
+          shared-key: gh-burst-coverage-e2e
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
@@ -336,7 +328,8 @@ jobs:
       # that even the nextest retry fails (concurrent_writes_no_sqlite_busy
       # hit "database is locked" on both tries, bridge/auto-commit timing
       # tests timed out). 32 keeps the box saturated without the lock storms.
-      NEXTEST_TEST_THREADS: 32
+      # When bursting, match the 16-core gh-linux-16x runner instead.
+      NEXTEST_TEST_THREADS: ${{ needs.route.outputs.linux_burst == 'true' && '16' || '32' }}
     steps:
       - uses: actions/checkout@v7
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -363,13 +356,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-coverage-all
+          shared-key: gh-burst-coverage-all
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
@@ -404,8 +397,7 @@ jobs:
           retention-days: 3
 
   pr-title:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -430,8 +422,7 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
@@ -472,12 +463,11 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Routed like the other utility jobs: tinybox (Ubuntu 22.04) normally,
-  # a WarpBuild 2x runner when bursting — both have the required
-  # dpkg-deb / tar+xz toolchain preinstalled.
+  # Seconds-long like the other utility jobs, so it runs directly on
+  # ubuntu-latest, which has the required dpkg-deb / tar+xz toolchain
+  # preinstalled.
   deb-packaging:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
