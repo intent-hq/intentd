@@ -1293,6 +1293,20 @@ impl Services {
         // rehydrating via agent.list/agent.get after the failure event still
         // sees the corrupted flag.
         let session_corrupted = self.session_poisoned(&session);
+        // Live-turn overlay: while a worker is draining an in-flight turn,
+        // derive `lastAgentResponse`/`digest` from the live slot's streamed
+        // text blocks so `agent.get`/`agent.list` track the
+        // turn instead of staying pinned on the previous turn's persisted
+        // preview. Per-field: a turn that has streamed no text yet (or no
+        // digest yet) yields `None` for that field and the persisted-preview
+        // value is kept.
+        let live_overlay = if is_responding {
+            self.live_turn(&session.id).map(|live| {
+                last_response_and_digest_from_blocks(&text_blocks(&Value::Array(live.blocks)))
+            })
+        } else {
+            None
+        };
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1301,6 +1315,14 @@ impl Services {
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
         lite.session_corrupted = session_corrupted;
+        if let Some((live_response, live_digest)) = live_overlay {
+            if live_response.is_some() {
+                lite.last_agent_response = live_response;
+            }
+            if live_digest.is_some() {
+                lite.digest = live_digest;
+            }
+        }
         lite
     }
 

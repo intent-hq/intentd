@@ -1155,6 +1155,187 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     assert!(reset, "turn-liveness fields reset after the turn ends");
 }
 
+/// Live-turn preview overlay over WSS: while a turn is in flight, `agent.get`
+/// and `agent.list` derive `lastAgentResponse` from the live-turn slot's
+/// streamed text instead of the persisted preview. The mock's first turn
+/// streams "streaming-before-cancel" and parks with NOTHING persisted for the
+/// turn, so a non-null `lastAgentResponse` mid-turn can only come from the
+/// overlay. After the interrupted flush + a resumed turn completes, the
+/// projection falls back to the newest persisted preview.
+#[tokio::test]
+async fn agent_lite_live_turn_preview_overlay_over_wss() {
+    let Some(script) = gate("WSS live-turn preview overlay E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Overlay", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // First turn streams its chunk and parks at session/cancel.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // Mid-turn, nothing is persisted for this turn (and no previous turn
+    // exists), so the streamed text can only be served by the live-turn
+    // overlay. Poll briefly: the slot is stamped on the chunk path.
+    let mut mid_turn: Option<Value> = None;
+    for i in 0..40 {
+        let got = wss_rpc(
+            &mut rpc,
+            20 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["lastAgentResponse"].as_str() == Some("streaming-before-cancel") {
+            mid_turn = Some(got["agent"].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mid_turn = mid_turn.expect("mid-turn agent.get served the live-turn overlay");
+    assert_eq!(
+        mid_turn["isResponding"], true,
+        "overlay only applies while responding: {mid_turn}"
+    );
+    // No digest streamed and none persisted → omitted.
+    assert!(
+        mid_turn.get("digest").is_none(),
+        "no digest mid-turn: {mid_turn}"
+    );
+
+    // `agent.list` serves the same overlay.
+    let list = wss_rpc(&mut rpc, 60, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let row = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == agent_id.as_str())
+        .unwrap_or_else(|| panic!("agent row in list: {list}"));
+    assert_eq!(
+        row["lastAgentResponse"].as_str(),
+        Some("streaming-before-cancel"),
+        "agent.list serves the live-turn overlay: {row}"
+    );
+
+    // Interrupt the parked turn, then resume; the second turn completes
+    // normally with "resumed turn=2".
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            break;
+        }
+    }
+    let resumed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            break;
+        }
+    }
+
+    // Once the turn ends (slot cleared, worker released) the projection is
+    // back to persisted semantics: the newest persisted assistant row wins.
+    let mut settled = false;
+    for i in 0..40 {
+        let got = wss_rpc(
+            &mut rpc,
+            70 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["isResponding"] == false {
+            assert_eq!(
+                got["agent"]["lastAgentResponse"].as_str(),
+                Some("resumed turn=2"),
+                "idle agent.get serves the persisted preview: {got}"
+            );
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(settled, "agent settled back to persisted previews");
+}
+
 /// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
 /// `priority: "interrupt"` preempts a mid-turn agent instead of queueing —
 /// the current turn is cancelled keep-alive (terminal `agent:stream:end`,
