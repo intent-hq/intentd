@@ -19295,11 +19295,11 @@ mod display_status {
     #[test]
     fn no_prs_no_tasks_is_not_started() {
         assert_eq!(
-            compute_display_status(None, &[], None),
+            compute_display_status(None, &[], None, None),
             WorkspaceDisplayStatus::NotStarted
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(0, 0, 0))),
+            compute_display_status(None, &[], None, Some(&stats(0, 0, 0))),
             WorkspaceDisplayStatus::NotStarted
         );
     }
@@ -19307,19 +19307,19 @@ mod display_status {
     #[test]
     fn no_prs_uses_pure_task_logic() {
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 0, 0))),
             WorkspaceDisplayStatus::NotStarted
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 1))),
+            compute_display_status(None, &[], None, Some(&stats(3, 0, 1))),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 1, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 1, 0))),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 3, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19329,7 +19329,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&open), &[], Some(&stats(2, 0, 1))),
+            compute_display_status(Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19338,20 +19338,20 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&open), &[], None),
+            compute_display_status(Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&draft), &[], None),
+            compute_display_status(Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(Some(&flagged), &[], None),
+            compute_display_status(Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19363,6 +19363,7 @@ mod display_status {
             compute_display_status(
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 1, 1))
             ),
             WorkspaceDisplayStatus::InProgress
@@ -19371,6 +19372,7 @@ mod display_status {
             compute_display_status(
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 0, 0))
             ),
             WorkspaceDisplayStatus::NotStarted
@@ -19383,14 +19385,14 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19402,7 +19404,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19411,11 +19413,11 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&merged), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(Some(&merged), &[], None),
+            compute_display_status(Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19426,7 +19428,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19435,12 +19437,102 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&closed), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&closed), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(Some(&closed), &[], None),
+            compute_display_status(Some(&closed), &[], None, None),
             WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Open), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Draft), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_wins_over_open_tasks() {
+        // The pr_status fallback is a step-1 PR-stage signal: it precedes the
+        // open-tasks check, so in-progress or not-started tasks never mask it.
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_participates_in_merged_check() {
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_never_masks_open_tasks() {
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn pr_info_objects_take_precedence_over_pr_status() {
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&ready), &[], Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrReady
+        );
+        let list = vec![ready];
+        assert_eq!(
+            compute_display_status(None, &list, Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrReady
         );
     }
 }
