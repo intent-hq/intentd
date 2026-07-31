@@ -401,9 +401,17 @@ mod tests {
                     if get_volume_id(p).is_none_or(|v| v == src_vol) {
                         return false;
                     }
-                    let marker = p.join(".cow_clone_force_writable_probe");
+                    let marker = p.join(format!(
+                        ".cow_clone_force_writable_probe_{}",
+                        std::process::id()
+                    ));
+                    if marker.exists() {
+                        return false;
+                    }
                     let writable = fs::write(&marker, b"w").is_ok();
-                    let _ = fs::remove_file(&marker);
+                    if writable {
+                        let _ = fs::remove_file(&marker);
+                    }
                     writable
                 })
             })
