@@ -77,11 +77,23 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     let _ = stream.write_all(&body);
 }
 
-/// A base URL whose port refuses connections (network down).
+/// A base URL whose port refuses requests (network down).
+///
+/// The listener stays bound for the life of the process and a detached
+/// thread accepts each connection and immediately drops it, so the sitter's
+/// update check deterministically fails. Binding and then dropping the
+/// listener (the previous approach) released the ephemeral port back to the
+/// OS, which could reassign it to a sibling test's fixture server before the
+/// sitter connected — turning the "dead" URL into a live one under parallel
+/// test load (intent-hq/monorepo#1211).
 fn dead_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
     url
 }
 
