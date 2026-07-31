@@ -1344,8 +1344,9 @@ impl Services {
         // derive `lastAgentResponse`/`digest` from the live slot's streamed
         // text blocks so `agent.get`/`agent.list` track the
         // turn instead of staying pinned on the previous turn's persisted
-        // preview. The live variant clips the still-streaming trailing
-        // partial line, so the overlay only ever surfaces completed lines.
+        // preview. The live variant clips the trailing partial line only
+        // while the final text block is still streaming; a final block
+        // closed by a tool-call boundary surfaces its last line unclipped.
         // Per-field: a turn that has streamed no completed line yet (or no
         // digest yet) yields `None` for that field and the persisted-preview
         // value is kept.
