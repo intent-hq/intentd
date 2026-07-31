@@ -27,6 +27,7 @@ use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
     fetch_auggie_models, fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows,
+    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
     parse_model_list_json, parse_model_list_output, parse_session_stats_output,
     resolve_auggie_bin_with, static_models,
 };
@@ -1671,7 +1672,9 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
         .expect("append");
 
     // Mid-turn (busy worker + slot with streamed text): the overlay wins and
-    // the last non-empty line of the live text is served.
+    // the last COMPLETED line of the live text is served — the trailing
+    // "Latest streamed line" has no newline yet, so it is clipped as a
+    // still-streaming partial.
     svc.set_test_busy(&id, true);
     svc.set_live_turn(
         &id,
@@ -1683,10 +1686,7 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
         })],
     );
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(
-        got.last_agent_response.as_deref(),
-        Some("Latest streamed line")
-    );
+    assert_eq!(got.last_agent_response.as_deref(), Some("Working on it"));
     // No digest streamed yet → the persisted digest is retained (per-field
     // fallback).
     assert_eq!(got.digest.as_deref(), Some("old digest"));
@@ -1694,10 +1694,27 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
     let agents = svc.agent_list_op(ws.clone()).await.expect("list");
     assert_eq!(
         agents[0].last_agent_response.as_deref(),
-        Some("Latest streamed line")
+        Some("Working on it")
     );
 
-    // A digest inside the live text is extracted and wins too.
+    // A turn whose streamed text has no newline at all yet is entirely a
+    // partial line → the persisted lastAgentResponse is retained.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "still streaming the very first line",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
+    assert_eq!(got.digest.as_deref(), Some("old digest"));
+
+    // A digest whose closing tag has streamed is extracted and wins even
+    // though it sits on the (clipped) trailing partial line; the response
+    // comes from the completed lines only.
     svc.set_live_turn(
         &id,
         "msg-live",
@@ -1733,6 +1750,64 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
     let got = svc.agent_get_op(id, None).await.expect("get");
     assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
     assert_eq!(got.digest.as_deref(), Some("old digest"));
+}
+
+/// Mid-turn preview derivation clips the still-streaming trailing partial
+/// line: only completed (newline-terminated) lines surface, a pre-newline
+/// turn omits the response, and a partial `<agent_digest>` span never leaks —
+/// while the terminal derivation is unaffected.
+#[test]
+fn live_preview_derivation_clips_trailing_partial_line() {
+    let blocks = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+    // Completed lines advance; the trailing partial line is excluded.
+    let (resp, digest) =
+        live_response_and_digest_from_blocks(&blocks(&["First done\nSecond done\npartial tail"]));
+    assert_eq!(resp.as_deref(), Some("Second done"));
+    assert_eq!(digest, None);
+
+    // A newline-terminated final line is complete and served.
+    let (resp, _) = live_response_and_digest_from_blocks(&blocks(&["First done\nSecond done\n"]));
+    assert_eq!(resp.as_deref(), Some("Second done"));
+
+    // Pre-newline turn (no completed line anywhere) omits the field.
+    let (resp, digest) = live_response_and_digest_from_blocks(&blocks(&["no newline yet"]));
+    assert_eq!(resp, None);
+    assert_eq!(digest, None);
+    assert_eq!(live_response_and_digest_from_blocks(&[]), (None, None));
+
+    // Only the FINAL block is mid-stream: an earlier block without a trailing
+    // newline was closed by a block boundary and still serves its last line.
+    let (resp, _) =
+        live_response_and_digest_from_blocks(&blocks(&["Block one final", "streaming partial"]));
+    assert_eq!(resp.as_deref(), Some("Block one final"));
+
+    // A partial trailing digest span never leaks — neither as digest (no
+    // closing tag yet) nor as response text.
+    let (resp, digest) =
+        live_response_and_digest_from_blocks(&blocks(&["Answer line\n<agent_digest>par"]));
+    assert_eq!(resp.as_deref(), Some("Answer line"));
+    assert_eq!(digest, None);
+    // Same when the unclosed span itself contains newlines: the cleaning
+    // strips the unclosed opener to end-of-text.
+    let (resp, digest) =
+        live_response_and_digest_from_blocks(&blocks(&["Answer line\n<agent_digest>par\ntial"]));
+    assert_eq!(resp.as_deref(), Some("Answer line"));
+    assert_eq!(digest, None);
+
+    // A digest whose closing tag has streamed surfaces immediately, even
+    // without a trailing newline.
+    let (resp, digest) = live_response_and_digest_from_blocks(&blocks(&[
+        "Answer line\n<agent_digest>done</agent_digest>",
+    ]));
+    assert_eq!(resp.as_deref(), Some("Answer line"));
+    assert_eq!(digest.as_deref(), Some("done"));
+
+    // Terminal/persisted derivation is unchanged: the trailing line counts.
+    let (resp, digest) =
+        last_response_and_digest_from_blocks(&blocks(&["First done\nfinal line no newline"]));
+    assert_eq!(resp.as_deref(), Some("final line no newline"));
+    assert_eq!(digest, None);
 }
 
 /// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
