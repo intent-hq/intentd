@@ -304,6 +304,43 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
+/// Poll `agent.getSession` until the session reports `want`, returning the
+/// settled snapshot. `agent:idle` is published inside the turn body BEFORE the
+/// worker's `end_turn()` persists the status row (intent-hq/monorepo#1159), so
+/// a read landing right after the event can still see the previous status on a
+/// loaded host — poll with a hard deadline instead of asserting the first
+/// snapshot. Fresh JSON-RPC ids per iteration: `wss_rpc` matches replies by id.
+async fn await_session_status<S>(
+    ws: &mut WebSocketStream<S>,
+    ws_id: &str,
+    agent_id: &str,
+    want: &str,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut rpc_id = 900i64;
+    loop {
+        rpc_id += 1;
+        let snapshot = wss_rpc(
+            ws,
+            rpc_id,
+            "agent.getSession",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if snapshot["session"]["status"] == want {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session {want} after warn-and-continue: last snapshot {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Serialize the messages of an `agent.getConversation` result into
 /// per-message `(role, contentBlocks-as-string)` pairs for text assertions.
 fn conversation_texts(conv: &Value) -> Vec<(String, String)> {
@@ -505,17 +542,9 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     );
 
     // The session settled idle with no stop reason, and nothing was requeued.
-    let session = wss_rpc(
-        &mut rpc,
-        13,
-        "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(
-        session["session"]["status"], "idle",
-        "session idle after warn-and-continue: {session}"
-    );
+    // Deadline-polled: agent:idle fires before the status row persists
+    // (intent-hq/monorepo#1159), so the first read may still say "active".
+    let session = await_session_status(&mut rpc, &ws_id, &agent_id, "idle").await;
     assert!(
         session["session"]["stopReason"].is_null(),
         "no stopReason after warn-and-continue: {session}"
