@@ -109,14 +109,18 @@ pub enum NoteVisibility {
 }
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
-/// the BE-owned "current cycle" status rollup over the active/latest PR and
-/// `taskStats`. Wire values are the snake_case variant names, matching the FE
-/// union exactly.
+/// the BE-owned "current cycle" status rollup over the active/latest PR,
+/// `taskStats`, and live agent activity. Wire values are the snake_case
+/// variant names, matching the FE union exactly. A running agent promotes
+/// the rollup to `InProgress`; without one, a task-stage rollup
+/// (`InProgress`/`NotStarted`) demotes to `Idle` — so `NotStarted` and the
+/// task-derived `InProgress` never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
     NotStarted,
     InProgress,
+    Idle,
     Complete,
     PrReady,
     PrOpen,

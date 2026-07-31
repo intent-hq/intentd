@@ -540,7 +540,8 @@ async fn task_completion_transition_over_wss() {
     assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
 
     // The emit path derives displayStatus on get/list (also seeding the
-    // last-observed cache for the transition below).
+    // last-observed cache for the transition below). No agent is running,
+    // so the task-stage rollup reads as idle.
     let got = wss_rpc(
         &mut rpc,
         3,
@@ -548,7 +549,7 @@ async fn task_completion_transition_over_wss() {
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
-    assert_eq!(got["workspace"]["displayStatus"], "in_progress");
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
     let listed = wss_rpc(&mut rpc, 4, "workspace.list", json!({})).await;
     let ws_row = listed["workspaces"]
         .as_array()
@@ -556,7 +557,7 @@ async fn task_completion_transition_over_wss() {
         .iter()
         .find(|w| w["id"] == fx.ws_id.as_str())
         .expect("seeded workspace listed");
-    assert_eq!(ws_row["displayStatus"], "in_progress");
+    assert_eq!(ws_row["displayStatus"], "idle");
 
     // Subscribe on a separate connection, then complete the task.
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
@@ -616,7 +617,8 @@ async fn pr_linkage_transition_over_wss() {
     .await;
 
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    // Seed the last-observed cache over the wire (not_started; no PR yet).
+    // Seed the last-observed cache over the wire (idle: no PR yet, no tasks
+    // started, no agent running).
     let got = wss_rpc(
         &mut rpc,
         1,
@@ -624,7 +626,7 @@ async fn pr_linkage_transition_over_wss() {
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
-    assert_eq!(got["workspace"]["displayStatus"], "not_started");
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
 
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
     let sub_res = wss_rpc(

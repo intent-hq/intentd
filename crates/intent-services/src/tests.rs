@@ -487,7 +487,8 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
-    assert_eq!(row.display_status, Some(WorkspaceDisplayStatus::InProgress));
+    // No agent is running, so the task-stage rollup demotes to idle.
+    assert_eq!(row.display_status, Some(WorkspaceDisplayStatus::Idle));
     assert!(row.cow_supported.is_some(), "cowSupported populated");
     assert!(row.agent_summary.is_none(), "agentSummary omitted");
     assert!(row.diff_summary.is_none(), "diffSummary omitted");
@@ -499,7 +500,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
 
     // Wire shape: cheap aggregates present, heavy aggregates absent.
     let v = serde_json::to_value(row).unwrap();
-    assert_eq!(v["displayStatus"], "in_progress");
+    assert_eq!(v["displayStatus"], "idle");
     assert_eq!(v["taskStats"]["total"], 3);
     assert!(v["cowSupported"].is_boolean());
     assert!(v.get("agentSummary").is_none());
@@ -18485,7 +18486,9 @@ mod last_activity_events {
 
     /// Regression for STAB-N: busy→idle transition debounce (test b). An
     /// `agent_activity_end` with no re-begin MUST emit exactly one
-    /// `workspace:activity-changed { idle }` event after the debounce window.
+    /// `workspace:activity-changed { idle }` event after the debounce window
+    /// (accompanied by exactly one `workspace:displayStatus-changed { idle }`
+    /// — the derived-status demotion rides the same debounced flip).
     #[tokio::test]
     async fn idle_debounce_emits_after_window() {
         let _guard = DebounceEnvGuard::new("100");
@@ -18510,13 +18513,41 @@ mod last_activity_events {
             "no idle event before debounce window expires"
         );
 
-        // After the window expires, exactly one idle event.
+        // After the window expires, the flip lands: exactly one idle
+        // activity event plus exactly one displayStatus demotion to idle
+        // (batching/order agnostic).
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let ev_idle = recv_one(&mut sub).await;
-        assert_envelope(&ev_idle, &h.ws.0, "workspace:activity-changed");
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            let batch = timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("debounced events delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                events.push(serde_json::to_value(ev).expect("serialize event"));
+            }
+        }
+        assert_eq!(events.len(), 2, "exactly two debounced events: {events:?}");
+        for ev in &events {
+            assert_eq!(ev["workspaceId"], h.ws.0);
+        }
         assert_eq!(
-            ev_idle["data"]["activity"], "idle",
-            "idle event emitted after debounce window"
+            events
+                .iter()
+                .filter(|ev| ev["type"] == "workspace:activity-changed"
+                    && ev["data"]["activity"] == "idle")
+                .count(),
+            1,
+            "one idle activity event after debounce window: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev["type"] == "workspace:displayStatus-changed"
+                    && ev["data"]["displayStatus"] == "idle")
+                .count(),
+            1,
+            "one displayStatus idle demotion after debounce window: {events:?}"
         );
 
         // workspace_activity() now reports Idle.
@@ -19298,33 +19329,80 @@ mod display_status {
     }
 
     #[test]
-    fn no_prs_no_tasks_is_not_started() {
+    fn no_prs_no_tasks_is_idle() {
         assert_eq!(
-            compute_display_status(None, &[], None, None),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, None),
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(None, &[], None, Some(&stats(0, 0, 0))),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, Some(&stats(0, 0, 0))),
+            WorkspaceDisplayStatus::Idle
         );
     }
 
     #[test]
-    fn no_prs_uses_pure_task_logic() {
+    fn no_prs_task_stage_demotes_to_idle_without_agent() {
+        // The base rollup is in_progress / not_started, but without a
+        // running agent the task-stage statuses demote to idle.
         assert_eq!(
-            compute_display_status(None, &[], None, Some(&stats(3, 0, 0))),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 0))),
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(None, &[], None, Some(&stats(3, 0, 1))),
+            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 1))),
+            WorkspaceDisplayStatus::Idle
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(3, 1, 0))),
+            WorkspaceDisplayStatus::Idle
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+    }
+
+    #[test]
+    fn running_agent_promotes_to_in_progress_unconditionally() {
+        // A live agent wins over every PR/task rollup.
+        assert_eq!(
+            compute_display_status(true, None, &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], None, Some(&stats(3, 1, 0))),
+            compute_display_status(true, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::InProgress
         );
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(true, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(true, Some(&merged), &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn pr_stages_and_complete_pass_through_without_agent() {
+        // The idle demotion only applies to the task-stage rollups; PR
+        // stages and complete are untouched.
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(false, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::PrReady
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(false, Some(&merged), &[], None, None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(false, None, &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19334,7 +19412,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&open), &[], None, Some(&stats(2, 0, 1))),
+            compute_display_status(false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19343,44 +19421,48 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&open), &[], None, None),
+            compute_display_status(false, Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&draft), &[], None, None),
+            compute_display_status(false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(Some(&flagged), &[], None, None),
+            compute_display_status(false, Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
 
     #[test]
     fn merged_pr_never_masks_open_tasks() {
+        // Open tasks keep the rollup off pr_merged; without a running agent
+        // the resulting task-stage status reads as idle.
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
             compute_display_status(
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
                 None,
                 Some(&stats(3, 1, 1))
             ),
-            WorkspaceDisplayStatus::InProgress
+            WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
             compute_display_status(
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
                 None,
                 Some(&stats(3, 0, 0))
             ),
-            WorkspaceDisplayStatus::NotStarted
+            WorkspaceDisplayStatus::Idle
         );
     }
 
@@ -19390,14 +19472,14 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19409,7 +19491,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(None, &list, None, None),
+            compute_display_status(false, None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19418,11 +19500,11 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&merged), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&merged), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(Some(&merged), &[], None, None),
+            compute_display_status(false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19433,7 +19515,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(None, &list, None, None),
+            compute_display_status(false, None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19442,23 +19524,23 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&closed), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, Some(&closed), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(Some(&closed), &[], None, None),
-            WorkspaceDisplayStatus::NotStarted
+            compute_display_status(false, Some(&closed), &[], None, None),
+            WorkspaceDisplayStatus::Idle
         );
     }
 
     #[test]
     fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
         assert_eq!(
-            compute_display_status(None, &[], Some(PullRequestStatus::Open), None),
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Open), None),
             WorkspaceDisplayStatus::PrOpen
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(PullRequestStatus::Draft), None),
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Draft), None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19469,6 +19551,7 @@ mod display_status {
         // open-tasks check, so in-progress or not-started tasks never mask it.
         assert_eq!(
             compute_display_status(
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -19478,6 +19561,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -19487,6 +19571,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Draft),
@@ -19500,6 +19585,7 @@ mod display_status {
     fn pr_status_merged_participates_in_merged_check() {
         assert_eq!(
             compute_display_status(
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Merged),
@@ -19508,21 +19594,24 @@ mod display_status {
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(PullRequestStatus::Merged), None),
+            compute_display_status(false, None, &[], Some(PullRequestStatus::Merged), None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
 
     #[test]
     fn pr_status_merged_never_masks_open_tasks() {
+        // Open tasks keep the rollup off pr_merged; without a running agent
+        // the task-stage status reads as idle.
         assert_eq!(
             compute_display_status(
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Merged),
                 Some(&stats(3, 1, 1))
             ),
-            WorkspaceDisplayStatus::InProgress
+            WorkspaceDisplayStatus::Idle
         );
     }
 
@@ -19531,12 +19620,18 @@ mod display_status {
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&ready), &[], Some(PullRequestStatus::Merged), None),
+            compute_display_status(
+                false,
+                Some(&ready),
+                &[],
+                Some(PullRequestStatus::Merged),
+                None
+            ),
             WorkspaceDisplayStatus::PrReady
         );
         let list = vec![ready];
         assert_eq!(
-            compute_display_status(None, &list, Some(PullRequestStatus::Merged), None),
+            compute_display_status(false, None, &list, Some(PullRequestStatus::Merged), None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19557,7 +19652,7 @@ mod display_status_events {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{workspace, TempDb};
+    use super::{workspace, DebounceEnvGuard, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
@@ -19760,15 +19855,15 @@ mod display_status_events {
         );
     }
 
-    /// Deleting an open spec-child task note that moves the derived rollup
-    /// (in_progress → not_started once the last open task is gone) emits the
+    /// Deleting a spec-child task note that moves the derived rollup
+    /// (complete → idle once the only completed task is gone) emits the
     /// transition event: `note.delete` goes through the same
     /// recompute+maybe-emit hook as the task-status mutations.
     #[tokio::test]
     async fn task_note_delete_transition_emits() {
         let h = harness().await;
         h.store
-            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
             .await
             .expect("insert task");
         // Seed the last-observed cache (first observation never emits).
@@ -19783,7 +19878,47 @@ mod display_status_events {
         assert_eq!(ev["type"], "workspace:displayStatus-changed");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "not_started" })
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Agent activity folds into the derivation: `agent_activity_begin`
+    /// promotes the rollup to `in_progress` and emits the transition
+    /// immediately; the debounced idle flip after `agent_activity_end`
+    /// demotes it back to `idle` and emits again — in lockstep with the
+    /// `workspace:activity-changed` debounce (no early idle emission).
+    #[tokio::test]
+    async fn agent_activity_transitions_emit() {
+        let _guard = DebounceEnvGuard::new("500");
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache: no agent running → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+
+        // End the run: during the grace window the status stays in_progress
+        // (workspace_activity still reports AgentRunning) — no event yet
+        // (assert_silent's 300ms watch sits inside the 500ms window).
+        h.services.agent_activity_end(&h.ws).await;
+        assert_silent(&mut sub).await;
+
+        // After the debounce window the demotion to idle emits.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
     }
 
