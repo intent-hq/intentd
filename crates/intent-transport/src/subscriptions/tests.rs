@@ -138,7 +138,7 @@ fn chat_channel_tails_stream_family_and_message() {
     assert_eq!(
         chat,
         vec![
-            "agent:stream:chunk".to_string(),
+            "chat:stream:delta".to_string(),
             "agent:tool:call".to_string(),
             "agent:stream:end".to_string(),
             "agent:message".to_string(),
@@ -396,7 +396,7 @@ fn agent() -> AgentId {
 fn chunk_event(message_id: &str, block_id: &str, block_type: &str, content: Value) -> Event {
     Event {
         id: "evt-1".into(),
-        event_type: AGENT_STREAM_CHUNK.to_string(),
+        event_type: CHAT_STREAM_DELTA.to_string(),
         timestamp: now_iso(),
         workspace_id: WorkspaceId::from("w"),
         session_id: Some(message_id.to_string()),
@@ -1195,6 +1195,124 @@ mod chat_message_delta {
         assert_eq!(added[1]["block"]["id"], "user-msg-1:1");
         assert!(d["updated"].as_array().unwrap().is_empty());
         assert!(d["removedIds"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_row_message_entities_carry_row_metadata() {
+        // A child→coordinator send persists the user row with
+        // `metadata: { type: "agent_message", fromAgentId, fromAgentName }`
+        // (sender attribution). The live delta entities must lift that row
+        // metadata so subscribers render the sender chip with no refetch —
+        // rows without metadata keep the pre-existing entity shape (additive).
+        let metadata = json!({
+            "type": "agent_message",
+            "fromAgentId": "agent-child",
+            "fromAgentName": "Child Agent",
+        });
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "metadata": metadata,
+                    "contentBlocks": [ { "type": "text", "text": "child report" } ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added[0]["metadata"], metadata,
+            "entity must carry the persisted row metadata: {d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_row_message_without_metadata_omits_the_field() {
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        for e in d["added"].as_array().unwrap() {
+            assert!(
+                e.get("metadata").is_none(),
+                "rows without metadata keep the lean entity shape: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_row_message_entities_carry_app_message_id() {
+        // monorepo#1157: a user row persisted with a client-minted
+        // `userAppMessageId` serves it top-level as `appMessageId` on the
+        // re-read; the live delta entities must lift it so subscribers can
+        // dedup optimistic user rows by id on the delta path — every entity
+        // of the row carries it.
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "appMessageId": "app-msg-1",
+                    "contentBlocks": [
+                        { "type": "text", "text": "optimistic send" },
+                        { "type": "image", "data": "abc", "mimeType": "image/png" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 2);
+        for e in added {
+            assert_eq!(
+                e["appMessageId"], "app-msg-1",
+                "entity must carry the row's appMessageId: {d}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_row_message_without_app_message_id_omits_the_field() {
+        // Rows without a client id keep the lean entity shape — the field is
+        // omitted entirely, never serialized as null.
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        for e in d["added"].as_array().unwrap() {
+            assert!(
+                e.get("appMessageId").is_none(),
+                "rows without a client id omit appMessageId: {e}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -719,8 +719,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
             let agent_id = require_str_param(params, "agentId")?;
+            let force = opt_bool(params, "force");
             let result = api
-                .assign_agent(ws, note_id, agent_id)
+                .assign_agent(ws, note_id, agent_id, force)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1284,6 +1285,23 @@ async fn dispatch(
             };
             let result = api
                 .stats_get_usage(period, key, tz_offset_minutes)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "stats.getRateHistory" => {
+            // Global per-minute token-rate history behind the HUD TOK/MIN
+            // chart (§5.39); no workspaceId. `limit` (default 60, max 1440)
+            // is the number of trailing minute samples returned.
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_i64()
+                        .ok_or_else(|| rpc(INVALID_PARAMS, "limit must be an integer"))?,
+                ),
+            };
+            let result = api
+                .stats_get_rate_history(limit)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

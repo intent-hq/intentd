@@ -65,6 +65,7 @@ mod event_ops;
 mod event_subscriptions;
 pub mod events;
 mod file_ops;
+mod git_diff_singleflight;
 mod git_ops;
 pub mod host_exec;
 pub mod host_exec_stream;
@@ -74,6 +75,7 @@ mod github_ops;
 mod github_auth_ops;
 mod github_browse_ops;
 
+mod agent_list_cache;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
@@ -295,6 +297,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
+    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
+    /// teardown races are deterministic. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
+    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -439,6 +446,10 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Cached agent.list message projections per workspace. Invalidated on
+    /// message append / session create+delete so focus-time list bursts hit
+    /// memory instead of re-running the SQLite JSON window.
+    agent_list_cache: Arc<agent_list_cache::AgentListProjectionCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
     /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
@@ -458,6 +469,22 @@ pub struct Services {
     /// so the [`AgentManager`]'s turn worker and the delegate front doors
     /// observe the same gates.
     sandbox_provisioning: Arc<Mutex<HashMap<AgentId, tokio::sync::watch::Receiver<()>>>>,
+    /// Single-flight registry for in-flight `git.diffs` walks: concurrent
+    /// calls with an identical `(workspace_id, paths, staged, commit_hash)`
+    /// identity coalesce onto one blocking-pool libgit2 walk and share its
+    /// result; non-identical requests run independently. Shared across clones
+    /// so every service handle observes the same in-flight set.
+    git_diffs_inflight: Arc<git_diff_singleflight::DiffSingleFlight>,
+    /// Per-workspace rate limiter for the `git.diffs` "slow worktree hunk
+    /// walk" WARN: at most one WARN per workspace per 60s; further slow walks
+    /// within the window log at DEBUG so a busy workspace cannot flood
+    /// stderr. Shared across clones.
+    git_diffs_slow_warns: Arc<git_diff_singleflight::SlowWalkWarnLimiter>,
+    /// Test seam: when set, invoked on the blocking pool immediately before
+    /// each underlying `git.diffs` walk (counting + parking for coalescing
+    /// tests). Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
+    git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -499,6 +526,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
+            script_supervise_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -523,8 +551,12 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
+            git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
+            git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
+            git_diffs_walk_probe: None,
         }
     }
 
@@ -740,6 +772,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
+            self.script_supervise_park.clone(),
         )
     }
 
@@ -750,6 +783,34 @@ impl Services {
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
         self
+    }
+
+    /// Test seam (monorepo#1180): park `script.*` supervisors in their
+    /// pre-registration window so teardown-vs-registration races are
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_supervise_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_supervise_park = Some(park);
+        self
+    }
+
+    /// Test seam: observe/park the underlying `git.diffs` walk on the
+    /// blocking pool so single-flight coalescing tests are deterministic.
+    /// Production wiring keeps `None`.
+    #[cfg(test)]
+    pub(crate) fn with_git_diffs_walk_probe(mut self, probe: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.git_diffs_walk_probe = Some(probe);
+        self
+    }
+
+    /// Test seam: number of followers currently awaiting the in-flight
+    /// `git.diffs` walk for `key`.
+    #[cfg(test)]
+    pub(crate) fn git_diffs_waiters(&self, key: &git_diff_singleflight::DiffKey) -> usize {
+        self.git_diffs_inflight.waiters(key)
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -973,9 +1034,14 @@ impl Services {
         // post-read mutation compares against this baseline (a seed never
         // emits; see [`Services::maybe_emit_display_status_changed`]).
         if ws.task_stats.is_some() {
+            // Derive from the row's own `activity` (set by every caller just
+            // before enrichment) so a single response can never pair
+            // `activity: "agent_running"` with `displayStatus: "idle"`.
             let display_status = compute_display_status(
+                ws.activity == WorkspaceActivity::AgentRunning,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.pr_status,
                 ws.task_stats.as_ref(),
             );
             if let Ok(mut map) = self.last_display_statuses.lock() {
@@ -999,12 +1065,19 @@ impl Services {
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
     /// the derivation (task/note status updates, task-note deletion, PR
-    /// link/status changes) — never from a polling loop. The first
+    /// link/status changes, agent activity begin/debounced end) — never from
+    /// a polling loop. The first
     /// observation for a workspace seeds the cache without emitting (no
     /// baseline to transition from); a read
     /// failure skips the recompute entirely so a transient store error can
     /// never fake a transition. Best-effort: errors are swallowed, the
-    /// mutation's own result is the contract.
+    /// mutation's own result is the contract. Concurrent callers (e.g. the
+    /// debounced idle demotion racing an `agent_activity_begin` promotion)
+    /// can in principle invert: the compute-then-insert is not atomic, so a
+    /// stale compute inserted second would emit outdated and leave the
+    /// baseline stale until the next transition. The activity read and cache
+    /// insert have no await between them, so the window is negligible and
+    /// self-heals on the next transition.
     pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
@@ -1014,8 +1087,10 @@ impl Services {
         };
         let task_stats = compute_task_stats(&notes);
         let status = compute_display_status(
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
+            ws.pr_status,
             Some(&task_stats),
         );
         let transitioned = match self.last_display_statuses.lock() {
@@ -1234,7 +1309,10 @@ impl Services {
     /// Record an agent session entering flight for `workspace_id`. On the
     /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
     /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change)
-    /// and cancels any pending idle debounce.
+    /// and cancels any pending idle debounce. The same transition recomputes
+    /// the derived `displayStatus` (a running agent promotes it to
+    /// `in_progress`) so `workspace:displayStatus-changed` tracks live agent
+    /// state without a client-side overlay.
     pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -1256,6 +1334,7 @@ impl Services {
                 activity_changed_event(workspace_id, WorkspaceActivity::AgentRunning),
             )
             .await;
+            self.maybe_emit_display_status_changed(workspace_id).await;
         }
     }
 
@@ -1339,6 +1418,14 @@ impl Services {
 
             if should_emit {
                 // Remove debouncer entry before emitting so reads stop reporting grace.
+                // Race note: an `agent_activity_begin` that lands after the
+                // should_emit check finds no handle to abort, so the client
+                // can observe `agent_running` followed by this stale `idle`
+                // activity event (pre-existing inversion). The displayStatus
+                // recompute below is safe against it: it re-reads
+                // `workspace_activity()` at emit time (count already 1 →
+                // `in_progress`) and the dedup cache suppresses a bogus
+                // demotion.
                 if let Ok(mut map) = debouncers.lock() {
                     if let Some((current_gen, _)) = map.get(&ws_id) {
                         if *current_gen == gen {
@@ -1352,6 +1439,9 @@ impl Services {
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
                 )
                 .await;
+                // The debounced idle flip also moves the derived displayStatus
+                // (no running agent demotes a task-stage rollup to `idle`).
+                this.maybe_emit_display_status_changed(&ws_id).await;
             }
         });
 
@@ -3456,6 +3546,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await?;
+                self.invalidate_agent_list_cache(workspace_id);
                 Ok(serde_json::json!({ "success": true, "queued": false }))
             }
         }
@@ -4161,21 +4252,52 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 }
 
 /// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
-/// "Proposed representation" / "Decision: BE-owned displayStatus"):
+/// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
+/// in live agent activity (previously a client-side overlay):
+/// 0. `agent_running` → `in_progress` unconditionally: a live agent always
+///    reads as active work, whatever the PR/task rollup says.
 /// 1. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+///    When neither carries an open/draft entry but the workspace `prStatus`
+///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
+///    and yields `pr_open` (never `pr_ready`: the column carries no
+///    mergeable info).
 /// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged →
-///    `pr_merged`.
+/// 3. Latest PR (linked, else most recently updated entry) merged — or
+///    `prStatus == Merged` — → `pr_merged`.
 /// 4. All tasks complete → `complete`; else `not_started`.
+/// 5. Without a running agent, a task-stage rollup (`in_progress` /
+///    `not_started` from steps 2/4) demotes to `idle`; the PR stages and
+///    `complete` pass through unchanged.
 ///
 /// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
 /// for open/draft entries) or open tasks (step 2 precedes the merged check).
 fn compute_display_status(
+    agent_running: bool,
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
+    task_stats: Option<&WorkspaceTaskStats>,
+) -> WorkspaceDisplayStatus {
+    if agent_running {
+        return WorkspaceDisplayStatus::InProgress;
+    }
+    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+        WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
+            WorkspaceDisplayStatus::Idle
+        }
+        other => other,
+    }
+}
+
+/// PR/task-only precedence behind [`compute_display_status`] (steps 1–4);
+/// the caller applies the agent-activity promotion/demotion around it.
+fn compute_base_display_status(
+    active_pr: Option<&PullRequestInfo>,
+    pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     let is_open = |pr: &&PullRequestInfo| {
@@ -4198,6 +4320,12 @@ fn compute_display_status(
             WorkspaceDisplayStatus::PrOpen
         };
     }
+    if matches!(
+        pr_status,
+        Some(PullRequestStatus::Open | PullRequestStatus::Draft)
+    ) {
+        return WorkspaceDisplayStatus::PrOpen;
+    }
     let (total, completed, in_progress) = task_stats
         .map(|s| (s.total, s.completed, s.in_progress))
         .unwrap_or_default();
@@ -4213,7 +4341,9 @@ fn compute_display_status(
             .iter()
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
-    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
+        || pr_status == Some(PullRequestStatus::Merged)
+    {
         return WorkspaceDisplayStatus::PrMerged;
     }
     if total > 0 && completed == total {
@@ -4294,6 +4424,9 @@ fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
 /// (`{ count, agents, agentIds }`). `isStreaming`/`isResponding` are always
 /// `false` (the headless backend has no live stream state; `status` carries
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
+/// `parentAgentId` (v2.9) carries the session's delegation parent (the value
+/// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
+/// root agents.
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let agents: Vec<WorkspaceAgentInfo> = sessions
         .iter()
@@ -4305,6 +4438,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             last_activity: Some(s.updated_at.clone()),
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
     let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -6305,7 +6439,7 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
-/// `agent:stream:chunk` that do not need durable storage.
+/// `chat:stream:delta` that do not need durable storage.
 pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
     bus.as_ref().map(|b| b.publish_transient(&event))
 }
@@ -8682,8 +8816,10 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 if ws.task_stats.is_some() {
                     let display_status = compute_display_status(
+                        ws.activity == WorkspaceActivity::AgentRunning,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.pr_status,
                         ws.task_stats.as_ref(),
                     );
                     // Seed the last-observed cache when absent so the first
@@ -12741,6 +12877,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -12771,6 +12908,29 @@ impl WorkspaceApi for Services {
                     note_id,
                     agent_id: agent,
                 });
+            }
+            // Occupancy guard: assigning a NEW agent to a task that already
+            // has a live assigned agent needs `force: true`; re-assigning an
+            // already-assigned id stays idempotent-ok (handled above). Same
+            // predicate as `agent_delegate_op`'s pre-gate: newest live
+            // (loadable, not Deleted, not poisoned) assignee while the task
+            // is still workable (status not complete/cancelled).
+            if !already_assigned
+                && force != Some(true)
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+            {
+                if let Some(existing) = services
+                    .scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "Task is already being worked by agent {} (\"{}\"). \
+                         Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                         or pass force: true to intentionally assign a second agent.",
+                        existing.id, existing.name
+                    )));
+                }
             }
             let now = now_iso();
             let previous_status = task.status;
@@ -14800,6 +14960,9 @@ impl WorkspaceApi for Services {
         commit_hash: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let inflight = Arc::clone(&self.git_diffs_inflight);
+        let slow_warns = Arc::clone(&self.git_diffs_slow_warns);
+        let walk_probe = self.git_diffs_walk_probe.clone();
         Box::pin(async move {
             let empty = serde_json::json!([]);
             let ws = match store.get_workspace(&workspace_id).await {
@@ -14816,28 +14979,123 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            // Full worktree hunk diffs can run for many seconds of pure libgit2
-            // CPU. Never do that on a Tokio worker: it holds a bulk permit and
-            // can freeze the whole runtime so host.status never runs (seen as
-            // bulk permit held 5-40s with "nothing else" making progress).
-            let started = std::time::Instant::now();
-            let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
-            let result = tokio::task::spawn_blocking(move || {
-                git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
-            let elapsed = started.elapsed();
-            if elapsed.as_millis() >= 250 {
-                tracing::warn!(
-                    workspace_id = %workspace_id.as_str(),
-                    total_ms = elapsed.as_millis() as u64,
-                    staged,
-                    path_count,
-                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
-                );
+            // Defense-in-depth: absolute `paths` entries under the worktree
+            // root are stripped to their worktree-relative form so a client
+            // sending absolute paths still narrows the walk (entries outside
+            // the root pass through verbatim and match nothing, as before).
+            // This runs BEFORE the single-flight key is computed so
+            // equivalent absolute/relative requests coalesce.
+            // Sorting + deduping makes the identity order-insensitive, so
+            // clients naming the same path set in a different order (or with
+            // duplicates) still coalesce; `build_diffs` matches pathspecs as
+            // a set, so the walk itself is unaffected.
+            let paths = paths.map(|p| {
+                let mut p = git_ops::normalize_diff_paths(&worktree, p);
+                p.sort();
+                p.dedup();
+                p
+            });
+            // Concurrent calls with an identical request identity coalesce
+            // onto one walk (single-flight). `Some([])` behaves exactly like
+            // `None` in `build_diffs`, so both normalize onto the same key.
+            let paths = paths.filter(|p| !p.is_empty());
+            let key: git_diff_singleflight::DiffKey = (
+                workspace_id.clone(),
+                paths.clone(),
+                staged,
+                commit_hash.clone(),
+            );
+            loop {
+                match inflight.join(&key) {
+                    git_diff_singleflight::Join::Leader(flight) => {
+                        // Full worktree hunk diffs can run for many seconds of
+                        // pure libgit2 CPU. Never do that on a Tokio worker: it
+                        // holds a bulk permit and can freeze the whole runtime
+                        // so host.status never runs (seen as bulk permit held
+                        // 5-40s with "nothing else" making progress).
+                        let started = std::time::Instant::now();
+                        let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let walk_worktree = worktree.clone();
+                        let walk_paths = paths.clone();
+                        let walk_commit = commit_hash.clone();
+                        let probe = walk_probe.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            if let Some(probe) = &probe {
+                                probe();
+                            }
+                            git_ops::build_diffs(
+                                &walk_worktree,
+                                walk_paths.as_deref(),
+                                staged,
+                                walk_commit.as_deref(),
+                            )
+                        })
+                        .await
+                        .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
+                        let elapsed = started.elapsed();
+                        if elapsed.as_millis() >= 250 {
+                            // At most one WARN per workspace per 60s; further
+                            // slow walks within the window drop to DEBUG so a
+                            // busy workspace cannot flood stderr.
+                            if slow_warns.should_warn(&workspace_id) {
+                                tracing::warn!(
+                                    workspace_id = %workspace_id.as_str(),
+                                    total_ms = elapsed.as_millis() as u64,
+                                    staged,
+                                    path_count,
+                                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    workspace_id = %workspace_id.as_str(),
+                                    total_ms = elapsed.as_millis() as u64,
+                                    staged,
+                                    path_count,
+                                    "git.diffs: slow worktree hunk walk (WARN rate-limited; offloaded to blocking pool)"
+                                );
+                            }
+                        }
+                        return match result {
+                            Ok(value) => {
+                                flight.finish(Ok(Arc::new(value.clone())));
+                                Ok(value)
+                            }
+                            Err(e) => {
+                                // Publish the inner message: every walk error
+                                // is `Error::Internal` (map_git_err), and the
+                                // follower re-wraps as `Error::Internal`, so
+                                // coalesced callers observe the same variant
+                                // and message (no double "internal error:"
+                                // prefix).
+                                flight.finish(Err(match &e {
+                                    Error::Internal(msg) => msg.clone(),
+                                    other => other.to_string(),
+                                }));
+                                Err(e)
+                            }
+                        };
+                    }
+                    git_diff_singleflight::Join::Follower(mut rx) => {
+                        tracing::debug!(
+                            workspace_id = %workspace_id.as_str(),
+                            staged,
+                            "git.diffs: coalesced into identical in-flight walk"
+                        );
+                        match rx.wait_for(|slot| slot.is_some()).await {
+                            Ok(slot) => {
+                                return match slot.clone().expect("wait_for guarantees Some") {
+                                    Ok(shared) => Ok((*shared).clone()),
+                                    Err(msg) => Err(Error::Internal(msg)),
+                                };
+                            }
+                            // The leader vanished without publishing
+                            // (cancelled RPC / panicked walk): retry — the
+                            // next join elects a new leader.
+                            Err(_) => continue,
+                        }
+                    }
+                }
             }
-            result
         })
     }
 
@@ -15602,6 +15860,21 @@ impl WorkspaceApi for Services {
                 tz_offset_minutes,
                 time::OffsetDateTime::now_utc(),
             )
+        })
+    }
+
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let limit = usage_rate::parse_limit(limit)?;
+            let now = time::OffsetDateTime::now_utc();
+            let rows = self
+                .store
+                .list_usage_rate_since(&usage_rate::window_start(now, limit))
+                .await?;
+            Ok(usage_rate::rate_history_json(&rows, limit, now))
         })
     }
 
@@ -19916,6 +20189,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_rate;
 pub mod usage_stats;
 pub mod usage_stats_read;
 pub mod session_stats {}

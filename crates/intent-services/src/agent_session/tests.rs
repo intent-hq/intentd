@@ -8,8 +8,8 @@ use std::time::Duration;
 use intent_acp::session::{ContentBlock, InitializeResponse};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Event, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -637,31 +637,78 @@ async fn prompt_turn_streams_events_and_accumulates() {
     // Collect the published events (default filter → one event per batch).
     // The turn also emits a `prompt` status hint before the first chunk
     // (STAT-1 / PROTOCOL §7 pre-first-token status family), so expect one
-    // extra frame ahead of the chunk/tool/end/idle sequence.
-    let mut events = Vec::new();
-    while events.len() < 6 {
+    // extra frame ahead of the delta/activity/tool/end/idle sequence. The
+    // first chunk additionally emits the content-free `agent:stream:activity`
+    // signal (leading edge of the per-agent throttle); the second chunk
+    // normally lands inside the 1s window and produces a delta only, but
+    // under CI load it can slip past the window and emit a second activity
+    // signal, so the sequence assertion below drops any activity events
+    // after the first instead of hard-coding exactly one.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
             .expect("subscription open");
         events.extend(batch);
     }
-    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let mut seen_activity = false;
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e.event_type.as_str())
+        .filter(|t| {
+            if *t == "agent:stream:activity" {
+                if seen_activity {
+                    return false;
+                }
+                seen_activity = true;
+            }
+            true
+        })
+        .collect();
     assert_eq!(
         types,
         vec![
             "agent:stream:status",
-            "agent:stream:chunk",
-            "agent:stream:chunk",
+            "chat:stream:delta",
+            "agent:stream:activity",
+            "chat:stream:delta",
             "agent:tool:call",
             "agent:stream:end",
             "agent:idle",
         ],
-        "a normal turn emits the `prompt` status hint before the first chunk and exactly one agent:idle after the terminal stream:end"
+        "a normal turn emits the `prompt` status hint before the first chunk, the leading-edge activity signal on the first chunk, and exactly one agent:idle after the terminal stream:end"
+    );
+
+    // The activity signal carries identifiers plus the server-derived live
+    // preview — never the raw transcript content. The first activity fires
+    // after the first chunk ("Hello ") landed, so its preview reflects the
+    // streamed-so-far text.
+    let activity = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:activity")
+        .expect("turn emits at least one activity signal");
+    assert_eq!(activity.data["agentId"], json!("agent-1"));
+    assert!(
+        activity.data["messageId"].is_string(),
+        "activity carries the turn's messageId"
+    );
+    assert!(
+        activity.data.get("content").is_none(),
+        "activity payload never carries transcript content"
+    );
+    assert_eq!(
+        activity.data["lastAgentResponse"],
+        json!("Hello"),
+        "first activity carries the preview derived from the first chunk"
+    );
+    assert!(
+        activity.data.get("digest").is_none(),
+        "digest omitted when the streamed text has no <agent_digest> span"
     );
 
     // The pre-first-token status hint carries the "Sent prompt…" phrase and
-    // arrives BEFORE any `agent:stream:chunk` so the FE spinner can render it
+    // arrives BEFORE any `chat:stream:delta` so the FE spinner can render it
     // while the turn is starting.
     let status = &events[0];
     assert_eq!(status.event_type, "agent:stream:status");
@@ -749,11 +796,11 @@ async fn prompt_turn_streams_events_and_accumulates() {
         ])
     );
 
-    // The streaming chunk events carry the SAME stable block id across both
+    // The streaming delta events carry the SAME stable block id across both
     // text chunks; the persisted message id is the block-id prefix (D1/D4).
     let chunks: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type == "agent:stream:chunk")
+        .filter(|e| e.event_type == "chat:stream:delta")
         .collect();
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].data["blockId"], json!(format!("{mid}:0")));
@@ -767,6 +814,8 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
     // The terminal stream:end carries the turn's messageId; `trailingBlocks`
     // is omitted when no AtTurnEnd attachments were drained (monorepo#732).
+    // It also carries the FINAL preview values (the last throttled activity
+    // may have missed the response tail).
     let end = events
         .iter()
         .find(|e| e.event_type == "agent:stream:end")
@@ -775,6 +824,11 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert!(
         end.data.get("trailingBlocks").is_none(),
         "trailingBlocks omitted on a turn without AtTurnEnd attachments"
+    );
+    assert_eq!(
+        end.data["lastAgentResponse"],
+        json!("Hello world"),
+        "terminal stream:end carries the final preview from the full turn text"
     );
 }
 
@@ -927,7 +981,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let mut events = Vec::new();
-    while events.len() < 6 {
+    while events.len() < 7 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -939,8 +993,9 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
         types,
         vec![
             "agent:stream:status",
-            "agent:stream:chunk",
-            "agent:stream:chunk",
+            "chat:stream:delta",
+            "agent:stream:activity",
+            "chat:stream:delta",
             "agent:tool:call",
             "agent:stream:end",
             "agent:idle",
@@ -2017,7 +2072,8 @@ async fn post_output_transport_death_keeps_terminal_events() {
         types,
         vec![
             "agent:stream:status",
-            "agent:stream:chunk",
+            "chat:stream:delta",
+            "agent:stream:activity",
             "agent:stream:end",
             "agent:failed",
         ],
@@ -2153,7 +2209,8 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
         types,
         vec![
             "agent:stream:status",
-            "agent:stream:chunk",
+            "chat:stream:delta",
+            "agent:stream:activity",
             "agent:stream:end"
         ],
         "partial streams, normal stream:end, no agent:failed / agent:idle"
@@ -2729,4 +2786,68 @@ async fn resume_session_resolves_and_persists_effective_model() {
     assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(stored.model.as_deref(), Some("claude-code:Opus 4.8"));
+}
+
+/// `agent:stream:activity` leading-edge throttle (PROTOCOL §7): the first
+/// activity of a turn emits immediately, activity inside the 1s window is
+/// suppressed, the window elapsing re-opens the gate, and clearing the
+/// live-turn slot (stream end/failure/abort) resets the state so the next
+/// turn's first activity is immediate again.
+#[tokio::test]
+async fn activity_throttle_leading_edge_window_and_reset() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let other = AgentId::from("agent-2");
+
+    // No live-turn slot open → nothing to signal for.
+    assert!(
+        !services.should_emit_activity(&agent_id),
+        "no slot → no emission"
+    );
+
+    // Leading edge: the turn's first activity emits immediately…
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+    assert!(
+        services.should_emit_activity(&agent_id),
+        "first activity of a turn emits immediately"
+    );
+    // …and activity inside the window is suppressed.
+    assert!(
+        !services.should_emit_activity(&agent_id),
+        "second activity within 1s is suppressed"
+    );
+    assert!(
+        !services.should_emit_activity(&agent_id),
+        "still suppressed within the window"
+    );
+
+    // Per-agent state: another agent's turn throttles independently.
+    services.set_live_turn(&other, "m2", Vec::new());
+    assert!(
+        services.should_emit_activity(&other),
+        "another agent's first activity is unaffected"
+    );
+
+    // The window elapsing re-opens the gate.
+    tokio::time::sleep(super::ACTIVITY_THROTTLE + Duration::from_millis(50)).await;
+    assert!(
+        services.should_emit_activity(&agent_id),
+        "activity after the window emits again"
+    );
+    assert!(
+        !services.should_emit_activity(&agent_id),
+        "the re-emission re-arms the window"
+    );
+
+    // Turn end/failure clears the slot → the next turn's first activity is
+    // immediate again (no leftover window from the previous turn).
+    services.clear_live_turn(&agent_id);
+    assert!(
+        !services.should_emit_activity(&agent_id),
+        "no slot after clear"
+    );
+    services.set_live_turn(&agent_id, "m3", Vec::new());
+    assert!(
+        services.should_emit_activity(&agent_id),
+        "throttle state reset with the slot: next turn leads immediately"
+    );
 }

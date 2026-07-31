@@ -461,6 +461,20 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
+  // Per-prompt exit: die mid-prompt whenever the prompt text carries the
+  // configured marker (unconditional — every redrive of the marked prompt
+  // dies again, so the silent-redrive budget is spent and the failure goes
+  // terminal). Lets one MOCK_AGENT_BEHAVIOR drive a healthy delegating parent
+  // (no match) and a child whose delegated instructions carry the marker and
+  // must fail terminally (agent:failed).
+  if (
+    typeof behavior.exitIfPromptContains === 'string' &&
+    behavior.exitIfPromptContains.length > 0 &&
+    promptText.includes(behavior.exitIfPromptContains)
+  ) {
+    log(`exiting during prompt (marker "${behavior.exitIfPromptContains}" matched)`);
+    process.exit(1);
+  }
   const active = selectBehavior(behavior, promptText);
   // Bridge-concurrency probe (monorepo#871): { longCallCode, releaseFile }.
   // On success the turn resolves with the probe stats stamped into the text

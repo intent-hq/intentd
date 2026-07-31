@@ -344,7 +344,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.8",
+        sess[0]["result"]["protocolVersion"], "2.9",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1995,6 +1995,137 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
 }
 
 #[tokio::test]
+async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
+    // stats.getRateHistory (§5.39): the global per-minute token-rate history
+    // behind the HUD TOK/MIN chart. Seed minute buckets straight into the
+    // store — current minute, two minutes back, and one outside a 5-sample
+    // window — then read over the real WSS path and assert the documented
+    // zero-filled, chronological result shape.
+    let srv = start(WsOptions::default()).await;
+
+    use chrono::{Duration as ChronoDuration, Utc};
+    let now = Utc::now();
+    let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:00Z").to_string();
+    srv.store
+        .add_usage_rate(
+            &bucket_key(now),
+            &intent_store::UsageRateDelta {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_tokens: 20,
+                cache_creation_tokens: 10,
+            },
+        )
+        .await
+        .expect("seed current minute");
+    // Second fold into the same bucket must accumulate, not replace.
+    srv.store
+        .add_usage_rate(
+            &bucket_key(now),
+            &intent_store::UsageRateDelta {
+                input_tokens: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fold current minute");
+    srv.store
+        .add_usage_rate(
+            &bucket_key(now - ChronoDuration::minutes(2)),
+            &intent_store::UsageRateDelta {
+                input_tokens: 7,
+                output_tokens: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed minute-2 bucket");
+    srv.store
+        .add_usage_rate(
+            &bucket_key(now - ChronoDuration::minutes(30)),
+            &intent_store::UsageRateDelta {
+                input_tokens: 999,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed out-of-window bucket");
+
+    let frame = r#"{"jsonrpc":"2.0","id":20,"method":"stats.getRateHistory","params":{"limit":5}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 20);
+    assert!(resp.get("error").is_none(), "{resp}");
+    let samples = resp["result"]["samples"].as_array().expect("samples");
+    assert_eq!(samples.len(), 5, "{resp}");
+    // Chronological order, one sample per minute, every field present.
+    for s in samples {
+        assert!(s["bucketUtc"].is_string(), "{s}");
+        assert!(s["inputTokens"].is_u64(), "{s}");
+        assert!(s["outputTokens"].is_u64(), "{s}");
+        assert!(s["cacheReadTokens"].is_u64(), "{s}");
+        assert!(s["cacheCreationTokens"].is_u64(), "{s}");
+    }
+    let buckets: Vec<&str> = samples
+        .iter()
+        .map(|s| s["bucketUtc"].as_str().expect("bucketUtc"))
+        .collect();
+    let mut sorted = buckets.clone();
+    sorted.sort_unstable();
+    assert_eq!(buckets, sorted, "samples must be oldest-first: {resp}");
+    // The seeded minutes land in their buckets (the newest sample is the
+    // current minute unless the wall clock ticked mid-test, so locate rows
+    // by bucket key rather than by index).
+    let find = |key: &str| samples.iter().find(|s| s["bucketUtc"] == key);
+    if let Some(cur) = find(&bucket_key(now)) {
+        assert_eq!(cur["inputTokens"], 101, "{resp}");
+        assert_eq!(cur["outputTokens"], 40, "{resp}");
+        assert_eq!(cur["cacheReadTokens"], 20, "{resp}");
+        assert_eq!(cur["cacheCreationTokens"], 10, "{resp}");
+    } else {
+        panic!("current-minute bucket missing from window: {resp}");
+    }
+    let mid = find(&bucket_key(now - ChronoDuration::minutes(2)))
+        .expect("minute-2 bucket inside the window");
+    assert_eq!(mid["inputTokens"], 7, "{resp}");
+    assert_eq!(mid["outputTokens"], 2, "{resp}");
+    // Untouched minutes are zero-filled; the 30-minute-old row is outside.
+    assert!(
+        !samples.iter().any(|s| s["inputTokens"] == 999),
+        "out-of-window bucket leaked: {resp}"
+    );
+    assert!(
+        samples.iter().any(|s| s["inputTokens"] == 0),
+        "expected zero-filled gap minutes: {resp}"
+    );
+
+    // Default limit is 60 samples.
+    let frame = r#"{"jsonrpc":"2.0","id":21,"method":"stats.getRateHistory","params":{}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(
+        resp["result"]["samples"].as_array().expect("samples").len(),
+        60,
+        "{resp}"
+    );
+
+    // Out-of-range / malformed limits surface as -32602 over the wire.
+    let frame = r#"{"jsonrpc":"2.0","id":22,"method":"stats.getRateHistory","params":{"limit":0}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    let frame =
+        r#"{"jsonrpc":"2.0","id":23,"method":"stats.getRateHistory","params":{"limit":1441}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    let frame =
+        r#"{"jsonrpc":"2.0","id":24,"method":"stats.getRateHistory","params":{"limit":"x"}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the static
@@ -3419,8 +3550,9 @@ async fn wss_git_commit_details_round_trip() {
 
 /// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
 /// prunes the unstaged walk to exactly the requested workspace-relative files,
-/// the legacy single `path` unions with `paths`, and an absent/empty `paths`
-/// keeps the full-tree behavior.
+/// the legacy single `path` unions with `paths`, an absolute path under the
+/// worktree is normalized to its relative form (same narrowed result), and an
+/// absent/empty `paths` keeps the full-tree behavior.
 #[tokio::test]
 async fn wss_git_diffs_paths_narrowing_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -3497,6 +3629,44 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
     assert_eq!(arr.len(), 2, "union of paths + path: {paths:?}");
     assert!(paths.contains(&"a.txt"));
     assert!(paths.contains(&"b.txt"));
+
+    // Defense-in-depth normalization: an absolute path under the worktree
+    // returns the same narrowed result as the relative form (result `path`
+    // values stay worktree-relative), and an absolute path outside the
+    // worktree matches nothing.
+    let relative = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["a.txt"]}}}}"#
+        ),
+    )
+    .await;
+    let absolute = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["{}"]}}}}"#,
+            repo.join("a.txt").display()
+        ),
+    )
+    .await;
+    assert_eq!(
+        absolute["result"], relative["result"],
+        "absolute form narrows like relative"
+    );
+    let arr = absolute["result"].as_array().expect("diffs array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "a.txt", "result path stays relative");
+    let outside = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["/no/such/root/a.txt"]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(outside["result"], serde_json::json!([]));
 
     // An empty `paths` array keeps the full-tree behavior.
     let resp = wss_call(
