@@ -2,6 +2,72 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.15] - 2026-07-31
+
+### 🚀 Features
+
+- Honor workspace setup settings (worktrees location, per-workspace auto-commit, commit-policy prompts) ([#744](https://github.com/intent-hq/intentd/pull/744))
+- *(transport)* Emit user-row deltas on chat.subscribe ([#747](https://github.com/intent-hq/intentd/pull/747))
+- Warn-and-continue on prompt idle timeout instead of terminal failure
+- Agent attention requests (requestDiscussion/reportBlocker, blocked task status) ([#754](https://github.com/intent-hq/intentd/pull/754))
+- Hold automatic deliveries while an agent's question is pending ([#751](https://github.com/intent-hq/intentd/pull/751))
+- Scoped cancel for agent.cancelSubscriptions ([#759](https://github.com/intent-hq/intentd/pull/759))
+- Rename agent:stream:chunk broadcast to content-free agent:stream:activity with leading-edge 1s throttle ([#775](https://github.com/intent-hq/intentd/pull/775))
+- Serve-time synthetic block ids + appMessageId on user-row chat deltas (monorepo#1114, monorepo#1157)
+- Overlay live-turn text into AgentLite lastAgentResponse/digest ([#786](https://github.com/intent-hq/intentd/pull/786))
+- Per-minute token-rate history and agentSummary parentAgentId (protocol 2.8/2.9) ([#789](https://github.com/intent-hq/intentd/pull/789))
+- Carry optional parentAgentId on agent:attention-requested and agent:failed ([#788](https://github.com/intent-hq/intentd/pull/788))
+- Carry live preview fields on agent:stream:activity ([#792](https://github.com/intent-hq/intentd/pull/792))
+- Derive idle/running agent activity into displayStatus ([#793](https://github.com/intent-hq/intentd/pull/793))
+
+### 🐛 Bug Fixes
+
+- Renumber workspace auto-commit migration to 0067 (intent-hq/monorepo#1126) ([#752](https://github.com/intent-hq/intentd/pull/752))
+- *(store)* Retry SQLITE_BUSY on note read path (monorepo#1139) ([#783](https://github.com/intent-hq/intentd/pull/783))
+- Await supervisor teardown in script remove/upsert/start to prevent PTY orphans (monorepo#1180)
+- Do not clip final text block closed by a tool-call boundary ([#796](https://github.com/intent-hq/intentd/pull/796))
+- *(services)* Generation-stamp script registry entries to close the start remove+recreate identity-confusion race (monorepo#1194) ([#801](https://github.com/intent-hq/intentd/pull/801))
+- Select Windows-native shells and provider shims (intent-hq/monorepo#1054)
+- *(intent-git)* Use COPYFILE_CLONE_FORCE for per-file CoW clone (intent-hq/monorepo#1124) ([#782](https://github.com/intent-hq/intentd/pull/782))
+- Normalize spaced workspace-mcp bridge path ([#736](https://github.com/intent-hq/intentd/pull/736))
+- Deliver attention-request parent wake immediately in after_all groups ([#758](https://github.com/intent-hq/intentd/pull/758))
+- Emit FILE_CHANGED before fs/write_text_file response to close attribution TOCTOU (intent-hq/monorepo#1144)
+- Honor INTENTD_TCP_PORT=0 as ephemeral port for the secure WSS boot bind ([#737](https://github.com/intent-hq/intentd/pull/737))
+- Stop workspace list CPU thrash and oversized git.diffs wire frames ([#743](https://github.com/intent-hq/intentd/pull/743))
+- Enforce one active completion watch per (parent, child) ([#761](https://github.com/intent-hq/intentd/pull/761))
+- Suppress SUB-1 child→parent auto-watch and carry row metadata on message deltas ([#773](https://github.com/intent-hq/intentd/pull/773))
+- Make script.run cancellation-safe and guard concurrent runs (monorepo#1155) ([#777](https://github.com/intent-hq/intentd/pull/777))
+- Agent.diagnostics taskNoteId filter matches assigned agents (monorepo#1150) ([#765](https://github.com/intent-hq/intentd/pull/765))
+- Treat workspace prStatus as a PR-stage signal in displayStatus ([#760](https://github.com/intent-hq/intentd/pull/760))
+- Guard agent.delegate and task.assignAgent against double-delegating an occupied task ([#774](https://github.com/intent-hq/intentd/pull/774))
+- Retain pending attention request across automatic deliveries ([#785](https://github.com/intent-hq/intentd/pull/785))
+- Single-flight git.diffs walks, rate-limit slow-walk warn, normalize absolute paths ([#790](https://github.com/intent-hq/intentd/pull/790))
+- Clip mid-turn live previews at the last completed newline ([#795](https://github.com/intent-hq/intentd/pull/795))
+- Poll session idle status in idle-timeout e2e test (monorepo#1164) ([#799](https://github.com/intent-hq/intentd/pull/799))
+- Persist row-level messageMetadata on wake deliveries ([#802](https://github.com/intent-hq/intentd/pull/802))
+
+### 📚 Documentation
+
+- *(acp)* Document why prompt idle timeout must not be raised ([#740](https://github.com/intent-hq/intentd/pull/740))
+
+### ⚡ Performance
+
+- *(store)* Persist last-message previews at write time ([#742](https://github.com/intent-hq/intentd/pull/742))
+- *(services)* Cache agent.list message projections until append ([#776](https://github.com/intent-hq/intentd/pull/776))
+- *(git)* Use clonefile(2) for whole-tree CoW fast path (monorepo#1125)
+
+### 🧪 Testing
+
+- Add services-level literal paths tests for git.diffs (monorepo#1078) ([#734](https://github.com/intent-hq/intentd/pull/734))
+- Adopt _logged WSS readiness pollers in e2e_wss_runtime_control ([#748](https://github.com/intent-hq/intentd/pull/748))
+- Assert appMessageId on fresh chat.subscribe snapshot user rows (monorepo#1157) ([#791](https://github.com/intent-hq/intentd/pull/791))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml dependencies
+- Remove dead agent stream event constants ([#756](https://github.com/intent-hq/intentd/pull/756))
+
+
 ## [0.2.14] - 2026-07-29
 
 ### 🔧 Refactor
