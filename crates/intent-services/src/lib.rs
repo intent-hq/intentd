@@ -14931,7 +14931,16 @@ impl WorkspaceApi for Services {
             // the root pass through verbatim and match nothing, as before).
             // This runs BEFORE the single-flight key is computed so
             // equivalent absolute/relative requests coalesce.
-            let paths = paths.map(|p| git_ops::normalize_diff_paths(&worktree, p));
+            // Sorting + deduping makes the identity order-insensitive, so
+            // clients naming the same path set in a different order (or with
+            // duplicates) still coalesce; `build_diffs` matches pathspecs as
+            // a set, so the walk itself is unaffected.
+            let paths = paths.map(|p| {
+                let mut p = git_ops::normalize_diff_paths(&worktree, p);
+                p.sort();
+                p.dedup();
+                p
+            });
             // Concurrent calls with an identical request identity coalesce
             // onto one walk (single-flight). `Some([])` behaves exactly like
             // `None` in `build_diffs`, so both normalize onto the same key.
@@ -14998,7 +15007,16 @@ impl WorkspaceApi for Services {
                                 Ok(value)
                             }
                             Err(e) => {
-                                flight.finish(Err(e.to_string()));
+                                // Publish the inner message: every walk error
+                                // is `Error::Internal` (map_git_err), and the
+                                // follower re-wraps as `Error::Internal`, so
+                                // coalesced callers observe the same variant
+                                // and message (no double "internal error:"
+                                // prefix).
+                                flight.finish(Err(match &e {
+                                    Error::Internal(msg) => msg.clone(),
+                                    other => other.to_string(),
+                                }));
                                 Err(e)
                             }
                         };

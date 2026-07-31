@@ -22,8 +22,9 @@ pub(crate) type DiffKey = (WorkspaceId, Option<Vec<String>>, bool, Option<String
 
 /// The result shape shared across coalesced callers. The payload is `Arc`ed so
 /// followers clone the JSON value, not re-run the walk; errors travel as their
-/// rendered message ([`intent_core::Error`] is not `Clone`) and followers
-/// surface them as `Error::Internal`.
+/// message ([`intent_core::Error`] is not `Clone`) and followers surface them
+/// as `Error::Internal` — variant-faithful in practice, since every walk error
+/// is already `Error::Internal` (libgit2 failures map through `map_git_err`).
 pub(crate) type SharedDiffResult = std::result::Result<Arc<serde_json::Value>, String>;
 
 type Slot = Option<SharedDiffResult>;
@@ -84,11 +85,13 @@ pub(crate) struct FlightGuard {
 }
 
 impl FlightGuard {
-    /// Publish the walk result to every follower. The send happens before the
-    /// `Drop` impl unregisters the flight, so a request landing in between
-    /// subscribes to an already-resolved channel instead of hanging.
+    /// Publish the walk result to every follower. `send_replace` stores the
+    /// value even with zero receivers (a plain `send` would fail and publish
+    /// nothing), and it happens before the `Drop` impl unregisters the
+    /// flight, so a request landing in between subscribes to an
+    /// already-resolved channel instead of hanging or retrying.
     pub(crate) fn finish(self, result: SharedDiffResult) {
-        let _ = self.tx.send(Some(result));
+        self.tx.send_replace(Some(result));
     }
 }
 
@@ -119,9 +122,13 @@ impl SlowWalkWarnLimiter {
     fn should_warn_within(&self, workspace_id: &WorkspaceId, window: Duration) -> bool {
         let mut last_warn = self.last_warn.lock().unwrap();
         let now = Instant::now();
+        // Evict expired entries so the map stays bounded by the set of
+        // workspaces that warned within the current window (workspaces come
+        // and go; a grow-only map would leak).
+        last_warn.retain(|_, prev| now.duration_since(*prev) < window);
         match last_warn.get(workspace_id) {
-            Some(prev) if now.duration_since(*prev) < window => false,
-            _ => {
+            Some(_) => false,
+            None => {
                 last_warn.insert(workspace_id.clone(), now);
                 true
             }
@@ -155,6 +162,25 @@ mod tests {
         assert_eq!(*shared, serde_json::json!([{ "path": "a" }]));
         drop(slot);
         assert!(flights.inflight.lock().unwrap().is_empty(), "unregistered");
+    }
+
+    /// `finish` publishes even with zero receivers (`send_replace`; a plain
+    /// `send` fails without receivers), so a request that subscribes between
+    /// the publish and the guard drop reads the resolved slot instead of
+    /// blocking until close and retrying.
+    #[tokio::test]
+    async fn finish_publishes_with_zero_receivers() {
+        let flights = Arc::new(DiffSingleFlight::default());
+        let ws = WorkspaceId::new();
+        let Join::Leader(guard) = flights.join(&key(&ws)) else {
+            panic!("first joiner must lead");
+        };
+        let tx = Arc::clone(&guard.tx);
+        guard.finish(Ok(Arc::new(serde_json::json!([]))));
+        assert!(
+            tx.borrow().is_some(),
+            "resolved slot published without receivers"
+        );
     }
 
     /// Distinct request identities never share a flight.
@@ -199,5 +225,8 @@ mod tests {
         // A zero window means every prior WARN is already outside it.
         assert!(limiter.should_warn_within(&a, Duration::ZERO));
         assert!(limiter.should_warn_within(&a, Duration::ZERO));
+        // Expired entries are evicted, so the map stays bounded: after the
+        // zero-window calls only the freshly re-inserted `a` remains.
+        assert_eq!(limiter.last_warn.lock().unwrap().len(), 1);
     }
 }

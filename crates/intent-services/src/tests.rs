@@ -10408,6 +10408,87 @@ mod file_tracking {
         assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
     }
 
+    /// The single-flight identity is order-insensitive and duplicate-free:
+    /// concurrent `git.diffs` calls naming the same path set in a different
+    /// order (one with a duplicate entry) coalesce onto one walk.
+    #[tokio::test]
+    async fn git_diffs_reordered_and_duplicated_paths_coalesce() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let walks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_diffs_walk_probe({
+            let walks = Arc::clone(&walks);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                walks.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        wait_until("leader to enter the walk", || {
+            walks.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move {
+                svc.git_diffs(
+                    ws,
+                    Some(vec![
+                        "other.txt".to_string(),
+                        "seed.txt".to_string(),
+                        "seed.txt".to_string(),
+                    ]),
+                    false,
+                    None,
+                )
+                .await
+            }
+        });
+        // The reordered/duplicated request sorted+deduped onto the same key
+        // and joined the in-flight walk as a follower.
+        let key = (
+            ws_id.clone(),
+            Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
+            false,
+            None,
+        );
+        wait_until("reordered request to join as follower", || {
+            svc.git_diffs_waiters(&key) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let a = first.await.unwrap().unwrap();
+        let b = second.await.unwrap().unwrap();
+        assert_eq!(walks.load(Ordering::SeqCst), 1, "one underlying walk");
+        assert_eq!(a, b, "both callers get the same result");
+        assert_eq!(a.as_array().unwrap()[0]["path"], "seed.txt");
+    }
+
     /// Regression (monorepo#1061): `diffs::compute_and_store` (single
     /// pathspec-narrowed pass) returns the same summary + persisted hunks
     /// JSON as the legacy two-pass compute for modified, untracked, and
