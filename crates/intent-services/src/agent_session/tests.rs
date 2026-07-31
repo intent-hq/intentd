@@ -680,7 +680,10 @@ async fn prompt_turn_streams_events_and_accumulates() {
         "a normal turn emits the `prompt` status hint before the first chunk, the leading-edge activity signal on the first chunk, and exactly one agent:idle after the terminal stream:end"
     );
 
-    // The content-free activity signal carries identifiers only — no content.
+    // The activity signal carries identifiers plus the server-derived live
+    // preview — never the raw transcript content. The first activity fires
+    // after the first chunk ("Hello ") landed, so its preview reflects the
+    // streamed-so-far text.
     let activity = events
         .iter()
         .find(|e| e.event_type == "agent:stream:activity")
@@ -692,7 +695,16 @@ async fn prompt_turn_streams_events_and_accumulates() {
     );
     assert!(
         activity.data.get("content").is_none(),
-        "activity payload is content-free"
+        "activity payload never carries transcript content"
+    );
+    assert_eq!(
+        activity.data["lastAgentResponse"],
+        json!("Hello"),
+        "first activity carries the preview derived from the first chunk"
+    );
+    assert!(
+        activity.data.get("digest").is_none(),
+        "digest omitted when the streamed text has no <agent_digest> span"
     );
 
     // The pre-first-token status hint carries the "Sent prompt…" phrase and
@@ -802,6 +814,8 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
     // The terminal stream:end carries the turn's messageId; `trailingBlocks`
     // is omitted when no AtTurnEnd attachments were drained (monorepo#732).
+    // It also carries the FINAL preview values (the last throttled activity
+    // may have missed the response tail).
     let end = events
         .iter()
         .find(|e| e.event_type == "agent:stream:end")
@@ -810,6 +824,11 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert!(
         end.data.get("trailingBlocks").is_none(),
         "trailingBlocks omitted on a turn without AtTurnEnd attachments"
+    );
+    assert_eq!(
+        end.data["lastAgentResponse"],
+        json!("Hello world"),
+        "terminal stream:end carries the final preview from the full turn text"
     );
 }
 
