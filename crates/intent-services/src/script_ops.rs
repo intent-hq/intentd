@@ -215,7 +215,9 @@ impl ScriptManager {
                 self.pty.kill(pty_id).await;
             }
             if let Some(handle) = handle {
-                let _ = handle.await;
+                if let Err(e) = handle.await {
+                    tracing::warn!(script = %id, error = %e, "script supervisor join failed during upsert teardown");
+                }
             }
         }
         let def = Script {
@@ -422,7 +424,9 @@ impl ScriptManager {
             self.pty.kill(pty_id).await;
         }
         if let Some(handle) = handle {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during remove teardown");
+            }
         }
         self.store.remove_script(script_id).await?;
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -525,7 +529,9 @@ impl ScriptManager {
         // — `mark_running` finds the entry gone and the supervisor reaps any
         // PTY it spawned before returning.
         if let Some(handle) = orphan {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during orphan teardown");
+            }
         }
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
@@ -2355,6 +2361,17 @@ mod tests {
         id: String,
         pid: i64,
         _pidfile: PidFile,
+    }
+
+    /// Best-effort kill on drop so a test that fails/panics before teardown
+    /// completes cannot leak the long-lived child process into CI.
+    impl Drop for ParkedScript {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &self.pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 
     /// Start a service through park-enabled services and hold `supervise()`
