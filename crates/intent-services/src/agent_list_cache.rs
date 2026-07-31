@@ -3,26 +3,33 @@
 //! ## Why
 //!
 //! Focus/menu refresh fans out `workspace.list` → `agent.list` per workspace.
-//! Each `agent.list` runs a SQLite window over `agent_message` plus
-//! `json_each` / `json_extract` on the newest user/assistant rows. On large
-//! workspaces that query is >1s and dwarfs everything else in a post-focus
-//! `sample(1)` of intentd.
+//! Each `agent.list` re-runs the per-workspace message projection
+//! ([`Store::get_agent_session_message_projections`]): a bounded aggregate
+//! `COUNT` over `agent_message` joined to every session in the workspace,
+//! plus the persisted last-user/assistant preview columns (monorepo#958,
+//! 0066) with the per-agent `heal_session_preview_columns` fallback. Bounded,
+//! but still a full-workspace aggregate repeated for every workspace on each
+//! focus burst; on large workspaces it dominates a post-focus `sample(1)` of
+//! intentd.
 //!
 //! Session metadata (`list_agent_session_summaries`) stays uncached so
-//! status/name edits stay live. Only the expensive message projection map is
-//! cached.
+//! status/name edits stay live. Only the message projection map is cached.
 //!
 //! ## Coherency
 //!
-//! - **Invalidate on message append** (primary): every services path that
-//!   writes `agent_message` bumps the workspace epoch and drops the entry.
+//! - **Invalidate on transcript write** (primary): every services path that
+//!   writes `agent_message` (append, replace/truncate rewrite) bumps the
+//!   workspace epoch and drops the cached map.
 //! - **Invalidate on session create/delete**: new empty agents and removals
 //!   must appear/disappear even with no messages.
 //! - **Epoch guard**: in-flight loads capture the epoch at start and only
 //!   write if it still matches, so a late completion cannot repopulate after
 //!   invalidate (same pattern as [`crate::workspace_aggregates`]).
-//! - **Single-flight** per workspace so a focus burst does not stack N
-//!   identical projection queries.
+//! - **Best-effort single-flight** per workspace: one loader claims the slot
+//!   and fills the cache; concurrent losers fall through to their own direct
+//!   load (never blocking behind the winner), so a fully cold cache can still
+//!   run a handful of identical queries once. The claim bounds cache-fill
+//!   churn rather than hard-deduplicating queries.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -30,9 +37,19 @@ use std::sync::{Arc, Mutex};
 use intent_core::{Result, WorkspaceId};
 use intent_store::{SessionMessageProjection, Store};
 
-struct CacheEntry {
+/// Per-workspace cache state: the invalidation epoch and the cached
+/// projection map live in ONE entry so they cannot desynchronize.
+///
+/// Invalidation clears `projections` but never removes the entry: the epoch
+/// must outlive the cached data, because a state that were removed and later
+/// recreated would restart at epoch 0 — a previously observable value — and
+/// a stale in-flight load that captured that epoch could then pass the
+/// [`AgentListProjectionCache::store_if_current`] guard and repopulate the
+/// cache with pre-invalidate data. The residual cost is one `(String, u64)`
+/// per workspace ever invalidated, bounded by the workspace count.
+struct WorkspaceState {
     epoch: u64,
-    projections: HashMap<String, SessionMessageProjection>,
+    projections: Option<HashMap<String, SessionMessageProjection>>,
 }
 
 /// RAII single-flight slot: removes the key on drop (panic / cancel safe).
@@ -49,38 +66,40 @@ impl Drop for InFlightGuard {
 
 /// Shared projection cache held as an `Arc` field on [`crate::Services`].
 pub(crate) struct AgentListProjectionCache {
-    entries: Mutex<HashMap<String, CacheEntry>>,
-    epoch: Mutex<HashMap<String, u64>>,
+    states: Mutex<HashMap<String, WorkspaceState>>,
     in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AgentListProjectionCache {
     pub(crate) fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            epoch: Mutex::new(HashMap::new()),
+            states: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Drop the cached projection map for `workspace_id` and bump its epoch
-    /// so any in-flight load is discarded on completion.
+    /// so any in-flight load is discarded on completion. The state entry
+    /// (and its epoch) is retained — see [`WorkspaceState`] for why removal
+    /// would break the epoch guard.
     pub(crate) fn invalidate(&self, workspace_id: &str) {
-        self.epoch
-            .lock()
-            .unwrap()
+        let mut states = self.states.lock().unwrap();
+        let state = states
             .entry(workspace_id.to_string())
-            .and_modify(|e| *e = e.wrapping_add(1))
-            .or_insert(1);
-        self.entries.lock().unwrap().remove(workspace_id);
+            .or_insert(WorkspaceState {
+                epoch: 0,
+                projections: None,
+            });
+        state.epoch = state.epoch.wrapping_add(1);
+        state.projections = None;
     }
 
     fn current_epoch(&self, workspace_id: &str) -> u64 {
-        self.epoch
+        self.states
             .lock()
             .unwrap()
             .get(workspace_id)
-            .copied()
+            .map(|s| s.epoch)
             .unwrap_or(0)
     }
 
@@ -89,12 +108,12 @@ impl AgentListProjectionCache {
         workspace_id: &str,
         epoch: u64,
     ) -> Option<HashMap<String, SessionMessageProjection>> {
-        let guard = self.entries.lock().unwrap();
-        let entry = guard.get(workspace_id)?;
-        if entry.epoch != epoch {
+        let guard = self.states.lock().unwrap();
+        let state = guard.get(workspace_id)?;
+        if state.epoch != epoch {
             return None;
         }
-        Some(entry.projections.clone())
+        state.projections.clone()
     }
 
     fn store_if_current(
@@ -103,13 +122,29 @@ impl AgentListProjectionCache {
         epoch: u64,
         projections: HashMap<String, SessionMessageProjection>,
     ) {
-        if self.current_epoch(workspace_id) != epoch {
-            return;
+        let mut states = self.states.lock().unwrap();
+        match states.get_mut(workspace_id) {
+            Some(state) => {
+                if state.epoch != epoch {
+                    return;
+                }
+                state.projections = Some(projections);
+            }
+            None => {
+                // No state yet means the workspace was never invalidated, so
+                // only the implicit epoch 0 may publish.
+                if epoch != 0 {
+                    return;
+                }
+                states.insert(
+                    workspace_id.to_string(),
+                    WorkspaceState {
+                        epoch: 0,
+                        projections: Some(projections),
+                    },
+                );
+            }
         }
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(workspace_id.to_string(), CacheEntry { epoch, projections });
     }
 
     /// Serve the projection map from cache or load it once (single-flight).

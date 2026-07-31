@@ -1158,8 +1158,9 @@ impl Services {
             .store
             .list_agent_session_summaries(&workspace_id)
             .await?;
-        // Message projections are the expensive half (SQLite json_each on last
-        // user/assistant rows). Cache per workspace; invalidated on append.
+        // Message projections are the expensive half (full-workspace COUNT
+        // aggregate + preview columns). Cache per workspace; invalidated on
+        // transcript writes and session create/delete.
         let mut projections = self
             .agent_list_cache
             .get_or_load(&self.store, &workspace_id)
@@ -2336,6 +2337,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let replaced_count = inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2416,6 +2418,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -3509,6 +3512,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&workspace_id);
                 self.publish_agent_mutation_event(
                     &workspace_id,
                     &caller,

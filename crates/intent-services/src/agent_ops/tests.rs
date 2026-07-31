@@ -14119,6 +14119,106 @@ async fn agent_list_and_get_do_not_hydrate_transcripts_regression() {
 }
 
 // ---------------------------------------------------------------------------
+// agent.list projection-cache invalidation on transcript rewrites
+// ---------------------------------------------------------------------------
+
+/// `agent.replaceMessages` rewrites the whole transcript (message count and
+/// both preview columns change); a warmed `agent.list` projection cache must
+/// reflect the swap on the next list, not serve the pre-replace projection.
+#[tokio::test]
+async fn agent_replace_messages_invalidates_warm_agent_list_cache() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "ReplaceCache").await;
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".into(),
+        json!([{ "type": "text", "text": "before" }]),
+        None,
+    )
+    .await
+    .expect("append");
+
+    // Warm the projection cache.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("warm list");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(lite.message_count, 1);
+    assert_eq!(lite.last_user_message.as_deref(), Some("before"));
+
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "after" }] },
+            { "role": "assistant", "contentBlocks": [{ "type": "text", "text": "reply" }] },
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "newest ask" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+
+    let agents = svc.agent_list_op(ws).await.expect("list after replace");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(lite.message_count, 3, "cache must drop on replaceMessages");
+    assert_eq!(lite.last_user_message.as_deref(), Some("newest ask"));
+    assert_eq!(lite.last_agent_response.as_deref(), Some("reply"));
+}
+
+/// `agent.editAndRegenerate`'s truncate step swaps the transcript via the
+/// same replace machinery; a warmed `agent.list` projection cache must show
+/// the truncated count and previews on the next list.
+#[tokio::test]
+async fn agent_edit_truncate_invalidates_warm_agent_list_cache() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "TruncateCache").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+
+    // Warm the projection cache.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("warm list");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(lite.message_count, 4);
+    assert_eq!(lite.last_user_message.as_deref(), Some("second question"));
+
+    svc.agent_edit_truncate_op(&id, &msg_ids[2])
+        .await
+        .expect("truncate");
+
+    let agents = svc.agent_list_op(ws).await.expect("list after truncate");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(lite.message_count, 2, "cache must drop on edit truncate");
+    assert_eq!(lite.last_user_message.as_deref(), Some("first question"));
+    assert_eq!(lite.last_agent_response.as_deref(), Some("first answer"));
+}
+
+/// `agent.requestAttention` appends a system-role transcript notice; the
+/// cached projection's `message_count` (COUNT over all roles) must not go
+/// stale on the next `agent.list`.
+#[tokio::test]
+async fn agent_request_attention_notice_invalidates_warm_agent_list_cache() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttentionCache").await;
+
+    // Warm the projection cache.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("warm list");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(lite.message_count, 0);
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(id.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    let agents = svc.agent_list_op(ws).await.expect("list after notice");
+    let lite = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(
+        lite.message_count, 1,
+        "system notice must invalidate the cache"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Suspected-stall wake annotation (monorepo#1016)
 // ---------------------------------------------------------------------------
 
