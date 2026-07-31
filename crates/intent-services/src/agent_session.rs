@@ -1915,12 +1915,13 @@ impl Services {
         // failure without a follow-up `agent.get`. Optional: OMITTED entirely
         // for parentless agents — never `null`. Enriched centrally here so
         // every terminal-failure emit site (prompt turn, idle-timeout cap,
-        // spawn/turn terminal pair) carries it. Best-effort: a store error
-        // leaves the base payload untouched.
+        // spawn/turn terminal pair) carries it. Best-effort: a store error —
+        // or a non-object payload (guarded via `as_object_mut` so a malformed
+        // `data` can't panic the index-assign) — leaves the payload untouched.
         if event_type == AGENT_FAILED && data.get("parentAgentId").is_none() {
             if let Ok(session) = self.store.get_agent_session(agent_id).await {
-                if let Some(parent) = session.parent_agent_id {
-                    data["parentAgentId"] = Value::String(parent.0);
+                if let (Some(parent), Some(map)) = (session.parent_agent_id, data.as_object_mut()) {
+                    map.insert("parentAgentId".to_string(), Value::String(parent.0));
                 }
             }
         }
