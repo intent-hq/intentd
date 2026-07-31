@@ -1,5 +1,5 @@
 //! macOS CoW implementation: clonefile(2) for whole-tree clones, copyfile(3)
-//! with COPYFILE_CLONE for single-file clones (probe path).
+//! with COPYFILE_CLONE_FORCE for single-file clones (probe path).
 
 use intent_core::{Error, Result};
 use std::ffi::CString;
@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 
 use super::{CowCloneStats, CowSupport};
 
-// copyfile(3) flags from copyfile.h
-const COPYFILE_CLONE: u32 = 1 << 24;
+// copyfile(3) flags from copyfile.h. COPYFILE_CLONE_FORCE is clone-or-fail:
+// unlike the best-effort COPYFILE_CLONE (1 << 24), it never falls back to a
+// physical byte copy, preserving the module contract (monorepo#1124).
+const COPYFILE_CLONE_FORCE: u32 = 1 << 25;
 
 // getattrlist volume capability constants
 // TODO: Re-enable fast path once f_fsid comparison is fixed for APFS
@@ -224,7 +226,7 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
             src_cstr.as_ptr(),
             dst_cstr.as_ptr(),
             std::ptr::null_mut(),
-            COPYFILE_CLONE,
+            COPYFILE_CLONE_FORCE,
         )
     };
 
@@ -373,5 +375,64 @@ mod tests {
 
         drop(listener);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Regression test for the clone-or-fail contract (intent-hq/monorepo#1124):
+    /// with COPYFILE_CLONE_FORCE a cross-volume per-file clone must return
+    /// `Unsupported` instead of silently falling back to a physical byte copy
+    /// (as the best-effort COPYFILE_CLONE did). Needs a second writable volume
+    /// to exercise the cross-volume case; skipped when none is mounted.
+    #[test]
+    fn clone_file_cross_volume_returns_unsupported() {
+        let base = std::env::temp_dir().join(format!("cow_clone_force_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let src = base.join("src.txt");
+        fs::write(&src, b"data").unwrap();
+
+        let Some(src_vol) = get_volume_id(&base) else {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        };
+
+        let other_volume = fs::read_dir("/Volumes")
+            .map(|entries| {
+                entries.flatten().map(|e| e.path()).find(|p| {
+                    if get_volume_id(p).is_none_or(|v| v == src_vol) {
+                        return false;
+                    }
+                    let marker = p.join(".cow_clone_force_writable_probe");
+                    let writable = fs::write(&marker, b"w").is_ok();
+                    let _ = fs::remove_file(&marker);
+                    writable
+                })
+            })
+            .ok()
+            .flatten();
+
+        let Some(vol) = other_volume else {
+            eprintln!(
+                "skipping clone_file_cross_volume_returns_unsupported: \
+                 no second writable volume mounted"
+            );
+            let _ = fs::remove_dir_all(&base);
+            return;
+        };
+
+        let dst = vol.join(format!(".cow_clone_force_dst_{}", std::process::id()));
+        let _ = fs::remove_file(&dst);
+        let result = clone_file(&src, &dst);
+        let dst_exists = dst.exists();
+        let _ = fs::remove_file(&dst);
+        let _ = fs::remove_dir_all(&base);
+
+        match result {
+            Err(Error::Unsupported(_)) => {}
+            other => panic!("cross-volume clone_file must return Unsupported, got {other:?}"),
+        }
+        assert!(
+            !dst_exists,
+            "clone_file must not leave a byte-copied destination behind"
+        );
     }
 }
