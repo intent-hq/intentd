@@ -433,8 +433,11 @@ pub(crate) fn last_response_and_digest(
 /// [`last_response_and_digest`] over pre-extracted text-block strings — the
 /// shared core also fed by the store's text-only projection (P1b), whose
 /// capped blocks keep their tails so the last-line/digest extraction here is
-/// unaffected by the cap.
-fn last_response_and_digest_from_blocks(blocks: &[String]) -> (Option<String>, Option<String>) {
+/// unaffected by the cap, and by the `agent:stream:activity` /
+/// `agent:stream:end` live-preview payloads (`agent_session.rs`).
+pub(crate) fn last_response_and_digest_from_blocks(
+    blocks: &[String],
+) -> (Option<String>, Option<String>) {
     let mut digest: Option<String> = None;
     let mut last_response: Option<String> = None;
     for block in blocks {

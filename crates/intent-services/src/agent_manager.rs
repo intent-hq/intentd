@@ -2536,6 +2536,10 @@ impl AgentManager {
         // path (`!suppress_idle_emit`) opts into persisting an EMPTY row for
         // a pre-first-token stop — the STAB-114 zero-output combined delivery
         // in `interrupt_send_message` must never see a phantom row.
+        let interrupted_text_blocks = partial_turn
+            .as_ref()
+            .map(|live| crate::agent_session::text_block_strings(&live.blocks))
+            .unwrap_or_default();
         let interrupted_message_id = match partial_turn {
             Some(live) => {
                 self.services
@@ -2609,6 +2613,11 @@ impl AgentManager {
             if let Some(ref message_id) = interrupted_message_id {
                 end_data["messageId"] = json!(message_id);
             }
+            // Final live-preview values from the flushed partial turn (same
+            // contract as the normal-completion terminal emit in
+            // `run_prompt_turn`) so a preview-tracking client is not left on
+            // a stale mid-turn value after an interrupt.
+            crate::agent_session::stamp_preview_fields(&mut end_data, &interrupted_text_blocks);
             self.services
                 .publish_agent_event(
                     &workspace_id,

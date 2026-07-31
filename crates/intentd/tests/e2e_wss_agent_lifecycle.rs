@@ -443,6 +443,8 @@ async fn mock_agent_full_turn_over_wss() {
     let mut ends = 0u32;
     let mut saw_note_updated = false;
     let mut first_chunk_at: Option<usize> = None;
+    let mut first_activity_frame: Option<Value> = None;
+    let mut end_frame: Option<Value> = None;
     let mut status_frames: Vec<(usize, Value)> = Vec::new();
     for i in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
@@ -451,10 +453,12 @@ async fn mock_agent_full_turn_over_wss() {
                 chunks += 1;
                 if first_chunk_at.is_none() {
                     first_chunk_at = Some(i);
+                    first_activity_frame = Some(frame["params"]["event"].clone());
                 }
             }
             Some("agent:stream:end") => {
                 ends += 1;
+                end_frame = Some(frame["params"]["event"].clone());
                 break;
             }
             Some("agent:stream:status") => {
@@ -469,6 +473,35 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(
         saw_note_updated,
         "tool's note:updated domain event delivered over WSS"
+    );
+
+    // Live-preview enrichment: the activity signal carries the server-derived
+    // `lastAgentResponse` (the mock streams its text response before the
+    // first activity emit) but never raw transcript `content`; the terminal
+    // stream:end carries the final preview values.
+    let activity = first_activity_frame.expect("first activity frame captured");
+    let activity_data = &activity["data"];
+    assert_eq!(
+        activity_data["agentId"].as_str(),
+        Some(agent_id.as_str()),
+        "activity carries the agent id: {activity}"
+    );
+    assert!(
+        activity_data.get("content").is_none(),
+        "activity payload never carries transcript content: {activity}"
+    );
+    assert!(
+        activity_data["lastAgentResponse"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "activity carries a non-empty lastAgentResponse preview: {activity}"
+    );
+    let end = end_frame.expect("terminal stream:end frame captured");
+    assert!(
+        end["data"]["lastAgentResponse"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "terminal stream:end carries the final lastAgentResponse: {end}"
     );
 
     // STAT-1 — pre-first-token status hints must reach the FE over the real
