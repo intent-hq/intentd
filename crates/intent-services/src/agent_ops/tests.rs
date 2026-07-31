@@ -11571,6 +11571,50 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
     assert_eq!(block["messageMetadata"]["type"], "task_wake");
 }
 
+/// monorepo#1217 regression: wake deliveries on the store-only path must
+/// persist `messageMetadata` as ROW-LEVEL metadata (not just folded onto the
+/// content block), matching the direct-send and queue-drain persists — the FE
+/// attribution chip reads the row's `metadata` column.
+#[tokio::test]
+async fn wake_or_create_store_only_persists_row_level_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Row tag").await;
+    let metadata = json!({
+        "type": "agent_message",
+        "fromAgentId": "agent-33333333-3333-3333-3333-333333333333",
+        "fromAgentName": "Coordinator"
+    });
+    let input = AgentWakeOrCreateInput {
+        message_metadata: Some(metadata.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws, note_id, "hello".into(), input)
+        .await
+        .expect("wake");
+    let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
+    let conv = svc
+        .agent_get_conversation_op(new_id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    let msg = &conv["messages"][0];
+    assert_eq!(msg["role"], "user");
+    assert_eq!(
+        msg["metadata"], metadata,
+        "store-only wake must persist messageMetadata on the row: {msg}"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&new_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.messages[0].metadata.as_ref(),
+        Some(&metadata),
+        "row-level metadata read back from the store verbatim"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // DELIV-1 regression: wake / send-to-task delivery must drive a REAL turn
 // when the runtime `AgentManager` is attached. Both call sites previously
@@ -11783,6 +11827,42 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
     let block = &msg["contentBlocks"][0];
     assert_eq!(block["text"], "hello");
     assert_eq!(block["messageMetadata"]["type"], "task_wake");
+    manager.stop(&agent_id).await;
+}
+
+/// monorepo#1217 regression: the RUNTIME idle branch of `deliver_wake_message`
+/// (manager attached, slot claimed, pre-persisted spawn) must also store
+/// `messageMetadata` as row-level metadata — parity with `persist_user`'s
+/// queue-drain persist and the direct `agent.sendMessage` path.
+#[tokio::test]
+async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let note_id = seed_task(&svc, &ws, "Row tag runtime").await;
+    let metadata = json!({
+        "type": "agent_message",
+        "fromAgentId": "agent-44444444-4444-4444-4444-444444444444",
+        "fromAgentName": "Coordinator"
+    });
+    let input = AgentWakeOrCreateInput {
+        message_metadata: Some(metadata.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws, note_id, "hello".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["ok"], true);
+    let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
+    let conv = svc
+        .agent_get_conversation_op(agent_id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    let msg = &conv["messages"][0];
+    assert_eq!(msg["role"], "user");
+    assert_eq!(
+        msg["metadata"], metadata,
+        "runtime wake must persist messageMetadata on the row: {msg}"
+    );
     manager.stop(&agent_id).await;
 }
 
