@@ -2,7 +2,7 @@
 
 use super::*;
 use intent_core::events::{
-    AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_STATUS, AGENT_TOOL_CALL,
+    AGENT_STREAM_END, AGENT_STREAM_STATUS, AGENT_TOOL_CALL, CHAT_STREAM_DELTA,
 };
 use intent_core::{ActorType, Event, EventActor, WorkspaceId};
 use intent_store::{NewEvent, Store};
@@ -60,11 +60,11 @@ async fn agent_stream_chunks_are_transient() {
     .await
     .expect("publish status");
 
-    // 2) Stream chunk (transient).
+    // 2) Chat stream delta (transient).
     let chunk_event = NewEvent {
         workspace_id: ws.clone(),
         timestamp: intent_core::now_iso(),
-        event_type: AGENT_STREAM_CHUNK.to_string(),
+        event_type: CHAT_STREAM_DELTA.to_string(),
         actor: agent.clone(),
         session_id: Some(agent_id.to_string()),
         correlation_id: None,
@@ -75,11 +75,11 @@ async fn agent_stream_chunks_are_transient() {
     let chunk1 = bus.publish_transient(&chunk_event);
     assert!(!chunk1.id.is_empty(), "chunk should have minted id");
 
-    // 3) Another stream chunk (transient).
+    // 3) Another chat stream delta (transient).
     let chunk2 = bus.publish_transient(&NewEvent {
         workspace_id: ws.clone(),
         timestamp: intent_core::now_iso(),
-        event_type: AGENT_STREAM_CHUNK.to_string(),
+        event_type: CHAT_STREAM_DELTA.to_string(),
         actor: agent.clone(),
         session_id: Some(agent_id.to_string()),
         correlation_id: None,
@@ -127,7 +127,7 @@ async fn agent_stream_chunks_are_transient() {
     assert_eq!(recv.len(), 5, "subscriber should see all 5 events");
     let chunk_count = recv
         .iter()
-        .filter(|e| e.event_type == AGENT_STREAM_CHUNK)
+        .filter(|e| e.event_type == CHAT_STREAM_DELTA)
         .count();
     assert_eq!(chunk_count, 2, "subscriber should see 2 chunks");
 
@@ -147,7 +147,7 @@ async fn agent_stream_chunks_are_transient() {
     );
     let stored_chunks = stored
         .iter()
-        .filter(|e| e.event_type == AGENT_STREAM_CHUNK)
+        .filter(|e| e.event_type == CHAT_STREAM_DELTA)
         .count();
     assert_eq!(stored_chunks, 0, "chunks should NOT be in the store");
 

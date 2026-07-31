@@ -887,7 +887,7 @@ impl ScriptManager {
     /// Broadcast a `script:output` event carrying a base64 output `chunk`.
     ///
     /// Transient (broadcast-only, never persisted — same path as
-    /// `agent:stream:chunk` / `terminal:data`): script PTY output is
+    /// `chat:stream:delta` / `terminal:data`): script PTY output is
     /// high-volume and must not serialize behind a durable SQLite commit per
     /// chunk. Scrollback replay reads the PTY host ring buffer via
     /// `script.output`, so nothing consumes persisted `script:output` rows.

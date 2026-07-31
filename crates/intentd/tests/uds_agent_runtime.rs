@@ -321,7 +321,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         }
         match frame["params"]["event"]["type"].as_str() {
             Some("note:updated") => saw_note_updated = true,
-            Some("agent:stream:chunk") => saw_chunk = true,
+            Some("agent:stream:activity") => saw_chunk = true,
             Some("agent:stream:end") => {
                 saw_stream_end = true;
                 break;
@@ -333,7 +333,7 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         saw_note_updated,
         "tool's note:updated domain event received over the transport"
     );
-    assert!(saw_chunk, "at least one agent:stream:chunk received");
+    assert!(saw_chunk, "at least one agent:stream:activity received");
     assert!(saw_stream_end, "terminal agent:stream:end received");
 
     // BE state changed via the daemon-spawned child's real MCP tool call.
@@ -401,10 +401,12 @@ async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds
     // Subscriber connection (before the turn so no events are missed).
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
     let mut sub_reader = BufReader::new(sub_read);
+    // `chat:stream:delta` (explicitly subscribed — it is outside `agent:*`)
+    // carries the streamed content this test asserts on (turn markers).
     send(
         &mut sub_write,
         json!({ "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
-            "params": { "eventTypes": ["agent:*"], "workspaceId": ws.0 } }),
+            "params": { "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws.0 } }),
     )
     .await;
     let sub_resp = read_json(&mut sub_reader, 5).await;
@@ -439,14 +441,14 @@ async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Wait for the in-flight chunk so we know the turn is parked before stopping.
+    // Wait for the in-flight delta so we know the turn is parked before stopping.
     let mut saw_block_chunk = false;
     for _ in 0..50 {
         let frame = read_json(&mut sub_reader, 30).await;
         if frame["method"] != "events.event" {
             continue;
         }
-        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
             && frame["params"]["event"]["data"]["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -514,7 +516,7 @@ async fn agent_stop_interrupts_keep_alive_and_emits_terminal_stream_end_over_uds
             continue;
         }
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if frame["params"]["event"]["data"]["content"]
                     .as_str()
                     .unwrap_or_default()

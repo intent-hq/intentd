@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::events::{AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_TOOL_CALL};
+use intent_core::events::{AGENT_STREAM_END, AGENT_TOOL_CALL, CHAT_STREAM_DELTA};
 use intent_core::{now_iso, ActorType, AgentId, EventActor, WorkspaceId};
 use intent_services::{EventBus, Services};
 use intent_store::{NewEvent, Store};
@@ -425,7 +425,7 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 }
 
 /// CS-3 reconciliation invariant: the seq-0 snapshot reduced with the live
-/// `stream:chunk`/`tool:call`/`stream:end` deltas equals a fresh
+/// `chat:stream:delta`/`tool:call`/`stream:end` deltas equals a fresh
 /// `agent.getConversation` snapshot. Drives a mock turn — two text chunks that
 /// coalesce onto one block (added → updated), a tool call (tool_use → tool_use
 /// updated + tool_result added), then trailing text — persists the assistant
@@ -505,7 +505,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(0, "I'll run "),
     )
     .await;
@@ -513,7 +513,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(0, "the tests."),
     )
     .await;
@@ -546,7 +546,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(3, "Done."),
     )
     .await;
@@ -752,7 +752,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(0, "the tests."),
     )
     .await;
@@ -785,7 +785,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(3, "Done."),
     )
     .await;
@@ -1042,7 +1042,7 @@ async fn chat_subscription_isolates_stream_across_agents() {
         &bus,
         &ws_id,
         &b_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         json!({
             "agentId": b_id, "content": "secret from B", "messageId": b_mid,
             "blockIndex": 0, "blockId": format!("{b_mid}:0"), "blockType": "text",
@@ -1054,7 +1054,7 @@ async fn chat_subscription_isolates_stream_across_agents() {
         &bus,
         &ws_id,
         &a_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         json!({
             "agentId": a_id, "content": "hello A", "messageId": a_mid,
             "blockIndex": 0, "blockId": format!("{a_mid}:0"), "blockType": "text",
@@ -1075,8 +1075,10 @@ async fn chat_subscription_isolates_stream_across_agents() {
 }
 
 /// CS-4 firehose coexistence (Risk R1): the legacy `events.subscribe` firehose
-/// keeps emitting `agent:stream:*` events unchanged WHILE a `chat.subscribe`
-/// receives its block deltas for the SAME turn — both fire for one chunk.
+/// receives the content-free `agent:stream:activity` signal WHILE a
+/// `chat.subscribe` receives the block delta mapped from `chat:stream:delta`
+/// for the SAME turn — both fire for one chunk (the emit path publishes the
+/// delta plus, on the throttle's leading edge, the activity signal).
 #[tokio::test]
 async fn chat_subscription_coexists_with_events_firehose() {
     let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
@@ -1129,25 +1131,41 @@ async fn chat_subscription_coexists_with_events_firehose() {
     let _resp = read_json(&mut sub_reader).await;
     let _snap = read_json(&mut sub_reader).await;
 
-    // Publish a single chunk for A.
+    // Publish a single chunk for A as the emit path does: the content-bearing
+    // chat delta plus (leading edge of the throttle) the content-free
+    // activity signal.
     let mid = Uuid::now_v7().to_string();
     publish_stream(
         &bus,
         &ws_id,
         &a_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         json!({
             "agentId": a_id, "content": "hello", "messageId": mid,
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     )
     .await;
+    publish_stream(
+        &bus,
+        &ws_id,
+        &a_id,
+        intent_core::events::AGENT_STREAM_ACTIVITY,
+        json!({ "agentId": a_id, "messageId": mid }),
+    )
+    .await;
 
-    // The firehose sees the raw event unchanged (events.event, full payload).
+    // The firehose sees the content-free activity signal (the chat delta is
+    // outside the `agent:*` family, so the firehose never receives content).
     let fh = read_json(&mut fh_reader).await;
     assert_eq!(fh["method"], "events.event");
-    assert_eq!(fh["params"]["event"]["type"], "agent:stream:chunk");
-    assert_eq!(fh["params"]["event"]["data"]["content"], "hello");
+    assert_eq!(fh["params"]["event"]["type"], "agent:stream:activity");
+    assert_eq!(fh["params"]["event"]["data"]["agentId"], a_id.as_str());
+    assert_eq!(fh["params"]["event"]["data"]["messageId"], mid.as_str());
+    assert!(
+        fh["params"]["event"]["data"].get("content").is_none(),
+        "activity payload is content-free"
+    );
 
     // The chat subscription sees the mapped block delta for the same chunk.
     let delta = read_json(&mut sub_reader).await;
@@ -1251,7 +1269,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(0, "I'll run the tests. "),
     )
     .await;
@@ -1273,7 +1291,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(2, "Checking output. "),
     )
     .await;
@@ -1298,7 +1316,7 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         &bus,
         &ws_id,
         &agent_id,
-        AGENT_STREAM_CHUNK,
+        CHAT_STREAM_DELTA,
         chunk(4, "Let me also "),
     )
     .await;

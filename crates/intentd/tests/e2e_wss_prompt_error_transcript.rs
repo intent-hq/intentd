@@ -369,7 +369,7 @@ async fn failed_prompt_turn_preserves_partial_transcript_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -414,7 +414,7 @@ async fn failed_prompt_turn_preserves_partial_transcript_over_wss() {
             continue;
         }
         match event["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("chat:stream:delta") => {
                 if serde_json::to_string(&event["data"])
                     .unwrap_or_default()
                     .contains("Model metadata for")

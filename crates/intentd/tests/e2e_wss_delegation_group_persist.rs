@@ -721,9 +721,9 @@ async fn baseline_plus_aggregated_wake() {
             continue;
         }
         match ev["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 wake_chunks += 1;
-                eprintln!("  parent stream:chunk (wake_chunks={})", wake_chunks);
+                eprintln!("  parent stream:activity (wake_chunks={})", wake_chunks);
             }
             Some("agent:stream:end") => {
                 wake_ends += 1;

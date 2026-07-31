@@ -6320,7 +6320,7 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
-/// `agent:stream:chunk` that do not need durable storage.
+/// `chat:stream:delta` that do not need durable storage.
 pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
     bus.as_ref().map(|b| b.publish_transient(&event))
 }
