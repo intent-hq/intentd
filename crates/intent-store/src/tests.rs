@@ -4953,6 +4953,150 @@ async fn agent_queue_load_defaults_null_turn_id_to_row_id() {
     );
 }
 
+/// A transient SQLITE_BUSY error as surfaced by the repositories
+/// (monorepo#1139: "get note failed: ... (code: 5) database is locked").
+fn busy_error() -> Error {
+    Error::Internal(
+        "get note failed: error returned from database: (code: 5) database is locked".to_string(),
+    )
+}
+
+/// `with_read_retry` retries a closure that fails with a `code: 5` Internal
+/// error N times before succeeding, and returns the eventual Ok
+/// (monorepo#1139).
+#[tokio::test]
+async fn read_retry_retries_busy_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result = crate::with_read_retry(|| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 2 {
+            Err(busy_error())
+        } else {
+            Ok(42u32)
+        }
+    })
+    .await;
+    assert_eq!(result.expect("busy failures should be retried"), 42);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// Non-busy errors are NOT retried: the closure runs exactly once and the
+/// error is surfaced immediately.
+#[tokio::test]
+async fn read_retry_does_not_retry_non_busy_errors() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal("boom".to_string()))
+    })
+    .await;
+    match result {
+        Err(Error::Internal(msg)) => assert_eq!(msg, "boom"),
+        other => panic!("expected Internal(boom), got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Extended busy-family codes (261 SQLITE_BUSY_RECOVERY, 517
+/// SQLITE_BUSY_SNAPSHOT, 773 SQLITE_BUSY_TIMEOUT) are retried like the base
+/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK)
+/// are not.
+#[tokio::test]
+async fn read_retry_classifies_busy_family_codes() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    for code in [261u32, 517, 773] {
+        let calls = AtomicU32::new(0);
+        let result = crate::with_read_retry(|| async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 1 {
+                Err(Error::Internal(format!(
+                    "error returned from database: (code: {code}) database is locked"
+                )))
+            } else {
+                Ok(code)
+            }
+        })
+        .await;
+        assert_eq!(result.expect("busy-family code should be retried"), code);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "code {code}");
+    }
+
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Internal(
+            "error returned from database: (code: 516) abort due to ROLLBACK".to_string(),
+        ))
+    })
+    .await;
+    assert!(matches!(result, Err(Error::Internal(_))));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "non-busy 5xx code must not be retried"
+    );
+}
+
+/// `NotFound` is not a busy error: it passes through without retries.
+#[tokio::test]
+async fn read_retry_passes_through_not_found() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_read_retry(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(Error::NotFound("note spec".to_string()))
+    })
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The shared loop returns the last error once the deadline is exhausted.
+/// Uses a small injected deadline so the test stays fast (the production
+/// wrappers use a ~30s window).
+#[tokio::test]
+async fn busy_retry_returns_last_error_after_deadline() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result: crate::Result<u32> = crate::with_busy_retry(
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(busy_error())
+        },
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+    match result {
+        Err(Error::Internal(msg)) => assert!(msg.contains("code: 5"), "unexpected error: {msg}"),
+        other => panic!("expected Internal busy error, got {other:?}"),
+    }
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "expected at least one retry before the deadline"
+    );
+}
+
+/// `with_write_txn_retry` (STAB-7) shares the same loop: busy failures are
+/// retried until success.
+#[tokio::test]
+async fn write_txn_retry_retries_busy_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let calls = AtomicU32::new(0);
+    let result = crate::with_write_txn_retry(|| async {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        if n < 1 {
+            Err(busy_error())
+        } else {
+            Ok("done")
+        }
+    })
+    .await;
+    assert_eq!(result.expect("busy failures should be retried"), "done");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 /// Guard against duplicate migration version numbers: two files sharing a
 /// version (e.g. two `0062_*.sql`) embed fine but make every `Store::open`
 /// fail at runtime with a UNIQUE constraint violation on
