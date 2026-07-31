@@ -11010,11 +11010,27 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
         row["contentBlocks"][0]["text"], user_entity["block"]["text"],
         "delta block text matches the persisted row"
     );
+    // monorepo#1114: the snapshot path stamps the same synthetic id at serve
+    // time, so `agent.getConversation` and the delta agree byte-for-byte on
+    // block identity.
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "serve-time stamped snapshot id matches the delta's block id"
+    );
+    // monorepo#1157 omission side: this send carried no userAppMessageId, so
+    // the delta entity must omit `appMessageId` entirely (no null).
+    assert!(
+        user_entity.get("appMessageId").is_none(),
+        "rows without a client id omit appMessageId: {user_entity}"
+    );
 }
 
 /// Direct-send path: a plain `agent.sendMessage` from connection A (idle
 /// agent) surfaces as a user-row delta on connection B's `chat.subscribe`
-/// BEFORE any assistant chunk of the triggered turn.
+/// BEFORE any assistant chunk of the triggered turn. The send carries a
+/// client-minted `userAppMessageId`, so the delta entity must lift it as
+/// `appMessageId` (monorepo#1157) and the served conversation row must carry
+/// the same serve-time stamped block id as the delta (monorepo#1114).
 #[tokio::test]
 async fn direct_send_user_row_delta_over_chat_subscribe() {
     let Some(script) = gate("WSS direct-send user-row chat delta E2E") else {
@@ -11076,7 +11092,12 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from A" }),
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "hello from A",
+            "userAppMessageId": "app-msg-delta-e2e",
+        }),
     )
     .await;
     assert_eq!(sent["queued"], false, "idle agent streams: {sent}");
@@ -11110,5 +11131,44 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
         user_entity["block"]["id"],
         json!(format!("{sent_row_id}:0")),
         "stable synthetic block id: {user_entity}"
+    );
+    // monorepo#1157: the delta entity lifts the client-minted id so the FE
+    // can dedup its optimistic row on the delta path — no refetch needed.
+    assert_eq!(
+        user_entity["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "delta entity carries the send's appMessageId: {user_entity}"
+    );
+
+    // monorepo#1114: the served conversation row carries the same serve-time
+    // stamped `{messageId}:{index}` block id the delta emitted, so snapshot
+    // and delta agree byte-for-byte on block identity.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(&sent_row_id))
+        .expect("sent user row persisted")
+        .clone();
+    assert_eq!(
+        row["contentBlocks"][0]["id"],
+        json!(format!("{sent_row_id}:0")),
+        "agent.getConversation serves the stamped synthetic block id: {row}"
+    );
+    assert_eq!(
+        row["contentBlocks"][0]["id"], user_entity["block"]["id"],
+        "snapshot block id matches the delta's block id"
+    );
+    assert_eq!(
+        row["appMessageId"],
+        json!("app-msg-delta-e2e"),
+        "persisted row surfaces the appMessageId on reads: {row}"
     );
 }

@@ -652,13 +652,21 @@ impl ChatDeltaState {
         // sender attribution chip on an `agent_message`-tagged row — without
         // a refetch. Rows without metadata keep the lean entity shape.
         let metadata = msg.get("metadata").filter(|m| !m.is_null());
+        // monorepo#1157: lift the row's top-level `appMessageId` (the
+        // client-minted `userAppMessageId`, serialized by `AgentMessage` when
+        // present) onto each entity so subscribers can dedup optimistic user
+        // rows by id on the delta path. Omitted entirely when absent.
+        let app_message_id = msg.get("appMessageId").filter(|v| !v.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
-            // Persisted non-assistant blocks may lack a stored `id`; stamp the
-            // stable synthetic `{messageId}:{index}` (CS-0 D1) so re-delivery
-            // upserts by id instead of duplicating.
+            // Defense-in-depth fallback: since monorepo#1114 the re-read
+            // (`agent.getConversation`) already serves blocks stamped with the
+            // stable synthetic `{messageId}:{index}` (CS-0 D1), so this
+            // normally sees an id on every block; keep the stamp for rows
+            // reaching here id-less so re-delivery still upserts by id
+            // instead of duplicating.
             let mut block = block.clone();
             let bid = match block.get("id").and_then(Value::as_str) {
                 Some(id) => id.to_string(),
@@ -673,8 +681,13 @@ impl ChatDeltaState {
             let is_added = !self.seen_ids.contains(&bid);
             self.seen_ids.insert(bid.clone());
             let mut entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
-            if let (Some(md), Some(obj)) = (metadata, entity.as_object_mut()) {
-                obj.insert("metadata".to_string(), md.clone());
+            if let Some(obj) = entity.as_object_mut() {
+                if let Some(md) = metadata {
+                    obj.insert("metadata".to_string(), md.clone());
+                }
+                if let Some(app_id) = app_message_id {
+                    obj.insert("appMessageId".to_string(), app_id.clone());
+                }
             }
             push_entity(&mut added, &mut updated, is_added, entity);
         }

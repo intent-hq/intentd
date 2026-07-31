@@ -1256,6 +1256,66 @@ mod chat_message_delta {
     }
 
     #[tokio::test]
+    async fn user_row_message_entities_carry_app_message_id() {
+        // monorepo#1157: a user row persisted with a client-minted
+        // `userAppMessageId` serves it top-level as `appMessageId` on the
+        // re-read; the live delta entities must lift it so subscribers can
+        // dedup optimistic user rows by id on the delta path — every entity
+        // of the row carries it.
+        let conv = json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 4,
+                    "timestamp": "2026-07-30T00:00:00Z",
+                    "appMessageId": "app-msg-1",
+                    "contentBlocks": [
+                        { "type": "text", "text": "optimistic send" },
+                        { "type": "image", "data": "abc", "mimeType": "image/png" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 5,
+            "nextToken": Value::Null,
+        });
+        let api = ConvApi::new(conv);
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 2);
+        for e in added {
+            assert_eq!(
+                e["appMessageId"], "app-msg-1",
+                "entity must carry the row's appMessageId: {d}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_row_message_without_app_message_id_omits_the_field() {
+        // Rows without a client id keep the lean entity shape — the field is
+        // omitted entirely, never serialized as null.
+        let api = ConvApi::new(user_row_conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        let d = s
+            .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row agent:message must map to a delta");
+        for e in d["added"].as_array().unwrap() {
+            assert!(
+                e.get("appMessageId").is_none(),
+                "rows without a client id omit appMessageId: {e}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn assistant_row_message_maps_to_none_without_re_read() {
         // Assistant rows are owned by the stream + terminal reconcile; an
         // `agent:message` echo for one must NOT emit (double-emission guard)
