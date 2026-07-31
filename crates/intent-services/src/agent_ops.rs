@@ -1161,7 +1161,13 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
         return message;
     };
     for (index, block) in blocks.iter_mut().enumerate() {
-        if block.get("id").and_then(Value::as_str).is_some() {
+        // An empty-string id is treated as missing — it can't serve as a
+        // stable upsert key, so it gets the synthetic id like an absent one.
+        if block
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
             continue;
         }
         if let Some(obj) = block.as_object_mut() {

@@ -655,7 +655,10 @@ impl ChatDeltaState {
         // monorepo#1157: lift the row's top-level `appMessageId` (the
         // client-minted `userAppMessageId`, serialized by `AgentMessage` when
         // present) onto each entity so subscribers can dedup optimistic user
-        // rows by id on the delta path. Omitted entirely when absent.
+        // rows by id on the delta path. Omitted entirely when absent. The
+        // null-guard is defensive: the real re-read never serves a null
+        // `appMessageId` (`AgentMessage` skips the field when `None`), but a
+        // hand-built row (tests, future callers) shouldn't leak `null`.
         let app_message_id = msg.get("appMessageId").filter(|v| !v.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
@@ -668,7 +671,11 @@ impl ChatDeltaState {
             // reaching here id-less so re-delivery still upserts by id
             // instead of duplicating.
             let mut block = block.clone();
-            let bid = match block.get("id").and_then(Value::as_str) {
+            let bid = match block
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
                 Some(id) => id.to_string(),
                 None => {
                     let id = format!("{message_id}:{index}");

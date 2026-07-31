@@ -1993,7 +1993,9 @@ async fn get_conversation_strips_anonymous_tool_use_pairs() {
 /// monorepo#1114 helper: only id-less object blocks are stamped with the
 /// stable synthetic `{messageId}:{index}`; existing ids are never overwritten,
 /// non-object blocks pass through, and the index counts ALL blocks so it
-/// matches the delta path's enumeration. Non-array content is untouched.
+/// matches the delta path's enumeration. An empty-string id is treated as
+/// missing (it can't serve as a stable upsert key). Non-array content is
+/// untouched.
 #[test]
 fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
     use crate::agent_ops::stamp_synthetic_block_ids;
@@ -2012,6 +2014,7 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
         { "type": "text", "id": "kept", "text": "has id" },
         "not-an-object",
         { "type": "image", "data": "x", "mimeType": "image/png" },
+        { "type": "text", "id": "", "text": "empty id" },
     ])));
     let blocks = stamped.content.as_array().unwrap();
     assert_eq!(blocks[0]["id"], "m-1:0");
@@ -2024,8 +2027,42 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
         blocks[3]["id"], "m-1:3",
         "index counts ALL blocks, matching the delta path's enumeration"
     );
+    assert_eq!(
+        blocks[4]["id"], "m-1:4",
+        "an empty-string id is treated as missing and re-stamped"
+    );
     let passthrough = stamp_synthetic_block_ids(msg(json!("raw")));
     assert_eq!(passthrough.content, json!("raw"));
+}
+
+/// monorepo#1114 strip→stamp composition: when `strip_anonymous_tool_blocks`
+/// removes leading blocks, a surviving id-less block is stamped with its
+/// POST-strip index — the invariant that makes the served array's ids match
+/// the delta path's enumeration of the same served blocks.
+#[test]
+fn stamp_after_strip_uses_post_strip_indices() {
+    use crate::agent_ops::{stamp_synthetic_block_ids, strip_anonymous_tool_blocks};
+    let message = intent_core::AgentMessage {
+        id: "m-2".to_string(),
+        agent_id: AgentId::from("agent-x"),
+        seq: 1,
+        role: "assistant".to_string(),
+        content: json!([
+            { "type": "tool_use", "toolCallId": "anon-1", "name": "", "input": {} },
+            { "type": "tool_result", "tool_use_id": "anon-1", "content": [] },
+            { "type": "text", "text": "survives without an id" },
+        ]),
+        metadata: None,
+        app_message_id: None,
+        created_at: now_iso(),
+    };
+    let served = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+    let blocks = served.content.as_array().unwrap();
+    assert_eq!(blocks.len(), 1, "anonymous pair stripped: {blocks:?}");
+    assert_eq!(
+        blocks[0]["id"], "m-2:0",
+        "synthetic id reflects the post-strip index, not the original position"
+    );
 }
 
 /// monorepo#1114: `agent.getConversation` stamps the stable synthetic
