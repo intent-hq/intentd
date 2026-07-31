@@ -530,11 +530,11 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Wait for the agent to be observably in-flight: blockUntilCancel streams a chunk
-    // then parks, so seeing agent:stream:chunk means the agent is in the busy set.
+    // then parks, so seeing agent:stream:activity means the agent is in the busy set.
     let mut saw_chunk = false;
     for _ in 0..20 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+        if frame["params"]["event"]["type"] == "agent:stream:activity" {
             saw_chunk = true;
             break;
         }

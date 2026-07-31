@@ -374,12 +374,12 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     let mut saw_chunk = false;
     for _ in 0..20 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+        if frame["params"]["event"]["type"] == "agent:stream:activity" {
             saw_chunk = true;
             break;
         }
     }
-    assert!(saw_chunk, "agent did not stream its parked-turn chunk");
+    assert!(saw_chunk, "agent did not signal its parked-turn activity");
 
     // The mock writes the pid file at process startup, so it must exist by the
     // time a chunk streamed; the short poll only absorbs fs visibility lag.

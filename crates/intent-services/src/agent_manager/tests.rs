@@ -5605,7 +5605,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut streamed_chunks = 0;
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
-            if ev.event_type == intent_core::events::AGENT_STREAM_CHUNK {
+            if ev.event_type == intent_core::events::CHAT_STREAM_DELTA {
                 streamed_chunks += 1;
             }
         }
@@ -8141,11 +8141,11 @@ mod harness_wake_tests {
         // Wait until the chunk is routed (live-turn slot has content), then
         // interrupt mid-settle-window.
         let events = collect_until(&mut sub, |seen| {
-            seen.iter().any(|e| e.event_type == "agent:stream:chunk")
+            seen.iter().any(|e| e.event_type == "chat:stream:delta")
         })
         .await;
         assert!(
-            events.iter().any(|e| e.event_type == "agent:stream:chunk"),
+            events.iter().any(|e| e.event_type == "chat:stream:delta"),
             "wake turn streamed the chunk"
         );
         assert!(mgr.interrupt(&id).await, "interrupt found the agent");
