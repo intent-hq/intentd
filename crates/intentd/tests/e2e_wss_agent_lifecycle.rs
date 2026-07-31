@@ -1231,25 +1231,19 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     // `wss_event`'s per-read window resets on every frame (heartbeat pings
     // included), which can spin past the runner's test budget on a slow
     // coverage machine instead of failing fast. On timeout, surface every
-    // event observed while waiting, an `agent.get` snapshot, and the daemon
-    // log tail so a CI-only failure is diagnosable from the runner output.
+    // event observed while waiting plus the daemon log tail so a CI-only
+    // failure is diagnosable from the runner output alone. No RPC in the
+    // diagnostic path: after 120s of not reading `rpc` its heartbeat pongs
+    // stopped, so the server may have dropped that connection already.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let mut seen_events: Vec<Value> = Vec::new();
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
-            let snapshot = wss_rpc(
-                &mut rpc,
-                19,
-                "agent.get",
-                json!({ "workspaceId": ws_id, "agentId": agent_id }),
-            )
-            .await;
             let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
             let tail = &log[log.len().saturating_sub(4000)..];
             panic!(
                 "first turn did not stream its chunk within deadline;\n\
-                 events seen while waiting: {seen_events:?}\n\
-                 agent.get at timeout: {snapshot}\n\
+                 events seen while waiting: {seen_events:#?}\n\
                  daemon.log tail:\n{tail}"
             );
         };
