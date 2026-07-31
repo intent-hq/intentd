@@ -99,9 +99,12 @@ pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 // Agent attention request (new in intentd). Emitted by
 // `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` when an agent
 // explicitly raises attention before ending its turn. Self-sufficient payload
-// `{ workspaceId, agentId, agentName, kind, reason }` (`kind`:
+// `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }` (`kind`:
 // `"discussion" | "blocker"`) drives the FE sticky "Switch To" toast without
-// a follow-up fetch.
+// a follow-up fetch. `parentAgentId` is present only when the caller is a
+// delegated child — omitted entirely (never `null`) for parentless agents;
+// `agent:failed` carries the same optional field (enriched centrally in
+// `publish_agent_event`).
 pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
 
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR

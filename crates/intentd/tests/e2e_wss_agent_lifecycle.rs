@@ -3026,6 +3026,12 @@ async fn attention_request_discussion_over_wss() {
         json!(ws_id),
         "attention event carries workspaceId: {attention}"
     );
+    // The RPC front-door delegate is parentless, so the optional
+    // `parentAgentId` must be OMITTED entirely — never `null`.
+    assert!(
+        attention.get("parentAgentId").is_none(),
+        "parentAgentId omitted for a parentless caller: {attention}"
+    );
     assert_eq!(
         attention["agentName"],
         json!(agent_name),
@@ -3427,6 +3433,194 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
         session["status"], "error",
         "taskless turn ended normally: {}",
         session["status"]
+    );
+}
+
+/// Delegated (parented) children carry the optional `parentAgentId` on both
+/// `agent:attention-requested` and `agent:failed` over WSS. A parent agent
+/// delegates TWO children through the MCP front door (`ws.agent.delegate`,
+/// which records the caller as `parent_agent_id`):
+///  - child A raises `ws.agent.requestDiscussion(reason)` →
+///    `agent:attention-requested` with `parentAgentId` == the parent's id;
+///  - child B's prompt carries the mock's `exitIfPromptContains` marker, so
+///    every attempt dies mid-`session/prompt` — the one-shot silent redrive
+///    (monorepo#764) is spent and the terminal `agent:failed` fires with
+///    `parentAgentId` == the parent's id (enriched centrally in
+///    `publish_agent_event`).
+/// The parentless-omission halves are covered by
+/// `attention_request_discussion_over_wss` (attention) and the MIDTURN-1
+/// suite in `e2e_wss_agent_midturn_failure.rs` (failed).
+#[tokio::test]
+async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() {
+    let Some(script) = gate("WSS parented attention/failed parentAgentId E2E") else {
+        return;
+    };
+
+    const PARENT_GO: &str = "PARENTID_PARENT_GO";
+    const CHILD_ATTN: &str = "PARENTID_CHILD_ATTN";
+    const CHILD_DIE: &str = "PARENTID_CHILD_DIE";
+    const REASON: &str = "PARENTID need a decision from the coordinator";
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let delegate_attn_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(format!("{CHILD_ATTN} raise a discussion request")),
+    );
+    let delegate_die_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(format!("{CHILD_DIE} this child dies mid-prompt")),
+    );
+    let behavior = json!({
+        // Child B: every prompt carrying the marker dies mid-`session/prompt`
+        // (checked before rule selection), so the silent redrive's fresh
+        // child dies again and the failure goes terminal.
+        "exitIfPromptContains": CHILD_DIE,
+        "rules": [
+            {
+                "ifPromptContains": CHILD_ATTN,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": request_js, "summary": "raise discussion request" }
+                },
+                "response": "child A ended after requestDiscussion",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_attn_js, "summary": "delegate attention child" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": delegate_die_js, "summary": "delegate dying child" }
+                    },
+                ],
+                "response": "parent delegated two children",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — registered BEFORE the parent's delegating turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "ParentId-Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Both milestones under one hard deadline, order-insensitive: child A's
+    // attention event and child B's terminal agent:failed. The failed path
+    // includes a full silent-redrive cycle (kill + respawn + re-prompt), so
+    // the window is generous.
+    let mut attention: Option<Value> = None;
+    let mut failed: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !(attention.is_some() && failed.is_some()) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out: attention={a} failed={f}",
+                a = attention.is_some(),
+                f = failed.is_some(),
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:attention-requested" if data["reason"] == json!(REASON) => {
+                attention = Some(data.clone());
+            }
+            "agent:failed" if data["agentId"] != json!(parent_id) => {
+                failed = Some(data.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Child A's attention event names the delegating parent.
+    let attention = attention.expect("attention event captured");
+    let attn_child = attention["agentId"].as_str().expect("attention agentId");
+    assert_ne!(attn_child, parent_id, "attention came from the child");
+    assert_eq!(
+        attention["parentAgentId"],
+        json!(parent_id),
+        "delegated child's attention event carries parentAgentId: {attention}"
+    );
+
+    // Child B's terminal agent:failed names the delegating parent too.
+    let failed = failed.expect("failed event captured");
+    let failed_child = failed["agentId"].as_str().expect("failed agentId");
+    assert_ne!(
+        failed_child, attn_child,
+        "the dying child is a distinct agent"
+    );
+    let err = failed["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("agent stdout closed"),
+        "agent:failed carries the mid-turn prompt error, got: {err}"
+    );
+    assert_eq!(
+        failed["parentAgentId"],
+        json!(parent_id),
+        "delegated child's agent:failed carries parentAgentId: {failed}"
     );
 }
 
