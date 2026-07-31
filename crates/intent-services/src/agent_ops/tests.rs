@@ -1712,6 +1712,24 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
     assert_eq!(got.last_agent_response.as_deref(), Some("Old final line"));
     assert_eq!(got.digest.as_deref(), Some("old digest"));
 
+    // A final text block CLOSED by a tool-call boundary is complete even
+    // without a trailing newline: the overlay serves its last line unclipped
+    // for the duration of the tool call.
+    svc.set_live_turn_closed_final_block(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "Checking the failing tests",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Checking the failing tests")
+    );
+
     // A digest whose closing tag has streamed is extracted and wins even
     // though it sits on the (clipped) trailing partial line; the response
     // comes from the completed lines only.
@@ -1755,51 +1773,74 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
 /// Mid-turn preview derivation clips the still-streaming trailing partial
 /// line: only completed (newline-terminated) lines surface, a pre-newline
 /// turn omits the response, and a partial `<agent_digest>` span never leaks —
-/// while the terminal derivation is unaffected.
+/// while a CLOSED final block (tool-call boundary) and the terminal
+/// derivation are unaffected.
 #[test]
 fn live_preview_derivation_clips_trailing_partial_line() {
     let blocks = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
 
     // Completed lines advance; the trailing partial line is excluded.
-    let (resp, digest) =
-        live_response_and_digest_from_blocks(&blocks(&["First done\nSecond done\npartial tail"]));
+    let (resp, digest) = live_response_and_digest_from_blocks(
+        &blocks(&["First done\nSecond done\npartial tail"]),
+        true,
+    );
     assert_eq!(resp.as_deref(), Some("Second done"));
     assert_eq!(digest, None);
 
     // A newline-terminated final line is complete and served.
-    let (resp, _) = live_response_and_digest_from_blocks(&blocks(&["First done\nSecond done\n"]));
+    let (resp, _) =
+        live_response_and_digest_from_blocks(&blocks(&["First done\nSecond done\n"]), true);
     assert_eq!(resp.as_deref(), Some("Second done"));
 
     // Pre-newline turn (no completed line anywhere) omits the field.
-    let (resp, digest) = live_response_and_digest_from_blocks(&blocks(&["no newline yet"]));
+    let (resp, digest) = live_response_and_digest_from_blocks(&blocks(&["no newline yet"]), true);
     assert_eq!(resp, None);
     assert_eq!(digest, None);
-    assert_eq!(live_response_and_digest_from_blocks(&[]), (None, None));
+    assert_eq!(
+        live_response_and_digest_from_blocks(&[], true),
+        (None, None)
+    );
 
     // Only the FINAL block is mid-stream: an earlier block without a trailing
     // newline was closed by a block boundary and still serves its last line.
-    let (resp, _) =
-        live_response_and_digest_from_blocks(&blocks(&["Block one final", "streaming partial"]));
+    let (resp, _) = live_response_and_digest_from_blocks(
+        &blocks(&["Block one final", "streaming partial"]),
+        true,
+    );
     assert_eq!(resp.as_deref(), Some("Block one final"));
+
+    // A final text block CLOSED by a non-text boundary (e.g. a tool call
+    // flushed it, no new text since) is complete even without a trailing
+    // newline — no clipping applies, so the preview advances to its last
+    // line for the duration of the tool call.
+    let (resp, digest) = live_response_and_digest_from_blocks(
+        &blocks(&["Checking the failing tests"]),
+        false, // final block closed
+    );
+    assert_eq!(resp.as_deref(), Some("Checking the failing tests"));
+    assert_eq!(digest, None);
 
     // A partial trailing digest span never leaks — neither as digest (no
     // closing tag yet) nor as response text.
     let (resp, digest) =
-        live_response_and_digest_from_blocks(&blocks(&["Answer line\n<agent_digest>par"]));
+        live_response_and_digest_from_blocks(&blocks(&["Answer line\n<agent_digest>par"]), true);
     assert_eq!(resp.as_deref(), Some("Answer line"));
     assert_eq!(digest, None);
     // Same when the unclosed span itself contains newlines: the cleaning
     // strips the unclosed opener to end-of-text.
-    let (resp, digest) =
-        live_response_and_digest_from_blocks(&blocks(&["Answer line\n<agent_digest>par\ntial"]));
+    let (resp, digest) = live_response_and_digest_from_blocks(
+        &blocks(&["Answer line\n<agent_digest>par\ntial"]),
+        true,
+    );
     assert_eq!(resp.as_deref(), Some("Answer line"));
     assert_eq!(digest, None);
 
     // A digest whose closing tag has streamed surfaces immediately, even
     // without a trailing newline.
-    let (resp, digest) = live_response_and_digest_from_blocks(&blocks(&[
-        "Answer line\n<agent_digest>done</agent_digest>",
-    ]));
+    let (resp, digest) = live_response_and_digest_from_blocks(
+        &blocks(&["Answer line\n<agent_digest>done</agent_digest>"]),
+        true,
+    );
     assert_eq!(resp.as_deref(), Some("Answer line"));
     assert_eq!(digest.as_deref(), Some("done"));
 
