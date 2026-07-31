@@ -998,8 +998,11 @@ impl Services {
         // post-read mutation compares against this baseline (a seed never
         // emits; see [`Services::maybe_emit_display_status_changed`]).
         if ws.task_stats.is_some() {
+            // Derive from the row's own `activity` (set by every caller just
+            // before enrichment) so a single response can never pair
+            // `activity: "agent_running"` with `displayStatus: "idle"`.
             let display_status = compute_display_status(
-                self.workspace_activity(&ws.id) == WorkspaceActivity::AgentRunning,
+                ws.activity == WorkspaceActivity::AgentRunning,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1032,7 +1035,13 @@ impl Services {
     /// baseline to transition from); a read
     /// failure skips the recompute entirely so a transient store error can
     /// never fake a transition. Best-effort: errors are swallowed, the
-    /// mutation's own result is the contract.
+    /// mutation's own result is the contract. Concurrent callers (e.g. the
+    /// debounced idle demotion racing an `agent_activity_begin` promotion)
+    /// can in principle invert: the compute-then-insert is not atomic, so a
+    /// stale compute inserted second would emit outdated and leave the
+    /// baseline stale until the next transition. The activity read and cache
+    /// insert have no await between them, so the window is negligible and
+    /// self-heals on the next transition.
     pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
@@ -1373,6 +1382,14 @@ impl Services {
 
             if should_emit {
                 // Remove debouncer entry before emitting so reads stop reporting grace.
+                // Race note: an `agent_activity_begin` that lands after the
+                // should_emit check finds no handle to abort, so the client
+                // can observe `agent_running` followed by this stale `idle`
+                // activity event (pre-existing inversion). The displayStatus
+                // recompute below is safe against it: it re-reads
+                // `workspace_activity()` at emit time (count already 1 →
+                // `in_progress`) and the dedup cache suppresses a bogus
+                // demotion.
                 if let Ok(mut map) = debouncers.lock() {
                     if let Some((current_gen, _)) = map.get(&ws_id) {
                         if *current_gen == gen {
