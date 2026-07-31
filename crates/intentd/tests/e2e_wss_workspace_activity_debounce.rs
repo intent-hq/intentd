@@ -2,7 +2,10 @@
 //!
 //! Proves over a real WSS connection that the busy→idle transition is debounced
 //! (~3s default, 50ms in test) using the mock ACP agent fixture to drive real
-//! agent activity.
+//! agent activity, and that the derived `displayStatus` tracks the same
+//! transitions in lockstep: the agent run promotes it to `in_progress`
+//! (emitting `workspace:displayStatus-changed`) and the debounced idle flip
+//! demotes it back to `idle`.
 
 #![cfg(unix)]
 
@@ -299,6 +302,14 @@ async fn workspace_activity_changed_debounce() {
         .expect("workspace id")
         .to_string();
 
+    // Seed the displayStatus last-observed baseline (a first observation
+    // never emits) and pin the pre-run wire value: no agent running → idle.
+    let got = uds_rpc(&socket, 3, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        got["result"]["workspace"]["displayStatus"], "idle",
+        "pre-run displayStatus is idle: {got}"
+    );
+
     // Subscribe to workspace:* before any activity, scoped to this workspace.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(
@@ -332,16 +343,27 @@ async fn workspace_activity_changed_debounce() {
     )
     .await;
 
-    // Drain events until we see the agent_running workspace activity change.
-    // The subscription is scoped to this workspace, so we expect only relevant events.
+    // Drain events until we see the agent_running workspace activity change
+    // plus the displayStatus promotion to in_progress that rides the same
+    // transition. The subscription is scoped to this workspace, so we expect
+    // only relevant events.
     let mut saw_agent_running = false;
-    for _ in 0..20 {
+    let mut saw_in_progress = false;
+    for _ in 0..40 {
+        if saw_agent_running && saw_in_progress {
+            break;
+        }
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
-            if ev["params"]["event"]["type"] == "workspace:activity-changed"
-                && ev["params"]["event"]["data"]["activity"] == "agent_running"
+            let ev = &ev["params"]["event"];
+            if ev["type"] == "workspace:activity-changed"
+                && ev["data"]["activity"] == "agent_running"
             {
                 saw_agent_running = true;
-                break;
+            }
+            if ev["type"] == "workspace:displayStatus-changed"
+                && ev["data"]["displayStatus"] == "in_progress"
+            {
+                saw_in_progress = true;
             }
         }
     }
@@ -349,24 +371,47 @@ async fn workspace_activity_changed_debounce() {
         saw_agent_running,
         "expected workspace:activity-changed agent_running"
     );
+    assert!(
+        saw_in_progress,
+        "expected workspace:displayStatus-changed in_progress during the run"
+    );
 
     // Agent completes automatically. Wait a bit longer for the debounce + idle emission.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Drain events until we see the idle workspace activity change.
+    // Drain events until we see the idle workspace activity change plus the
+    // displayStatus demotion to idle that rides the same debounced flip.
     let mut saw_idle = false;
-    for _ in 0..20 {
+    let mut saw_status_idle = false;
+    for _ in 0..40 {
+        if saw_idle && saw_status_idle {
+            break;
+        }
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
-            if ev["params"]["event"]["type"] == "workspace:activity-changed"
-                && ev["params"]["event"]["data"]["activity"] == "idle"
-            {
+            let ev = &ev["params"]["event"];
+            if ev["type"] == "workspace:activity-changed" && ev["data"]["activity"] == "idle" {
                 saw_idle = true;
-                break;
+            }
+            if ev["type"] == "workspace:displayStatus-changed"
+                && ev["data"]["displayStatus"] == "idle"
+            {
+                saw_status_idle = true;
             }
         }
     }
     assert!(
         saw_idle,
         "expected workspace:activity-changed idle after debounce"
+    );
+    assert!(
+        saw_status_idle,
+        "expected workspace:displayStatus-changed idle after debounce"
+    );
+
+    // The post-run read path agrees with the event stream.
+    let got = uds_rpc(&socket, 4, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        got["result"]["workspace"]["displayStatus"], "idle",
+        "post-run displayStatus is idle: {got}"
     );
 }

@@ -1034,7 +1034,11 @@ impl Services {
         // post-read mutation compares against this baseline (a seed never
         // emits; see [`Services::maybe_emit_display_status_changed`]).
         if ws.task_stats.is_some() {
+            // Derive from the row's own `activity` (set by every caller just
+            // before enrichment) so a single response can never pair
+            // `activity: "agent_running"` with `displayStatus: "idle"`.
             let display_status = compute_display_status(
+                ws.activity == WorkspaceActivity::AgentRunning,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1061,12 +1065,19 @@ impl Services {
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
     /// the derivation (task/note status updates, task-note deletion, PR
-    /// link/status changes) — never from a polling loop. The first
+    /// link/status changes, agent activity begin/debounced end) — never from
+    /// a polling loop. The first
     /// observation for a workspace seeds the cache without emitting (no
     /// baseline to transition from); a read
     /// failure skips the recompute entirely so a transient store error can
     /// never fake a transition. Best-effort: errors are swallowed, the
-    /// mutation's own result is the contract.
+    /// mutation's own result is the contract. Concurrent callers (e.g. the
+    /// debounced idle demotion racing an `agent_activity_begin` promotion)
+    /// can in principle invert: the compute-then-insert is not atomic, so a
+    /// stale compute inserted second would emit outdated and leave the
+    /// baseline stale until the next transition. The activity read and cache
+    /// insert have no await between them, so the window is negligible and
+    /// self-heals on the next transition.
     pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
@@ -1076,6 +1087,7 @@ impl Services {
         };
         let task_stats = compute_task_stats(&notes);
         let status = compute_display_status(
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -1297,7 +1309,10 @@ impl Services {
     /// Record an agent session entering flight for `workspace_id`. On the
     /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
     /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change)
-    /// and cancels any pending idle debounce.
+    /// and cancels any pending idle debounce. The same transition recomputes
+    /// the derived `displayStatus` (a running agent promotes it to
+    /// `in_progress`) so `workspace:displayStatus-changed` tracks live agent
+    /// state without a client-side overlay.
     pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -1319,6 +1334,7 @@ impl Services {
                 activity_changed_event(workspace_id, WorkspaceActivity::AgentRunning),
             )
             .await;
+            self.maybe_emit_display_status_changed(workspace_id).await;
         }
     }
 
@@ -1402,6 +1418,14 @@ impl Services {
 
             if should_emit {
                 // Remove debouncer entry before emitting so reads stop reporting grace.
+                // Race note: an `agent_activity_begin` that lands after the
+                // should_emit check finds no handle to abort, so the client
+                // can observe `agent_running` followed by this stale `idle`
+                // activity event (pre-existing inversion). The displayStatus
+                // recompute below is safe against it: it re-reads
+                // `workspace_activity()` at emit time (count already 1 →
+                // `in_progress`) and the dedup cache suppresses a bogus
+                // demotion.
                 if let Ok(mut map) = debouncers.lock() {
                     if let Some((current_gen, _)) = map.get(&ws_id) {
                         if *current_gen == gen {
@@ -1415,6 +1439,9 @@ impl Services {
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
                 )
                 .await;
+                // The debounced idle flip also moves the derived displayStatus
+                // (no running agent demotes a task-stage rollup to `idle`).
+                this.maybe_emit_display_status_changed(&ws_id).await;
             }
         });
 
@@ -4225,7 +4252,10 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 }
 
 /// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
-/// "Proposed representation" / "Decision: BE-owned displayStatus"):
+/// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
+/// in live agent activity (previously a client-side overlay):
+/// 0. `agent_running` → `in_progress` unconditionally: a live agent always
+///    reads as active work, whatever the PR/task rollup says.
 /// 1. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
@@ -4238,10 +4268,33 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// 3. Latest PR (linked, else most recently updated entry) merged — or
 ///    `prStatus == Merged` — → `pr_merged`.
 /// 4. All tasks complete → `complete`; else `not_started`.
+/// 5. Without a running agent, a task-stage rollup (`in_progress` /
+///    `not_started` from steps 2/4) demotes to `idle`; the PR stages and
+///    `complete` pass through unchanged.
 ///
 /// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
 /// for open/draft entries) or open tasks (step 2 precedes the merged check).
 fn compute_display_status(
+    agent_running: bool,
+    active_pr: Option<&PullRequestInfo>,
+    pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
+    task_stats: Option<&WorkspaceTaskStats>,
+) -> WorkspaceDisplayStatus {
+    if agent_running {
+        return WorkspaceDisplayStatus::InProgress;
+    }
+    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+        WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
+            WorkspaceDisplayStatus::Idle
+        }
+        other => other,
+    }
+}
+
+/// PR/task-only precedence behind [`compute_display_status`] (steps 1–4);
+/// the caller applies the agent-activity promotion/demotion around it.
+fn compute_base_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
@@ -8763,6 +8816,7 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 if ws.task_stats.is_some() {
                     let display_status = compute_display_status(
+                        ws.activity == WorkspaceActivity::AgentRunning,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
                         ws.pr_status,
