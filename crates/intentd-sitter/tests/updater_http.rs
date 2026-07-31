@@ -20,17 +20,7 @@ use intentd_sitter::updater::{UpdateError, UpdateOutcome, Updater};
 /// Minimal single-purpose HTTP/1.1 fixture server: serves a fixed
 /// path → body map, closing each connection after one response.
 fn serve(routes: HashMap<String, Vec<u8>>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let routes = Arc::new(routes);
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let routes = Arc::clone(&routes);
-            thread::spawn(move || handle(stream, &routes));
-        }
-    });
-    format!("http://{addr}")
+    serve_on(TcpListener::bind("127.0.0.1:0").unwrap(), routes)
 }
 
 fn handle(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
@@ -113,23 +103,25 @@ fn serve_release(version: &str, bin_contents: &[u8], tamper_sha: bool) -> String
         sha256_hex(&archive)
     };
 
-    // Two-step bind: the manifest embeds absolute archive URLs, so learn the
-    // address first, then register routes against it.
+    // The manifest embeds absolute archive URLs, so learn the bound address
+    // first, then register routes against it. The same listener is handed to
+    // the server thread — dropping and rebinding by address (the previous
+    // approach) left a window where a parallel test could bind the port
+    // (intent-hq/monorepo#1211).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
     let mut routes = HashMap::new();
     routes.insert(
         "/channel-stable/stable.json".to_string(),
         manifest_json(version, &base_url, &asset, &sha),
     );
     routes.insert(format!("/{asset}"), archive);
-    serve_on(routes, &base_url)
+    serve_on(listener, routes)
 }
 
-fn serve_on(routes: HashMap<String, Vec<u8>>, base_url: &str) -> String {
-    let addr = base_url.strip_prefix("http://").unwrap();
-    let listener = TcpListener::bind(addr).unwrap();
+/// Serve `routes` on an already-bound listener; returns its base URL.
+fn serve_on(listener: TcpListener, routes: HashMap<String, Vec<u8>>) -> String {
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
     let routes = Arc::new(routes);
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -138,7 +130,7 @@ fn serve_on(routes: HashMap<String, Vec<u8>>, base_url: &str) -> String {
             thread::spawn(move || handle(stream, &routes));
         }
     });
-    base_url.to_string()
+    base_url
 }
 
 fn paths_in(dir: &Path) -> SitterPaths {
@@ -249,10 +241,7 @@ fn invalid_manifest_version_is_rejected_and_nothing_installed() {
 fn network_down_is_a_soft_failure() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths_in(dir.path());
-    // Bind then immediately drop a listener so the port refuses connections.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    let base_url = unreachable_base();
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
     let err = updater.check_and_install(Channel::Stable).unwrap_err();
@@ -390,11 +379,23 @@ fn prune_keeps_current_and_one_previous_version() {
     );
 }
 
-/// Base URL that refuses connections (bound then immediately dropped).
+/// A base URL whose port refuses requests (network down).
+///
+/// The listener stays bound for the life of the process and a detached
+/// thread accepts each connection and immediately drops it, so the updater's
+/// fetch deterministically fails. Binding and then dropping the listener
+/// (the previous approach) released the ephemeral port back to the OS, which
+/// could reassign it to a sibling test's fixture server before the updater
+/// connected — turning the "dead" URL into a live one under parallel test
+/// load (intent-hq/monorepo#1211).
 fn unreachable_base() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
     base_url
 }
 
@@ -428,7 +429,7 @@ fn falls_back_to_second_base_when_primary_manifest_fetch_fails() {
     )]);
     let cases = [
         ("404", serve(HashMap::new())),
-        ("connection refused", unreachable_base()),
+        ("connection reset", unreachable_base()),
         ("unparseable manifest", serve(unparseable)),
     ];
     for (case, primary) in cases {
