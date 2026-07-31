@@ -305,7 +305,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// RETRY-1a: session/new stall → retry with status hint → success.
 /// Mock ignores session/new on the first attempt (timeout), then succeeds on
 /// retry. Assert agent:stream:status retry hint is observed before the turn
-/// completes with agent:stream:chunk + agent:stream:end.
+/// completes with agent:stream:activity + agent:stream:end.
 #[tokio::test]
 async fn agent_spawn_retry_session_new_stall_over_wss() {
     let Some(script) = gate("WSS spawn retry session/new stall E2E") else {
@@ -392,7 +392,7 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
             Some("agent:stream:status") => {
                 status_frames.push(frame["params"]["event"].clone());
             }
-            Some("agent:stream:chunk") => chunks += 1,
+            Some("agent:stream:activity") => chunks += 1,
             Some("agent:stream:end") => {
                 ends += 1;
                 break;
@@ -420,7 +420,7 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
             );
         }
     }
-    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
 
@@ -511,7 +511,7 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
             Some("agent:stream:status") => {
                 status_frames.push(frame["params"]["event"].clone());
             }
-            Some("agent:stream:chunk") => chunks += 1,
+            Some("agent:stream:activity") => chunks += 1,
             Some("agent:stream:end") => {
                 ends += 1;
                 break;
@@ -534,7 +534,7 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
             );
         }
     }
-    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
 
@@ -644,7 +644,7 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
                 saw_end = true;
                 break;
             }
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 panic!("unexpected chunk after exhaustion: {frame}");
             }
             _ => {}
@@ -829,13 +829,13 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     // Give the retry spawn a moment to start and complete
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Wait for the turn to complete: expect agent:stream:chunk and agent:stream:end
+    // Wait for the turn to complete: expect agent:stream:activity and agent:stream:end
     let mut saw_chunk = false;
     let mut saw_end = false;
     for _ in 0..100 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:chunk") => {
+            Some("agent:stream:activity") => {
                 saw_chunk = true;
             }
             Some("agent:stream:end") => {
@@ -850,7 +850,10 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
             _ => {}
         }
     }
-    assert!(saw_chunk, "agent:stream:chunk emitted after retry recovery");
+    assert!(
+        saw_chunk,
+        "agent:stream:activity emitted after retry recovery"
+    );
     assert!(saw_end, "agent:stream:end emitted after retry recovery");
 
     // Verify final status is no longer error
@@ -982,7 +985,7 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
             Some("agent:failed") => {
                 panic!("agent:failed on slow initialize — handshake timeout regressed: {frame}");
             }
-            Some("agent:stream:chunk") => chunks += 1,
+            Some("agent:stream:activity") => chunks += 1,
             Some("agent:stream:end") => {
                 ends += 1;
                 break;
@@ -994,6 +997,6 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
         retry_hints.is_empty(),
         "slow initialize must succeed on the first attempt, saw retry hints: {retry_hints:?}"
     );
-    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }

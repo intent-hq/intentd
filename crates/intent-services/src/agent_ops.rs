@@ -16,7 +16,8 @@ use intent_core::events::{
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
+    MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -46,6 +47,18 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// Outcome of [`Services::scan_assigned_agents`]: the newest live/resumable
+/// session (occupancy), the newest known session (inheritance source), plus
+/// the stale (`cleaned_up`) and poisoned assignment ids the wakeOrCreate
+/// branches prune/migrate.
+#[derive(Debug, Default)]
+pub(crate) struct AssignedAgentScan {
+    pub(crate) live_session: Option<AgentSession>,
+    pub(crate) inheritance_source: Option<AgentSession>,
+    pub(crate) cleaned_up: Vec<AgentId>,
+    pub(crate) poisoned: Vec<AgentId>,
+}
 
 #[cfg(test)]
 mod tests;
@@ -1147,6 +1160,39 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// monorepo#1114: stamp the stable synthetic `{messageId}:{index}` id onto any
+/// content block that persisted without one, so `agent.getConversation`, the
+/// seq-0 chat snapshot, and the §7.1 delta path (which re-reads through this
+/// op) agree byte-for-byte on block identity. Assistant blocks always persist
+/// with ids, so the pass is a no-op for them; non-assistant rows (user /
+/// system / tool) gain the same id the delta path stamps. Serve-time only —
+/// the stored rows are untouched, so the read stays idempotent. Runs AFTER
+/// [`strip_anonymous_tool_blocks`] so indices match the served array.
+fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
+    let message_id = message.id.clone();
+    let Some(blocks) = message.content.as_array_mut() else {
+        return message;
+    };
+    for (index, block) in blocks.iter_mut().enumerate() {
+        // An empty-string id is treated as missing — it can't serve as a
+        // stable upsert key, so it gets the synthetic id like an absent one.
+        if block
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            continue;
+        }
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert(
+                "id".to_string(),
+                Value::String(format!("{message_id}:{index}")),
+            );
+        }
+    }
+    message
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
@@ -1158,9 +1204,12 @@ impl Services {
             .store
             .list_agent_session_summaries(&workspace_id)
             .await?;
+        // Message projections are the expensive half (full-workspace COUNT
+        // aggregate + preview columns). Cache per workspace; invalidated on
+        // transcript writes and session create/delete.
         let mut projections = self
-            .store
-            .get_agent_session_message_projections(&workspace_id)
+            .agent_list_cache
+            .get_or_load(&self.store, &workspace_id)
             .await?;
         Ok(sessions
             .into_iter()
@@ -1169,6 +1218,13 @@ impl Services {
                 self.project_lite_with_flags_from_projection(s, &projection)
             })
             .collect())
+    }
+
+    /// Drop the cached agent.list message projections for `workspace_id`.
+    /// Call after any successful agent_message write or session create/delete
+    /// in this workspace so the next list reloads from SQLite.
+    pub(crate) fn invalidate_agent_list_cache(&self, workspace_id: &WorkspaceId) {
+        self.agent_list_cache.invalidate(&workspace_id.0);
     }
 
     /// `agent.get` (PROTOCOL §5.5). `NotFound` is surfaced to the router which
@@ -1237,6 +1293,19 @@ impl Services {
         // rehydrating via agent.list/agent.get after the failure event still
         // sees the corrupted flag.
         let session_corrupted = self.session_poisoned(&session);
+        // Live-turn overlay: while a worker is draining an in-flight turn,
+        // derive `lastAgentResponse`/`digest` from the live slot's streamed
+        // text blocks so `agent.get`/`agent.list` track the
+        // turn instead of staying pinned on the previous turn's persisted
+        // preview. Per-field: a turn that has streamed no text yet (or no
+        // digest yet) yields `None` for that field and the persisted-preview
+        // value is kept.
+        let live_overlay = if is_responding {
+            self.live_turn_text_blocks(&session.id)
+                .map(|blocks| last_response_and_digest_from_blocks(&blocks))
+        } else {
+            None
+        };
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1245,6 +1314,14 @@ impl Services {
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
         lite.session_corrupted = session_corrupted;
+        if let Some((live_response, live_digest)) = live_overlay {
+            if live_response.is_some() {
+                lite.last_agent_response = live_response;
+            }
+            if live_digest.is_some() {
+                lite.digest = live_digest;
+            }
+        }
         lite
     }
 
@@ -1358,6 +1435,11 @@ impl Services {
     /// non-destructively — the stored rows are untouched, so the read is
     /// idempotent and covers old rows and restored backups alike.
     ///
+    /// monorepo#1114: the served page also stamps the stable synthetic
+    /// `{messageId}:{index}` id onto blocks that persisted without one
+    /// ([`stamp_synthetic_block_ids`]), so snapshot and delta consumers see
+    /// identical block identities.
+    ///
     /// Pagination happens SQL-side (monorepo#958): the window is resolved
     /// against the row count and only the requested page is selected and
     /// decoded, so a `limit=N` read touches at most N rows regardless of
@@ -1396,6 +1478,7 @@ impl Services {
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
+            .map(stamp_synthetic_block_ids)
             .collect();
         Ok(json!({
             "agentId": agent_id,
@@ -1779,6 +1862,7 @@ impl Services {
             sandbox_branch: None,
         };
         self.store.insert_agent_session(&session).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
         // falling back to the provider id when no model is resolved yet;
@@ -1957,6 +2041,7 @@ impl Services {
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
+            self.invalidate_agent_list_cache(session_ws);
         }
         self.agent_queues
             .lock()
@@ -2219,6 +2304,7 @@ impl Services {
                 &created_at,
             )
             .await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -2324,6 +2410,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(&agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let replaced_count = inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2404,6 +2491,7 @@ impl Services {
             })
             .collect();
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -2779,6 +2867,7 @@ impl Services {
         };
         match message {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&session.workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Reuses the session validated above; best-effort (logged on error).
@@ -2893,6 +2982,7 @@ impl Services {
                 return Err(e);
             }
         };
+        self.invalidate_agent_list_cache(&session.workspace_id);
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -3496,6 +3586,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(&workspace_id);
                 self.publish_agent_mutation_event(
                     &workspace_id,
                     &caller,
@@ -3776,6 +3867,33 @@ impl Services {
                 )?;
             }
         }
+        // Occupancy pre-gate: a task note that already has a live assigned
+        // agent cannot be silently double-delegated. Runs BEFORE any
+        // side-effectful work (child creation, group enrollment), alongside
+        // the depth/scope gates above, so a rejection leaves no orphaned
+        // child. "Occupied" reuses the same live/resumable predicate as
+        // `agent_wake_or_create_op`'s newest-first scan (loadable, not
+        // Deleted, not poisoned) and only applies while the task itself is
+        // still workable (status not complete/cancelled). `force: true`
+        // deliberately adds a second agent.
+        if input.force != Some(true) {
+            if let Some(task) = task_note.as_ref().and_then(|n| n.metadata.task.as_ref()) {
+                if !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+                    if let Some(existing) = self
+                        .scan_assigned_agents(&task.assigned_agent_ids)
+                        .await?
+                        .live_session
+                    {
+                        return Err(Error::InvalidParams(format!(
+                            "Task is already being worked by agent {} (\"{}\"). \
+                             Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                             or pass force: true to intentionally add a second agent.",
+                            existing.id, existing.name
+                        )));
+                    }
+                }
+            }
+        }
         let delegation_depth = parent_agent_id.as_ref().map(|_| {
             parent_session
                 .as_ref()
@@ -3916,8 +4034,16 @@ impl Services {
         }
 
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
+            // Occupancy was already resolved by the pre-gate above (or
+            // deliberately overridden), so this internal assignment must not
+            // be re-blocked by `assign_agent`'s own guard.
             let _ = self
-                .assign_agent(workspace_id.clone(), task_note_id, agent_id.clone())
+                .assign_agent(
+                    workspace_id.clone(),
+                    task_note_id,
+                    agent_id.clone(),
+                    Some(true),
+                )
                 .await;
         }
         // Auto-subscribe the delegating caller to the child's completion (AS-2).
@@ -5348,6 +5474,81 @@ impl Services {
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
     }
 
+    /// Newest-first probe over a task's `assignedAgentIds` (B1 + B2;
+    /// `Vec::push` append-order means newest is the tail). Shared by
+    /// `agent_wake_or_create_op`'s live/resumable scan and the occupancy
+    /// guards in `agent_delegate_op` / `assign_agent`. Probe each session:
+    ///   * NotFound / Deleted → stale, queue for cleanup.
+    ///   * Poisoned (monorepo#840: Error + session-fatal provider block or
+    ///     an identical-failure streak) → NOT resumable: waking it would
+    ///     replay the provider-blocked turn ("start a new session" means a
+    ///     fresh session). Queue for cleanup so a fresh agent is created,
+    ///     keeping it as the inheritance source for specialist/model.
+    ///     Poisoned ids are ALSO tracked separately: their parked queues
+    ///     are migrated onto the wake/create target and the dead session
+    ///     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+    ///     cleanup-only behavior.
+    ///   * Otherwise → treat as resumable; the newest live session wins.
+    ///
+    /// Once the newest live session is found, older candidates are left
+    /// untouched EXCEPT poisoned ones: a failed queue migration keeps the
+    /// poisoned assignment in place (now older than the live winner), so
+    /// the scan keeps probing for poisoned ids to retry the migration + GC
+    /// on this wake (monorepo#847).
+    /// `inheritance_source` captures the newest **known** previous session
+    /// (live, poisoned, or deleted) so wakeOrCreate's create branch can still
+    /// inherit specialist/model when no live agent is available.
+    pub(crate) async fn scan_assigned_agents(
+        &self,
+        assigned: &[AgentId],
+    ) -> Result<AssignedAgentScan> {
+        let mut scan = AssignedAgentScan::default();
+        for candidate in assigned.iter().rev().cloned() {
+            if scan.live_session.is_some() {
+                match self.store.get_agent_session(&candidate).await {
+                    Ok(session)
+                        if session.status != AgentStatus::Deleted
+                            && self.session_poisoned(&session) =>
+                    {
+                        scan.poisoned.push(candidate.clone());
+                        scan.cleaned_up.push(candidate);
+                    }
+                    Ok(_) | Err(Error::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+            match self.store.get_agent_session(&candidate).await {
+                Ok(session)
+                    if session.status != AgentStatus::Deleted
+                        && !self.session_poisoned(&session) =>
+                {
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(session.clone());
+                    }
+                    scan.live_session = Some(session);
+                }
+                Ok(unusable_session) => {
+                    if unusable_session.status != AgentStatus::Deleted {
+                        tracing::warn!(
+                            agent = %candidate,
+                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
+                            "assigned-agent scan skipping poisoned session; not resumable (monorepo#840)"
+                        );
+                        scan.poisoned.push(candidate.clone());
+                    }
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(unusable_session);
+                    }
+                    scan.cleaned_up.push(candidate);
+                }
+                Err(Error::NotFound(_)) => scan.cleaned_up.push(candidate),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(scan)
+    }
+
     /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
     /// newest live/resumable agent assigned to the task, or — when none is
     /// found — create a new one with specialist/model inheritance from the
@@ -5416,74 +5617,15 @@ impl Services {
             .await?;
         let task_title = task.title.clone();
 
-        // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
-        // append-order means newest is the tail). Probe each session:
-        //   * NotFound / Deleted → stale, queue for cleanup.
-        //   * Poisoned (monorepo#840: Error + session-fatal provider block or
-        //     an identical-failure streak) → NOT resumable: waking it would
-        //     replay the provider-blocked turn ("start a new session" means a
-        //     fresh session). Queue for cleanup so a fresh agent is created,
-        //     keeping it as the inheritance source for specialist/model.
-        //     Poisoned ids are ALSO tracked separately: their parked queues
-        //     are migrated onto the wake/create target and the dead session
-        //     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
-        //     cleanup-only behavior.
-        //   * Otherwise → treat as resumable; the newest live session wins.
-        // Once the newest live session is found, older candidates are left
-        // untouched EXCEPT poisoned ones: a failed queue migration keeps the
-        // poisoned assignment in place (now older than the live winner), so
-        // the scan keeps probing for poisoned ids to retry the migration + GC
-        // on this wake (monorepo#847).
-        // `inheritance_source` captures the newest **known** previous session
-        // (live, poisoned, or deleted) so the create branch can still inherit
-        // specialist/model when no live agent is available.
-        let mut cleaned_up: Vec<AgentId> = Vec::new();
-        let mut poisoned: Vec<AgentId> = Vec::new();
-        let mut live_session: Option<AgentSession> = None;
-        let mut inheritance_source: Option<AgentSession> = None;
-        for candidate in task.assigned_agents.iter().rev().cloned() {
-            if live_session.is_some() {
-                match self.store.get_agent_session(&candidate).await {
-                    Ok(session)
-                        if session.status != AgentStatus::Deleted
-                            && self.session_poisoned(&session) =>
-                    {
-                        poisoned.push(candidate.clone());
-                        cleaned_up.push(candidate);
-                    }
-                    Ok(_) | Err(Error::NotFound(_)) => {}
-                    Err(e) => return Err(e),
-                }
-                continue;
-            }
-            match self.store.get_agent_session(&candidate).await {
-                Ok(session)
-                    if session.status != AgentStatus::Deleted
-                        && !self.session_poisoned(&session) =>
-                {
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(session.clone());
-                    }
-                    live_session = Some(session);
-                }
-                Ok(unusable_session) => {
-                    if unusable_session.status != AgentStatus::Deleted {
-                        tracing::warn!(
-                            agent = %candidate,
-                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
-                            "wakeOrCreate skipping poisoned session; a fresh agent will be created (monorepo#840)"
-                        );
-                        poisoned.push(candidate.clone());
-                    }
-                    if inheritance_source.is_none() {
-                        inheritance_source = Some(unusable_session);
-                    }
-                    cleaned_up.push(candidate);
-                }
-                Err(Error::NotFound(_)) => cleaned_up.push(candidate),
-                Err(e) => return Err(e),
-            }
-        }
+        // B1 + B2: the newest-first live/resumable probe over the task's
+        // assignments (see `scan_assigned_agents` for the full contract —
+        // stale/poisoned tracking, inheritance source, newest live winner).
+        let AssignedAgentScan {
+            live_session,
+            inheritance_source,
+            mut cleaned_up,
+            poisoned,
+        } = self.scan_assigned_agents(&task.assigned_agents).await?;
 
         // B7: `messageMetadata` is applied to the delivered context message on
         // BOTH branches via `deliver_wake_message`.
@@ -5764,8 +5906,11 @@ impl Services {
             .unwrap_or_default()
             .to_string();
         let agent = AgentId::from(agent_id_str.as_str());
+        // The scan above already established there is no live assigned agent
+        // (create branch), so this internal assignment bypasses
+        // `assign_agent`'s occupancy guard.
         let _ = self
-            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str)
+            .assign_agent(workspace_id.clone(), task_note_id, agent_id_str, Some(true))
             .await;
         // monorepo#847: same ordering contract as the wake branch — migrate
         // the poisoned siblings' parked queues BEFORE `deliver_wake_message`
@@ -5994,7 +6139,10 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(msg) => msg,
+            Ok(msg) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                msg
+            }
             Err(_) => {
                 manager.release_slot(agent_id).await;
                 let (queued, position) = self.enqueue_message(
@@ -6110,6 +6258,7 @@ impl Services {
             .await
         {
             Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -7111,6 +7260,7 @@ impl Services {
                     return Err(e);
                 }
             };
+            self.invalidate_agent_list_cache(&workspace_id);
 
             // Emit agent:message + agent:updated so live UIs render the marker.
             self.publish_agent_mutation_event(
@@ -7242,6 +7392,7 @@ impl Services {
             .store
             .append_agent_message(agent_id, "system", &content, &now_iso())
             .await?;
+        self.invalidate_agent_list_cache(&workspace_id);
 
         // Mark the interrupted_agent row as resolved
         let updated = self

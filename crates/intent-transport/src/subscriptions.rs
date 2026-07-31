@@ -12,8 +12,8 @@
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
-    AGENT_RENAMED, AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_CHUNK,
-    AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
+    AGENT_RENAMED, AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_END,
+    AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
     WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
@@ -335,15 +335,16 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             PR_UNLINKED,
         ],
         Channel::Comment => &[COMMENT_ADDED],
-        // The chat channel is the one consumer of the `agent:stream:*` family
-        // (CS-0); the forwarder additionally filters these to one agent by
-        // `sessionId == agentId`. `agent:message` is tailed for NON-assistant
-        // rows (user/system/tool persists — queue drains, direct sends, model
-        // switches) so subscribers render them live without a refetch;
-        // assistant echoes map to `None` (the stream + terminal reconcile
-        // owns assistant content).
+        // The chat channel is the one consumer of the content-bearing
+        // `chat:stream:delta` firehose (CS-0); the forwarder additionally
+        // filters these to one agent by `sessionId == agentId`.
+        // `agent:message` is tailed for NON-assistant rows (user/system/tool
+        // persists — queue drains, direct sends, model switches) so
+        // subscribers render them live without a refetch; assistant echoes
+        // map to `None` (the stream + terminal reconcile owns assistant
+        // content).
         Channel::Chat => &[
-            AGENT_STREAM_CHUNK,
+            CHAT_STREAM_DELTA,
             AGENT_TOOL_CALL,
             AGENT_STREAM_END,
             AGENT_MESSAGE,
@@ -586,13 +587,14 @@ impl ChatDeltaState {
     }
 
     /// Map one tailed chat-channel event to a chat block delta (or `None` for
-    /// an unrelated/malformed event). `chunk`/`tool:call` build live block upserts
-    /// from the payload; `stream:end` reconciles against the persisted message and
-    /// resets the per-turn state; `agent:message` re-reads a persisted
-    /// NON-assistant row and emits its blocks as authoritative entities.
+    /// an unrelated/malformed event). `chat:stream:delta`/`tool:call` build live
+    /// block upserts from the payload; `stream:end` reconciles against the
+    /// persisted message and resets the per-turn state; `agent:message` re-reads
+    /// a persisted NON-assistant row and emits its blocks as authoritative
+    /// entities.
     pub(crate) async fn delta(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
         match event.event_type.as_str() {
-            AGENT_STREAM_CHUNK => self.chunk_delta(event),
+            CHAT_STREAM_DELTA => self.chunk_delta(event),
             AGENT_TOOL_CALL => self.tool_delta(event),
             AGENT_STREAM_END => self.finalize(api).await,
             AGENT_MESSAGE => self.message_row_delta(api, event).await,
@@ -650,15 +652,30 @@ impl ChatDeltaState {
         // sender attribution chip on an `agent_message`-tagged row — without
         // a refetch. Rows without metadata keep the lean entity shape.
         let metadata = msg.get("metadata").filter(|m| !m.is_null());
+        // monorepo#1157: lift the row's top-level `appMessageId` (the
+        // client-minted `userAppMessageId`, serialized by `AgentMessage` when
+        // present) onto each entity so subscribers can dedup optimistic user
+        // rows by id on the delta path. Omitted entirely when absent. The
+        // null-guard is defensive: the real re-read never serves a null
+        // `appMessageId` (`AgentMessage` skips the field when `None`), but a
+        // hand-built row (tests, future callers) shouldn't leak `null`.
+        let app_message_id = msg.get("appMessageId").filter(|v| !v.is_null());
         let blocks = msg.get("contentBlocks").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
-            // Persisted non-assistant blocks may lack a stored `id`; stamp the
-            // stable synthetic `{messageId}:{index}` (CS-0 D1) so re-delivery
-            // upserts by id instead of duplicating.
+            // Defense-in-depth fallback: since monorepo#1114 the re-read
+            // (`agent.getConversation`) already serves blocks stamped with the
+            // stable synthetic `{messageId}:{index}` (CS-0 D1), so this
+            // normally sees an id on every block; keep the stamp for rows
+            // reaching here id-less so re-delivery still upserts by id
+            // instead of duplicating.
             let mut block = block.clone();
-            let bid = match block.get("id").and_then(Value::as_str) {
+            let bid = match block
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
                 Some(id) => id.to_string(),
                 None => {
                     let id = format!("{message_id}:{index}");
@@ -671,8 +688,13 @@ impl ChatDeltaState {
             let is_added = !self.seen_ids.contains(&bid);
             self.seen_ids.insert(bid.clone());
             let mut entity = self.entity_with_role(&message_id, role, block, seq, ts, true);
-            if let (Some(md), Some(obj)) = (metadata, entity.as_object_mut()) {
-                obj.insert("metadata".to_string(), md.clone());
+            if let Some(obj) = entity.as_object_mut() {
+                if let Some(md) = metadata {
+                    obj.insert("metadata".to_string(), md.clone());
+                }
+                if let Some(app_id) = app_message_id {
+                    obj.insert("appMessageId".to_string(), app_id.clone());
+                }
             }
             push_entity(&mut added, &mut updated, is_added, entity);
         }
@@ -682,7 +704,7 @@ impl ChatDeltaState {
         Some(json!({ "added": added, "updated": updated, "removedIds": [] }))
     }
 
-    /// Map an `agent:stream:chunk`: accumulate the chunk and emit the full block
+    /// Map a `chat:stream:delta`: accumulate the chunk and emit the full block
     /// (D2/D4). Text chunks coalesce onto one `blockId` (`updated` on growth);
     /// non-text chunks pass through as the full block (`added`), stamped with the
     /// same id the persisted block carries.

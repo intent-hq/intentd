@@ -45,21 +45,37 @@ pub const AGENT_SUBSCRIPTIONS_CHANGED: &str = "agent:subscriptions-changed";
 pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 
 // Agent streaming events (for the WebSocket API). All share the
-// `agent:stream:` prefix — the high-volume chunk family the §10.2
+// `agent:stream:` prefix — the high-volume stream family the §10.2
 // retention/compaction sweep is allowed to trim.
 pub const AGENT_STREAM_PREFIX: &str = "agent:stream:";
 pub const AGENT_STREAM_START: &str = "agent:stream:start";
-pub const AGENT_STREAM_CHUNK: &str = "agent:stream:chunk";
+// Content-free per-agent activity signal (renamed from `agent:stream:chunk`):
+// broadcast while a turn streams so clients can tick busy/stall state without
+// receiving transcript content. Payload is `{ agentId, messageId }` only;
+// leading-edge throttled per agent (first activity of a turn emits
+// immediately, then at most one per second). Transcript content flows on the
+// internal chat channel (`CHAT_STREAM_DELTA`) instead.
+pub const AGENT_STREAM_ACTIVITY: &str = "agent:stream:activity";
 pub const AGENT_STREAM_END: &str = "agent:stream:end";
 // Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
 // §7). Emitted while an agent turn is starting so the chat spinner can show
 // the current phase (`launch` / `init` / `session-create` / `session-load` /
-// `prompt`) before the first `agent:stream:chunk` arrives; cleared by the FE
-// on the first chunk / `agent:stream:end` / `agent:failed`. Self-sufficient
-// payload `{ agentId, workspaceId, phase, message, level, timestamp }` so a
-// thin client renders the hint directly without a follow-up fetch. Mirrors
-// the TS reference `acp-provider.ts` `emitStatus()` call sites.
+// `prompt`) before the first `agent:stream:activity` arrives; cleared by the
+// FE on the first activity / `agent:stream:end` / `agent:failed`.
+// Self-sufficient payload `{ agentId, workspaceId, phase, message, level,
+// timestamp }` so a thin client renders the hint directly without a
+// follow-up fetch. Mirrors the TS reference `acp-provider.ts` `emitStatus()`
+// call sites.
 pub const AGENT_STREAM_STATUS: &str = "agent:stream:status";
+
+// Internal chat-channel content delta (PROTOCOL §7.1). Carries the full
+// incremental transcript payload (`content` + block identity) that the
+// per-agent `chat.subscribe` forwarder accumulates into block deltas.
+// Deliberately OUTSIDE the `agent:*` family so `agent:*` (and bare-`*`)
+// `events.subscribe` filters never receive the high-volume content firehose —
+// external subscribers get the content-free `AGENT_STREAM_ACTIVITY` signal
+// instead. Transient / broadcast-only, like the activity event.
+pub const CHAT_STREAM_DELTA: &str = "chat:stream:delta";
 
 // Agent queue events (for the WebSocket API).
 pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
@@ -346,9 +362,10 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_SUBSCRIPTIONS_CHANGED,
     AGENT_MESSAGE_DELIVERY_FAILED,
     AGENT_STREAM_START,
-    AGENT_STREAM_CHUNK,
+    AGENT_STREAM_ACTIVITY,
     AGENT_STREAM_END,
     AGENT_STREAM_STATUS,
+    CHAT_STREAM_DELTA,
     AGENT_QUEUE_UPDATED,
     AGENT_QUEUE_PROCESSING,
     AGENT_QUEUE_PROCESSING_CANCELLED,

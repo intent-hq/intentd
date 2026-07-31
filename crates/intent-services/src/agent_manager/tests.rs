@@ -5605,7 +5605,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut streamed_chunks = 0;
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
-            if ev.event_type == intent_core::events::AGENT_STREAM_CHUNK {
+            if ev.event_type == intent_core::events::CHAT_STREAM_DELTA {
                 streamed_chunks += 1;
             }
         }
@@ -8141,11 +8141,11 @@ mod harness_wake_tests {
         // Wait until the chunk is routed (live-turn slot has content), then
         // interrupt mid-settle-window.
         let events = collect_until(&mut sub, |seen| {
-            seen.iter().any(|e| e.event_type == "agent:stream:chunk")
+            seen.iter().any(|e| e.event_type == "chat:stream:delta")
         })
         .await;
         assert!(
-            events.iter().any(|e| e.event_type == "agent:stream:chunk"),
+            events.iter().any(|e| e.event_type == "chat:stream:delta"),
             "wake turn streamed the chunk"
         );
         assert!(mgr.interrupt(&id).await, "interrupt found the agent");
@@ -9151,5 +9151,238 @@ mod question_hold_gates {
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         assert!(!mgr.is_busy(&id), "hold still blocks automatic entries");
         assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+    }
+}
+
+/// Attention-request clear gating (PROTOCOL §5.5): a pending
+/// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` request retires
+/// only on a USER-ORIGIN delivery — automatic/system messages (A2A sends,
+/// parent/subscription wakes, sendToTask, wakeOrCreate) must never dismiss a
+/// request the user has not seen. The drain handoffs restore each queue
+/// entry's captured origin, so a user message that parked behind a busy turn
+/// still clears the request when it drains.
+mod attention_request_clear_gates {
+    use super::*;
+    use crate::agent_manager::TurnOptions;
+    use intent_core::MessageOrigin;
+
+    /// Seed an agent on the mock provider with a pending attention request
+    /// persisted on the session.
+    async fn seed_with_pending_request(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        seed_agent(mgr, ws, id).await;
+        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        session.attention_request_kind = Some("discussion".to_string());
+        session.attention_request_reason = Some("need a decision".to_string());
+        session.attention_request_timestamp = Some(now_iso());
+        mgr.services
+            .store
+            .update_agent_session(ws, &session)
+            .await
+            .expect("seed pending attention request");
+    }
+
+    /// Wait for the in-flight turn + worker drain to finish.
+    async fn await_worker_idle(mgr: &Arc<AgentManager>, id: &AgentId) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("turn completes and worker exits");
+    }
+
+    /// Drain the subscription and report whether an `agent:updated` with
+    /// `attentionRequestCleared: true` was published.
+    async fn saw_cleared_event(sub: &mut crate::events::Subscription) -> bool {
+        let mut cleared = false;
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+            for e in batch {
+                if e.event_type == intent_core::events::AGENT_UPDATED
+                    && e.data["attentionRequestCleared"] == json!(true)
+                {
+                    cleared = true;
+                }
+            }
+        }
+        cleared
+    }
+
+    /// An automatic delivery (default `TurnOptions`, e.g. an A2A send or a
+    /// parent wake) leaves the pending request intact and emits no
+    /// `attentionRequestCleared`.
+    #[tokio::test]
+    async fn automatic_delivery_leaves_attention_request_pending() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-auto"),
+            AgentId::from("a-attn-auto"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("automatic send");
+        assert_eq!(r["queued"], json!(false), "idle agent delivers directly");
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            !saw_cleared_event(&mut sub).await,
+            "automatic delivery must not emit attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(
+            session.attention_request_kind.as_deref(),
+            Some("discussion"),
+            "request kind survives the automatic delivery"
+        );
+        assert_eq!(
+            session.attention_request_reason.as_deref(),
+            Some("need a decision")
+        );
+        assert!(session.attention_request_timestamp.is_some());
+    }
+
+    /// A user-origin delivery (`agent.sendMessage` front door) clears the
+    /// pending request and emits `attentionRequestCleared: true`.
+    #[tokio::test]
+    async fn user_delivery_clears_attention_request() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-user"),
+            AgentId::from("a-attn-user"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "user follow-up".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(r["queued"], json!(false), "idle agent delivers directly");
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "user delivery emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
+    /// A drained USER-ORIGIN queue entry (a user send that parked behind a
+    /// busy turn) clears the request — the drain handoff restores the
+    /// entry's origin instead of defaulting to `Automatic`.
+    #[tokio::test]
+    async fn drained_user_origin_entry_clears_attention_request() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-drain"),
+            AgentId::from("a-attn-drain"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        let opts = TurnOptions {
+            origin: MessageOrigin::User,
+            ..TurnOptions::default()
+        };
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "parked user answer".to_string(),
+            None,
+            None,
+            None,
+            opts.queued_prepend(),
+            opts.interrupt_priority,
+            opts.origin.is_user(),
+        );
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "drained user-origin entry emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
+    /// A drained AUTOMATIC queue entry (e.g. a parked A2A wake) leaves the
+    /// request pending — the restored origin is `Automatic`.
+    #[tokio::test]
+    async fn drained_automatic_entry_leaves_attention_request_pending() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-drain-auto"),
+            AgentId::from("a-attn-drain-auto"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        mgr.services.enqueue_message(
+            &id,
+            "parked auto wake".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            !saw_cleared_event(&mut sub).await,
+            "drained automatic entry must not emit attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(
+            session.attention_request_kind.as_deref(),
+            Some("discussion"),
+            "request survives the automatic drain"
+        );
     }
 }

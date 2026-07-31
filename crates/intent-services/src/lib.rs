@@ -74,6 +74,7 @@ mod github_ops;
 mod github_auth_ops;
 mod github_browse_ops;
 
+mod agent_list_cache;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
@@ -295,6 +296,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
+    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
+    /// teardown races are deterministic. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
+    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -439,6 +445,10 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Cached agent.list message projections per workspace. Invalidated on
+    /// message append / session create+delete so focus-time list bursts hit
+    /// memory instead of re-running the SQLite JSON window.
+    agent_list_cache: Arc<agent_list_cache::AgentListProjectionCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
     /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
@@ -499,6 +509,7 @@ impl Services {
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
+            script_supervise_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -523,6 +534,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -740,6 +752,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
+            self.script_supervise_park.clone(),
         )
     }
 
@@ -749,6 +762,18 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
+        self
+    }
+
+    /// Test seam (monorepo#1180): park `script.*` supervisors in their
+    /// pre-registration window so teardown-vs-registration races are
+    /// deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_supervise_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_supervise_park = Some(park);
         self
     }
 
@@ -976,6 +1001,7 @@ impl Services {
             let display_status = compute_display_status(
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.pr_status,
                 ws.task_stats.as_ref(),
             );
             if let Ok(mut map) = self.last_display_statuses.lock() {
@@ -1016,6 +1042,7 @@ impl Services {
         let status = compute_display_status(
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
+            ws.pr_status,
             Some(&task_stats),
         );
         let transitioned = match self.last_display_statuses.lock() {
@@ -3456,6 +3483,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await?;
+                self.invalidate_agent_list_cache(workspace_id);
                 Ok(serde_json::json!({ "success": true, "queued": false }))
             }
         }
@@ -4165,10 +4193,14 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// 1. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+///    When neither carries an open/draft entry but the workspace `prStatus`
+///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
+///    and yields `pr_open` (never `pr_ready`: the column carries no
+///    mergeable info).
 /// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged →
-///    `pr_merged`.
+/// 3. Latest PR (linked, else most recently updated entry) merged — or
+///    `prStatus == Merged` — → `pr_merged`.
 /// 4. All tasks complete → `complete`; else `not_started`.
 ///
 /// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
@@ -4176,6 +4208,7 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 fn compute_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
+    pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     let is_open = |pr: &&PullRequestInfo| {
@@ -4198,6 +4231,12 @@ fn compute_display_status(
             WorkspaceDisplayStatus::PrOpen
         };
     }
+    if matches!(
+        pr_status,
+        Some(PullRequestStatus::Open | PullRequestStatus::Draft)
+    ) {
+        return WorkspaceDisplayStatus::PrOpen;
+    }
     let (total, completed, in_progress) = task_stats
         .map(|s| (s.total, s.completed, s.in_progress))
         .unwrap_or_default();
@@ -4213,7 +4252,9 @@ fn compute_display_status(
             .iter()
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
-    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
+        || pr_status == Some(PullRequestStatus::Merged)
+    {
         return WorkspaceDisplayStatus::PrMerged;
     }
     if total > 0 && completed == total {
@@ -4294,6 +4335,9 @@ fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
 /// (`{ count, agents, agentIds }`). `isStreaming`/`isResponding` are always
 /// `false` (the headless backend has no live stream state; `status` carries
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
+/// `parentAgentId` (v2.9) carries the session's delegation parent (the value
+/// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
+/// root agents.
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let agents: Vec<WorkspaceAgentInfo> = sessions
         .iter()
@@ -4305,6 +4349,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             last_activity: Some(s.updated_at.clone()),
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
     let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -6305,7 +6350,7 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
-/// `agent:stream:chunk` that do not need durable storage.
+/// `chat:stream:delta` that do not need durable storage.
 pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
     bus.as_ref().map(|b| b.publish_transient(&event))
 }
@@ -8684,6 +8729,7 @@ impl WorkspaceApi for Services {
                     let display_status = compute_display_status(
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
+                        ws.pr_status,
                         ws.task_stats.as_ref(),
                     );
                     // Seed the last-observed cache when absent so the first
@@ -12741,6 +12787,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         note_id: NoteId,
         agent_id: String,
+        force: Option<bool>,
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -12771,6 +12818,29 @@ impl WorkspaceApi for Services {
                     note_id,
                     agent_id: agent,
                 });
+            }
+            // Occupancy guard: assigning a NEW agent to a task that already
+            // has a live assigned agent needs `force: true`; re-assigning an
+            // already-assigned id stays idempotent-ok (handled above). Same
+            // predicate as `agent_delegate_op`'s pre-gate: newest live
+            // (loadable, not Deleted, not poisoned) assignee while the task
+            // is still workable (status not complete/cancelled).
+            if !already_assigned
+                && force != Some(true)
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+            {
+                if let Some(existing) = services
+                    .scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "Task is already being worked by agent {} (\"{}\"). \
+                         Use agent.sendToTask or agent.wakeOrCreate to reach the existing agent, \
+                         or pass force: true to intentionally assign a second agent.",
+                        existing.id, existing.name
+                    )));
+                }
             }
             let now = now_iso();
             let previous_status = task.status;
@@ -15602,6 +15672,21 @@ impl WorkspaceApi for Services {
                 tz_offset_minutes,
                 time::OffsetDateTime::now_utc(),
             )
+        })
+    }
+
+    fn stats_get_rate_history(
+        &self,
+        limit: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let limit = usage_rate::parse_limit(limit)?;
+            let now = time::OffsetDateTime::now_utc();
+            let rows = self
+                .store
+                .list_usage_rate_since(&usage_rate::window_start(now, limit))
+                .await?;
+            Ok(usage_rate::rate_history_json(&rows, limit, now))
         })
     }
 
@@ -19916,6 +20001,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_rate;
 pub mod usage_stats;
 pub mod usage_stats_read;
 pub mod session_stats {}

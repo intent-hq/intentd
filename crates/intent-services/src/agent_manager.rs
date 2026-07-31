@@ -234,6 +234,18 @@ impl TurnOptions {
     }
 }
 
+/// Reconstruct a [`TurnOptions::origin`] from a `QueuedMessage`'s persisted
+/// `user_origin` flag at the queue-drain handoffs, so a drained entry keeps
+/// its originator's semantics (question-hold bypass recorded at enqueue time;
+/// attention-request clear gated on user origin).
+fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
+    if user_origin {
+        intent_core::MessageOrigin::User
+    } else {
+        intent_core::MessageOrigin::Automatic
+    }
+}
+
 /// Conservative cap used when total system memory cannot be determined.
 const DEFAULT_PROCESS_CAP: usize = 8;
 
@@ -2761,12 +2773,19 @@ impl AgentManager {
         }
     }
 
-    /// Clear a pending attention request when a new turn begins — the request
-    /// (`ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) is a pending
-    /// state that retires as soon as the agent next receives a message, on
-    /// ANY delivery path (sendMessage, queue drain, parent/subscription wake —
-    /// all turns start here). Skips the store write and event when no request
-    /// is pending (the common case). Emits `agent:updated` with
+    /// Clear a pending attention request when a USER-ORIGIN turn begins — the
+    /// request (`ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) is a
+    /// pending state that retires as soon as the agent next receives a
+    /// user-origin message (`agent.sendMessage` front door,
+    /// `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`, or a drained
+    /// user-origin queue entry). Automatic deliveries (A2A sends, parent /
+    /// subscription wakes, `agent.sendToTask`, `agent.wakeOrCreate`, stale
+    /// redrives of automatic entries) never retire it — the call site gates
+    /// on `TurnOptions::origin.is_user()`. A stale redrive of a USER-ORIGIN
+    /// entry still clears: the drain handoff restores `origin = User`, unlike
+    /// the completion-report clear, which staleness suppresses regardless of
+    /// origin (`suppress_report_clear`). Skips the store write and event when
+    /// no request is pending (the common case). Emits `agent:updated` with
     /// `attentionRequestCleared: true` when one was present and cleared so
     /// clients retire the sidebar/footer indicator.
     async fn clear_attention_request_if_present(
@@ -3159,7 +3178,10 @@ impl AgentManager {
             )
             .await
         {
-            Ok(message) => message,
+            Ok(message) => {
+                self.services.invalidate_agent_list_cache(&workspace_id);
+                message
+            }
             Err(append_err) => {
                 // Store write failed on a validated agent (e.g. duplicate
                 // client-supplied messageId) → auto-queue, matching the
@@ -3378,6 +3400,10 @@ impl AgentManager {
             prepend_file_blocks: next.prepend_file_blocks.clone(),
             turn_id: Some(next.turn_id.clone()),
             interrupt_priority: next.interrupt_priority,
+            // Restore the entry's captured origin so a user message that
+            // parked behind a busy turn still clears a pending attention
+            // request when it drains.
+            origin: origin_from_user_flag(next.user_origin),
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -3542,7 +3568,10 @@ impl AgentManager {
                 )
                 .await
             {
-                Ok(message) => message,
+                Ok(message) => {
+                    self.services.invalidate_agent_list_cache(&workspace_id);
+                    message
+                }
                 Err(append_err) => {
                     // Transactional guarantee: release the slot and restore
                     // the entry at the FRONT (`persisted: false`, so a retry
@@ -4339,6 +4368,7 @@ impl AgentManager {
                 .await
             {
                 Ok(message) => {
+                    self.services.invalidate_agent_list_cache(workspace_id);
                     self.services
                         .publish_agent_mutation_event(
                             workspace_id,
@@ -5642,11 +5672,15 @@ async fn run_message_worker(
                     mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
                         .await;
                 }
-                // A pending attention request retires on ANY new message
-                // (stale redrives included — the delivery itself is the
-                // "agent was next messaged" signal the indicator keys off).
-                mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
-                    .await;
+                // A pending attention request retires only on a USER-ORIGIN
+                // delivery (sendMessage front door, sendQueuedMessageNow,
+                // editAndRegenerate, drained user-origin queue entry) — an
+                // automatic/system message must never dismiss a request the
+                // user has not seen.
+                if options.origin.is_user() {
+                    mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
+                        .await;
+                }
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
@@ -5963,6 +5997,9 @@ async fn run_message_worker(
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
                 turn_id: Some(next.turn_id.clone()),
                 interrupt_priority: next.interrupt_priority,
+                // Restore the entry's captured origin so a drained user
+                // message still clears a pending attention request.
+                origin: origin_from_user_flag(next.user_origin),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -6040,6 +6077,8 @@ async fn run_message_worker(
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
                 turn_id: Some(next.turn_id.clone()),
                 interrupt_priority: next.interrupt_priority,
+                // Same origin restore as the pre-release drain arm.
+                origin: origin_from_user_flag(next.user_origin),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -6136,7 +6175,10 @@ async fn persist_user(
             )
             .await
         {
-            Ok(message) => break message,
+            Ok(message) => {
+                mgr.services.invalidate_agent_list_cache(workspace_id);
+                break message;
+            }
             Err(e) => {
                 let Some(&delay_ms) = backoff.get(attempt) else {
                     tracing::warn!(

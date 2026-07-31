@@ -285,15 +285,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         ))
         .await
         .unwrap();
-    store
-        .insert_agent_session(&mk_agent(
-            "agent-2",
-            "Verifier",
-            None,
-            "2026-01-01T00:00:02Z",
-        ))
-        .await
-        .unwrap();
+    // agent-2 is delegated by agent-1: `agentSummary` surfaces the session's
+    // delegation parent as `parentAgentId` (v2.9, additive).
+    let mut delegated = mk_agent("agent-2", "Verifier", None, "2026-01-01T00:00:02Z");
+    delegated.parent_agent_id = Some(AgentId::from("agent-1"));
+    store.insert_agent_session(&delegated).await.unwrap();
 
     // Hermetic root: the get/list enrichment probes the workspaces root for
     // `cowSupported`, and tests must never touch `~/intent/workspaces`.
@@ -311,7 +307,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(summary.agents.iter().any(|a| a.name == "Builder"
         && a.specialist.as_deref() == Some("implementor")
         && !a.is_streaming
-        && !a.is_responding));
+        && !a.is_responding
+        && a.parent_agent_id.is_none()));
+    // The delegated agent carries its parent's id (root agents omit it).
+    assert!(summary.agents.iter().any(|a| a.name == "Verifier"
+        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")));
     // `agentIds` mirrors the agents used to build `agents` (forward-compat).
     let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
     let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
@@ -328,6 +328,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["taskStats"]["inProgress"], 2);
     assert_eq!(v["agentSummary"]["count"], 2);
     assert_eq!(v["agentSummary"]["agents"][0]["id"], "agent-1");
+    // `parentAgentId` wire shape: omitted (not null) on roots, camelCased when set.
+    assert!(v["agentSummary"]["agents"][0]
+        .get("parentAgentId")
+        .is_none());
+    assert_eq!(v["agentSummary"]["agents"][1]["parentAgentId"], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
@@ -1409,13 +1414,13 @@ async fn assign_agent_validates_and_starts_task() {
         .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
-        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into())
+        .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
         .await
         .is_err());
     // Valid agent id → assigned and status flips to in_progress.
     let agent = "agent-b0a8044a-5eac-4b52-8456-15d3b784decb";
     let r = svc
-        .assign_agent(ws.clone(), id.clone(), agent.into())
+        .assign_agent(ws.clone(), id.clone(), agent.into(), None)
         .await
         .expect("assignAgent");
     assert_eq!(r.agent_id.0, agent);
@@ -19295,11 +19300,11 @@ mod display_status {
     #[test]
     fn no_prs_no_tasks_is_not_started() {
         assert_eq!(
-            compute_display_status(None, &[], None),
+            compute_display_status(None, &[], None, None),
             WorkspaceDisplayStatus::NotStarted
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(0, 0, 0))),
+            compute_display_status(None, &[], None, Some(&stats(0, 0, 0))),
             WorkspaceDisplayStatus::NotStarted
         );
     }
@@ -19307,19 +19312,19 @@ mod display_status {
     #[test]
     fn no_prs_uses_pure_task_logic() {
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 0, 0))),
             WorkspaceDisplayStatus::NotStarted
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 0, 1))),
+            compute_display_status(None, &[], None, Some(&stats(3, 0, 1))),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 1, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 1, 0))),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(None, &[], Some(&stats(3, 3, 0))),
+            compute_display_status(None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19329,7 +19334,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&open), &[], Some(&stats(2, 0, 1))),
+            compute_display_status(Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19338,20 +19343,20 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&open), &[], None),
+            compute_display_status(Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(Some(&draft), &[], None),
+            compute_display_status(Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(Some(&flagged), &[], None),
+            compute_display_status(Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19363,6 +19368,7 @@ mod display_status {
             compute_display_status(
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 1, 1))
             ),
             WorkspaceDisplayStatus::InProgress
@@ -19371,6 +19377,7 @@ mod display_status {
             compute_display_status(
                 Some(&merged),
                 std::slice::from_ref(&merged),
+                None,
                 Some(&stats(3, 0, 0))
             ),
             WorkspaceDisplayStatus::NotStarted
@@ -19383,14 +19390,14 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &list, None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19402,7 +19409,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19411,11 +19418,11 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&merged), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&merged), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(Some(&merged), &[], None),
+            compute_display_status(Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19426,7 +19433,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(None, &list, None),
+            compute_display_status(None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19435,12 +19442,102 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(Some(&closed), &[], Some(&stats(2, 2, 0))),
+            compute_display_status(Some(&closed), &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(Some(&closed), &[], None),
+            compute_display_status(Some(&closed), &[], None, None),
             WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Open), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Draft), None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_open_or_draft_wins_over_open_tasks() {
+        // The pr_status fallback is a step-1 PR-stage signal: it precedes the
+        // open-tasks check, so in-progress or not-started tasks never mask it.
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_participates_in_merged_check() {
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn pr_status_merged_never_masks_open_tasks() {
+        assert_eq!(
+            compute_display_status(
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn pr_info_objects_take_precedence_over_pr_status() {
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&ready), &[], Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrReady
+        );
+        let list = vec![ready];
+        assert_eq!(
+            compute_display_status(None, &list, Some(PullRequestStatus::Merged), None),
+            WorkspaceDisplayStatus::PrReady
         );
     }
 }
