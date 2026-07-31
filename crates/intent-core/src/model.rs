@@ -508,7 +508,10 @@ pub struct WorkspaceTaskStats {
 /// `specialist`/`lastActivity` as optional. `status` carries the same wire
 /// strings as `agent.list`; `isStreaming`/`isResponding` are always `false`
 /// (the headless backend has no live stream state — `status` carries liveness,
-/// matching the `AgentLite` iOS wire-shape parity decision).
+/// matching the `AgentLite` iOS wire-shape parity decision). `parentAgentId`
+/// (v2.9, additive) is the delegating/spawning agent — the same session value
+/// surfaced as `metadata.createdByAgentId` on full `agent.get` loads — omitted
+/// for root agents so cards can draw the delegation tree from the summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceAgentInfo {
@@ -521,6 +524,8 @@ pub struct WorkspaceAgentInfo {
     pub last_activity: Option<String>,
     pub is_streaming: bool,
     pub is_responding: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
 }
 
 /// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
@@ -2953,6 +2958,7 @@ mod tests {
             last_activity: Some(ts.clone()),
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: Some(AgentId::from("agent-root")),
         };
         let summary = WorkspaceAgentSummary {
             count: 1,
@@ -2986,6 +2992,8 @@ mod tests {
         assert_eq!(v["agents"][0]["lastActivity"], ts);
         assert_eq!(v["agents"][0]["isStreaming"], false);
         assert_eq!(v["agents"][0]["isResponding"], false);
+        // `parentAgentId` (v2.9): the delegating agent, camelCased on the wire.
+        assert_eq!(v["agents"][0]["parentAgentId"], "agent-root");
         // `agentIds` is emitted alongside `agents` (forward-compat TS parity).
         assert_eq!(v["agentIds"][0], "agent-1");
         assert_eq!(v["agentIds"].as_array().unwrap().len(), 1);
@@ -3287,8 +3295,9 @@ mod tests {
         assert_eq!(v["anotherUnknown"], 42);
     }
 
-    /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity` keys
-    /// when absent (not `null`), while the non-optional flags stay present.
+    /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity`/
+    /// `parentAgentId` keys when absent (not `null`), while the non-optional
+    /// flags stay present.
     #[test]
     fn workspace_agent_info_optionals_absent() {
         let agent = WorkspaceAgentInfo {
@@ -3299,10 +3308,12 @@ mod tests {
             last_activity: None,
             is_streaming: false,
             is_responding: false,
+            parent_agent_id: None,
         };
         let v = serde_json::to_value(&agent).unwrap();
         assert!(v.get("specialist").is_none());
         assert!(v.get("lastActivity").is_none());
+        assert!(v.get("parentAgentId").is_none());
         assert_eq!(v["status"], "pending");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isResponding"], false);

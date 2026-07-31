@@ -276,15 +276,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         ))
         .await
         .unwrap();
-    store
-        .insert_agent_session(&mk_agent(
-            "agent-2",
-            "Verifier",
-            None,
-            "2026-01-01T00:00:02Z",
-        ))
-        .await
-        .unwrap();
+    // agent-2 is delegated by agent-1: `agentSummary` surfaces the session's
+    // delegation parent as `parentAgentId` (v2.9, additive).
+    let mut delegated = mk_agent("agent-2", "Verifier", None, "2026-01-01T00:00:02Z");
+    delegated.parent_agent_id = Some(AgentId::from("agent-1"));
+    store.insert_agent_session(&delegated).await.unwrap();
 
     // Hermetic root: the get/list enrichment probes the workspaces root for
     // `cowSupported`, and tests must never touch `~/intent/workspaces`.
@@ -302,7 +298,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(summary.agents.iter().any(|a| a.name == "Builder"
         && a.specialist.as_deref() == Some("implementor")
         && !a.is_streaming
-        && !a.is_responding));
+        && !a.is_responding
+        && a.parent_agent_id.is_none()));
+    // The delegated agent carries its parent's id (root agents omit it).
+    assert!(summary.agents.iter().any(|a| a.name == "Verifier"
+        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")));
     // `agentIds` mirrors the agents used to build `agents` (forward-compat).
     let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
     let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
@@ -319,6 +319,11 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["taskStats"]["inProgress"], 2);
     assert_eq!(v["agentSummary"]["count"], 2);
     assert_eq!(v["agentSummary"]["agents"][0]["id"], "agent-1");
+    // `parentAgentId` wire shape: omitted (not null) on roots, camelCased when set.
+    assert!(v["agentSummary"]["agents"][0]
+        .get("parentAgentId")
+        .is_none());
+    assert_eq!(v["agentSummary"]["agents"][1]["parentAgentId"], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
