@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent_ops::last_response_and_digest_from_blocks;
 use crate::{token_usage, usage_stats, Services};
 
 #[cfg(test)]
@@ -363,6 +364,19 @@ impl Transcript {
         }
         blocks
     }
+
+    /// The text of the coalesced `type: "text"` blocks AS THEY STAND mid-turn
+    /// (the pushed text blocks plus, when text is pending, the unflushed
+    /// buffer) — the input to the `agent:stream:activity` live-preview
+    /// derivation. Cheaper than [`snapshot_blocks`](Self::snapshot_blocks):
+    /// tool payloads (which can be large mid-turn) are never cloned.
+    fn text_block_strings(&self) -> Vec<String> {
+        let mut out = text_block_strings(&self.blocks);
+        if !self.text.is_empty() {
+            out.push(self.text.clone());
+        }
+        out
+    }
 }
 
 /// The per-agent in-flight ("live") turn slot (CS-0 D5): the assistant message
@@ -447,6 +461,49 @@ fn last_response_summary(blocks: &[Value]) -> Option<String> {
         Some(format!("...{tail}"))
     } else {
         Some(text)
+    }
+}
+
+/// Extract the `type: "text"` block strings from content blocks — the input
+/// shape [`last_response_and_digest_from_blocks`] expects.
+pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Cap on the stamped `lastAgentResponse` preview (chars). The helper's
+/// last-line extraction is unbounded for a response without newlines — that
+/// is tolerable on the pull path (`agent.list`), but the event payload is
+/// re-broadcast up to 1/s and persisted on `agent:stream:end`, so the stamp
+/// keeps only the trailing slice (same tail-wins convention as
+/// [`last_response_summary`]).
+const PREVIEW_RESPONSE_CAP: usize = 500;
+
+/// Stamp the server-derived live preview onto an event payload: derive
+/// `(lastAgentResponse, digest)` from `text_blocks` via the same helper the
+/// `AgentLite` live-turn overlay uses and set only the fields that derived to
+/// `Some` — a turn that has produced no text (or no digest) yet omits that
+/// field rather than sending an empty string. Mid-turn a chunk boundary can
+/// split a marker (`<agent_dig…`), letting the partial tag text surface for
+/// up to one throttle window; the next derivation strips the completed tag.
+pub(crate) fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
+    let (last_response, digest) = last_response_and_digest_from_blocks(text_blocks);
+    if let Some(r) = last_response {
+        let chars: Vec<char> = r.chars().collect();
+        let capped = if chars.len() > PREVIEW_RESPONSE_CAP {
+            let tail: String = chars[chars.len() - PREVIEW_RESPONSE_CAP..].iter().collect();
+            format!("...{tail}")
+        } else {
+            r
+        };
+        data["lastAgentResponse"] = Value::String(capped);
+    }
+    if let Some(d) = digest {
+        data["digest"] = Value::String(d);
     }
 }
 
@@ -701,14 +758,11 @@ impl Services {
     /// be large mid-turn) stay untouched under the lock. `None` when no slot
     /// is open; `Some(vec![])` when a slot is open but has no text blocks yet.
     pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<Vec<String>> {
-        self.live_turns.lock().ok()?.get(agent_id).map(|live| {
-            live.blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
+        self.live_turns
+            .lock()
+            .ok()?
+            .get(agent_id)
+            .map(|live| text_block_strings(&live.blocks))
     }
 
     /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
@@ -1266,6 +1320,10 @@ impl Services {
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
+        // Final-value preview for the terminal `agent:stream:end` below: the
+        // last throttled `agent:stream:activity` may have missed the response
+        // tail, so the terminal frame re-derives from the full turn text.
+        let preview_text_blocks = text_block_strings(&blocks);
         // Snapshot the drained AtTurnEnd blocks AS PERSISTED (post id-stamping
         // — the drain pushed them last, so they are the trailing slice) for
         // the terminal `agent:stream:end` payload below: the FE finalizes the
@@ -1400,6 +1458,10 @@ impl Services {
             if let Some(tid) = turn_id {
                 end_data["turnId"] = json!(tid);
             }
+            // Final live-preview values (same fields as the throttled
+            // activity frames) so a client tracking the preview push-style
+            // lands on the turn's true final state.
+            stamp_preview_fields(&mut end_data, &preview_text_blocks);
             self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
                 .await;
         }
@@ -1598,6 +1660,7 @@ impl Services {
             }
         }
         let blocks = transcript.into_blocks();
+        let preview_text_blocks = text_block_strings(&blocks);
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -1628,6 +1691,9 @@ impl Services {
         if message_persisted {
             end_data["messageId"] = json!(message_id);
         }
+        // Final live-preview values, same contract as the prompt-turn
+        // terminal `agent:stream:end` above.
+        stamp_preview_fields(&mut end_data, &preview_text_blocks);
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
         message_persisted.then_some(message_id)
@@ -1854,19 +1920,24 @@ impl Services {
                     }),
                 )
                 .await;
-                // External content-free activity signal (§7): leading-edge
-                // throttled per agent — the first chunk of a turn emits
-                // immediately (preserves the FE's pre-first-token status-hint
-                // clearing latency), then at most one per second.
+                // External activity signal (§7): leading-edge throttled per
+                // agent — the first chunk of a turn emits immediately
+                // (preserves the FE's pre-first-token status-hint clearing
+                // latency), then at most one per second. Carries the
+                // server-derived live preview (`lastAgentResponse` / `digest`
+                // from the streamed-so-far text) so watched-agent rows update
+                // push-style without a refetch.
                 if self.should_emit_activity(agent_id) {
+                    let mut activity_data = json!({
+                        "agentId": agent_id.0,
+                        "messageId": message_id,
+                    });
+                    stamp_preview_fields(&mut activity_data, &transcript.text_block_strings());
                     self.publish_agent_event(
                         workspace_id,
                         agent_id,
                         AGENT_STREAM_ACTIVITY,
-                        json!({
-                            "agentId": agent_id.0,
-                            "messageId": message_id,
-                        }),
+                        activity_data,
                     )
                     .await;
                 }
@@ -2004,8 +2075,23 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         event_type: &str,
-        data: Value,
+        mut data: Value,
     ) {
+        // `agent:failed` carries the failing agent's delegation parentage so
+        // subscribers (parent coordinators, FE grouping) can attribute a child
+        // failure without a follow-up `agent.get`. Optional: OMITTED entirely
+        // for parentless agents — never `null`. Enriched centrally here so
+        // every terminal-failure emit site (prompt turn, idle-timeout cap,
+        // spawn/turn terminal pair) carries it. Best-effort: a store error —
+        // or a non-object payload (guarded via `as_object_mut` so a malformed
+        // `data` can't panic the index-assign) — leaves the payload untouched.
+        if event_type == AGENT_FAILED && data.get("parentAgentId").is_none() {
+            if let Ok(session) = self.store.get_agent_session(agent_id).await {
+                if let (Some(parent), Some(map)) = (session.parent_agent_id, data.as_object_mut()) {
+                    map.insert("parentAgentId".to_string(), Value::String(parent.0));
+                }
+            }
+        }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),

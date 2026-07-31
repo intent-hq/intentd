@@ -433,8 +433,11 @@ pub(crate) fn last_response_and_digest(
 /// [`last_response_and_digest`] over pre-extracted text-block strings — the
 /// shared core also fed by the store's text-only projection (P1b), whose
 /// capped blocks keep their tails so the last-line/digest extraction here is
-/// unaffected by the cap.
-fn last_response_and_digest_from_blocks(blocks: &[String]) -> (Option<String>, Option<String>) {
+/// unaffected by the cap, and by the `agent:stream:activity` /
+/// `agent:stream:end` live-preview payloads (`agent_session.rs`).
+pub(crate) fn last_response_and_digest_from_blocks(
+    blocks: &[String],
+) -> (Option<String>, Option<String>) {
     let mut digest: Option<String> = None;
     let mut last_response: Option<String> = None;
     for block in blocks {
@@ -3491,8 +3494,9 @@ impl Services {
     ///    `agent:message`) so the conversation renders a distinct card that
     ///    survives rehydration;
     /// 3. emits the self-sufficient `agent:attention-requested` event
-    ///    `{ workspaceId, agentId, agentName, kind, reason }` (FE sticky
-    ///    toast);
+    ///    `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }`
+    ///    (FE sticky toast; `parentAgentId` is present only for delegated
+    ///    callers — omitted entirely, never `null`, when there is no parent);
     /// 4. transitions the linked task to `discussion_needed` / `blocked`
     ///    (terminal statuses untouched; no linked task = skip);
     /// 5. wakes a delegated caller's parent with a kind-flavored message —
@@ -3602,18 +3606,25 @@ impl Services {
                 );
             }
         }
-        // 3. Self-sufficient toast-driving event.
+        // 3. Self-sufficient toast-driving event. `parentAgentId` rides along
+        // for delegated callers so subscribers can attribute the request to
+        // the delegation tree without a follow-up `agent.get`; OMITTED
+        // entirely (never `null`) for parentless agents.
+        let mut attention_data = json!({
+            "workspaceId": workspace_id.0,
+            "agentId": caller.0,
+            "agentName": session.name.clone(),
+            "kind": kind,
+            "reason": reason,
+        });
+        if let Some(parent) = &parent {
+            attention_data["parentAgentId"] = json!(parent.0);
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &caller,
             intent_core::events::AGENT_ATTENTION_REQUESTED,
-            json!({
-                "workspaceId": workspace_id.0,
-                "agentId": caller.0,
-                "agentName": session.name.clone(),
-                "kind": kind,
-                "reason": reason,
-            }),
+            attention_data.clone(),
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -3658,13 +3669,10 @@ impl Services {
                     "id": uuid::Uuid::new_v4().to_string(),
                     "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
                     "timestamp": saved_at,
-                    "data": {
-                        "workspaceId": workspace_id.0,
-                        "agentId": caller.0,
-                        "agentName": session.name.clone(),
-                        "kind": kind,
-                        "reason": reason,
-                    },
+                    // Same enriched payload as the published event (including
+                    // `parentAgentId` — the wake only fires for delegated
+                    // callers, so it is always present here).
+                    "data": attention_data,
                     "actor": {
                         "type": "agent",
                         "id": caller.0,

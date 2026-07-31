@@ -49,13 +49,22 @@ pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 // retention/compaction sweep is allowed to trim.
 pub const AGENT_STREAM_PREFIX: &str = "agent:stream:";
 pub const AGENT_STREAM_START: &str = "agent:stream:start";
-// Content-free per-agent activity signal (renamed from `agent:stream:chunk`):
-// broadcast while a turn streams so clients can tick busy/stall state without
-// receiving transcript content. Payload is `{ agentId, messageId }` only;
-// leading-edge throttled per agent (first activity of a turn emits
-// immediately, then at most one per second). Transcript content flows on the
-// internal chat channel (`CHAT_STREAM_DELTA`) instead.
+// Per-agent activity signal (renamed from `agent:stream:chunk`): broadcast
+// while a turn streams so clients can tick busy/stall state and update
+// watched-agent preview rows without receiving the transcript firehose.
+// Payload is `{ agentId, messageId }` plus the server-derived live preview
+// (`lastAgentResponse` / `digest`, each omitted until derivable from the
+// streamed-so-far text); leading-edge throttled per agent (first activity of
+// a turn emits immediately, then at most one per second). Full transcript
+// content flows on the internal chat channel (`CHAT_STREAM_DELTA`) instead.
 pub const AGENT_STREAM_ACTIVITY: &str = "agent:stream:activity";
+// Terminal stream frame. The transcript-bearing terminal paths — normal
+// prompt-turn completion, harness-wake finalize, and the user-interrupt
+// flush — also carry the final `lastAgentResponse` / `digest` preview values
+// (same optional fields as the activity signal, derived from the turn's full
+// text) so a client tracking the live preview lands on the turn's true final
+// state; the last throttled activity may have missed the response tail. The
+// pre-output terminal-failure emit has no transcript, so it carries neither.
 pub const AGENT_STREAM_END: &str = "agent:stream:end";
 // Pre-first-token turn-startup status hints (new in intentd; PROTOCOL §6.5 /
 // §7). Emitted while an agent turn is starting so the chat spinner can show
@@ -73,7 +82,7 @@ pub const AGENT_STREAM_STATUS: &str = "agent:stream:status";
 // per-agent `chat.subscribe` forwarder accumulates into block deltas.
 // Deliberately OUTSIDE the `agent:*` family so `agent:*` (and bare-`*`)
 // `events.subscribe` filters never receive the high-volume content firehose —
-// external subscribers get the content-free `AGENT_STREAM_ACTIVITY` signal
+// external subscribers get the throttled `AGENT_STREAM_ACTIVITY` signal
 // instead. Transient / broadcast-only, like the activity event.
 pub const CHAT_STREAM_DELTA: &str = "chat:stream:delta";
 
@@ -115,9 +124,12 @@ pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 // Agent attention request (new in intentd). Emitted by
 // `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` when an agent
 // explicitly raises attention before ending its turn. Self-sufficient payload
-// `{ workspaceId, agentId, agentName, kind, reason }` (`kind`:
+// `{ workspaceId, agentId, agentName, kind, reason, parentAgentId? }` (`kind`:
 // `"discussion" | "blocker"`) drives the FE sticky "Switch To" toast without
-// a follow-up fetch.
+// a follow-up fetch. `parentAgentId` is present only when the caller is a
+// delegated child — omitted entirely (never `null`) for parentless agents;
+// `agent:failed` carries the same optional field (enriched centrally in
+// `publish_agent_event`).
 pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
 
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR

@@ -3550,8 +3550,9 @@ async fn wss_git_commit_details_round_trip() {
 
 /// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
 /// prunes the unstaged walk to exactly the requested workspace-relative files,
-/// the legacy single `path` unions with `paths`, and an absent/empty `paths`
-/// keeps the full-tree behavior.
+/// the legacy single `path` unions with `paths`, an absolute path under the
+/// worktree is normalized to its relative form (same narrowed result), and an
+/// absent/empty `paths` keeps the full-tree behavior.
 #[tokio::test]
 async fn wss_git_diffs_paths_narrowing_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -3628,6 +3629,44 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
     assert_eq!(arr.len(), 2, "union of paths + path: {paths:?}");
     assert!(paths.contains(&"a.txt"));
     assert!(paths.contains(&"b.txt"));
+
+    // Defense-in-depth normalization: an absolute path under the worktree
+    // returns the same narrowed result as the relative form (result `path`
+    // values stay worktree-relative), and an absolute path outside the
+    // worktree matches nothing.
+    let relative = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["a.txt"]}}}}"#
+        ),
+    )
+    .await;
+    let absolute = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["{}"]}}}}"#,
+            repo.join("a.txt").display()
+        ),
+    )
+    .await;
+    assert_eq!(
+        absolute["result"], relative["result"],
+        "absolute form narrows like relative"
+    );
+    let arr = absolute["result"].as_array().expect("diffs array");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "a.txt", "result path stays relative");
+    let outside = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["/no/such/root/a.txt"]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(outside["result"], serde_json::json!([]));
 
     // An empty `paths` array keeps the full-tree behavior.
     let resp = wss_call(
