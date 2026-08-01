@@ -5,6 +5,27 @@
 # tinybox has no rustup at all, and none of them necessarily have the pinned
 # toolchain or the cross targets (x86_64-apple-darwin on the arm64 Mac, musl
 # on Linux) installed.
+#
+# On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the WSL
+# stub) shadows Git Bash in PATH, and WSL bash can't execute the runner's
+# Windows-path step scripts. Prepend Git's bin dir so every later
+# `shell: bash` step resolves Git Bash instead (same workaround as ci.yml's
+# build job).
+- name: Put Git Bash first on PATH (Windows)
+  if: runner.os == 'Windows'
+  shell: cmd
+  run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+# dist's generated "Install dependencies" step runs `sudo apt-get install`
+# without -y. GitHub-hosted Ubuntu images make that non-interactive via
+# /etc/apt/apt.conf.d/90assumeyes; tinybox doesn't have it, so apt prompts,
+# reads EOF, and aborts. Mirror the hosted-image config and export
+# DEBIAN_FRONTEND=noninteractive for the later steps.
+- name: Make apt-get non-interactive (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+    echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
 - name: Provision Rust toolchain and matrix targets (self-hosted runners)
   shell: bash
   run: |

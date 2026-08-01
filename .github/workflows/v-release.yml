@@ -127,6 +127,16 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Put Git Bash first on PATH (Windows)"
+        if: "runner.os == 'Windows'"
+        run: "echo C:\\Program Files\\Git\\bin>>\"%GITHUB_PATH%\""
+        shell: "cmd"
+      - name: "Make apt-get non-interactive (Linux)"
+        if: "runner.os == 'Linux'"
+        run: |
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+          echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
+        shell: "bash"
       - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
