@@ -3143,7 +3143,8 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///    `isBackground: true`), and the child/background retire rule
 ///    (PROTOCOL §5.5) makes the coordinator's follow-up the acknowledgement.
 ///    (Top-level foreground agents keep the user-only dismissal — covered by
-///    the `attention_request_clear_gates` unit tests.)
+///    the `attention_request_clear_gates` unit tests and, over the wire, by
+///    `attention_request_foreground_automatic_delivery_negative_over_wss`.)
 #[tokio::test]
 async fn attention_request_discussion_over_wss() {
     let Some(script) = gate("WSS attention-request discussion E2E") else {
@@ -3517,6 +3518,226 @@ async fn attention_request_discussion_over_wss() {
     assert!(
         !session.contains_key("attentionRequestTimestamp"),
         "attentionRequestTimestamp cleared by the automatic delivery (background delegate)"
+    );
+}
+
+/// The preserved NEGATIVE case of the attention-clear gate over the wire
+/// (PROTOCOL §5.5, monorepo#1237): an AUTOMATIC delivery to a TOP-LEVEL
+/// FOREGROUND agent — created via `agent.create` (not a delegate), so no
+/// parent linkage and `isBackground` defaults to false — must NOT retire a
+/// pending `requestDiscussion` attention request. Only the user may dismiss
+/// a top-level foreground agent's request, so the `agent.sendToTask` nudge
+/// (the same default-origin path as A2A sends and system wakes) completes
+/// its turn WITHOUT emitting `attentionRequestCleared`, and
+/// `agent.getSession` still serves the pending `attentionRequest*` fields
+/// afterwards. Complements the child/background clear path in
+/// `attention_request_discussion_over_wss` and the unit-level
+/// `attention_request_clear_gates` suite.
+#[tokio::test]
+async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
+    let Some(script) = gate("WSS attention-request foreground negative E2E") else {
+        return;
+    };
+
+    const RAISE_MARKER: &str = "ATTN_FG_RAISE";
+    const REASON: &str = "ATTN_WSS foreground needs the user's decision";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": RAISE_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": request_js, "summary": "raise discussion request" }
+            },
+            "response": "turn ended after requestDiscussion",
+        }],
+        "response": "automatic nudge acknowledged",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent events, registered BEFORE any turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // TOP-LEVEL FOREGROUND agent (`agent.create` front door — contrast the
+    // background delegate in `attention_request_discussion_over_wss`),
+    // assigned to the task note so `agent.sendToTask` resolves it as the
+    // assignee.
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Raise: a user message carrying the behavior marker drives the
+    // requestDiscussion turn, leaving a pending request on the session.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{RAISE_MARKER} raise a discussion request"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "raise sendMessage ok: {sent}");
+    let mut raised = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(raised && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the raise: raised={raised} idle={idle}"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                raised = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "pending attentionRequestKind before the automatic delivery: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "pending attentionRequestReason before the automatic delivery: {session}"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "pending attentionRequestTimestamp before the automatic delivery: {session}"
+    );
+
+    // The AUTOMATIC delivery (agent.sendToTask — same default-origin path
+    // as A2A sends and system wakes) must NOT retire the request for this
+    // top-level foreground agent. Were the clear to fire, its
+    // `agent:updated` would be published at the nudge turn's begin, BEFORE
+    // the turn runs — so the turn's terminal `agent:idle` bounds the
+    // negative wait deterministically (no sleeps).
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the automatic nudge turn's agent:idle"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        if data["agentId"] != json!(agent_id) {
+            continue;
+        }
+        assert!(
+            !(ev["type"] == "agent:updated" && data["attentionRequestCleared"] == json!(true)),
+            "automatic delivery must NOT emit attentionRequestCleared for a \
+             top-level foreground agent: {ev}"
+        );
+        if ev["type"] == "agent:idle" {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "attentionRequestKind survives the automatic delivery: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "attentionRequestReason survives the automatic delivery: {session}"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "attentionRequestTimestamp survives the automatic delivery: {session}"
     );
 }
 
