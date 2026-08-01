@@ -150,3 +150,7 @@ tracker for all components. Do not track issues in markdown files.
   comment on / link the existing issue instead of filing a duplicate.
 - **Cross-reference**: reference the issue number in related commits/PRs (e.g.
   `fix: handle empty envelope (#123)`).
+- **Fix references**: when a PR fixes a monorepo issue, use the full cross-repo form
+  `Fixes intent-hq/monorepo#N` in the squash-commit message or PR body — it auto-closes
+  the issue on merge and lets the release notifier (`scripts/notify-fixed-issues.sh`)
+  comment on it when the fix ships in a beta/stable release.

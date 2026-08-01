@@ -18,6 +18,11 @@
 # body with aggregated release notes covering every version since the previous
 # stable (aggregate-stable-notes.sh). Notes steps are fail-soft: they never
 # block the promotion or change manifest publishing.
+#
+# When the MONOREPO_ISSUES_TOKEN secret is configured, monorepo issues
+# referenced by commits/PRs in (previous stable, promoted] also get a
+# fail-soft "intentd vX.Y.Z promoted to stable" comment
+# (scripts/notify-fixed-issues.sh).
 name: Promote stable
 
 on:
@@ -133,6 +138,47 @@ jobs:
             echo "- [channel-stable release (aggregated notes)](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
             echo "- [stable.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-stable/stable.json)"
           } >> "$GITHUB_STEP_SUMMARY"
+      # --- Issue notifier: comment on fixed monorepo issues ---
+      # Fail-soft: skipped with a warning when the MONOREPO_ISSUES_TOKEN
+      # secret is not configured, and continue-on-error so a notification
+      # failure never blocks manifest publishing (already done above) or the
+      # mirror steps below.
+      - name: Check issues token
+        id: notify-token
+        shell: bash
+        env:
+          MONOREPO_ISSUES_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: |
+          if [[ -n "$MONOREPO_ISSUES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::MONOREPO_ISSUES_TOKEN secret is not configured; skipping fixed-issue notifications"
+          fi
+      - name: Notify fixed monorepo issues (stable)
+        if: steps.notify-token.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
+          ISSUES_GH_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: |
+          # First promotion (or unreadable stable.json): there is no sane
+          # range to scan, so skip rather than guess.
+          if [[ -z "$PREV_STABLE" ]]; then
+            echo "::warning::Previous stable version unknown (first promotion?); skipping fixed-issue notifications"
+            exit 0
+          fi
+          # The checkout is shallow; the notifier needs full history and tags
+          # to scan the (previous stable, promoted] commit range.
+          git fetch --quiet --tags --unshallow 2>/dev/null || git fetch --quiet --tags
+          for tag in "v${PREV_STABLE}" "v${VERSION}"; do
+            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::warning::Tag $tag not found in checkout; skipping fixed-issue notifications"
+              exit 0
+            fi
+          done
+          ./scripts/notify-fixed-issues.sh intentd "$VERSION" stable "v${PREV_STABLE}" "v${VERSION}"
       # --- Public mirror: intent-hq/intentd-releases ---
       # Runs last so a mirror failure (bad/expired token, network error) still
       # fails the workflow loudly, but can no longer skip the fail-soft notes
