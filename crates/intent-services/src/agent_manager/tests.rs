@@ -2393,7 +2393,11 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         .services
         .dequeue_message(&id)
         .expect("auto-queued message survives the failed self-drain");
-    assert_eq!(queued.content, "urgent update");
+    assert!(
+        queued.content.starts_with("urgent update"),
+        "original content first (dequeue-wait note may follow): {}",
+        queued.content
+    );
     assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
     assert_eq!(
         queued.prepend_image_blocks,
@@ -2452,7 +2456,12 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         .expect("messages");
     let user_rows: Vec<_> = messages
         .iter()
-        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("urgent update"))
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("urgent update"))
+        })
         .collect();
     assert_eq!(
         user_rows.len(),
@@ -2633,7 +2642,15 @@ async fn drain_emits_queue_processing_with_turn_id() {
         .expect("agent:queue:processing event");
     assert_eq!(processing.data["agentId"], json!(id.0));
     assert_eq!(processing.data["messageId"], json!(enqueued.id));
-    assert_eq!(processing.data["content"], json!("queued work"));
+    // The payload's content matches what is persisted/sent to the provider,
+    // which includes the dequeue-wait annotation appended at drain time.
+    assert!(
+        processing.data["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("queued work")),
+        "queue:processing carries the drained content: {:?}",
+        processing.data
+    );
     assert_eq!(
         processing.data["turnId"],
         json!(enqueued.turn_id),
@@ -5673,7 +5690,12 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
         .expect("messages");
     let user_rows: Vec<_> = messages
         .iter()
-        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("boom"))
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("boom"))
+        })
         .collect();
     assert_eq!(
         user_rows.len(),
@@ -5844,7 +5866,11 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
         .services
         .dequeue_message(&id)
         .expect("failed message requeued for agent.retry");
-    assert_eq!(requeued.content, "boom");
+    assert!(
+        requeued.content.starts_with("boom"),
+        "original content first (dequeue-wait note may follow): {}",
+        requeued.content
+    );
     assert!(
         !requeued.persisted,
         "requeue must carry persisted: false so the retry drain re-attempts the append"
@@ -5928,7 +5954,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
         .expect("messages");
     let user_rows: Vec<_> = messages
         .iter()
-        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("boom"))
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("boom"))
+        })
         .collect();
     assert_eq!(
         user_rows.len(),
@@ -6009,7 +6040,12 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         .expect("messages");
     let user_rows: Vec<_> = messages
         .iter()
-        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("blip"))
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("blip"))
+        })
         .collect();
     assert_eq!(
         user_rows.len(),
@@ -6361,7 +6397,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
         .unwrap_or_else(|| panic!("warning turn streamed: {texts:?}"));
     let queued_idx = texts
         .iter()
-        .position(|t| t == "user:queued follow-up")
+        .position(|t| t.starts_with("user:queued follow-up"))
         .unwrap_or_else(|| panic!("queued user row persisted: {texts:?}"));
     assert!(
         warning_idx < continued_idx && continued_idx < queued_idx,
@@ -8138,7 +8174,201 @@ mod stale_redrive_tests {
             .find(|m| m.role == "user")
             .expect("drained user row persisted");
         let text = user_row.content[0]["text"].as_str().unwrap();
-        assert_eq!(text, "fresh work", "fresh content is not annotated");
+        assert!(
+            text.starts_with("fresh work"),
+            "fresh content is preserved: {text}"
+        );
+        assert!(
+            !text.contains(super::super::STALE_REDRIVE_NOTE_PREFIX),
+            "fresh content carries no stale-redrive note: {text}"
+        );
+        assert!(
+            text.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
+            "every drained row carries the dequeue-wait note: {text}"
+        );
+    }
+}
+
+/// Dequeue-wait annotation: every drained queue entry tells the target when
+/// it entered the queue and how long it waited before delivery —
+/// [`super::annotate_dequeue_wait`] must annotate exactly once, never rewrite
+/// a persisted requeue, and never touch messages that were delivered
+/// immediately (the direct-send path never constructs a queue entry).
+mod dequeue_wait_tests {
+    use super::*;
+    use crate::agent_ops::QueuedMessage;
+
+    fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
+        QueuedMessage {
+            id: "qm-wait-test".to_string(),
+            turn_id: "qm-wait-test".to_string(),
+            content: content.to_string(),
+            image_blocks: None,
+            file_blocks: None,
+            queued_at: queued_at.to_string(),
+            editing: false,
+            persisted,
+            requeued_after_failure: false,
+            message_metadata: None,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
+            interrupt_priority: false,
+            user_origin: false,
+        }
+    }
+
+    #[test]
+    fn fresh_entry_is_annotated() {
+        let queued_at = "2026-01-01T00:00:00Z";
+        let mut msg = queued_msg("please continue", queued_at, false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert!(
+            msg.content.starts_with("please continue"),
+            "original content is preserved: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
+            "drained content carries the dequeue-wait note: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(queued_at),
+            "the note names the enqueue timestamp: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("before delivery."),
+            "the note names the wait: {}",
+            msg.content
+        );
+    }
+
+    #[test]
+    fn annotation_is_idempotent_across_requeues() {
+        let mut msg = queued_msg("loop", "2026-01-01T00:00:00Z", false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        let once = msg.content.clone();
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(
+            msg.content, once,
+            "a requeued annotated entry is not double-annotated"
+        );
+    }
+
+    #[test]
+    fn persisted_requeue_is_never_rewritten() {
+        // A terminal-failure requeue whose transcript row is already durable:
+        // the content must stay byte-identical to the persisted row, so the
+        // note is skipped entirely for such entries.
+        let mut msg = queued_msg("already persisted", "2026-01-01T00:00:00Z", true);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(
+            msg.content, "already persisted",
+            "persisted rows are never rewritten"
+        );
+    }
+
+    #[test]
+    fn unparseable_queued_at_fails_open() {
+        let mut msg = queued_msg("hello", "not-a-timestamp", false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(msg.content, "hello", "unparseable queued_at → no note");
+    }
+
+    #[test]
+    fn wait_duration_formatting() {
+        assert_eq!(super::super::format_wait_duration(-5), "0s");
+        assert_eq!(super::super::format_wait_duration(0), "0s");
+        assert_eq!(super::super::format_wait_duration(59), "59s");
+        assert_eq!(super::super::format_wait_duration(60), "1m 0s");
+        assert_eq!(super::super::format_wait_duration(125), "2m 5s");
+        assert_eq!(super::super::format_wait_duration(3600), "1h 0m");
+        assert_eq!(super::super::format_wait_duration(3750), "1h 2m");
+    }
+
+    /// `agent.sendQueuedMessageNow` runtime path: the delivered (and
+    /// persisted) content carries the dequeue-wait note.
+    #[tokio::test]
+    async fn send_queued_message_now_annotates_dequeue_wait() {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-wait-a"), AgentId::from("a-wait-a"));
+        seed_agent(&mgr, &ws, &id).await;
+        let _agent = track_mock_agent(&mgr, &id, false);
+        let queued = mgr
+            .services
+            .agent_queue_message_op(id.clone(), "queued work".into(), None, None)
+            .await
+            .expect("queue");
+        let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+        let result = mgr
+            .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+            .await
+            .expect("send queued now");
+        assert_eq!(result["queued"], json!(false));
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row = messages
+            .iter()
+            .find(|m| m.id == entry_id)
+            .expect("user row persisted under the entry id");
+        let text = serde_json::to_string(&row.content).unwrap();
+        assert!(
+            text.contains("queued work"),
+            "original content preserved: {text}"
+        );
+        assert!(
+            text.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
+            "dequeue-wait note appended: {text}"
+        );
+    }
+
+    /// A message delivered immediately (never queued) is NOT annotated: the
+    /// direct-send branch never constructs a queue entry, so its persisted
+    /// user row is byte-identical to what the caller sent.
+    #[tokio::test]
+    async fn immediate_delivery_is_not_annotated() {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-wait-b"), AgentId::from("a-wait-b"));
+        seed_agent(&mgr, &ws, &id).await;
+        let _agent = track_mock_agent(&mgr, &id, false);
+
+        let result = mgr
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "direct hello".to_string(),
+                None,
+                super::super::TurnOptions::default(),
+            )
+            .await
+            .expect("direct send");
+        assert_eq!(result["queued"], json!(false), "delivered immediately");
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("direct user row persisted");
+        let text = row.content[0]["text"].as_str().unwrap();
+        assert_eq!(
+            text, "direct hello",
+            "immediate deliveries carry no dequeue-wait note"
+        );
     }
 }
 
@@ -8707,9 +8937,12 @@ mod harness_wake_tests {
             let wake_row = messages
                 .iter()
                 .any(|m| m.role == "assistant" && m.content[0]["text"] == json!("wake output"));
-            let user_row = messages
-                .iter()
-                .any(|m| m.role == "user" && m.content[0]["text"] == json!("racing user message"));
+            let user_row = messages.iter().any(|m| {
+                m.role == "user"
+                    && m.content[0]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("racing user message"))
+            });
             if wake_row && user_row {
                 break;
             }

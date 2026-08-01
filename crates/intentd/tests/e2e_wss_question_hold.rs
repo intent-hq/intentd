@@ -60,6 +60,11 @@ const ASK_MARKER: &str = "ASK_HOLD_QUESTION_NOW_E2E";
 /// Trigger for the sibling sender's automatic `ws.agent.send` calls.
 const SEND_MARKER: &str = "SEND_HELD_MESSAGES_NOW_E2E";
 
+/// Trigger for the second sibling's automatic interrupt `ws.agent.send`
+/// (scenario 1 uses one sender per held message — the single-pending-message
+/// guard refuses a second parked send from the same caller).
+const SEND_URGENT_MARKER: &str = "SEND_HELD_URGENT_NOW_E2E";
+
 /// The two automatic messages parked by the hold in scenario 1.
 const HELD_NORMAL: &str = "held normal message";
 const HELD_URGENT: &str = "held urgent message";
@@ -490,8 +495,8 @@ where
         .to_string()
 }
 
-/// Read the sender-captured `hold-results` note and return its parsed JSON.
-async fn read_capture_note<S>(rpc: &mut WebSocketStream<S>, ws_id: &str) -> Value
+/// Read a sender-captured results note by title and return its parsed JSON.
+async fn read_capture_note<S>(rpc: &mut WebSocketStream<S>, ws_id: &str, title: &str) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -500,7 +505,7 @@ where
         .as_array()
         .expect("notes array")
         .iter()
-        .find(|n| n["title"] == "hold-results")
+        .find(|n| n["title"] == title)
         .expect("capture note created by the sender")["id"]
         .as_str()
         .expect("note id")
@@ -544,7 +549,9 @@ where
     panic!("conversation predicate never satisfied: {what}");
 }
 
-/// 0-based index of the user row whose first text block equals `text`.
+/// 0-based index of the user row whose first text block starts with `text`
+/// (held messages drain from the queue, so their rows may carry the appended
+/// dequeue-wait system note).
 fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
     messages.iter().position(|m| {
         m["role"] == "user"
@@ -552,7 +559,9 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|b| b["type"] == "text" && b["text"] == text)
+                .any(|b| {
+                    b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.starts_with(text))
+                })
     })
 }
 
@@ -560,13 +569,14 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
 ///
 /// 1. The asker's kickoff turn emits a `ws.app.question.ask` question — the
 ///    hold activates (last transcript message = assistant question row).
-/// 2. A sibling fires two AUTOMATIC `ws.agent.send` deliveries at the asker
-///    (one normal, one `priority: "interrupt"`): both park in the queue with
-///    `heldForQuestions: true` on the send results, the interrupt entry FIRST
-///    (`interruptPriority: true` — spec §Decisions: interrupts are held too,
-///    no exceptions), and NO user row reaches the asker's transcript.
-///    `agent:queue:updated` carries the held snapshot in interrupt-first
-///    order.
+/// 2. Two siblings each fire one AUTOMATIC `ws.agent.send` at the asker
+///    (one normal, one `priority: "interrupt"` — one sender per message, the
+///    single-pending-message guard refuses a second parked send from the
+///    same caller): both park in the queue with `heldForQuestions: true` on
+///    the send results, the interrupt entry FIRST (`interruptPriority: true`
+///    — spec §Decisions: interrupts are held too, no exceptions), and NO
+///    user row reaches the asker's transcript. `agent:queue:updated` carries
+///    the held snapshot in interrupt-first order.
 /// 3. The user answers via `agent.sendMessage` — user origin is NEVER held:
 ///    the answer delivers immediately (`queued: false`), the hold flips
 ///    false, and the queue drains interrupt-first: transcript order is
@@ -576,12 +586,18 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let Some(script) = gate("WSS question-hold user-answer E2E") else {
         return;
     };
-    let send_code = format!(
+    let send_normal_code = format!(
         "const agents = await ws.agent.list(true); \
          const target = agents.find(a => a.name === 'AskerA'); \
          const first = await ws.agent.send(target.id, '{HELD_NORMAL}'); \
+         await ws.note.create('hold-results', JSON.stringify({{ first }})); \
+         return 'sent';"
+    );
+    let send_urgent_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
          const second = await ws.agent.send(target.id, '{HELD_URGENT}', 'interrupt'); \
-         await ws.note.create('hold-results', JSON.stringify({{ first, second }})); \
+         await ws.note.create('hold-results-urgent', JSON.stringify({{ second }})); \
          return 'sent';"
     );
     let behavior = json!({
@@ -591,9 +607,17 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
                 "ifPromptContains": SEND_MARKER,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": send_code, "summary": "held sends e2e" }
+                    "arguments": { "code": send_normal_code, "summary": "held send e2e" }
                 },
-                "response": "sends dispatched"
+                "response": "send dispatched"
+            },
+            {
+                "ifPromptContains": SEND_URGENT_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_urgent_code, "summary": "held urgent send e2e" }
+                },
+                "response": "urgent send dispatched"
             }
         ],
         "response": "plain reply"
@@ -614,11 +638,12 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
     let sender_id = create_agent(&mut rpc, &ws_id, "SenderB").await;
+    let urgent_sender_id = create_agent(&mut rpc, &ws_id, "SenderC").await;
 
     // ---- (1) The asker's question turn activates the hold ----
     drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
 
-    // ---- (2) Automatic sends park in the queue ----
+    // ---- (2) Automatic sends park in the queue (one sender each) ----
     let sent = wss_rpc(
         &mut rpc,
         "agent.sendMessage",
@@ -630,6 +655,19 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
+    await_stream_end(&mut sub, &sender_id).await;
+
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": urgent_sender_id,
+            "content": format!("message the asker {SEND_URGENT_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "urgent sender kickoff ok: {sent}");
 
     // The wire contract (§6.5): an `agent:queue:updated` snapshot for the
     // asker carries BOTH held entries, interrupt-first. (The interim 1-entry
@@ -649,7 +687,7 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
                 }
             }
             Some("agent:stream:end")
-                if ev["data"]["agentId"].as_str() == Some(sender_id.as_str()) =>
+                if ev["data"]["agentId"].as_str() == Some(urgent_sender_id.as_str()) =>
             {
                 sender_done = true;
             }
@@ -659,7 +697,7 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
             break;
         }
     }
-    assert!(sender_done, "sender turn completed");
+    assert!(sender_done, "urgent sender turn completed");
     let snapshot = held_snapshot.expect("agent:queue:updated carried the 2-entry held snapshot");
     assert_eq!(
         snapshot[0]["content"], HELD_URGENT,
@@ -678,10 +716,13 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         "normal entry carries no interrupt marker: {snapshot:?}"
     );
 
-    // The senders saw the hold on the RPC results (captured via the note).
-    let capture = read_capture_note(&mut rpc, &ws_id).await;
-    for key in ["first", "second"] {
-        let r = &capture[key];
+    // The senders saw the hold on the RPC results (captured via the notes).
+    let normal_capture = read_capture_note(&mut rpc, &ws_id, "hold-results").await;
+    let urgent_capture = read_capture_note(&mut rpc, &ws_id, "hold-results-urgent").await;
+    for (key, r) in [
+        ("first", &normal_capture["first"]),
+        ("second", &urgent_capture["second"]),
+    ] {
         assert_eq!(r["success"], true, "{key} send ok: {r}");
         assert_eq!(r["queued"], true, "{key} send parked: {r}");
         assert_eq!(
@@ -690,8 +731,8 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         );
     }
     assert_eq!(
-        capture["second"]["queuedMessage"]["interruptPriority"], true,
-        "interrupt send's queue entry carries the marker: {capture}"
+        urgent_capture["second"]["queuedMessage"]["interruptPriority"], true,
+        "interrupt send's queue entry carries the marker: {urgent_capture}"
     );
 
     // `agent.getQueue` agrees with the event snapshot, and the held messages
@@ -823,7 +864,7 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
     assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
     await_stream_end(&mut sub, &sender_id).await;
 
-    let capture = read_capture_note(&mut rpc, &ws_id).await;
+    let capture = read_capture_note(&mut rpc, &ws_id, "hold-results").await;
     assert_eq!(capture["first"]["queued"], true, "parked: {capture}");
     assert_eq!(
         capture["first"]["heldForQuestions"], true,
@@ -903,8 +944,10 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
                 .contains(ASK_MARKER),
         "first user row is the kickoff: {user_rows:?}"
     );
-    assert_eq!(
-        user_rows[1]["contentBlocks"][0]["text"], HELD_DISMISS,
+    assert!(
+        user_rows[1]["contentBlocks"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(HELD_DISMISS)),
         "second user row is the drained held message: {user_rows:?}"
     );
 

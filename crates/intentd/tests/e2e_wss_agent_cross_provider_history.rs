@@ -807,8 +807,12 @@ async fn same_provider_model_switch_resumes_via_session_load() {
         !text.contains("<supervisor>"),
         "resumed session must not replay history: {text:?}"
     );
+    // The send may drain via the queue (busy window during the respawn), in
+    // which case the dequeue-wait system note trails the user content.
     assert!(
-        text.ends_with("SLS_SECOND_USER_TURN"),
+        text.contains("SLS_SECOND_USER_TURN")
+            && !text.contains("SLS_FIRST_USER_TURN")
+            && (text.ends_with("SLS_SECOND_USER_TURN") || text.ends_with("before delivery.")),
         "second prompt carries only the new user content: {text:?}"
     );
 }

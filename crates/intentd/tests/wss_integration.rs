@@ -884,6 +884,97 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
+/// `agent.diagnostics` reports real pending-message queue snapshots over the
+/// WSS wire: after `agent.queueMessage`, `diagnostics.queues` carries the
+/// target's queue (drain-order entries with `queuedAt`, content truncated to
+/// 200 chars) and `summary.queuedAgents` counts it; after
+/// `agent.removeQueuedMessage` the snapshot is empty again.
+#[tokio::test]
+async fn wss_agent_diagnostics_reports_queue_snapshots() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Diag Queues"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Diag Queue Target"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Enqueue a >200-char message so the diagnostics preview truncation shows.
+    let long_content = "z".repeat(250);
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"{long_content}"}}}}"#
+    );
+    let queued = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(queued["result"]["success"], Value::Bool(true), "{queued}");
+    let message_id = queued["result"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued message id")
+        .to_string();
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(srv.port, srv.cfg.clone(), &diag_frame).await;
+    let d = &diag["result"]["diagnostics"];
+    assert_eq!(
+        d["summary"]["queuedAgents"],
+        Value::from(1),
+        "one agent has a pending queue: {d}"
+    );
+    let queues = d["queues"].as_array().expect("queues array");
+    assert_eq!(queues.len(), 1, "one queue snapshot: {d}");
+    let q = &queues[0];
+    assert_eq!(q["agentId"], Value::String(agent_id.clone()));
+    assert_eq!(q["agentName"], Value::String("Diag Queue Target".into()));
+    assert_eq!(q["queueLength"], Value::from(1));
+    let entries = q["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], Value::String(message_id.clone()));
+    assert_eq!(entries[0]["position"], Value::from(0));
+    assert!(entries[0]["queuedAt"].is_string(), "queuedAt: {entries:?}");
+    let preview = entries[0]["content"].as_str().expect("content string");
+    assert_eq!(
+        preview.chars().count(),
+        201,
+        "content truncated to 200 chars plus ellipsis marker"
+    );
+    assert!(preview.ends_with('…'));
+    assert!(long_content.starts_with(preview.trim_end_matches('…')));
+    let text = diag["result"]["text"].as_str().expect("text");
+    assert!(text.contains("Queued agents: 1"), "text: {text}");
+    assert!(text.contains("Pending message queues:"), "text: {text}");
+
+    // Remove the entry — diagnostics returns to an empty snapshot.
+    let remove_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.removeQueuedMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","messageId":"{message_id}"}}}}"#
+    );
+    let removed = wss_call(srv.port, srv.cfg.clone(), &remove_frame).await;
+    assert_eq!(removed["result"]["success"], Value::Bool(true), "{removed}");
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(srv.port, srv.cfg.clone(), &diag_frame).await;
+    let d = &diag["result"]["diagnostics"];
+    assert_eq!(d["queues"], serde_json::json!([]), "empty after removal");
+    assert_eq!(d["summary"]["queuedAgents"], Value::from(0));
+
+    srv.ws.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
