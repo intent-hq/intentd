@@ -81,6 +81,67 @@ fn stale_redrive_note(report_timestamp: &str) -> String {
 const STALE_REDRIVE_NOTE_PREFIX: &str =
     "[SYSTEM NOTE] This message was queued before you completed";
 
+/// Deterministic system note appended to every drained queue entry so the
+/// target agent knows when the message entered the queue and how long it
+/// waited before delivery. Messages delivered immediately (never queued)
+/// are NOT annotated — the note is applied only on the queue-drain paths.
+/// Coexists with the #576 stale-redrive note (both may appear).
+fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
+    format!(
+        "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
+    )
+}
+
+/// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
+/// idempotent when an already-annotated entry is requeued and drained again
+/// (the original wait deliberately stays — a terminal-failure requeue keeps
+/// its first-delivery numbers). Distinct from [`STALE_REDRIVE_NOTE_PREFIX`]
+/// ("…queued before you completed"), so the two checks never shadow each
+/// other.
+const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+
+/// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
+/// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
+fn format_wait_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Dequeue-wait annotation: appends [`dequeue_wait_note`] to a drained
+/// entry's content so the target knows when it was enqueued and how long it
+/// waited. Idempotent across requeues via the stable prefix check.
+/// `persisted: true` entries (terminal-failure requeues whose transcript row
+/// is already durable) are never rewritten — mirroring the stale-redrive
+/// constraint — so those redrives skip the note entirely: the delivered
+/// prompt stays byte-identical to the persisted row, at the cost of no wait
+/// note for that entry. Fail open: an unparseable `queued_at` leaves the
+/// content untouched.
+fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
+    if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
+        return;
+    }
+    let Some(queued) = parse_iso(&msg.queued_at) else {
+        tracing::warn!(
+            queued_at = %msg.queued_at,
+            "dequeue-wait annotation skipped: queued_at parse failed"
+        );
+        return;
+    };
+    let waited = (time::OffsetDateTime::now_utc() - queued).whole_seconds();
+    msg.content = format!(
+        "{}\n\n{}",
+        msg.content,
+        dequeue_wait_note(&msg.queued_at, &format_wait_duration(waited))
+    );
+}
+
 const GB: u64 = 1024 * 1024 * 1024;
 
 /// Whether a `session/cancel` error means the child's transport is already
@@ -3375,6 +3436,9 @@ impl AgentManager {
         // annotated content reaches both the persisted user row and the
         // provider prompt.
         let stale = self.annotate_stale_redrive(&agent_id, &mut next).await;
+        // Dequeue-wait note: same placement contract — the persisted row and
+        // the provider prompt both carry the enqueue time + wait.
+        annotate_dequeue_wait(&mut next);
         // Drain-start signal (monorepo#1022): the entry just flipped to
         // in-flight; its `turnId` covers redrives that skip the user-row
         // append below. Emitted AFTER the stale-redrive annotation so the
@@ -3515,6 +3579,9 @@ impl AgentManager {
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.
         let stale = self.annotate_stale_redrive(&agent_id, &mut entry).await;
+        // Dequeue-wait note: parity with the drain paths — the "send now"
+        // delivery tells the target when the entry was enqueued.
+        annotate_dequeue_wait(&mut entry);
         // Publish the shrunk snapshot (write-through persist inside) so
         // clients see the entry leave the queue before the turn starts.
         self.services
@@ -6000,6 +6067,8 @@ async fn run_message_worker(
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Dequeue-wait note: same placement contract as the stale check.
+            annotate_dequeue_wait(&mut next);
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
@@ -6084,6 +6153,8 @@ async fn run_message_worker(
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Dequeue-wait note: same placement contract as the stale check.
+            annotate_dequeue_wait(&mut next);
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
