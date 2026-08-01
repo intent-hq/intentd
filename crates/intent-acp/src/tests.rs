@@ -8249,6 +8249,26 @@ mod wsapi4_bindings_tests {
         assert_eq!(api.agent_unsubscribe_calls.lock().unwrap()[0], "sub-9");
     }
 
+    /// monorepo#1229: `ws.agent.unwatch()` with a missing or empty argument
+    /// fails the required-parameter validation instead of reaching the
+    /// service with an empty subscriptionId.
+    #[tokio::test]
+    async fn agent_unwatch_missing_or_empty_argument_errors() {
+        let (srv, _api) = server_with_caller("caller-1");
+        for script in [
+            "return await ws.agent.unwatch();",
+            "return await ws.agent.unwatch('');",
+        ] {
+            let resp = call(&srv, script).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "script: {script}");
+            assert!(
+                text(&resp).contains("subscriptionId or agentId is required"),
+                "script: {script}, text: {}",
+                text(&resp)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn agent_report_to_parent_threads_caller() {
         let (srv, api) = server_with_caller("child-99");

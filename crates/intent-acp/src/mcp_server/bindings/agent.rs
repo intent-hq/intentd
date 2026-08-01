@@ -39,8 +39,8 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'agent.unsubscribe', args: { subscriptionId } }),
         watch: (agentId) => host({ method: 'agent.watch', args: { agentId } }),
         unwatch: (subscriptionIdOrAgentId) => {
-            const s = String(subscriptionIdOrAgentId || '');
-            const args = s.startsWith('agent-') ? { agentId: s } : { subscriptionId: s };
+            const s = subscriptionIdOrAgentId == null ? '' : String(subscriptionIdOrAgentId);
+            const args = s === '' ? {} : s.startsWith('agent-') ? { agentId: s } : { subscriptionId: s };
             return host({ method: 'agent.unwatch', args });
         },
         list: (includeCompleted) =>
@@ -438,8 +438,10 @@ async fn unwatch(
     args: &Value,
 ) -> Result<Value, String> {
     let caller = caller.ok_or_else(|| "agent.unwatch is only available to agents".to_string())?;
-    let subscription_id = opt_str(args, "subscriptionId");
-    let target = opt_str(args, "agentId").map(|s| AgentId::from(s.as_str()));
+    let subscription_id = opt_str(args, "subscriptionId").filter(|s| !s.is_empty());
+    let target = opt_str(args, "agentId")
+        .filter(|s| !s.is_empty())
+        .map(|s| AgentId::from(s.as_str()));
     if subscription_id.is_none() && target.is_none() {
         return Err("subscriptionId or agentId is required".to_string());
     }
