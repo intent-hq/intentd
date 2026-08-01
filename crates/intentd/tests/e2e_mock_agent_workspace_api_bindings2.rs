@@ -487,6 +487,14 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     let services = Services::new(store.clone())
         .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(serde_json::json!([
+            { "path": "workspaceApi.toonOutput", "value": false }
+        ]))
+        .await
+        .expect("disable toonOutput");
 
     let ws = WorkspaceId::new();
     store
@@ -769,6 +777,14 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let services = Services::new(store.clone())
         .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(serde_json::json!([
+            { "path": "workspaceApi.toonOutput", "value": false }
+        ]))
+        .await
+        .expect("disable toonOutput");
 
     let ws = WorkspaceId::new();
     store
