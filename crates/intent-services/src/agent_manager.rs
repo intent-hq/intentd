@@ -2864,7 +2864,7 @@ impl AgentManager {
     /// case). Emits `agent:updated` with `attentionRequestCleared: true` when
     /// one was present and cleared so clients retire the sidebar/footer
     /// indicator.
-    async fn clear_attention_request_if_present(
+    pub(crate) async fn clear_attention_request_if_present(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -2884,6 +2884,12 @@ impl AgentManager {
                         intent_core::events::AGENT_UPDATED,
                         json!({ "agentId": agent_id.0, "attentionRequestCleared": true }),
                     )
+                    .await;
+                // Retiring the request can retire the workspace's
+                // needs_attention displayStatus (§6.5 step 0):
+                // recompute-and-compare.
+                self.services
+                    .maybe_emit_display_status_changed(workspace_id)
                     .await;
             }
             Ok(false) => {
@@ -3324,6 +3330,12 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
+        // The persisted user row supersedes a pending question tail, which
+        // can retire the workspace's needs_attention displayStatus (§6.5
+        // step 0): recompute-and-compare.
+        self.services
+            .maybe_emit_display_status_changed(&workspace_id)
+            .await;
         self.spawn_worker(agent_id, workspace_id, content, options, true);
         Ok(json!({
             "success": true,
@@ -3684,6 +3696,12 @@ impl AgentManager {
                         Some(entry.turn_id.as_str()),
                     ),
                 )
+                .await;
+            // The persisted user row supersedes a pending question tail,
+            // which can retire the workspace's needs_attention displayStatus
+            // (§6.5 step 0): recompute-and-compare.
+            self.services
+                .maybe_emit_display_status_changed(&workspace_id)
                 .await;
         }
         let entry_id = entry.id.clone();
@@ -6334,6 +6352,12 @@ async fn persist_user(
             intent_core::events::AGENT_MESSAGE,
             crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
+        .await;
+    // The persisted user row supersedes a pending question tail, which can
+    // retire the workspace's needs_attention displayStatus (§6.5 step 0):
+    // recompute-and-compare.
+    mgr.services
+        .maybe_emit_display_status_changed(workspace_id)
         .await;
     true
 }

@@ -1684,6 +1684,99 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     );
 }
 
+/// §6.5 step-0 turn-end trigger: a turn whose persisted assistant tail
+/// carries a question resource block promotes the workspace's derived
+/// `displayStatus` to `needs_attention` (and emits the transition); the next
+/// turn — after the user's answer superseded the questions — persists a
+/// question-free tail and the same turn-end recompute retires it back to
+/// `idle`.
+#[tokio::test]
+async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["workspace:displayStatus-changed".to_string()],
+        ..Default::default()
+    });
+
+    // Turn 1: an AtTurnEnd question attachment lands as the trailing
+    // resource block of the persisted assistant message (the shape
+    // `ws.app.question.ask` produces).
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-q1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "question://q-1".to_string(),
+            name: "Question".to_string(),
+            text: "{\"questions\":[]}".to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("ask")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+
+    // The user's answer supersedes the questions (appended directly — the
+    // send paths carry their own recompute, exercised elsewhere), then turn
+    // 2 persists a question-free tail: the turn-end recompute retires the
+    // hold and emits the demotion.
+    bus.store()
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "answer" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append answer");
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+}
+
 /// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
 /// never saw (the abort echo a cancelled child emits after an interrupt: no
 /// title/rawInput → derived name "") must NOT fabricate an anonymous

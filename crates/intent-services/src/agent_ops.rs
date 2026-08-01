@@ -3005,6 +3005,11 @@ impl Services {
                     agent_message_event_payload(&agent_id, &message, None),
                 )
                 .await;
+                // The user row supersedes a pending question tail, which can
+                // retire the workspace's needs_attention displayStatus (§6.5
+                // step 0): recompute-and-compare.
+                self.maybe_emit_display_status_changed(&session.workspace_id)
+                    .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -3122,6 +3127,11 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
+        // The user row supersedes a pending question tail, which can retire
+        // the workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare.
+        self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
@@ -3239,6 +3249,10 @@ impl Services {
             }),
         )
         .await;
+        // Dismissing the questions retires the question hold, which can
+        // retire the workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare.
+        self.maybe_emit_display_status_changed(&workspace_id).await;
         // The hold (if it was gating this message's questions) is now released:
         // kick the drain so held queue entries resume without waiting for the
         // next end-of-turn drain.
@@ -3745,6 +3759,11 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // A pending attention request on a top-level agent promotes the
+        // derived displayStatus to needs_attention (§6.5 step 0):
+        // recompute-and-compare (child/background raises stay silent — the
+        // derivation ignores them and the dedup cache suppresses the no-op).
+        self.maybe_emit_display_status_changed(&workspace_id).await;
         // 4. Linked-task transition (no linked task = skip).
         if let Some(note_id) = task_note_id {
             self.transition_linked_task_status(
