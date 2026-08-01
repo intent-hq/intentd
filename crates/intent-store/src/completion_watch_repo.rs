@@ -26,6 +26,9 @@ pub struct PersistedCompletionWatch {
     pub one_shot: bool,
     pub group_id: Option<String>,
     pub report_delivered: bool,
+    /// Explicit `agent.watch` watches also wake on the child's attention
+    /// requests (blocker/discussion); auto-registered watches default false.
+    pub wake_on_attention: bool,
     pub deadline_at_ms: Option<i64>,
     pub created_at: String,
 }
@@ -40,14 +43,15 @@ impl Store {
             "INSERT INTO completion_watch (
                 id, parent_workspace_id, child_workspace_id, parent_agent_id,
                 parent_agent_name, child_agent_id, one_shot, group_id,
-                report_delivered, deadline_at_ms, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                report_delivered, wake_on_attention, deadline_at_ms, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 parent_workspace_id = excluded.parent_workspace_id,
                 parent_agent_name = excluded.parent_agent_name,
                 one_shot = excluded.one_shot,
                 group_id = excluded.group_id,
                 report_delivered = excluded.report_delivered,
+                wake_on_attention = excluded.wake_on_attention,
                 deadline_at_ms = excluded.deadline_at_ms",
         )
         .bind(&w.id)
@@ -59,6 +63,7 @@ impl Store {
         .bind(w.one_shot as i64)
         .bind(&w.group_id)
         .bind(w.report_delivered as i64)
+        .bind(w.wake_on_attention as i64)
         .bind(w.deadline_at_ms)
         .bind(&w.created_at)
         .execute(self.write_pool())
@@ -73,7 +78,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
                     parent_agent_name, child_agent_id, one_shot, group_id,
-                    report_delivered, deadline_at_ms, created_at
+                    report_delivered, wake_on_attention, deadline_at_ms, created_at
              FROM completion_watch
              ORDER BY created_at ASC",
         )
@@ -206,6 +211,10 @@ fn decode_watch_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedCompletion
         report_delivered: row
             .try_get::<i64, _>("report_delivered")
             .map_err(|e| Error::Internal(format!("decode report_delivered: {e}")))?
+            != 0,
+        wake_on_attention: row
+            .try_get::<i64, _>("wake_on_attention")
+            .map_err(|e| Error::Internal(format!("decode wake_on_attention: {e}")))?
             != 0,
         deadline_at_ms: row
             .try_get("deadline_at_ms")
