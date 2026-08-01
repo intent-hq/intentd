@@ -222,9 +222,9 @@ where
 }
 
 /// Poll `terminal.list` until the workspace's setup terminal (named "Setup
-/// Script") has finished executing, returning its list entry. Uses a generous
+/// Script") is running, returning its live list entry. Uses a generous
 /// deadline so slow CI machines don't flake.
-async fn await_setup_terminal<S>(
+async fn await_running_setup_terminal<S>(
     ws: &mut WebSocketStream<S>,
     base_id: i64,
     workspace_id: &str,
@@ -246,20 +246,18 @@ where
         let terminals = list_resp["result"].as_array().expect("terminal.list array");
         if let Some(entry) = terminals
             .iter()
-            .find(|t| t["name"] == json!("Setup Script") && t["isExecutingCommand"] == json!(false))
+            .find(|t| t["name"] == json!("Setup Script") && t["isExecutingCommand"] == json!(true))
         {
             return entry.clone();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("setup terminal named \"Setup Script\" never finished for {workspace_id}");
+    panic!("running setup terminal named \"Setup Script\" never appeared for {workspace_id}");
 }
 
 /// Poll `terminal.getBuffer` until the decoded scrollback contains `needle`,
-/// returning the buffer. The child process being reaped (which flips
-/// `isExecutingCommand` to false) has no ordering guarantee with the PTY
-/// reader thread appending the final output to scrollback, so a single read
-/// after `await_setup_terminal` could race it.
+/// returning the buffer. Setup terminals disappear from `terminal.list` on
+/// exit, but their retained PTY sessions remain readable by id.
 async fn await_buffer_contains<S>(
     ws: &mut WebSocketStream<S>,
     base_id: i64,
@@ -279,6 +277,37 @@ where
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("buffer never contained {needle:?}: {buffer:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll `terminal.list` until the exited setup terminal is no longer returned.
+async fn await_terminal_omitted<S>(
+    ws: &mut WebSocketStream<S>,
+    base_id: i64,
+    workspace_id: &str,
+    terminal_id: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempt = 0;
+    loop {
+        let list_resp = wss_rpc(
+            ws,
+            base_id + attempt,
+            "terminal.list",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+        attempt += 1;
+        let terminals = list_resp["result"].as_array().expect("terminal.list array");
+        if terminals.iter().all(|entry| entry["id"] != terminal_id) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("exited setup terminal {terminal_id} remained in terminal.list");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -575,13 +604,16 @@ async fn setup_script_executes_on_create() {
         r#"#!/bin/sh
 set -e
 # Write env vars to a file in the worktree (hermetic, not /tmp)
+	while [ ! -f "${{WORKTREE_PATH}}/.setup-release-{}" ]; do
+	  sleep 0.1
+	done
 echo "MAIN_CHECKOUT=${{MAIN_CHECKOUT}}" > "${{WORKTREE_PATH}}/setup-env-{}.txt"
 echo "WORKTREE_PATH=${{WORKTREE_PATH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
 echo "BRANCH_NAME=${{BRANCH_NAME}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
 echo "SOURCE_BRANCH=${{SOURCE_BRANCH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
 touch "${{WORKTREE_PATH}}/.setup-ran-{}"
 "#,
-        test_run_id, test_run_id, test_run_id, test_run_id, test_run_id
+        test_run_id, test_run_id, test_run_id, test_run_id, test_run_id, test_run_id
     );
 
     let create_resp = wss_rpc(
@@ -611,6 +643,19 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     let workspace_path = create_resp["result"]["workspace"]["worktreePath"]
         .as_str()
         .expect("worktreePath should be set");
+
+    // Setup Script remains list-visible while running. Hold it behind a marker
+    // so even fast CI machines can observe it before allowing it to finish.
+    let setup_terminal = await_running_setup_terminal(&mut wss, 100, &workspace_id).await;
+    let terminal_id = setup_terminal["id"]
+        .as_str()
+        .expect("terminal id")
+        .to_string();
+    std::fs::write(
+        PathBuf::from(workspace_path).join(format!(".setup-release-{}", test_run_id)),
+        "",
+    )
+    .expect("release setup script");
 
     // Poll for the marker file (script execution is fire-and-forget, may take a moment)
     let marker_path = PathBuf::from(workspace_path).join(format!(".setup-ran-{}", test_run_id));
@@ -645,22 +690,28 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         "SOURCE_BRANCH should be set"
     );
 
-    // The setup terminal is named "Setup Script" in terminal.list, and its
-    // scrollback ends with the completion summary (elapsed time + exit code)
-    // even for a late-attaching client reading via terminal.getBuffer.
-    let setup_terminal = await_setup_terminal(&mut wss, 100, &workspace_id).await;
-    let terminal_id = setup_terminal["id"].as_str().expect("terminal id");
+    // After exit, the terminal is omitted from terminal.list but its scrollback
+    // remains readable by the id captured while it was running.
     let buffer =
-        await_buffer_contains(&mut wss, 300, terminal_id, "Setup script completed in ").await;
+        await_buffer_contains(&mut wss, 300, &terminal_id, "Setup script completed in ").await;
     assert!(
         buffer.contains("(exit code 0)"),
         "buffer should report exit code 0: {buffer:?}"
     );
+    await_terminal_omitted(&mut wss, 800, &workspace_id, &terminal_id).await;
 
     // Test that a failing script doesn't fail workspace.create
-    let failing_script = r#"#!/bin/sh
+    let failing_run_id = Uuid::new_v4().simple().to_string();
+    let failing_script = format!(
+        r#"#!/bin/sh
+while [ ! -f "${{WORKTREE_PATH}}/.setup-fail-release-{}" ]; do
+  sleep 0.1
+done
+touch "${{WORKTREE_PATH}}/.setup-fail-ran-{}"
 exit 1
-"#;
+"#,
+        failing_run_id, failing_run_id
+    );
     let create_resp2 = wss_rpc(
         &mut wss,
         2,
@@ -687,14 +738,45 @@ exit 1
         .as_str()
         .unwrap()
         .to_string();
-    let failed_terminal = await_setup_terminal(&mut wss, 400, &workspace_id2).await;
-    let failed_terminal_id = failed_terminal["id"].as_str().expect("terminal id");
-    let failed_buffer =
-        await_buffer_contains(&mut wss, 600, failed_terminal_id, "Setup script failed in ").await;
+    let workspace_path2 = create_resp2["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath should be set");
+    let failed_terminal = await_running_setup_terminal(&mut wss, 400, &workspace_id2).await;
+    let failed_terminal_id = failed_terminal["id"]
+        .as_str()
+        .expect("terminal id")
+        .to_string();
+    std::fs::write(
+        PathBuf::from(workspace_path2).join(format!(".setup-fail-release-{}", failing_run_id)),
+        "",
+    )
+    .expect("release failing setup script");
+    let failed_marker_path =
+        PathBuf::from(workspace_path2).join(format!(".setup-fail-ran-{}", failing_run_id));
+    let mut failed_marker_found = false;
+    for _ in 0..100 {
+        if failed_marker_path.exists() {
+            failed_marker_found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        failed_marker_found,
+        "failing setup script should have created marker file"
+    );
+    let failed_buffer = await_buffer_contains(
+        &mut wss,
+        600,
+        &failed_terminal_id,
+        "Setup script failed in ",
+    )
+    .await;
     assert!(
         failed_buffer.contains("(exit code 1)"),
         "buffer should report exit code 1: {failed_buffer:?}"
     );
+    await_terminal_omitted(&mut wss, 900, &workspace_id2, &failed_terminal_id).await;
 
     // Test that skipWorktree workspace does not execute the script
     let skip_marker_id = Uuid::new_v4().simple().to_string();

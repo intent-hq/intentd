@@ -14793,11 +14793,158 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
         got.last_user_message.as_deref(),
         Some("second ask\nwith a second line")
     );
+    // The trailing system row is transparent: the newest user/assistant
+    // message is the assistant reply.
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
     assert_eq!(serde_json::to_value(got).unwrap(), old);
 
     let agents = svc.agent_list_op(ws).await.expect("list");
     let listed = agents.into_iter().find(|a| a.id == id).expect("listed");
     assert_eq!(serde_json::to_value(listed).unwrap(), old);
+}
+
+/// `lastMessageRole` derivation across both projection paths: omitted on an
+/// empty transcript, `"user"` when the newest user/assistant message is the
+/// user's (including with a trailing system row), `"assistant"` after a
+/// reply, and recomputed by `agent.replaceMessages`.
+#[tokio::test]
+async fn agent_lite_last_message_role_follows_newest_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RoleTracker").await;
+
+    // Empty transcript: field omitted on the wire.
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role, None);
+    let v = serde_json::to_value(&got).unwrap();
+    assert!(
+        v.get("lastMessageRole").is_none(),
+        "field omitted when absent: {v}"
+    );
+
+    let append = |role: &'static str, text: &'static str| {
+        let svc = &svc;
+        let id = id.clone();
+        async move {
+            svc.store()
+                .append_agent_message(
+                    &id,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append");
+        }
+    };
+    append("user", "first ask").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("user"));
+
+    append("assistant", "reply").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
+
+    append("user", "follow-up").await;
+    append("system", "system tail").await;
+    svc.invalidate_agent_list_cache(&ws);
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_message_role.as_deref(),
+        Some("user"),
+        "system tail is transparent"
+    );
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(listed.last_message_role.as_deref(), Some("user"));
+
+    // replaceMessages recomputes: truncating to end on the assistant reply
+    // flips the role back to "assistant".
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "user", "content": [{ "type": "text", "text": "first ask" }] },
+            { "role": "assistant", "content": [{ "type": "text", "text": "reply" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
+}
+
+/// Live-turn overlay flip (intentd#786/#792): mid-turn, `lastMessageRole`
+/// stays on the persisted value ("user") until the in-flight turn has
+/// derivable streamed text — the same gate as the live `lastAgentResponse`
+/// overlay — then flips to "assistant"; turn end returns to persisted
+/// semantics (the assistant row has persisted by then in production).
+#[tokio::test]
+async fn agent_lite_last_message_role_live_turn_overlay_flip() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RoleStreamer").await;
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "do the thing" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+
+    // Pre-first-token (busy worker, no derivable text yet — tool-only slot):
+    // persisted "user" is served unchanged.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "tool_use",
+            "id": "msg-live:0",
+            "name": "read_file",
+            "input": {},
+            "toolCallId": "call-1",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("user"));
+    assert_eq!(got.last_agent_response, None);
+
+    // Streamed text with no completed line yet: still no derivable response,
+    // so the role does not flip.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "still streaming the first line",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("user"));
+
+    // A completed line makes the response derivable: role flips to
+    // "assistant" together with the response overlay, on both read paths.
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "First line done\npartial tail",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
+    assert_eq!(got.last_agent_response.as_deref(), Some("First line done"));
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert_eq!(agents[0].last_message_role.as_deref(), Some("assistant"));
+
+    // Turn end (slot cleared, worker released): back to persisted semantics.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("user"));
 }
 
 /// monorepo#958 regression: `agent.list` and `agent.get` never hydrate full
@@ -15603,7 +15750,7 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         session.dismissed_questions_message_id(),
         Some(asked.id.as_str())
     );
-    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
     assert_eq!(
         lite.metadata.dismissed_questions_message_id.as_deref(),
         Some(asked.id.as_str())

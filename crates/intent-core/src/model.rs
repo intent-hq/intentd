@@ -2052,6 +2052,13 @@ pub struct AgentSession {
     /// omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// ISO timestamp recorded when `stop_reason` was persisted (terminal agent
+    /// failures). Set alongside `stop_reason`, cleared wherever `stop_reason`
+    /// clears (turn begin, `agent.retry`), so clients can render how long ago
+    /// a parked-in-error session failed. Serialized as `stopReasonTimestamp`
+    /// on both `AgentSession` and `AgentLite`; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_timestamp: Option<String>,
     /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940): `true`
     /// when the session is parked in `error` AND the failure classifies as
     /// session-fatal (provider block or deterministic prompt rejection) or the
@@ -2218,6 +2225,14 @@ pub struct AgentLite {
     pub last_agent_response: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_message: Option<String>,
+    /// Role (`"user"` / `"assistant"`) of the session's newest
+    /// user/assistant transcript message — system (and any other) rows are
+    /// transparent. Additive wire field; omitted when the session has no
+    /// user/assistant message. Mid-turn, the service projection overlays
+    /// `"assistant"` once the in-flight turn has derivable streamed text
+    /// (the same gate as the live `lastAgentResponse` overlay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2232,6 +2247,10 @@ pub struct AgentLite {
     /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// When `stopReason` was recorded; see [`AgentSession::stop_reason_timestamp`].
+    /// Top-level `stopReasonTimestamp`; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_timestamp: Option<String>,
     /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940); see
     /// [`AgentSession::session_corrupted`]. Overlaid by the service projection
     /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
@@ -2249,6 +2268,7 @@ impl AgentLite {
         last_agent_response: Option<String>,
         last_user_message: Option<String>,
         digest: Option<String>,
+        last_message_role: Option<String>,
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
@@ -2296,10 +2316,12 @@ impl AgentLite {
             message_count,
             last_agent_response,
             last_user_message,
+            last_message_role,
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
             stop_reason: session.stop_reason,
+            stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             metadata,
         }
@@ -3479,6 +3501,7 @@ mod tests {
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
             })),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
@@ -3486,7 +3509,14 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
+        let lite = AgentLite::from_session(
+            session,
+            0,
+            None,
+            Some("hi".to_string()),
+            None,
+            Some("user".to_string()),
+        );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
         // The question-dismissal marker is lifted out of the free-form session
@@ -3505,6 +3535,7 @@ mod tests {
         // to `[]` when no completion watches are pending (PROTOCOL §5.5/§7.1).
         assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
+        assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastActivity"], "t1");
     }
 
@@ -3552,6 +3583,7 @@ mod tests {
             is_background: false,
             metadata: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),

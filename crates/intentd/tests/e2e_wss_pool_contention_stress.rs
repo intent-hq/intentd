@@ -348,6 +348,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         let contents: Vec<serde_json::Value> = (0..60)

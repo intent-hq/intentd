@@ -12,16 +12,18 @@ permissions:
 env:
   # Burst the Linux jobs to GitHub-hosted larger runners when more than
   # this many Linux jobs are queued/running ahead of this run (see the
-  # route job). Note that jobs still blocked on `needs` are invisible to
-  # the jobs API, so only check/coverage jobs already released to tinybox
-  # (queued or running there) count toward the depth. Bursted jobs don't
-  # carry the self-hosted+Linux labels and stop counting toward the
-  # depth, so the system naturally falls back to tinybox as it frees up.
-  LINUX_BURST_THRESHOLD: 2
+  # route job). tinybox runs 8 concurrent runner slots, so the threshold
+  # tolerates one queued/running job per slot before bursting. Note that
+  # jobs still blocked on `needs` are invisible to the jobs API, so only
+  # check/coverage jobs already released to tinybox (queued or running
+  # there) count toward the depth. Bursted jobs don't carry the
+  # self-hosted+Linux labels and stop counting toward the depth, so the
+  # system naturally falls back to tinybox as it frees up.
+  LINUX_BURST_THRESHOLD: 8
 
-# The heavy jobs share a single self-hosted runner slot and serialize, so
-# cancel superseded PR runs instead of letting them back up the queue (push
-# to main and merge-queue runs are never cancelled).
+# The heavy jobs share the tinybox's 8 self-hosted runner slots, so cancel
+# superseded PR runs instead of letting them back up the queue (push to
+# main and merge-queue runs are never cancelled).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -55,7 +57,7 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
         with:
-          # tinybox serves several repos on one runner slot, so the probe
+          # tinybox serves several repos on its runner slots, so the probe
           # wants to size the queue across all of them — but the default
           # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
           # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
@@ -71,10 +73,10 @@ jobs:
             // instead.
             const burst = ["gh-linux-16x"];
             const checkBurst = ["gh-linux-8x"];
-            const threshold = parseInt(process.env.THRESHOLD || "2", 10);
+            const threshold = parseInt(process.env.THRESHOLD || "8", 10);
             // Count self-hosted Linux jobs that are queued or running in
-            // queued/in-progress runs: a running job occupies the single
-            // tinybox slot just as much as a queued one. GitHub-hosted jobs
+            // queued/in-progress runs: a running job occupies a tinybox
+            // slot just as much as a queued one. GitHub-hosted jobs
             // — including this route job and bursted heavy jobs — don't
             // match the self-hosted+Linux label filter, so they never
             // inflate the depth.
@@ -127,9 +129,14 @@ jobs:
       # dir. A per-job CARGO_TARGET_DIR under $HOME survives both, which is
       # what makes builds warm across runs (and why swatinem/rust-cache was
       # dropped: GH cache save/restore would be pure overhead on top of it).
+      # The path is also keyed on $RUNNER_NAME: the 8 tinybox runner slots
+      # share one $HOME, and without the key concurrent jobs would serialize
+      # on cargo's target-dir lock (and the coverage jobs would clobber each
+      # other — see their comments). Trade-off: up to 8 per-slot copies of
+      # each job's target dir; prune $HOME/ci-target if disk gets tight.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/check" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -203,7 +210,8 @@ jobs:
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale; re-add swatinem/rust-cache, keyed
-      # per target, if a GH-hosted matrix entry is re-enabled). On the Windows
+      # per target, if a GH-hosted matrix entry is re-enabled). The mac and
+      # Windows runners are single-slot, so no $RUNNER_NAME key. On the Windows
       # runner this runs under Git Bash, where $HOME is an MSYS-style path
       # cargo (spawned from the default pwsh shell) can't use — $USERPROFILE
       # carries the native C:\Users\... form, so prefer it when set.
@@ -242,12 +250,15 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 32 (not 64) on the 64-core tinybox: at 64 threads the latency-bound
-      # stress tests (e.g. e2e_wss_pool_contention_stress's <2s read assert)
-      # blow their wall-clock bounds under llvm-cov load on both nextest
-      # tries. 32 keeps the box saturated without the latency spikes. When
-      # bursting, match the 16-core gh-linux-16x runner instead.
-      NEXTEST_TEST_THREADS: ${{ needs.route.outputs.linux_burst == 'true' && '16' || '32' }}
+      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
+      # (at 64 threads the latency-bound stress tests — e.g.
+      # e2e_wss_pool_contention_stress's <2s read assert — blew their
+      # wall-clock bounds under llvm-cov load on both nextest tries), but up
+      # to 8 co-tenant jobs now share the box, so halve to 16 to keep those
+      # tests inside their bounds under co-tenancy. This also matches the
+      # 16-core gh-linux-16x burst runner, so the value no longer varies by
+      # route.
+      NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -261,9 +272,12 @@ jobs:
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
+      # The $RUNNER_NAME key is a correctness requirement here, not just
+      # lock avoidance: that same clean means two coverage jobs on different
+      # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-e2e" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -323,13 +337,15 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 32 (not 64) on the 64-core tinybox: at 64 threads the full workspace
-      # suite thrashes SQLite/WAL and wall-clock-timeout tests hard enough
-      # that even the nextest retry fails (concurrent_writes_no_sqlite_busy
-      # hit "database is locked" on both tries, bridge/auto-commit timing
-      # tests timed out). 32 keeps the box saturated without the lock storms.
-      # When bursting, match the 16-core gh-linux-16x runner instead.
-      NEXTEST_TEST_THREADS: ${{ needs.route.outputs.linux_burst == 'true' && '16' || '32' }}
+      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
+      # (at 64 threads the full workspace suite thrashed SQLite/WAL and
+      # wall-clock-timeout tests hard enough that even the nextest retry
+      # failed: concurrent_writes_no_sqlite_busy hit "database is locked" on
+      # both tries, bridge/auto-commit timing tests timed out), but up to 8
+      # co-tenant jobs now share the box, so halve to 16 to avoid the lock
+      # storms under co-tenancy. This also matches the 16-core gh-linux-16x
+      # burst runner, so the value no longer varies by route.
+      NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -343,9 +359,12 @@ jobs:
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
+      # The $RUNNER_NAME key is a correctness requirement here, not just
+      # lock avoidance: that same clean means two coverage jobs on different
+      # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-all" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash

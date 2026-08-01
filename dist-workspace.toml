@@ -30,16 +30,23 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # toolchains (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Build jobs run on the org's self-hosted runners (GH-hosted billing is
-# unavailable): tinybox (Linux x64, Ubuntu 22.04), m1mac (macOS arm64), 5090pc
-# (Windows x64). Runner values must be single labels here (the generated
-# workflow interpolates them as strings), and each machine exposes its
-# hostname as a label.
+# Linux/macOS build jobs run on the org's self-hosted runners: tinybox
+# (Linux x64, Ubuntu 22.04) and m1mac (macOS arm64). Runner values must be
+# single labels here (the generated workflow interpolates them as strings),
+# and each machine exposes its hostname as a label.
 #
-# The global jobs (plan / build-global-artifacts / host / announce) run on
-# GitHub-hosted runners instead: `plan` runs on every PR and the rest
-# fire at release time, so keeping them off tinybox isolates them from its
-# single-slot queue — the same rationale as ci.yml's route/burst pattern.
+# The Windows build runs on a GitHub-hosted runner: the self-hosted 5090pc
+# lacks PowerShell 7, so default-shell steps fall back to Windows PowerShell
+# 5.1, whose `>` redirection writes UTF-16 — dist's generated
+# `dist build ... > dist-manifest.json` step then produces a manifest dist
+# can't read back ("stream did not contain valid UTF-8"). Move it back to
+# 5090pc once pwsh 7 is installed there.
+#
+# The global jobs (plan / build-global-artifacts / host / announce) also
+# run on tinybox: they sat on GitHub-hosted runners while tinybox had a
+# single slot (`plan` runs on every PR and queueing it behind the heavy CI
+# jobs was the intentd#805 rationale), but with 8 tinybox slots that
+# queue-isolation concern is gone.
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
@@ -48,7 +55,7 @@ github-build-setup = "../dist-build-setup.yml"
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "ubuntu-latest"
+global = "tinybox"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "m1mac"
@@ -66,4 +73,4 @@ runner = "tinybox"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]
-runner = "5090pc"
+runner = "windows-2022"

@@ -129,6 +129,8 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::INTENTD_RELEASES_TOKEN secret is not configured; skipping mirror to intent-hq/intentd-releases"
           fi
+      # Notes are copied from the source release body (download URLs rewritten
+      # to the mirror) and re-synced if the mirrored release already exists.
       - name: Mirror release assets to intentd-releases
         if: steps.mirror.outputs.enabled == 'true'
         shell: bash

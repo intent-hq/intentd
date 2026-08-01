@@ -7401,9 +7401,11 @@ mod wsapi4_bindings_tests {
             digest: None,
             last_agent_response: None,
             last_user_message: None,
+            last_message_role: None,
             context_references: None,
             image_blocks: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             metadata: AgentMetadata {
                 is_background: false,

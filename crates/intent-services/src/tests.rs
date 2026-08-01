@@ -274,6 +274,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
     store
@@ -1637,6 +1638,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     };
     svc.store
@@ -3996,6 +3998,7 @@ mod change_event_parity {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         h.store
@@ -5882,6 +5885,7 @@ mod mcp_callback {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
@@ -11246,6 +11250,7 @@ mod search_adapters {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
@@ -12302,11 +12307,10 @@ mod script {
             .expect("stop");
     }
 
-    /// The unified host: a running script's PTY is visible to `terminal.list` and
-    /// its scrollback is readable via `terminal.getBuffer` — a terminal attaching
-    /// to a live script (§12.2).
+    /// A running script's PTY stays hidden from `terminal.list` while its
+    /// scrollback remains readable through `script.output` (§12.2).
     #[tokio::test]
-    async fn terminal_attaches_to_running_script_pty() {
+    async fn running_script_is_hidden_but_output_remains_available() {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(
@@ -12331,27 +12335,23 @@ mod script {
         })
         .await;
 
-        // The script's PTY appears in the workspace's terminal list...
+        // Script-owned PTYs do not hydrate as generic terminal tabs.
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let term_id = list
-            .as_array()
-            .expect("bare terminals array")
-            .iter()
-            .filter_map(|t| t["id"].as_str())
-            .next()
-            .expect("script PTY listed as a terminal")
-            .to_string();
-
-        // ...and a terminal reads its scrollback (attach to a running script).
-        let buf = h
-            .services
-            .terminal_get_buffer(term_id, None)
-            .await
-            .expect("getBuffer");
-        let bytes = decode(buf["data"].as_str().expect("data"));
         assert!(
-            contains(&bytes, b"SCRIPT-PTY-MARK"),
-            "terminal reads the running script's PTY output"
+            list.as_array().is_some_and(Vec::is_empty),
+            "script PTY must not be listed: {list}"
+        );
+
+        // The same PTY scrollback remains available through the script API.
+        let output = h
+            .services
+            .script_output(h.ws.clone(), id.clone(), None, None, None)
+            .await
+            .expect("script output");
+        let text = output.as_str().expect("script output string");
+        assert!(
+            text.contains("SCRIPT-PTY-MARK"),
+            "script.output reads the hidden PTY output: {text:?}"
         );
         h.services
             .script_stop(h.ws.clone(), id)
@@ -13009,6 +13009,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13141,6 +13142,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13263,6 +13265,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13381,6 +13384,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13499,6 +13503,7 @@ mod rules {
             sandbox_path: None, // NO sandbox — explicit "shared" override!
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13621,6 +13626,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -16106,6 +16112,7 @@ mod file_ops_service {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store
@@ -17092,6 +17099,7 @@ mod heal_stale_agent_sessions {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -18039,6 +18047,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18077,6 +18086,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18194,6 +18204,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18757,6 +18768,7 @@ mod last_activity_events {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -19043,6 +19055,7 @@ mod turn_token_usage {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }

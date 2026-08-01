@@ -2,9 +2,9 @@
 //!
 //! Ports `script-process-manager.ts` so scripts run as real PTYs in the *same*
 //! [`PtyHost`] that backs `terminal.*` — there is no separate process-spawning
-//! path. A script's PTY is workspace-scoped, so it appears in `terminal.list`
-//! and a terminal can read its scrollback via `terminal.getBuffer` (attach to a
-//! running script). `service` scripts auto-restart per the ported backoff
+//! path. Script PTYs are omitted from `terminal.list` because scripts have their
+//! own runtime UI, while their scrollback remains addressable by id and through
+//! `script.output`. `service` scripts auto-restart per the ported backoff
 //! policy; `command` scripts run once. Service output is scanned for a local
 //! dev-server URL, surfaced on the `script:state` event for the `forward.*`
 //! hook. Live output streams as `script:output` (base64 `chunk`).
@@ -1079,6 +1079,7 @@ impl ScriptManager {
         spec.cwd = cwd.clone();
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = SCRUBBED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        spec.listed = false;
         spec
     }
 }
@@ -2008,6 +2009,42 @@ mod tests {
                 }
             }
         }
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+    }
+
+    #[tokio::test]
+    async fn running_script_is_hidden_from_terminal_list_but_output_remains_available() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let terminals = h
+            .services
+            .terminal_list(h.ws.clone())
+            .await
+            .expect("terminal list");
+        assert_eq!(
+            terminals,
+            json!([]),
+            "script PTY must not become a terminal tab"
+        );
+        assert!(
+            h.services
+                .script_output(h.ws.clone(), id.clone(), None, None, None)
+                .await
+                .expect("script output")
+                .is_string(),
+            "hidden PTY output remains available through script.output"
+        );
+
         h.services
             .script_stop(h.ws.clone(), id)
             .await

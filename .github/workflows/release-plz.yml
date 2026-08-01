@@ -11,11 +11,12 @@
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
 #
-# Both jobs run on GitHub-hosted runners, not the self-hosted tinybox
-# slot: every push to main triggers this workflow, and queueing behind the
-# single tinybox slot (shared with CI's heavy jobs) ballooned wall clock to
-# hours (intent-hq/monorepo#1221). See intentd#749/#787 for the runner
-# placement history.
+# Both jobs run on the self-hosted tinybox runners. They were moved to
+# GitHub-hosted runners while tinybox had a single slot: every push to main
+# triggers this workflow, and queueing behind that slot (shared with CI's
+# heavy jobs) ballooned wall clock to hours (intent-hq/monorepo#1221). With
+# 8 tinybox slots the queue-isolation rationale is gone. See
+# intentd#749/#787/#805 for the runner placement history.
 
 name: Release-plz
 
@@ -54,12 +55,12 @@ jobs:
   # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
   # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
   # and the implicit token stays powerless.
-  # A 2x runner is plenty: on ordinary commits this job is a ~15s no-op, and
-  # on Release-PR merges it only does git/tag work (releases are git-tag-only
-  # per release-plz.toml — nothing is compiled or published).
+  # Any tinybox slot is plenty: on ordinary commits this job is a ~15s no-op,
+  # and on Release-PR merges it only does git/tag work (releases are
+  # git-tag-only per release-plz.toml — nothing is compiled or published).
   release-plz-release:
     name: Release-plz release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: ${{ github.repository_owner == 'intent-hq' }}
     steps:
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
@@ -86,12 +87,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-  # Sized like ci.yml's coverage burst runner (gh-linux-16x): this job runs
-  # `cargo package --workspace`, which compiles the whole workspace — closer
-  # to the coverage jobs' full-suite compiles than to check's fmt+clippy.
+  # This job runs `cargo package --workspace`, which compiles the whole
+  # workspace — closer to ci.yml's coverage jobs (which also run on tinybox)
+  # than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
-    runs-on: gh-linux-16x
+    runs-on: [self-hosted, Linux, X64]
     # Run after the release job: on a Release-PR merge commit the tag must be
     # pushed before release-pr computes the next version, or it races on tag
     # visibility and can open a spurious Release PR. On ordinary commits the
@@ -119,10 +120,10 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       # openssl-sys needs the OpenSSL headers (found via pkg-config);
-      # GitHub's ubuntu images preinstall pkg-config and libssl-dev, so this
-      # is normally a no-op — kept as an idempotent guard against image
-      # changes (ci.yml's guard, extended to also cover a missing
-      # pkg-config).
+      # tinybox has pkg-config and libssl-dev installed, so this is normally
+      # a no-op — kept as an idempotent guard (ci.yml's guard, extended to
+      # also cover a missing pkg-config; relies on the runner user's
+      # passwordless sudo, same as ci.yml's self-hosted jobs).
       - name: Install pkg-config/libssl-dev if missing
         run: |
           if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
@@ -146,23 +147,15 @@ jobs:
       # files from disk instead of re-running `cargo package --list`
       # (which fails for internal path-only dependencies).
       #
-      # The dir deliberately coincides with rust-cache's default cache path
-      # (`$GITHUB_WORKSPACE/target`, from its default `workspaces: . ->
-      # target` input): rust-cache derives cached target paths only from
-      # that input — it never reads CARGO_TARGET_DIR — so pointing the
-      # build anywhere else (e.g. runner.temp) would silently skip caching
-      # the build dir. `/target` is gitignored, so it doesn't dirty the
-      # checkout for release-plz's git operations.
-      - name: Set shared cargo target dir
+      # Keep the dir OUTSIDE the runner work dir so it survives checkout's
+      # clean across runs (see ci.yml's `check` job comment), making
+      # Swatinem/rust-cache — which only ephemeral GitHub-hosted runners
+      # needed — pure overhead, so it was dropped. Key it on $RUNNER_NAME:
+      # the tinybox slots share one $HOME, and two slots must never write
+      # to the same target dir concurrently.
+      - name: Set persistent cargo target dir
         shell: bash
-        run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
-      # Cross-run build cache for the `cargo package --workspace` compiles;
-      # without it every run cold-compiles the whole workspace (~30-45 min).
-      # The shared-key follows ci.yml's `gh-burst-*` pattern so ephemeral
-      # GitHub-hosted runners restore the same cache across runs.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: gh-release-plz-pr
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
