@@ -49,10 +49,7 @@ env:
 
 jobs:
   mirror:
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64] when
-    # tinybox is back — see monorepo#1239/#1253 (applies to every job in
-    # this workflow).
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     outputs:
       kind: ${{ steps.validate.outputs.kind }}
@@ -146,8 +143,7 @@ jobs:
   republish-beta:
     needs: mirror
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'beta' || inputs.republish == 'both') }}
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     concurrency:
       group: intentd-beta-manifest-publish
@@ -200,8 +196,7 @@ jobs:
   republish-stable:
     needs: mirror
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'stable' || inputs.republish == 'both') }}
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     concurrency:
       group: intentd-stable-promotion

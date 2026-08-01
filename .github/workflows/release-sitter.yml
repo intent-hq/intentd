@@ -42,10 +42,7 @@ on:
 
 jobs:
   plan:
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64] when
-    # tinybox is back — see monorepo#1239/#1253 (applies to every Linux job
-    # in this workflow).
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -101,13 +98,11 @@ jobs:
             os: [self-hosted, macOS, ARM64, m1mac]
           - target: x86_64-apple-darwin
             os: [self-hosted, macOS, ARM64, m1mac]
-          # TEMPORARY(tinybox offline): the two musl entries revert to
-          # os: [self-hosted, Linux, X64] when tinybox is back.
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: x86_64-pc-windows-msvc
             os: [self-hosted, Windows, X64]
@@ -217,8 +212,7 @@ jobs:
     needs:
       - plan
       - build
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Serialize sitter-latest updates so two tags pushed close together cannot
     # interleave and leave the fixed release with mixed assets.
@@ -296,8 +290,7 @@ jobs:
       - plan
       - publish
       - deb
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     outputs:
       enabled: ${{ steps.mirror.outputs.enabled }}
@@ -376,8 +369,7 @@ jobs:
       - publish
       - mirror
     if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
     # non-fast-forward push.
@@ -442,8 +434,7 @@ jobs:
     needs:
       - plan
       - publish
-    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64].
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     # Own group (not the publish one): asset names are disjoint from the
     # archives, so deb refreshes only need to serialize against themselves.
