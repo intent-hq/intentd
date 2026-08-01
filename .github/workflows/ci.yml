@@ -118,18 +118,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
-      # slots share one $HOME filesystem, and the per-slot persistent target
-      # dirs (see "Point CARGO_TARGET_DIR outside the work dir" below) can
-      # fill it — a full box kills jobs mid-run with ENOSPC while writing
-      # even the runner's own _diag logs. If free space is below the job's
-      # threshold, self-prune stale per-slot ci-target dirs first (mtime
-      # older than 2 days, oldest first, never this job's own dir, never
-      # anything outside $HOME/ci-target — shared caches like ~/.cargo and
-      # ~/.rustup are untouched), then fail with an actionable message if
-      # space is still short. Thresholds: 10 GiB here (small target dir with
-      # debuginfo off), 30 GiB for the instrumented coverage jobs. Exact
-      # no-op on burst runners (step skipped). tinybox-prune.yml does the
-      # routine scheduled pruning; this is only the emergency backstop.
+      # slots share one /raid CI-scratch volume, and the per-slot persistent
+      # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
+      # can fill it — a full volume kills jobs mid-run with ENOSPC. If free
+      # space is below the job's threshold, self-prune stale per-slot
+      # ci-target dirs first (mtime older than 2 days, oldest first, never
+      # this job's own dir, never anything outside /raid/ci-target — shared
+      # caches like ~/.cargo and ~/.rustup are untouched), then fail with an
+      # actionable message if space is still short. Thresholds: 10 GiB here
+      # (small target dir with debuginfo off), 30 GiB for the instrumented
+      # coverage jobs. Exact no-op on burst runners (step skipped).
+      # tinybox-prune.yml does the routine scheduled pruning; this is only
+      # the emergency backstop.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -137,14 +137,14 @@ jobs:
           JOB_TARGET_SUBDIR: check
         run: |
           set -euo pipefail
-          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
           while IFS= read -r entry; do
             dir="${entry#* }"
-            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
@@ -154,10 +154,10 @@ jobs:
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
@@ -172,17 +172,21 @@ jobs:
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
       # the start of every job, and all jobs on this runner share one work
-      # dir. A per-job CARGO_TARGET_DIR under $HOME survives both, which is
+      # dir. A per-job CARGO_TARGET_DIR on /raid survives both, which is
       # what makes builds warm across runs (and why swatinem/rust-cache was
       # dropped: GH cache save/restore would be pure overhead on top of it).
       # The path is also keyed on $RUNNER_NAME: the 8 tinybox runner slots
-      # share one $HOME, and without the key concurrent jobs would serialize
+      # share the box, and without the key concurrent jobs would serialize
       # on cargo's target-dir lock (and the coverage jobs would clobber each
-      # other — see their comments). Trade-off: up to 8 per-slot copies of
-      # each job's target dir; prune $HOME/ci-target if disk gets tight.
+      # other — see their comments). The dirs live on the 300G /raid volume,
+      # off the (much smaller) root volume that holds $HOME — the root
+      # volume reached box-level ENOSPC when they lived there (monorepo#1253).
+      # Trade-off: up to 8 per-slot copies of each job's target dir;
+      # tinybox-prune.yml prunes /raid/ci-target on a schedule and the
+      # preflight above is the emergency backstop.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/check" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -317,14 +321,14 @@ jobs:
           JOB_TARGET_SUBDIR: coverage-e2e
         run: |
           set -euo pipefail
-          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
           while IFS= read -r entry; do
             dir="${entry#* }"
-            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
@@ -334,10 +338,10 @@ jobs:
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -356,7 +360,7 @@ jobs:
       # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/coverage-e2e" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -461,14 +465,14 @@ jobs:
           JOB_TARGET_SUBDIR: coverage-all
         run: |
           set -euo pipefail
-          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
           [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
           echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
           while IFS= read -r entry; do
             dir="${entry#* }"
-            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
@@ -478,10 +482,10 @@ jobs:
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -500,7 +504,7 @@ jobs:
       # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/coverage-all" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
