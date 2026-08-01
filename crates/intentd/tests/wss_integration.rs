@@ -5036,9 +5036,61 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     assert_eq!(lite["messageCount"], 120);
     assert_eq!(lite["lastUserMessage"].as_str(), Some("prompt 118"));
     assert_eq!(lite["lastAgentResponse"].as_str(), Some("reply 119"));
+    assert_eq!(
+        lite["lastMessageRole"].as_str(),
+        Some("assistant"),
+        "newest seeded message is the assistant reply: {lite}"
+    );
     assert!(
         lite.get("messages").is_none(),
         "AgentLite carries no transcript: {lite}"
+    );
+
+    // lastMessageRole on the wire for the awaiting-reply shape: a second
+    // agent whose only message is the user's serves "user"; a fresh agent
+    // with no messages omits the field entirely.
+    let created2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"AwaitingReply"}}}}"#
+        ),
+    )
+    .await;
+    let agent2_id = created2["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent2 id")
+        .to_string();
+    assert!(
+        created2["result"]["agent"].get("lastMessageRole").is_none(),
+        "no messages yet: field omitted: {created2}"
+    );
+    srv.store
+        .append_agent_message(
+            &AgentId::from(agent2_id.as_str()),
+            "user",
+            &json!([{ "type": "text", "text": "no reply yet" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+    let got2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"agent.get","params":{{"agentId":"{agent2_id}","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let lite2 = &got2["result"]["agent"];
+    assert_eq!(
+        lite2["lastMessageRole"].as_str(),
+        Some("user"),
+        "user message with no assistant reply serves \"user\": {lite2}"
+    );
+    assert!(
+        lite2.get("lastAgentResponse").is_none(),
+        "no assistant reply yet: {lite2}"
     );
 
     // agent.get — `{ agent: AgentLite }`, byte-identical to the list entry.
@@ -5200,7 +5252,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         ),
     )
     .await;
-    let lite = &list["result"]["agents"].as_array().expect("agents")[0];
+    let lite = list["result"]["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("seeded agent listed");
     assert_eq!(lite["messageCount"], 120);
     assert_eq!(lite["lastUserMessage"].as_str(), Some("prompt 118"));
     assert_eq!(lite["lastAgentResponse"].as_str(), Some("reply 119"));

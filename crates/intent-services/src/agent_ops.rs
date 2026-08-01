@@ -1112,8 +1112,22 @@ fn is_delegated_background_task_session(session: &AgentSession) -> bool {
 fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
+    let last_role = last_message_role(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(session, count, last_response, last_user, digest)
+    AgentLite::from_session(session, count, last_response, last_user, digest, last_role)
+}
+
+/// Derive `lastMessageRole` from a loaded transcript: the role of the newest
+/// `user`/`assistant` message — system (and any other) rows are transparent.
+/// `None` when no such message exists (the wire field is omitted). The
+/// projection paths serve the same value from the persisted
+/// `agent_session.last_message_role` column (0070).
+fn last_message_role(messages: &[AgentMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| m.role.clone())
 }
 
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
@@ -1143,6 +1157,7 @@ fn project_lite_from_projection(
         last_response,
         last_user,
         digest,
+        projection.last_message_role.clone(),
     )
 }
 
@@ -1366,6 +1381,11 @@ impl Services {
         lite.session_corrupted = session_corrupted;
         if let Some((live_response, live_digest)) = live_overlay {
             if live_response.is_some() {
+                // The in-flight turn has derivable streamed text: the newest
+                // (live) message is the assistant's, so `lastMessageRole`
+                // flips with the response overlay. Pre-first-token the
+                // persisted value (typically "user") is served unchanged.
+                lite.last_message_role = Some("assistant".to_string());
                 lite.last_agent_response = live_response;
             }
             if live_digest.is_some() {
@@ -1935,7 +1955,7 @@ impl Services {
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
         // at their `AgentLite::from_session` defaults (no live runtime state).
-        let lite = AgentLite::from_session(session, 0, None, None, None);
+        let lite = AgentLite::from_session(session, 0, None, None, None, None);
         Ok(json!({ "agent": lite }))
     }
 
