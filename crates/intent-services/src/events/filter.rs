@@ -29,6 +29,34 @@ pub const VALID_EVENT_CATEGORY_WILDCARDS: &[&str] = &[
     "comment:*",
 ];
 
+/// Category wildcards a bare `*` expands to for AGENT subscribers
+/// (monorepo#1229): every entry of [`VALID_EVENT_CATEGORY_WILDCARDS`] except
+/// `agent:*` — agent events are internal for agent callers, who watch other
+/// agents via `ws.agent.watch` instead.
+pub const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
+    "file:*",
+    "task:*",
+    "git:*",
+    "note:*",
+    "terminal:*",
+    "test:*",
+    "build:*",
+    "workspace:*",
+    "spec:*",
+    "goal:*",
+    "comment:*",
+];
+
+/// Whether an event type (or subscription pattern) is off-limits to
+/// agent-owned event subscriptions (monorepo#1229): every `agent:`-prefixed
+/// type — transcript/tool/stream traffic, lifecycle, and the observability
+/// events the original TS hard-excluded as `INTERNAL_OBSERVABILITY_EVENTS` —
+/// plus `chat:stream:delta`, the one high-volume streaming type outside the
+/// `agent:` prefix. The prefix rule also covers the `agent:*` pattern itself.
+pub fn is_agent_restricted_event_type(event_type: &str) -> bool {
+    event_type.starts_with("agent:") || event_type == "chat:stream:delta"
+}
+
 /// Default coalescing window applied when a subscriber requests batching
 /// without a value (TS `options.batchWindow || 500`).
 pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
@@ -52,6 +80,11 @@ pub struct SubscriptionFilter {
     pub workspace_id: Option<String>,
     /// When set, coalesce matched events within this window (`batchWindow`).
     pub batch_window: Option<Duration>,
+    /// When set, events failing [`is_agent_restricted_event_type`] never match
+    /// — the match-time guard for agent-owned subscriptions (monorepo#1229),
+    /// which also narrows rehydrated legacy `agent:*` rows. FE-facing
+    /// subscriptions leave this `false` and keep the full stream.
+    pub exclude_agent_events: bool,
 }
 
 impl SubscriptionFilter {
@@ -98,6 +131,26 @@ pub fn resolve_event_types(event_types: &[String]) -> Vec<String> {
     resolved
 }
 
+/// [`resolve_event_types`] for AGENT subscribers (monorepo#1229): a bare `*`
+/// silently narrows to [`AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS`] (no
+/// `agent:*`); all other entries pass through unchanged — explicit restricted
+/// types are rejected upstream at subscribe time, before resolution.
+pub fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for ev in event_types {
+        if ev == "*" {
+            resolved.extend(
+                AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+        } else {
+            resolved.push(ev.clone());
+        }
+    }
+    resolved
+}
+
 /// Match one event type against one pattern. A `prefix:*` pattern matches any
 /// type starting with `prefix:`; every other pattern is an exact match. Mirrors
 /// the `matchesFilter` rule (`endsWith(":*")` → `startsWith(slice(0,-1))`).
@@ -113,6 +166,9 @@ pub fn event_type_matches(event_type: &str, pattern: &str) -> bool {
 /// Whether `event` satisfies every set criterion of `filter` (AND logic).
 /// Field order and short-circuiting mirror the TS `matchesFilter`.
 pub fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool {
+    if filter.exclude_agent_events && is_agent_restricted_event_type(&event.event_type) {
+        return false;
+    }
     if !filter.event_types.is_empty()
         && !filter
             .event_types
@@ -210,6 +266,73 @@ mod tests {
         assert!(!event_matches(
             &f,
             &event("mcp:notification", None, ActorType::System)
+        ));
+    }
+
+    #[test]
+    fn agent_bare_star_narrows_to_non_agent_categories() {
+        let resolved = resolve_event_types_for_agent(&["*".to_string()]);
+        assert_eq!(resolved, AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS);
+        assert!(!resolved.contains(&"agent:*".to_string()));
+        // Non-star entries pass through unchanged (rejection happens upstream).
+        let passthrough = resolve_event_types_for_agent(&["file:changed".to_string()]);
+        assert_eq!(passthrough, vec!["file:changed".to_string()]);
+    }
+
+    #[test]
+    fn agent_restricted_event_types() {
+        // Every `agent:`-prefixed type (including the pattern itself and the
+        // observability events) plus `chat:stream:delta` is restricted.
+        for t in [
+            "agent:message",
+            "agent:tool:call",
+            "agent:*",
+            "agent:woken-by-subscription",
+            "agent:subscriptions-restored",
+            "chat:stream:delta",
+        ] {
+            assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
+        }
+        for t in ["file:changed", "task:status-changed", "chat:stream"] {
+            assert!(!is_agent_restricted_event_type(t), "{t} must be allowed");
+        }
+    }
+
+    #[test]
+    fn exclude_agent_events_guards_match_time() {
+        // A rehydrated legacy `agent:*` subscription (agent-owned) never
+        // matches agent events or `chat:stream:delta`, but still matches the
+        // other categories it named.
+        let f = SubscriptionFilter {
+            event_types: vec!["agent:*".to_string(), "file:*".to_string()],
+            exclude_agent_events: true,
+            ..Default::default()
+        };
+        assert!(!event_matches(
+            &f,
+            &event("agent:message", Some("a"), ActorType::Agent)
+        ));
+        assert!(!event_matches(
+            &f,
+            &event("agent:tool:call", Some("a"), ActorType::Agent)
+        ));
+        assert!(!event_matches(
+            &f,
+            &event("chat:stream:delta", Some("a"), ActorType::Agent)
+        ));
+        assert!(event_matches(
+            &f,
+            &event("file:changed", Some("a"), ActorType::Agent)
+        ));
+
+        // FE-facing subscriptions (flag unset) keep the full agent stream.
+        let fe = SubscriptionFilter {
+            event_types: vec!["agent:*".to_string()],
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &fe,
+            &event("agent:message", Some("a"), ActorType::Agent)
         ));
     }
 

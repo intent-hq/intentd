@@ -8375,16 +8375,15 @@ mod wsapi4_bindings_tests {
     }
 
     #[tokio::test]
-    async fn event_subscribe_expands_wildcard_star() {
+    async fn event_subscribe_passes_wildcard_star_through() {
+        // The binding no longer expands `*` — the daemon resolves it
+        // per-subscriber (agents get the non-agent categories only,
+        // monorepo#1229), so the wildcard must reach the API verbatim.
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.event.subscribe(['*']);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.event_subscribe_calls.lock().unwrap();
-        let resolved = &calls[0].0;
-        assert!(resolved.contains(&"agent:*".to_string()));
-        assert!(resolved.contains(&"file:*".to_string()));
-        assert!(resolved.contains(&"comment:*".to_string()));
-        assert_eq!(resolved.len(), 12);
+        assert_eq!(calls[0].0, vec!["*".to_string()]);
     }
 
     #[tokio::test]

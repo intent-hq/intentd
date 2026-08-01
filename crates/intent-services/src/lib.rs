@@ -13881,18 +13881,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }
             // Registers the subscription with a live bus delivery task
             // (matching + batching + subscriber wake, monorepo#937); bare `*`
-            // expands to the category wildcards inside registration.
+            // expands to the category wildcards inside registration
+            // (narrowed to the non-agent categories for agent subscribers).
             let (subscription_id, resolved) = self
                 .register_event_subscription(
                     &workspace_id,
@@ -16260,12 +16264,15 @@ impl WorkspaceApi for Services {
             // would match EVERY event (and persist that across restarts).
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }

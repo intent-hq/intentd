@@ -3742,6 +3742,128 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     assert!(matches!(empty, Error::Internal(m) if m == "subscriptionId is required"));
 }
 
+/// Agent-owned subscriptions (monorepo#1229): explicit agent event types are
+/// rejected with `InvalidParams` on BOTH subscribe surfaces, and a bare `*`
+/// silently narrows to the non-agent categories. Front-door (subscriber-less)
+/// subscriptions keep the full stream — the `*` expansion in
+/// [`subscribe_resolves_star_and_unsubscribe_roundtrips`] still contains
+/// `agent:*`.
+#[tokio::test]
+async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
+    let (_tmp, svc, ws) = event_setup().await;
+    // A live subscriber session: the phantom-subscriber guard (monorepo#568)
+    // runs after the event-type guard, so this pins WHICH check fired.
+    let agent = AgentId::from("agent-sub-guard");
+    svc.store()
+        .insert_agent_session(&AgentSession {
+            id: agent.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "sub-guard".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        })
+        .await
+        .expect("insert agent session");
+
+    // Explicit agent-restricted types → InvalidParams pointing at
+    // ws.agent.watch, on `event.subscribe` …
+    for t in ["agent:*", "agent:idle", "chat:stream:delta"] {
+        let err = svc
+            .event_subscribe(
+                ws.clone(),
+                Some(agent.clone()),
+                vec![t.to_string()],
+                None,
+                None,
+            )
+            .await
+            .expect_err("agent-restricted type must be rejected");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("ws.agent.watch")),
+            "{t}: {err:?}"
+        );
+    }
+    // … and on the `agent.subscribe` alias (same guard, shared registration).
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["agent:*".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("alias must reject agent:* too");
+    assert!(
+        matches!(&err, Error::InvalidParams(m) if m.contains("ws.agent.watch")),
+        "alias: {err:?}"
+    );
+
+    // A mixed list is rejected atomically — nothing is registered.
+    let err = svc
+        .event_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["file:*".to_string(), "agent:idle".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("mixed list must be rejected");
+    assert!(matches!(&err, Error::InvalidParams(_)), "mixed: {err:?}");
+    assert!(svc.list_event_subscriptions_for_agent(&agent).is_empty());
+
+    // Bare `*` narrows for agents: no `agent:*`, other categories intact.
+    let sub = svc
+        .event_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["*".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect("bare * subscribe");
+    assert!(
+        !sub.event_types.contains(&"agent:*".to_string()),
+        "agent bare * must not include agent:*: {:?}",
+        sub.event_types
+    );
+    assert!(sub.event_types.contains(&"file:*".to_string()));
+    assert!(sub.event_types.contains(&"task:*".to_string()));
+}
+
 /// camelCase parity fixtures for the change-event envelopes published by CRUD
 /// mutations (M2.6): the wire-serialized [`intent_core::Event`] must carry the
 /// exact field names + payload shapes the iOS client expects (PROTOCOL §6.5).

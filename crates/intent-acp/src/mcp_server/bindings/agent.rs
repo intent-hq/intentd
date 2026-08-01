@@ -372,11 +372,11 @@ async fn subscribe(
     args: &Value,
 ) -> Result<Value, String> {
     let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
-        "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string()
+        "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string()
     })?;
     if event_types.is_empty() {
         return Err(
-            "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+            "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string(),
         );
     }
     let v = api

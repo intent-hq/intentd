@@ -130,10 +130,12 @@ async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &s
 }
 
 /// Subscribe over the wire with a subscriber `agentId`, drive a matching
-/// `agent:*` event from another actor (an `agent.create` emits
-/// `agent:created`), and assert the subscriber is woken with the batched
+/// `note:*` event from another actor (a front-door `note.create` emits
+/// `note:created`), and assert the subscriber is woken with the batched
 /// `[WORKSPACE EVENTS]` message. Then unsubscribe and assert a further
-/// matching event delivers nothing.
+/// matching event delivers nothing. Agent subscribers use non-agent
+/// categories here because `agent:*` is rejected for them (monorepo#1229),
+/// which is asserted separately below.
 #[tokio::test]
 async fn agent_subscribe_delivers_batched_wake_over_wss() {
     let fx = boot().await;
@@ -150,9 +152,9 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
 
     let subscriber = create_agent(&mut rpc, 2, &ws_id, "Watcher").await;
 
-    // Subscribe with the subscriber identity and a short batch window
-    // (PROTOCOL §5.5 request shape + monorepo#937 `agentId`).
-    let sub = wss_rpc(
+    // The guard over the wire (monorepo#1229): an agent-owned subscription to
+    // `agent:*` is rejected with an error pointing at ws.agent.watch.
+    let err = wss_rpc_raw(
         &mut rpc,
         3,
         "agent.subscribe",
@@ -160,26 +162,51 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
             "workspaceId": ws_id,
             "agentId": subscriber,
             "eventTypes": ["agent:*"],
+        }),
+    )
+    .await;
+    let msg = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("ws.agent.watch"),
+        "agent:* must be rejected for agent subscribers: {err}"
+    );
+
+    // Subscribe with the subscriber identity and a short batch window
+    // (PROTOCOL §5.5 request shape + monorepo#937 `agentId`).
+    let sub = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["note:*"],
             "batchWindow": 50,
         }),
     )
     .await;
     let sub_id = sub["subscriptionId"].as_str().expect("subscriptionId");
-    assert_eq!(sub["eventTypes"], json!(["agent:*"]));
+    assert_eq!(sub["eventTypes"], json!(["note:*"]));
 
-    // Another actor's event: creating a second agent publishes
-    // `agent:created` in this workspace, which matches `agent:*` and is not
+    // Another actor's event: a front-door `note.create` publishes
+    // `note:created` in this workspace, which matches `note:*` and is not
     // the subscriber's own actor id.
-    let _other = create_agent(&mut rpc, 4, &ws_id, "Worker").await;
+    wss_rpc(
+        &mut rpc,
+        5,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "N1", "content": "one" }),
+    )
+    .await;
 
     // Await the batched wake landing in the subscriber's conversation.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut req_id = 5;
+    let mut req_id = 6;
     loop {
         let text = conversation_text(&mut rpc, req_id, &ws_id, &subscriber).await;
         req_id += 1;
         if text.contains("WORKSPACE EVENTS") {
-            assert!(text.contains("agent:created"), "wake names the event type");
+            assert!(text.contains("note:created"), "wake names the event type");
             break;
         }
         assert!(
@@ -205,7 +232,13 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     // before the baseline read (review: flake window).
     tokio::time::sleep(Duration::from_millis(400)).await;
     let baseline = conversation_text(&mut rpc, 101, &ws_id, &subscriber).await;
-    let _third = create_agent(&mut rpc, 102, &ws_id, "Worker2").await;
+    wss_rpc(
+        &mut rpc,
+        102,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "N2", "content": "two" }),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     let after = conversation_text(&mut rpc, 103, &ws_id, &subscriber).await;
     assert_eq!(
@@ -353,7 +386,7 @@ async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss
         json!({
             "workspaceId": ws_id,
             "agentId": subscriber,
-            "eventTypes": ["agent:*"],
+            "eventTypes": ["note:*"],
         }),
     )
     .await;
@@ -389,7 +422,7 @@ async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss
         json!({
             "workspaceId": ws_id,
             "agentId": subscriber,
-            "eventTypes": ["agent:*"],
+            "eventTypes": ["note:*"],
         }),
     )
     .await;
