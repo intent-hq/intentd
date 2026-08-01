@@ -55,7 +55,6 @@ async fn parent_rewoken_after_send_to_settled_child() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");

@@ -9,7 +9,9 @@
 //!    silently narrows to the non-agent categories;
 //!  - `ws.agent.watch(agentId)` wakes the watcher on the target's idle,
 //!    blocker (`ws.agent.reportBlocker`), discussion
-//!    (`ws.agent.requestDiscussion`), and terminal failure; `ws.agent.unwatch`
+//!    (`ws.agent.requestDiscussion`), and terminal failure; attention wakes
+//!    never consume the watch, each completion wake retires it (deliver-once;
+//!    the watcher re-arms with another `ws.agent.watch`); `ws.agent.unwatch`
 //!    stops the wakes;
 //!  - a bare-`*` agent subscription never wakes on another agent's
 //!    message/tool-call/idle events but does wake on non-agent categories;
@@ -689,10 +691,11 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
 }
 
 /// WATCH-1 (monorepo#1229): `ws.agent.watch(agentId)` through the real MCP
-/// bridge registers a persistent watch that wakes the watcher on the
-/// target's idle completion, blocker (`ws.agent.reportBlocker`), discussion
-/// (`ws.agent.requestDiscussion`), and terminal failure; `ws.agent.unwatch`
-/// stops the wakes.
+/// bridge registers a watch that wakes the watcher on the target's idle
+/// completion, blocker (`ws.agent.reportBlocker`), discussion
+/// (`ws.agent.requestDiscussion`), and terminal failure. Every completion
+/// wake retires the watch (deliver-once), so the watcher re-arms between
+/// target turns; `ws.agent.unwatch` stops the wakes.
 #[tokio::test]
 async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss() {
     let Some(script) = gate("WSS agent.watch lifecycle E2E") else {
@@ -803,7 +806,8 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         "watch names the target: {text}"
     );
 
-    // 1. Target idle → completion wake ("Child agent … completed").
+    // 1. Target idle → completion wake ("Child agent … completed"), which
+    // retires the watch (deliver-once).
     let sent = wss_rpc(
         &mut setup.rpc,
         30,
@@ -825,11 +829,23 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         text.contains("completed."),
         "idle wake reports the target completed: {text}"
     );
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
 
-    // 2. Blocker → attention wake ("Watched agent … reports a blocker: …").
+    // 2. Re-arm, then blocker → attention wake ("Watched agent … reports a
+    // blocker: …"). The attention wake does not consume the watch; the
+    // trailing idle of the same target turn does.
     let sent = wss_rpc(
         &mut setup.rpc,
         31,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        32,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_BLOCKER }),
     )
@@ -849,10 +865,21 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         "blocker wake carries the reason: {text}"
     );
 
-    // 3. Discussion → attention wake ("… requests a discussion: …").
+    // 3. Re-arm, then discussion → attention wake ("… requests a
+    // discussion: …").
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
     let sent = wss_rpc(
         &mut setup.rpc,
-        32,
+        33,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        34,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_DISCUSS }),
     )
@@ -872,10 +899,21 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         "discussion wake carries the reason: {text}"
     );
 
-    // 4. Unwatch, then a further target completion delivers NO new wake.
+    // 4. Re-arm, unwatch, then a further target completion delivers NO new
+    // wake (unwatch removes the live watch it just re-registered).
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
     let sent = wss_rpc(
         &mut setup.rpc,
-        33,
+        35,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        36,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_UNWATCH }),
     )

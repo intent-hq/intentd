@@ -36,7 +36,8 @@ pub(crate) const MAX_MESSAGE_ID_LEN: usize = 256;
 use crate::agent_subscriptions::CompletionWatch;
 
 /// `waitMode` value that defers the completion watch into an `after_all`
-/// delegation group (AS-4) rather than registering a standalone oneShot here.
+/// delegation group (AS-4) rather than registering a standalone ungrouped
+/// watch here.
 const WAIT_MODE_AFTER_ALL: &str = "after_all";
 
 /// Marker `metadata.source` written on new agents created by
@@ -44,10 +45,6 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 /// consumers (activity feeds, filters) can trace provenance.
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
-/// Auto-cleanup window for the non-oneShot watch registered when
-/// `agent.wakeOrCreate` queues the context message to an active agent
-/// (SUB-1, mirrors the TS 5-minute `setTimeout` unsubscribe leak guard).
-const QUEUED_WATCH_CLEANUP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1599,7 +1596,7 @@ impl Services {
     /// (`isWaitingForOtherAgents` / `waitingForAgentIds`, the same projection
     /// `agent.get` serves) so clients converge on watch-set changes without
     /// polling (PROTOCOL §6.5). Emitted when watches are added (delegate /
-    /// watchCompletion) and when wake delivery removes them (oneShot /
+    /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
     pub(crate) async fn publish_subscriptions_changed(
         &self,
@@ -3451,8 +3448,9 @@ impl Services {
         // Immediate parent wake for non-grouped children: if this child is in an
         // `after_all` delegation group, skip the immediate wake — the group's
         // aggregated wake will fold this report in when all children settle. Otherwise,
-        // deliver the wake NOW unconditionally to the parent, then mark any oneShot
-        // watches to suppress their agent:idle delivery (report-time wake requirement).
+        // deliver the wake NOW unconditionally to the parent, then mark the parent's
+        // ungrouped watches to suppress their agent:idle delivery (report-time wake
+        // requirement).
         let grouped = self.child_in_undelivered_group(&parent, &caller);
         if !grouped {
             // Deliver the wake in the parent's HOME workspace: for a
@@ -3508,7 +3506,7 @@ impl Services {
                 );
             }
 
-            // Mark any oneShot, ungrouped watches whose parent matches this parent as
+            // Mark any ungrouped watches whose parent matches this parent as
             // report_delivered, so deliver_completion_to_watches will skip agent:idle
             // for them (suppressing the duplicate wake). Do NOT mark watches for other
             // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
@@ -3516,7 +3514,7 @@ impl Services {
             let watches = self.find_watches_for_child(&caller);
             for watch in watches
                 .iter()
-                .filter(|w| w.one_shot && w.group_id.is_none() && w.parent_agent_id == parent)
+                .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
             {
                 self.mark_watch_report_delivered(&watch.id);
             }
@@ -4247,7 +4245,8 @@ impl Services {
         // Auto-subscribe the delegating caller to the child's completion (AS-2).
         // Only the MCP front door carries a caller (`parent_agent_id = Some`); the
         // RPC front door (`None`) registers nothing. `after_all` defers to the
-        // delegation-group fan-in (AS-4); `immediate`/default registers a oneShot.
+        // delegation-group fan-in (AS-4); `immediate`/default registers an
+        // ungrouped watch.
         if let Some(parent) = parent_agent_id {
             // Best-effort guard: skip if the parent agent is already deleted
             // (TS `selectIsAgentDeleted`).
@@ -4272,8 +4271,8 @@ impl Services {
                 // and the group creation below is safe from partial state.
                 if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
                     // Enroll the child in the parent's after_all delegation group
-                    // and register a group watch (group_id = Some, not oneShot) so
-                    // the delivery worker routes its completion into the group
+                    // and register a group watch (group_id = Some) so the
+                    // delivery worker routes its completion into the group
                     // fan-in instead of waking the parent immediately (AS-4).
                     let gid = self.get_or_create_delegation_group(&parent_home_ws, &parent);
                     self.enroll_child_in_group(&gid, &child);
@@ -4283,7 +4282,6 @@ impl Services {
                         parent.clone(),
                         parent_name,
                         child,
-                        false,
                         Some(gid),
                     )?;
                 } else {
@@ -4293,7 +4291,6 @@ impl Services {
                         parent.clone(),
                         parent_name,
                         child,
-                        true,
                         None,
                     )?;
                 }
@@ -4508,9 +4505,9 @@ impl Services {
     }
 
     /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion
-    /// (AS-5, the MCP `create_agent` front door): register a oneShot watch,
-    /// mirroring the immediate-mode branch of `agent_delegate_op` above —
-    /// including the deleted-parent guard (TS `selectIsAgentDeleted`).
+    /// (AS-5, the MCP `create_agent` front door): register an ungrouped
+    /// watch, mirroring the immediate-mode branch of `agent_delegate_op`
+    /// above — including the deleted-parent guard (TS `selectIsAgentDeleted`).
     /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_op(
         &self,
@@ -4544,11 +4541,10 @@ impl Services {
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
         let child_ws = child_session.workspace_id;
-        // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
+        // Dedupe: reuse an existing ungrouped watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &parent_agent_id,
             &child_agent_id,
-            true,
             parent_name.clone(),
             resolved_home.as_ref(),
         ) {
@@ -4559,7 +4555,6 @@ impl Services {
                 parent_agent_id.clone(),
                 parent_name.unwrap_or_default(),
                 child_agent_id,
-                true,
                 None,
             )?,
         };
@@ -4571,7 +4566,7 @@ impl Services {
     /// Conditionally auto-subscribe a coordination-message SENDER to the
     /// target's completion (SUB-1, the TS
     /// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`):
-    /// register a oneShot caller→target watch UNLESS the caller is a
+    /// register a caller→target watch UNLESS the caller is a
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
     /// wakeup cards unrelated to their own task — or the caller is a child
@@ -4646,11 +4641,10 @@ impl Services {
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
         let target_ws = target_session.workspace_id;
-        // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
+        // Dedupe: reuse an existing ungrouped watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &caller_agent_id,
             &target_agent_id,
-            true,
             caller_name.clone(),
             resolved_home.as_ref(),
         ) {
@@ -4661,7 +4655,6 @@ impl Services {
                 caller_agent_id.clone(),
                 caller_name.unwrap_or_default(),
                 target_agent_id,
-                true,
                 None,
             )?,
         };
@@ -4670,17 +4663,15 @@ impl Services {
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
-    /// `agent.watch` (monorepo#1229): explicit, PERSISTENT caller→target
-    /// subscription to the target's harness-curated completion set —
-    /// idle/completed, failed, deleted, blocker raised, discussion
-    /// requested. Unlike the auto-registered delegation/SUB-1 watches this
-    /// watch is non-oneShot (it survives each delivery until the target is
-    /// deleted or the caller unwatches) and `wake_on_attention` (the
-    /// attention fan-out in `agent_request_attention_op` wakes it). The
-    /// registration is durably persisted before returning. Fails closed on
-    /// a nonexistent target and rejects self-watching; the shared
-    /// `check_watch_scope` gate rejects cross-workspace targets for
-    /// non-chief callers.
+    /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
+    /// the target's harness-curated completion set — idle/completed, failed,
+    /// deleted, blocker raised, discussion requested. Unlike the
+    /// auto-registered delegation/SUB-1 watches this watch is
+    /// `wake_on_attention` (the attention fan-out in
+    /// `agent_request_attention_op` wakes it). The registration is durably
+    /// persisted before returning. Fails closed on a nonexistent target and
+    /// rejects self-watching; the shared `check_watch_scope` gate rejects
+    /// cross-workspace targets for non-chief callers.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -4782,7 +4773,7 @@ impl Services {
     /// set of existing target agents — the subscription side of
     /// `agent.delegate` without creating children. Reuses the exact same
     /// registration/group helpers as the delegate call sites: `immediate`
-    /// (default) registers a oneShot watch per target; `after_all` enrolls
+    /// (default) registers an ungrouped watch per target; `after_all` enrolls
     /// every target in the caller's open delegation group anchored in the
     /// caller's home workspace (sealed on the caller's idle, one aggregated
     /// wake, restart-safe through the existing group persistence). Targets
@@ -4792,7 +4783,7 @@ impl Services {
     /// leaves no partial group or watches behind.
     ///
     /// Pair uniqueness: as an EXPLICIT registration path, a target the caller
-    /// already watches (oneShot, non-oneShot, or grouped) is rejected with
+    /// already watches (ungrouped or grouped) is rejected with
     /// `-32602` naming the target — run in the same up-front validation loop,
     /// so the rejection is side-effect free. (Auto-subscribe paths silently
     /// adopt the existing watch instead; see `register_completion_watch`.)
@@ -4884,7 +4875,7 @@ impl Services {
             }
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
             // Pair uniqueness: an explicit registration on a child the caller
-            // ALREADY watches (oneShot, non-oneShot, or grouped) is rejected
+            // ALREADY watches (ungrouped or grouped) is rejected
             // up front — before any side-effectful registration — instead of
             // silently adopting the existing watch like the auto-subscribe
             // paths do, so a duplicate wait can never appear on the wire.
@@ -4906,7 +4897,7 @@ impl Services {
         let mut results = Vec::with_capacity(resolved.len());
         if wait_mode == WAIT_MODE_AFTER_ALL {
             // Enroll every target in the caller's open after_all group and
-            // register a grouped watch each (group_id = Some, not oneShot),
+            // register a grouped watch each (group_id = Some),
             // exactly like the delegate after_all branch (AS-4).
             let gid = self.get_or_create_delegation_group(&caller_home_ws, &caller_agent_id);
             for (target, target_name, target_ws) in resolved {
@@ -4922,7 +4913,6 @@ impl Services {
                         caller_agent_id.clone(),
                         caller_name.clone().unwrap_or_default(),
                         target.clone(),
-                        false,
                         Some(gid.clone()),
                     )
                     .await?;
@@ -4935,13 +4925,12 @@ impl Services {
                 }));
             }
         } else {
-            // Immediate: one oneShot watch per target, deduped against a live
-            // ungrouped watch (same reuse path as `agent.watchCompletion`).
+            // Immediate: one ungrouped watch per target, deduped against a
+            // live one (same reuse path as `agent.watchCompletion`).
             for (target, target_name, target_ws) in resolved {
                 let sub_id = match self.find_and_refresh_ungrouped_watch(
                     &caller_agent_id,
                     &target,
-                    true,
                     caller_name.clone(),
                     resolved_home.as_ref(),
                 ) {
@@ -4955,7 +4944,6 @@ impl Services {
                             caller_agent_id.clone(),
                             caller_name.clone().unwrap_or_default(),
                             target.clone(),
-                            true,
                             None,
                         )
                         .await?
@@ -4973,53 +4961,13 @@ impl Services {
         self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
             .await;
         // Reconcile already-settled targets NOW (immediate: fires the fresh
-        // oneShot watch right away; after_all: records the completion in the
+        // watch right away; after_all: records the completion in the
         // still-open group, which fires once it seals on the caller's idle).
         for (target, target_ws) in reconcile_targets {
             self.reconcile_watch_child_on_rehydration(&target, &target_ws)
                 .await;
         }
         Ok(json!({ "ok": true, "waitMode": wait_mode, "results": results }))
-    }
-
-    /// Remove `subscription_id` after `after` elapses (SUB-1 leak guard for
-    /// the non-oneShot queued-message watch — mirrors the TS 5-minute
-    /// `setTimeout` unsubscribe). A watch already removed by delivery is a
-    /// no-op; only a real removal republishes the parent's subscriptions.
-    ///
-    /// SUB-2: repeated arm calls monotonically extend the effective deadline
-    /// via [`Services::bump_watch_cleanup_deadline`]. Each spawned task then
-    /// consults that shared deadline before deleting, so an earlier task
-    /// waking first cannot remove a watch whose deadline was pushed out by a
-    /// later call — the later task (spawned for the new deadline) is the one
-    /// that performs the removal.
-    pub(crate) fn spawn_watch_cleanup(
-        &self,
-        workspace_id: WorkspaceId,
-        parent_agent_id: AgentId,
-        subscription_id: String,
-        after: std::time::Duration,
-    ) -> bool {
-        // Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuM: only arm the cleanup
-        // task when the deadline bump actually landed on a live watch —
-        // otherwise the watch was removed concurrently (e.g. an oneShot
-        // delivery raced this reuse, or a prior cleanup already expired)
-        // and spawning a task that just sleeps and no-ops wastes a
-        // tokio worker slot per repeated wake.
-        let deadline = tokio::time::Instant::now() + after;
-        if !self.bump_watch_cleanup_deadline(&subscription_id, deadline) {
-            return false;
-        }
-        let services = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(after).await;
-            if services.remove_watch_if_deadline_passed(&subscription_id) {
-                services
-                    .publish_subscriptions_changed(&workspace_id, &parent_agent_id)
-                    .await;
-            }
-        });
-        true
     }
 
     /// `agent.getSubscriptions`: live completion-watch payload for `agent_id`
@@ -5067,7 +5015,10 @@ impl Services {
                     // for cross-workspace (chief) ones.
                     "workspaceId": w.parent_workspace_id,
                     "createdAt": w.created_at,
-                    "oneShot": w.one_shot,
+                    // Derived for wire back-compat: every ungrouped watch is
+                    // deliver-once now (the field itself is removed from the
+                    // registry model).
+                    "oneShot": w.group_id.is_none(),
                     "actorIds": [w.child_agent_id],
                     "eventTypes": event_types,
                     "delegationGroup": delegation_group,
@@ -5376,7 +5327,8 @@ impl Services {
                     "eventTypes": event_types,
                     "actorIds": [w.child_agent_id.clone()],
                     "priority": "normal",
-                    "oneShot": w.one_shot,
+                    // Derived for wire back-compat (see agent.getSubscriptions).
+                    "oneShot": w.group_id.is_none(),
                     "delegationGroupId": w.group_id,
                     "orphaned": !session_ids.contains(&w.parent_agent_id.0),
                 })
@@ -6047,34 +5999,19 @@ impl Services {
                 cleaned_up,
             );
             // SUB-1: auto-subscribe the waking caller to the target's
-            // completion (TS `WakeOrCreateTaskAgentTool`). Woke-existing gets
-            // a oneShot watch; a queued context message gets a NON-oneShot
-            // watch (the target's `agent:idle` for its CURRENT turn fires
-            // before the queued message is processed) with a 5-minute
-            // auto-cleanup so the watch never leaks. Response text mirrors
-            // the reference tool, including the notification line.
+            // completion (TS `WakeOrCreateTaskAgentTool`). Response text
+            // mirrors the reference tool, including the notification line.
             //
             // SUB-2: repeated `wakeOrCreate` calls for the same caller/target
             // pair must not stack duplicate watches (which would multiply the
             // parent wakes on the next `agent:idle`). Reuse any existing live
-            // ungrouped watch for this pair; for the queued branch, extend
-            // its 5-minute leak-guard by respawning the cleanup timer against
-            // the reused subscription id.
+            // ungrouped watch for this pair.
             //
             // monorepo#994: skipped entirely for a Deleted caller (see
             // `caller_deleted` at the pre-gate) — the response then keeps the
             // caller-less shape (no `subscriptionId` / `message`), mirroring
             // `agent_delegate_op`'s deleted-parent guard.
             if let Some(caller) = input.caller_agent_id.clone().filter(|_| !caller_deleted) {
-                // SUB-2: only reuse a live ungrouped watch when its
-                // `one_shot` mode matches this call. A queued wake needs a
-                // non-oneShot watch (it must survive the assignee's current
-                // `agent:idle`), so it must never inherit an existing
-                // oneShot watch — and a non-queued wake must not degrade the
-                // registry by re-observing an existing non-oneShot watch as
-                // oneShot. Mismatched modes fall through to a fresh
-                // `register_completion_watch`.
-                let one_shot = !queued;
                 // Resolve the caller's current display name up front so a
                 // fresh watch is registered with it, and a reused watch has
                 // its stored `parent_agent_name` refreshed against the same
@@ -6087,8 +6024,7 @@ impl Services {
                 // resolved name as `Option<String>` so a failed session
                 // lookup does not overwrite an existing watch's stored
                 // `parent_agent_name` with an empty placeholder on the
-                // reuse path. The reuse itself and the paired deadline bump
-                // still proceed; only the fresh-register branch has to
+                // reuse path. Only the fresh-register branch has to
                 // materialize a name, and there `""` matches the pre-fix
                 // behaviour for a brand-new watch.
                 // monorepo#932: `caller_session` is the single lookup the
@@ -6110,15 +6046,13 @@ impl Services {
                 // ungrouped watch is found, its `parent_agent_name` is
                 // refreshed under the same lock when a fresh name was
                 // resolved; otherwise we fall through to registering a fresh
-                // watch. This closes the race where a concurrent oneShot
-                // delivery or expired cleanup task removed the watch between
-                // a prior find and refresh, which would otherwise leave the
-                // caller subscribed to a dead id.
+                // watch. This closes the race where a concurrent delivery
+                // removed the watch between a prior find and refresh, which
+                // would otherwise leave the caller subscribed to a dead id.
                 let (subscription_id, reused) = if let Some(existing_id) = self
                     .find_and_refresh_ungrouped_watch(
                         &caller,
                         &agent_id,
-                        one_shot,
                         caller_name.clone(),
                         resolved_home.as_ref(),
                     ) {
@@ -6130,7 +6064,6 @@ impl Services {
                         caller.clone(),
                         caller_name.unwrap_or_default(),
                         agent_id.clone(),
-                        one_shot,
                         None,
                     )?;
                     (new_id, false)
@@ -6138,14 +6071,6 @@ impl Services {
                 if !reused {
                     self.publish_subscriptions_changed(&caller_home_ws, &caller)
                         .await;
-                }
-                if queued {
-                    self.spawn_watch_cleanup(
-                        caller_home_ws.clone(),
-                        caller,
-                        subscription_id.clone(),
-                        QUEUED_WATCH_CLEANUP,
-                    );
                 }
                 let message = if queued {
                     format!(
@@ -6303,9 +6228,9 @@ impl Services {
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
         // child id was freshly minted this call, so no live watch can exist
-        // for the pair — always a fresh oneShot registration (no SUB-2 reuse
-        // and no queued leak-guard: a brand-new agent has no in-flight turn
-        // for the context message to queue behind).
+        // for the pair — always a fresh registration (no SUB-2 reuse: a
+        // brand-new agent has no in-flight turn for the context message to
+        // queue behind).
         //
         // monorepo#994: skipped entirely for a Deleted caller (see
         // `caller_deleted` at the pre-gate), mirroring `agent_delegate_op`'s
@@ -6329,7 +6254,6 @@ impl Services {
                 caller.clone(),
                 caller_name,
                 agent.clone(),
-                true,
                 None,
             )?;
             self.publish_subscriptions_changed(&caller_home_ws, &caller)
@@ -7383,7 +7307,7 @@ fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
 
 /// Best-effort human description mirroring TS `describeAgentSubscription`:
 /// `"<parent>: <n event types>, from <child>[, delegation group <id> (await all,
-/// k expected)][, one-shot]"`. Exact wording is not asserted.
+/// k expected)]"`. Exact wording is not asserted.
 fn describe_subscription(
     watch: &CompletionWatch,
     event_types: &[&str],
@@ -7401,9 +7325,6 @@ fn describe_subscription(
         desc.push_str(&format!(
             ", delegation group {group_id} (await all, {expected} expected)"
         ));
-    }
-    if watch.one_shot {
-        desc.push_str(", one-shot");
     }
     desc
 }
@@ -7590,7 +7511,6 @@ impl Services {
                         parent,
                         parent_name,
                         agent_id.clone(),
-                        false,
                         Some(gid),
                     )
                     .map(|_| ())
@@ -7599,7 +7519,6 @@ impl Services {
                     match self.find_and_refresh_ungrouped_watch(
                         &parent,
                         agent_id,
-                        true,
                         Some(parent_name.clone()),
                         resolved_home.as_ref(),
                     ) {
@@ -7611,7 +7530,6 @@ impl Services {
                                 parent,
                                 parent_name,
                                 agent_id.clone(),
-                                true,
                                 None,
                             )
                             .map(|_| ()),
