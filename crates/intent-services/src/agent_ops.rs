@@ -1924,6 +1924,7 @@ impl Services {
             is_background,
             metadata,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             created_at: now.clone(),
             updated_at: now,
