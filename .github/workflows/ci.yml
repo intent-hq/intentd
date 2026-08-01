@@ -116,9 +116,50 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
-      # this job's target dir stays small, and tinybox has ~380G free.
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
+      # slots share one $HOME filesystem, and the per-slot persistent target
+      # dirs (see "Point CARGO_TARGET_DIR outside the work dir" below) can
+      # fill it — a full box kills jobs mid-run with ENOSPC while writing
+      # even the runner's own _diag logs. If free space is below the job's
+      # threshold, self-prune stale per-slot ci-target dirs first (mtime
+      # older than 2 days, oldest first, never this job's own dir, never
+      # anything outside $HOME/ci-target — shared caches like ~/.cargo and
+      # ~/.rustup are untouched), then fail with an actionable message if
+      # space is still short. Thresholds: 10 GiB here (small target dir with
+      # debuginfo off), 30 GiB for the instrumented coverage jobs. Exact
+      # no-op on burst runners (step skipped). tinybox-prune.yml does the
+      # routine scheduled pruning; this is only the emergency backstop.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 10
+          JOB_TARGET_SUBDIR: check
+        run: |
+          set -euo pipefail
+          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
       # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
       # relies on the runner user's passwordless sudo.
@@ -266,6 +307,39 @@ jobs:
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 30
+          JOB_TARGET_SUBDIR: coverage-e2e
+        run: |
+          set -euo pipefail
+          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
@@ -377,6 +451,39 @@ jobs:
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 30
+          JOB_TARGET_SUBDIR: coverage-all
+        run: |
+          set -euo pipefail
+          own_dir="$HOME/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on \$HOME: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |

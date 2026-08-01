@@ -1,0 +1,118 @@
+# Scheduled prune of stale CI artifacts on tinybox's shared $HOME
+# (monorepo#1253).
+#
+# The 8 tinybox runner slots share one $HOME filesystem, and ci.yml keeps
+# per-slot persistent CARGO_TARGET_DIRs under ~/ci-target ("prune
+# $HOME/ci-target if disk gets tight" — this workflow is that pruning, made
+# automatic). Up to 8 multi-GiB copies per job flavor accumulate, plus
+# smaller per-slot tool dirs, and the box has reached box-level ENOSPC
+# (killed jobs mid-run). Deletion here is age-based (mtime), oldest first,
+# and strictly path-allowlisted:
+#   ~/ci-target/*/*/*      per-slot cargo target dirs — stale > 7 days,
+#                          tightened to > 2 days while free space < 100 GiB
+#   ~/ci-install-action/*  per-slot install-action HOMEs — stale > 7 days
+#   ~/setup-pnpm-*         per-slot pnpm dests — stale > 7 days
+#   ~/.install-action      legacy shared install-action dir — stale > 7 days
+# Shared caches (~/.cargo registry, ~/.rustup toolchains) are never touched.
+# An entry is only deleted when nothing inside it was modified within the
+# window (recursive mtime check), so a running job's target dir is never
+# deleted — ci.yml's fail-fast preflight is the emergency backstop between
+# these daily runs. The run log doubles as a disk report (df + per-entry
+# size/age table). No sudo anywhere.
+name: Tinybox prune
+
+on:
+  schedule:
+    # Daily at 11:30 UTC ≈ 03:30/04:30 Pacific — a quiet hour for the box.
+    - cron: "30 11 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what would be deleted without deleting anything
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Two prune runs must never overlap (the second would race the first's
+# deletions and mtime checks); never cancel a prune mid-deletion either.
+concurrency:
+  group: tinybox-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    # Repo-variable gate: set TINYBOX_ONLINE to 'false' while the box is down
+    # so the daily run skips instead of queueing-and-expiring on the offline
+    # runner; clear it (or set anything else) when tinybox returns. Unset
+    # counts as online.
+    if: vars.TINYBOX_ONLINE != 'false'
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+    steps:
+      - name: Disk report (before)
+        run: |
+          set -euo pipefail
+          df -h "$HOME"
+          echo
+          echo "ci-target entries (size / age-days / path):"
+          now=$(date +%s)
+          # This report is informational: `|| true` keeps a missing
+          # ~/ci-target or a dir vanishing mid-report (concurrent cleanup)
+          # from failing the workflow under pipefail before pruning runs.
+          { find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | while IFS= read -r entry; do
+            ts="${entry%% *}"; dir="${entry#* }"
+            printf '%8s %4sd %s\n' "$(du -sh "$dir" 2>/dev/null | cut -f1 || true)" "$(( (now - ${ts%.*}) / 86400 ))" "$dir"
+          done
+          echo
+          echo "tool dirs:"
+          du -sh "$HOME/ci-install-action" "$HOME"/setup-pnpm-* "$HOME/.install-action" 2>/dev/null || true
+      - name: Prune stale CI dirs
+        env:
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          set -euo pipefail
+          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          remove() {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would delete: $1"
+            else
+              echo "deleting: $1"
+              rm -rf -- "$1"
+            fi
+          }
+          # Fresh = anything inside modified within $2 days. A running job
+          # keeps its target dir fresh, so fresh entries are never deleted.
+          # -mmin gives a strict N*24h window (-mtime rounds to whole days);
+          # `|| true` keeps a dir vanishing mid-check from failing the run.
+          is_fresh() { [ -n "$(find "$1" -mmin -"$(( $2 * 1440 ))" -print -quit 2>/dev/null || true)" ]; }
+          # Stale per-slot target dirs at exactly ~/ci-target/<repo>/<slot>/<job>,
+          # oldest first; the case guard re-asserts the allowlist.
+          prune_targets() {
+            local days="$1"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+              is_fresh "$dir" "$days" && continue
+              remove "$dir"
+            done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          }
+          echo "free before: $(free_gib) GiB"
+          prune_targets 7
+          # Comfort target: with < 100 GiB free the next day's coverage jobs
+          # could still crowd the box, so tighten the window to 2 days.
+          if [ "$(free_gib)" -lt 100 ]; then
+            echo "free space < 100 GiB after 7-day pass — tightening to 2 days"
+            prune_targets 2
+          fi
+          # Small per-slot / legacy tool dirs (recreated on demand by their
+          # actions): 7-day window, same recursive freshness rule.
+          for d in "$HOME/ci-install-action"/* "$HOME"/setup-pnpm-* "$HOME/.install-action"; do
+            [ -e "$d" ] || continue
+            is_fresh "$d" 7 && continue
+            remove "$d"
+          done
+          echo "free after: $(free_gib) GiB (dry_run=$DRY_RUN)"
+      - name: Disk report (after)
+        run: df -h "$HOME"
