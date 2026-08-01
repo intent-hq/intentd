@@ -35,6 +35,9 @@ on:
 
 permissions:
   contents: write
+  # The notifier script reads squash-merged PR bodies on this repo via
+  # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
+  pull-requests: read
 
 # Never cancel a promotion in progress
 concurrency:

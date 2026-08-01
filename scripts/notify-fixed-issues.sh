@@ -16,8 +16,9 @@
 # without posting (ISSUES_GH_TOKEN is then optional and the marker check is
 # best-effort).
 #
-# This script is best-effort by design: callers (publish-channel-manifest.yml)
-# run it fail-soft so a notification failure never blocks a release.
+# This script is best-effort by design: callers (publish-channel-manifest.yml,
+# promote-stable.yml) run it fail-soft so a notification failure never blocks
+# a release or promotion.
 # Requires: git (a checkout with full history for the range) and gh
 # (authenticated via GH_TOKEN for the SOURCE_REPO PR-body reads).
 #
@@ -71,6 +72,11 @@ if [[ "$DRY_RUN" == false && -z "$ISSUES_GH_TOKEN" ]]; then
   exit 1
 fi
 for ref in "$FROM_REF" "$TO_REF"; do
+  if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    # Deliberately not echoing the raw ref: it is unvalidated (log injection).
+    echo "error: from-ref/to-ref must match ^[A-Za-z0-9._/-]+\$" >&2
+    exit 1
+  fi
   if ! git rev-parse -q --verify "${ref}^{commit}" >/dev/null; then
     echo "error: ref not found in this checkout: $ref" >&2
     exit 1

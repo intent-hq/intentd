@@ -35,6 +35,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # The notifier script reads squash-merged PR bodies on this repo via
+      # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
+      pull-requests: read
     # Serialize beta.json updates so two tags pushed close together cannot
     # interleave and leave the manifest pointing at the older release.
     concurrency:
