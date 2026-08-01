@@ -148,11 +148,13 @@ jobs:
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
-            [ -n "$(find "$dir" -mtime -2 -print -quit 2>/dev/null)" ] && continue
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mtime +2 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
             echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
@@ -326,11 +328,13 @@ jobs:
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
-            [ -n "$(find "$dir" -mtime -2 -print -quit 2>/dev/null)" ] && continue
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mtime +2 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
             echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
@@ -468,11 +472,13 @@ jobs:
             [ "$dir" = "$own_dir" ] && continue
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
-            [ -n "$(find "$dir" -mtime -2 -print -quit 2>/dev/null)" ] && continue
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
-          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mtime +2 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
             echo "::error::tinybox \$HOME has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
