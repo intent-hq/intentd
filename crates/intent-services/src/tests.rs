@@ -19797,11 +19797,11 @@ mod display_status {
     #[test]
     fn no_prs_no_tasks_is_idle() {
         assert_eq!(
-            compute_display_status(false, None, &[], None, None),
+            compute_display_status(false, false, None, &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(0, 0, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(0, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -19811,19 +19811,19 @@ mod display_status {
         // The base rollup is in_progress / not_started, but without a
         // running agent the task-stage statuses demote to idle.
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 1))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 1))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 1, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 1, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19832,23 +19832,59 @@ mod display_status {
     fn running_agent_promotes_to_in_progress_unconditionally() {
         // A live agent wins over every PR/task rollup.
         assert_eq!(
-            compute_display_status(true, None, &[], None, None),
+            compute_display_status(false, true, None, &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(true, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(false, true, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::InProgress
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(true, Some(&ready), &[], None, None),
+            compute_display_status(false, true, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(true, Some(&merged), &[], None, None),
+            compute_display_status(false, true, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn needs_attention_wins_over_everything() {
+        // Step 0: the needs-attention signal outranks a running agent, every
+        // PR stage, and every task rollup.
+        assert_eq!(
+            compute_display_status(true, false, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(true, true, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(true, false, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(true, true, Some(&merged), &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(
+                true,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::NeedsAttention
         );
     }
 
@@ -19859,16 +19895,16 @@ mod display_status {
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&ready), &[], None, None),
+            compute_display_status(false, false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::PrReady
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, None),
+            compute_display_status(false, false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19878,7 +19914,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
+            compute_display_status(false, false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19887,20 +19923,20 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&open), &[], None, None),
+            compute_display_status(false, false, Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&draft), &[], None, None),
+            compute_display_status(false, false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&flagged), &[], None, None),
+            compute_display_status(false, false, Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19913,6 +19949,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
                 None,
@@ -19922,6 +19959,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
@@ -19938,14 +19976,28 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &list,
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &list,
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19957,7 +20009,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(false, None, &list, None, None),
+            compute_display_status(false, false, None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19966,11 +20018,18 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &[],
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, None),
+            compute_display_status(false, false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19981,7 +20040,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(false, None, &list, None, None),
+            compute_display_status(false, false, None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19990,11 +20049,18 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&closed), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&closed),
+                &[],
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(false, Some(&closed), &[], None, None),
+            compute_display_status(false, false, Some(&closed), &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -20002,11 +20068,18 @@ mod display_status {
     #[test]
     fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Open), None),
+            compute_display_status(false, false, None, &[], Some(PullRequestStatus::Open), None),
             WorkspaceDisplayStatus::PrOpen
         );
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Draft), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                None
+            ),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -20018,6 +20091,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -20028,6 +20102,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -20037,6 +20112,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 None,
                 &[],
@@ -20052,6 +20128,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Merged),
@@ -20060,7 +20137,14 @@ mod display_status {
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Merged), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                None
+            ),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -20071,6 +20155,7 @@ mod display_status {
         // the task-stage status reads as idle.
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 None,
                 &[],
@@ -20088,6 +20173,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 Some(&ready),
                 &[],
                 Some(PullRequestStatus::Merged),
@@ -20097,9 +20183,208 @@ mod display_status {
         );
         let list = vec![ready];
         assert_eq!(
-            compute_display_status(false, None, &list, Some(PullRequestStatus::Merged), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &list,
+                Some(PullRequestStatus::Merged),
+                None
+            ),
             WorkspaceDisplayStatus::PrReady
         );
+    }
+}
+
+/// Per-workspace needs-attention signal (`Services::workspace_needs_attention`,
+/// PROTOCOL §6.5): true iff a **top-level** session (no parent, not
+/// background, not deleted) carries a pending attention request or pending
+/// structured questions; child/background/deleted sessions never count.
+mod workspace_needs_attention {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::json;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    pub(super) fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Waiting,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// Assistant content carrying one structured-question resource block
+    /// (the shape `has_question_blocks` matches).
+    pub(super) fn question_content() -> serde_json::Value {
+        json!([{
+            "type": "resource",
+            "resource": {
+                "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+                "uri": "question://q-1",
+                "text": "{\"questions\":[]}"
+            }
+        }])
+    }
+
+    async fn setup() -> (Services, WorkspaceId, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (Services::new(store), ws, tmp)
+    }
+
+    #[tokio::test]
+    async fn no_sessions_is_false() {
+        let (svc, ws, _tmp) = setup().await;
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn plain_top_level_session_is_false() {
+        let (svc, ws, _tmp) = setup().await;
+        svc.store
+            .insert_agent_session(&mk_session(&ws, "agent-plain"))
+            .await
+            .unwrap();
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn top_level_attention_request_is_true() {
+        let (svc, ws, _tmp) = setup().await;
+        for kind in ["discussion", "blocker"] {
+            let mut s = mk_session(&ws, &format!("agent-{kind}"));
+            s.attention_request_kind = Some(kind.to_string());
+            svc.store.insert_agent_session(&s).await.unwrap();
+        }
+        assert!(svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn delegated_background_or_deleted_sessions_never_count() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut child = mk_session(&ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-parent"));
+        child.attention_request_kind = Some("blocker".to_string());
+        svc.store.insert_agent_session(&child).await.unwrap();
+
+        let mut background = mk_session(&ws, "agent-bg");
+        background.is_background = true;
+        background.attention_request_kind = Some("discussion".to_string());
+        svc.store.insert_agent_session(&background).await.unwrap();
+
+        let mut deleted = mk_session(&ws, "agent-deleted");
+        deleted.status = AgentStatus::Deleted;
+        deleted.attention_request_kind = Some("discussion".to_string());
+        svc.store.insert_agent_session(&deleted).await.unwrap();
+
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn pending_questions_on_top_level_session_is_true() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-q");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        svc.store
+            .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        assert!(svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn superseded_or_dismissed_questions_are_false() {
+        let (svc, ws, _tmp) = setup().await;
+
+        // A user reply after the question row supersedes the hold.
+        let answered = mk_session(&ws, "agent-answered");
+        svc.store.insert_agent_session(&answered).await.unwrap();
+        svc.store
+            .append_agent_message(&answered.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        svc.store
+            .append_agent_message(
+                &answered.id,
+                "user",
+                &json!([{ "type": "text", "text": "answer" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+
+        // A persisted dismissal marker for the question message id.
+        let dismissed = mk_session(&ws, "agent-dismissed");
+        svc.store.insert_agent_session(&dismissed).await.unwrap();
+        let msg = svc
+            .store
+            .append_agent_message(&dismissed.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        let mut updated = dismissed.clone();
+        updated.metadata = Some(json!({
+            (intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY): msg.id
+        }));
+        svc.store.update_agent_session(&ws, &updated).await.unwrap();
+
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    /// A store read failure fails open to `false` (list/get emission must
+    /// never be wedged by the attention probe).
+    #[tokio::test]
+    async fn store_read_failure_fails_open_to_false() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut s = mk_session(&ws, "agent-attn");
+        s.attention_request_kind = Some("blocker".to_string());
+        svc.store.insert_agent_session(&s).await.unwrap();
+        assert!(svc.workspace_needs_attention(&ws).await);
+
+        // Force list_agent_session_summaries to fail.
+        sqlx::query("DROP TABLE agent_session")
+            .execute(svc.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(!svc.workspace_needs_attention(&ws).await);
     }
 }
 
@@ -20424,6 +20709,137 @@ mod display_status_events {
         assert!(
             !seeded,
             "cache must not be seeded from a stats-free compute"
+        );
+    }
+
+    /// Attention raise/retire triggers (§6.5 step 0): a top-level
+    /// `agent.requestAttention` raise promotes the derived rollup to
+    /// `needs_attention` and emits; the turn-begin clear
+    /// (`clear_attention_request_if_present`) retires it and emits the
+    /// demotion.
+    #[tokio::test]
+    async fn attention_raise_and_retire_transitions_emit() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-attn");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_request_attention_op(
+                h.ws.clone(),
+                "discussion".to_string(),
+                "need user input".to_string(),
+                Some(session.id.clone()),
+            )
+            .await
+            .expect("raise attention");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+
+        // Retire via the runtime's turn-begin clear hook.
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        manager
+            .clear_attention_request_if_present(&session.id, &h.ws)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
+    /// persisting the dismissal marker retires the question hold and emits the
+    /// needs_attention → idle demotion.
+    #[tokio::test]
+    async fn question_dismiss_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let msg = h
+            .store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &super::workspace_needs_attention::question_content(),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        // Seed: the pending question makes the baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_dismiss_questions_op(h.ws.clone(), session.id.clone(), msg.id)
+            .await
+            .expect("dismiss questions");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
+    /// the persisted user row supersedes the pending question tail
+    /// (store-only `agent.sendMessage` path) and emits the demotion.
+    #[tokio::test]
+    async fn user_answer_retires_question_hold_and_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q2");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &super::workspace_needs_attention::question_content(),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_send_message_op(
+                session.id.clone(),
+                "here is my answer".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("send answer");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
     }
 }

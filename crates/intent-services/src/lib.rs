@@ -1052,6 +1052,7 @@ impl Services {
             // before enrichment) so a single response can never pair
             // `activity: "agent_running"` with `displayStatus: "idle"`.
             let display_status = compute_display_status(
+                self.workspace_needs_attention(&ws.id).await,
                 ws.activity == WorkspaceActivity::AgentRunning,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
@@ -1100,7 +1101,9 @@ impl Services {
             return;
         };
         let task_stats = compute_task_stats(&notes);
+        let needs_attention = self.workspace_needs_attention(workspace_id).await;
         let status = compute_display_status(
+            needs_attention,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
@@ -1121,6 +1124,41 @@ impl Services {
             )
             .await;
         }
+    }
+
+    /// Whether any **top-level** agent in the workspace is waiting on the
+    /// user (PROTOCOL §6.5, `needs_attention`): a session with no
+    /// `parent_agent_id`, not background, and not deleted, that either
+    /// carries a pending attention request (`attention_request_kind` —
+    /// `discussion`/`blocker`) or has pending structured questions
+    /// ([`Services::question_hold_active`]). Child/background sessions never
+    /// count — their attention surface is the parent/subscriber (attention
+    /// -retire taxonomy). The cheap metadata check runs over every candidate
+    /// first, so transcript tail reads only happen when no session already
+    /// flagged via an attention request. Best-effort: a store read failure
+    /// fails open to `false` (and `question_hold_active` fails open itself)
+    /// so list/get emission is never wedged.
+    pub(crate) async fn workspace_needs_attention(&self, workspace_id: &WorkspaceId) -> bool {
+        let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
+            return false;
+        };
+        let top_level: Vec<_> = sessions
+            .iter()
+            .filter(|s| {
+                s.parent_agent_id.is_none()
+                    && !s.is_background
+                    && s.status != intent_core::AgentStatus::Deleted
+            })
+            .collect();
+        if top_level.iter().any(|s| s.attention_request_kind.is_some()) {
+            return true;
+        }
+        for session in top_level {
+            if self.question_hold_active(&session.id).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -4272,34 +4310,42 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 
 /// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
 /// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
-/// in live agent activity (previously a client-side overlay):
-/// 0. `agent_running` → `in_progress` unconditionally: a live agent always
-///    reads as active work, whatever the PR/task rollup says.
-/// 1. Active PR — the linked `activePullRequest` when open/draft, else the
+/// in live agent activity (previously a client-side overlay) and the
+/// per-workspace needs-attention signal:
+/// 0. `needs_attention` → `needs_attention` unconditionally: a top-level
+///    agent waiting on the user outranks everything, including a running
+///    agent ([`Services::workspace_needs_attention`]).
+/// 1. `agent_running` → `in_progress`: a live agent always reads as active
+///    work, whatever the PR/task rollup says.
+/// 2. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
 ///    When neither carries an open/draft entry but the workspace `prStatus`
 ///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
 ///    and yields `pr_open` (never `pr_ready`: the column carries no
 ///    mergeable info).
-/// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
+/// 3. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged — or
+/// 4. Latest PR (linked, else most recently updated entry) merged — or
 ///    `prStatus == Merged` — → `pr_merged`.
-/// 4. All tasks complete → `complete`; else `not_started`.
-/// 5. Without a running agent, a task-stage rollup (`in_progress` /
-///    `not_started` from steps 2/4) demotes to `idle`; the PR stages and
+/// 5. All tasks complete → `complete`; else `not_started`.
+/// 6. Without a running agent, a task-stage rollup (`in_progress` /
+///    `not_started` from steps 3/5) demotes to `idle`; the PR stages and
 ///    `complete` pass through unchanged.
 ///
-/// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 2 precedes the merged check).
+/// A merged PR in history never masks an open PR (step 2 scans `pullRequests`
+/// for open/draft entries) or open tasks (step 3 precedes the merged check).
 fn compute_display_status(
+    needs_attention: bool,
     agent_running: bool,
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
+    if needs_attention {
+        return WorkspaceDisplayStatus::NeedsAttention;
+    }
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
@@ -4311,8 +4357,9 @@ fn compute_display_status(
     }
 }
 
-/// PR/task-only precedence behind [`compute_display_status`] (steps 1–4);
-/// the caller applies the agent-activity promotion/demotion around it.
+/// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
+/// the caller applies the attention/agent-activity promotion/demotion
+/// around it.
 fn compute_base_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
@@ -8835,6 +8882,7 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 if ws.task_stats.is_some() {
                     let display_status = compute_display_status(
+                        this.workspace_needs_attention(&ws.id).await,
                         ws.activity == WorkspaceActivity::AgentRunning,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),

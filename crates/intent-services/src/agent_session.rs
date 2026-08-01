@@ -1441,6 +1441,14 @@ impl Services {
             self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
         }
+        // The new assistant tail moves the question-hold derivation (§6.5
+        // step 0): a trailing question resource block RAISES the workspace's
+        // needs_attention displayStatus; a question-free tail after a prior
+        // question message RETIRES it. Recompute-and-compare (transition-only
+        // emission inside) so steady-state question-free turns stay silent.
+        if message_persisted {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
@@ -1752,6 +1760,11 @@ impl Services {
             }
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
+        }
+        // Same §6.5 step-0 recompute as the prompt-turn persist: the new
+        // assistant tail moves the question-hold derivation either way.
+        if message_persisted {
+            self.maybe_emit_display_status_changed(workspace_id).await;
         }
         self.clear_live_turn(agent_id);
         let mut end_data = json!({ "agentId": agent_id.0 });
