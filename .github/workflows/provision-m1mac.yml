@@ -1,0 +1,109 @@
+name: Provision m1mac
+
+# Installs the gh CLI on the m1mac self-hosted runner and persists it on
+# PATH for all future jobs via the runner-root `.path` file (read by the
+# actions runner at the start of every job). Idempotent: re-dispatching
+# upgrades gh to the latest release, or no-ops when already current.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  provision:
+    name: Install gh CLI (m1mac)
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    timeout-minutes: 15
+    steps:
+      - name: Resolve latest gh release
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "::error::Expected arm64 runner, got $(uname -m)"
+            exit 1
+          fi
+          # The /releases/latest URL redirects to /releases/tag/vX.Y.Z;
+          # read the tag off the final URL (no API rate limits, no JSON).
+          final_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+            https://github.com/cli/cli/releases/latest)
+          tag="${final_url##*/}"
+          version="${tag#v}"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not resolve gh version from $final_url"; exit 1 ;;
+          esac
+          echo "Latest gh release: $tag"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install gh into ~/.local/bin (checksum-verified)
+        env:
+          GH_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          dest="$HOME/.local/bin"
+          if [ -x "$dest/gh" ]; then
+            current=$("$dest/gh" --version | head -n 1 | awk '{print $3}')
+            if [ "$current" = "$GH_VERSION" ]; then
+              echo "gh $current already installed at $dest/gh; nothing to install"
+              exit 0
+            fi
+            echo "Upgrading gh $current -> $GH_VERSION"
+          fi
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cd "$tmp"
+          asset="gh_${GH_VERSION}_macOS_arm64.zip"
+          base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
+          curl -fsSLO "$base/$asset"
+          curl -fsSLO "$base/gh_${GH_VERSION}_checksums.txt"
+          grep " ${asset}\$" "gh_${GH_VERSION}_checksums.txt" | shasum -a 256 -c -
+          ditto -x -k "$asset" extracted
+          mkdir -p "$dest"
+          install -m 0755 "extracted/gh_${GH_VERSION}_macOS_arm64/bin/gh" "$dest/gh"
+          echo "Installed: $("$dest/gh" --version | head -n 1)"
+
+      - name: Persist ~/.local/bin on PATH via runner .path file
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP is <runner-root>/_work/_temp; walk up two levels
+          # and confirm it really is the runner root before writing.
+          runner_root=$(cd "$RUNNER_TEMP/../.." && pwd)
+          if [ ! -f "$runner_root/.runner" ] && [ ! -f "$runner_root/run.sh" ]; then
+            echo "::error::$runner_root (from RUNNER_TEMP=$RUNNER_TEMP) does not look like a runner root"
+            exit 1
+          fi
+          path_file="$runner_root/.path"
+          dest="$HOME/.local/bin"
+          # The runner replaces the job PATH with the .path file contents
+          # at the start of every job, so the file must hold a full PATH
+          # string, not just our directory.
+          if [ -f "$path_file" ]; then
+            existing=$(cat "$path_file")
+            case ":$existing:" in
+              *":$dest:"*) echo "$path_file already contains $dest" ;;
+              *) printf '%s\n' "$dest:$existing" > "$path_file"
+                 echo "Prepended $dest to existing $path_file" ;;
+            esac
+          else
+            printf '%s\n' "$dest:$PATH" > "$path_file"
+            echo "Created $path_file from current job PATH"
+          fi
+          echo "== $path_file =="
+          cat "$path_file"
+
+  # Runs as a separate job so the runner re-reads the .path file at job
+  # start — exactly what every future job on this runner will do. Passing
+  # here proves persistence; no PATH manipulation happens in this job.
+  verify:
+    name: Verify gh on PATH (fresh job)
+    needs: provision
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    timeout-minutes: 5
+    steps:
+      - name: gh resolves without any PATH setup
+        run: |
+          set -euo pipefail
+          command -v gh
+          gh --version
