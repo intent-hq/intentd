@@ -39,6 +39,16 @@
     channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
     rustup toolchain install "$channel" --profile minimal --no-self-update
     rustup target add --toolchain "$channel" ${{ join(matrix.targets, ' ') }}
+    # Pin the rustup proxies to the toolchain provisioned above for all
+    # later steps. Without this, the first `cargo` invocation inside
+    # `dist build` re-enters rustup's rust-toolchain.toml sync to add the
+    # declared rustfmt/clippy components, which on the GitHub-hosted
+    # gh-linux-16x images collides with the preinstalled Rust ("failed to
+    # install component: 'rustfmt-preview-...', detected conflict:
+    # 'bin/cargo-fmt'"), rolls back, and leaves the shim reporting cargo
+    # as missing (v0.2.16 Release run 30706345522, aarch64-musl leg).
+    # The components aren't needed for release builds.
+    echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
     # dist's musl packages_install does a user-site `pip3 install
     # cargo-zigbuild` on the Linux runner, which lands in ~/.local/bin —
     # not on the runner service's PATH.
