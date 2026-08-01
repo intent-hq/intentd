@@ -9617,6 +9617,20 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Pin `workspaceApi.toonOutput` off so the persisted `ws.agent.send` tool
+    // result stays plain JSON for the `serde_json::from_str` extraction below
+    // (TOON encoding is on by default).
+    let updated = wss_rpc(
+        &mut rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [ { "path": "workspaceApi.toonOutput", "value": false } ] }),
+    )
+    .await;
+    assert!(
+        updated["applied"].is_array(),
+        "toonOutput pinned: {updated}"
+    );
     let parent = wss_rpc(
         &mut rpc,
         10,
