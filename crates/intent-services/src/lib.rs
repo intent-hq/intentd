@@ -2611,12 +2611,19 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
-    /// Wake every parent whose watch matches child_id, then drop that watch.
-    /// group_id = Some watches defer to the AS-4 delegation-group fan-in
-    /// and are left untouched. A single failed delivery is logged and skipped so
-    /// the remaining watches still fire. STAB-18: remove ungrouped watches BEFORE
+    /// Wake every parent whose watch matches child_id, then drop that watch:
+    /// every ungrouped watch is deliver-once-and-retire. group_id = Some
+    /// watches defer to the AS-4 delegation-group fan-in and are left
+    /// untouched. A single failed delivery is logged and skipped so the
+    /// remaining watches still fire. STAB-18: remove ungrouped watches BEFORE
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
+    ///
+    /// Queue-aware completion: an `agent:idle` for a child with ready-to-send
+    /// queued messages is an interim idle — ungrouped watches neither deliver
+    /// nor retire on it (they stay armed for the real completion after the
+    /// queue drains). Grouped watches are exempt: group settlement accounting
+    /// must see every completion or an `after_all` batch can hang.
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -2635,7 +2642,24 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
-        if event.event_type != AGENT_FAILED {
+        // Queue-aware completion: an `agent:idle` for a child whose pending
+        // message queue still holds ready-to-send entries is an interim idle —
+        // the drain loop is about to redrive the child, so ungrouped watches
+        // neither deliver nor retire (they stay armed for the real
+        // completion). Grouped watches are unaffected: group settlement owns
+        // their accounting and lifecycle. Narrows the enqueue-vs-idle-emit
+        // race: the turn-end emit checks the queue before publishing, and a
+        // message enqueued between that check and this delivery would
+        // otherwise consume the watch with a premature wake. (A snapshot,
+        // not a lock: an enqueue landing after this check can still race a
+        // premature wake, but the window shrinks from emit→delivery to
+        // check→wake.)
+        let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        // The dedup clear is completion-scoped: an interim idle is not a
+        // completion, so it must not clear failure-dedup state (a poisoned
+        // child's replayed identical failure could otherwise slip a
+        // duplicate wake through).
+        if event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
@@ -2737,6 +2761,19 @@ impl Services {
                     }
                 }
                 self.try_fire_group(&gid).await;
+                continue;
+            }
+            // Interim idle (queue-aware completion): the child still has
+            // ready-to-send queued messages, so this idle is not its real
+            // completion — deliver nothing and leave the watch (including a
+            // report_delivered one, which retires at the real completion)
+            // armed for the settlement that follows the queue drain.
+            if interim_idle {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "skipping agent:idle wake — child has pending queued messages (interim idle)"
+                );
                 continue;
             }
             // Report-time wake suppression: if the watch has already delivered the

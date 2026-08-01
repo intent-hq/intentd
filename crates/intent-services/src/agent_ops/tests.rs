@@ -261,6 +261,266 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
+/// Queue-aware completion: an `agent:idle` while the child still has
+/// ready-to-send queued messages is an interim idle — no wake is delivered
+/// and the ungrouped watch survives, then fires exactly once at the real
+/// completion after the queue drains.
+#[tokio::test]
+async fn interim_idle_with_pending_queue_neither_delivers_nor_retires_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // A ready-to-send queue entry makes the next idle an interim idle.
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake on an interim idle"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch survives an interim idle"
+    );
+
+    // Drain the queue; the next idle is the real completion.
+    svc.take_queued_message(&child, &queued.id)
+        .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "exactly one wake at the real completion"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the completion wake"
+    );
+}
+
+/// Queue-aware suppression is scoped to `agent:idle`: `agent:failed` for a
+/// child with queued messages still delivers its wake and retires the watch
+/// (a failed child is parked — its queue will not self-drain).
+#[tokio::test]
+async fn failed_with_pending_queue_still_delivers_and_retires_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.enqueue_message(
+        &child,
+        "never drained".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "failed wake delivers despite the pending queue"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the failure wake"
+    );
+}
+
+/// The interim-idle gate uses `has_ready_to_send`: a queue holding only
+/// under-edit entries is NOT interim — the idle is the real completion
+/// (matching the idle-emit invariant), so the wake delivers and the watch
+/// retires.
+#[tokio::test]
+async fn idle_with_editing_only_queue_delivers_and_retires_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    let q = svc
+        .agent_queue_message_op(child.clone(), "draft".into(), None, None)
+        .await
+        .expect("queue message");
+    let mid = q["queuedMessage"]["id"].as_str().unwrap().to_string();
+    svc.agent_edit_queued_message_op(child.clone(), mid, "draft".into(), Some(true))
+        .await
+        .expect("mark editing");
+    assert!(!svc.has_ready_to_send(&child));
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "editing-only queue is not interim: the wake delivers"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the completion wake"
+    );
+}
+
+/// A `report_delivered` watch survives an interim idle and retires (with the
+/// idle wake still suppressed) at the real completion after the queue drains.
+#[tokio::test]
+async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+
+    // Interim idle: a ready-to-send entry keeps the reported-on watch armed.
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "report_delivered watch survives the interim idle"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+
+    // Real completion after the drain: idle wake still suppressed, watch retired.
+    svc.take_queued_message(&child, &queued.id)
+        .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "idle wake stays suppressed after reportToParent"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired at the real completion"
+    );
+}
+
+/// Grouped watches are exempt from the interim-idle gate: a grouped child's
+/// idle with a pending queue still records its group completion (settlement
+/// accounting must see every completion or an after_all batch can hang).
+#[tokio::test]
+async fn grouped_watch_records_completion_on_interim_idle() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    svc.enqueue_message(&child, "pending".into(), None, None, None, None, false);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    let group = svc
+        .list_groups_for_parent(&parent)
+        .into_iter()
+        .find(|g| g.group_id == gid)
+        .expect("group still open");
+    assert!(
+        group.completed_agent_ids.contains(&child),
+        "grouped completion recorded despite the pending queue"
+    );
+}
+
 /// The immediate-path wake persists FE-shaped `event_notification` metadata on
 /// the parent's user-message row so `EventWakeupBanner` can render a real
 /// `eventCount` / `eventTypes` / per-agent `events` payload instead of the
@@ -4042,7 +4302,7 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     .await;
     // No second wake fires — idle suppression working.
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    // The oneShot watch is consumed after the idle suppression.
+    // The ungrouped watch is retired at the suppressed completion.
     assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
@@ -16355,6 +16615,39 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     assert!(
         text.contains("reports a blocker: sandbox exploded"),
         "watcher wake is kind-flavored with the reason: {text}"
+    );
+    // Attention is not a completion: no watch is consumed by the fan-out.
+    assert_eq!(
+        svc.list_watches_for_parent(&watcher).len(),
+        1,
+        "watcher's watch survives the attention wake"
+    );
+    assert_eq!(
+        svc.list_watches_for_parent(&parent).len(),
+        1,
+        "parent's delegation watch survives the attention wake"
+    );
+
+    // The surviving watches still fire once at the child's real completion.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        watcher_baseline + 2,
+        "watcher receives the completion wake after the attention wake"
+    );
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "watcher's watch retired at completion"
+    );
+    assert!(
+        svc.list_watches_for_parent(&parent).is_empty(),
+        "parent's watch retired at completion"
     );
 }
 
