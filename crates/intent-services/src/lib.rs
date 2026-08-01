@@ -2642,7 +2642,24 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
-        if event.event_type != AGENT_FAILED {
+        // Queue-aware completion: an `agent:idle` for a child whose pending
+        // message queue still holds ready-to-send entries is an interim idle —
+        // the drain loop is about to redrive the child, so ungrouped watches
+        // neither deliver nor retire (they stay armed for the real
+        // completion). Grouped watches are unaffected: group settlement owns
+        // their accounting and lifecycle. Narrows the enqueue-vs-idle-emit
+        // race: the turn-end emit checks the queue before publishing, and a
+        // message enqueued between that check and this delivery would
+        // otherwise consume the watch with a premature wake. (A snapshot,
+        // not a lock: an enqueue landing after this check can still race a
+        // premature wake, but the window shrinks from emit→delivery to
+        // check→wake.)
+        let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        // The dedup clear is completion-scoped: an interim idle is not a
+        // completion, so it must not clear failure-dedup state (a poisoned
+        // child's replayed identical failure could otherwise slip a
+        // duplicate wake through).
+        if event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
@@ -2654,16 +2671,6 @@ impl Services {
                 .to_string()
         });
         let watches = self.find_watches_for_child(child_id);
-        // Queue-aware completion: an `agent:idle` for a child whose pending
-        // message queue still holds ready-to-send entries is an interim idle —
-        // the drain loop is about to redrive the child, so ungrouped watches
-        // neither deliver nor retire (they stay armed for the real
-        // completion). Grouped watches are unaffected: group settlement owns
-        // their accounting and lifecycle. Closes the enqueue-vs-idle-emit
-        // race: the turn-end emit checks the queue before publishing, but a
-        // message enqueued between that check and this delivery would
-        // otherwise consume the watch with a premature wake.
-        let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
         // monorepo#1016: best-effort stall detection — an agent:idle with no
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
