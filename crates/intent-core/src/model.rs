@@ -2218,6 +2218,14 @@ pub struct AgentLite {
     pub last_agent_response: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_message: Option<String>,
+    /// Role (`"user"` / `"assistant"`) of the session's newest
+    /// user/assistant transcript message — system (and any other) rows are
+    /// transparent. Additive wire field; omitted when the session has no
+    /// user/assistant message. Mid-turn, the service projection overlays
+    /// `"assistant"` once the in-flight turn has derivable streamed text
+    /// (the same gate as the live `lastAgentResponse` overlay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2249,6 +2257,7 @@ impl AgentLite {
         last_agent_response: Option<String>,
         last_user_message: Option<String>,
         digest: Option<String>,
+        last_message_role: Option<String>,
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
@@ -2296,6 +2305,7 @@ impl AgentLite {
             message_count,
             last_agent_response,
             last_user_message,
+            last_message_role,
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
@@ -3486,7 +3496,14 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
+        let lite = AgentLite::from_session(
+            session,
+            0,
+            None,
+            Some("hi".to_string()),
+            None,
+            Some("user".to_string()),
+        );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
         // The question-dismissal marker is lifted out of the free-form session
@@ -3505,6 +3522,7 @@ mod tests {
         // to `[]` when no completion watches are pending (PROTOCOL §5.5/§7.1).
         assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
+        assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastActivity"], "t1");
     }
 

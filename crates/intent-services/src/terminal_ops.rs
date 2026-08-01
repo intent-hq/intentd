@@ -229,7 +229,8 @@ pub(crate) fn get_buffer(
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
 
-/// The workspace's live terminals as a bare array
+/// The workspace's live terminals as a bare array. Exited PTYs are omitted
+/// while their sessions remain retained for post-exit output and release.
 /// `[{ id, name, cwd, isExecutingCommand }]` (TS `ws.terminal.list`). `name` is
 /// the display name given at spawn (`SpawnSpec::name`, e.g. "Setup Script"),
 /// else the constant `"Terminal"`; `cwd` is the working directory resolved at
@@ -1386,6 +1387,20 @@ mod tests {
         assert_eq!(exit.data["terminalId"], json!(id));
         assert_eq!(exit.data["exitCode"], json!(0));
         assert!(exit.data["signal"].is_null());
+
+        let listed = list(pty.as_ref(), &ws("ws-1")).unwrap();
+        assert!(
+            listed
+                .as_array()
+                .is_some_and(|terminals| terminals.iter().all(|terminal| terminal["id"] != id)),
+            "naturally exited terminal must not remain in terminal.list: {listed}"
+        );
+        assert!(
+            get_buffer(pty.as_ref(), &id, None).is_ok(),
+            "post-exit output must remain available until release"
+        );
+
+        kill(pty.as_ref(), &id).await.unwrap();
     }
 
     #[tokio::test]

@@ -517,6 +517,7 @@ mod tests {
             digest: None,
             last_agent_response: None,
             last_user_message: None,
+            last_message_role: None,
             context_references: None,
             image_blocks: None,
             stop_reason: None,
