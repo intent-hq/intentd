@@ -37,6 +37,12 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'agent.subscribe', args: { eventTypes, ...(opts || {}) } }),
         unsubscribe: (subscriptionId) =>
             host({ method: 'agent.unsubscribe', args: { subscriptionId } }),
+        watch: (agentId) => host({ method: 'agent.watch', args: { agentId } }),
+        unwatch: (subscriptionIdOrAgentId) => {
+            const s = subscriptionIdOrAgentId == null ? '' : String(subscriptionIdOrAgentId);
+            const args = s === '' ? {} : s.startsWith('agent-') ? { agentId: s } : { subscriptionId: s };
+            return host({ method: 'agent.unwatch', args });
+        },
         list: (includeCompleted) =>
             host({ method: 'agent.list', args: { includeCompleted } }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
@@ -73,6 +79,8 @@ pub(crate) async fn dispatch(
         "sendToTask" => send_to_task(api, ws, caller, args).await,
         "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
+        "watch" => watch(api, ws, caller, args).await,
+        "unwatch" => unwatch(api, ws, caller, args).await,
         "list" => list(api, ws).await,
         "status" => status(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
@@ -364,11 +372,11 @@ async fn subscribe(
     args: &Value,
 ) -> Result<Value, String> {
     let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
-        "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string()
+        "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string()
     })?;
     if event_types.is_empty() {
         return Err(
-            "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+            "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string(),
         );
     }
     let v = api
@@ -396,6 +404,52 @@ async fn unsubscribe(
         .await
         .map_err(map_err)?;
     Ok(json!({ "ok": true, "subscriptionId": subscription_id }))
+}
+
+/// `ws.agent.watch(agentId)` (monorepo#1229): explicit persistent
+/// subscription to another agent's completion set — idle/completed, failed,
+/// deleted, blocker raised, discussion requested. Caller-only (the front
+/// door has no wake target).
+async fn watch(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "agent.watch is only available to agents".to_string())?;
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let v = api
+        .agent_watch(
+            ws.clone(),
+            caller.clone(),
+            AgentId::from(agent_id_str.as_str()),
+        )
+        .await
+        .map_err(map_err)?;
+    Ok(merge_ok(v))
+}
+
+/// `ws.agent.unwatch(subscriptionIdOrAgentId)` (monorepo#1229): remove one of
+/// the caller's own watches, addressed by subscription id or watched agent id.
+async fn unwatch(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "agent.unwatch is only available to agents".to_string())?;
+    let subscription_id = opt_str(args, "subscriptionId").filter(|s| !s.is_empty());
+    let target = opt_str(args, "agentId")
+        .filter(|s| !s.is_empty())
+        .map(|s| AgentId::from(s.as_str()));
+    if subscription_id.is_none() && target.is_none() {
+        return Err("subscriptionId or agentId is required".to_string());
+    }
+    let v = api
+        .agent_unwatch(ws.clone(), caller.clone(), subscription_id, target)
+        .await
+        .map_err(map_err)?;
+    Ok(merge_ok(v))
 }
 
 async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {

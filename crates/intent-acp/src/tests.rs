@@ -8309,6 +8309,26 @@ mod wsapi4_bindings_tests {
         assert_eq!(api.agent_unsubscribe_calls.lock().unwrap()[0], "sub-9");
     }
 
+    /// monorepo#1229: `ws.agent.unwatch()` with a missing or empty argument
+    /// fails the required-parameter validation instead of reaching the
+    /// service with an empty subscriptionId.
+    #[tokio::test]
+    async fn agent_unwatch_missing_or_empty_argument_errors() {
+        let (srv, _api) = server_with_caller("caller-1");
+        for script in [
+            "return await ws.agent.unwatch();",
+            "return await ws.agent.unwatch('');",
+        ] {
+            let resp = call(&srv, script).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "script: {script}");
+            assert!(
+                text(&resp).contains("subscriptionId or agentId is required"),
+                "script: {script}, text: {}",
+                text(&resp)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn agent_report_to_parent_threads_caller() {
         let (srv, api) = server_with_caller("child-99");
@@ -8435,16 +8455,15 @@ mod wsapi4_bindings_tests {
     }
 
     #[tokio::test]
-    async fn event_subscribe_expands_wildcard_star() {
+    async fn event_subscribe_passes_wildcard_star_through() {
+        // The binding no longer expands `*` — the daemon resolves it
+        // per-subscriber (agents get the non-agent categories only,
+        // monorepo#1229), so the wildcard must reach the API verbatim.
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.event.subscribe(['*']);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.event_subscribe_calls.lock().unwrap();
-        let resolved = &calls[0].0;
-        assert!(resolved.contains(&"agent:*".to_string()));
-        assert!(resolved.contains(&"file:*".to_string()));
-        assert!(resolved.contains(&"comment:*".to_string()));
-        assert_eq!(resolved.len(), 12);
+        assert_eq!(calls[0].0, vec!["*".to_string()]);
     }
 
     #[tokio::test]

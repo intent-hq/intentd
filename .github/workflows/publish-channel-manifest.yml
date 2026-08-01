@@ -31,7 +31,9 @@ on:
 
 jobs:
   publish-channel-manifest:
-    runs-on: [self-hosted, Linux, X64]
+    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64] when
+    # tinybox is back — see monorepo#1239/#1253.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write

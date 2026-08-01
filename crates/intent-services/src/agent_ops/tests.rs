@@ -5911,7 +5911,7 @@ async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
         .agent_subscribe(
             ws.clone(),
             Some(AgentId::from("agent-nope")),
-            vec!["agent:*".into()],
+            vec!["note:*".into()],
             None,
             None,
         )
@@ -5926,7 +5926,7 @@ async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
         .agent_subscribe(
             ws.clone(),
             Some(subscriber),
-            vec!["agent:*".into()],
+            vec!["note:*".into()],
             None,
             None,
         )
@@ -5967,11 +5967,14 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
     // load can split them into two wake batches, flaking the len()==1
     // assertion below (monorepo#972). Both publishes land back-to-back, so a
     // wide window still coalesces them into exactly one batch.
+    // `file:*` — not `agent:*` — because agent event types are rejected for
+    // agent subscribers (monorepo#1229); the batching mechanics under test
+    // are type-agnostic.
     let sub = svc
         .agent_subscribe(
             ws.clone(),
             Some(subscriber.clone()),
-            vec!["agent:*".into()],
+            vec!["file:*".into()],
             None,
             Some(2000),
         )
@@ -5984,7 +5987,7 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
         bus.publish(&NewEvent {
             workspace_id: ws.clone(),
             timestamp: now_iso(),
-            event_type: AGENT_IDLE.to_string(),
+            event_type: "file:changed".to_string(),
             actor: EventActor {
                 actor_type: ActorType::Agent,
                 id: Some(other.0.clone()),
@@ -5994,7 +5997,7 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
             correlation_id: None,
             parent_event_id: None,
             metadata: None,
-            data: json!({ "agentId": other.0 }),
+            data: json!({ "path": "x.rs" }),
         })
         .await
         .expect("publish");
@@ -6032,11 +6035,14 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
     let other = create_agent(&svc, &ws, "Worker").await;
 
+    // `file:*` — not `agent:*` — because agent event types are rejected for
+    // agent subscribers (monorepo#1229); excludeSelf/unsubscribe semantics
+    // are type-agnostic.
     let sub = svc
         .agent_subscribe(
             ws.clone(),
             Some(subscriber.clone()),
-            vec!["agent:*".into()],
+            vec!["file:*".into()],
             None,
             Some(50),
         )
@@ -6051,7 +6057,7 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
             bus.publish(&NewEvent {
                 workspace_id: ws,
                 timestamp: now_iso(),
-                event_type: AGENT_IDLE.to_string(),
+                event_type: "file:changed".to_string(),
                 actor: EventActor {
                     actor_type: ActorType::Agent,
                     id: Some(actor_id.clone()),
@@ -6113,11 +6119,13 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
         let svc = Services::new(store).with_event_bus(bus);
         let subscriber = create_agent(&svc, &ws, "Watcher").await;
         let other = create_agent(&svc, &ws, "Worker").await;
+        // `file:*` — agent event types are rejected for agent subscribers
+        // (monorepo#1229); persistence/rehydration are type-agnostic.
         let sub = svc
             .agent_subscribe(
                 ws.clone(),
                 Some(subscriber.clone()),
-                vec!["agent:*".into()],
+                vec!["file:*".into()],
                 None,
                 Some(50),
             )
@@ -6133,7 +6141,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
                 .expect("list rows");
             if rows.len() == 1 {
                 assert_eq!(rows[0].subscriber_agent_id, subscriber);
-                assert_eq!(rows[0].event_types, vec!["agent:*".to_string()]);
+                assert_eq!(rows[0].event_types, vec!["file:*".to_string()]);
                 assert!(rows[0].exclude_self);
                 assert_eq!(rows[0].batch_window_ms, 50);
                 break;
@@ -6165,7 +6173,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     bus.publish(&NewEvent {
         workspace_id: ws.clone(),
         timestamp: now_iso(),
-        event_type: AGENT_IDLE.to_string(),
+        event_type: "file:changed".to_string(),
         actor: EventActor {
             actor_type: ActorType::Agent,
             id: Some(other.0.clone()),
@@ -6471,7 +6479,7 @@ async fn workspace_delete_cleans_up_event_subscriptions() {
         .agent_subscribe(
             ws.clone(),
             Some(subscriber.clone()),
-            vec!["agent:*".into()],
+            vec!["file:*".into()],
             None,
             Some(50),
         )
@@ -6481,7 +6489,7 @@ async fn workspace_delete_cleans_up_event_subscriptions() {
     svc.agent_subscribe(
         other_ws.clone(),
         Some(other_subscriber.clone()),
-        vec!["agent:*".into()],
+        vec!["file:*".into()],
         None,
         Some(50),
     )
@@ -6539,7 +6547,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
         svc.agent_subscribe(
             gone_ws.clone(),
             Some(chief_sub.clone()),
-            vec!["agent:*".into()],
+            vec!["file:*".into()],
             None,
             Some(50),
         )
@@ -7611,6 +7619,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
                 one_shot,
                 group_id: None,
                 report_delivered: false,
+                wake_on_attention: false,
                 deadline_at_ms: None,
                 created_at: created_at.to_string(),
             })
@@ -16444,4 +16453,357 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
         note.metadata.task.expect("task").assigned_agent_ids.len(),
         2
     );
+}
+
+// ===========================================================================
+// agent.watch / agent.unwatch (monorepo#1229): explicit persistent watches
+// ===========================================================================
+
+/// `agent.watch` registers a persistent (non-oneShot, wake_on_attention)
+/// watch that survives an `agent:idle` delivery: the watcher is woken on
+/// each completion instead of once.
+#[tokio::test]
+async fn agent_watch_persists_across_idle_deliveries() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    let r = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["agentId"], json!(target.0));
+    let sub_id = r["subscriptionId"].as_str().expect("subscriptionId");
+
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(watches[0].id, sub_id);
+    assert!(!watches[0].one_shot, "explicit watch is persistent");
+    assert!(
+        watches[0].wake_on_attention,
+        "explicit watch wakes on attention"
+    );
+
+    for expected in 1..=2usize {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &target,
+            json!({ "agentId": target.0 }),
+        ))
+        .await;
+        assert_eq!(
+            parent_message_count(&svc, &watcher).await,
+            expected,
+            "wake #{expected} delivered"
+        );
+    }
+    // The watch is still armed after both deliveries.
+    assert_eq!(svc.list_watches_for_parent(&watcher).len(), 1);
+}
+
+/// `agent:deleted` is terminal: the persistent watch delivers one final wake
+/// and is removed (no leak on a deleted target).
+#[tokio::test]
+async fn agent_watch_removed_after_target_deleted() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &target,
+        json!({ "agentId": target.0, "status": "deleted" }),
+    ))
+    .await;
+
+    assert_eq!(parent_message_count(&svc, &watcher).await, 1);
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "persistent watch must not survive the target's deletion"
+    );
+}
+
+/// An attention request (blocker) from the watched agent wakes third-party
+/// `agent.watch` watchers, while the parent's own wake path is unchanged —
+/// the parent is excluded from the fan-out (no duplicate).
+#[tokio::test]
+async fn agent_watch_wakes_watcher_on_attention_request() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch");
+    let parent_baseline = parent_message_count(&svc, &parent).await;
+    let watcher_baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        parent_baseline + 1,
+        "parent keeps its single direct attention wake"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        watcher_baseline + 1,
+        "third-party watcher receives the attention wake"
+    );
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("reports a blocker: sandbox exploded"),
+        "watcher wake is kind-flavored with the reason: {text}"
+    );
+}
+
+/// A parent that ALSO explicitly watches its child receives exactly ONE
+/// attention wake (the direct parent wake); the fan-out excludes the parent.
+#[tokio::test]
+async fn agent_watch_attention_fanout_excludes_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("parent explicitly watches its child");
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "exactly one attention wake for a parent that also watches"
+    );
+}
+
+/// `reportToParent` idle suppression stays scoped to the parent's oneShot
+/// watch: a third-party persistent watcher still receives the `agent:idle`
+/// wake after the child reported.
+#[tokio::test]
+async fn report_to_parent_does_not_suppress_third_party_watch_idle_wake() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch");
+    let parent_baseline = parent_message_count(&svc, &parent).await;
+    let watcher_baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("all done"), Some(child.clone()))
+        .await
+        .expect("report");
+    // The report wake reaches only the parent.
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        parent_baseline + 1
+    );
+    assert_eq!(parent_message_count(&svc, &watcher).await, watcher_baseline);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    // Parent's idle wake is suppressed (report already delivered); the
+    // third-party watcher still gets its idle wake.
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        parent_baseline + 1,
+        "parent idle wake suppressed after reportToParent"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        watcher_baseline + 1,
+        "third-party watcher must still receive the idle wake"
+    );
+}
+
+/// Registration-time reconciliation: watching an agent that ALREADY settled
+/// (Completed) delivers the synthetic completion wake immediately, and the
+/// terminal-status handling removes nothing (idle is not terminal).
+#[tokio::test]
+async fn agent_watch_reconciles_already_settled_target() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    session.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("settle target");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch settled target");
+
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "synthetic completion delivered at registration time"
+    );
+}
+
+/// Validation: self-watch and unknown targets are rejected; `agent.unwatch`
+/// removes the watch by subscription id or agent id, rejects a foreign
+/// subscription id, and is idempotent on the agentId form.
+#[tokio::test]
+async fn agent_watch_unwatch_validation_and_removal() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    assert!(matches!(
+        svc.agent_watch_op(ws.clone(), watcher.clone(), watcher.clone())
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    assert!(matches!(
+        svc.agent_watch_op(ws.clone(), watcher.clone(), missing)
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+
+    // Unwatch by subscription id.
+    let r = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+    let sub_id = r["subscriptionId"].as_str().expect("id").to_string();
+    // A different agent cannot cancel someone else's watch.
+    assert!(matches!(
+        svc.agent_unwatch_op(ws.clone(), other.clone(), Some(sub_id.clone()), None)
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    let r = svc
+        .agent_unwatch_op(ws.clone(), watcher.clone(), Some(sub_id), None)
+        .await
+        .expect("unwatch by id");
+    assert_eq!(r["removed"], json!(true));
+    assert!(svc.list_watches_for_parent(&watcher).is_empty());
+
+    // Unwatch by agent id + idempotency.
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("re-watch");
+    let r = svc
+        .agent_unwatch_op(ws.clone(), watcher.clone(), None, Some(target.clone()))
+        .await
+        .expect("unwatch by agent id");
+    assert_eq!(r["removed"], json!(true));
+    let r = svc
+        .agent_unwatch_op(ws.clone(), watcher.clone(), None, Some(target))
+        .await
+        .expect("idempotent unwatch");
+    assert_eq!(r["removed"], json!(false));
+    // Missing both selectors is rejected.
+    assert!(matches!(
+        svc.agent_unwatch_op(ws.clone(), watcher, None, None).await,
+        Err(Error::InvalidParams(_))
+    ));
+}
+
+/// Restart durability: an explicit watch survives daemon restart with its
+/// non-oneShot + wake_on_attention flags intact.
+#[tokio::test]
+async fn agent_watch_rehydrates_with_flags_after_restart() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (watcher, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let watcher = create_agent(&svc, &ws, "Watcher").await;
+        let target = create_agent(&svc, &ws, "Target").await;
+        svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+            .await
+            .expect("watch");
+        (watcher, target)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1);
+    let watches = restarted.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert!(!watches[0].one_shot, "persistent flag survives restart");
+    assert!(
+        watches[0].wake_on_attention,
+        "wake_on_attention flag survives restart"
+    );
+    assert_eq!(watches[0].child_agent_id, target);
 }
