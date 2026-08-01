@@ -384,6 +384,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         })
         .await
@@ -424,6 +425,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         })
         .await
@@ -478,6 +480,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         })
         .await
@@ -561,6 +564,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         })
         .await
@@ -1483,6 +1487,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     };
     mgr.services
@@ -4087,6 +4092,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     }
 }
@@ -4342,6 +4348,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     };
     mgr.services
@@ -5154,6 +5161,259 @@ async fn terminal_failure_event_omits_session_corrupted_for_ordinary_error() {
         ev.data.get("sessionCorrupted").is_none(),
         "ordinary error omits sessionCorrupted (got {:?})",
         ev.data
+    );
+}
+
+/// A terminal failure appends a durable system-role transcript notice with a
+/// single text block carrying the error text and `meta.kind = "turn-failure"`
+/// (the InterruptionNotice shape), and emits `agent:message` (role=system)
+/// for it. Persisting the error status/stop_reason must not depend on the
+/// notice (best-effort append).
+#[tokio::test]
+async fn terminal_failure_appends_turn_failure_transcript_notice() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-tfn"), AgentId::from("a-tfn"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_MESSAGE.to_string()],
+        ..Default::default()
+    });
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "do work",
+        &super::TurnOptions::default(),
+        true,
+        "boom: provider exploded",
+    )
+    .await;
+
+    // Transcript: exactly one system-role notice with the turn-failure meta.kind.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let notices: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "system" && m.content[0]["meta"]["kind"] == json!("turn-failure"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "one turn-failure notice in the transcript: {messages:?}"
+    );
+    assert_eq!(
+        notices[0].content,
+        json!([{
+            "type": "text",
+            "text": "boom: provider exploded",
+            "meta": { "kind": "turn-failure" }
+        }]),
+        "notice carries a single text block with the error text"
+    );
+
+    // Wire: agent:message (role=system) for the appended notice.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let ev = batch
+        .iter()
+        .find(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE && e.data["role"] == json!("system")
+        })
+        .expect("agent:message (system) event");
+    assert_eq!(ev.data["messageId"], json!(notices[0].id));
+}
+
+/// A repeat of the IDENTICAL terminal failure with no intervening
+/// `agent.retry` or successful turn (streak > 1 — e.g. a fresh redrive of
+/// the same message failing the same way again) does NOT append a
+/// duplicate notice; a DISTINCT failure text appends a new one.
+#[tokio::test]
+async fn terminal_failure_notice_not_duplicated_on_identical_requeue() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-tfn-dup"), AgentId::from("a-tfn-dup"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, "do work", &options, true, "boom").await;
+    super::persist_error_and_requeue(&mgr, &id, &ws, "do work", &options, true, "boom").await;
+
+    let count_notices = |messages: &[intent_core::AgentMessage], text: &str| {
+        messages
+            .iter()
+            .filter(|m| {
+                m.role == "system"
+                    && m.content[0]["meta"]["kind"] == json!("turn-failure")
+                    && m.content[0]["text"] == json!(text)
+            })
+            .count()
+    };
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        count_notices(&messages, "boom"),
+        1,
+        "identical repeat failure appends no duplicate notice: {messages:?}"
+    );
+
+    // A distinct failure resets the streak and appends its own notice.
+    super::persist_error_and_requeue(&mgr, &id, &ws, "do work", &options, true, "other error")
+        .await;
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(count_notices(&messages, "boom"), 1);
+    assert_eq!(
+        count_notices(&messages, "other error"),
+        1,
+        "a distinct failure text appends a new notice: {messages:?}"
+    );
+}
+
+/// `agent.retry` clears the identical-failure streak (monorepo#840, the
+/// deliberate quarantine escape hatch): a same-text failure immediately
+/// after a retry restarts the streak at 1, so it DOES append its own
+/// turn-failure notice — unlike a same-text failure with no intervening
+/// retry, which is deduped (see
+/// `terminal_failure_notice_not_duplicated_on_identical_requeue`).
+#[tokio::test]
+async fn terminal_failure_notice_not_deduped_across_agent_retry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-tfn-retry"),
+        AgentId::from("a-tfn-retry"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, "do work", &options, true, "boom").await;
+
+    // agent.retry clears the streak — the deliberate quarantine escape hatch.
+    mgr.services.clear_failure_streak(&id);
+    mgr.services.clear_failure_wake_dedup(&id);
+
+    // The identical failure text repeats right after the retry.
+    super::persist_error_and_requeue(&mgr, &id, &ws, "do work", &options, true, "boom").await;
+
+    let count_notices = |messages: &[intent_core::AgentMessage], text: &str| {
+        messages
+            .iter()
+            .filter(|m| {
+                m.role == "system"
+                    && m.content[0]["meta"]["kind"] == json!("turn-failure")
+                    && m.content[0]["text"] == json!(text)
+            })
+            .count()
+    };
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        count_notices(&messages, "boom"),
+        2,
+        "a same-text failure after agent.retry gets its own fresh notice: {messages:?}"
+    );
+}
+
+/// A terminal failure persists `stop_reason_timestamp` alongside `stop_reason`
+/// and the `agent:status-changed` error payload carries `stopReasonTimestamp`;
+/// clearing the stop reason (turn begin / `agent.retry` — the `Some(None)`
+/// path through `persist_status_with_stop_reason`) clears the persisted
+/// timestamp and emits `stopReasonTimestamp: null`.
+#[tokio::test]
+async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-srt"), AgentId::from("a-srt"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:status-changed".to_string()],
+        ..Default::default()
+    });
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "do work",
+        &super::TurnOptions::default(),
+        true,
+        "boom",
+    )
+    .await;
+
+    let session = mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .expect("session");
+    assert_eq!(session.stop_reason, Some("boom".to_string()));
+    let persisted_ts = session
+        .stop_reason_timestamp
+        .expect("stop_reason_timestamp persisted with the error");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "agent:status-changed")
+        .expect("status-changed event");
+    assert_eq!(ev.data["stopReason"], json!("boom"));
+    assert_eq!(
+        ev.data["stopReasonTimestamp"],
+        json!(persisted_ts),
+        "error event carries the persisted stopReasonTimestamp"
+    );
+
+    // Clearing the stop reason clears the timestamp (store) and emits null (wire).
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:status-changed".to_string()],
+        ..Default::default()
+    });
+    mgr.persist_status_with_stop_reason(&id, &ws, AgentStatus::RuntimeIdle, false, Some(None))
+        .await;
+    let session = mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .expect("session");
+    assert_eq!(session.stop_reason, None, "stop_reason cleared");
+    assert_eq!(
+        session.stop_reason_timestamp, None,
+        "stop_reason_timestamp cleared wherever stop_reason clears"
+    );
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "agent:status-changed")
+        .expect("status-changed event");
+    assert_eq!(ev.data["stopReason"], Value::Null);
+    assert_eq!(
+        ev.data["stopReasonTimestamp"],
+        Value::Null,
+        "clear event carries stopReasonTimestamp: null"
     );
 }
 

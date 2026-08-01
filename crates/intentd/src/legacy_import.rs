@@ -1455,6 +1455,7 @@ fn session_from_legacy_json(
         is_background,
         metadata: Some(Value::Object(metadata)),
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         created_at,
         updated_at,

@@ -2979,6 +2979,9 @@ impl AgentManager {
         // when setting (Some(Some(x))), JSON null when clearing (Some(None)). When the
         // parameter is None (unchanged), omit the field so unrelated status changes
         // don't clobber the FE's canonical session state (cloudlands-fe#147).
+        // "stopReasonTimestamp" rides along with the same set/clear semantics: the
+        // persisted timestamp is coupled to stop_reason (see
+        // `Store::set_agent_session_status`), so the event mirrors the store.
         let mut data = json!({
             "agentId": agent_id.0,
             "status": serialized_status,
@@ -2987,6 +2990,10 @@ impl AgentManager {
         if let Some(reason) = &stop_reason_for_event {
             data["stopReason"] = match reason {
                 Some(r) => Value::String(r.clone()),
+                None => Value::Null,
+            };
+            data["stopReasonTimestamp"] = match reason {
+                Some(_) => Value::String(ts.clone()),
                 None => Value::Null,
             };
         }
@@ -6532,9 +6539,19 @@ async fn publish_terminal_failure_events(
 /// the failed message to the front of the queue so `agent.retry` — or a future
 /// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
 /// turn-failure paths. The `error_text` argument is persisted into
-/// `agent_session.stop_reason` and included in the `agent:status-changed` event's
-/// `stopReason` field (durable-before-observable). `persisted` reports whether
-/// the failed turn's user row durably reached the transcript (STAB-51).
+/// `agent_session.stop_reason` (stamping `stop_reason_timestamp`) and included
+/// in the `agent:status-changed` event's `stopReason` / `stopReasonTimestamp`
+/// fields (durable-before-observable). `persisted` reports whether the failed
+/// turn's user row durably reached the transcript (STAB-51). A system-role
+/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
+/// the InterruptionNotice shape, §5.35) is appended best-effort for each
+/// DISTINCT terminal failure — a repeat of the identical failure text with
+/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
+/// fresh redrive of the same message that fails again the same way) skips
+/// the append so the transcript never stacks duplicate cards. `agent.retry`
+/// clears the streak (the deliberate quarantine escape hatch), so a failure
+/// with the SAME text immediately after a retry still gets its own card —
+/// the user acted and it failed again, which is new information.
 async fn persist_error_and_requeue(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -6580,7 +6597,9 @@ async fn persist_error_and_requeue(
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
     } else {
-        // Emit agent:status-changed with stopReason so live subscribers get the canonical field.
+        // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
+        // subscribers get the canonical fields (the timestamp matches the value
+        // persisted alongside stop_reason by `set_agent_session_status`).
         // `sessionCorrupted: true` is included only when the failure classifies as
         // corrupted/poisoned (absent otherwise, matching the serialized projections).
         let mut data = json!({
@@ -6588,13 +6607,14 @@ async fn persist_error_and_requeue(
             "status": "error",
             "isActive": false,
             "stopReason": error_text,
+            "stopReasonTimestamp": ts,
         });
         if session_corrupted {
             data["sessionCorrupted"] = json!(true);
         }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
-            timestamp: ts,
+            timestamp: ts.clone(),
             event_type: AGENT_STATUS_CHANGED.to_string(),
             actor: agent_actor(agent_id),
             session_id: Some(agent_id.0.clone()),
@@ -6649,6 +6669,54 @@ async fn persist_error_and_requeue(
             mgr.services.queue_snapshot(agent_id),
         )
         .await;
+
+    // Durable transcript record of the terminal failure: a system-role message
+    // with a single text block carrying the error text and
+    // `meta.kind = "turn-failure"` (the InterruptionNotice shape, §5.35 — the
+    // same pattern as the discussion-request/blocker-report notices in
+    // `agent_request_attention_op`). Appended only on the FIRST occurrence of
+    // a failure text in the current streak (streak == 1): a same-text failure
+    // repeating with no intervening `agent.retry` or successful turn already
+    // has its card in the transcript, so the append is skipped instead of
+    // stacking duplicates. `agent.retry` resets the streak, so a same-text
+    // failure right after a retry DOES get a fresh card (streak restarts at
+    // 1) — the user acted and it failed again, which is new information.
+    // Best-effort and deliberately LAST: the persisted (status, stop_reason,
+    // stop_reason_timestamp) and the requeue above are the durable contract —
+    // an append failure is logged and swallowed, and the append never delays
+    // the status-changed → requeue sequence clients key on.
+    if streak == 1 {
+        let notice_content = json!([{
+            "type": "text",
+            "text": error_text,
+            "meta": { "kind": "turn-failure" }
+        }]);
+        match mgr
+            .services
+            .store
+            .append_agent_message(agent_id, "system", &notice_content, &ts)
+            .await
+        {
+            Ok(message) => {
+                mgr.services.invalidate_agent_list_cache(workspace_id);
+                mgr.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_MESSAGE,
+                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "failed to append turn-failure transcript notice"
+                );
+            }
+        }
+    }
 }
 
 /// Handle terminal spawn failure after all retries are exhausted. Publishes
@@ -7027,6 +7095,7 @@ mod role_reminder_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -8480,6 +8549,7 @@ mod agent_retry_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
