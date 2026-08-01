@@ -5618,7 +5618,9 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
 // queued entry wire shape (`queuedMessage.messageMetadata`, PROTOCOL §5.5) and
 // (b) persist it on the drained user message row so `agent.getConversation`
 // returns the same `metadata` a directly-delivered send would have — e.g. a
-// parent wake's `event_notification` tag survives the busy-parent enqueue.
+// parent wake's `event_notification` tag survives the busy-parent enqueue —
+// plus (c) the drain-time `queueInfo` stamp ({ queuedAt, waitedMs }, PROTOCOL
+// §5.5 dequeue-wait annotation) alongside the caller's fields.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -5736,7 +5738,8 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     }
     assert_eq!(stream_end_count, 2, "both turns must complete");
 
-    // (b) The drained user message row persists the metadata verbatim.
+    // (b) The drained user message row persists the caller's metadata fields
+    // verbatim, PLUS the drain-time queueInfo stamp.
     let convo = wss_rpc(
         &mut rpc,
         14,
@@ -5755,16 +5758,29 @@ async fn queued_message_metadata_survives_drain_over_wss() {
                     .is_some_and(|t| t.starts_with("tagged queued message"))
         })
         .expect("drained user message row present");
+    for (key, want) in metadata.as_object().unwrap() {
+        assert_eq!(
+            &tagged["metadata"][key], want,
+            "drained user row must persist messageMetadata field {key}: {tagged}"
+        );
+    }
+    // (c) queueInfo carries the entry's enqueue timestamp (byte-identical to
+    // the queued entry's `queuedAt`) and an integer wait in millis.
+    let queue_info = &tagged["metadata"]["queueInfo"];
     assert_eq!(
-        tagged["metadata"], metadata,
-        "drained user row must persist messageMetadata: {tagged}"
+        queue_info["queuedAt"], send2["queuedMessage"]["queuedAt"],
+        "queueInfo.queuedAt is the queue entry's queuedAt: {tagged}"
+    );
+    assert!(
+        queue_info["waitedMs"].as_u64().is_some(),
+        "queueInfo.waitedMs is a non-negative integer: {tagged}"
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity).
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], metadata,
-        "drained user block must fold messageMetadata: {tagged}"
+        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
 
@@ -9819,8 +9835,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
 ///   bystander is later woken by the parent's completion;
 /// - the parent's `chat.subscribe` delta for the delivered row lifts the
 ///   persisted `agent_message` sender-attribution `metadata` onto the wire
-///   entity (§7.1), while a human `agent.sendMessage` row keeps the lean
-///   metadata-free entity shape.
+///   entity (§7.1), while a human `agent.sendMessage` row carries no
+///   attribution metadata (lean metadata-free shape, or at most the drain-time
+///   `queueInfo` stamp if the send raced the parent's busy window).
 #[tokio::test]
 async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_wss() {
     let Some(script) = gate("WSS child→parent watch suppression + delta metadata E2E") else {
@@ -10077,7 +10094,39 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         "attribution carries the sender name: {tagged}"
     );
 
-    // Lean-shape control: a human send's delta entity carries NO metadata.
+    // Lean-shape control: a human send's delta entity carries NO
+    // sender-attribution metadata. Wait for the parent's child-message turn
+    // to finish on the chat channel first so the send is (usually) delivered
+    // directly — but if it still races the busy window and queues, the row
+    // legitimately gains ONLY the drain-time `queueInfo` stamp (PROTOCOL
+    // §5.5), never `agent_message` attribution; the assertion below allows
+    // exactly that.
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            let done = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .any(|e| {
+                    e["role"] == "assistant"
+                        && e["streamingComplete"] == json!(true)
+                        && e["block"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("plain reply"))
+                });
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("parent's child-message turn replied on the chat channel");
     let human = wss_rpc(
         &mut rpc,
         14,
@@ -10110,10 +10159,23 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    assert!(
-        lean.get("metadata").is_none(),
-        "a metadata-free row keeps the lean entity shape: {lean}"
-    );
+    match lean.get("metadata") {
+        None => {} // direct delivery: the lean metadata-free entity shape
+        Some(md) => {
+            // Queued delivery race: only the drain-time queueInfo stamp is
+            // allowed — human sends never gain A2A attribution metadata.
+            let keys: Vec<&String> = md
+                .as_object()
+                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
+                .keys()
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["queueInfo"],
+                "a human row carries at most the queueInfo stamp: {lean}"
+            );
+        }
+    }
 
     // Contrast: a parentless BYSTANDER running the identical send DOES get
     // the SUB-1 sender watch — and is later woken by the parent's completion.

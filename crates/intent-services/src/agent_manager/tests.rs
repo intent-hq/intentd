@@ -8243,6 +8243,13 @@ mod dequeue_wait_tests {
             "the note names the wait: {}",
             msg.content
         );
+        // The structured stamp rides alongside the content note.
+        let md = msg.message_metadata.as_ref().expect("queueInfo stamped");
+        assert_eq!(md["queueInfo"]["queuedAt"], queued_at);
+        assert!(
+            md["queueInfo"]["waitedMs"].as_u64().is_some(),
+            "waitedMs is a non-negative integer: {md}"
+        );
     }
 
     #[test]
@@ -8250,11 +8257,54 @@ mod dequeue_wait_tests {
         let mut msg = queued_msg("loop", "2026-01-01T00:00:00Z", false);
         super::super::annotate_dequeue_wait(&mut msg);
         let once = msg.content.clone();
+        let stamped_once = msg.message_metadata.clone();
         super::super::annotate_dequeue_wait(&mut msg);
         assert_eq!(
             msg.content, once,
             "a requeued annotated entry is not double-annotated"
         );
+        assert_eq!(
+            msg.message_metadata, stamped_once,
+            "a requeued entry keeps its first-delivery queueInfo"
+        );
+    }
+
+    #[test]
+    fn queue_info_merges_into_existing_metadata() {
+        // An entry enqueued with metadata (e.g. a parent wake's
+        // `event_notification` tag) keeps its fields; queueInfo is additive.
+        let mut msg = queued_msg("tagged", "2026-01-01T00:00:00Z", false);
+        msg.message_metadata = Some(json!({ "type": "event_notification" }));
+        super::super::annotate_dequeue_wait(&mut msg);
+        let md = msg.message_metadata.as_ref().unwrap();
+        assert_eq!(md["type"], "event_notification", "existing fields kept");
+        assert_eq!(md["queueInfo"]["queuedAt"], "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn existing_queue_info_is_never_overwritten() {
+        // Belt-and-braces beyond the content-prefix guard: even if the note
+        // is absent, a pre-existing queueInfo keeps its original numbers.
+        let original = json!({ "queuedAt": "2026-01-01T00:00:00Z", "waitedMs": 42 });
+        let mut msg = queued_msg("kept", "2026-02-02T00:00:00Z", false);
+        msg.message_metadata = Some(json!({ "queueInfo": original.clone() }));
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(
+            msg.message_metadata.as_ref().unwrap()["queueInfo"],
+            original,
+            "first-delivery queueInfo stays"
+        );
+    }
+
+    #[test]
+    fn negative_wait_clamps_to_zero() {
+        // Clock skew: an entry "queued in the future" clamps to 0, matching
+        // the content note's `0s`.
+        let mut msg = queued_msg("skewed", "2999-01-01T00:00:00Z", false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert!(msg.content.contains("waited 0s"), "{}", msg.content);
+        let md = msg.message_metadata.as_ref().unwrap();
+        assert_eq!(md["queueInfo"]["waitedMs"], 0);
     }
 
     #[test]
@@ -8268,6 +8318,10 @@ mod dequeue_wait_tests {
             msg.content, "already persisted",
             "persisted rows are never rewritten"
         );
+        assert_eq!(
+            msg.message_metadata, None,
+            "persisted rows are never stamped"
+        );
     }
 
     #[test]
@@ -8275,6 +8329,10 @@ mod dequeue_wait_tests {
         let mut msg = queued_msg("hello", "not-a-timestamp", false);
         super::super::annotate_dequeue_wait(&mut msg);
         assert_eq!(msg.content, "hello", "unparseable queued_at → no note");
+        assert_eq!(
+            msg.message_metadata, None,
+            "unparseable queued_at → no queueInfo stamp"
+        );
     }
 
     #[test]
@@ -8328,6 +8386,16 @@ mod dequeue_wait_tests {
         assert!(
             text.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
             "dequeue-wait note appended: {text}"
+        );
+        // The structured queueInfo stamp reaches the persisted row metadata.
+        let md = row.metadata.as_ref().expect("row carries queueInfo");
+        assert!(
+            md["queueInfo"]["queuedAt"].as_str().is_some(),
+            "queuedAt is the entry's ISO enqueue timestamp: {md}"
+        );
+        assert!(
+            md["queueInfo"]["waitedMs"].as_u64().is_some(),
+            "waitedMs is a non-negative integer: {md}"
         );
     }
 
