@@ -2,8 +2,9 @@
 //!
 //! Thin JS wrappers around `host({ method, args })` that route to the shared
 //! [`WorkspaceApi`] event surface (§5.10). The subscribe wildcard `"*"` is
-//! expanded here — parity with the reference `ws-event-api.ts` — into the
-//! documented category list before it reaches the daemon.
+//! passed through to the daemon, which expands it per-subscriber: agent
+//! callers get the non-agent categories only (monorepo#1229 — agent events
+//! are watched via `ws.agent.watch`, not the event bus).
 
 use std::sync::Arc;
 
@@ -11,23 +12,6 @@ use intent_core::{AgentId, EventQueryParams, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
-
-/// Category wildcards the reference `ws.event.subscribe` expands `"*"` into.
-/// Kept in-sync with `VALID_EVENT_CATEGORY_WILDCARDS` in the TS builder.
-const VALID_EVENT_CATEGORY_WILDCARDS: &[&str] = &[
-    "agent:*",
-    "file:*",
-    "task:*",
-    "git:*",
-    "note:*",
-    "terminal:*",
-    "test:*",
-    "build:*",
-    "workspace:*",
-    "spec:*",
-    "goal:*",
-    "comment:*",
-];
 
 pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
@@ -143,19 +127,18 @@ async fn subscribe(
     args: &Value,
 ) -> Result<Value, String> {
     let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
-        "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string()
+        "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string()
     })?;
     if event_types.is_empty() {
         return Err(
-            "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+            "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\". Agent events are not subscribable — use ws.agent.watch(agentId) instead.".to_string(),
         );
     }
-    let resolved = expand_wildcards(&event_types);
     let r = api
         .event_subscribe(
             ws.clone(),
             caller.cloned(),
-            resolved,
+            event_types,
             opt_bool(args, "excludeSelf"),
             args.get("batchWindow").and_then(Value::as_i64),
         )
@@ -176,16 +159,4 @@ async fn unsubscribe(
         .await
         .map_err(map_err)?;
     serde_json::to_value(r).map_err(|e| e.to_string())
-}
-
-fn expand_wildcards(event_types: &[String]) -> Vec<String> {
-    let mut resolved = Vec::with_capacity(event_types.len());
-    for t in event_types {
-        if t == "*" {
-            resolved.extend(VALID_EVENT_CATEGORY_WILDCARDS.iter().map(|s| s.to_string()));
-        } else {
-            resolved.push(t.clone());
-        }
-    }
-    resolved
 }

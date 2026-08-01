@@ -3766,10 +3766,10 @@ impl Services {
         // the request is still pending — a parent reply before settlement
         // clears the fields and retires the fold. Non-delegated callers have
         // no parent to wake.
-        if let Some(parent) = parent {
+        if let Some(parent) = &parent {
             let parent_home_ws = self
                 .store
-                .get_agent_session(&parent)
+                .get_agent_session(parent)
                 .await
                 .map(|s| s.workspace_id)
                 .unwrap_or_else(|_| workspace_id.clone());
@@ -3805,6 +3805,53 @@ impl Services {
                     parent = %parent.0,
                     child = %caller.0,
                     "failed to deliver attention-request wake to parent"
+                );
+            }
+        }
+        // 6. monorepo#1229: attention fan-out to explicit `agent.watch`
+        // watchers (`wake_on_attention`). The caller's parent is excluded —
+        // step 5 already woke it directly — so a parent that ALSO explicitly
+        // watches its child never receives a duplicate attention wake.
+        // Watches are left in place (attention is not a completion).
+        for watch in self
+            .find_watches_for_child(&caller)
+            .into_iter()
+            .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
+        {
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {}",
+                session.name, caller.0, wake_verb, reason
+            );
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
+                    "timestamp": saved_at,
+                    "data": attention_data,
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            if let Err(e) = self
+                .deliver_parent_wake(
+                    &watch.parent_workspace_id,
+                    watch.parent_agent_id.clone(),
+                    wake_text,
+                    Some(metadata),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    watcher = %watch.parent_agent_id.0,
+                    child = %caller.0,
+                    "failed to deliver attention-request wake to watcher"
                 );
             }
         }
@@ -4589,6 +4636,114 @@ impl Services {
         self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
             .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))
+    }
+
+    /// `agent.watch` (monorepo#1229): explicit, PERSISTENT caller→target
+    /// subscription to the target's harness-curated completion set —
+    /// idle/completed, failed, deleted, blocker raised, discussion
+    /// requested. Unlike the auto-registered delegation/SUB-1 watches this
+    /// watch is non-oneShot (it survives each delivery until the target is
+    /// deleted or the caller unwatches) and `wake_on_attention` (the
+    /// attention fan-out in `agent_request_attention_op` wakes it). The
+    /// registration is durably persisted before returning. Fails closed on
+    /// a nonexistent target and rejects self-watching; the shared
+    /// `check_watch_scope` gate rejects cross-workspace targets for
+    /// non-chief callers.
+    pub(crate) async fn agent_watch_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<Value> {
+        if caller_agent_id == target_agent_id {
+            return Err(Error::InvalidParams("cannot watch yourself".to_string()));
+        }
+        let target_session = self.require_agent_session(&target_agent_id).await?;
+        if target_session.status == AgentStatus::Deleted {
+            return Err(Error::InvalidParams(format!(
+                "unknown agent id: {}",
+                target_agent_id.0
+            )));
+        }
+        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        let caller_name = caller_session.as_ref().map(|s| s.name.clone());
+        // Anchor the watch in the caller's HOME workspace (falls back to the
+        // call's workspace when the session lookup failed), mirroring
+        // `agent_watch_completion_op`.
+        let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
+        let caller_home_ws = resolved_home.unwrap_or_else(|| workspace_id.clone());
+        let target_ws = target_session.workspace_id;
+        let id = self
+            .register_agent_watch_durable(
+                &caller_home_ws,
+                &target_ws,
+                caller_agent_id.clone(),
+                caller_name.unwrap_or_default(),
+                target_agent_id.clone(),
+            )
+            .await?;
+        self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
+            .await;
+        // Close the registration-time race: a target that already settled
+        // delivers its synthetic completion immediately (same reconciliation
+        // path as `app.agents.waitFor` / startup rehydration).
+        self.reconcile_watch_child_on_rehydration(&target_agent_id, &target_ws)
+            .await;
+        Ok(json!({
+            "ok": true,
+            "subscriptionId": id,
+            "agentId": target_agent_id.0,
+        }))
+    }
+
+    /// `agent.unwatch` (monorepo#1229): remove one of the caller's own
+    /// completion watches — addressed by `subscriptionId` or by the watched
+    /// `agentId`. A watch owned by another agent is rejected with `-32602`
+    /// (never removed); grouped watches are owned by delegation-group
+    /// settlement and are rejected too. Idempotent on the agentId form: no
+    /// matching watch returns `{ ok: true, removed: false }`.
+    pub(crate) async fn agent_unwatch_op(
+        &self,
+        _workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        subscription_id: Option<String>,
+        target_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        let watches = self.list_watches_for_parent(&caller_agent_id);
+        let watch = match (&subscription_id, &target_agent_id) {
+            (Some(id), _) => {
+                let Some(w) = watches.iter().find(|w| &w.id == id) else {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown subscription id: {id} (not owned by caller)"
+                    )));
+                };
+                Some(w)
+            }
+            (None, Some(target)) => watches
+                .iter()
+                .find(|w| &w.child_agent_id == target && w.group_id.is_none()),
+            (None, None) => {
+                return Err(Error::InvalidParams(
+                    "subscriptionId or agentId is required".to_string(),
+                ));
+            }
+        };
+        let Some(watch) = watch else {
+            return Ok(json!({ "ok": true, "removed": false }));
+        };
+        if watch.group_id.is_some() {
+            return Err(Error::InvalidParams(
+                "cannot unwatch a delegation-group watch; use \
+                 agent.cancelSubscriptions with groupId instead"
+                    .to_string(),
+            ));
+        }
+        let removed = self.remove_watch(&watch.id);
+        if removed {
+            self.publish_subscriptions_changed(&watch.parent_workspace_id, &caller_agent_id)
+                .await;
+        }
+        Ok(json!({ "ok": true, "removed": removed }))
     }
 
     /// `app.agents.waitFor`: register completion watches for the caller on a

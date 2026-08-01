@@ -83,6 +83,13 @@ pub(crate) struct CompletionWatch {
     /// still delivers for `agent:failed` / `agent:deleted` (failure after
     /// reporting is a new signal, not a duplicate).
     pub report_delivered: bool,
+    /// Explicit `agent.watch` registration (monorepo#1229): the watcher is
+    /// also woken when the child raises an attention request
+    /// (`agent.reportBlocker` / `agent.requestDiscussion`). Auto-registered
+    /// watches (delegation, SUB-1 sender watches) leave this `false`; the
+    /// child's parent is excluded from the attention fan-out because
+    /// `agent_request_attention_op` already wakes it directly.
+    pub wake_on_attention: bool,
 }
 
 /// Fan-in table for `waitMode: "after_all"` delegation groups. All children a
@@ -181,6 +188,7 @@ impl Services {
             child_agent_id,
             one_shot,
             group_id,
+            false,
         )?;
         // Write-through persist (best-effort) so the watch survives a daemon
         // restart (rehydrated by `heal_completion_watches_on_startup`). On the
@@ -219,6 +227,39 @@ impl Services {
             child_agent_id,
             one_shot,
             group_id,
+            false,
+        )?;
+        let id = watch.id.clone();
+        let persisted = completion_watch_to_persisted(&watch);
+        if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
+            tracing::warn!("completion_watch upsert failed {id}: {e}");
+        }
+        Ok(id)
+    }
+
+    /// Explicit `agent.watch` registration (monorepo#1229): a PERSISTENT
+    /// (non-oneShot) ungrouped watch that also wakes on the child's attention
+    /// requests, with an AWAITED persist (the registration is the caller's
+    /// durable contract). Adoption strengthens an existing watch for the pair
+    /// (oneShot cleared, `wake_on_attention` set) — grouped watches keep
+    /// their group but gain the attention flag.
+    pub(crate) async fn register_agent_watch_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+    ) -> Result<String> {
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            false,
+            None,
+            true,
         )?;
         let id = watch.id.clone();
         let persisted = completion_watch_to_persisted(&watch);
@@ -244,6 +285,9 @@ impl Services {
     /// - A non-oneShot ungrouped request upgrades an existing oneShot watch
     ///   (a queued wake must survive the current `agent:idle`); a oneShot
     ///   request never degrades a non-oneShot watch.
+    /// - `wake_on_attention` is strengthen-only too: an explicit
+    ///   `agent.watch` sets it on the adopted watch; a later auto
+    ///   registration never clears it.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -254,6 +298,7 @@ impl Services {
         child_agent_id: AgentId,
         one_shot: bool,
         group_id: Option<String>,
+        wake_on_attention: bool,
     ) -> Result<CompletionWatch> {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
         let watch = {
@@ -275,6 +320,7 @@ impl Services {
                 } else if existing.group_id.is_none() {
                     existing.one_shot = existing.one_shot && one_shot;
                 }
+                existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
                 // Refresh the parent display name and home-workspace anchor
                 // from the current registration (mirroring
                 // `find_and_refresh_ungrouped_watch`): a watch created with
@@ -302,6 +348,7 @@ impl Services {
                     created_at: now_iso(),
                     cleanup_deadline: None,
                     report_delivered: false,
+                    wake_on_attention,
                 };
                 guard.subscriptions.push(watch.clone());
                 watch
@@ -1829,6 +1876,7 @@ fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletion
         one_shot: watch.one_shot,
         group_id: watch.group_id.clone(),
         report_delivered: watch.report_delivered,
+        wake_on_attention: watch.wake_on_attention,
         deadline_at_ms: watch.cleanup_deadline.map(instant_to_epoch_ms),
         created_at: watch.created_at.clone(),
     }
@@ -1851,6 +1899,7 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         created_at: p.created_at.clone(),
         cleanup_deadline: None,
         report_delivered: p.report_delivered,
+        wake_on_attention: p.wake_on_attention,
     }
 }
 

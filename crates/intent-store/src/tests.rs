@@ -95,7 +95,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71
+            69, 70, 71, 72
         ]
     );
     assert_eq!(
@@ -104,7 +104,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71
+            69, 70, 71, 72
         ]
     );
 }
@@ -4422,11 +4422,14 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
 /// Concurrent write + read stress test: verify that the single-writer pool
 /// eliminates SQLITE_BUSY (code 5) errors under heavy concurrent load.
 /// Spawns ~50 concurrent writes + concurrent reads; all must succeed without
-/// busy_timeout errors, and reads must stay fast while writes are in flight.
+/// busy_timeout errors, and no read may be latency-coupled to the write storm
+/// (which is what a shared read/write pool regression looks like).
 #[tokio::test]
 async fn concurrent_writes_no_sqlite_busy() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
+
+    let storm_start = std::time::Instant::now();
 
     // Spawn 50 concurrent single-row writes
     let write_handles: Vec<_> = (0..50)
@@ -4480,12 +4483,18 @@ async fn concurrent_writes_no_sqlite_busy() {
         })
         .collect();
 
-    // Spawn 50 concurrent reads (list workspaces) and time them
-    let read_start = std::time::Instant::now();
+    // Spawn 50 concurrent reads (list workspaces); each measures its own
+    // completion latency so the read bound is not inflated by waiting on the
+    // write joins below (the 50 fsync-heavy writes can take a while on a
+    // loaded host).
     let read_handles: Vec<_> = (0..50)
         .map(|_| {
             let store = store.clone();
-            tokio::spawn(async move { store.list_workspaces(false).await.map(|ws| ws.len()) })
+            let started = std::time::Instant::now();
+            tokio::spawn(async move {
+                let result = store.list_workspaces(false).await.map(|ws| ws.len());
+                (result, started.elapsed())
+            })
         })
         .collect();
 
@@ -4498,17 +4507,27 @@ async fn concurrent_writes_no_sqlite_busy() {
             result
         );
     }
+    let write_storm = storm_start.elapsed();
 
-    // All reads must succeed and stay fast (complete in < 5s even with writes in flight)
+    // All reads must succeed, and none may be latency-coupled to the write
+    // storm. The budget is relative to the measured storm duration (floor 5s)
+    // rather than an absolute wall-clock bound: on a CI box co-tenant with
+    // other heavy jobs (monorepo#1239) fsync/scheduler contention slows
+    // everything uniformly, but only a shared-pool regression makes reads
+    // queue behind the writers and finish with the storm.
+    let mut slowest_read = std::time::Duration::ZERO;
     for handle in read_handles {
-        let result = handle.await.unwrap();
+        let (result, elapsed) = handle.await.unwrap();
         assert!(result.is_ok(), "Read failed: {:?}", result);
+        slowest_read = slowest_read.max(elapsed);
     }
-    let read_elapsed = read_start.elapsed();
+    let read_budget = std::cmp::max(std::time::Duration::from_secs(5), write_storm / 2);
     assert!(
-        read_elapsed.as_secs() < 5,
-        "Reads took too long: {:?} (writes blocking readers?)",
-        read_elapsed
+        slowest_read < read_budget,
+        "Slowest read took {:?} (budget {:?}, write storm {:?}) — reads queueing behind writers?",
+        slowest_read,
+        read_budget,
+        write_storm
     );
 
     // Verify all 50 workspaces were written

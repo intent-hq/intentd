@@ -15,6 +15,11 @@
 # intent-hq/intentd-releases repo, together with a beta.json whose platform
 # URLs point at the mirrored assets. The beta.json published on this repo is
 # unchanged (sitter fallback path + future open-source path).
+#
+# When the MONOREPO_ISSUES_TOKEN secret is configured, monorepo issues
+# referenced by commits/PRs in (previous tag, released tag] also get a
+# fail-soft "Fixed in intentd vX.Y.Z (beta)" comment
+# (scripts/notify-fixed-issues.sh).
 name: Publish channel manifest
 
 on:
@@ -26,10 +31,15 @@ on:
 
 jobs:
   publish-channel-manifest:
-    runs-on: [self-hosted, Linux, X64]
+    # TEMPORARY(tinybox offline): revert to [self-hosted, Linux, X64] when
+    # tinybox is back — see monorepo#1239/#1253.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      # The notifier script reads squash-merged PR bodies on this repo via
+      # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
+      pull-requests: read
     # Serialize beta.json updates so two tags pushed close together cannot
     # interleave and leave the manifest pointing at the older release.
     concurrency:
@@ -62,6 +72,53 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh beta beta.json
+      # --- Issue notifier: comment on fixed monorepo issues ---
+      # Fail-soft: skipped with a warning when the MONOREPO_ISSUES_TOKEN
+      # secret is not configured, and continue-on-error so a notification
+      # failure never blocks the release.
+      - name: Check issues token
+        id: notify-token
+        shell: bash
+        env:
+          MONOREPO_ISSUES_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: |
+          if [[ -n "$MONOREPO_ISSUES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::MONOREPO_ISSUES_TOKEN secret is not configured; skipping fixed-issue notifications"
+          fi
+      - name: Notify fixed monorepo issues (beta)
+        if: steps.notify-token.outputs.enabled == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          ISSUES_GH_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
+        run: |
+          # Validate before echoing: the tag came from the dist plan
+          # (log-injection posture as elsewhere in this repo).
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::warning::Announced tag is not a plain semver tag; skipping fixed-issue notifications"
+            exit 0
+          fi
+          # The dist checkout is shallow; the notifier needs full history and
+          # tags to compute the previous tag and scan the commit range.
+          git fetch --quiet --tags --unshallow 2>/dev/null || git fetch --quiet --tags
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::warning::Tag $TAG not found in checkout; skipping fixed-issue notifications"
+            exit 0
+          fi
+          # Previous semver tag before the announced one (version order).
+          prev=$(git tag --list \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            | sort -V \
+            | awk -v tag="$TAG" '$0 == tag { exit } { prev = $0 } END { print prev }')
+          if [[ -z "$prev" ]]; then
+            echo "::warning::No semver tag before $TAG (first release?); skipping fixed-issue notifications"
+            exit 0
+          fi
+          ./scripts/notify-fixed-issues.sh intentd "${TAG#v}" beta "$prev" "$TAG"
       # --- Public mirror: intent-hq/intentd-releases ---
       # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
       # configured, so a missing secret never blocks the release itself.
