@@ -153,23 +153,29 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     let subscriber = create_agent(&mut rpc, 2, &ws_id, "Watcher").await;
 
     // The guard over the wire (monorepo#1229): an agent-owned subscription to
-    // `agent:*` is rejected with an error pointing at ws.agent.watch.
-    let err = wss_rpc_raw(
-        &mut rpc,
-        3,
-        "agent.subscribe",
-        json!({
-            "workspaceId": ws_id,
-            "agentId": subscriber,
-            "eventTypes": ["agent:*"],
-        }),
-    )
-    .await;
-    let msg = err["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        msg.contains("ws.agent.watch"),
-        "agent:* must be rejected for agent subscribers: {err}"
-    );
+    // the `agent:*` wildcard or an exact agent event type is rejected with an
+    // error pointing at ws.agent.watch.
+    for (i, event_type) in ["agent:*", "agent:message", "agent:tool:call"]
+        .iter()
+        .enumerate()
+    {
+        let err = wss_rpc_raw(
+            &mut rpc,
+            200 + i as i64,
+            "agent.subscribe",
+            json!({
+                "workspaceId": ws_id,
+                "agentId": subscriber,
+                "eventTypes": [event_type],
+            }),
+        )
+        .await;
+        let msg = err["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("ws.agent.watch"),
+            "{event_type} must be rejected for agent subscribers: {err}"
+        );
+    }
 
     // Subscribe with the subscriber identity and a short batch window
     // (PROTOCOL §5.5 request shape + monorepo#937 `agentId`).
@@ -257,6 +263,73 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     assert!(
         err.get("error").is_some(),
         "unknown subscription must error"
+    );
+}
+
+/// Bare `*` expansion over the wire (monorepo#1229): an agent-owned
+/// subscription silently narrows to the non-agent categories (no `agent:*`,
+/// no `chat:stream:delta`), while a front-door subscription (no `agentId`)
+/// keeps the full category expansion including `agent:*`.
+#[tokio::test]
+async fn bare_star_expansion_narrows_for_agent_subscribers_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "Bare-star narrowing e2e", "path": "." }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+    let subscriber = create_agent(&mut rpc, 2, &ws_id, "Watcher").await;
+
+    let sub = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["*"],
+        }),
+    )
+    .await;
+    let types: Vec<&str> = sub["eventTypes"]
+        .as_array()
+        .expect("eventTypes array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !types.contains(&"agent:*") && !types.contains(&"chat:stream:delta"),
+        "agent subscriber's bare * must exclude agent events: {types:?}"
+    );
+    for expected in ["file:*", "task:*", "note:*", "workspace:*"] {
+        assert!(
+            types.contains(&expected),
+            "agent subscriber's bare * keeps {expected}: {types:?}"
+        );
+    }
+
+    // Front door (no agentId): the full expansion, `agent:*` included.
+    let sub = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.subscribe",
+        json!({ "workspaceId": ws_id, "eventTypes": ["*"] }),
+    )
+    .await;
+    let types: Vec<&str> = sub["eventTypes"]
+        .as_array()
+        .expect("eventTypes array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        types.contains(&"agent:*"),
+        "front-door bare * keeps agent:*: {types:?}"
     );
 }
 
