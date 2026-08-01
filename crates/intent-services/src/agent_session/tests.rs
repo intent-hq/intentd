@@ -1777,6 +1777,190 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
 }
 
+/// Question resource content-block array — the tail shape
+/// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
+/// over the transcript-mutation ops below.
+fn question_blocks() -> Value {
+    json!([{
+        "type": "resource",
+        "resource": {
+            "uri": "intent-question://q-1266",
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "text": "{\"questions\":[]}"
+        }
+    }])
+}
+
+/// The `workspace:displayStatus-changed`-only subscription the monorepo#1266
+/// regression tests below assert against.
+fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["workspace:displayStatus-changed".to_string()],
+        ..Default::default()
+    })
+}
+
+/// monorepo#1266 regression (retire): a user row appended via
+/// `agent.appendMessage` supersedes a pending question tail, so the op's own
+/// recompute must retire the workspace's `needs_attention` displayStatus —
+/// not leave it stale until the next trigger or snapshot.
+#[tokio::test]
+async fn append_message_op_user_row_retires_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed a question-bearing assistant tail, then the last-observed
+    // baseline (needs_attention; a first observation never emits).
+    bus.store()
+        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question tail");
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer" }]),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+}
+
+/// monorepo#1266 regression (raise): an assistant row with a trailing
+/// question resource block appended via `agent.appendMessage` activates the
+/// question hold, so the op's own recompute must promote the workspace's
+/// displayStatus to `needs_attention` and emit the transition.
+#[tokio::test]
+async fn append_message_op_question_row_raises_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (idle; a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+}
+
+/// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
+/// transcript, which can move the question-hold derivation in either
+/// direction — a question-free swap retires `needs_attention`, a swap ending
+/// on a question-bearing assistant row raises it again. Both flips must emit.
+#[tokio::test]
+async fn replace_messages_op_moves_needs_attention_both_ways() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed a question-bearing tail, then the baseline (needs_attention).
+    bus.store()
+        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question tail");
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    // Retire: the swapped transcript ends on a user row.
+    services
+        .agent_replace_messages_op(
+            agent_id.clone(),
+            json!([
+                { "role": "assistant", "contentBlocks": question_blocks() },
+                { "role": "user", "contentBlocks": [{ "type": "text", "text": "answer" }] },
+            ]),
+        )
+        .await
+        .expect("replaceMessages succeeds");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+
+    // Raise: swap back to a transcript ending on a question-bearing row.
+    services
+        .agent_replace_messages_op(
+            agent_id.clone(),
+            json!([{ "role": "assistant", "contentBlocks": question_blocks() }]),
+        )
+        .await
+        .expect("replaceMessages succeeds");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+}
+
+/// monorepo#1266 transition-only guard: an `agent.appendMessage` mutation
+/// that does NOT move the derivation (a user row onto an already-hold-free
+/// transcript) recomputes silently — no `workspace:displayStatus-changed`.
+#[tokio::test]
+async fn append_message_op_without_derivation_change_emits_nothing() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (idle; a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "note to self" }]),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    assert!(
+        timeout(Duration::from_millis(750), sub.recv())
+            .await
+            .is_err(),
+        "no displayStatus event for a derivation-preserving mutation"
+    );
+}
+
 /// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
 /// never saw (the abort echo a cancelled child emits after an interrupt: no
 /// title/rawInput → derived name "") must NOT fabricate an anonymous
