@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.16] - 2026-08-01
+
+### 🚀 Features
+
+- Persist and serve lastMessageRole on AgentLite ([#807](https://github.com/intent-hq/intentd/pull/807))
+- Sticky attention-state for child/background agents + failure timestamps ([#810](https://github.com/intent-hq/intentd/pull/810))
+- Agent-facing queue visibility, single-pending-message guard, dequeue annotation ([#816](https://github.com/intent-hq/intentd/pull/816))
+- Restrict agent event subscriptions and add ws.agent.watch/unwatch (intent-hq/monorepo#1229)
+- Adjustable workspace_api output limit + TOON encoding ([#819](https://github.com/intent-hq/intentd/pull/819))
+- Needs_attention workspace displayStatus ([#825](https://github.com/intent-hq/intentd/pull/825))
+
+### 🐛 Bug Fixes
+
+- Omit exited and script-owned PTYs from terminal.list ([#745](https://github.com/intent-hq/intentd/pull/745))
+
+### 🧪 Testing
+
+- Wss e2e for foreground automatic-delivery attention negative case (monorepo#1237)
+- Make pool-contention stress budgets co-tenancy-safe (monorepo#1239) ([#818](https://github.com/intent-hq/intentd/pull/818))
+
+
 ## [0.2.15] - 2026-07-31
 
 ### 🚀 Features
