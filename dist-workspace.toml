@@ -42,10 +42,11 @@ github-build-setup = "../dist-build-setup.yml"
 # can't read back ("stream did not contain valid UTF-8"). Move it back to
 # 5090pc once pwsh 7 is installed there.
 #
-# The global jobs (plan / build-global-artifacts / host / announce) run on
-# GitHub-hosted runners instead: `plan` runs on every PR and the rest
-# fire at release time, so keeping them off tinybox isolates them from its
-# single-slot queue — the same rationale as ci.yml's route/burst pattern.
+# The global jobs (plan / build-global-artifacts / host / announce) also
+# run on tinybox: they sat on GitHub-hosted runners while tinybox had a
+# single slot (`plan` runs on every PR and queueing it behind the heavy CI
+# jobs was the intentd#805 rationale), but with 8 tinybox slots that
+# queue-isolation concern is gone.
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
@@ -54,7 +55,7 @@ github-build-setup = "../dist-build-setup.yml"
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "ubuntu-latest"
+global = "tinybox"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "m1mac"
