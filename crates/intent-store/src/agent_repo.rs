@@ -22,7 +22,8 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason";
+    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
+    stop_reason_timestamp";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
@@ -367,7 +368,8 @@ fn bind_session_insert<'q>(
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
-        .bind(&s.stop_reason))
+        .bind(&s.stop_reason)
+        .bind(&s.stop_reason_timestamp))
 }
 
 impl Store {
@@ -382,7 +384,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -440,7 +442,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1309,7 +1311,8 @@ impl Store {
              completion_report=?, completion_report_timestamp=?, attention_request_kind=?, \
              attention_request_reason=?, attention_request_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=? \
+             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
+             stop_reason_timestamp=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1341,6 +1344,7 @@ impl Store {
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
+        .bind(&s.stop_reason_timestamp)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.write_pool())
@@ -1401,6 +1405,9 @@ impl Store {
     /// `stop_reason`: `None` leaves the column untouched; `Some(None)` clears it
     /// to NULL; `Some(Some(reason))` sets the new value. This three-way encoding
     /// allows callers to set, clear, or leave unchanged across a status update.
+    /// `stop_reason_timestamp` is coupled to `stop_reason`: setting a reason
+    /// stamps the column with `updated_at`, clearing the reason clears it, and
+    /// leaving the reason untouched leaves the timestamp untouched.
     pub async fn set_agent_session_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -1412,7 +1419,7 @@ impl Store {
     ) -> Result<()> {
         let rows = match stop_reason {
             None => {
-                // Leave stop_reason untouched.
+                // Leave stop_reason (and its timestamp) untouched.
                 sqlx::query(
                     "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
                      WHERE id=? AND workspace_id=?",
@@ -1429,14 +1436,19 @@ impl Store {
             }
             Some(reason) => {
                 // Set or clear stop_reason: Some(None) → NULL, Some(Some(x)) → x.
+                // stop_reason_timestamp is stamped with `updated_at` when a
+                // reason is set and cleared to NULL alongside a cleared reason.
+                let stop_reason_timestamp = reason.is_some().then_some(updated_at);
                 sqlx::query(
-                    "UPDATE agent_session SET status=?, is_active=?, updated_at=?, stop_reason=? \
+                    "UPDATE agent_session SET status=?, is_active=?, updated_at=?, \
+                     stop_reason=?, stop_reason_timestamp=? \
                      WHERE id=? AND workspace_id=?",
                 )
                 .bind(enum_to_db(&status)?)
                 .bind(is_active as i64)
                 .bind(updated_at)
                 .bind(reason)
+                .bind(stop_reason_timestamp)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
                 .execute(self.write_pool())
@@ -1844,6 +1856,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
         stop_reason: col(row, "stop_reason")?,
+        stop_reason_timestamp: col(row, "stop_reason_timestamp")?,
         // Derived on emit by the service layer (monorepo#940); never persisted.
         session_corrupted: false,
         created_at: col(row, "created_at")?,
@@ -2461,6 +2474,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
@@ -2572,6 +2586,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
@@ -2721,6 +2736,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -3819,6 +3835,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store
@@ -3963,6 +3980,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
@@ -4181,6 +4199,7 @@ mod tests {
                 sandbox_path: None,
                 sandbox_branch: None,
                 stop_reason: None,
+                stop_reason_timestamp: None,
                 session_corrupted: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
