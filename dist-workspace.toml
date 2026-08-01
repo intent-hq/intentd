@@ -54,8 +54,14 @@ github-build-setup = "../dist-build-setup.yml"
 # - tinybox runs the musl builds as cross builds from the glibc host triple,
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
+# TEMPORARY(tinybox offline): the Linux runners below (global +
+# x86_64/aarch64 musl) are flipped from "tinybox" to GitHub-hosted while the
+# tinybox host is down — see monorepo#1239/#1253 for context. Revert them to
+# "tinybox" (and re-sync v-release.yml's global runs-on) when it is back.
+# The `host` overrides are unchanged, so the musl cross strategies
+# (cargo-zigbuild / musl-tools from the glibc host triple) are preserved.
 [dist.github-custom-runners]
-global = "tinybox"
+global = "ubuntu-latest"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "m1mac"
@@ -65,11 +71,11 @@ runner = "m1mac"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
-runner = "tinybox"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.aarch64-unknown-linux-musl]
-runner = "tinybox"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]
