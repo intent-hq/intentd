@@ -1498,6 +1498,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Ownership-checked removal for the MCP `ws.agent.removeQueuedMessage`
+    /// binding (PROTOCOL §6.8): removes the entry ONLY when its
+    /// `messageMetadata.fromAgentId` equals `caller_agent_id` — an agent may
+    /// retract its own pending sends but never another sender's (or the
+    /// user's). Unlike the idempotent FE `agent.removeQueuedMessage`, an
+    /// unknown message id is an error. Removal republishes
+    /// `agent:queue:updated` and persists (same path as the FE RPC).
+    fn agent_remove_queued_message_owned(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        caller_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, message_id, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_remove_queued_message_owned not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getQueue`: the agent's pending message queue; `{ success, queue:
     /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
     /// When `workspace_id` is supplied the callee verifies the session belongs
