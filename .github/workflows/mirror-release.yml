@@ -7,7 +7,9 @@
 # Accepts daemon tags ([v]X.Y.Z), sitter tags (sitter-vX.Y.Z), and the fixed
 # sitter-latest release. Mirrors the tag's assets via
 # scripts/mirror-release-assets.sh (idempotent: re-runs re-upload with
-# --clobber; sitter-latest additionally prunes stale assets). Optionally also
+# --clobber; daemon tags also re-sync the mirrored release notes, so re-running
+# backfills notes on releases mirrored before notes were copied; sitter-latest
+# additionally prunes stale assets). Optionally also
 # republishes the beta/stable channel manifests on intentd-releases (daemon
 # tags only), rebuilt with ASSET_REPO so their platform URLs point at the
 # mirrored assets. Each channel republish runs in its own job that shares the
@@ -93,7 +95,9 @@ jobs:
       # Sitter tags get the sitter asset regex + release title/notes matching
       # what release-sitter.yml publishes; sitter-latest also prunes stale
       # assets since that fixed release is refreshed in place. Daemon tags use
-      # the script's daemon defaults.
+      # the script's daemon defaults: notes are copied from the source release
+      # body (download URLs rewritten to the mirror) and re-synced onto an
+      # already-mirrored release, so re-running backfills notes.
       - name: Mirror release assets to intentd-releases
         shell: bash
         env:

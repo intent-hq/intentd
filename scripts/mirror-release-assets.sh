@@ -12,6 +12,14 @@
 # --clobber, so re-runs are idempotent (promote-stable relies on this to
 # backfill releases cut before mirroring existed). Requires: gh, jq.
 #
+# Release notes: when RELEASE_NOTES is not set (daemon tags), the mirror
+# release copies the source release body with asset download URLs rewritten
+# from SOURCE_REPO to DEST_REPO (asset names are identical on the mirror), and
+# re-runs sync those notes onto an already-existing mirror release
+# (mirror-release.yml relies on this to backfill notes). When RELEASE_NOTES is
+# set (sitter tags), the notes are used verbatim at create time only and
+# existing releases are left untouched.
+#
 # Env:
 #   SOURCE_REPO     repo to read the release from (default: intent-hq/intentd)
 #   DEST_REPO       repo to mirror to (required; no default so a local run can
@@ -21,8 +29,10 @@
 #                   (default: daemon platform archives + .sha256 sidecars)
 #   RELEASE_TITLE   title when creating the DEST_REPO release
 #                   (default: "intentd <tag>")
-#   RELEASE_NOTES   notes when creating the DEST_REPO release
-#                   (default: daemon mirror notes)
+#   RELEASE_NOTES   notes for the DEST_REPO release; when unset, the source
+#                   release body is copied with download URLs rewritten to
+#                   DEST_REPO (falling back to a short daemon mirror blurb if
+#                   the source body is empty) and synced on re-runs
 #   PRUNE_STALE     "true" to delete DEST_REPO release assets that match
 #                   ASSET_REGEX but are absent from the source set — for
 #                   refreshed fixed releases (e.g. sitter-latest) where a
@@ -37,7 +47,13 @@ DEST_REPO="${DEST_REPO:?DEST_REPO (owner/repo) must be set}"
 : "${DEST_GH_TOKEN:?DEST_GH_TOKEN must be set (contents:write on DEST_REPO)}"
 ASSET_REGEX="${ASSET_REGEX:-^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)(\\.sha256)?\$}"
 RELEASE_TITLE="${RELEASE_TITLE:-intentd $TAG}"
-RELEASE_NOTES="${RELEASE_NOTES:-Mirror of the $TAG intentd release: platform archives and .sha256 sidecars for the daemon auto-updater.}"
+# Track whether the caller set RELEASE_NOTES: explicit notes (sitter tags) are
+# used verbatim at create time only; otherwise the source body is mirrored and
+# kept in sync on re-runs.
+notes_explicit=false
+if [[ -n "${RELEASE_NOTES:-}" ]]; then
+  notes_explicit=true
+fi
 PRUNE_STALE="${PRUNE_STALE:-false}"
 
 # Daemon tag shapes (same as make-channel-manifest.sh) plus the sitter tags
@@ -51,7 +67,7 @@ if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ \
   exit 1
 fi
 
-release_json=$(gh release view "$TAG" --repo "$SOURCE_REPO" --json assets,isPrerelease,publishedAt)
+release_json=$(gh release view "$TAG" --repo "$SOURCE_REPO" --json assets,body,isPrerelease,publishedAt)
 if [[ -z $(jq -r '.publishedAt // empty' <<<"$release_json") ]]; then
   echo "error: release $TAG on $SOURCE_REPO has no publishedAt (draft/unpublished?)" >&2
   exit 1
@@ -74,13 +90,35 @@ fi
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
+# Assets live in a subdirectory so the notes file is never swept up by the
+# wildcard upload below.
+assets_dir="$tmpdir/assets"
+mkdir -p "$assets_dir"
+
+# Notes go through --notes-file so large markdown bodies survive intact.
+notes_file="$tmpdir/notes.md"
+if [[ "$notes_explicit" == "true" ]]; then
+  printf '%s' "$RELEASE_NOTES" >"$notes_file"
+else
+  # Mirror the source release body, rewriting asset download URLs so the
+  # Download table resolves against the mirrored assets (identical names on
+  # DEST_REPO). Empty body falls back to the short daemon mirror blurb.
+  source_notes=$(jq -r '.body // ""' <<<"$release_json" \
+    | sed "s|github.com/$SOURCE_REPO/releases/download/|github.com/$DEST_REPO/releases/download/|g")
+  if [[ -z "${source_notes//[[:space:]]/}" ]]; then
+    source_notes="Mirror of the $TAG intentd release: platform archives and .sha256 sidecars for the daemon auto-updater."
+  fi
+  printf '%s' "$source_notes" >"$notes_file"
+fi
 
 for asset in "${assets[@]}"; do
   gh release download "$TAG" --repo "$SOURCE_REPO" --pattern "$asset" \
-    --dir "$tmpdir" --clobber
+    --dir "$assets_dir" --clobber
 done
 
+release_exists=true
 if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/null 2>&1; then
+  release_exists=false
   prerelease_args=()
   if [[ "$is_prerelease" == "true" ]]; then
     prerelease_args=(--prerelease)
@@ -92,7 +130,7 @@ if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/
     --latest=false \
     "${prerelease_args[@]}" \
     --title "$RELEASE_TITLE" \
-    --notes "$RELEASE_NOTES"
+    --notes-file "$notes_file"
   then
     # Tolerate only a lost create race (two mirrors close together): the
     # release must exist now; otherwise fail loudly.
@@ -103,6 +141,15 @@ if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/
   fi
 fi
 
+# Sync mirrored notes onto a pre-existing release so re-runs (mirror-release.yml)
+# backfill notes on releases mirrored before notes were copied. Title stays
+# as-is; explicit RELEASE_NOTES keeps its create-only semantics.
+if [[ "$release_exists" == "true" && "$notes_explicit" == "false" ]]; then
+  GH_TOKEN="$DEST_GH_TOKEN" gh release edit "$TAG" \
+    --repo "$DEST_REPO" \
+    --notes-file "$notes_file"
+fi
+
 # Refresh mode: drop dest assets that match the pattern but are gone from the
 # source set, so a refreshed fixed release (sitter-latest) never keeps stale
 # assets that --clobber alone would leave behind.
@@ -111,7 +158,7 @@ if [[ "$PRUNE_STALE" == "true" ]]; then
     | jq -r --arg re "$ASSET_REGEX" '.assets[].name | select(test($re))')
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    if [[ ! -e "$tmpdir/$name" ]]; then
+    if [[ ! -e "$assets_dir/$name" ]]; then
       GH_TOKEN="$DEST_GH_TOKEN" gh release delete-asset "$TAG" "$name" \
         --repo "$DEST_REPO" --yes
       echo "pruned stale asset $name from $DEST_REPO@$TAG" >&2
@@ -120,7 +167,7 @@ if [[ "$PRUNE_STALE" == "true" ]]; then
 fi
 
 GH_TOKEN="$DEST_GH_TOKEN" gh release upload "$TAG" \
-  "$tmpdir"/* \
+  "$assets_dir"/* \
   --repo "$DEST_REPO" \
   --clobber
 echo "mirrored ${#assets[@]} assets from $SOURCE_REPO@$TAG to $DEST_REPO@$TAG" >&2
