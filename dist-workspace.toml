@@ -37,7 +37,7 @@ github-build-setup = "../dist-build-setup.yml"
 # hostname as a label.
 #
 # The global jobs (plan / build-global-artifacts / host / announce) run on
-# WarpBuild ephemeral runners instead: `plan` runs on every PR and the rest
+# GitHub-hosted runners instead: `plan` runs on every PR and the rest
 # fire at release time, so keeping them off tinybox isolates them from its
 # single-slot queue — the same rationale as ci.yml's route/burst pattern.
 #
@@ -48,7 +48,7 @@ github-build-setup = "../dist-build-setup.yml"
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "warp-ubuntu-latest-x64-2x"
+global = "ubuntu-latest"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
 runner = "m1mac"
