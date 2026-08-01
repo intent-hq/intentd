@@ -1981,7 +1981,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// target's harness-curated completion set — idle/completed, failed,
     /// deleted, blocker raised, discussion requested. Unlike the
     /// auto-registered watches this watch also wakes on the target's
-    /// attention requests. Returns `{ ok, subscriptionId, agentId }`.
+    /// attention requests (attention wakes do not consume it). Like every
+    /// ungrouped watch it is deliver-once: the first delivered completion
+    /// retires it, so a caller that wants further completions re-arms with
+    /// another `agent.watch`. Returns `{ ok, subscriptionId, agentId }`.
     fn agent_watch(
         &self,
         workspace_id: WorkspaceId,

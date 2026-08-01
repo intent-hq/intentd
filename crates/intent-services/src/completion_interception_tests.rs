@@ -454,7 +454,7 @@ mod tests {
                 &ws.id,
                 parent_id.clone(),
                 "Parent".to_string(),
-                child_id.clone(), // oneShot
+                child_id.clone(),
                 None,
             )
             .expect("register watch");
@@ -627,7 +627,7 @@ mod tests {
                 &ws.id,
                 parent_id.clone(),
                 "Parent".to_string(),
-                child_id.clone(), // oneShot
+                child_id.clone(),
                 None,
             )
             .expect("register watch");
