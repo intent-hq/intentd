@@ -4630,6 +4630,100 @@ async fn remove_queued_message_is_idempotent_for_unknown_agent() {
     assert_eq!(r["success"], true);
 }
 
+/// Ownership guard for the MCP `ws.agent.removeQueuedMessage` binding: an
+/// agent may retract its OWN pending send (entry `messageMetadata.fromAgentId`
+/// == caller) but never another sender's or the user's.
+#[tokio::test]
+async fn remove_queued_message_owned_removes_own_entry() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let (queued, _) = svc.enqueue_message(
+        &target,
+        "retract me".into(),
+        None,
+        None,
+        Some(json!({
+            "type": "agent_message",
+            "fromAgentId": caller.as_str(),
+            "fromAgentName": "Caller",
+        })),
+        None,
+        false,
+    );
+    let r = svc
+        .agent_remove_queued_message_owned_op(target.clone(), queued.id.clone(), caller)
+        .await
+        .expect("owned remove");
+    assert_eq!(r["success"], true);
+    assert_eq!(r["messageId"], json!(queued.id));
+    assert!(svc.queue_snapshot(&target).is_empty());
+}
+
+#[tokio::test]
+async fn remove_queued_message_owned_rejects_foreign_sender() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let (queued, _) = svc.enqueue_message(
+        &target,
+        "not yours".into(),
+        None,
+        None,
+        Some(json!({
+            "type": "agent_message",
+            "fromAgentId": "agent-someone-else",
+            "fromAgentName": "Other",
+        })),
+        None,
+        false,
+    );
+    let err = svc
+        .agent_remove_queued_message_owned_op(target.clone(), queued.id, caller)
+        .await
+        .expect_err("foreign entry must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("another sender"),
+        "error names the ownership violation: {err}"
+    );
+    assert_eq!(svc.queue_snapshot(&target).len(), 1, "entry untouched");
+}
+
+#[tokio::test]
+async fn remove_queued_message_owned_rejects_user_entry() {
+    // A user/FE-origin entry has no `fromAgentId` attribution — never removable
+    // by an agent caller.
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let queued = svc
+        .agent_queue_message_op(target.clone(), "user entry".into(), None, None)
+        .await
+        .expect("queue");
+    let mid = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let err = svc
+        .agent_remove_queued_message_owned_op(target.clone(), mid, caller)
+        .await
+        .expect_err("user entry must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert_eq!(svc.queue_snapshot(&target).len(), 1, "entry untouched");
+}
+
+#[tokio::test]
+async fn remove_queued_message_owned_unknown_id_errors() {
+    // Unlike the idempotent FE op, the ownership-checked variant surfaces an
+    // error for an unknown message id — the retracting agent needs to know.
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let err = svc
+        .agent_remove_queued_message_owned_op(target, "msg-does-not-exist".into(), caller)
+        .await
+        .expect_err("unknown id must error");
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn queue_message_emits_queue_updated_with_snapshot() {
     // `agent.queueMessage` must publish `agent:queue:updated` carrying the
@@ -6258,6 +6352,98 @@ async fn diagnostics_reports_event_subscriptions() {
         json!(false),
         "a live cross-workspace chief subscriber must not be flagged orphaned"
     );
+}
+
+/// `agent.diagnostics` reports real per-agent queue snapshots instead of a
+/// hardcoded `[]`: entries in drain order (interrupt-priority first), sender
+/// attribution + `queuedAt` preserved, content truncated to 200 chars,
+/// `summary.queuedAgents` counted, the text rendering lines present, the
+/// `agentId` filter respected, and the snapshot empty again after a drain.
+#[tokio::test]
+async fn diagnostics_reports_queue_snapshots() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Loaded").await;
+    let sender = create_agent(&svc, &ws, "Sender").await;
+
+    // Normal FIFO entry with sender attribution, >200-char content, and
+    // bulky image/file payloads that the preview must drop.
+    let long_content = "x".repeat(250);
+    svc.enqueue_message(
+        &target,
+        long_content.clone(),
+        Some(json!([{ "data": "base64-image-payload" }])),
+        Some(json!([{ "data": "base64-file-payload" }])),
+        Some(json!({
+            "type": "agent_message",
+            "fromAgentId": sender.as_str(),
+            "fromAgentName": "Sender",
+        })),
+        None,
+        false,
+    );
+    // A later interrupt-priority entry drains FIRST — the snapshot must list
+    // it ahead of the earlier normal entry.
+    svc.enqueue_message(&target, "urgent".into(), None, None, None, None, true);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["summary"]["queuedAgents"], json!(1));
+    let queues = diag["queues"].as_array().expect("queues array");
+    assert_eq!(queues.len(), 1);
+    let q = &queues[0];
+    assert_eq!(q["agentId"], json!(target.0));
+    assert_eq!(q["agentName"], json!("Loaded"));
+    assert_eq!(q["queueLength"], json!(2));
+    let entries = q["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2);
+    // Drain order: the interrupt entry first, then the normal FIFO entry.
+    assert_eq!(entries[0]["content"], json!("urgent"));
+    assert_eq!(entries[0]["interruptPriority"], json!(true));
+    assert_eq!(entries[0]["position"], json!(0));
+    // Truncation to 200 chars + `…` marker — the full 250-char content is
+    // never embedded, and the marker matches the MCP-side presentation.
+    let preview = entries[1]["content"].as_str().expect("content string");
+    assert_eq!(preview.chars().count(), 201);
+    assert!(preview.ends_with('…'));
+    assert!(long_content.starts_with(preview.trim_end_matches('…')));
+    assert_eq!(entries[1]["position"], json!(1));
+    // Bulky base64 payloads are dropped from the preview.
+    assert!(entries[1].get("imageBlocks").is_none());
+    assert!(entries[1].get("fileBlocks").is_none());
+    // Sender attribution and enqueue time survive the projection.
+    assert_eq!(
+        entries[1]["messageMetadata"]["fromAgentId"],
+        json!(sender.0)
+    );
+    assert!(entries[1]["queuedAt"].is_string());
+    let text = result["text"].as_str().expect("text");
+    assert!(text.contains("Queued agents: 1"), "text: {text}");
+    assert!(text.contains("Pending message queues:"), "text: {text}");
+    assert!(text.contains(&format!("Loaded ({})", target.0)), "{text}");
+
+    // The agentId filter scopes the queue list too.
+    let filtered = svc
+        .agent_diagnostics_op(ws.clone(), Some(sender.clone()), None, None)
+        .await
+        .expect("diagnostics filtered");
+    assert_eq!(filtered["diagnostics"]["queues"], json!([]));
+    assert_eq!(filtered["diagnostics"]["summary"]["queuedAgents"], json!(0));
+
+    // After draining both entries the snapshot is empty again.
+    svc.dequeue_message(&target).expect("drain interrupt");
+    svc.dequeue_message(&target).expect("drain normal");
+    let drained = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics after drain");
+    assert_eq!(drained["diagnostics"]["queues"], json!([]));
+    assert_eq!(drained["diagnostics"]["summary"]["queuedAgents"], json!(0));
+    let text = drained["text"].as_str().expect("text");
+    assert!(text.contains("Queued agents: 0"), "text: {text}");
+    assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
 /// monorepo#947: deleting a workspace drops its event subscriptions — the
