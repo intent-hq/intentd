@@ -301,8 +301,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # install-action derives every path it touches from $HOME: the bin dir
+      # (~/.install-action/bin here — tinybox's cargo lives at /usr/local/bin,
+      # outside $CARGO_HOME/bin, so the action always takes its fallback) and,
+      # crucially, its download scratch dir (~/.install-action/tmp), which is
+      # shared even when the bin dir isn't — so keying CARGO_HOME per slot
+      # would not help. The 8 tinybox slots share one $HOME, and concurrent
+      # installs clobber each other's downloads (curl error 23; monorepo#1239).
+      # Point the action at a per-slot HOME (keyed on $RUNNER_NAME like the
+      # ci-target dirs) so every path it derives is slot-private; only the
+      # install steps see the override, so rustup/CARGO_TARGET_DIR/registry
+      # caches under the real $HOME are untouched, and the action still adds
+      # its (now per-slot) bin dir to GITHUB_PATH for the later steps. Burst
+      # runners are ephemeral single-job machines, so they keep the real HOME.
+      - name: Key install-action dirs per runner slot
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run e2e coverage
         run: |
           cd ${{ github.workspace }}
@@ -388,8 +412,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # Per-slot HOME for install-action — see the coverage-e2e job's comment
+      # for the full rationale (shared ~/.install-action tmp/bin race across
+      # the 8 tinybox slots; monorepo#1239).
+      - name: Key install-action dirs per runner slot
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run combined coverage
         run: |
           cd ${{ github.workspace }}
