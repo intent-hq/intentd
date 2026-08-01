@@ -45,6 +45,7 @@ jobs:
           report node
           report pnpm
           report brew
+          report gh
           if command -v cargo >/dev/null 2>&1; then
             cargo llvm-cov --version >/dev/null 2>&1 \
               && echo "cargo-llvm-cov: $(cargo llvm-cov --version | head -n 1)" \
@@ -55,4 +56,26 @@ jobs:
           else
             echo "cargo-llvm-cov: absent (no cargo)"
             echo "cargo-nextest: absent (no cargo)"
+          fi
+
+      - name: Xcode and iOS simulators
+        run: |
+          if xcodebuild -version >/dev/null 2>&1; then
+            echo "== xcodebuild -version =="
+            xcodebuild -version
+          else
+            echo "xcodebuild: absent (full Xcode not installed)"
+          fi
+          if xcrun simctl help >/dev/null 2>&1; then
+            echo "== iOS runtimes (xcrun simctl list runtimes) =="
+            xcrun simctl list runtimes
+            if xcrun simctl list runtimes 2>/dev/null | grep -q "^iOS "; then
+              echo "iOS platform runtime: present"
+            else
+              echo "iOS platform runtime: absent"
+            fi
+            iphone_count=$(xcrun simctl list devices available 2>/dev/null | grep -c "iPhone" || true)
+            echo "Available iPhone simulators: $iphone_count"
+          else
+            echo "simctl: absent"
           fi
