@@ -7370,6 +7370,9 @@ mod wsapi4_bindings_tests {
         event_dir_calls: Mutex<Vec<DirCall>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
+        /// Raw `agent.getQueue` entries served by `agent_get_queue`.
+        queue_entries: Mutex<Vec<Value>>,
+        remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -7448,6 +7451,29 @@ mod wsapi4_bindings_tests {
                 }
                 Ok(stub_agent(&id, &ws))
             })
+        }
+
+        fn agent_get_queue(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let queue = self.queue_entries.lock().unwrap().clone();
+            Box::pin(async move { Ok(json!({ "success": true, "queue": queue })) })
+        }
+
+        fn agent_remove_queued_message_owned(
+            &self,
+            agent_id: AgentId,
+            message_id: String,
+            caller_agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.remove_queued_owned_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                message_id.clone(),
+                caller_agent_id.as_str().to_string(),
+            ));
+            Box::pin(async move { Ok(json!({ "success": true, "messageId": message_id })) })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -7760,6 +7786,99 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["id"], json!("a-42"));
         assert_eq!(api.agent_get_calls.lock().unwrap()[0], "a-42");
+        // The status result carries the merged (empty) queue view.
+        assert_eq!(v["queueLength"], json!(0));
+        assert_eq!(v["queue"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn agent_status_merges_truncated_queue() {
+        let (srv, api) = server();
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "q-1",
+            "content": "y".repeat(300),
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "a-9", "fromAgentName": "Nine" },
+        })];
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["queueLength"], json!(1));
+        let content = v["queue"][0]["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), 201, "200 chars + ellipsis");
+        assert!(content.ends_with('…'));
+        assert_eq!(v["queue"][0]["fromAgentId"], json!("a-9"));
+        assert_eq!(v["queue"][0]["fromAgentName"], json!("Nine"));
+    }
+
+    #[tokio::test]
+    async fn agent_get_queue_presents_drain_order_and_attribution() {
+        let (srv, api) = server();
+        *api.queue_entries.lock().unwrap() = vec![
+            json!({
+                "id": "q-normal",
+                "content": "normal",
+                "queuedAt": "2026-01-01T00:00:00Z",
+                "position": 0,
+                "messageMetadata": { "fromAgentId": "a-9", "fromAgentName": "Nine" },
+            }),
+            json!({
+                "id": "q-interrupt",
+                "content": "urgent",
+                "queuedAt": "2026-01-01T00:00:01Z",
+                "position": 1,
+                "interruptPriority": true,
+            }),
+        ];
+        let resp = call(&srv, "return await ws.agent.getQueue('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["agentId"], json!("a-42"));
+        assert_eq!(v["queueLength"], json!(2));
+        // Next delivery first: the interrupt entry ahead of normal FIFO.
+        assert_eq!(v["queue"][0]["id"], json!("q-interrupt"));
+        assert_eq!(v["queue"][0]["position"], json!(0));
+        assert_eq!(v["queue"][1]["id"], json!("q-normal"));
+        assert_eq!(v["queue"][1]["fromAgentId"], json!("a-9"));
+        assert!(v["queue"][1].get("messageMetadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_remove_queued_message_forwards_caller_identity() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.removeQueuedMessage('a-42', 'q-7');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["agentId"], json!("a-42"));
+        assert_eq!(v["messageId"], json!("q-7"));
+        let calls = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            (
+                "a-42".to_string(),
+                "q-7".to_string(),
+                "caller-1".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_remove_queued_message_requires_caller() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.removeQueuedMessage('a-42', 'q-7');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

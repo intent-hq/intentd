@@ -15803,6 +15803,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_remove_queued_message_owned(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        caller_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_remove_queued_message_owned_op(agent_id, message_id, caller_agent_id)
+                .await
+        })
+    }
+
     fn agent_get_queue(
         &self,
         agent_id: AgentId,

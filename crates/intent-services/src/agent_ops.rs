@@ -23,6 +23,12 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Per-entry `content` cap (chars) for the shared queue *preview* projection
+/// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
+/// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
+/// untruncated.
+const QUEUE_PREVIEW_MAX_CHARS: usize = 200;
+
 /// Maximum length for caller-supplied message IDs to prevent unbounded storage
 /// and DoS via oversized persisted IDs.
 pub(crate) const MAX_MESSAGE_ID_LEN: usize = 256;
@@ -2865,6 +2871,48 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// Ownership-checked removal for the MCP `ws.agent.removeQueuedMessage`
+    /// binding (PROTOCOL §6.8). Removes the entry ONLY when its
+    /// `messageMetadata.fromAgentId` equals `caller_agent_id`; an entry sent
+    /// by another agent, or by the user/FE (no `fromAgentId` attribution), is
+    /// rejected with `InvalidParams`. Unlike the idempotent FE op above, an
+    /// unknown message id is an error — a retracting agent needs to know its
+    /// target was not found. On success republishes `agent:queue:updated`
+    /// (which also persists) — same path as the FE RPC.
+    pub(crate) async fn agent_remove_queued_message_owned_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        caller_agent_id: AgentId,
+    ) -> Result<Value> {
+        {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let queue = guard
+                .get_mut(&agent_id)
+                .ok_or_else(|| Error::NotFound(format!("queued message {message_id}")))?;
+            let position = queue
+                .iter()
+                .position(|m| m.id == message_id)
+                .ok_or_else(|| Error::NotFound(format!("queued message {message_id}")))?;
+            let from_agent_id = queue[position]
+                .message_metadata
+                .as_ref()
+                .and_then(|md| md.get("fromAgentId"))
+                .and_then(Value::as_str);
+            if from_agent_id != Some(caller_agent_id.as_str()) {
+                return Err(Error::InvalidParams(format!(
+                    "queued message {message_id} belongs to another sender (or the user) and cannot be removed"
+                )));
+            }
+            queue.remove(position);
+        }
+        self.publish_queue_updated(&agent_id).await;
+        Ok(json!({ "success": true, "messageId": message_id }))
+    }
+
     /// Resolve the target agent session, failing closed on a nonexistent id
     /// (monorepo#564): a truncated/mistyped `agentId` must surface a
     /// client-facing `-32602` naming the id instead of silently proceeding
@@ -4993,11 +5041,17 @@ impl Services {
     ///
     /// Ports the TS `buildAgentDiagnosticsSnapshot` shape over the daemon's
     /// (simpler) runtime: completion-watch records back the `subscriptions` view
-    /// and the delegation-group registry backs `delegationGroups`. The daemon
-    /// does not track per-agent event queues, deleted-agent references, or
-    /// delivery health, so `queues`, `deletedAgentReferences`, `recentEvents` are
-    /// empty and `deliveryStats` is zeroed — honestly reflecting what the runtime
-    /// knows about. Returns `{ ok, diagnostics, text }` (`buildToolResponse`).
+    /// and the delegation-group registry backs `delegationGroups`. `queues`
+    /// carries real per-agent pending-message snapshots — one entry per
+    /// in-scope agent with a non-empty queue, each listing its entries in
+    /// drain order via [`Services::queue_snapshot_preview`] (content truncated
+    /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
+    /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// The daemon does not track per-agent event queues, deleted-agent
+    /// references, or delivery health, so `deletedAgentReferences` and
+    /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
+    /// reflecting what the runtime knows about. Returns
+    /// `{ ok, diagnostics, text }` (`buildToolResponse`).
     pub(crate) async fn agent_diagnostics_op(
         &self,
         workspace_id: WorkspaceId,
@@ -5285,6 +5339,27 @@ impl Services {
             agent_rows.push(Value::Object(row));
         }
 
+        // Real per-agent pending-message queue snapshots (drain order, content
+        // truncated) for every in-scope agent with a non-empty queue.
+        let mut queues: Vec<Value> = Vec::new();
+        for id in &all_agent_ids {
+            if !in_scope(id) {
+                continue;
+            }
+            let entries = self.queue_snapshot_preview(&AgentId(id.clone()));
+            if entries.is_empty() {
+                continue;
+            }
+            let mut q = serde_json::Map::new();
+            q.insert("agentId".into(), json!(id));
+            if let Some(s) = session_by_id.get(id) {
+                q.insert("agentName".into(), json!(s.name));
+            }
+            q.insert("queueLength".into(), json!(entries.len()));
+            q.insert("entries".into(), Value::Array(entries));
+            queues.push(Value::Object(q));
+        }
+
         // stuck-risk signals.
         let mut stuck_risks: Vec<Value> = Vec::new();
         for row in &agent_rows {
@@ -5381,7 +5456,7 @@ impl Services {
             "agents": agent_rows.len(),
             "subscriptions": subscriptions.len(),
             "eventSubscriptions": event_subscriptions.len(),
-            "queuedAgents": 0,
+            "queuedAgents": queues.len(),
             "queuedEvents": 0,
             "delegationGroups": delegation_groups.len(),
             "deletedAgents": 0,
@@ -5406,7 +5481,7 @@ impl Services {
             "agents": agent_rows,
             "subscriptions": subscriptions,
             "eventSubscriptions": event_subscriptions,
-            "queues": [],
+            "queues": queues,
             "delegationGroups": delegation_groups,
             "deliveryStats": delivery_stats,
             "deletedAgentReferences": [],
@@ -5423,6 +5498,7 @@ impl Services {
                 "Event subscriptions: {}",
                 diagnostics["summary"]["eventSubscriptions"]
             ),
+            format!("Queued agents: {}", diagnostics["summary"]["queuedAgents"]),
             format!("Queued events: {}", diagnostics["summary"]["queuedEvents"]),
             format!(
                 "Delegation groups: {}",
@@ -5430,6 +5506,18 @@ impl Services {
             ),
             format!("Stuck risks: {}", diagnostics["summary"]["stuckRisks"]),
         ];
+        if let Some(qs) = diagnostics["queues"].as_array() {
+            if !qs.is_empty() {
+                lines.push(String::new());
+                lines.push("Pending message queues:".to_string());
+                for q in qs.iter().take(10) {
+                    let aid = q["agentId"].as_str().unwrap_or_default();
+                    let name = q["agentName"].as_str().unwrap_or(aid);
+                    let len = q["queueLength"].as_u64().unwrap_or(0);
+                    lines.push(format!("- {name} ({aid}): {len} queued message(s)"));
+                }
+            }
+        }
         if let Some(risks) = diagnostics["stuckRisks"].as_array() {
             if !risks.is_empty() {
                 lines.push(String::new());
@@ -6650,6 +6738,28 @@ impl Services {
             .get(agent_id)
             .map(|q| q.iter().enumerate().map(|(i, m)| m.to_value(i)).collect())
             .unwrap_or_default()
+    }
+
+    /// Like [`Services::queue_snapshot`] but with each entry's `content`
+    /// truncated to [`QUEUE_PREVIEW_MAX_CHARS`] chars — the shared preview
+    /// projection for surfaces that embed *other* agents' queues
+    /// (`agent.diagnostics`). Entries keep the stored queue order, which IS
+    /// the drain order (next delivery first: interrupt-priority entries in
+    /// arrival order, then normal FIFO); entries the drain skips surface
+    /// flagged `editing: true` at their stored position rather than being
+    /// excluded.
+    pub(crate) fn queue_snapshot_preview(&self, agent_id: &AgentId) -> Vec<Value> {
+        let mut entries = self.queue_snapshot(agent_id);
+        for entry in &mut entries {
+            let truncated = entry["content"]
+                .as_str()
+                .filter(|c| c.chars().count() > QUEUE_PREVIEW_MAX_CHARS)
+                .map(|c| c.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect::<String>());
+            if let Some(t) = truncated {
+                entry["content"] = Value::String(t);
+            }
+        }
+        entries
     }
 
     /// Write-through persistence of an agent's queue: snapshot the in-memory

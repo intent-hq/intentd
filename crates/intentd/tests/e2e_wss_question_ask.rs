@@ -616,8 +616,9 @@ async fn question_ask_round_trip_over_wss() {
     );
 
     // The mock child logged the exact prompt text it received per turn: the
-    // flattened answers must arrive VERBATIM as the tail of turn 2 (any
-    // per-turn preamble, e.g. a role reminder, precedes the user content).
+    // flattened answers must arrive VERBATIM within turn 2 (any per-turn
+    // preamble, e.g. a role reminder, precedes the user content; the send may
+    // drain via the queue, appending the dequeue-wait system note after it).
     let log = read_prompt_log(&prompt_log);
     assert!(
         log.len() >= 2,
@@ -627,7 +628,7 @@ async fn question_ask_round_trip_over_wss() {
     let (second_turn, second_text) = &log[log.len() - 1];
     assert_eq!(*second_turn, 2, "same child served turn 2 (no respawn)");
     assert!(
-        second_text.ends_with(FLATTENED_ANSWERS),
+        second_text.contains(FLATTENED_ANSWERS),
         "flattened Q:/A: answers delivered verbatim on turn 2: {second_text:?}"
     );
     // Verbatim means UNTRANSFORMED: the multi-line Q:/A: text survives as one
@@ -654,7 +655,12 @@ async fn question_ask_round_trip_over_wss() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .any(|b| b["type"] == "text" && b["text"] == FLATTENED_ANSWERS)
+                    .any(|b| {
+                        b["type"] == "text"
+                            && b["text"]
+                                .as_str()
+                                .is_some_and(|t| t.starts_with(FLATTENED_ANSWERS))
+                    })
         }),
         "answers persisted as a plain user text message: {messages2:?}"
     );

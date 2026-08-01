@@ -40,6 +40,9 @@ pub(crate) const PRELUDE: &str = r#"
         list: (includeCompleted) =>
             host({ method: 'agent.list', args: { includeCompleted } }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
+        getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
+        removeQueuedMessage: (agentId, messageId) =>
+            host({ method: 'agent.removeQueuedMessage', args: { agentId, messageId } }),
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
         wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata) =>
@@ -72,6 +75,8 @@ pub(crate) async fn dispatch(
         "unsubscribe" => unsubscribe(api, ws, args).await,
         "list" => list(api, ws).await,
         "status" => status(api, ws, args).await,
+        "getQueue" => get_queue(api, ws, args).await,
+        "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
         "diagnostics" => diagnostics(api, ws, args).await,
         "wakeOrCreate" => wake_or_create(api, ws, caller, args).await,
         "readConversation" => read_conversation(api, ws, args).await,
@@ -248,6 +253,10 @@ async fn delegate(
     Ok(merge_ok(v))
 }
 
+/// `ws.agent.send`. Guarded by the single-pending-message rule: when the
+/// caller (an agent) already has a pending entry in the target's queue, the
+/// send is refused with an `ok: false` result echoing the target's queue —
+/// see [`pending_send_refusal`].
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -257,6 +266,9 @@ async fn send(
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
+    if let Some(refusal) = pending_send_refusal(api, ws, caller, &agent_id).await {
+        return Ok(refusal);
+    }
     let mut result = api
         .agent_send_message(
             ws.clone(),
@@ -285,6 +297,10 @@ async fn send(
     Ok(out)
 }
 
+/// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
+/// applied against the task's assigned agent (resolution failures fall
+/// through so the unguarded call surfaces its existing error/`ok: false`
+/// shapes — e.g. "No agent assigned to task").
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -294,6 +310,21 @@ async fn send_to_task(
     let task_note_id =
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
+    if caller.is_some() {
+        if let Ok(task) = api
+            .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
+            .await
+        {
+            if let Some(target) = task.assigned_agents.first() {
+                if let Some(mut refusal) = pending_send_refusal(api, ws, caller, target).await {
+                    if let Some(obj) = refusal.as_object_mut() {
+                        obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                    }
+                    return Ok(refusal);
+                }
+            }
+        }
+    }
     let mut result = api
         .agent_send_to_task(
             ws.clone(),
@@ -367,17 +398,80 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
+/// `ws.agent.status` merges the target's pending queue into the result
+/// (`queue` + `queueLength`) — MCP-side only, the wire `AgentLite` shape used
+/// by `agent.get`/`agent.list` is untouched. Queue entries use the
+/// `getQueue` presentation (drain order, lifted attribution) with `content`
+/// truncated to [`STATUS_QUEUE_PREVIEW_MAX_CHARS`] chars (`…` appended).
 async fn status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
     let agent = api
-        .agent_get(AgentId::from(agent_id_str.as_str()), Some(ws.clone()))
+        .agent_get(agent_id.clone(), Some(ws.clone()))
         .await
         .map_err(map_err)?;
-    serde_json::to_value(agent).map_err(|e| e.to_string())
+    let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
+    let queue = fetch_presented_queue(api, ws, &agent_id).await?;
+    let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("queueLength".to_string(), json!(queue.len()));
+        obj.insert("queue".to_string(), Value::Array(queue));
+    }
+    Ok(out)
+}
+
+/// `ws.agent.getQueue`: the target's full pending queue — every entry
+/// regardless of sender — in actual drain order (next delivery first).
+async fn get_queue(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let queue = fetch_presented_queue(api, ws, &agent_id).await?;
+    Ok(json!({
+        "ok": true,
+        "agentId": agent_id_str,
+        "queueLength": queue.len(),
+        "queue": queue,
+    }))
+}
+
+/// `ws.agent.removeQueuedMessage`: retract the caller's OWN pending message
+/// from the target's queue. Ownership-guarded in the service op — an entry
+/// whose `messageMetadata.fromAgentId` is not the caller (another agent's
+/// send, or a user/FE entry with no attribution) is rejected.
+async fn remove_queued_message(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let message_id = req_str(args, "messageId").map_err(|_| "messageId is required".to_string())?;
+    let caller = caller
+        .ok_or_else(|| "removeQueuedMessage requires an agent caller identity".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    // Workspace scoping: same defense-in-depth as getQueue — the target must
+    // resolve inside the caller's workspace before any queue mutation.
+    let _ = api
+        .agent_get(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    let v = api
+        .agent_remove_queued_message_owned(agent_id, message_id.clone(), caller.clone())
+        .await
+        .map_err(map_err)?;
+    let mut out = merge_ok(v);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("agentId".to_string(), json!(agent_id_str));
+    }
+    Ok(out)
 }
 
 async fn diagnostics(
@@ -578,6 +672,154 @@ async fn watch_sender(
     }
 }
 
+/// Max `content` chars per queue entry embedded in `ws.agent.status` (same
+/// preview cap as the services-side `QUEUE_PREVIEW_MAX_CHARS` used by
+/// `agent.diagnostics`).
+const STATUS_QUEUE_PREVIEW_MAX_CHARS: usize = 200;
+
+/// Fetch the target's queue via `agent.getQueue` (workspace-scoped) and
+/// project it into the MCP presentation via [`present_queue`].
+async fn fetch_presented_queue(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Vec<Value>, String> {
+    let v = api
+        .agent_get_queue(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    let raw = v
+        .get("queue")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(present_queue(raw))
+}
+
+/// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
+/// when the caller (an agent) already has a pending entry in the target's
+/// queue, refuse the send instead of stacking a second one. Returns
+/// `Some(refusal)` — a **successful** tool result with `ok: false`, the
+/// target's presented queue (drain order, [`truncate_entry_content`]'d), the
+/// caller's pending entry id, and the instruction to either keep the existing
+/// entry or remove it and re-send one combined message (which lands at the
+/// end of the queue). Returns `None` when the guard does not apply: no agent
+/// caller identity (user/FE-origin sends are never guarded), the queue could
+/// not be fetched (fall through so the unguarded send surfaces its existing
+/// error shapes — e.g. the monorepo#564 unknown-id `-32602`), or the caller
+/// has no pending (non-editing) entry in the queue.
+async fn pending_send_refusal(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    target: &AgentId,
+) -> Option<Value> {
+    let caller = caller?;
+    let queue = fetch_presented_queue(api, ws, target).await.ok()?;
+    let pending_id = caller_pending_entry(&queue, caller)?.to_string();
+    let queue_length = queue.len();
+    let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
+    Some(json!({
+        "ok": false,
+        "agentId": target.as_str(),
+        "error": format!(
+            "send refused: you already have a pending message (id: {pending_id}) in this agent's queue"
+        ),
+        "pendingMessageId": pending_id,
+        "queueLength": queue_length,
+        "queue": queue,
+        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or remove it with ws.agent.removeQueuedMessage(agentId, messageId) and re-send ONE message combining everything you want to say. Note: a re-sent message lands at the END of the queue.",
+    }))
+}
+
+/// The id of the caller's first pending entry in a presented queue
+/// (`fromAgentId` attribution equals the caller), if any. Entries flagged
+/// `editing: true` are SKIPPED — the drain skips them, so they are not
+/// pending deliveries and must not block a send that would deliver now.
+fn caller_pending_entry<'a>(queue: &'a [Value], caller: &AgentId) -> Option<&'a str> {
+    queue.iter().find_map(|e| {
+        let editing = e.get("editing").and_then(Value::as_bool).unwrap_or(false);
+        (!editing && e.get("fromAgentId").and_then(Value::as_str) == Some(caller.as_str()))
+            .then(|| e.get("id").and_then(Value::as_str))
+            .flatten()
+    })
+}
+
+/// Project raw `agent.getQueue` entries into the `ws.agent.getQueue` /
+/// `ws.agent.status` presentation:
+///
+/// - **Drain order** — next delivery first: interrupt-priority entries (in
+///   arrival order among themselves) ahead of normal FIFO entries. The stored
+///   queue order already IS the drain order (interrupt sends park
+///   front-of-queue), so this stable sort is a defensive normalization.
+///   Entries with `editing: true` (skipped by the drain) are NOT excluded:
+///   they sort to the end, explicitly flagged `editing: true`.
+/// - **Attribution lifted top-level** — `fromAgentId?` / `fromAgentName?` are
+///   surfaced from `messageMetadata` when present (absent for user/FE-origin
+///   entries), and the bulky `messageMetadata` / `imageBlocks` / `fileBlocks`
+///   payloads are dropped.
+/// - **`position` renumbered** to the presented order (0 = next delivery).
+fn present_queue(raw: Vec<Value>) -> Vec<Value> {
+    let mut entries = raw;
+    entries.sort_by_key(|e| {
+        let editing = e.get("editing").and_then(Value::as_bool).unwrap_or(false);
+        let interrupt = e
+            .get("interruptPriority")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match (editing, interrupt) {
+            (false, true) => 0u8,
+            (false, false) => 1,
+            (true, _) => 2,
+        }
+    });
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mut out = serde_json::Map::new();
+            for key in ["id", "content", "queuedAt", "turnId"] {
+                if let Some(v) = e.get(key) {
+                    out.insert(key.to_string(), v.clone());
+                }
+            }
+            out.insert("position".to_string(), json!(i));
+            for key in ["interruptPriority", "editing", "requeuedAfterFailure"] {
+                if e.get(key).and_then(Value::as_bool).unwrap_or(false) {
+                    out.insert(key.to_string(), Value::Bool(true));
+                }
+            }
+            if let Some(md) = e.get("messageMetadata") {
+                if let Some(from) = md.get("fromAgentId").and_then(Value::as_str) {
+                    out.insert("fromAgentId".to_string(), json!(from));
+                    if let Some(name) = md.get("fromAgentName").and_then(Value::as_str) {
+                        out.insert("fromAgentName".to_string(), json!(name));
+                    }
+                }
+            }
+            Value::Object(out)
+        })
+        .collect()
+}
+
+/// Truncate a presented queue entry's `content` to
+/// [`STATUS_QUEUE_PREVIEW_MAX_CHARS`] chars, appending `…` when truncated.
+fn truncate_entry_content(mut entry: Value) -> Value {
+    let truncated = entry
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|c| c.chars().count() > STATUS_QUEUE_PREVIEW_MAX_CHARS)
+        .map(|c| {
+            let mut t: String = c.chars().take(STATUS_QUEUE_PREVIEW_MAX_CHARS).collect();
+            t.push('…');
+            t
+        });
+    if let Some(t) = truncated {
+        entry["content"] = Value::String(t);
+    }
+    entry
+}
+
 /// Merge `{ ok: true }` into a daemon-shaped result object (parity with the
 /// TS `buildToolResponse` fallback that always stamps `ok: true`). Non-object
 /// results (e.g. bare arrays) pass through unchanged.
@@ -586,4 +828,153 @@ fn merge_ok(mut v: Value) -> Value {
         obj.entry("ok".to_string()).or_insert(Value::Bool(true));
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, extra: Value) -> Value {
+        let mut v = json!({
+            "id": id,
+            "content": format!("content-{id}"),
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+        });
+        if let (Some(obj), Some(ex)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in ex {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn present_queue_sorts_next_delivery_first() {
+        // Deliberately scrambled input: normal, editing, interrupt, normal.
+        let raw = vec![
+            entry("normal-1", json!({})),
+            entry("editing-1", json!({ "editing": true })),
+            entry("interrupt-1", json!({ "interruptPriority": true })),
+            entry("normal-2", json!({})),
+        ];
+        let out = present_queue(raw);
+        let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["interrupt-1", "normal-1", "normal-2", "editing-1"]);
+        for (i, e) in out.iter().enumerate() {
+            assert_eq!(e["position"], json!(i), "position renumbered: {e}");
+        }
+        assert_eq!(out[0]["interruptPriority"], json!(true));
+        assert_eq!(out[3]["editing"], json!(true));
+    }
+
+    #[test]
+    fn present_queue_keeps_interrupt_arrival_order() {
+        let raw = vec![
+            entry("interrupt-1", json!({ "interruptPriority": true })),
+            entry("interrupt-2", json!({ "interruptPriority": true })),
+            entry("normal-1", json!({})),
+        ];
+        let out = present_queue(raw);
+        let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["interrupt-1", "interrupt-2", "normal-1"]);
+    }
+
+    #[test]
+    fn present_queue_lifts_attribution_and_drops_bulk() {
+        let raw = vec![entry(
+            "attributed",
+            json!({
+                "messageMetadata": {
+                    "type": "agent_message",
+                    "fromAgentId": "agent-abc",
+                    "fromAgentName": "Sender",
+                },
+                "imageBlocks": [{ "type": "image", "data": "x" }],
+            }),
+        )];
+        let out = present_queue(raw);
+        assert_eq!(out[0]["fromAgentId"], json!("agent-abc"));
+        assert_eq!(out[0]["fromAgentName"], json!("Sender"));
+        assert!(out[0].get("messageMetadata").is_none());
+        assert!(out[0].get("imageBlocks").is_none());
+    }
+
+    #[test]
+    fn present_queue_user_entries_have_no_attribution() {
+        let out = present_queue(vec![entry("user-entry", json!({}))]);
+        assert!(out[0].get("fromAgentId").is_none());
+        assert!(out[0].get("fromAgentName").is_none());
+    }
+
+    #[test]
+    fn caller_pending_entry_matches_only_the_caller() {
+        let caller = AgentId::from("agent-caller");
+        let queue = present_queue(vec![
+            entry(
+                "foreign",
+                json!({ "messageMetadata": { "fromAgentId": "agent-other" } }),
+            ),
+            entry("user-entry", json!({})),
+            entry(
+                "own",
+                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+            ),
+        ]);
+        assert_eq!(caller_pending_entry(&queue, &caller), Some("own"));
+        assert_eq!(
+            caller_pending_entry(&queue, &AgentId::from("agent-unrelated")),
+            None,
+            "foreign + user entries never match another caller"
+        );
+        assert_eq!(caller_pending_entry(&[], &caller), None, "empty queue");
+    }
+
+    #[test]
+    fn caller_pending_entry_skips_editing_entries() {
+        let caller = AgentId::from("agent-caller");
+        let queue = present_queue(vec![entry(
+            "own-editing",
+            json!({
+                "editing": true,
+                "messageMetadata": { "fromAgentId": "agent-caller" },
+            }),
+        )]);
+        assert_eq!(
+            caller_pending_entry(&queue, &caller),
+            None,
+            "editing entries are skipped by the drain — not pending deliveries"
+        );
+
+        let queue = present_queue(vec![
+            entry(
+                "own-editing",
+                json!({
+                    "editing": true,
+                    "messageMetadata": { "fromAgentId": "agent-caller" },
+                }),
+            ),
+            entry(
+                "own-pending",
+                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+            ),
+        ]);
+        assert_eq!(
+            caller_pending_entry(&queue, &caller),
+            Some("own-pending"),
+            "the non-editing entry still matches"
+        );
+    }
+
+    #[test]
+    fn truncate_entry_content_caps_at_200_chars() {
+        let long: String = "x".repeat(300);
+        let out = truncate_entry_content(json!({ "id": "e", "content": long }));
+        let content = out["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), STATUS_QUEUE_PREVIEW_MAX_CHARS + 1);
+        assert!(content.ends_with('…'));
+
+        let short = truncate_entry_content(json!({ "id": "e", "content": "short" }));
+        assert_eq!(short["content"], json!("short"));
+    }
 }

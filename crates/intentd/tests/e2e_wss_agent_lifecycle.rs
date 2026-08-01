@@ -5596,7 +5596,12 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("queued message"))
+        })
         .and_then(|m| m["id"].as_str())
         .expect("dequeued user message row present in transcript")
         .to_string();
@@ -5743,7 +5748,12 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "tagged queued message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("tagged queued message"))
+        })
         .expect("drained user message row present");
     assert_eq!(
         tagged["metadata"], metadata,
@@ -5909,7 +5919,12 @@ async fn user_app_message_id_round_trips_over_wss() {
     assert_eq!(row1["metadata"]["userAppMessageId"], "app-msg-direct-1");
     let row2 = messages
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued tagged message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("queued tagged message"))
+        })
         .expect("drained user row present");
     assert_eq!(row2["appMessageId"], "app-msg-queued-2");
     assert_eq!(row2["metadata"]["userAppMessageId"], "app-msg-queued-2");
@@ -8494,6 +8509,27 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "dequeued agent:message event ID matches the second (queued) user message"
     );
 
+    // Dequeue-wait note: the drained entry's delivered content (persisted
+    // user row == provider prompt) carries the enqueue-time annotation;
+    // the direct send was never queued, so its row stays untouched. Stable
+    // prefix of `DEQUEUE_WAIT_NOTE_PREFIX` in `intent-services`'s
+    // agent_manager.
+    const DEQUEUE_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+    let direct_text = serde_json::to_string(&user_messages[0]["contentBlocks"]).unwrap_or_default();
+    assert!(
+        !direct_text.contains(DEQUEUE_NOTE_PREFIX),
+        "immediate delivery is NOT annotated: {direct_text}"
+    );
+    let queued_text = serde_json::to_string(&user_messages[1]["contentBlocks"]).unwrap_or_default();
+    assert!(
+        queued_text.contains(DEQUEUE_NOTE_PREFIX),
+        "the drained message carries the dequeue-wait note: {queued_text}"
+    );
+    assert!(
+        queued_text.contains("before delivery."),
+        "the note names the wait duration: {queued_text}"
+    );
+
     // Part 2: Wake delivery path (deliver_wake_message runtime).
     let marked = wss_rpc(
         &mut rpc,
@@ -9439,7 +9475,12 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let messages = conv["messages"].as_array().expect("messages array");
     let tagged = messages
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "cross-agent hello")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("cross-agent hello"))
+        })
         .expect("cross-agent user row present");
     assert_eq!(
         tagged["metadata"],
@@ -9486,7 +9527,12 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "human follow-up")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("human follow-up"))
+        })
         .expect("human user row present")
         .clone();
     assert_ne!(
@@ -9699,7 +9745,12 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
             .as_array()
             .expect("messages array")
             .iter()
-            .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == text)
+            .find(|m| {
+                m["role"] == "user"
+                    && m["contentBlocks"][0]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with(text))
+            })
             .unwrap_or_else(|| panic!("user row `{text}` present: {conv}"))
             .clone()
     };
@@ -11821,7 +11872,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
                 }
             }
         }
-        role == "user" && text == "queued message"
+        role == "user" && text.starts_with("queued message")
     })
     .await;
     assert!(

@@ -553,10 +553,12 @@ async fn user_message_texts(data_dir: &Path, agent_id: &str) -> Vec<String> {
 /// user message lands strictly BEFORE both preserved queued messages, which
 /// appear exactly once each, in their original FIFO order.
 fn assert_continuation_first_then_fifo(users: &[String]) {
+    // Prefix match: drained queue entries carry the appended dequeue-wait
+    // system note after the original content.
     let idx = |needle: &str| {
         users
             .iter()
-            .position(|t| t == needle)
+            .position(|t| t.starts_with(needle))
             .unwrap_or_else(|| panic!("missing user message {needle:?} in transcript: {users:?}"))
     };
     let i_start = idx(START_MSG);
@@ -577,7 +579,7 @@ fn assert_continuation_first_then_fifo(users: &[String]) {
     );
     for needle in [CONTINUATION_TEXT, QUEUED_ONE, QUEUED_TWO] {
         assert_eq!(
-            users.iter().filter(|t| *t == needle).count(),
+            users.iter().filter(|t| t.starts_with(needle)).count(),
             1,
             "user message {needle:?} must appear exactly once: {users:?}"
         );
