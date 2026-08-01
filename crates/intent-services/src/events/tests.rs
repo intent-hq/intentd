@@ -35,6 +35,7 @@ async fn agent_stream_chunks_are_transient() {
         actor_types: vec![],
         since: None,
         batch_window: None,
+        exclude_agent_events: false,
     });
     let received: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let recv_clone = Arc::clone(&received);

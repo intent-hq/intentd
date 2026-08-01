@@ -26,6 +26,26 @@ use uuid::Uuid;
 use crate::events::{self, SubscriptionFilter};
 use crate::Services;
 
+/// Subscribe-time guard for AGENT callers (monorepo#1229): every explicit
+/// `agent:`-prefixed entry (exact types, the `agent:*` wildcard, and the
+/// observability events) and `chat:stream:delta` is rejected with
+/// `InvalidParams` — agents watch other agents via `ws.agent.watch`, not the
+/// event bus. A bare `*` passes: it is silently narrowed to the non-agent
+/// categories at resolution time ([`events::resolve_event_types_for_agent`]).
+pub(crate) fn validate_agent_event_types(event_types: &[String]) -> Result<()> {
+    for t in event_types {
+        if events::is_agent_restricted_event_type(t) {
+            return Err(Error::InvalidParams(format!(
+                "\"{t}\" is not subscribable by agents: agent events are internal. Use \
+                 ws.agent.watch(agentId) to be woken when another agent completes, fails, \
+                 or raises a blocker/discussion; non-agent categories (\"file:*\", \
+                 \"task:*\", \"git:*\", \"note:*\", ...) remain available."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One live `event.subscribe` registration.
 #[derive(Debug, Clone)]
 pub(crate) struct EventSubscriptionRecord {
@@ -110,11 +130,18 @@ impl Services {
         exclude_self: Option<bool>,
         batch_window: Option<i64>,
     ) -> (String, Vec<String>) {
+        // Agent subscribers get the narrowed bare-`*` expansion (no `agent:*`,
+        // monorepo#1229); front-door subscriptions keep the full category list.
+        let resolved_types = if subscriber_agent_id.is_some() {
+            events::resolve_event_types_for_agent(event_types)
+        } else {
+            events::resolve_event_types(event_types)
+        };
         let record = EventSubscriptionRecord {
             id: Uuid::new_v4().to_string(),
             workspace_id: workspace_id.clone(),
             subscriber_agent_id,
-            event_types: events::resolve_event_types(event_types),
+            event_types: resolved_types,
             // TS default: excludeSelf true (subscribers skip their own events).
             exclude_self: exclude_self.unwrap_or(true),
             batch_window_ms: normalize_batch_window_ms(batch_window),
@@ -303,6 +330,10 @@ impl Services {
             },
             workspace_id: Some(record.workspace_id.0.clone()),
             batch_window: Some(Duration::from_millis(record.batch_window_ms as u64)),
+            // Match-time guard (monorepo#1229): agent-owned subscriptions —
+            // including rehydrated rows persisted before the subscribe-time
+            // guard existed — never match agent events or `chat:stream:delta`.
+            exclude_agent_events: true,
             ..Default::default()
         };
         let services = self.clone();
