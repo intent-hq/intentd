@@ -2740,7 +2740,12 @@ impl Services {
             // if delivery fails the parent misses the wake, but that's safer than
             // duplicate delivery (which we observed in production: STAB-5). Group
             // watches are still removed AFTER group settlement as before.
-            if watch.one_shot {
+            // monorepo#1229: a persistent (non-oneShot ungrouped) watch on a
+            // DELETED child can never fire again — remove it with the same
+            // remove-before-delivery protocol so it does not leak.
+            let terminal =
+                watch.one_shot || (watch.group_id.is_none() && event.event_type == AGENT_DELETED);
+            if terminal {
                 let removed = self.remove_watch(&watch.id);
                 if !removed {
                     // Watch was concurrently removed (e.g. by another event or
@@ -2748,7 +2753,7 @@ impl Services {
                     tracing::debug!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
-                        "oneShot watch already removed, skipping delivery"
+                        "watch already removed, skipping delivery"
                     );
                     continue;
                 }
@@ -2777,7 +2782,7 @@ impl Services {
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
-            if watch.one_shot {
+            if terminal {
                 self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                     .await;
             }
@@ -13876,18 +13881,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }
             // Registers the subscription with a live bus delivery task
             // (matching + batching + subscriber wake, monorepo#937); bare `*`
-            // expands to the category wildcards inside registration.
+            // expands to the category wildcards inside registration
+            // (narrowed to the non-agent categories for agent subscribers).
             let (subscription_id, resolved) = self
                 .register_event_subscription(
                     &workspace_id,
@@ -16093,6 +16102,36 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_watch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_watch_op(workspace_id, caller_agent_id, target_agent_id)
+                .await
+        })
+    }
+
+    fn agent_unwatch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        subscription_id: Option<String>,
+        target_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_unwatch_op(
+                workspace_id,
+                caller_agent_id,
+                subscription_id,
+                target_agent_id,
+            )
+            .await
+        })
+    }
+
     fn app_agents_wait(
         &self,
         workspace_id: WorkspaceId,
@@ -16225,12 +16264,15 @@ impl WorkspaceApi for Services {
             // would match EVERY event (and persist that across restarts).
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }

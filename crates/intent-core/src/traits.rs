@@ -1976,6 +1976,51 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.watch` (the `ws.agent.watch(agentId)` MCP binding,
+    /// monorepo#1229): explicit persistent caller→target subscription to the
+    /// target's harness-curated completion set — idle/completed, failed,
+    /// deleted, blocker raised, discussion requested. Unlike the
+    /// auto-registered oneShot watches this watch survives each delivery
+    /// until the target is deleted or the caller unwatches. Returns
+    /// `{ ok, subscriptionId, agentId }`.
+    fn agent_watch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller_agent_id, target_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_watch not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.unwatch` (the `ws.agent.unwatch` MCP binding, monorepo#1229):
+    /// remove one of the caller's own completion watches, addressed by
+    /// `subscription_id` or by the watched `target_agent_id`. Returns
+    /// `{ ok, removed }`.
+    fn agent_unwatch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        subscription_id: Option<String>,
+        target_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            caller_agent_id,
+            subscription_id,
+            target_agent_id,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_unwatch not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `app.agents.waitFor` (the `ws.app.agents.waitFor` MCP binding):
     /// register completion watches for `caller_agent_id` on a set of existing
     /// target agents — the subscription side of `agent.delegate` without

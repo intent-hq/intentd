@@ -13,7 +13,8 @@ pub mod watcher;
 
 pub use bus::{EventBus, Subscription};
 pub use filter::{
-    event_matches, event_type_matches, resolve_event_types, SubscriptionFilter,
+    event_matches, event_type_matches, is_agent_restricted_event_type, resolve_event_types,
+    resolve_event_types_for_agent, SubscriptionFilter, AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS,
     DEFAULT_BATCH_WINDOW, VALID_EVENT_CATEGORY_WILDCARDS,
 };
 pub use registry::WatcherRegistry;
