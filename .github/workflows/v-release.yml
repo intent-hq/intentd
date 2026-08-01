@@ -47,7 +47,7 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
-    runs-on: "warp-ubuntu-latest-x64-2x"
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -127,6 +127,16 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Put Git Bash first on PATH (Windows)"
+        if: "runner.os == 'Windows'"
+        run: "echo C:\\Program Files\\Git\\bin>>\"%GITHUB_PATH%\""
+        shell: "cmd"
+      - name: "Make apt-get non-interactive (Linux)"
+        if: "runner.os == 'Linux'"
+        run: |
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+          echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
+        shell: "bash"
       - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
@@ -188,7 +198,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "warp-ubuntu-latest-x64-2x"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -239,7 +249,7 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "warp-ubuntu-latest-x64-2x"
+    runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -304,7 +314,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "warp-ubuntu-latest-x64-2x"
+    runs-on: "ubuntu-latest"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
