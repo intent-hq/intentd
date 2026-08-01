@@ -123,6 +123,14 @@ fn format_wait_duration(secs: i64) -> String {
 /// prompt stays byte-identical to the persisted row, at the cost of no wait
 /// note for that entry. Fail open: an unparseable `queued_at` leaves the
 /// content untouched.
+///
+/// Alongside the content note, the entry's `messageMetadata` is stamped with
+/// structured queue info — `queueInfo: { queuedAt, waitedMs }` (PROTOCOL
+/// §5.5) — so the persisted user row carries machine-readable enqueue time +
+/// wait for clients, riding the same metadata plumbing as the A2A sender
+/// attribution. Same guards as the note: an existing `queueInfo` is never
+/// overwritten (first-delivery numbers stay across requeues), and the
+/// persisted-entry / unparseable-`queued_at` skips above cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
@@ -134,12 +142,31 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
         );
         return;
     };
-    let waited = (time::OffsetDateTime::now_utc() - queued).whole_seconds();
+    let elapsed = time::OffsetDateTime::now_utc() - queued;
     msg.content = format!(
         "{}\n\n{}",
         msg.content,
-        dequeue_wait_note(&msg.queued_at, &format_wait_duration(waited))
+        dequeue_wait_note(
+            &msg.queued_at,
+            &format_wait_duration(elapsed.whole_seconds())
+        )
     );
+    // Negative waits (clock skew) clamp to 0, matching the note's formatting.
+    let waited_ms = u64::try_from(elapsed.whole_milliseconds().max(0)).unwrap_or(u64::MAX);
+    let queue_info = json!({ "queuedAt": msg.queued_at, "waitedMs": waited_ms });
+    match msg.message_metadata.as_mut() {
+        None => msg.message_metadata = Some(json!({ "queueInfo": queue_info })),
+        Some(Value::Object(map)) => {
+            map.entry("queueInfo").or_insert(queue_info);
+        }
+        Some(_) => {
+            tracing::warn!(
+                id = %msg.id,
+                queued_at = %msg.queued_at,
+                "dequeue-wait queueInfo stamp skipped: messageMetadata is not an object"
+            );
+        }
+    }
 }
 
 const GB: u64 = 1024 * 1024 * 1024;
