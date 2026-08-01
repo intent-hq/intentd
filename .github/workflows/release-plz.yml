@@ -86,8 +86,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-  # Sized like ci.yml's check burst runner (gh-linux-16x): this job runs
-  # `cargo package --workspace`, which compiles the workspace.
+  # Sized like ci.yml's coverage burst runner (gh-linux-16x): this job runs
+  # `cargo package --workspace`, which compiles the whole workspace — closer
+  # to the coverage jobs' full-suite compiles than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
     runs-on: gh-linux-16x
