@@ -6365,13 +6365,14 @@ async fn diagnostics_reports_queue_snapshots() {
     let target = create_agent(&svc, &ws, "Loaded").await;
     let sender = create_agent(&svc, &ws, "Sender").await;
 
-    // Normal FIFO entry with sender attribution and >200-char content.
+    // Normal FIFO entry with sender attribution, >200-char content, and
+    // bulky image/file payloads that the preview must drop.
     let long_content = "x".repeat(250);
     svc.enqueue_message(
         &target,
         long_content.clone(),
-        None,
-        None,
+        Some(json!([{ "data": "base64-image-payload" }])),
+        Some(json!([{ "data": "base64-file-payload" }])),
         Some(json!({
             "type": "agent_message",
             "fromAgentId": sender.as_str(),
@@ -6402,11 +6403,16 @@ async fn diagnostics_reports_queue_snapshots() {
     assert_eq!(entries[0]["content"], json!("urgent"));
     assert_eq!(entries[0]["interruptPriority"], json!(true));
     assert_eq!(entries[0]["position"], json!(0));
-    // Truncation to 200 chars — the full 250-char content is never embedded.
+    // Truncation to 200 chars + `…` marker — the full 250-char content is
+    // never embedded, and the marker matches the MCP-side presentation.
     let preview = entries[1]["content"].as_str().expect("content string");
-    assert_eq!(preview.chars().count(), 200);
-    assert!(long_content.starts_with(preview));
+    assert_eq!(preview.chars().count(), 201);
+    assert!(preview.ends_with('…'));
+    assert!(long_content.starts_with(preview.trim_end_matches('…')));
     assert_eq!(entries[1]["position"], json!(1));
+    // Bulky base64 payloads are dropped from the preview.
+    assert!(entries[1].get("imageBlocks").is_none());
+    assert!(entries[1].get("fileBlocks").is_none());
     // Sender attribution and enqueue time survive the projection.
     assert_eq!(
         entries[1]["messageMetadata"]["fromAgentId"],

@@ -948,10 +948,11 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let preview = entries[0]["content"].as_str().expect("content string");
     assert_eq!(
         preview.chars().count(),
-        200,
-        "content truncated to 200 chars"
+        201,
+        "content truncated to 200 chars plus ellipsis marker"
     );
-    assert!(long_content.starts_with(preview));
+    assert!(preview.ends_with('…'));
+    assert!(long_content.starts_with(preview.trim_end_matches('…')));
     let text = diag["result"]["text"].as_str().expect("text");
     assert!(text.contains("Queued agents: 1"), "text: {text}");
     assert!(text.contains("Pending message queues:"), "text: {text}");

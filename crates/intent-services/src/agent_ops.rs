@@ -5546,6 +5546,10 @@ impl Services {
     /// `priority: "interrupt"` preempts the assignee's in-flight turn keep-alive
     /// (never killing the child) and delivers immediately when the runtime
     /// manager is attached; other priorities keep the existing delivery.
+    /// The target resolution (`task.assigned_agents.first()`) is mirrored by
+    /// the MCP `ws.agent.sendToTask` single-pending guard in
+    /// `intent-acp/src/mcp_server/bindings/agent.rs` — if this resolution
+    /// changes, that guard site must change with it.
     pub(crate) async fn agent_send_to_task_op(
         &self,
         workspace_id: WorkspaceId,
@@ -6741,22 +6745,34 @@ impl Services {
     }
 
     /// Like [`Services::queue_snapshot`] but with each entry's `content`
-    /// truncated to [`QUEUE_PREVIEW_MAX_CHARS`] chars — the shared preview
+    /// truncated to [`QUEUE_PREVIEW_MAX_CHARS`] chars (with a trailing `…`
+    /// marker, matching the MCP-side presentation) and the bulky
+    /// `imageBlocks` / `fileBlocks` payloads dropped (potentially large
+    /// base64 blobs that would defeat the size cap) — the shared preview
     /// projection for surfaces that embed *other* agents' queues
-    /// (`agent.diagnostics`). Entries keep the stored queue order, which IS
-    /// the drain order (next delivery first: interrupt-priority entries in
-    /// arrival order, then normal FIFO); entries the drain skips surface
-    /// flagged `editing: true` at their stored position rather than being
-    /// excluded.
+    /// (`agent.diagnostics`). Sender attribution stays available via the
+    /// retained `messageMetadata`. Entries keep the stored queue order,
+    /// which IS the drain order (next delivery first: interrupt-priority
+    /// entries in arrival order, then normal FIFO); entries the drain skips
+    /// surface flagged `editing: true` at their stored position rather than
+    /// being excluded.
     pub(crate) fn queue_snapshot_preview(&self, agent_id: &AgentId) -> Vec<Value> {
         let mut entries = self.queue_snapshot(agent_id);
         for entry in &mut entries {
             let truncated = entry["content"]
                 .as_str()
                 .filter(|c| c.chars().count() > QUEUE_PREVIEW_MAX_CHARS)
-                .map(|c| c.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect::<String>());
+                .map(|c| {
+                    let mut t: String = c.chars().take(QUEUE_PREVIEW_MAX_CHARS).collect();
+                    t.push('…');
+                    t
+                });
             if let Some(t) = truncated {
                 entry["content"] = Value::String(t);
+            }
+            if let Some(obj) = entry.as_object_mut() {
+                obj.remove("imageBlocks");
+                obj.remove("fileBlocks");
             }
         }
         entries

@@ -9545,8 +9545,9 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
 /// Sender attribution for the remaining agent-originated send paths
 /// (PROTOCOL §5.5): `ws.agent.sendToTask` must tag the assignee's delivered
 /// row with the `agent_message` attribution, and the `ws.agent.create`
-/// kickoff message must carry the same auto-tag — unless the caller supplies
-/// an explicit `messageMetadata`, which is persisted verbatim (precedence).
+/// kickoff message must carry the same auto-tag — an explicit
+/// `messageMetadata` keeps its own fields but the attribution fields are
+/// daemon-stamped (never caller-controlled).
 /// Drives all three through the full daemon stack: a real mock-ACP sender
 /// turn invokes the MCP `workspace_api` bindings, and the assertions read
 /// the persisted transcripts back over WSS `agent.getConversation`.
@@ -9783,8 +9784,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "create kickoff must carry sender attribution: {row}"
     );
 
-    // 3. create kickoff with explicit messageMetadata: persisted verbatim,
-    // taking precedence over the auto-tag.
+    // 3. create kickoff with explicit messageMetadata: the caller's own
+    // fields persist, with the attribution fields daemon-stamped (the
+    // guard/ownership key is never caller-controlled).
     let conv = wss_rpc(
         &mut rpc,
         18,
@@ -9795,8 +9797,13 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     let row = user_row(&conv, "kickoff explicit");
     assert_eq!(
         row["metadata"],
-        json!({ "type": "custom_tag", "note": "explicit wins" }),
-        "explicit messageMetadata must win over the auto-tag: {row}"
+        json!({
+            "type": "custom_tag",
+            "note": "explicit wins",
+            "fromAgentId": sender_id,
+            "fromAgentName": "SenderA",
+        }),
+        "explicit messageMetadata must keep its fields with daemon-stamped attribution: {row}"
     );
 }
 

@@ -8021,10 +8021,11 @@ mod wsapi4_bindings_tests {
         );
     }
 
-    /// Explicit `messageMetadata` on `send` wins over the auto-tag — we never
-    /// overwrite metadata the caller supplied.
+    /// Explicit `messageMetadata` on `send` keeps its own fields, but the
+    /// attribution fields are daemon-stamped — the guard/ownership key
+    /// (`fromAgentId`) can be neither omitted nor spoofed by the caller.
     #[tokio::test]
-    async fn agent_send_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_send_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -8033,12 +8034,42 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_calls.lock().unwrap();
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom", "reason": "x" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "reason": "x",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
-    /// Explicit `messageMetadata` on `sendToTask` wins over the auto-tag.
+    /// A spoofed `fromAgentId` in explicit metadata is overwritten with the
+    /// real caller identity — attribution is daemon-stamped, never trusted.
     #[tokio::test]
-    async fn agent_send_to_task_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_send_spoofed_from_agent_id_is_overwritten() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', null, { fromAgentId: 'agent-victim', fromAgentName: 'Victim' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    /// Explicit `messageMetadata` on `sendToTask` keeps its own fields with
+    /// the attribution fields daemon-stamped.
+    #[tokio::test]
+    async fn agent_send_to_task_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -8047,13 +8078,20 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_to_task_calls.lock().unwrap();
-        assert_eq!(calls[0].2, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].2,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
-    /// Explicit `messageMetadata` in `create()` opts wins over the auto-tag on
-    /// the kickoff delivery.
+    /// Explicit `messageMetadata` in `create()` opts keeps its own fields on
+    /// the kickoff delivery, with the attribution fields daemon-stamped.
     #[tokio::test]
-    async fn agent_create_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_create_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -8063,7 +8101,14 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_calls.lock().unwrap();
         assert_eq!(calls[0].0, "child-1");
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
     /// `wakeOrCreate`'s delivered context message is an agent-originated send
@@ -8090,9 +8135,9 @@ mod wsapi4_bindings_tests {
     }
 
     /// Explicit `messageMetadata` on `wakeOrCreate` (new optional 4th arg)
-    /// wins over the auto-tag.
+    /// keeps its own fields with the attribution fields daemon-stamped.
     #[tokio::test]
-    async fn agent_wake_or_create_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_wake_or_create_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -8101,7 +8146,14 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_wake_or_create_calls.lock().unwrap();
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
     /// Caller-less (FE/RPC front door) wakes stay untagged.

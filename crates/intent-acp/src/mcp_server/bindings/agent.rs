@@ -195,10 +195,11 @@ async fn create(
     // Deliver the initial message so the child actually starts its first
     // turn — parity with the WSAPI-2 path. Failure is non-fatal (the
     // session already exists) but is logged. Sender attribution reuses the
-    // depth-guard lookup's name (no second `agent_get` round-trip); an
-    // explicit `messageMetadata` in opts wins over the auto-tag.
-    let kickoff_metadata = explicit_metadata(args)
-        .or_else(|| caller.map(|c| agent_message_metadata(c, caller_name.as_deref())));
+    // depth-guard lookup's name (no second `agent_get` round-trip); for
+    // agent callers the attribution fields are daemon-stamped into any
+    // explicit `messageMetadata` (`merge_sender_attribution`).
+    let kickoff_metadata =
+        merge_sender_attribution(explicit_metadata(args), caller, caller_name.as_deref());
     if let Err(e) = api
         .agent_send_message(
             ws.clone(),
@@ -300,7 +301,11 @@ async fn send(
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
-/// shapes — e.g. "No agent assigned to task").
+/// shapes — e.g. "No agent assigned to task"). The guard's target
+/// resolution (`task.assigned_agents.first()`) deliberately mirrors
+/// `agent_send_to_task_op` in `intent-services` — if the op's resolution
+/// ever changes, this site must change with it or the guard checks the
+/// wrong agent.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -512,10 +517,10 @@ async fn wake_or_create(
         }
     }
     // Sender attribution on the delivered context message (monorepo#1015):
-    // same explicit-wins/auto-tag semantics as `send`, reusing the
+    // same daemon-stamped attribution semantics as `send`, reusing the
     // depth-guard lookup's name (no second `agent_get` round-trip).
-    let message_metadata = explicit_metadata(args)
-        .or_else(|| caller.map(|c| agent_message_metadata(c, caller_name.as_deref())));
+    let message_metadata =
+        merge_sender_attribution(explicit_metadata(args), caller, caller_name.as_deref());
     let v = api
         .agent_wake_or_create(
             ws.clone(),
@@ -615,36 +620,68 @@ fn agent_message_metadata(caller: &AgentId, name: Option<&str>) -> Value {
 }
 
 /// An explicit non-null `messageMetadata` arg, if the caller supplied one.
-/// Explicit metadata always wins over auto-tagging; `null` is treated as
-/// absent (it does not suppress the auto-tag).
+/// Explicit metadata wins over auto-tagging for its own fields — but for
+/// agent callers the attribution fields are daemon-stamped and never
+/// caller-controlled (see [`merge_sender_attribution`]); `null` is treated
+/// as absent (it does not suppress the auto-tag).
 fn explicit_metadata(args: &Value) -> Option<Value> {
     args.get("messageMetadata")
         .filter(|v| !v.is_null())
         .cloned()
 }
 
-/// `messageMetadata` for agent-originated sends: an explicit caller-supplied
-/// `messageMetadata` arg takes precedence; otherwise, when the caller is an
-/// agent (not the FE/RPC front door), auto-tag the delivered message with
-/// [`agent_message_metadata`] so clients can render who sent it. `fromAgentName`
-/// is resolved from the caller's session; human-originated sends
-/// (`caller == None`, no explicit metadata) return `None` and stay untagged.
+/// Combine explicit caller-supplied metadata with the daemon-derived sender
+/// attribution. Attribution (`fromAgentId`/`fromAgentName`) is
+/// SECURITY-RELEVANT — the single-pending-message guard and
+/// `ws.agent.removeQueuedMessage` ownership both key on it — so for agent
+/// callers it is ALWAYS daemon-stamped, overwriting any caller-supplied
+/// values: omitting it must not evade the guard, and spoofing it must not
+/// misattribute the entry or hand removal rights to another agent. All other
+/// explicit fields are preserved; a non-object explicit value cannot carry
+/// attribution and is replaced by the pure auto-tag. Caller-less (FE/RPC
+/// front door) invocations keep explicit metadata verbatim, or none at all.
+fn merge_sender_attribution(
+    explicit: Option<Value>,
+    caller: Option<&AgentId>,
+    name: Option<&str>,
+) -> Option<Value> {
+    let Some(caller) = caller else {
+        return explicit;
+    };
+    match explicit {
+        Some(Value::Object(mut obj)) => {
+            obj.insert("fromAgentId".to_string(), json!(caller.as_str()));
+            obj.insert("fromAgentName".to_string(), json!(name));
+            Some(Value::Object(obj))
+        }
+        _ => Some(agent_message_metadata(caller, name)),
+    }
+}
+
+/// `messageMetadata` for agent-originated sends: when the caller is an agent
+/// (not the FE/RPC front door), the delivered message carries the
+/// [`agent_message_metadata`] attribution — merged into any explicit
+/// caller-supplied `messageMetadata` with the attribution fields
+/// daemon-stamped ([`merge_sender_attribution`]) so clients can trust who
+/// sent it. `fromAgentName` is resolved from the caller's session;
+/// human-originated sends (`caller == None`) keep explicit metadata verbatim
+/// and stay untagged when none was supplied.
 async fn sender_metadata(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Option<Value> {
-    if let Some(explicit) = explicit_metadata(args) {
-        return Some(explicit);
-    }
-    let caller = caller?;
+    let explicit = explicit_metadata(args);
+    let Some(caller) = caller else {
+        return explicit;
+    };
     let name = api
         .agent_get(caller.clone(), Some(ws.clone()))
         .await
         .ok()
         .map(|lite| lite.name);
-    Some(agent_message_metadata(caller, name.as_deref()))
+    merge_sender_attribution(explicit, Some(caller), name.as_deref())
 }
 
 /// SUB-1 sender auto-subscribe: register the caller→target completion watch
@@ -708,6 +745,12 @@ async fn fetch_presented_queue(
 /// not be fetched (fall through so the unguarded send surfaces its existing
 /// error shapes — e.g. the monorepo#564 unknown-id `-32602`), or the caller
 /// has no pending (non-editing) entry in the queue.
+///
+/// The guard is advisory hygiene, not a hard invariant: it is a
+/// check-then-send without atomicity, so two concurrent sends from the same
+/// caller can both observe no pending entry and both park (TOCTOU). The
+/// queue registry lock lives in `Services`; consumers must not assume the
+/// single-pending property is enforced.
 async fn pending_send_refusal(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
