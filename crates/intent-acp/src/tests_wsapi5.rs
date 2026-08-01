@@ -113,6 +113,21 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
 }
 
 impl WorkspaceApi for FakeApi {
+    // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+    // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+    // bodies; the TOON/limit paths are covered by
+    // `workspace_api_output_limit_tests`.
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let value = match path.as_str() {
+                "workspaceApi.toonOutput" => json!(false),
+                "workspaceApi.maxOutputChars" => json!(0),
+                _ => Value::Null,
+            };
+            Ok(json!({ "path": path, "value": value }))
+        })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let variant = *self.workspace_variant.lock().unwrap();
         let override_sm = self.status_message_state.lock().unwrap().clone();

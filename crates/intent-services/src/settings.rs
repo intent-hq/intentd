@@ -1168,6 +1168,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             72.0,
         ),
+        number(
+            "workspaceApi.maxOutputChars",
+            "Max workspace API output chars",
+            "Max characters of one workspace_api tool result before the output is redirected to a file (0 = unlimited; min 1000 when non-zero)",
+            "workspaceApi",
+            Some(0.0),
+            Some(10_000_000.0),
+            100_000.0,
+        ),
+        boolean(
+            "workspaceApi.toonOutput",
+            "TOON output",
+            "TOON-encode workspace_api tool results (token-efficient) instead of plain JSON",
+            "workspaceApi",
+            true,
+        ),
     ]
 }
 
@@ -1945,6 +1961,125 @@ mod tests {
         // Positive integer → Some(cap).
         settings.agents.max_concurrent = 12;
         assert_eq!(max_concurrent_agents(&settings), Some(12));
+    }
+
+    /// `workspaceApi.*` are non-secret TOML-backed catalog entries:
+    /// `maxOutputChars` is a bounded number (0 = unlimited, max 10M, default
+    /// 100k) and `toonOutput` a boolean defaulting to `true`.
+    #[test]
+    fn workspace_api_catalog_entries_are_toml_backed() {
+        let def = find_definition("workspaceApi.maxOutputChars")
+            .expect("workspaceApi.maxOutputChars missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspaceApi");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(10_000_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(100_000.0)));
+        assert!(KNOWN_PATHS.contains(&"workspaceApi.maxOutputChars"));
+
+        let def =
+            find_definition("workspaceApi.toonOutput").expect("workspaceApi.toonOutput missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspaceApi");
+        assert!(matches!(def.ty, SettingType::Boolean));
+        assert_eq!(def.default_value, Some(json!(true)));
+        assert!(KNOWN_PATHS.contains(&"workspaceApi.toonOutput"));
+    }
+
+    /// `workspaceApi.*` round-trip through the registry-wired service:
+    /// defaults read with `default` origin, updates persist to config.toml
+    /// (`file` origin, never SQLite), the sub-1000 non-zero value for
+    /// `maxOutputChars` rejects with `-32602` via the typed schema, `0`
+    /// (unlimited) is accepted, and reset restores the defaults.
+    #[tokio::test]
+    async fn workspace_api_settings_round_trip_via_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-wsapi-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-wsapi-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Defaults with `default` origin.
+        let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["value"], json!(100_000.0));
+        assert_eq!(got["origin"], json!("default"));
+        let got = svc.get("workspaceApi.toonOutput").await.expect("get");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+
+        // Updates persist to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([
+            { "path": "workspaceApi.maxOutputChars", "value": 250_000 },
+            { "path": "workspaceApi.toonOutput", "value": false },
+        ]))
+        .await
+        .expect("update");
+        let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["value"], json!(250_000.0));
+        assert_eq!(got["origin"], json!("file"));
+        let got = svc.get("workspaceApi.toonOutput").await.expect("get");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("maxOutputChars"), "{text}");
+        assert!(text.contains("toonOutput"), "{text}");
+        for path in ["workspaceApi.maxOutputChars", "workspaceApi.toonOutput"] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed keys must never write a SQLite settings row"
+            );
+        }
+
+        // Non-zero values below 1000 reject via the typed schema (-32602).
+        let err = svc
+            .update(&json!([{ "path": "workspaceApi.maxOutputChars", "value": 500 }]))
+            .await
+            .expect_err("sub-1000 non-zero value must reject");
+        assert!(
+            matches!(err, Error::InvalidParams(ref msg) if msg.contains("workspaceApi.maxOutputChars")),
+            "expected InvalidParams naming the key, got {err:?}"
+        );
+        // …and the prior value is untouched.
+        let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["value"], json!(250_000.0));
+
+        // 0 (unlimited) is accepted.
+        svc.update(&json!([{ "path": "workspaceApi.maxOutputChars", "value": 0 }]))
+            .await
+            .expect("0 = unlimited must be accepted");
+        let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["value"], json!(0.0));
+
+        // Reset restores the defaults and strips the keys from the file.
+        let reset = svc
+            .reset("workspaceApi.maxOutputChars")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(100_000.0));
+        let reset = svc.reset("workspaceApi.toonOutput").await.expect("reset");
+        assert_eq!(reset["value"], json!(true));
+        let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// Q1 regression: with the registry wired (production composition), a

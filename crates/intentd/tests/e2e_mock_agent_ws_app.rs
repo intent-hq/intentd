@@ -98,6 +98,12 @@ async fn chief_agent_ws_app_workspaces_list() {
     let services = Services::new(store.clone())
         .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
 
     // Seed 2+ user workspaces
     let ws1 = WorkspaceId::new();
@@ -746,6 +752,12 @@ async fn non_chief_agent_ws_app_gating_error() {
     let services = Services::new(store.clone())
         .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
 
     // Create a regular (non-chief) workspace
     let ws = WorkspaceId::new();

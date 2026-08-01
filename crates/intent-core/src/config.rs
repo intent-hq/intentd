@@ -22,6 +22,15 @@ pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 30;
 /// out and preserve all events.
 pub const DEFAULT_STREAM_RETENTION_HOURS: u32 = 72;
 
+/// Default max characters of one `workspace_api` tool result before the
+/// output is redirected to a file (`workspaceApi.maxOutputChars`); `0` means
+/// unlimited (never redirect).
+pub const DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS: u32 = 100_000;
+
+/// Default for `workspaceApi.toonOutput` — whether `workspace_api` tool
+/// results are TOON-encoded (token-efficient) instead of plain JSON.
+pub const DEFAULT_WORKSPACE_API_TOON_OUTPUT: bool = true;
+
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

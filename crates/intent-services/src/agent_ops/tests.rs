@@ -7172,6 +7172,11 @@ async fn scoped_cancel_combined_success_and_event_subscriptions_untouched() {
 #[tokio::test]
 async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let (_t, svc, ws) = setup().await;
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    svc.settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
 
     // MCP front door: caller set -> child parentAgentId == caller.
     let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
@@ -7238,6 +7243,11 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 #[tokio::test]
 async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     let (_t, svc, ws) = setup().await;
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool bodies stay
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    svc.settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
     let parent = create_agent(&svc, &ws, "Parent").await;
     let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
 
@@ -8773,6 +8783,11 @@ async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
 #[tokio::test]
 async fn mcp_delegate_immediate_registers_oneshot_watch() {
     let (_t, svc, ws) = setup().await;
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    svc.settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
     let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
     let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
     let server =
