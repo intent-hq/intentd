@@ -190,7 +190,7 @@ async fn delete_skips_emit_when_session_already_gone() {
 }
 
 #[tokio::test]
-async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
+async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -7868,7 +7868,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
 /// MCP front door (caller set), default wait mode: exactly one ungrouped watch is
 /// registered linking the caller (parent) to the freshly created child.
 #[tokio::test]
-async fn delegate_immediate_registers_one_oneshot_watch_for_mcp_caller() {
+async fn delegate_immediate_registers_one_ungrouped_watch_for_mcp_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = AgentId::from("agent-00000000-0000-0000-0000-0000000caller");
 
@@ -7963,7 +7963,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
 /// registers exactly one completion watch for the parent→child pair and returns
 /// its subscription id.
 #[tokio::test]
-async fn watch_completion_registers_oneshot_watch() {
+async fn watch_completion_registers_ungrouped_watch() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -8018,7 +8018,7 @@ async fn watch_completion_skips_when_parent_deleted() {
 /// caller→target watch, subscription id returned (the TS
 /// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`).
 #[tokio::test]
-async fn sender_watch_registers_oneshot_for_foreground_caller() {
+async fn sender_watch_registers_ungrouped_for_foreground_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
@@ -8828,7 +8828,7 @@ async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
 /// End-to-end through the MCP front door: delegating with a caller registers
 /// exactly one completion watch for the child returned by the tool.
 #[tokio::test]
-async fn mcp_delegate_immediate_registers_oneshot_watch() {
+async fn mcp_delegate_immediate_registers_ungrouped_watch() {
     let (_t, svc, ws) = setup().await;
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -8851,7 +8851,7 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
                 "name": "workspace_api",
                 "arguments": {
                     "code": "return await ws.agent.delegate({ agentInstructions: 'do work' });",
-                    "summary": "immediate delegate registers oneshot watch"
+                    "summary": "immediate delegate registers ungrouped watch"
                 }
             }
         }))
@@ -12542,7 +12542,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 /// the registry (memory + persisted row), and a later bus-loop reprocessing of
 /// the same event delivers nothing (no duplicate wake).
 #[tokio::test]
-async fn delete_workspace_consumes_chief_oneshot_watch_without_bus() {
+async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     let (_t, svc, ws) = setup().await;
     let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();

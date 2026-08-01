@@ -407,10 +407,10 @@ async fn unsubscribe(
 }
 
 /// `ws.agent.watch(agentId)` (monorepo#1229): explicit deliver-once
-/// subscription to another agent's completion (idle with an empty queue,
-/// failed, deleted) with attention fan-out (blocker raised, discussion
-/// requested) that does not consume the watch. Caller-only (the front
-/// door has no wake target).
+/// subscription to another agent's completion (idle with an empty pending
+/// message queue, failed, deleted) with attention fan-out (blocker raised,
+/// discussion requested) that does not consume the watch. Caller-only (the
+/// front door has no wake target).
 async fn watch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
