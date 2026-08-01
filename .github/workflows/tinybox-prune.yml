@@ -1,15 +1,19 @@
-# Scheduled prune of stale CI artifacts on tinybox's shared $HOME
-# (monorepo#1253).
+# Scheduled prune of stale CI artifacts on tinybox's shared CI-scratch
+# volumes (monorepo#1253).
 #
-# The 8 tinybox runner slots share one $HOME filesystem, and ci.yml keeps
-# per-slot persistent CARGO_TARGET_DIRs under ~/ci-target ("prune
-# $HOME/ci-target if disk gets tight" — this workflow is that pruning, made
-# automatic). Up to 8 multi-GiB copies per job flavor accumulate, plus
-# smaller per-slot tool dirs, and the box has reached box-level ENOSPC
-# (killed jobs mid-run). Deletion here is age-based (mtime), oldest first,
-# and strictly path-allowlisted:
-#   ~/ci-target/*/*/*      per-slot cargo target dirs — stale > 7 days,
+# The 8 tinybox runner slots share the box, and ci.yml keeps per-slot
+# persistent CARGO_TARGET_DIRs under /raid/ci-target on the 300G /raid
+# volume ("prune ci-target if disk gets tight" — this workflow is that
+# pruning, made automatic). Up to 8 multi-GiB copies per job flavor
+# accumulate, plus smaller per-slot tool dirs on $HOME, and the root volume
+# reached box-level ENOSPC when the target dirs lived there (killed jobs
+# mid-run). Deletion here is age-based (mtime), oldest first, and strictly
+# path-allowlisted:
+#   /raid/ci-target/*/*/*  per-slot cargo target dirs — stale > 7 days,
 #                          tightened to > 2 days while free space < 100 GiB
+#   ~/ci-target/*/*/*      legacy pre-/raid target dirs on the root volume —
+#                          stale > 7 days (tightened alongside /raid); as
+#                          these age out, CI itself frees the root volume
 #   ~/ci-install-action/*  per-slot install-action HOMEs — stale > 7 days
 #   ~/setup-pnpm-*         per-slot pnpm dests — stale > 7 days
 #   ~/.install-action      legacy shared install-action dir — stale > 7 days
@@ -54,14 +58,15 @@ jobs:
       - name: Disk report (before)
         run: |
           set -euo pipefail
-          df -h "$HOME"
+          df -h /raid "$HOME"
           echo
           echo "ci-target entries (size / age-days / path):"
           now=$(date +%s)
           # This report is informational: `|| true` keeps a missing
-          # ~/ci-target or a dir vanishing mid-report (concurrent cleanup)
-          # from failing the workflow under pipefail before pruning runs.
-          { find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | while IFS= read -r entry; do
+          # ci-target root or a dir vanishing mid-report (concurrent
+          # cleanup) from failing the workflow under pipefail before
+          # pruning runs.
+          { find /raid/ci-target "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null || true; } | sort -n | while IFS= read -r entry; do
             ts="${entry%% *}"; dir="${entry#* }"
             printf '%8s %4sd %s\n' "$(du -sh "$dir" 2>/dev/null | cut -f1 || true)" "$(( (now - ${ts%.*}) / 86400 ))" "$dir"
           done
@@ -73,7 +78,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           set -euo pipefail
-          free_gib() { df -Pk "$HOME" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
           remove() {
             if [ "$DRY_RUN" = "true" ]; then
               echo "[dry-run] would delete: $1"
@@ -87,24 +92,30 @@ jobs:
           # -mmin gives a strict N*24h window (-mtime rounds to whole days);
           # `|| true` keeps a dir vanishing mid-check from failing the run.
           is_fresh() { [ -n "$(find "$1" -mmin -"$(( $2 * 1440 ))" -print -quit 2>/dev/null || true)" ]; }
-          # Stale per-slot target dirs at exactly ~/ci-target/<repo>/<slot>/<job>,
-          # oldest first; the case guard re-asserts the allowlist.
+          # Stale per-slot target dirs at exactly <root>/<repo>/<slot>/<job>,
+          # oldest first; the case guard re-asserts the allowlist. $2 is the
+          # ci-target root: /raid/ci-target (primary) or $HOME/ci-target
+          # (legacy pre-/raid dirs on the root volume — sweeping them with
+          # the same windows lets CI itself free the root volume as they
+          # age out, retiring #1253's manual-cleanup item).
           prune_targets() {
-            local days="$1"
+            local days="$1" root="$2"
             while IFS= read -r entry; do
               dir="${entry#* }"
-              case "$dir" in "$HOME/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in "$root/"?*) ;; *) continue ;; esac
               is_fresh "$dir" "$days" && continue
               remove "$dir"
-            done < <(find "$HOME/ci-target" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
+            done < <(find "$root" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
           }
           echo "free before: $(free_gib) GiB"
-          prune_targets 7
+          prune_targets 7 /raid/ci-target
+          prune_targets 7 "$HOME/ci-target"
           # Comfort target: with < 100 GiB free the next day's coverage jobs
-          # could still crowd the box, so tighten the window to 2 days.
+          # could still crowd the volume, so tighten the window to 2 days.
           if [ "$(free_gib)" -lt 100 ]; then
             echo "free space < 100 GiB after 7-day pass — tightening to 2 days"
-            prune_targets 2
+            prune_targets 2 /raid/ci-target
+            prune_targets 2 "$HOME/ci-target"
           fi
           # Small per-slot / legacy tool dirs (recreated on demand by their
           # actions): 7-day window, same recursive freshness rule.
@@ -115,4 +126,4 @@ jobs:
           done
           echo "free after: $(free_gib) GiB (dry_run=$DRY_RUN)"
       - name: Disk report (after)
-        run: df -h "$HOME"
+        run: df -h /raid "$HOME"
