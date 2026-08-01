@@ -745,7 +745,7 @@ impl Store {
             return Ok(());
         };
         let role: String = row.get("role");
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_session SET last_message_role = ? \
              WHERE id = ? AND last_message_role IS NULL",
         )
@@ -754,7 +754,21 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("last message role self-heal failed: {e}")))?;
-        projection.last_message_role = Some(role);
+        if result.rows_affected() > 0 {
+            projection.last_message_role = Some(role);
+        } else {
+            // A concurrent writer stamped the column between the probe and
+            // the guarded UPDATE: its value is authoritative — serve it
+            // instead of the (possibly stale) probe result.
+            let row = sqlx::query("SELECT last_message_role FROM agent_session WHERE id = ?")
+                .bind(agent_id)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("last message role self-heal re-read failed: {e}"))
+                })?;
+            projection.last_message_role = row.and_then(|r| r.get("last_message_role"));
+        }
         Ok(())
     }
 
