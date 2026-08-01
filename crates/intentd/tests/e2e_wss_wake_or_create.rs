@@ -561,7 +561,7 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
 /// `agent.wakeOrCreate` with `callerAgentId` on a task with no live assignee
 /// (`action: created_new`) must return `subscriptionId` + the notification
 /// message line, and `agent.getSubscriptions` for the caller must list the
-/// oneShot watch on the created agent immediately — SUB-1 parity with the
+/// completion watch on the created agent immediately — SUB-1 parity with the
 /// wake/queued branches. Hermetic (no ACP provider needed).
 #[tokio::test]
 async fn wake_or_create_created_new_subscribes_caller_over_wss() {
@@ -619,9 +619,12 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
     let subs = subs_res["subscriptions"]
         .as_array()
         .expect("subscriptions array");
-    assert_eq!(subs.len(), 1, "one oneShot watch: {subs:?}");
+    assert_eq!(subs.len(), 1, "one completion watch: {subs:?}");
     assert_eq!(subs[0]["id"], json!(sub_id));
-    assert_eq!(subs[0]["oneShot"], json!(true));
+    assert!(
+        subs[0].get("oneShot").is_none(),
+        "oneShot dropped from wire"
+    );
     assert_eq!(subs[0]["actorIds"], json!([child_id]));
     assert_eq!(subs[0]["workspaceId"], json!(ws_id));
 }

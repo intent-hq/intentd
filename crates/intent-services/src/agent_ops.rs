@@ -5015,10 +5015,6 @@ impl Services {
                     // for cross-workspace (chief) ones.
                     "workspaceId": w.parent_workspace_id,
                     "createdAt": w.created_at,
-                    // Derived for wire back-compat: every ungrouped watch is
-                    // deliver-once now (the field itself is removed from the
-                    // registry model).
-                    "oneShot": w.group_id.is_none(),
                     "actorIds": [w.child_agent_id],
                     "eventTypes": event_types,
                     "delegationGroup": delegation_group,
@@ -5327,8 +5323,6 @@ impl Services {
                     "eventTypes": event_types,
                     "actorIds": [w.child_agent_id.clone()],
                     "priority": "normal",
-                    // Derived for wire back-compat (see agent.getSubscriptions).
-                    "oneShot": w.group_id.is_none(),
                     "delegationGroupId": w.group_id,
                     "orphaned": !session_ids.contains(&w.parent_agent_id.0),
                 })
