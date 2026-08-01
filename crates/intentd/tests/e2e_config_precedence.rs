@@ -92,7 +92,7 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     // and the unpinned file key autoCommit=false stays effective.
     std::fs::write(
         data_dir.join("config.toml"),
-        "[agents]\nidleReapMinutes = 7\n\n[git]\nautoCommit = false\n",
+        "[agents]\nidleReapMinutes = 7\n\n[git]\nautoCommit = false\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n",
     )
     .expect("seed config.toml");
 
@@ -131,6 +131,42 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     let rtk = uds_rpc(&socket, 3, "settings.get", json!({ "path": "rtk.enabled" })).await;
     assert_eq!(rtk["result"]["value"], json!(false), "{rtk}");
     assert_eq!(rtk["result"]["origin"], json!("default"), "{rtk}");
+
+    // `workspaceApi.*` from the file: effective values follow the seeded
+    // config with `file` origin.
+    let chars = uds_rpc(
+        &socket,
+        6,
+        "settings.get",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(chars["result"]["value"], json!(5000.0), "{chars}");
+    assert_eq!(chars["result"]["origin"], json!("file"), "{chars}");
+    let toon = uds_rpc(
+        &socket,
+        7,
+        "settings.get",
+        json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(toon["result"]["value"], json!(false), "{toon}");
+    assert_eq!(toon["result"]["origin"], json!("file"), "{toon}");
+
+    // A non-zero value under the 1000 floor rejects via the typed schema.
+    let bad = uds_rpc(
+        &socket,
+        8,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspaceApi.maxOutputChars", "value": 500 }] }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "{bad}");
+    let msg = bad["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("workspaceApi.maxOutputChars"),
+        "rejection names the key: {bad}"
+    );
 
     // settings.update on the pinned key → -32602 naming the pinning env var.
     let update = uds_rpc(

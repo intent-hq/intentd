@@ -4957,6 +4957,21 @@ mod workspace_api_tool_tests {
             let snapshot = self.ws.lock().unwrap().clone();
             Box::pin(async move { Ok(snapshot) })
         }
+
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
     }
 
     fn server(id: &str, path: Option<&str>) -> WorkspaceMcpServer {
@@ -5313,6 +5328,21 @@ mod wsapi3_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         // ---- note.* ----
         fn get_note(
             &self,
@@ -6675,6 +6705,21 @@ mod wsapi6_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         fn pr_status(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
             *self.pr_status_calls.lock().unwrap() += 1;
             let result = self.pr_status_result.lock().unwrap().clone();
@@ -7431,6 +7476,21 @@ mod wsapi4_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         fn agent_list(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
             *self.agent_list_calls.lock().unwrap() += 1;
             Box::pin(async move { Ok(vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]) })
@@ -8430,5 +8490,279 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["subscriptionId"], json!("sub-5"));
         assert_eq!(v["ok"], json!(true));
+    }
+}
+
+/// `workspace_api` output shaping: the `workspaceApi.toonOutput` and
+/// `workspaceApi.maxOutputChars` knobs read live per invocation. Covers TOON
+/// on/off, under/over-limit, the oversized-output redirect into the
+/// workspace folder's `tool-outputs/` directory (a SIBLING of the repo
+/// checkout), unlimited (`0`), and the unresolvable-workspace-dir fallback.
+#[cfg(test)]
+mod workspace_api_output_limit_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+        WorkspaceId, WorkspaceStatus,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    /// Mock whose `settings_get` serves configurable `workspaceApi.*` knobs
+    /// and whose `get_workspace` reports an optional on-disk checkout path.
+    struct OutputLimitMockApi {
+        checkout: Mutex<Option<String>>,
+        toon_output: Mutex<Value>,
+        max_output_chars: Mutex<Value>,
+    }
+
+    impl OutputLimitMockApi {
+        fn new(checkout: Option<&str>, toon_output: bool, max_output_chars: u64) -> Arc<Self> {
+            Arc::new(Self {
+                checkout: Mutex::new(checkout.map(str::to_string)),
+                toon_output: Mutex::new(json!(toon_output)),
+                max_output_chars: Mutex::new(json!(max_output_chars)),
+            })
+        }
+    }
+
+    impl WorkspaceApi for OutputLimitMockApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let checkout = self.checkout.lock().unwrap().clone();
+            Box::pin(async move {
+                let now = "2026-01-01T00:00:00Z".to_string();
+                Ok(Workspace {
+                    id: id.clone(),
+                    title: id.as_str().to_string(),
+                    branch: id.as_str().to_string(),
+                    base_ref: None,
+                    base_commit_sha: None,
+                    status: WorkspaceStatus::Active,
+                    status_message: None,
+                    status_image_asset_id: None,
+                    activity: WorkspaceActivity::Idle,
+                    attention: WorkspaceAttention::None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    last_activity: None,
+                    tags: Vec::new(),
+                    path: None,
+                    repository_path: None,
+                    repository_owner: None,
+                    repository_name: None,
+                    worktree_path: checkout,
+                    scope: None,
+                    skip_worktree: false,
+                    setup_script: None,
+                    is_remote: false,
+                    default_model: None,
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    active_pull_request: None,
+                    pull_requests: None,
+                    archived: false,
+                    archived_at: None,
+                    task_stats: None,
+                    agent_summary: None,
+                    diff_summary: None,
+                    token_usage: None,
+                    cow_supported: None,
+                    display_status: None,
+                    checkout_mode: None,
+                })
+            })
+        }
+
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            let toon = self.toon_output.lock().unwrap().clone();
+            let max = self.max_output_chars.lock().unwrap().clone();
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => toon,
+                    "workspaceApi.maxOutputChars" => max,
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+    }
+
+    /// A fresh `<workspaces-root>/<workspace-name>/<repo-name>` layout on
+    /// disk; returns the workspace folder and the checkout path inside it.
+    fn temp_workspace_layout() -> (PathBuf, String) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("intent-acp-outlimit-{nanos}-{n}"));
+        let checkout = folder.join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        (folder, checkout.to_string_lossy().into_owned())
+    }
+
+    fn server(
+        checkout: Option<&str>,
+        toon_output: bool,
+        max_output_chars: u64,
+    ) -> WorkspaceMcpServer {
+        let api = OutputLimitMockApi::new(checkout, toon_output, max_output_chars);
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        assert_eq!(resp["result"]["isError"], json!(false));
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    /// The single file the redirect wrote under `<folder>/tool-outputs/`.
+    fn only_tool_output(folder: &std::path::Path) -> PathBuf {
+        let dir = folder.join("tool-outputs");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly one redirect file");
+        entries[0].path()
+    }
+
+    #[tokio::test]
+    async fn under_limit_output_passes_through_unchanged() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 1000);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let v: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(v, json!({ "a": 1, "b": "two" }));
+        // No redirect file is created for an in-limit body.
+        assert!(!folder.join("tool-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn over_limit_output_redirects_to_tool_outputs_file() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 50);
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+
+        // The file lands in `<workspace-folder>/tool-outputs/`, a sibling of
+        // the repo checkout, with the FULL body and a `.json` extension
+        // (TOON disabled).
+        let path = only_tool_output(&folder);
+        assert_eq!(path.parent().unwrap(), folder.join("tool-outputs"));
+        assert_eq!(path.extension().unwrap(), "json");
+        let full = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+
+        // The message carries total size, limit, the absolute path, a head
+        // preview, and the ws.file.read caveat.
+        let total = full.chars().count();
+        assert!(text.contains(&format!("Output too large: {total} characters (limit: 50)")));
+        assert!(text.contains(path.to_str().unwrap()));
+        assert!(text.contains("First 2000 characters:"));
+        let head: String = full.chars().take(50).collect();
+        assert!(text.contains(&head));
+        assert!(text.contains("`ws.file.read` cannot reach it"));
+    }
+
+    #[tokio::test]
+    async fn toon_encodes_object_results_when_enabled() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 0);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let text = tool_text(&resp);
+        let expected = toon_format::encode_default(&json!({ "a": 1, "b": "two" })).unwrap();
+        assert_eq!(text, expected);
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "TOON body must not parse as JSON: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toon_enabled_keeps_non_object_results_as_json() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 0);
+        assert_eq!(tool_text(&call(&srv, "return 'hello';").await), "\"hello\"");
+        assert_eq!(tool_text(&call(&srv, "return 42;").await), "42");
+        assert_eq!(tool_text(&call(&srv, "return null;").await), "null");
+    }
+
+    #[tokio::test]
+    async fn toon_disabled_returns_pretty_json() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 0);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let text = tool_text(&resp);
+        assert_eq!(
+            text,
+            serde_json::to_string_pretty(&json!({ "a": 1, "b": "two" })).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn toon_over_limit_redirect_writes_toon_file() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 50);
+        let resp = call(
+            &srv,
+            "return [{ id: 1, data: 'x'.repeat(200) }, { id: 2, data: 'y' }];",
+        )
+        .await;
+        let text = tool_text(&resp);
+        let path = only_tool_output(&folder);
+        assert_eq!(path.extension().unwrap(), "toon");
+        let full = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            full,
+            toon_format::encode_default(
+                &json!([{ "id": 1, "data": "x".repeat(200) }, { "id": 2, "data": "y" }])
+            )
+            .unwrap()
+        );
+        assert!(text.contains("Output too large:"));
+        assert!(text.contains(path.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn zero_limit_means_unlimited() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 0);
+        // Larger than the 100k catalog default, proving `0` disables the
+        // limit rather than falling back to it.
+        let resp = call(&srv, "return 'x'.repeat(120000);").await;
+        let text = tool_text(&resp);
+        assert_eq!(text.chars().count(), 120_002); // quotes included
+        assert!(!folder.join("tool-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn unresolvable_workspace_dir_falls_back_to_untruncated_output() {
+        // No on-disk checkout path: the redirect cannot be written, so the
+        // full body comes back untruncated and the call still succeeds.
+        let srv = server(None, false, 50);
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+        assert!(!text.contains("Output too large:"));
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["data"].as_str().unwrap().len(), 200);
     }
 }

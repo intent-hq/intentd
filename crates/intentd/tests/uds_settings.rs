@@ -403,6 +403,102 @@ async fn settings_round_trip_redaction_validation_and_event() {
         "list returns plaintext path"
     );
 
+    // `workspaceApi.*` — the workspace_api output knobs are plain non-secret
+    // TOML-backed settings: list/get expose the defaults with their bounds,
+    // update/reset round-trip, and out-of-range / mistyped values → -32602.
+    let list = rpc(&mut w, &mut r, 18, "settings.list", json!({})).await;
+    let chars = entry(&list, "workspaceApi.maxOutputChars");
+    assert_eq!(chars["type"], "number");
+    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["min"], json!(0.0));
+    assert_eq!(chars["max"], json!(10000000.0));
+    assert!(chars.get("sensitive").is_none());
+    let toon = entry(&list, "workspaceApi.toonOutput");
+    assert_eq!(toon["type"], "boolean");
+    assert_eq!(toon["value"], json!(true));
+    let got = rpc(
+        &mut w,
+        &mut r,
+        19,
+        "settings.get",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(100000.0));
+    assert_eq!(got["definition"]["type"], "number");
+
+    // Catalog validation → -32602, nothing applied.
+    for bad in [
+        json!([{ "path": "workspaceApi.maxOutputChars", "value": 20000000 }]),
+        json!([{ "path": "workspaceApi.maxOutputChars", "value": "lots" }]),
+        json!([{ "path": "workspaceApi.toonOutput", "value": "yes" }]),
+    ] {
+        let resp = call(
+            &mut w,
+            &mut r,
+            20,
+            "settings.update",
+            json!({ "changes": bad }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+    }
+
+    // Round-trip: update both, then reset back to the defaults.
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        21,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "workspaceApi.maxOutputChars", "value": 250000 },
+            { "path": "workspaceApi.toonOutput", "value": false },
+        ] }),
+    )
+    .await;
+    assert_eq!(applied["applied"][0]["path"], "workspaceApi.maxOutputChars");
+    assert_eq!(applied["applied"][1]["path"], "workspaceApi.toonOutput");
+    assert_eq!(applied["applied"][1]["value"], json!(false));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        22,
+        "settings.get",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(250000));
+    let got = rpc(
+        &mut w,
+        &mut r,
+        23,
+        "settings.get",
+        json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false));
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        24,
+        "settings.reset",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(100000.0));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        25,
+        "settings.reset",
+        json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(true));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }

@@ -130,6 +130,23 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
+/// Pin `workspaceApi.toonOutput` off over UDS so `workspace_api` tool result
+/// bodies stay plain JSON for the `serde_json::from_str` assertions below
+/// (TOON encoding is on by default).
+async fn disable_toon_output(socket: &Path) {
+    let resp = uds_rpc(
+        socket,
+        900,
+        "settings.update",
+        json!({ "changes": [ { "path": "workspaceApi.toonOutput", "value": false } ] }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "disable toonOutput failed: {resp}"
+    );
+}
+
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -1214,6 +1231,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
@@ -1586,6 +1604,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
@@ -1960,6 +1979,7 @@ async fn non_chief_waitfor_gated_over_wss() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
@@ -2081,6 +2101,7 @@ async fn workspace_archive_unarchive_bridge_over_wss() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
@@ -2229,6 +2250,7 @@ async fn chief_workspace_archive_gated_over_wss() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]

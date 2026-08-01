@@ -88,6 +88,8 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agents.maxConcurrent",
     "agents.idleReapMinutes",
     "events.streamRetentionHours",
+    "workspaceApi.maxOutputChars",
+    "workspaceApi.toonOutput",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).

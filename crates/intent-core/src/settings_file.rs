@@ -34,7 +34,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS};
+use crate::config::{
+    DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+};
 use crate::error::{Error, Result};
 
 /// Root of the `config.toml` schema. One field per top-level TOML table.
@@ -59,6 +62,7 @@ pub struct SettingsFile {
     pub logging: LoggingSettings,
     pub agents: AgentsSettings,
     pub events: EventsSettings,
+    pub workspace_api: WorkspaceApiSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -451,6 +455,28 @@ impl Default for EventsSettings {
     }
 }
 
+/// `[workspaceApi]` — `workspace_api` tool output knobs (`workspaceApi.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkspaceApiSettings {
+    /// `workspaceApi.maxOutputChars` — max characters of one `workspace_api`
+    /// tool result before the output is redirected to a file (0 = unlimited;
+    /// min 1000 when non-zero, max 10000000).
+    pub max_output_chars: u32,
+    /// `workspaceApi.toonOutput` — TOON-encode `workspace_api` tool results
+    /// (token-efficient) instead of plain JSON.
+    pub toon_output: bool,
+}
+
+impl Default for WorkspaceApiSettings {
+    fn default() -> Self {
+        Self {
+            max_output_chars: DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+            toon_output: DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -593,6 +619,13 @@ impl SettingsFile {
                     "must be between 0 and 200, got {}",
                     self.agents.max_concurrent
                 ),
+            ));
+        }
+        let chars = self.workspace_api.max_output_chars;
+        if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
+            return Err(bad(
+                "workspaceApi.maxOutputChars",
+                format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
         Ok(())
@@ -815,6 +848,15 @@ idleReapMinutes = 30
 # Stream retention hours -- hours ephemeral events are retained before the
 # retention/compaction sweep deletes them (0 disables).
 streamRetentionHours = 72
+
+[workspaceApi]
+# Max workspace API output chars -- max characters of one workspace_api tool
+# result before the output is redirected to a file (0 = unlimited; min 1000
+# when non-zero).
+maxOutputChars = 100000
+# TOON output -- TOON-encode workspace_api tool results (token-efficient)
+# instead of plain JSON.
+toonOutput = true
 "##;
 
 #[cfg(test)]
@@ -889,17 +931,27 @@ mod tests {
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
         );
+        assert_eq!(
+            d.workspace_api.max_output_chars,
+            DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS
+        );
+        assert_eq!(
+            d.workspace_api.toon_output,
+            DEFAULT_WORKSPACE_API_TOON_OUTPUT
+        );
     }
 
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[server.wsApi]\nenabled = true\nport = 2000\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
         assert_eq!(parsed.events.stream_retention_hours, 24);
+        assert_eq!(parsed.workspace_api.max_output_chars, 5000);
+        assert!(!parsed.workspace_api.toon_output);
         assert!(parsed.server.ws_api.enabled);
         assert_eq!(parsed.server.ws_api.port, 2000);
     }
@@ -955,6 +1007,14 @@ mod tests {
             ("[server]\nport = 80\n", "server.port"),
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
+            (
+                "[workspaceApi]\nmaxOutputChars = 500\n",
+                "workspaceApi.maxOutputChars",
+            ),
+            (
+                "[workspaceApi]\nmaxOutputChars = 20000000\n",
+                "workspaceApi.maxOutputChars",
+            ),
         ] {
             let err = SettingsFile::parse_str(body).unwrap_err();
             assert!(
@@ -962,6 +1022,12 @@ mod tests {
                 "{body:?} should fail naming `{key}`: {err}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_api_max_output_chars_zero_means_unlimited() {
+        let parsed = SettingsFile::parse_str("[workspaceApi]\nmaxOutputChars = 0\n").unwrap();
+        assert_eq!(parsed.workspace_api.max_output_chars, 0);
     }
 
     #[test]
