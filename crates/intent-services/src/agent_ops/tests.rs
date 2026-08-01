@@ -202,7 +202,6 @@ async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -240,7 +239,6 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         Some("group-1".into()),
     )
     .expect("register watch");
@@ -279,7 +277,6 @@ async fn completion_delivery_attaches_event_notification_metadata() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -340,7 +337,6 @@ async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
             parent.clone(),
             "Chief".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("chief cross-workspace watch is allowed");
@@ -399,7 +395,6 @@ async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     );
     assert!(
@@ -415,7 +410,6 @@ async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
         parent.clone(),
         "Parent".into(),
         AgentId::from("agent-local-child"),
-        true,
         None,
     )
     .expect("same-workspace watch is allowed");
@@ -484,7 +478,6 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
             parent.clone(),
             "Chief".into(),
             (*child).clone(),
-            false,
             Some(gid.clone()),
         )
         .expect("chief grouped watch");
@@ -710,7 +703,7 @@ async fn app_agents_wait_rejects_already_watched_target() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "original watch survives: {watches:?}");
     assert_eq!(watches[0].id, first_id, "original watch unchanged");
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert!(
         svc.delegation_group_for_parent(&caller).is_none(),
         "rejected after_all attempt leaves no group"
@@ -1014,7 +1007,6 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -1068,7 +1060,6 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -1135,7 +1126,6 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
             gone_parent.clone(),
             "GoneParent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch 1");
@@ -1147,7 +1137,6 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
             live_parent.clone(),
             "LiveParent".into(),
             child.clone(),
-            false,
             Some("group-gone".into()),
         )
         .expect("register watch 2");
@@ -1202,7 +1191,6 @@ async fn fired_completion_watch_does_not_rehydrate() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -1509,7 +1497,6 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -1560,7 +1547,6 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -4237,12 +4223,11 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
 
 /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt): if a live
 /// ungrouped watch is removed concurrently between find and refresh (by
-/// [`Services::deliver_completion_to_watches`] dropping a oneShot watch, or
-/// by an expired [`Services::spawn_watch_cleanup`] task), the follow-up
-/// `agent.wakeOrCreate` must fall through to CREATING a new live watch —
-/// not return the dead subscription id. Dropping the seeded watch directly
-/// stands in for the concurrent removal that would race the pre-fix
-/// non-atomic find/refresh pair.
+/// [`Services::deliver_completion_to_watches`] dropping a fired watch), the
+/// follow-up `agent.wakeOrCreate` must fall through to CREATING a new live
+/// watch — not return the dead subscription id. Dropping the seeded watch
+/// directly stands in for the concurrent removal that would race the
+/// pre-fix non-atomic find/refresh pair.
 #[tokio::test]
 async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
     let (_t, svc, ws) = setup().await;
@@ -4258,7 +4243,7 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
         ..Default::default()
     };
 
-    // First wake registers a fresh oneShot watch.
+    // First wake registers a fresh watch.
     let r1 = svc
         .agent_wake_or_create_op(ws.clone(), note_id.clone(), "resume 1".into(), input())
         .await
@@ -4267,8 +4252,7 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
     assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 
     // Simulate the concurrent removal window (deliver_completion_to_watches
-    // dropping the oneShot watch, or an expired queued-watch cleanup task
-    // removing it) by dropping the seeded watch directly.
+    // dropping the fired watch) by dropping the seeded watch directly.
     assert!(
         svc.remove_watch(&sub1),
         "seeded watch must be removed for the race scenario"
@@ -6841,7 +6825,7 @@ async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let grouped = delegate_after_all(&svc, &ws, &parent).await;
-    let _one_shot = svc
+    let _ungrouped = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput::default(),
@@ -6892,11 +6876,11 @@ async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
 /// watch (in-memory + persisted rows) while an ungrouped one-shot watch
 /// survives untouched.
 #[tokio::test]
-async fn scoped_cancel_by_group_id_leaves_one_shot_intact() {
+async fn scoped_cancel_by_group_id_leaves_ungrouped_intact() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let _grouped = delegate_after_all(&svc, &ws, &parent).await;
-    let _one_shot = svc
+    let _ungrouped = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput::default(),
@@ -7105,7 +7089,7 @@ async fn scoped_cancel_combined_success_and_event_subscriptions_untouched() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let _grouped = delegate_after_all(&svc, &ws, &parent).await;
-    let _one_shot = svc
+    let _ungrouped = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput::default(),
@@ -7379,7 +7363,6 @@ async fn completion_watch_registry_register_find_list_remove() {
             parent.clone(),
             "Parent".into(),
             child_a.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -7390,7 +7373,6 @@ async fn completion_watch_registry_register_find_list_remove() {
             parent.clone(),
             "Parent".into(),
             child_b.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -7399,7 +7381,7 @@ async fn completion_watch_registry_register_find_list_remove() {
     let for_child_a = svc.find_watches_for_child(&child_a);
     assert_eq!(for_child_a.len(), 1);
     assert_eq!(for_child_a[0].id, sub_a);
-    assert!(for_child_a[0].one_shot);
+    assert!(for_child_a[0].group_id.is_none());
     assert_eq!(for_child_a[0].parent_agent_id, parent);
     assert_eq!(for_child_a[0].child_agent_id, child_a);
 
@@ -7416,18 +7398,18 @@ async fn completion_watch_registry_register_find_list_remove() {
 
 // ── (parent, child) watch uniqueness ────────────────────────────────────────
 
-/// Footer-bug regression: a oneShot watch and after_all group membership on
-/// the SAME child must not coexist as two watches. The grouped registration
-/// adopts the existing oneShot watch in place (same subscription id, now
-/// grouped and non-oneShot), so the child's completion routes ONLY into the
-/// group fan-in — one aggregated wake, no immediate duplicate.
+/// Footer-bug regression: an ungrouped watch and after_all group membership
+/// on the SAME child must not coexist as two watches. The grouped
+/// registration adopts the existing ungrouped watch in place (same
+/// subscription id, now grouped), so the child's completion routes ONLY into
+/// the group fan-in — one aggregated wake, no immediate duplicate.
 #[tokio::test]
-async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
+async fn register_grouped_watch_adopts_existing_ungrouped_for_same_pair() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
 
-    // 1) An earlier coordination message left a oneShot watch on the pair.
+    // 1) An earlier coordination message left an ungrouped watch on the pair.
     let first = svc
         .register_completion_watch(
             &ws,
@@ -7435,10 +7417,9 @@ async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
-        .expect("oneshot watch");
+        .expect("ungrouped watch");
     // 2) The same child is then enrolled in the parent's after_all group.
     let gid = svc.get_or_create_delegation_group(&ws, &parent);
     svc.enroll_child_in_group(&gid, &child);
@@ -7449,7 +7430,6 @@ async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            false,
             Some(gid.clone()),
         )
         .expect("grouped watch");
@@ -7462,7 +7442,6 @@ async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
         "at most one watch per (parent, child): {watches:?}"
     );
     assert_eq!(watches[0].group_id.as_deref(), Some(gid.as_str()));
-    assert!(!watches[0].one_shot);
 
     // The child's completion routes only into the group — no immediate wake.
     svc.handle_completion_event(&completion_event(
@@ -7492,10 +7471,10 @@ async fn register_grouped_watch_adopts_existing_oneshot_for_same_pair() {
     );
 }
 
-/// An ungrouped registration (either mode) against an existing GROUPED
-/// watch for the pair is a true no-op: the grouped watch is returned
-/// unchanged — still grouped, still non-oneShot — because the group already
-/// provides the wake path and its settlement accounting owns the watch.
+/// An ungrouped registration against an existing GROUPED watch for the pair
+/// is a true no-op: the grouped watch is returned unchanged — still grouped
+/// — because the group already provides the wake path and its settlement
+/// accounting owns the watch.
 #[tokio::test]
 async fn register_ungrouped_watch_noops_onto_existing_grouped_watch() {
     let (_t, svc, ws) = setup().await;
@@ -7511,83 +7490,60 @@ async fn register_ungrouped_watch_noops_onto_existing_grouped_watch() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            false,
             Some(gid.clone()),
         )
         .expect("grouped watch");
 
-    for one_shot in [true, false] {
-        let id = svc
-            .register_completion_watch(
-                &ws,
-                &ws,
-                parent.clone(),
-                "Parent".into(),
-                child.clone(),
-                one_shot,
-                None,
-            )
-            .expect("ungrouped registration");
-        assert_eq!(id, grouped, "grouped watch adopted (oneShot={one_shot})");
-        let watches = svc.list_watches_for_parent(&parent);
-        assert_eq!(watches.len(), 1, "no duplicate: {watches:?}");
-        assert_eq!(
-            watches[0].group_id.as_deref(),
-            Some(gid.as_str()),
-            "watch stays grouped"
-        );
-        assert!(!watches[0].one_shot, "watch stays non-oneShot");
-    }
+    let id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("ungrouped registration");
+    assert_eq!(id, grouped, "grouped watch adopted");
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1, "no duplicate: {watches:?}");
+    assert_eq!(
+        watches[0].group_id.as_deref(),
+        Some(gid.as_str()),
+        "watch stays grouped"
+    );
 }
 
 /// Repeated ungrouped registrations for the same pair collapse onto one
-/// watch: same-mode re-registration returns the existing id; a non-oneShot
-/// request upgrades an existing oneShot watch in place (a queued wake must
-/// survive the current agent:idle); a later oneShot request never degrades
-/// the non-oneShot watch back.
+/// watch: re-registration returns the existing id.
 #[tokio::test]
-async fn register_ungrouped_watch_for_same_pair_reuses_and_upgrades() {
+async fn register_ungrouped_watch_for_same_pair_reuses() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
-    let register = |one_shot: bool| {
+    let register = || {
         svc.register_completion_watch(
             &ws,
             &ws,
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            one_shot,
             None,
         )
     };
 
-    let first = register(true).expect("first");
-    let second = register(true).expect("second");
-    assert_eq!(first, second, "same-mode re-registration reuses the watch");
+    let first = register().expect("first");
+    let second = register().expect("second");
+    assert_eq!(first, second, "re-registration reuses the watch");
     let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 1);
-    assert!(watches[0].one_shot);
-
-    let third = register(false).expect("third");
-    assert_eq!(first, third, "upgrade adopts the same watch");
-    let watches = svc.list_watches_for_parent(&parent);
-    assert_eq!(watches.len(), 1, "upgrade must not duplicate: {watches:?}");
-    assert!(!watches[0].one_shot, "oneShot upgraded to non-oneShot");
-
-    let fourth = register(true).expect("fourth");
-    assert_eq!(first, fourth);
-    let watches = svc.list_watches_for_parent(&parent);
-    assert_eq!(watches.len(), 1);
-    assert!(
-        !watches[0].one_shot,
-        "a oneShot request never degrades a non-oneShot watch"
-    );
+    assert!(watches[0].group_id.is_none());
 }
 
 /// Startup rehydration coalesces pre-invariant duplicate persisted rows for
-/// the same (parent, child) pair: exactly one row is loaded (grouped >
-/// non-oneShot > oneShot rank) and the duplicate rows are deleted.
+/// the same (parent, child) pair: exactly one row is loaded (grouped rows
+/// rank above ungrouped, older first within a rank) and the duplicate rows
+/// are deleted.
 #[tokio::test]
 async fn rehydration_prunes_duplicate_pair_rows() {
     let tmp = TempDb::new();
@@ -7602,11 +7558,11 @@ async fn rehydration_prunes_duplicate_pair_rows() {
     };
 
     // Seed two persisted rows for the SAME pair directly (the pre-invariant
-    // daemon could accumulate these): a oneShot row and a non-oneShot row.
+    // daemon could accumulate these): two ungrouped rows, older first wins.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    for (id, one_shot, created_at) in [
-        ("watch-dup-oneshot", true, "2026-01-01T00:00:00Z"),
-        ("watch-dup-nononeshot", false, "2026-01-02T00:00:00Z"),
+    for (id, created_at) in [
+        ("watch-dup-older", "2026-01-01T00:00:00Z"),
+        ("watch-dup-newer", "2026-01-02T00:00:00Z"),
     ] {
         store
             .upsert_completion_watch(&intent_store::PersistedCompletionWatch {
@@ -7616,11 +7572,9 @@ async fn rehydration_prunes_duplicate_pair_rows() {
                 parent_agent_id: parent.clone(),
                 parent_agent_name: "Parent".into(),
                 child_agent_id: child.clone(),
-                one_shot,
                 group_id: None,
                 report_delivered: false,
                 wake_on_attention: false,
-                deadline_at_ms: None,
                 created_at: created_at.to_string(),
             })
             .await
@@ -7635,10 +7589,6 @@ async fn rehydration_prunes_duplicate_pair_rows() {
     assert_eq!(loaded, 1, "exactly one row per pair rehydrated");
     let watches = restarted.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 1, "one in-memory watch: {watches:?}");
-    assert!(
-        !watches[0].one_shot,
-        "the higher-rank (non-oneShot) row wins the coalesce"
-    );
     // The duplicate row was deleted, so the surviving row is the only one.
     wait_for_persisted_watches(&restarted, 1).await;
     let rows = restarted
@@ -7646,7 +7596,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
         .list_completion_watches()
         .await
         .expect("rows");
-    assert_eq!(rows[0].id, "watch-dup-nononeshot");
+    assert_eq!(rows[0].id, "watch-dup-older", "older row wins the coalesce");
 }
 
 /// MCP front door (caller set), default wait mode: exactly one oneShot watch is
@@ -7668,7 +7618,7 @@ async fn delegate_immediate_registers_one_oneshot_watch_for_mcp_caller() {
 
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, child);
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
@@ -7709,7 +7659,6 @@ async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
 
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
-    assert!(!watches[0].one_shot);
     assert_eq!(
         watches[0].group_id.as_deref(),
         Some(group.group_id.as_str())
@@ -7763,7 +7712,7 @@ async fn watch_completion_registers_oneshot_watch() {
     let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, child);
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
@@ -7818,16 +7767,15 @@ async fn sender_watch_registers_oneshot_for_foreground_caller() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, target);
 }
 
 /// Pair uniqueness on the piggyback path: the sender auto-subscribe on a
-/// target the caller already watches (here via a live non-oneShot watch,
-/// which the oneShot reuse fast-path cannot match) silently no-ops onto the
-/// existing watch — same subscription id back, exactly one watch, the send
-/// itself unaffected, and the watch's stronger (non-oneShot) mode preserved.
+/// target the caller already watches silently no-ops onto the existing
+/// watch — same subscription id back, exactly one watch, the send itself
+/// unaffected.
 #[tokio::test]
 async fn sender_watch_silently_adopts_existing_watch_for_pair() {
     let (_t, svc, ws) = setup().await;
@@ -7840,10 +7788,9 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
             caller.clone(),
             "Coordinator".into(),
             target.clone(),
-            false,
             None,
         )
-        .expect("existing non-oneShot watch");
+        .expect("existing watch");
 
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
@@ -7854,10 +7801,6 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
 
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "no duplicate stacked: {watches:?}");
-    assert!(
-        !watches[0].one_shot,
-        "a oneShot piggyback never degrades the existing non-oneShot watch"
-    );
 }
 
 /// A delegated background task sender (isBackground + metadata
@@ -8055,7 +7998,7 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, target);
 }
 
@@ -8090,7 +8033,7 @@ async fn wake_or_create_created_new_subscribes_caller() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "one fresh watch: {watches:?}");
     assert_eq!(watches[0].id, sub_id);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
     assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, created);
 
@@ -8420,10 +8363,10 @@ async fn wake_or_create_deleted_out_of_scope_caller_skips_pre_gate() {
 }
 
 /// Queued-to-active wake: the context message queues behind the assignee's
-/// in-flight turn, so the caller's watch is NON-oneShot (it must survive the
-/// current turn's `agent:idle`) and the response carries the queued text.
+/// in-flight turn; the caller gets an ungrouped watch on the target and the
+/// response carries the queued text.
 #[tokio::test]
-async fn wake_or_create_queued_registers_non_oneshot_watch() {
+async fn wake_or_create_queued_registers_watch() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Busy assignee").await;
@@ -8458,61 +8401,20 @@ async fn wake_or_create_queued_registers_non_oneshot_watch() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
-    assert!(!watches[0].one_shot, "queued watch must survive agent:idle");
     assert_eq!(watches[0].child_agent_id, target);
 
     manager.release_slot(&target).await;
 }
 
-/// The queued watch's leak guard: `spawn_watch_cleanup` removes the watch
-/// after the timeout elapses (the TS 5-minute `setTimeout` unsubscribe).
-#[tokio::test]
-async fn spawn_watch_cleanup_removes_watch_after_timeout() {
-    let (_t, svc, ws) = setup().await;
-    let caller = create_agent(&svc, &ws, "Coordinator").await;
-    let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc
-        .register_completion_watch(
-            &ws,
-            &ws,
-            caller.clone(),
-            "Coordinator".into(),
-            target.clone(),
-            false,
-            None,
-        )
-        .expect("register watch");
-    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
-
-    svc.spawn_watch_cleanup(
-        ws.clone(),
-        caller.clone(),
-        sub_id,
-        Duration::from_millis(50),
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if svc.list_watches_for_parent(&caller).is_empty() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("cleanup did not remove the queued watch");
-}
-
 /// SUB-2 (PR #104 thread PRRT_kwDOS9Wxuc6QIRcq), updated for pair
-/// uniqueness: a queued wake must never LEAVE a oneShot watch as the
-/// caller's only wake path, because a oneShot watch is removed on the first
-/// `agent:idle` — which is precisely the idle that a queued message needs to
-/// survive. Under the (parent, child) uniqueness invariant the queued path
-/// now ADOPTS the pre-existing oneShot watch and upgrades it in place to
-/// non-oneShot (same subscription id, exactly one watch) instead of stacking
-/// a second watch next to it. A pre-seeded oneShot watch (registered via
+/// uniqueness: a queued wake ADOPTS the pre-existing watch for the pair
+/// (same subscription id, exactly one watch) instead of stacking a second
+/// watch next to it. A pre-seeded watch (registered via
 /// [`Services::register_completion_watch`] to sidestep runtime turn-starting
-/// side effects) drives the queued wake through the mode-mismatch
-/// fall-through in [`Services::agent_wake_or_create_op`].
+/// side effects) drives the queued wake through the reuse path in
+/// [`Services::agent_wake_or_create_op`].
 #[tokio::test]
-async fn wake_or_create_queued_upgrades_existing_oneshot_watch() {
+async fn wake_or_create_queued_adopts_existing_watch() {
     let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
@@ -8521,16 +8423,15 @@ async fn wake_or_create_queued_upgrades_existing_oneshot_watch() {
         .await
         .expect("assign");
 
-    // Seed a oneShot watch for this caller/target pair (as an earlier
+    // Seed a watch for this caller/target pair (as an earlier
     // non-queued wake would have registered).
-    let oneshot_sub_id = svc
+    let seeded_sub_id = svc
         .register_completion_watch(
             &ws,
             &ws,
             caller.clone(),
             "Coordinator".into(),
             target.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -8558,136 +8459,20 @@ async fn wake_or_create_queued_upgrades_existing_oneshot_watch() {
         .to_string();
 
     assert_eq!(
-        oneshot_sub_id, queued_sub_id,
+        seeded_sub_id, queued_sub_id,
         "queued wake adopts the existing watch for the pair"
     );
 
-    // Exactly one watch for the pair, upgraded in place to non-oneShot so it
-    // survives the assignee's current agent:idle.
+    // Exactly one watch for the pair.
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(
         watches.len(),
         1,
         "at most one watch per (caller, target): {watches:?}"
     );
-    assert_eq!(watches[0].id, oneshot_sub_id);
-    assert!(
-        !watches[0].one_shot,
-        "adopted watch must be upgraded to non-oneShot so it survives the current agent:idle"
-    );
-    assert!(
-        watches[0].cleanup_deadline.is_some(),
-        "queued branch arms the 5-minute leak guard on the adopted watch"
-    );
+    assert_eq!(watches[0].id, seeded_sub_id);
 
     manager.release_slot(&target).await;
-}
-
-/// SUB-2 (unresolved copilot review thread PRRT_kwDOS9Wxuc6QIRcq on PR #104):
-/// reusing a queued watch across repeated `wakeOrCreate` calls must not
-/// shorten its effective cleanup deadline. An earlier-spawned cleanup task
-/// wakes first but must no-op because the deadline has been extended by a
-/// later call; the later task then performs the removal at the new deadline.
-#[tokio::test]
-async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
-    let (_t, svc, ws) = setup().await;
-    let caller = create_agent(&svc, &ws, "Coordinator").await;
-    let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc
-        .register_completion_watch(
-            &ws,
-            &ws,
-            caller.clone(),
-            "Coordinator".into(),
-            target.clone(),
-            false,
-            None,
-        )
-        .expect("register watch");
-    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
-
-    // Arm a short cleanup, then immediately extend it with a much later
-    // deadline before the first timer can fire.
-    svc.spawn_watch_cleanup(
-        ws.clone(),
-        caller.clone(),
-        sub_id.clone(),
-        Duration::from_millis(80),
-    );
-    svc.spawn_watch_cleanup(
-        ws.clone(),
-        caller.clone(),
-        sub_id.clone(),
-        Duration::from_millis(600),
-    );
-
-    // Wait past the original (short) deadline. If the earlier task removed
-    // the watch it would be gone here — that is the bug this test guards
-    // against.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let watches = svc.list_watches_for_parent(&caller);
-    assert_eq!(
-        watches.len(),
-        1,
-        "earlier cleanup task must not shorten an extended deadline (watches now: {watches:?})"
-    );
-
-    // Wait past the extended deadline; the later task must fire and remove.
-    let removal_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < removal_deadline {
-        if svc.list_watches_for_parent(&caller).is_empty() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("later cleanup task did not remove the watch after the extended deadline");
-}
-
-/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuM):
-/// `spawn_watch_cleanup` must not arm a sleeper task when the deadline
-/// bump misses (e.g. the watch was removed concurrently between the reuse
-/// find and the cleanup arm). The bump returns `false`, and no task is
-/// spawned; the return value from `spawn_watch_cleanup` surfaces that.
-#[tokio::test]
-async fn spawn_watch_cleanup_skips_when_deadline_bump_misses() {
-    let (_t, svc, ws) = setup().await;
-    let caller = create_agent(&svc, &ws, "Coordinator").await;
-    let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc
-        .register_completion_watch(
-            &ws,
-            &ws,
-            caller.clone(),
-            "Coordinator".into(),
-            target.clone(),
-            false,
-            None,
-        )
-        .expect("register watch");
-
-    // Stand in for a concurrent removal: drop the watch before the cleanup
-    // task would be armed.
-    assert!(svc.remove_watch(&sub_id), "seed removal");
-    assert!(svc.list_watches_for_parent(&caller).is_empty());
-
-    // The arm must observe the missing watch, skip the tokio::spawn, and
-    // report `false`. Waiting past the requested delay must not resurrect
-    // the empty registry or otherwise mutate state.
-    let armed = svc.spawn_watch_cleanup(
-        ws.clone(),
-        caller.clone(),
-        sub_id,
-        Duration::from_millis(30),
-    );
-    assert!(
-        !armed,
-        "no cleanup task must be spawned when the bump misses"
-    );
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(
-        svc.list_watches_for_parent(&caller).is_empty(),
-        "registry stays empty; the skipped cleanup task cannot side-effect it",
-    );
 }
 
 /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuU):
@@ -8708,14 +8493,13 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
             caller.clone(),
             "Coordinator".into(),
             target.clone(),
-            true,
             None,
         )
         .expect("register watch");
 
     // Reuse with no resolved name: still returns the same subscription id
     // (reuse proceeds), and the stored `parent_agent_name` is untouched.
-    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, None, None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
@@ -8728,7 +8512,7 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
     // before, so the `None` short-circuit is scoped to the lookup-failed
     // case rather than disabling the refresh entirely.
     let reused =
-        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, Some("Renamed".into()), None);
+        svc.find_and_refresh_ungrouped_watch(&caller, &target, Some("Renamed".into()), None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches[0].parent_agent_name, "Renamed");
@@ -8754,13 +8538,12 @@ async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
             caller.clone(),
             "Chief".into(),
             target.clone(),
-            true,
             None,
         )
         .expect("register watch with fallback anchor");
 
     // Reuse with no resolved home: anchor untouched.
-    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, None, None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     assert_eq!(
         svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
@@ -8768,8 +8551,7 @@ async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
     );
 
     // Reuse with the parent's true home resolved: anchor corrected.
-    let reused =
-        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, Some(&chief_ws));
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, None, Some(&chief_ws));
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     assert_eq!(
         svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
@@ -8819,7 +8601,7 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].child_agent_id, child);
-    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
 }
 
 // ===========================================================================
@@ -9560,7 +9342,6 @@ async fn two_after_all_delegates_share_one_group() {
 
     let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 2);
-    assert!(watches.iter().all(|w| !w.one_shot));
     assert!(watches
         .iter()
         .all(|w| w.group_id.as_deref() == Some(group.group_id.as_str())));
@@ -10682,7 +10463,6 @@ async fn diagnostics_snapshot_shape_and_subscriptions() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -10879,16 +10659,8 @@ async fn diagnostics_flags_orphaned_subscription() {
     let (_t, svc, ws) = setup().await;
     let child = create_agent(&svc, &ws, "Child").await;
     let ghost = AgentId::from("agent-ghost");
-    svc.register_completion_watch(
-        &ws,
-        &ws,
-        ghost.clone(),
-        "Ghost".into(),
-        child.clone(),
-        true,
-        None,
-    )
-    .expect("register watch");
+    svc.register_completion_watch(&ws, &ws, ghost.clone(), "Ghost".into(), child.clone(), None)
+        .expect("register watch");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
@@ -12416,7 +12188,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     // Seed a completion watch (Alpha → Beta), a live-turn slot for Alpha,
     // and a queued message for Gamma — the three in-memory registries the
     // delete path must sweep.
-    svc.register_completion_watch(&ws, &ws, a.clone(), "Alpha".into(), b.clone(), true, None)
+    svc.register_completion_watch(&ws, &ws, a.clone(), "Alpha".into(), b.clone(), None)
         .expect("register watch");
     svc.set_live_turn(
         &a,
@@ -12517,7 +12289,6 @@ async fn delete_workspace_consumes_chief_oneshot_watch_without_bus() {
         parent.clone(),
         "Chief".into(),
         child.clone(),
-        true,
         None,
     )
     .await
@@ -12591,7 +12362,6 @@ async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
         parent.clone(),
         "Chief".into(),
         child.clone(),
-        false,
         Some(gid.clone()),
     )
     .expect("chief grouped watch");
@@ -12633,7 +12403,6 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
         parent.clone(),
         "Chief".into(),
         child.clone(),
-        false,
         Some(gid.clone()),
     )
     .expect("chief grouped watch");
@@ -12683,7 +12452,6 @@ async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
         parent_a.clone(),
         "ParentA".into(),
         child_a.clone(),
-        true,
         None,
     )
     .expect("ws-a watch");
@@ -12699,7 +12467,6 @@ async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
         parent_b.clone(),
         "ParentB".into(),
         child_b.clone(),
-        true,
         None,
     )
     .expect("ws-b watch");
@@ -13179,7 +12946,6 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         1,
         "exactly one watch retained for the failed child, got: {watches:?}"
     );
-    assert!(retained[0].one_shot, "retained watch must be oneShot");
     assert!(
         retained[0].group_id.is_none(),
         "retained watch must be ungrouped (the group is gone)"
@@ -14533,26 +14299,27 @@ async fn wake_or_create_survives_failed_queue_migration() {
 }
 
 /// monorepo#840 failure-wake dedup: a repeated `agent:failed` with the SAME
-/// error text is suppressed for a parent that already received it; a
-/// different error delivers, and a non-failure completion clears the dedup
-/// so a later identical failure delivers again.
+/// error text is suppressed for a parent that already received it (the
+/// suppressed delivery leaves the watch in place); a different error
+/// delivers, and a non-failure completion clears the dedup so a later
+/// identical failure is a fresh signal.
 #[tokio::test]
 async fn repeated_identical_failure_wake_is_deduped_per_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
-    // Non-oneShot watch: it survives deliveries, so only the dedup gate
-    // (not watch removal) can suppress the repeats.
     svc.register_completion_watch(
         &ws,
         &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        false,
         None,
     )
     .expect("register watch");
+    // Seed the dedup record as if "boom" was already delivered to this
+    // parent (recorded AFTER registration, which clears the pair).
+    svc.record_failure_wake(&parent, &child, "boom");
     let parent_message_count = |svc: &Services, parent: &AgentId| {
         let svc = svc.clone();
         let parent = parent.clone();
@@ -14574,28 +14341,28 @@ async fn repeated_identical_failure_wake_is_deduped_per_parent() {
         )
     };
 
-    // First failure delivers.
-    svc.handle_completion_event(&failed("boom")).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
-
-    // The SAME error again is suppressed; the watch stays in place.
+    // The SAME error is suppressed; the watch stays in place for a future
+    // distinct signal.
     svc.handle_completion_event(&failed("boom")).await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        1,
+        0,
         "identical repeat failure suppressed"
     );
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 
-    // A DIFFERENT error delivers.
+    // A DIFFERENT error delivers (and retires the watch).
     svc.handle_completion_event(&failed("bang")).await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        2,
+        1,
         "changed error delivers"
     );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc.failure_wake_is_duplicate(&parent, &child, "bang"));
 
-    // A non-failure completion clears the dedup (and itself delivers)…
+    // A non-failure completion clears the child's dedup records, so a later
+    // identical failure is fresh information for a re-registered watch.
     let idle = completion_event(
         &ws,
         AGENT_IDLE,
@@ -14603,13 +14370,23 @@ async fn repeated_identical_failure_wake_is_deduped_per_parent() {
         json!({ "agentId": child.0, "lastResponseSummary": "recovered" }),
     );
     svc.handle_completion_event(&idle).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 3);
-
-    // …so a later identical failure is a fresh signal and delivers again.
+    assert!(
+        !svc.failure_wake_is_duplicate(&parent, &child, "bang"),
+        "non-failure completion clears the dedup"
+    );
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-register watch");
     svc.handle_completion_event(&failed("bang")).await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        4,
+        2,
         "post-recovery failure delivers despite matching the old text"
     );
 }
@@ -14640,7 +14417,6 @@ async fn grouped_watch_bypasses_failure_wake_dedup() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        false,
         None,
     )
     .expect("register ungrouped watch");
@@ -14659,7 +14435,6 @@ async fn grouped_watch_bypasses_failure_wake_dedup() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        false,
         Some(gid.clone()),
     )
     .expect("register grouped watch");
@@ -14714,7 +14489,6 @@ async fn watch_registration_resets_failure_wake_dedup_for_pair() {
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register oneShot watch")
@@ -15397,7 +15171,6 @@ async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -15468,7 +15241,6 @@ async fn stall_annotation_skipped_when_completion_report_present() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -15529,7 +15301,6 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
             parent.clone(),
             "Parent".into(),
             child.clone(),
-            true,
             None,
         )
         .expect("register watch");
@@ -15575,7 +15346,6 @@ async fn stall_annotation_skipped_for_agent_failed() {
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
@@ -16456,14 +16226,14 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 }
 
 // ===========================================================================
-// agent.watch / agent.unwatch (monorepo#1229): explicit persistent watches
+// agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
-/// `agent.watch` registers a persistent (non-oneShot, wake_on_attention)
-/// watch that survives an `agent:idle` delivery: the watcher is woken on
-/// each completion instead of once.
+/// `agent.watch` registers a wake_on_attention watch; like every ungrouped
+/// watch it is deliver-once — the `agent:idle` wake retires it, and a second
+/// idle with no re-arm delivers nothing.
 #[tokio::test]
-async fn agent_watch_persists_across_idle_deliveries() {
+async fn agent_watch_delivers_once_and_is_retired() {
     let (_t, svc, ws) = setup().await;
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let target = create_agent(&svc, &ws, "Target").await;
@@ -16479,31 +16249,36 @@ async fn agent_watch_persists_across_idle_deliveries() {
     let watches = svc.list_watches_for_parent(&watcher);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
-    assert!(!watches[0].one_shot, "explicit watch is persistent");
     assert!(
         watches[0].wake_on_attention,
         "explicit watch wakes on attention"
     );
 
-    for expected in 1..=2usize {
-        svc.handle_completion_event(&completion_event(
-            &ws,
-            AGENT_IDLE,
-            &target,
-            json!({ "agentId": target.0 }),
-        ))
-        .await;
-        assert_eq!(
-            parent_message_count(&svc, &watcher).await,
-            expected,
-            "wake #{expected} delivered"
-        );
-    }
-    // The watch is still armed after both deliveries.
-    assert_eq!(svc.list_watches_for_parent(&watcher).len(), 1);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &watcher).await, 1);
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "watch retired after the completion wake"
+    );
+
+    // A second idle with no re-arm delivers nothing.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &watcher).await, 1);
 }
 
-/// `agent:deleted` is terminal: the persistent watch delivers one final wake
+/// `agent:deleted` is terminal: the watch delivers one final wake
 /// and is removed (no leak on a deleted target).
 #[tokio::test]
 async fn agent_watch_removed_after_target_deleted() {
@@ -16623,8 +16398,8 @@ async fn agent_watch_attention_fanout_excludes_parent() {
     );
 }
 
-/// `reportToParent` idle suppression stays scoped to the parent's oneShot
-/// watch: a third-party persistent watcher still receives the `agent:idle`
+/// `reportToParent` idle suppression stays scoped to the parent's own
+/// watch: a third-party watcher still receives the `agent:idle`
 /// wake after the child reported.
 #[tokio::test]
 async fn report_to_parent_does_not_suppress_third_party_watch_idle_wake() {
@@ -16800,7 +16575,6 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     assert_eq!(loaded, 1);
     let watches = restarted.list_watches_for_parent(&watcher);
     assert_eq!(watches.len(), 1);
-    assert!(!watches[0].one_shot, "persistent flag survives restart");
     assert!(
         watches[0].wake_on_attention,
         "wake_on_attention flag survives restart"

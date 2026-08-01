@@ -286,7 +286,7 @@ mod tests {
             .with_event_bus(bus.clone())
             .with_workspaces_root(workspaces_root.clone());
 
-        // Register a completion watch: parent watches child (oneShot)
+        // Register a completion watch: parent watches child
         services
             .register_completion_watch(
                 &ws.id,
@@ -294,7 +294,6 @@ mod tests {
                 parent_id.clone(),
                 "Parent".to_string(),
                 child_id.clone(),
-                true, // oneShot
                 None, // no group
             )
             .expect("register watch");
@@ -455,8 +454,7 @@ mod tests {
                 &ws.id,
                 parent_id.clone(),
                 "Parent".to_string(),
-                child_id.clone(),
-                true, // oneShot
+                child_id.clone(), // oneShot
                 None,
             )
             .expect("register watch");
@@ -629,8 +627,7 @@ mod tests {
                 &ws.id,
                 parent_id.clone(),
                 "Parent".to_string(),
-                child_id.clone(),
-                true, // oneShot
+                child_id.clone(), // oneShot
                 None,
             )
             .expect("register watch");

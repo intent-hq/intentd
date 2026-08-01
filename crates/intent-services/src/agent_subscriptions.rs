@@ -14,21 +14,20 @@
 //! shared registration path, not per-caller.
 //!
 //! Pair uniqueness: a parent holds AT MOST ONE active watch per child —
-//! across oneShot, non-oneShot, and grouped watches. The shared registration
-//! path enforces it by ADOPTING an existing watch for the pair instead of
-//! pushing a duplicate (a grouped request converts the watch to the group
-//! watch; a non-oneShot request upgrades a oneShot; a weaker request never
-//! degrades a stronger watch). Explicit registrations (`app.agents.waitFor`)
-//! reject an already-watched target up front instead; startup rehydration
-//! coalesces pre-existing duplicate persisted rows.
+//! across ungrouped and grouped watches. The shared registration path
+//! enforces it by ADOPTING an existing watch for the pair instead of pushing
+//! a duplicate (a grouped request converts the watch to the group watch; a
+//! weaker request never degrades a stronger watch). Explicit registrations
+//! (`app.agents.waitFor`) reject an already-watched target up front instead;
+//! startup rehydration coalesces pre-existing duplicate persisted rows.
 //!
-//! A oneShot watch is registered when an agent delegates with `waitMode`
+//! An ungrouped watch is registered when an agent delegates with `waitMode`
 //! `immediate` (default) over the MCP front door; the delivery worker that
 //! fires on child completion lands in AS-3 and the `after_all`
 //! delegation-group fan-in lands in AS-4.
 //!
 //! Mirrors the TS `subscribeCallerToAgentCompletion` / `agentSubscribe` shape
-//! (oneShot, `actorIds: [child]`, AGENT completion event set
+//! (`actorIds: [child]`, AGENT completion event set
 //! `['agent:idle','agent:failed','agent:deleted']`). The event-type wiring is an
 //! AS-3 concern; this module only owns the registry records and helpers.
 
@@ -36,19 +35,13 @@ use std::sync::Arc;
 
 use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup};
 
-// Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
-// deadline: Tokio timers/instants follow Tokio's time source while
-// `std::time::Instant` always reads real time; mixing them makes deadline
-// checks incorrect in paused-time tests (see `tokio::time::pause`).
-use tokio::time::Instant;
-
 use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
 use uuid::Uuid;
 
 use crate::Services;
 
-/// One parent→child completion-watch record. A `one_shot` watch is removed once
-/// the child's completion has been delivered to the parent (AS-3).
+/// One parent→child completion-watch record. An ungrouped watch is removed
+/// once the child's completion has been delivered to the parent (AS-3).
 // Fields are read by the AS-3 delivery worker and by tests; AS-2 only populates
 // the registry, so the lib-only build sees them as unread.
 #[allow(dead_code)]
@@ -66,17 +59,8 @@ pub(crate) struct CompletionWatch {
     pub parent_agent_id: AgentId,
     pub parent_agent_name: String,
     pub child_agent_id: AgentId,
-    pub one_shot: bool,
     pub group_id: Option<String>,
     pub created_at: String,
-    /// SUB-2: monotonic cleanup deadline for the leak-guard timer. Set (and
-    /// bumped) by [`Services::bump_watch_cleanup_deadline`]; a spawned cleanup
-    /// task only removes the watch once this instant is in the past, so an
-    /// earlier-scheduled timer cannot delete a watch whose deadline was
-    /// extended by a later `spawn_watch_cleanup` call. `None` means "no
-    /// timed cleanup is armed" (the default for one-shot watches, which are
-    /// removed on delivery instead).
-    pub cleanup_deadline: Option<Instant>,
     /// Report-time wake: set to `true` when `agent.reportToParent` delivers
     /// the parent wake immediately. When `true`, `deliver_completion_to_watches`
     /// skips delivery for `agent:idle` (suppressing the duplicate wake) but
@@ -169,7 +153,6 @@ impl Services {
     /// Pair uniqueness: when the parent already holds a watch on this child,
     /// the existing watch is ADOPTED (see [`Services::insert_watch_in_memory`])
     /// and its id is returned — no duplicate is ever pushed.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_completion_watch(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -177,7 +160,6 @@ impl Services {
         parent_agent_id: AgentId,
         parent_agent_name: String,
         child_agent_id: AgentId,
-        one_shot: bool,
         group_id: Option<String>,
     ) -> Result<String> {
         let watch = self.insert_watch_in_memory(
@@ -186,14 +168,13 @@ impl Services {
             parent_agent_id,
             parent_agent_name,
             child_agent_id,
-            one_shot,
             group_id,
             false,
         )?;
         // Write-through persist (best-effort) so the watch survives a daemon
         // restart (rehydrated by `heal_completion_watches_on_startup`). On the
         // adopt path this upserts the existing row's mutable columns
-        // (one_shot / group_id) so the strengthened mode is restart-durable.
+        // (group_id) so the strengthened mode is restart-durable.
         let id = watch.id.clone();
         self.persist_completion_watch(&watch);
         Ok(id)
@@ -208,7 +189,6 @@ impl Services {
     /// spawned delete and resurrect the row as an orphan (duplicate wake on
     /// the next restart). A failed persist only logs: the in-memory watch
     /// still fires live, matching the best-effort durability contract.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_completion_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -216,7 +196,6 @@ impl Services {
         parent_agent_id: AgentId,
         parent_agent_name: String,
         child_agent_id: AgentId,
-        one_shot: bool,
         group_id: Option<String>,
     ) -> Result<String> {
         let watch = self.insert_watch_in_memory(
@@ -225,7 +204,6 @@ impl Services {
             parent_agent_id,
             parent_agent_name,
             child_agent_id,
-            one_shot,
             group_id,
             false,
         )?;
@@ -237,12 +215,12 @@ impl Services {
         Ok(id)
     }
 
-    /// Explicit `agent.watch` registration (monorepo#1229): a PERSISTENT
-    /// (non-oneShot) ungrouped watch that also wakes on the child's attention
-    /// requests, with an AWAITED persist (the registration is the caller's
-    /// durable contract). Adoption strengthens an existing watch for the pair
-    /// (oneShot cleared, `wake_on_attention` set) — grouped watches keep
-    /// their group but gain the attention flag.
+    /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
+    /// watch that also wakes on the child's attention requests, with an
+    /// AWAITED persist (the registration is the caller's durable contract).
+    /// Adoption strengthens an existing watch for the pair
+    /// (`wake_on_attention` set) — grouped watches keep their group but gain
+    /// the attention flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
@@ -257,7 +235,6 @@ impl Services {
             parent_agent_id,
             parent_agent_name,
             child_agent_id,
-            false,
             None,
             true,
         )?;
@@ -276,18 +253,15 @@ impl Services {
     ///
     /// Adoption rules (strengthen-only, never weaken):
     /// - A grouped request converts the existing watch into the group watch
-    ///   (`group_id` adopted, `one_shot` cleared) — group settlement
-    ///   accounting REQUIRES the grouped watch to exist, so the group always
-    ///   wins a collision (this is the footer duplicate-wake bug: a oneShot
-    ///   watch coexisting with after_all membership double-woke the parent).
+    ///   (`group_id` adopted) — group settlement accounting REQUIRES the
+    ///   grouped watch to exist, so the group always wins a collision (this
+    ///   is the footer duplicate-wake bug: an ungrouped watch coexisting
+    ///   with after_all membership double-woke the parent).
     /// - An ungrouped request against an existing grouped watch is a no-op
     ///   (the group already provides the wake path).
-    /// - A non-oneShot ungrouped request upgrades an existing oneShot watch
-    ///   (a queued wake must survive the current `agent:idle`); a oneShot
-    ///   request never degrades a non-oneShot watch.
-    /// - `wake_on_attention` is strengthen-only too: an explicit
-    ///   `agent.watch` sets it on the adopted watch; a later auto
-    ///   registration never clears it.
+    /// - `wake_on_attention` is strengthen-only: an explicit `agent.watch`
+    ///   sets it on the adopted watch; a later auto registration never
+    ///   clears it.
     #[allow(clippy::too_many_arguments)]
     fn insert_watch_in_memory(
         &self,
@@ -296,7 +270,6 @@ impl Services {
         parent_agent_id: AgentId,
         parent_agent_name: String,
         child_agent_id: AgentId,
-        one_shot: bool,
         group_id: Option<String>,
         wake_on_attention: bool,
     ) -> Result<CompletionWatch> {
@@ -311,14 +284,6 @@ impl Services {
             }) {
                 if let Some(gid) = group_id {
                     existing.group_id = Some(gid);
-                    existing.one_shot = false;
-                    // Group settlement owns the watch's lifecycle now: disarm
-                    // any queued-wake leak-guard deadline so a stale cleanup
-                    // task cannot remove the grouped watch out from under the
-                    // group's completion accounting.
-                    existing.cleanup_deadline = None;
-                } else if existing.group_id.is_none() {
-                    existing.one_shot = existing.one_shot && one_shot;
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
                 // Refresh the parent display name and home-workspace anchor
@@ -343,10 +308,8 @@ impl Services {
                     parent_agent_id,
                     parent_agent_name,
                     child_agent_id,
-                    one_shot,
                     group_id,
                     created_at: now_iso(),
-                    cleanup_deadline: None,
                     report_delivered: false,
                     wake_on_attention,
                 };
@@ -363,9 +326,9 @@ impl Services {
     }
 
     /// Whether the parent already holds ANY active watch on this child —
-    /// oneShot, non-oneShot, or grouped (the pair-uniqueness pre-check used
-    /// by explicit registration paths that must reject duplicates instead of
-    /// silently adopting, e.g. `app.agents.waitFor`).
+    /// ungrouped or grouped (the pair-uniqueness pre-check used by explicit
+    /// registration paths that must reject duplicates instead of silently
+    /// adopting, e.g. `app.agents.waitFor`).
     pub(crate) fn pair_watch_exists(
         &self,
         parent_agent_id: &AgentId,
@@ -395,31 +358,27 @@ impl Services {
 
     /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt):
     /// atomically find a live ungrouped (immediate-mode) watch for the given
-    /// caller→target pair whose `one_shot` mode matches `one_shot` and, while
-    /// still holding the registry lock, refresh its stored `parent_agent_name`
-    /// to `new_parent_name`. Returns the live subscription id iff a matching
-    /// watch was found — so a concurrent removal by
-    /// [`Services::deliver_completion_to_watches`] (oneShot cleanup) or by an
-    /// expired [`Services::spawn_watch_cleanup`] task cannot land between the
-    /// find and the refresh and leave `agent.wakeOrCreate` returning a "reused"
-    /// subscription id that no longer exists. Callers must fall through to
+    /// caller→target pair and, while still holding the registry lock,
+    /// refresh its stored `parent_agent_name` to `new_parent_name`. Returns
+    /// the live subscription id iff a matching watch was found — so a
+    /// concurrent removal by [`Services::deliver_completion_to_watches`]
+    /// cannot land between the find and the refresh and leave
+    /// `agent.wakeOrCreate` returning a "reused" subscription id that no
+    /// longer exists. Callers must fall through to
     /// [`Services::register_completion_watch`] when this returns `None`.
     ///
     /// Grouped (`after_all`) watches are skipped since they are owned by the
-    /// delegation-group fan-in. The `one_shot` filter ensures a queued wake
-    /// (which needs a non-oneShot watch to survive the current `agent:idle`)
-    /// never reuses a oneShot watch, and vice versa. Refreshing the stored
-    /// name keeps `agent.getSubscriptions` / [`describe_subscription`] in sync
-    /// with any rename applied via `agent.rename` / `agent.update` since the
-    /// watch was registered; a no-op when the name is already current.
+    /// delegation-group fan-in. Refreshing the stored name keeps
+    /// `agent.getSubscriptions` / [`describe_subscription`] in sync with any
+    /// rename applied via `agent.rename` / `agent.update` since the watch
+    /// was registered; a no-op when the name is already current.
     ///
     /// `new_parent_name` is `None` when the caller's current display name
     /// could not be resolved (e.g. `store.get_agent_session` failed under
-    /// contention, Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU): the reuse and
-    /// the paired deadline bump still proceed, but the existing stored name
-    /// is left intact rather than overwritten with an empty placeholder that
-    /// would degrade `agent.getSubscriptions` / `describe_subscription`
-    /// output.
+    /// contention, Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU): the reuse
+    /// still proceeds, but the existing stored name is left intact rather
+    /// than overwritten with an empty placeholder that would degrade
+    /// `agent.getSubscriptions` / `describe_subscription` output.
     ///
     /// `resolved_parent_workspace_id` is `Some` only when the caller resolved
     /// the parent's home workspace from an actual session row (never from a
@@ -434,7 +393,6 @@ impl Services {
         &self,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
-        one_shot: bool,
         new_parent_name: Option<String>,
         resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
@@ -445,7 +403,6 @@ impl Services {
                 .expect("agent subscription registry poisoned");
             let watch = guard.subscriptions.iter_mut().find(|s| {
                 s.group_id.is_none()
-                    && s.one_shot == one_shot
                     && &s.parent_agent_id == parent_agent_id
                     && &s.child_agent_id == child_agent_id
             })?;
@@ -491,85 +448,6 @@ impl Services {
             });
         }
         Some(id)
-    }
-
-    /// SUB-2: monotonically bump a watch's cleanup deadline to at least
-    /// `new_deadline` (never shortens). Returns whether the watch was found.
-    /// Paired with [`Services::remove_watch_if_deadline_passed`] so that a
-    /// stale cleanup task spawned by an earlier call can no-op when a later
-    /// call has extended the deadline past its wake-up time.
-    pub(crate) fn bump_watch_cleanup_deadline(
-        &self,
-        subscription_id: &str,
-        new_deadline: Instant,
-    ) -> bool {
-        let bumped = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let Some(watch) = guard
-                .subscriptions
-                .iter_mut()
-                .find(|s| s.id == subscription_id)
-            else {
-                return false;
-            };
-            watch.cleanup_deadline = Some(match watch.cleanup_deadline {
-                Some(existing) => existing.max(new_deadline),
-                None => new_deadline,
-            });
-            watch.cleanup_deadline
-        };
-        // Best-effort DB sync of the leak-guard deadline as wall-clock epoch
-        // ms so a rehydrated watch re-arms with the remaining time.
-        if let Some(deadline) = bumped {
-            let store = self.store.clone();
-            let watch_id = subscription_id.to_string();
-            let deadline_at_ms = instant_to_epoch_ms(deadline);
-            tokio::spawn(async move {
-                if let Err(e) = store
-                    .set_completion_watch_deadline(&watch_id, deadline_at_ms)
-                    .await
-                {
-                    tracing::warn!("completion_watch deadline sync failed {watch_id}: {e}");
-                }
-            });
-        }
-        true
-    }
-
-    /// SUB-2: atomically remove the watch iff its `cleanup_deadline` is set
-    /// and has already elapsed. Returns whether a removal happened. Called
-    /// by the cleanup task spawned in [`Services::spawn_watch_cleanup`]; a
-    /// task that wakes before the current deadline is a no-op and the later
-    /// task (spawned for the extended deadline) performs the removal.
-    pub(crate) fn remove_watch_if_deadline_passed(&self, subscription_id: &str) -> bool {
-        let now = Instant::now();
-        let removed = {
-            let mut guard = self
-                .agent_subscriptions
-                .lock()
-                .expect("agent subscription registry poisoned");
-            let Some(idx) = guard
-                .subscriptions
-                .iter()
-                .position(|s| s.id == subscription_id)
-            else {
-                return false;
-            };
-            match guard.subscriptions[idx].cleanup_deadline {
-                Some(deadline) if deadline <= now => {
-                    guard.subscriptions.remove(idx);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if removed {
-            self.delete_persisted_watch(subscription_id);
-        }
-        removed
     }
 
     /// All watches registered by `parent_agent_id`, regardless of workspace
@@ -930,14 +808,13 @@ impl Services {
     /// Settle a delivered group's watches in one atomic registry pass: every
     /// completion watch carrying `group_id` is dropped, EXCEPT that watches on
     /// children listed in `retain_children` are converted in place into
-    /// ungrouped oneShot watches (STAB-129: failed-not-deleted members may
-    /// still be working, and their eventual real settlement must keep a wake
-    /// path to the parent). Conversion dedupes against any live ungrouped
-    /// watch for the same parent→child pair — oneShot or not (e.g. a SUB-1
-    /// sendToTask auto-watch or a queued non-oneShot `wakeOrCreate` watch
-    /// racing settlement) — since either already gives the parent a wake path,
-    /// so the late settlement delivers exactly one wake. Returns the number of
-    /// watches retained.
+    /// ungrouped watches (STAB-129: failed-not-deleted members may still be
+    /// working, and their eventual real settlement must keep a wake path to
+    /// the parent). Conversion dedupes against any live ungrouped watch for
+    /// the same parent→child pair (e.g. a SUB-1 sendToTask auto-watch or a
+    /// `wakeOrCreate` watch racing settlement) — since either already gives
+    /// the parent a wake path, so the late settlement delivers exactly one
+    /// wake. Returns the number of watches retained.
     pub(crate) fn settle_group_watches(
         &self,
         group_id: &str,
@@ -966,7 +843,6 @@ impl Services {
                     let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
                     if kept.insert(pair) {
                         s.group_id = None;
-                        s.one_shot = true;
                         converted_ids.push(s.id.clone());
                         retained += 1;
                         return true;
@@ -977,7 +853,7 @@ impl Services {
             });
             retained
         };
-        // Best-effort DB sync: converted watches become ungrouped oneShot rows,
+        // Best-effort DB sync: converted watches become ungrouped rows,
         // dropped watches lose their rows (restart durability).
         if !converted_ids.is_empty() || !dropped_ids.is_empty() {
             let store = self.store.clone();
@@ -1235,7 +1111,7 @@ impl Services {
     }
 
     /// Best-effort async delete of a persisted completion-watch row (fired
-    /// oneShot, cancellation, deadline expiry).
+    /// watch, cancellation).
     fn delete_persisted_watch(&self, subscription_id: &str) {
         let store = self.store.clone();
         let id = subscription_id.to_string();
@@ -1253,35 +1129,25 @@ impl Services {
     /// completion signal for the parent, handled by the reconciliation pass
     /// below (synthetic `agent:deleted`). Grouped watches whose delegation
     /// group no longer exists in memory (it fired or was never rehydrated)
-    /// are pruned too — group settlement owns their lifecycle — as are rows
-    /// whose leak-guard deadline already elapsed. Idempotent: watches already
-    /// present in memory (by id) are skipped.
+    /// are pruned too — group settlement owns their lifecycle. Idempotent:
+    /// watches already present in memory (by id) are skipped.
     ///
-    /// A rehydrated watch with a persisted leak-guard deadline re-arms its
-    /// cleanup timer with the remaining wall-clock time (an already-elapsed
-    /// deadline prunes the row instead). After loading, each watch's child is
-    /// reconciled against current agent state: a child that completed while
-    /// the daemon was down delivers its (synthetic) completion immediately,
-    /// so the parent is not left waiting forever.
+    /// After loading, each watch's child is reconciled against current agent
+    /// state: a child that completed while the daemon was down delivers its
+    /// (synthetic) completion immediately, so the parent is not left waiting
+    /// forever.
     ///
-    /// Pair uniqueness: rows are processed grouped-first (then non-oneShot,
-    /// then oneShot; older first within a rank), and a row whose
-    /// (parent, child) pair is already watched in memory is pruned — so
-    /// duplicate rows persisted by a pre-invariant daemon are coalesced onto
-    /// the single strongest watch on upgrade.
+    /// Pair uniqueness: rows are processed grouped-first (then ungrouped,
+    /// older first within a rank), and a row whose (parent, child) pair is
+    /// already watched in memory is pruned — so duplicate rows persisted by
+    /// a pre-invariant daemon are coalesced onto the single strongest watch
+    /// on upgrade.
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
         let mut persisted = self.store.list_completion_watches().await?;
-        // Strongest-first: grouped (0) < non-oneShot (1) < oneShot (2), with
-        // the store's created_at ASC ordering as the tiebreaker (stable sort).
-        let rank = |p: &intent_store::PersistedCompletionWatch| -> u8 {
-            if p.group_id.is_some() {
-                0
-            } else if !p.one_shot {
-                1
-            } else {
-                2
-            }
-        };
+        // Strongest-first: grouped (0) < ungrouped (1), with the store's
+        // created_at ASC ordering as the tiebreaker (stable sort).
+        let rank =
+            |p: &intent_store::PersistedCompletionWatch| -> u8 { u8::from(p.group_id.is_none()) };
         persisted.sort_by_key(rank);
         let mut loaded = 0usize;
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
@@ -1320,24 +1186,8 @@ impl Services {
                     continue;
                 }
             }
-            // Expired leak-guard deadline: the cleanup timer would have
-            // removed this watch already — prune instead of rehydrating.
-            let remaining = match p.deadline_at_ms {
-                Some(at_ms) => match remaining_from_epoch_ms(at_ms) {
-                    Some(d) => Some(d),
-                    None => {
-                        tracing::info!(
-                            watch = %p.id,
-                            "pruning persisted completion watch — cleanup deadline elapsed"
-                        );
-                        let _ = self.store.delete_completion_watch(&p.id).await;
-                        continue;
-                    }
-                },
-                None => None,
-            };
             enum LoadOutcome {
-                Loaded(String, WorkspaceId, AgentId, AgentId, WorkspaceId),
+                Loaded(AgentId, WorkspaceId),
                 AlreadyInMemory,
                 DuplicatePair,
             }
@@ -1351,16 +1201,13 @@ impl Services {
                 } else if guard.subscriptions.iter().any(|s| {
                     s.parent_agent_id == p.parent_agent_id && s.child_agent_id == p.child_agent_id
                 }) {
-                    // Pair uniqueness: a stronger watch (grouped /
-                    // non-oneShot) for the same (parent, child) already
-                    // loaded — this row is a pre-invariant duplicate.
+                    // Pair uniqueness: a stronger (grouped) watch for the
+                    // same (parent, child) already loaded — this row is a
+                    // pre-invariant duplicate.
                     LoadOutcome::DuplicatePair
                 } else {
                     let watch = persisted_to_completion_watch(&p);
                     let ids = LoadOutcome::Loaded(
-                        watch.id.clone(),
-                        watch.parent_workspace_id.clone(),
-                        watch.parent_agent_id.clone(),
                         watch.child_agent_id.clone(),
                         watch.child_workspace_id.clone(),
                     );
@@ -1368,8 +1215,8 @@ impl Services {
                     ids
                 }
             };
-            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = match outcome {
-                LoadOutcome::Loaded(id, pws, pa, ca, cws) => (id, pws, pa, ca, cws),
+            let (child_agent, child_ws) = match outcome {
+                LoadOutcome::Loaded(ca, cws) => (ca, cws),
                 LoadOutcome::AlreadyInMemory => continue,
                 LoadOutcome::DuplicatePair => {
                     tracing::info!(
@@ -1383,10 +1230,6 @@ impl Services {
                 }
             };
             loaded += 1;
-            // Re-arm the leak-guard cleanup with the remaining wall-clock time.
-            if let Some(after) = remaining {
-                self.spawn_watch_cleanup(parent_ws, parent_agent, watch_id, after);
-            }
             to_reconcile.push((child_agent, child_ws));
         }
         // Reconcile: a child that completed (or was deleted) while the daemon
@@ -1861,10 +1704,7 @@ fn is_group_complete(group: &DelegationGroup) -> bool {
         })
 }
 
-/// Convert in-memory `CompletionWatch` to persisted form. The monotonic
-/// `cleanup_deadline` instant is projected onto the wall clock (epoch ms) so
-/// a restarted daemon — with a fresh monotonic clock — can re-arm the timer
-/// with the remaining real time.
+/// Convert in-memory `CompletionWatch` to persisted form.
 fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletionWatch {
     PersistedCompletionWatch {
         id: watch.id.clone(),
@@ -1873,19 +1713,14 @@ fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletion
         parent_agent_id: watch.parent_agent_id.clone(),
         parent_agent_name: watch.parent_agent_name.clone(),
         child_agent_id: watch.child_agent_id.clone(),
-        one_shot: watch.one_shot,
         group_id: watch.group_id.clone(),
         report_delivered: watch.report_delivered,
         wake_on_attention: watch.wake_on_attention,
-        deadline_at_ms: watch.cleanup_deadline.map(instant_to_epoch_ms),
         created_at: watch.created_at.clone(),
     }
 }
 
-/// Convert a persisted row back to the in-memory form. `cleanup_deadline`
-/// starts `None`: rehydration re-arms it via `spawn_watch_cleanup` (which
-/// bumps the deadline under the registry lock) so the sleeper task and the
-/// in-memory instant stay paired.
+/// Convert a persisted row back to the in-memory form.
 fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatch {
     CompletionWatch {
         id: p.id.clone(),
@@ -1894,39 +1729,10 @@ fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatc
         parent_agent_id: p.parent_agent_id.clone(),
         parent_agent_name: p.parent_agent_name.clone(),
         child_agent_id: p.child_agent_id.clone(),
-        one_shot: p.one_shot,
         group_id: p.group_id.clone(),
         created_at: p.created_at.clone(),
-        cleanup_deadline: None,
         report_delivered: p.report_delivered,
         wake_on_attention: p.wake_on_attention,
-    }
-}
-
-/// Project a (possibly future) monotonic instant onto the wall clock as unix
-/// epoch milliseconds — the persisted representation of a cleanup deadline.
-fn instant_to_epoch_ms(deadline: Instant) -> i64 {
-    let now = Instant::now();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let delta_ms = deadline.saturating_duration_since(now).as_millis() as i64;
-    now_ms + delta_ms
-}
-
-/// Remaining wall-clock time until a persisted epoch-ms deadline; `None`
-/// when it already elapsed.
-fn remaining_from_epoch_ms(deadline_at_ms: i64) -> Option<std::time::Duration> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let remaining = deadline_at_ms - now_ms;
-    if remaining > 0 {
-        Some(std::time::Duration::from_millis(remaining as u64))
-    } else {
-        None
     }
 }
 

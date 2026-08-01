@@ -1935,7 +1935,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Auto-subscribe a parent agent to a child's completion: register a
-    /// oneShot parent→child completion watch (the TS
+    /// parent→child completion watch (the TS
     /// `subscribeCallerToAgentCompletion`). Called by the MCP `create_agent`
     /// front door after the child session exists and before its first turn
     /// starts. Returns `{ ok, subscriptionId }`; `ok: false` (no watch) when
@@ -1959,7 +1959,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`). Called
     /// by the MCP `send_message_to_agent` / `send_message_to_task_agent`
     /// front doors after delivery. Foreground/coordinator senders get a
-    /// oneShot watch; delegated background task senders are skipped (their
+    /// completion watch; delegated background task senders are skipped (their
     /// sibling coordination messages would otherwise create noisy wakeups).
     /// Returns `{ ok, subscriptionId }`; `ok: false` (null id) when skipped.
     fn agent_watch_completion_for_sender(
@@ -1977,12 +1977,11 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.watch` (the `ws.agent.watch(agentId)` MCP binding,
-    /// monorepo#1229): explicit persistent caller→target subscription to the
+    /// monorepo#1229): explicit caller→target subscription to the
     /// target's harness-curated completion set — idle/completed, failed,
     /// deleted, blocker raised, discussion requested. Unlike the
-    /// auto-registered oneShot watches this watch survives each delivery
-    /// until the target is deleted or the caller unwatches. Returns
-    /// `{ ok, subscriptionId, agentId }`.
+    /// auto-registered watches this watch also wakes on the target's
+    /// attention requests. Returns `{ ok, subscriptionId, agentId }`.
     fn agent_watch(
         &self,
         workspace_id: WorkspaceId,
@@ -2025,7 +2024,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// register completion watches for `caller_agent_id` on a set of existing
     /// target agents — the subscription side of `agent.delegate` without
     /// creating children. Semantics are identical to workspace agent
-    /// subscriptions: `wait_mode` `"immediate"` (default) registers a oneShot
+    /// subscriptions: `wait_mode` `"immediate"` (default) registers a
     /// watch per target; `"after_all"` enrolls every target in the caller's
     /// open delegation group (one aggregated wake once the caller idles and
     /// all targets settle). Targets in other workspaces are permitted only

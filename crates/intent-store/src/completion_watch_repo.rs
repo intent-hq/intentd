@@ -1,10 +1,10 @@
 //! Completion-watch repository: CRUD for persisted parent→child completion
-//! watches (one-shot and grouped).
+//! watches (ungrouped and grouped).
 //!
 //! Registration persists the row via a best-effort async write-through (NOT
 //! durable-before-observable — see `Services::persist_completion_watch`);
-//! firing a one-shot watch, cancellation, and deadline expiry delete it. On
-//! startup the daemon rehydrates surviving rows into the in-memory registry
+//! firing a watch and cancellation delete it. On startup the daemon
+//! rehydrates surviving rows into the in-memory registry
 //! (`agent_subscriptions.rs`) so a watch registered before a restart still
 //! wakes the parent when the child completes after the restart.
 
@@ -13,8 +13,7 @@ use sqlx::Row;
 
 use crate::Store;
 
-/// Persisted completion-watch row (mirrors the in-memory `CompletionWatch`;
-/// the monotonic `cleanup_deadline` instant is stored as wall-clock epoch ms).
+/// Persisted completion-watch row (mirrors the in-memory `CompletionWatch`).
 #[derive(Debug, Clone)]
 pub struct PersistedCompletionWatch {
     pub id: String,
@@ -23,36 +22,32 @@ pub struct PersistedCompletionWatch {
     pub parent_agent_id: AgentId,
     pub parent_agent_name: String,
     pub child_agent_id: AgentId,
-    pub one_shot: bool,
     pub group_id: Option<String>,
     pub report_delivered: bool,
     /// Explicit `agent.watch` watches also wake on the child's attention
     /// requests (blocker/discussion); auto-registered watches default false.
     pub wake_on_attention: bool,
-    pub deadline_at_ms: Option<i64>,
     pub created_at: String,
 }
 
 impl Store {
     /// Insert a completion_watch row, or update its mutable columns on id
-    /// conflict (parent anchor/name, one_shot, group_id, report_delivered,
-    /// deadline). The identity columns — child ids/workspace and created_at
-    /// — are fixed at registration and intentionally not overwritten.
+    /// conflict (parent anchor/name, group_id, report_delivered). The
+    /// identity columns — child ids/workspace and created_at — are fixed at
+    /// registration and intentionally not overwritten.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         sqlx::query(
             "INSERT INTO completion_watch (
                 id, parent_workspace_id, child_workspace_id, parent_agent_id,
-                parent_agent_name, child_agent_id, one_shot, group_id,
-                report_delivered, wake_on_attention, deadline_at_ms, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                parent_agent_name, child_agent_id, group_id,
+                report_delivered, wake_on_attention, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 parent_workspace_id = excluded.parent_workspace_id,
                 parent_agent_name = excluded.parent_agent_name,
-                one_shot = excluded.one_shot,
                 group_id = excluded.group_id,
                 report_delivered = excluded.report_delivered,
-                wake_on_attention = excluded.wake_on_attention,
-                deadline_at_ms = excluded.deadline_at_ms",
+                wake_on_attention = excluded.wake_on_attention",
         )
         .bind(&w.id)
         .bind(&w.parent_workspace_id.0)
@@ -60,11 +55,9 @@ impl Store {
         .bind(&w.parent_agent_id.0)
         .bind(&w.parent_agent_name)
         .bind(&w.child_agent_id.0)
-        .bind(w.one_shot as i64)
         .bind(&w.group_id)
         .bind(w.report_delivered as i64)
         .bind(w.wake_on_attention as i64)
-        .bind(w.deadline_at_ms)
         .bind(&w.created_at)
         .execute(self.write_pool())
         .await
@@ -77,8 +70,8 @@ impl Store {
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
         let rows = sqlx::query(
             "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
-                    parent_agent_name, child_agent_id, one_shot, group_id,
-                    report_delivered, wake_on_attention, deadline_at_ms, created_at
+                    parent_agent_name, child_agent_id, group_id,
+                    report_delivered, wake_on_attention, created_at
              FROM completion_watch
              ORDER BY created_at ASC",
         )
@@ -89,7 +82,7 @@ impl Store {
         rows.iter().map(decode_watch_row).collect()
     }
 
-    /// Delete a completion_watch row (fired one-shot, cancellation, expiry).
+    /// Delete a completion_watch row (fired watch, cancellation).
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM completion_watch WHERE id = ?")
             .bind(id)
@@ -129,21 +122,10 @@ impl Store {
         Ok(())
     }
 
-    /// Update the wall-clock leak-guard deadline (epoch ms).
-    pub async fn set_completion_watch_deadline(&self, id: &str, deadline_at_ms: i64) -> Result<()> {
-        sqlx::query("UPDATE completion_watch SET deadline_at_ms = ? WHERE id = ?")
-            .bind(deadline_at_ms)
-            .bind(id)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("set completion_watch deadline failed: {e}")))?;
-        Ok(())
-    }
-
-    /// Convert a grouped watch into an ungrouped oneShot watch (group
-    /// settlement retaining a failed-not-deleted member, STAB-129).
+    /// Convert a grouped watch into an ungrouped watch (group settlement
+    /// retaining a failed-not-deleted member, STAB-129).
     pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE completion_watch SET group_id = NULL, one_shot = 1 WHERE id = ?")
+        sqlx::query("UPDATE completion_watch SET group_id = NULL WHERE id = ?")
             .bind(id)
             .execute(self.write_pool())
             .await
@@ -201,10 +183,6 @@ fn decode_watch_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedCompletion
                 .map_err(|e| Error::Internal(format!("decode child_agent_id: {e}")))?
                 .as_str(),
         ),
-        one_shot: row
-            .try_get::<i64, _>("one_shot")
-            .map_err(|e| Error::Internal(format!("decode one_shot: {e}")))?
-            != 0,
         group_id: row
             .try_get("group_id")
             .map_err(|e| Error::Internal(format!("decode group_id: {e}")))?,
@@ -216,9 +194,6 @@ fn decode_watch_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedCompletion
             .try_get::<i64, _>("wake_on_attention")
             .map_err(|e| Error::Internal(format!("decode wake_on_attention: {e}")))?
             != 0,
-        deadline_at_ms: row
-            .try_get("deadline_at_ms")
-            .map_err(|e| Error::Internal(format!("decode deadline_at_ms: {e}")))?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| Error::Internal(format!("decode created_at: {e}")))?,

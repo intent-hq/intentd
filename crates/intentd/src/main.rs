@@ -896,7 +896,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // There is no scan RPC. Aborted on clean shutdown.
     let token_usage_scan =
         services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300));
-    // Completion-delivery worker (AS-3): wake parents holding a oneShot
+    // Completion-delivery worker (AS-3): wake parents holding a
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
     let completion_delivery = services.spawn_completion_delivery_loop();

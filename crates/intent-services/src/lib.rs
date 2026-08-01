@@ -210,11 +210,11 @@ pub struct Services {
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
-    /// same-workspace delegation and cross-workspace (chief) waits. A oneShot
-    /// watch is registered when an agent delegates with `waitMode` `immediate`
-    /// over the MCP front door; the delivery worker (AS-3) and the `after_all`
-    /// group fan-in (AS-4) consume it later. Shared across clones like the
-    /// other in-memory registries.
+    /// same-workspace delegation and cross-workspace (chief) waits. An
+    /// ungrouped watch is registered when an agent delegates with `waitMode`
+    /// `immediate` over the MCP front door; the delivery worker (AS-3) and
+    /// the `after_all` group fan-in (AS-4) consume it later. Shared across
+    /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
     /// `agent_id → (last error text, consecutive count)`. Incremented by the
@@ -2383,8 +2383,8 @@ impl Services {
     /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
     /// completion event set (agent:idle / agent:failed / agent:deleted) across
     /// every workspace and, on each child completion, wake every parent holding
-    /// a oneShot completion watch for that child (the same agent_send_message_op
-    /// path reportToParent uses), removing the oneShot watch after delivery.
+    /// a completion watch for that child (the same agent_send_message_op
+    /// path reportToParent uses), removing the watch after delivery.
     /// after_all delegation-group watches (group_id = Some) are left in place for
     /// AS-4. No-op-safe when no event bus is wired. Returns the task handle so the
     /// composition root can hold it for the process lifetime.
@@ -2611,10 +2611,10 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
-    /// Wake every parent whose oneShot watch matches child_id, then drop that
-    /// watch. group_id = Some watches defer to the AS-4 delegation-group fan-in
+    /// Wake every parent whose watch matches child_id, then drop that watch.
+    /// group_id = Some watches defer to the AS-4 delegation-group fan-in
     /// and are left untouched. A single failed delivery is logged and skipped so
-    /// the remaining watches still fire. Wave B: remove oneShot watches BEFORE
+    /// the remaining watches still fire. STAB-18: remove ungrouped watches BEFORE
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
     ///
@@ -2749,16 +2749,15 @@ impl Services {
                     parent = %watch.parent_agent_id.0,
                     "skipping agent:idle wake — report already delivered at reportToParent time"
                 );
-                // Remove the oneShot watch now that the completion cycle is done.
-                if watch.one_shot {
-                    self.remove_watch(&watch.id);
+                // Remove the watch now that the completion cycle is done.
+                if self.remove_watch(&watch.id) {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
                 }
                 continue;
             }
             // monorepo#840: suppress a repeated identical failure wake to the
-            // same parent. Checked BEFORE the oneShot removal so a suppressed
+            // same parent. Checked BEFORE the watch removal so a suppressed
             // delivery leaves the watch in place for a future distinct signal.
             // Grouped watches never reach here (the group branch above owns
             // them), so group settlement accounting is unaffected.
@@ -2772,29 +2771,22 @@ impl Services {
                     continue;
                 }
             }
-            // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
+            // STAB-18 fix: remove the ungrouped watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
             // if delivery fails the parent misses the wake, but that's safer than
             // duplicate delivery (which we observed in production: STAB-5). Group
             // watches are still removed AFTER group settlement as before.
-            // monorepo#1229: a persistent (non-oneShot ungrouped) watch on a
-            // DELETED child can never fire again — remove it with the same
-            // remove-before-delivery protocol so it does not leak.
-            let terminal =
-                watch.one_shot || (watch.group_id.is_none() && event.event_type == AGENT_DELETED);
-            if terminal {
-                let removed = self.remove_watch(&watch.id);
-                if !removed {
-                    // Watch was concurrently removed (e.g. by another event or
-                    // cancelSubscriptions); skip delivery to avoid a duplicate.
-                    tracing::debug!(
-                        child = %child_id.0,
-                        parent = %watch.parent_agent_id.0,
-                        "watch already removed, skipping delivery"
-                    );
-                    continue;
-                }
+            let removed = self.remove_watch(&watch.id);
+            if !removed {
+                // Watch was concurrently removed (e.g. by another event or
+                // cancelSubscriptions); skip delivery to avoid a duplicate.
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "watch already removed, skipping delivery"
+                );
+                continue;
             }
             let wake = format_completion_wake(child_id, event, stall.as_ref());
             let metadata = build_event_notification_metadata(&[event]);
@@ -2820,10 +2812,8 @@ impl Services {
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
-            if terminal {
-                self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
-                    .await;
-            }
+            self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
+                .await;
         }
     }
 
@@ -2844,7 +2834,7 @@ impl Services {
         // later; dropping every group watch here would leave the parent with
         // no wake path for that late settlement. `settle_group_watches`
         // atomically converts each failed-not-deleted member's grouped watch
-        // into an ungrouped oneShot watch (and drops the rest), so there is no
+        // into an ungrouped watch (and drops the rest), so there is no
         // window in which the child has neither a live group nor a watch.
         let failed_children = failed_group_children(&group);
         let retained = self.settle_group_watches(group_id, &failed_children);
@@ -2853,7 +2843,7 @@ impl Services {
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
                 retained,
-                "retained oneShot watch(es) for failed group member(s) after settlement"
+                "retained watch(es) for failed group member(s) after settlement"
             );
         }
         let wake = format_group_wake(&group);
@@ -6585,7 +6575,7 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
 
 /// STAB-129: the group members whose recorded terminal event was
 /// `agent:failed` and that were not deleted — the candidates whose grouped
-/// watch is retained (as an ungrouped oneShot) across settlement because the
+/// watch is retained (as an ungrouped watch) across settlement because the
 /// underlying agent may still be working and settle for real later. The
 /// `deleted_agent_ids` guard is defensive: `record_group_child_completion`
 /// records at most one terminal event per child, so a deleted member's raw
@@ -10331,8 +10321,8 @@ impl WorkspaceApi for Services {
             // Deterministic cross-workspace consumption (monorepo#463): the
             // publishes above are best-effort (`None` bus, logged-and-skipped
             // delivery failures), so a chief parent's watch on a child here
-            // could otherwise leak forever (no cleanup deadline on oneShot
-            // watches) and a chief-anchored after_all group would stay
+            // could otherwise leak forever (watches have no timed cleanup)
+            // and a chief-anchored after_all group would stay
             // incomplete until restart. Deliver the same synthetic
             // `agent:deleted` directly, BEFORE the store cascade drops the
             // session rows (grouped delivery still resolves the child's
