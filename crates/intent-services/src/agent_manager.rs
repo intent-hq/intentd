@@ -2782,21 +2782,27 @@ impl AgentManager {
         }
     }
 
-    /// Clear a pending attention request when a USER-ORIGIN turn begins — the
+    /// Clear a pending attention request when a qualifying turn begins — the
     /// request (`ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) is a
     /// pending state that retires as soon as the agent next receives a
     /// user-origin message (`agent.sendMessage` front door,
     /// `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`, or a drained
-    /// user-origin queue entry). Automatic deliveries (A2A sends, parent /
-    /// subscription wakes, `agent.sendToTask`, `agent.wakeOrCreate`, stale
-    /// redrives of automatic entries) never retire it — the call site gates
-    /// on `TurnOptions::origin.is_user()`. A stale redrive of a USER-ORIGIN
-    /// entry still clears: the drain handoff restores `origin = User`, unlike
-    /// the completion-report clear, which staleness suppresses regardless of
-    /// origin (`suppress_report_clear`). Skips the store write and event when
-    /// no request is pending (the common case). Emits `agent:updated` with
-    /// `attentionRequestCleared: true` when one was present and cleared so
-    /// clients retire the sidebar/footer indicator.
+    /// user-origin queue entry). For CHILD (`parent_agent_id` set) and
+    /// BACKGROUND (`is_background`) sessions, automatic deliveries (A2A
+    /// sends, parent / subscription wakes, `agent.sendToTask`,
+    /// `agent.wakeOrCreate`, drained automatic entries, stale redrives) ALSO
+    /// retire it — the parent/coordinator is those agents' attention surface,
+    /// so its follow-up is the acknowledgement. Top-level foreground agents
+    /// keep the user-only dismissal: an automatic message must never dismiss
+    /// a request the user has not seen. The call site gates on
+    /// `TurnOptions::origin.is_user()` OR the child/background session shape.
+    /// A stale redrive of a USER-ORIGIN entry still clears: the drain handoff
+    /// restores `origin = User`, unlike the completion-report clear, which
+    /// staleness suppresses regardless of origin (`suppress_report_clear`).
+    /// Skips the store write and event when no request is pending (the common
+    /// case). Emits `agent:updated` with `attentionRequestCleared: true` when
+    /// one was present and cleared so clients retire the sidebar/footer
+    /// indicator.
     async fn clear_attention_request_if_present(
         &self,
         agent_id: &AgentId,
@@ -5681,12 +5687,32 @@ async fn run_message_worker(
                     mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
                         .await;
                 }
-                // A pending attention request retires only on a USER-ORIGIN
+                // A pending attention request retires on a USER-ORIGIN
                 // delivery (sendMessage front door, sendQueuedMessageNow,
-                // editAndRegenerate, drained user-origin queue entry) — an
+                // editAndRegenerate, drained user-origin queue entry) for
+                // every agent, and ALSO on an automatic delivery (A2A send,
+                // parent wake, sendToTask, wakeOrCreate, subscription batch,
+                // drained automatic entry) when the session is a CHILD
+                // (`parent_agent_id` set) or BACKGROUND (`is_background`)
+                // agent — the parent/coordinator is those agents' attention
+                // surface, so its follow-up is the acknowledgement. Top-level
+                // foreground agents keep the user-only dismissal: an
                 // automatic/system message must never dismiss a request the
-                // user has not seen.
-                if options.origin.is_user() {
+                // user has not seen. Fail closed on a session-load error
+                // (leave the request pending).
+                let clear_attention = options.origin.is_user()
+                    || match mgr.services.store.get_agent_session(&agent_id).await {
+                        Ok(s) => s.parent_agent_id.is_some() || s.is_background,
+                        Err(e) => {
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "attention-clear gate: session lookup failed; leaving request pending"
+                            );
+                            false
+                        }
+                    };
+                if clear_attention {
                     mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
                         .await;
                 }

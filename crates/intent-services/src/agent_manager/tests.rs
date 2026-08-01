@@ -9165,23 +9165,35 @@ mod question_hold_gates {
 }
 
 /// Attention-request clear gating (PROTOCOL §5.5): a pending
-/// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` request retires
-/// only on a USER-ORIGIN delivery — automatic/system messages (A2A sends,
-/// parent/subscription wakes, sendToTask, wakeOrCreate) must never dismiss a
-/// request the user has not seen. The drain handoffs restore each queue
-/// entry's captured origin, so a user message that parked behind a busy turn
-/// still clears the request when it drains.
+/// `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` request retires on
+/// a USER-ORIGIN delivery for every agent, and ALSO on an automatic delivery
+/// (A2A sends, parent/subscription wakes, sendToTask, wakeOrCreate) when the
+/// target session is a CHILD (`parent_agent_id` set) or BACKGROUND
+/// (`is_background`) agent — the parent/coordinator is those agents'
+/// attention surface. For a top-level foreground agent an automatic/system
+/// message must never dismiss a request the user has not seen. The drain
+/// handoffs restore each queue entry's captured origin, so a user message
+/// that parked behind a busy turn still clears the request when it drains.
 mod attention_request_clear_gates {
     use super::*;
     use crate::agent_manager::TurnOptions;
     use intent_core::MessageOrigin;
 
     /// Seed an agent on the mock provider with a pending attention request
-    /// persisted on the session.
-    async fn seed_with_pending_request(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    /// persisted on the session, shaped as a child (`parent`) and/or
+    /// background (`background`) session.
+    async fn seed_with_pending_request_shaped(
+        mgr: &AgentManager,
+        ws: &WorkspaceId,
+        id: &AgentId,
+        parent: Option<AgentId>,
+        background: bool,
+    ) {
         seed_agent(mgr, ws, id).await;
         let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
         session.provider = Some("mock".to_string());
+        session.parent_agent_id = parent;
+        session.is_background = background;
         session.attention_request_kind = Some("discussion".to_string());
         session.attention_request_reason = Some("need a decision".to_string());
         session.attention_request_timestamp = Some(now_iso());
@@ -9190,6 +9202,12 @@ mod attention_request_clear_gates {
             .update_agent_session(ws, &session)
             .await
             .expect("seed pending attention request");
+    }
+
+    /// Seed a TOP-LEVEL FOREGROUND agent on the mock provider with a pending
+    /// attention request persisted on the session.
+    async fn seed_with_pending_request(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        seed_with_pending_request_shaped(mgr, ws, id, None, false).await;
     }
 
     /// Wait for the in-flight turn + worker drain to finish.
@@ -9226,8 +9244,8 @@ mod attention_request_clear_gates {
     }
 
     /// An automatic delivery (default `TurnOptions`, e.g. an A2A send or a
-    /// parent wake) leaves the pending request intact and emits no
-    /// `attentionRequestCleared`.
+    /// parent wake) to a TOP-LEVEL FOREGROUND agent leaves the pending
+    /// request intact and emits no `attentionRequestCleared`.
     #[tokio::test]
     async fn automatic_delivery_leaves_attention_request_pending() {
         let script = mock_agent_script();
@@ -9394,5 +9412,127 @@ mod attention_request_clear_gates {
             Some("discussion"),
             "request survives the automatic drain"
         );
+    }
+
+    /// An automatic delivery to a CHILD agent (`parent_agent_id` set) clears
+    /// the pending request and emits `attentionRequestCleared: true` — the
+    /// parent is the child's attention surface, so its follow-up is the
+    /// acknowledgement.
+    #[tokio::test]
+    async fn automatic_delivery_clears_attention_request_for_child_agent() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-child"),
+            AgentId::from("a-attn-child"),
+        );
+        seed_with_pending_request_shaped(&mgr, &ws, &id, Some(AgentId::from("a-parent")), false)
+            .await;
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "parent wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("automatic send");
+        assert_eq!(r["queued"], json!(false), "idle agent delivers directly");
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "automatic delivery to a child agent emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
+    /// An automatic delivery to a BACKGROUND (`is_background`, unparented)
+    /// agent clears the pending request and emits
+    /// `attentionRequestCleared: true`.
+    #[tokio::test]
+    async fn automatic_delivery_clears_attention_request_for_background_agent() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-attn-bg"), AgentId::from("a-attn-bg"));
+        seed_with_pending_request_shaped(&mgr, &ws, &id, None, true).await;
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("automatic send");
+        assert_eq!(r["queued"], json!(false), "idle agent delivers directly");
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "automatic delivery to a background agent emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
+    /// A user-origin delivery to a CHILD agent still clears the pending
+    /// request — user-origin dismissal is unchanged for all agent shapes.
+    #[tokio::test]
+    async fn user_delivery_clears_attention_request_for_child_agent() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-child-user"),
+            AgentId::from("a-attn-child-user"),
+        );
+        seed_with_pending_request_shaped(&mgr, &ws, &id, Some(AgentId::from("a-parent")), false)
+            .await;
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "user follow-up".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("user send");
+        assert_eq!(r["queued"], json!(false), "idle agent delivers directly");
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "user delivery to a child agent emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
     }
 }
