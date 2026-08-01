@@ -16,6 +16,10 @@
 //! 4. A delegated (child/background) agent raising a blocker never produces
 //!    `needs_attention`, even though `agent:attention-requested` fires and
 //!    the linked task moves to `blocked`.
+//! 5. The transcript-mutation RPCs recompute the derivation over the wire
+//!    (monorepo#1266): `agent.appendMessage` with a user row retires a
+//!    pending-question `needs_attention`, and `agent.replaceMessages`
+//!    swapping back to a question-tail transcript raises it again.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -864,4 +868,197 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
         got["session"]["attentionRequestKind"]
     );
     poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+}
+
+/// Scenario 5 — monorepo#1266: the transcript-mutation RPCs recompute the
+/// derived `displayStatus` over the real WSS router. A question tail raises
+/// `needs_attention` (as in scenario 3); then `agent.appendMessage` with a
+/// user row supersedes the question hold and the op's own recompute emits
+/// the retire transition; then `agent.replaceMessages` swapping back to a
+/// transcript ending on the question-bearing assistant row raises it again.
+#[tokio::test]
+async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
+    let Some(script) = gate("WSS needs_attention transcript-mutation E2E") else {
+        return;
+    };
+
+    // Same ask behavior as scenario 3: the marker turn ends on a trailing
+    // question resource block.
+    let ask_code = format!(
+        "return await ws.app.question.ask({});",
+        json!({
+            "header": "Deploy target",
+            "question": "Which environment should I deploy to?",
+            "options": [
+                { "label": "Staging" },
+                { "label": "Production" }
+            ]
+        })
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": ASK_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": ask_code, "summary": "ask a structured question" }
+            },
+            "response": "I have a clarifying question before I proceed.",
+        }],
+        "response": "acknowledged",
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    assert_eq!(get_display_status(&mut rpc, &ws_id).await, "idle");
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed", "agent:*"],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // ---- Seed the hold: the marker turn ends on a question tail ----
+    let agent_id = create_agent(&mut rpc, &ws_id, "mutator").await;
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("please plan the deploy {ASK_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "ask kickoff ok: {sent}");
+
+    let mut raised = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    while !(raised && idle) {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!("timed out: raised={raised} idle={idle}"),
+        };
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "workspace:displayStatus-changed" if data["displayStatus"] == "needs_attention" => {
+                raised = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+
+    // Let the turn's debounced not-running recompute (~3s grace window) run
+    // its silent no-op (the baseline is already `needs_attention`) before
+    // mutating, so every displayStatus event the loops below consume is
+    // attributable to the transcript-mutation ops alone.
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    // Capture the question row's blocks so replaceMessages can rebuild the
+    // tail below — and pin the hold prerequisite while at it.
+    let conv = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let last = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .last()
+        .expect("non-empty transcript")
+        .clone();
+    assert_eq!(
+        last["role"], "assistant",
+        "last message is the assistant question row: {last}"
+    );
+    let question_blocks = last["contentBlocks"].clone();
+    let trailing = question_blocks
+        .as_array()
+        .expect("contentBlocks")
+        .last()
+        .expect("blocks non-empty")
+        .clone();
+    assert_eq!(
+        trailing["resource"]["mimeType"], QUESTION_MIME,
+        "trailing block is the question resource: {trailing}"
+    );
+
+    // ---- Retire over the wire: agent.appendMessage persists a user row ----
+    let appended = wss_rpc(
+        &mut rpc,
+        "agent.appendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "role": "user",
+            "contentBlocks": [{ "type": "text", "text": "deploy to staging" }],
+        }),
+    )
+    .await;
+    assert_eq!(appended["success"], true, "appendMessage ok: {appended}");
+
+    // The op's own recompute emits the retire transition …
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!("timed out waiting for the appendMessage retire transition"),
+        };
+        if ev["type"] == "workspace:displayStatus-changed" {
+            assert_ne!(
+                ev["data"]["displayStatus"], "needs_attention",
+                "appendMessage retire transitions away from needs_attention: {ev}"
+            );
+            break;
+        }
+    }
+    // … and the read path settles at `idle` without re-serving it.
+    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+
+    // ---- Raise over the wire: agent.replaceMessages swaps the transcript
+    // back to one ending on the question-bearing assistant row ----
+    let replaced = wss_rpc(
+        &mut rpc,
+        "agent.replaceMessages",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messages": [{ "role": "assistant", "contentBlocks": question_blocks }],
+        }),
+    )
+    .await;
+    assert_eq!(replaced["success"], true, "replaceMessages ok: {replaced}");
+
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!("timed out waiting for the replaceMessages raise transition"),
+        };
+        if ev["type"] == "workspace:displayStatus-changed" {
+            assert_eq!(
+                ev["data"],
+                json!({ "workspaceId": ws_id, "displayStatus": "needs_attention" }),
+                "replaceMessages raise carries the self-sufficient payload: {ev}"
+            );
+            break;
+        }
+    }
+    assert_eq!(
+        get_display_status(&mut rpc, &ws_id).await,
+        "needs_attention",
+        "workspace.get serves needs_attention after the swap"
+    );
 }

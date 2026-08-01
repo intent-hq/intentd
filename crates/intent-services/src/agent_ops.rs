@@ -2401,6 +2401,13 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
+        // The appended row can move the question-hold derivation — a user
+        // row supersedes a pending question tail (retire), an assistant row
+        // with a trailing question block raises the hold — which flips the
+        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare (monorepo#1266).
+        self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
         Ok(json!({ "success": true, "message": message }))
     }
 
@@ -2496,6 +2503,12 @@ impl Services {
             json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
         )
         .await;
+        // The swapped transcript can move the question-hold derivation in
+        // either direction, flipping the workspace's needs_attention
+        // displayStatus (§6.5 step 0): recompute-and-compare
+        // (monorepo#1266).
+        self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
