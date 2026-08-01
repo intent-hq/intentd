@@ -25,11 +25,14 @@
 # pass under NEXTEST_TEST_THREADS=8 + llvm-cov), delay-invariant, not locally
 # reproducible. Mechanism not pinned; serialization removes the load condition.
 #
-# e2e_wss_pool_contention_stress also runs isolated: its tests assert wall-clock
-# read-latency bounds (<2s workspace.list / note.list mid-write-storm), which
+# e2e_wss_pool_contention_stress also runs isolated: its tests assert
+# read-latency bounds (workspace.list / note.list mid-write-storm), which
 # measure pool behavior, not machine load. Under llvm-cov with 32+ parallel
 # tests on the tinybox runner the read took ~3-4s on both tries purely from
-# scheduler contention (PR #750). Isolation makes the latency bound meaningful.
+# scheduler contention (PR #750). Isolation keeps in-process noise out of the
+# measurement; co-tenant runner slots sharing the box (monorepo#1239) are
+# outside nextest's control, so the tests additionally scale their budgets
+# from an in-test unloaded baseline of the same RPC.
 [profile.default]
 retries = 1
 slow-timeout = { period = "90s", terminate-after = 2 }
