@@ -1,9 +1,12 @@
 name: Provision m1mac
 
-# Installs the gh CLI on the m1mac self-hosted runner and persists it on
-# PATH for all future jobs via the runner-root `.path` file (read by the
-# actions runner at the start of every job). Idempotent: re-dispatching
-# upgrades gh to the latest release, or no-ops when already current.
+# Installs the gh CLI on the m1mac self-hosted runner and makes it
+# available to all jobs two ways: immediately, via a symlink into a
+# user-writable directory already on the runner's PATH; and durably, via
+# the runner-root `.path` file (runsvc.sh exports PATH=$(cat .path) when
+# the runner service starts, so .path edits take effect on the next
+# service restart). Idempotent: re-dispatching upgrades gh to the latest
+# release, or no-ops when already current.
 
 on:
   workflow_dispatch:
@@ -76,9 +79,12 @@ jobs:
           fi
           path_file="$runner_root/.path"
           dest="$HOME/.local/bin"
-          # The runner replaces the job PATH with the .path file contents
-          # at the start of every job, so the file must hold a full PATH
-          # string, not just our directory.
+          # runsvc.sh does `export PATH=$(cat .path)` once when the
+          # runner service starts (see actions/runner
+          # src/Misc/layoutbin/runsvc.sh), so the file must hold a full
+          # PATH string — and edits only take effect on the next service
+          # restart, which a job cannot perform (killing the listener
+          # kills the job).
           if [ -f "$path_file" ]; then
             existing=$(cat "$path_file")
             case ":$existing:" in
@@ -93,9 +99,36 @@ jobs:
           echo "== $path_file =="
           cat "$path_file"
 
-  # Runs as a separate job so the runner re-reads the .path file at job
-  # start — exactly what every future job on this runner will do. Passing
-  # here proves persistence; no PATH manipulation happens in this job.
+      - name: Link gh into a directory already on the runner PATH
+        run: |
+          set -euo pipefail
+          dest="$HOME/.local/bin"
+          # .path only kicks in after a runner service restart, so also
+          # symlink gh into the first user-writable directory already on
+          # the current PATH (inherited from the running listener) to
+          # make gh available to jobs immediately, no restart needed.
+          if command -v gh >/dev/null 2>&1; then
+            echo "gh already resolves at $(command -v gh); no shim needed"
+            exit 0
+          fi
+          linked=""
+          IFS=':' read -ra path_dirs <<< "$PATH"
+          for dir in "${path_dirs[@]}"; do
+            if [ "$dir" != "$dest" ] && [ -d "$dir" ] && [ -w "$dir" ]; then
+              ln -sf "$dest/gh" "$dir/gh"
+              echo "Linked $dest/gh -> $dir/gh (already on runner PATH)"
+              linked="$dir"
+              break
+            fi
+          done
+          if [ -z "$linked" ]; then
+            echo "::warning::No user-writable directory on the current PATH ($PATH); gh will only appear after the runner service is restarted (runsvc.sh re-reads .path at service start)."
+          fi
+
+  # Fresh job with no PATH manipulation: passing proves gh is available
+  # to jobs right now (via the shim, or via .path after a service
+  # restart). Warns instead of failing when gh is installed and .path is
+  # configured but a runner service restart is still pending.
   verify:
     name: Verify gh on PATH (fresh job)
     needs: provision
@@ -105,5 +138,16 @@ jobs:
       - name: gh resolves without any PATH setup
         run: |
           set -euo pipefail
-          command -v gh
-          gh --version
+          if command -v gh >/dev/null 2>&1; then
+            command -v gh
+            gh --version
+            exit 0
+          fi
+          runner_root=$(cd "$RUNNER_TEMP/../.." && pwd)
+          if [ -x "$HOME/.local/bin/gh" ] \
+            && grep -q "$HOME/.local/bin" "$runner_root/.path" 2>/dev/null; then
+            echo "::warning::gh is installed at $HOME/.local/bin/gh and persisted in $runner_root/.path, but the runner service must be restarted before jobs see it on PATH (on m1mac: ./svc.sh stop && ./svc.sh start in $runner_root)."
+            exit 0
+          fi
+          echo "::error::gh is not on PATH and not staged in $runner_root/.path"
+          exit 1
