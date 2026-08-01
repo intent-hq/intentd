@@ -1022,7 +1022,7 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
         "chief parent received the cross-workspace completion wake in __chief__"
     );
 
-    // The consumed oneShot watch republished `agent:subscriptions-changed` in
+    // The consumed watch republished `agent:subscriptions-changed` in
     // `__chief__` and the registry is empty for the chief again.
     let frame = wss_event(&mut sub, 30).await;
     let ev = &frame["params"]["event"];
@@ -1038,7 +1038,7 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
     assert_eq!(
         resp["result"]["subscriptions"],
         json!([]),
-        "oneShot watch consumed after delivery"
+        "watch consumed after delivery"
     );
 
     // Wind the chief's wake turn down before teardown.
@@ -1178,12 +1178,12 @@ where
 /// - a SECOND waitFor on the already-watched targets (same turn) is rejected
 ///   with the pair-uniqueness `-32602` error naming the target — the wire
 ///   contract for the duplicate-registration rejection,
-/// - `agent.getSubscriptions` reports both oneShot watches anchored under
+/// - `agent.getSubscriptions` reports both completion watches anchored under
 ///   `__chief__` BEFORE the targets settle (the rejected duplicate added
 ///   nothing),
 /// - registration publishes `agent:subscriptions-changed` in `__chief__`,
 /// - each target's completion delivers a `[WORKSPACE EVENTS]` wake into the
-///   chief transcript and the consumed oneShot watches drain the registry,
+///   chief transcript and the consumed watches drain the registry,
 /// - a re-registered wait is removed one-at-a-time by the scoped
 ///   `agent.cancelSubscriptions` (`subscriptionId`), an unknown id is
 ///   rejected with `-32602`, and the unscoped call removes the rest.
@@ -1348,7 +1348,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     assert_eq!(ev["workspaceId"], json!(CHIEF_WORKSPACE_ID));
     assert_eq!(ev["data"]["agentId"], json!(chief_id));
 
-    // BEFORE the targets settle: both oneShot watches visible, anchored in
+    // BEFORE the targets settle: both completion watches visible, anchored in
     // `__chief__`, ungrouped.
     let subs_payload = poll_subscriptions(
         &mut rpc,
@@ -1364,7 +1364,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     for s in subs {
         assert_eq!(s["agentId"], json!(chief_id), "watch owner: {s}");
         assert_eq!(s["workspaceId"], json!(CHIEF_WORKSPACE_ID), "anchor: {s}");
-        assert_eq!(s["oneShot"], json!(true), "immediate ⇒ oneShot: {s}");
+        assert!(s.get("oneShot").is_none(), "oneShot dropped from wire: {s}");
         assert!(s["delegationGroup"].is_null(), "ungrouped: {s}");
         actor_ids.push(s["actorIds"][0].as_str().expect("actor id"));
     }
@@ -1374,7 +1374,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     );
 
     // Settle both targets (mock provider full turns) → each `agent:idle`
-    // fires the matching oneShot watch → one wake per target in `__chief__`.
+    // fires the matching watch → one wake per target in `__chief__`.
     for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
         let resp = wss_rpc_envelope(
             &mut rpc,
@@ -1400,7 +1400,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     })
     .await;
 
-    // The consumed oneShot watches drained the registry.
+    // The consumed watches drained the registry.
     poll_subscriptions(
         &mut rpc,
         600,
@@ -1694,7 +1694,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     .await;
     for s in subs_payload["subscriptions"].as_array().unwrap() {
         assert_eq!(s["workspaceId"], json!(CHIEF_WORKSPACE_ID), "anchor: {s}");
-        assert_eq!(s["oneShot"], json!(false), "grouped watch: {s}");
+        assert!(s.get("oneShot").is_none(), "oneShot dropped from wire: {s}");
         assert_eq!(s["delegationGroup"]["groupId"], json!(group_id), "{s}");
         assert_eq!(s["delegationGroup"]["awaitMode"], json!("all"), "{s}");
     }

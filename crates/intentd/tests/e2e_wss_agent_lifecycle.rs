@@ -10230,7 +10230,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         "a non-child sender still gets the SUB-1 watch: {result}"
     );
 
-    // The parent's post-send idle fires the bystander's oneShot watch — the
+    // The parent's post-send idle fires the bystander's watch — the
     // wake lands in the bystander transcript. The CHILD, whose watch was
     // suppressed, has no wake despite the parent idling multiple times since
     // its earlier send.
