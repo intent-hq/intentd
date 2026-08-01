@@ -72,4 +72,4 @@ runner = "tinybox"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]
-runner = "windows-latest"
+runner = "windows-2022"
