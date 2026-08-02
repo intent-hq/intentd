@@ -10,6 +10,20 @@ use tokio::task::JoinHandle;
 
 use crate::transport::{Connection, ConnectionHooks};
 
+/// A fresh RAII temp directory with `prefix` under the system temp root. The
+/// returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn test_temp_dir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
 /// Mock agent: read JSON-RPC lines, assert each frame parses cleanly (whole-line
 /// atomicity), and echo a result for any request. Returns every frame it saw.
 fn spawn_responder<R, W>(read: R, write: W) -> JoinHandle<Vec<Value>>
@@ -231,7 +245,8 @@ async fn stderr_captured_and_auth_flagged() {
 async fn stderr_capture_written_to_daily_log_file() {
     use crate::spawn::{spawn_provider, SpawnOptions};
 
-    let dir = std::env::temp_dir().join(format!("intent-acp-stderr-{}", uuid::Uuid::new_v4()));
+    let tmp = test_temp_dir("intent-acp-stderr-");
+    let dir = tmp.path().join("logs");
 
     let base = *intent_providers::find_provider("auggie").unwrap();
     let provider = intent_providers::ProviderConfig {
@@ -302,7 +317,6 @@ async fn stderr_capture_written_to_daily_log_file() {
     assert!(checked > 0, "at least one daily log file was checked");
 
     agent.kill().await.ok();
-    tokio::fs::remove_dir_all(&dir).await.ok();
 }
 
 /// Minimal portable ACP responder: echoes a `{protocolVersion:1}` result for
@@ -2166,8 +2180,6 @@ mod mcp_tests {
 mod client_served_tests {
     use super::*;
 
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use intent_core::{AgentId, BoxFuture, WorkspaceId};
@@ -2211,17 +2223,10 @@ mod client_served_tests {
         }
     }
 
-    /// A unique, freshly created temp directory for sandbox tests.
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-acp-test-{nanos}-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A unique, freshly created temp directory for sandbox tests; removed
+    /// when the returned guard drops.
+    fn temp_dir() -> tempfile::TempDir {
+        super::test_temp_dir("intent-acp-test-")
     }
 
     /// Wire a `Connection` whose agent→client requests land on `req_rx`. Returns
@@ -2295,7 +2300,7 @@ mod client_served_tests {
     #[test]
     fn sandbox_rejects_traversal_but_allows_in_scope() {
         let root = temp_dir();
-        let svc = FileService::new(&root);
+        let svc = FileService::new(root.path());
         // §11.3 path sandboxing: every shape of `..` escape outside the worktree
         // must be rejected, including nested and trailing traversal that lexically
         // climbs above the root.
@@ -2317,12 +2322,15 @@ mod client_served_tests {
         );
         // In-scope `..` that stays within the root resolves and stays inside it.
         let ok = svc.resolve(std::path::Path::new("sub/ok.txt")).unwrap();
-        assert!(ok.starts_with(&root), "in-scope path resolves inside root");
+        assert!(
+            ok.starts_with(root.path()),
+            "in-scope path resolves inside root"
+        );
         let in_scope = svc
             .resolve(std::path::Path::new("a/b/../c.txt"))
             .expect("in-bounds traversal resolves");
         assert!(
-            in_scope.starts_with(&root),
+            in_scope.starts_with(root.path()),
             "traversal that stays within the root remains sandboxed"
         );
     }
@@ -2362,13 +2370,13 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::new(),
         );
         let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
-        let path = root.join("notes/hello.txt");
+        let path = root.path().join("notes/hello.txt");
 
         let req = send(
             &mut writer,
@@ -2445,13 +2453,13 @@ mod client_served_tests {
             WorkspaceId::from_string("ws-1"),
             AgentId::from_string("agent-1"),
             "auggie",
-            FileService::new(&root),
+            FileService::new(root.path()),
             Arc::new(PermissionRegistry::new()),
             PermissionPolicy::Interactive,
             sink.clone(),
         );
         let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
-        let path = root.join("ordered.txt");
+        let path = root.path().join("ordered.txt");
 
         let req = send(
             &mut writer,
@@ -2517,7 +2525,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, registry) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::new(),
@@ -2576,7 +2584,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::with_timeout(Duration::from_millis(50)),
@@ -2605,7 +2613,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::AutoByRisk,
             sink.clone(),
             PermissionRegistry::new(),
@@ -2645,7 +2653,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink,
             PermissionRegistry::new(),
@@ -8501,7 +8509,6 @@ mod wsapi4_bindings_tests {
 #[cfg(test)]
 mod workspace_api_output_limit_tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
@@ -8593,18 +8600,14 @@ mod workspace_api_output_limit_tests {
     }
 
     /// A fresh `<workspaces-root>/<workspace-name>/<repo-name>` layout on
-    /// disk; returns the workspace folder and the checkout path inside it.
-    fn temp_workspace_layout() -> (PathBuf, String) {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let folder = std::env::temp_dir().join(format!("intent-acp-outlimit-{nanos}-{n}"));
-        let checkout = folder.join("repo");
+    /// disk; returns the workspace folder guard and the checkout path inside
+    /// it. The folder is removed when the guard drops.
+    fn temp_workspace_layout() -> (tempfile::TempDir, String) {
+        let folder = super::test_temp_dir("intent-acp-outlimit-");
+        let checkout = folder.path().join("repo");
         std::fs::create_dir_all(&checkout).unwrap();
-        (folder, checkout.to_string_lossy().into_owned())
+        let checkout = checkout.to_string_lossy().into_owned();
+        (folder, checkout)
     }
 
     fn server(
@@ -8652,7 +8655,7 @@ mod workspace_api_output_limit_tests {
         let v: Value = serde_json::from_str(tool_text(&resp)).unwrap();
         assert_eq!(v, json!({ "a": 1, "b": "two" }));
         // No redirect file is created for an in-limit body.
-        assert!(!folder.join("tool-outputs").exists());
+        assert!(!folder.path().join("tool-outputs").exists());
     }
 
     #[tokio::test]
@@ -8665,8 +8668,8 @@ mod workspace_api_output_limit_tests {
         // The file lands in `<workspace-folder>/tool-outputs/`, a sibling of
         // the repo checkout, with the FULL body and a `.json` extension
         // (TOON disabled).
-        let path = only_tool_output(&folder);
-        assert_eq!(path.parent().unwrap(), folder.join("tool-outputs"));
+        let path = only_tool_output(folder.path());
+        assert_eq!(path.parent().unwrap(), folder.path().join("tool-outputs"));
         assert_eq!(path.extension().unwrap(), "json");
         let full = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&full).unwrap();
@@ -8728,7 +8731,7 @@ mod workspace_api_output_limit_tests {
         )
         .await;
         let text = tool_text(&resp);
-        let path = only_tool_output(&folder);
+        let path = only_tool_output(folder.path());
         assert_eq!(path.extension().unwrap(), "toon");
         let full = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -8751,7 +8754,7 @@ mod workspace_api_output_limit_tests {
         let resp = call(&srv, "return 'x'.repeat(120000);").await;
         let text = tool_text(&resp);
         assert_eq!(text.chars().count(), 120_002); // quotes included
-        assert!(!folder.join("tool-outputs").exists());
+        assert!(!folder.path().join("tool-outputs").exists());
     }
 
     #[tokio::test]
