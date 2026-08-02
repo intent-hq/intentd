@@ -139,9 +139,10 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

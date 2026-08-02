@@ -126,10 +126,11 @@ async fn settings_rollback_on_failed_listener_start() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // Attach a mock ServerControl that always fails start_ws_listener
     services.attach_server_control(Arc::new(FailingServerControl));

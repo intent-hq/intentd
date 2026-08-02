@@ -107,6 +107,7 @@ struct Harness {
     _bundled: TempDir,
     _work: TempDir,
     _tmp: TempDb,
+    _ws_root: tempfile::TempDir,
     user_dir: PathBuf,
     bundled_dir: PathBuf,
     work_dir: PathBuf,
@@ -128,9 +129,10 @@ async fn start() -> Harness {
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone())),
     );
@@ -153,6 +155,7 @@ async fn start() -> Harness {
         _bundled: bundled,
         _work: work,
         _tmp: tmp,
+        _ws_root: ws_root,
         socket,
         shutdown_tx: Some(shutdown_tx),
         server: Some(server),

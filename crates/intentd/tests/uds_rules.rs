@@ -152,9 +152,10 @@ async fn rules_round_trip_overrides_files_and_event() {
         .await
         .expect("insert workspace");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
     // Keep the socket name short — the macOS AF_UNIX path limit is ~104 bytes.

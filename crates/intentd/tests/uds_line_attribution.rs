@@ -104,11 +104,19 @@ async fn next_line_attribution_event(reader: &mut BufReader<OwnedReadHalf>) -> V
     }
 }
 
-async fn boot(bus: &EventBus) -> (PathBuf, tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
+async fn boot(
+    bus: &EventBus,
+) -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    oneshot::Sender<()>,
+    tempfile::TempDir,
+) {
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
         Services::new(bus.store().clone())
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -122,7 +130,7 @@ async fn boot(bus: &EventBus) -> (PathBuf, tokio::task::JoinHandle<()>, oneshot:
             .await;
         }
     });
-    (socket, server, shutdown_tx)
+    (socket, server, shutdown_tx, ws_root)
 }
 
 #[tokio::test]
@@ -130,7 +138,7 @@ async fn line_attribution_compute_now_persists_and_emits_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root) = boot(&bus).await;
 
     // RPC connection (mutations + their responses).
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();

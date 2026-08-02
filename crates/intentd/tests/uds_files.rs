@@ -111,8 +111,9 @@ async fn uds_file_tree_returns_root_entries() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -172,6 +173,7 @@ async fn boot(
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
     Config,
+    tempfile::TempDir,
 ) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let base = Path::new("/tmp").join(format!("intentd-{}-{}", repo_name, &short[..8]));
@@ -197,8 +199,9 @@ async fn boot(
     }
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -214,12 +217,12 @@ async fn boot(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (base, repo, server, tx, config)
+    (base, repo, server, tx, config, ws_root)
 }
 
 #[tokio::test]
 async fn uds_file_exists_reports_type_and_absent() {
-    let (base, repo, server, tx, config) = boot("exists").await;
+    let (base, repo, server, tx, config, _ws_root) = boot("exists").await;
     std::fs::write(repo.join("hello.txt"), "hi\n").unwrap();
     std::fs::create_dir_all(repo.join("subdir")).unwrap();
 
@@ -268,7 +271,7 @@ async fn uds_file_exists_reports_type_and_absent() {
 
 #[tokio::test]
 async fn uds_file_stat_returns_legacy_shape() {
-    let (base, repo, server, tx, config) = boot("stat").await;
+    let (base, repo, server, tx, config, _ws_root) = boot("stat").await;
     std::fs::write(repo.join("hello.txt"), "hello").unwrap();
 
     let resp = send(

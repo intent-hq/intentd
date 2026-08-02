@@ -155,10 +155,11 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(common::hermetic_workspaces_root()),
+            .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -216,10 +217,11 @@ async fn test_workspace_create_setup_script_fallback() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(common::hermetic_workspaces_root()),
+            .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -346,10 +348,11 @@ async fn test_script_list_bootstrap_from_repo() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(common::hermetic_workspaces_root()),
+            .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -436,10 +439,11 @@ async fn test_repo_instructions_in_system_prompt() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(common::hermetic_workspaces_root()),
+            .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -490,9 +494,9 @@ async fn concurrent_script_list_no_duplicates() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root()),
-    );
+    let ws_root = common::hermetic_workspaces_root();
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()));
     let socket_path = std::env::temp_dir().join(format!("intentd-{}.sock", Uuid::new_v4()));
 
     let repo = create_test_repo_with_config(
