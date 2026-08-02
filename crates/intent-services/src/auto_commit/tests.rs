@@ -107,6 +107,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

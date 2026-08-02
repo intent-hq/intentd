@@ -299,6 +299,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

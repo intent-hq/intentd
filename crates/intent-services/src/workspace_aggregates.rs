@@ -47,7 +47,7 @@ pub(crate) struct WorkspaceAggregateCache {
 /// RAII guard for a single-flight key: removes the key on drop, including on
 /// panic or task cancellation, so a failed computation can never wedge the
 /// single-flight state for the daemon's lifetime.
-struct InFlightGuard<K: Eq + Hash> {
+pub(crate) struct InFlightGuard<K: Eq + Hash> {
     set: Arc<Mutex<HashSet<K>>>,
     key: K,
 }
@@ -60,7 +60,7 @@ impl<K: Eq + Hash> Drop for InFlightGuard<K> {
 
 /// Claim the single-flight slot for `key`. Returns `None` when another caller
 /// already holds it.
-fn try_begin<K: Eq + Hash + Clone>(
+pub(crate) fn try_begin<K: Eq + Hash + Clone>(
     set: &Arc<Mutex<HashSet<K>>>,
     key: K,
 ) -> Option<InFlightGuard<K>> {

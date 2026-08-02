@@ -4955,6 +4955,7 @@ mod workspace_api_tool_tests {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                disk_usage: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
         }
@@ -8581,6 +8582,7 @@ mod workspace_api_output_limit_tests {
                     cow_supported: None,
                     display_status: None,
                     checkout_mode: None,
+                    disk_usage: None,
                 })
             })
         }

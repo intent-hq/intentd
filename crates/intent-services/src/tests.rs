@@ -143,6 +143,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -13115,6 +13116,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -13248,6 +13250,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -13372,6 +13375,7 @@ mod rules {
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13491,6 +13495,7 @@ mod rules {
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13609,6 +13614,7 @@ mod rules {
             cow_supported: Some(true), // CoW capable!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -13732,6 +13738,7 @@ mod rules {
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -14304,6 +14311,7 @@ mod known_repo {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
