@@ -2555,6 +2555,42 @@ mod tests {
     use super::*;
     use crate::Store;
 
+    /// A unique temp DB path whose `.db`/`-wal`/`-shm` files are removed on
+    /// drop, including on panic (mirrors `crate::tests::TempDb`, which is
+    /// private to that module). Set `INTENTD_TEST_KEEP_TMP` (non-empty) to
+    /// keep the files around for debugging. Derefs to the DB path, like
+    /// `tempfile::TempPath`.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{tag}-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl std::ops::Deref for TempDb {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+                return;
+            }
+            for suffix in ["", "-wal", "-shm"] {
+                let mut sidecar = self.path.clone().into_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(&sidecar);
+            }
+        }
+    }
+
     /// A UNIQUE violation on the session id maps to `Internal` naming the
     /// colliding id. Agent ids are server-minted (`agent-{uuid}`), so a
     /// duplicate insert is a server-side anomaly — never a client params
@@ -2564,9 +2600,9 @@ mod tests {
         use intent_core::{
             now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
         };
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-test".to_string());
@@ -2664,7 +2700,6 @@ mod tests {
             ),
             other => panic!("expected Internal, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `set_agent_session_token_usage` replaces (never sums) the persisted
@@ -2675,9 +2710,9 @@ mod tests {
         use intent_core::{
             now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
         };
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-test".to_string());
@@ -2820,8 +2855,6 @@ mod tests {
             .await
             .expect_err("cross-workspace write rejected");
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Minimal workspace literal for the baseline-fold tests below.
@@ -2923,9 +2956,9 @@ mod tests {
     #[tokio::test]
     async fn replace_acp_session_id_folds_snapshot_into_baseline() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3022,8 +3055,6 @@ mod tests {
             Some(110),
             "no snapshot to fold leaves the baseline unchanged"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The CAS-loss branch (stored id diverged from `expected_old`) writes
@@ -3031,9 +3062,9 @@ mod tests {
     #[tokio::test]
     async fn replace_acp_session_id_cas_loss_does_not_fold() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3073,8 +3104,6 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The nothing-stored branch of `replace_acp_session_id` also writes the
@@ -3083,9 +3112,9 @@ mod tests {
     #[tokio::test]
     async fn first_set_paths_and_baseline() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3148,8 +3177,6 @@ mod tests {
         let replace_row = by_id(&replace_none);
         assert!(replace_row.2.is_none(), "replace clears the snapshot");
         assert_eq!(replace_row.3.as_ref(), Some(&snap), "replace folds it");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Malformed stored JSON in `token_usage` / `token_usage_baseline`
@@ -3160,9 +3187,9 @@ mod tests {
     #[tokio::test]
     async fn replace_acp_session_id_treats_malformed_json_as_zero() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3250,8 +3277,6 @@ mod tests {
             Some(&snap),
             "malformed baseline overwritten by the folded snapshot"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The in-transaction CAS re-check in `write_acp_session_id`: when the
@@ -3261,9 +3286,9 @@ mod tests {
     #[tokio::test]
     async fn write_acp_session_id_recheck_loses_cleanly() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3305,8 +3330,6 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
         assert!(rows[0].3.is_none(), "baseline untouched on recheck loss");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Post-conversion to raw `BEGIN IMMEDIATE` (monorepo#783): the CAS-loss
@@ -3317,9 +3340,9 @@ mod tests {
     #[tokio::test]
     async fn write_acp_session_id_cas_loss_leaves_no_open_transaction() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3376,8 +3399,6 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
@@ -3392,9 +3413,9 @@ mod tests {
     #[tokio::test]
     async fn replace_acp_session_id_racing_writer_no_busy() {
         use intent_core::{now_iso, TokenUsage};
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
@@ -3456,8 +3477,6 @@ mod tests {
             }),
             "every fold landed exactly once"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Migration 0054 applies cleanly on an existing, populated DB: reverting
@@ -3466,9 +3485,9 @@ mod tests {
     #[tokio::test]
     async fn token_usage_baseline_migration_applies_on_existing_db() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-baseline".to_string());
         let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -3512,8 +3531,6 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot survives");
         assert!(rows[0].3.is_none(), "baseline NULL for pre-existing rows");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
@@ -3524,9 +3541,9 @@ mod tests {
     #[tokio::test]
     async fn usage_data_skips_hydration_for_snapshot_backed_sessions() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-hydration".to_string());
@@ -3603,8 +3620,6 @@ mod tests {
             vec![usage_msg],
             "malformed snapshot still hydrates (fallback preserved)"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `update_workspace_token_usage` (monorepo#738): the closure sees the
@@ -3615,9 +3630,9 @@ mod tests {
     #[tokio::test]
     async fn update_workspace_token_usage_scoped_write_and_decline() {
         use intent_core::{now_iso, TokenUsage};
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-scoped".to_string());
@@ -3697,8 +3712,6 @@ mod tests {
             .await
             .expect_err("missing workspace rejected");
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
@@ -3706,9 +3719,8 @@ mod tests {
         use intent_core::{
             now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
         };
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let agent_id = AgentId("agent-test".to_string());
         let ws_id = WorkspaceId("ws-test".to_string());
@@ -3827,8 +3839,6 @@ mod tests {
             .await
             .expect("resolve unknown");
         assert!(!updated2, "resolving unknown agent should return false");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
@@ -3836,9 +3846,8 @@ mod tests {
         use intent_core::{
             now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
         };
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let agent_id = AgentId("agent-double".to_string());
         let ws_id = WorkspaceId("ws-double".to_string());
@@ -3909,8 +3918,6 @@ mod tests {
             .await
             .expect("second claim");
         assert!(!claim2, "second claim should fail (already resolved)");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
@@ -3919,10 +3926,8 @@ mod tests {
             now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
             WorkspaceStatus,
         };
-        use std::path::PathBuf;
-        use uuid::Uuid;
 
-        let tmp = PathBuf::from("/tmp").join(format!("test-summaries-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-summaries");
         let store = Store::open(&tmp).await.expect("create test store");
         let ws_id = WorkspaceId("ws-summaries".to_string());
 
@@ -4054,8 +4059,6 @@ mod tests {
         );
         assert_eq!(summaries[0].id, agent_id, "id should match");
         assert_eq!(summaries[0].name, "Test Agent", "name should match");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
@@ -4064,10 +4067,8 @@ mod tests {
             now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
             WorkspaceStatus,
         };
-        use std::path::PathBuf;
-        use uuid::Uuid;
 
-        let tmp = PathBuf::from("/tmp").join(format!("test-update-inv-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-update-inv");
         let store = Store::open(&tmp).await.expect("create test store");
         let ws_id = WorkspaceId("ws-update-inv".to_string());
         let wrong_ws_id = WorkspaceId("ws-wrong".to_string());
@@ -4206,8 +4207,6 @@ mod tests {
         session.name = "New Name".to_string();
         let result4 = store.update_agent_session(&ws_id, &session).await;
         assert!(result4.is_ok(), "name change should succeed");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The narrow `set_agent_session_model` writer (`agent.setModel`,
@@ -4219,9 +4218,9 @@ mod tests {
     #[tokio::test]
     async fn set_agent_session_model_allows_cross_provider_after_first_use() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-setmodel".to_string());
@@ -4273,8 +4272,6 @@ mod tests {
             "acp session id untouched"
         );
         assert_eq!(after.name, "Baseline", "unrelated columns untouched");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
@@ -4283,10 +4280,8 @@ mod tests {
             now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
             WorkspaceStatus,
         };
-        use std::path::PathBuf;
-        use uuid::Uuid;
 
-        let tmp = PathBuf::from("/tmp").join(format!("test-msg-stats-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-msg-stats");
         let store = Store::open(&tmp).await.expect("create test store");
         let ws_id = WorkspaceId("ws-stats".to_string());
 
@@ -4419,8 +4414,6 @@ mod tests {
         let (count2, has_assistant2) = stats.get(&agent2.0).expect("agent2 stats");
         assert_eq!(*count2, 3, "agent2 should have 3 messages");
         assert!(has_assistant2, "agent2 should have assistant message");
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `get_agent_messages_page` returns exactly the `offset..offset+limit`
@@ -4430,9 +4423,9 @@ mod tests {
     #[tokio::test]
     async fn get_agent_messages_page_matches_full_read_windows() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-msg-page".to_string());
@@ -4522,8 +4515,6 @@ mod tests {
                 .expect("count empty"),
             0
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `get_agent_session_summary` returns the session row with `messages`
@@ -4532,9 +4523,9 @@ mod tests {
     #[tokio::test]
     async fn get_agent_session_summary_excludes_messages() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-summary".to_string());
@@ -4576,8 +4567,6 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `get_agent_session_message_projections` returns one entry per session
@@ -4589,9 +4578,9 @@ mod tests {
     #[tokio::test]
     async fn session_message_projections_bounded_and_correct() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-proj".to_string());
@@ -4718,8 +4707,6 @@ mod tests {
             Some(vec!["a3".to_string()]),
             "last assistant text blocks"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `get_agent_session_message_projection` (per-session, monorepo#981)
@@ -4730,9 +4717,9 @@ mod tests {
     #[tokio::test]
     async fn per_session_message_projection_matches_workspace_variant() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-proj-single".to_string());
@@ -4821,8 +4808,6 @@ mod tests {
             );
             assert_eq!(per_session, *expected, "projection mismatch for {agent:?}");
         }
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The self-heal fallback's per-agent window query (the only remaining
@@ -4836,9 +4821,7 @@ mod tests {
     /// few capped block strings.
     #[tokio::test]
     async fn projection_last_rows_query_plans_use_role_seq_index() {
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
 
         let per_agent_sql = last_messages_by_agent_sql();
@@ -4873,8 +4856,6 @@ mod tests {
             !disallowed_btree,
             "per-agent window must be fully index-ordered:\n{plan}"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// P1b: the projection never returns unbounded text. Multi-MB winner
@@ -4887,9 +4868,9 @@ mod tests {
     #[tokio::test]
     async fn projection_text_blocks_bounded_and_tolerant() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-proj-bounded".to_string());
@@ -5004,8 +4985,6 @@ mod tests {
                 .expect("per-agent projection");
             assert_eq!(per_agent, *p, "{label} per-agent parity");
         }
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The single-aggregate `get_agent_session_message_stats` never decodes
@@ -5014,9 +4993,9 @@ mod tests {
     #[tokio::test]
     async fn message_stats_do_not_decode_content() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-stats-raw".to_string());
@@ -5050,8 +5029,6 @@ mod tests {
             .await
             .expect("stats");
         assert_eq!(stats.get(&agent_id.0), Some(&(2, true)));
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Raw `(last_assistant_preview, last_user_preview)` column values for a
@@ -5173,9 +5150,8 @@ mod tests {
     #[tokio::test]
     async fn preview_columns_maintained_on_append() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-append".to_string());
@@ -5251,8 +5227,6 @@ mod tests {
             Some("[]".to_string()),
             "non-array winner stores the projection form"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// `replace_agent_messages` recomputes both preview columns from the
@@ -5261,9 +5235,8 @@ mod tests {
     #[tokio::test]
     async fn preview_columns_recomputed_on_replace() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-replace".to_string());
@@ -5330,8 +5303,6 @@ mod tests {
             (None, None),
             "empty batch clears both previews"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Equivalence: for sessions with messages — written via append, replace,
@@ -5342,9 +5313,8 @@ mod tests {
     #[tokio::test]
     async fn preview_columns_equal_window_query_projection() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-equiv".to_string());
@@ -5434,8 +5404,6 @@ mod tests {
                 "user preview equals window query for {agent_id:?}"
             );
         }
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The 0066 migration backfill produces columns identical to the window
@@ -5446,9 +5414,9 @@ mod tests {
     #[tokio::test]
     async fn migration_backfill_matches_window_query_projection() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-backfill".to_string());
@@ -5554,8 +5522,6 @@ mod tests {
             (None, None),
             "message-less session stays NULL"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Read-path self-heal (0066): sessions whose preview columns are NULL
@@ -5568,9 +5534,8 @@ mod tests {
     #[tokio::test]
     async fn projection_self_heals_null_preview_columns() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-heal".to_string());
@@ -5679,8 +5644,6 @@ mod tests {
         let (assistant_col, user_col) = read_preview_columns(&store, &full).await;
         assert_eq!(decode_preview(assistant_col), Some(vec!["a1".to_string()]));
         assert_eq!(decode_preview(user_col), Some(vec!["q1".to_string()]));
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Convergence of the self-heal gate: a session with messages of only
@@ -5693,9 +5656,8 @@ mod tests {
     #[tokio::test]
     async fn projection_heal_converges_for_sessions_missing_a_role() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-converge".to_string());
@@ -5773,8 +5735,6 @@ mod tests {
             (None, Some("[\"only\"]".to_string())),
             "columns unchanged after repeated reads"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Raw `last_message_role` column value for a session (0070).
@@ -5794,9 +5754,8 @@ mod tests {
     #[tokio::test]
     async fn last_message_role_maintained_on_writes() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-role-writes".to_string());
@@ -5901,8 +5860,6 @@ mod tests {
                 .and_then(|p| p.last_message_role.clone()),
             Some("user".to_string())
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The 0070 migration backfill stamps `last_message_role` from the
@@ -5913,9 +5870,9 @@ mod tests {
     #[tokio::test]
     async fn last_message_role_backfill_and_self_heal() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
+
         use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-role-backfill".to_string());
@@ -6033,8 +5990,6 @@ mod tests {
             read_role_column(&store, &user_newest).await,
             Some("user".to_string())
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// A corrupt (non-JSON) preview column value never fails the projection
@@ -6046,9 +6001,8 @@ mod tests {
     #[tokio::test]
     async fn projection_recovers_from_corrupt_preview_columns() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-preview-corrupt".to_string());
@@ -6143,8 +6097,6 @@ mod tests {
             (None, Some("[\"only\"]".to_string())),
             "stale assistant value cleared to NULL; corrupt user value repaired"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Message ids whose `agent_message_fts` (0074) row matches `query`,
@@ -6182,9 +6134,7 @@ mod tests {
     #[tokio::test]
     async fn fts_appends_indexed_with_message_text_semantics() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-append".to_string());
@@ -6273,8 +6223,6 @@ mod tests {
         assert!(fts_match_ids(&store, "excludedblockterm").await.is_empty());
         assert!(fts_match_ids(&store, "toolonlyterm").await.is_empty());
         assert!(fts_match_ids(&store, "systemonlyterm").await.is_empty());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The `agent.replaceMessages` swap (DELETE + re-INSERT) drops every
@@ -6285,9 +6233,7 @@ mod tests {
     #[tokio::test]
     async fn fts_synced_on_replace_and_session_delete() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-swap".to_string());
@@ -6355,8 +6301,6 @@ mod tests {
             0,
             "cascade delete of agent_message empties the index"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The 0074 migration backfills pre-existing rows: raw-inserted messages
@@ -6366,9 +6310,7 @@ mod tests {
     #[tokio::test]
     async fn fts_migration_backfills_existing_rows() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-backfill".to_string());
@@ -6428,8 +6370,6 @@ mod tests {
         assert_eq!(fts_match_ids(&store, "backfilledterm").await.len(), 1);
         assert!(fts_match_ids(&store, "backfilltoolterm").await.is_empty());
         assert_eq!(fts_row_count(&store).await, 1);
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The one-time activation VACUUM (`activate_incremental_vacuum`) may
@@ -6440,14 +6380,12 @@ mod tests {
     async fn fts_rebuilt_after_vacuum_activation() {
         use crate::AutoVacuumActivation;
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         // Legacy DB in auto_vacuum=NONE mode so activation runs a real VACUUM
         // (Store::open's pragma is recorded but inert on an existing file).
         {
             let opts = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&tmp)
+                .filename(&*tmp)
                 .create_if_missing(true);
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
@@ -6529,7 +6467,5 @@ mod tests {
             fts_match_ids(&store, "postvacuumterm").await,
             vec![after.id]
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 }
