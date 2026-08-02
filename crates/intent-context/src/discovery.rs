@@ -119,20 +119,24 @@ pub fn exec_path(auggie_path: &Path) -> OsString {
 mod tests {
     use super::*;
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-ctx-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-ctx-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
         dir
     }
 
     #[test]
     fn find_in_dirs_returns_none_when_absent() {
         let dir = unique_temp_dir("absent");
-        assert_eq!(find_in_dirs(&[dir]), None);
+        assert_eq!(find_in_dirs(&[dir.path().to_path_buf()]), None);
     }
 
     #[cfg(unix)]
@@ -140,19 +144,19 @@ mod tests {
     fn find_in_dirs_finds_executable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("found");
-        let bin = dir.join("auggie");
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(find_in_dirs(&[dir]), Some(bin));
+        assert_eq!(find_in_dirs(&[dir.path().to_path_buf()]), Some(bin));
     }
 
     #[cfg(unix)]
     #[test]
     fn find_in_dirs_skips_non_executable() {
         let dir = unique_temp_dir("nonexec");
-        let bin = dir.join("auggie");
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, "not executable").unwrap();
-        assert_eq!(find_in_dirs(&[dir]), None);
+        assert_eq!(find_in_dirs(&[dir.path().to_path_buf()]), None);
     }
 
     #[test]
