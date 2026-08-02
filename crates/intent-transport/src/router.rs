@@ -2073,17 +2073,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "pr.waitForChanges" => {
-            let ws = require_ws_note(params)?;
-            let timeout_seconds = opt_int(params, "timeoutSeconds");
-            let poll_interval_seconds = opt_int(params, "pollIntervalSeconds");
-            let watch = opt_str(params, "watch");
-            let r = api
-                .pr_wait_for_changes(ws, timeout_seconds, poll_interval_seconds, watch)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
         // method takes `(owner, repo[, number])` rather than resolving from the
         // workspace. `limit` falls back to the FE's `perPage` spelling.

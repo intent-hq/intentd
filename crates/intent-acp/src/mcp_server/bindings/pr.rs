@@ -20,8 +20,6 @@ pub(crate) const PRELUDE: &str = r#"
         status: () => host({ method: 'pr.status', args: {} }),
         merge: (options) => host({ method: 'pr.merge', args: { ...(options || {}) } }),
         updateBranch: () => host({ method: 'pr.updateBranch', args: {} }),
-        waitForChanges: (options) =>
-            host({ method: 'pr.waitForChanges', args: { ...(options || {}) } }),
         listReviewComments: (options) =>
             host({ method: 'pr.listReviewComments', args: { ...(options || {}) } }),
         replyToReviewComment: (commentId, body) =>
@@ -44,7 +42,6 @@ pub(crate) async fn dispatch(
         "status" => status(api, ws).await,
         "merge" => merge(api, ws, args).await,
         "updateBranch" => update_branch(api, ws).await,
-        "waitForChanges" => wait_for_changes(api, ws, args).await,
         "listReviewComments" => list_review_comments(api, ws, args).await,
         "replyToReviewComment" => reply_to_review_comment(api, ws, args).await,
         "resolveThread" => resolve_thread(api, ws, args).await,
@@ -93,24 +90,6 @@ async fn merge(
 
 async fn update_branch(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
     api.pr_update_branch(ws.clone()).await.map_err(map_err)
-}
-
-async fn wait_for_changes(
-    api: &Arc<dyn WorkspaceApi>,
-    ws: &WorkspaceId,
-    args: &Value,
-) -> Result<Value, String> {
-    let timeout = args.get("timeoutSeconds").and_then(Value::as_i64);
-    let poll = args.get("pollIntervalSeconds").and_then(Value::as_i64);
-    let watch = match opt_str(args, "watch") {
-        Some(w) if !matches!(w.as_str(), "any" | "checks" | "state" | "commits") => {
-            return Err("watch must be one of: any, checks, state, commits".to_string())
-        }
-        w => w,
-    };
-    api.pr_wait_for_changes(ws.clone(), timeout, poll, watch)
-        .await
-        .map_err(map_err)
 }
 
 async fn list_review_comments(

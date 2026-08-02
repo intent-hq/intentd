@@ -228,7 +228,6 @@ API:
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.waitForChanges({ timeoutSeconds?, pollIntervalSeconds?, watch? }?) → { ... }  // Waits for PR changes. `watch`: `"any"`, `"checks"`, `"state"`, or `"commits"`.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
   ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
@@ -423,7 +422,6 @@ API:
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.waitForChanges({ timeoutSeconds?, pollIntervalSeconds?, watch? }?) → { ... }  // Waits for PR changes. `watch`: `"any"`, `"checks"`, `"state"`, or `"commits"`.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
   ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.

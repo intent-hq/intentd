@@ -3151,23 +3151,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.waitForChanges`: poll the active PR's status + checks until a change
-    /// is detected or the timeout elapses (PROTOCOL §5.7).
-    fn pr_wait_for_changes(
-        &self,
-        workspace_id: WorkspaceId,
-        timeout_seconds: Option<i64>,
-        poll_interval_seconds: Option<i64>,
-        watch: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, timeout_seconds, poll_interval_seconds, watch);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_wait_for_changes not implemented".to_string(),
-            ))
-        })
-    }
-
     // ------------------------------------------------------------------------
     // `github.*` explicit-addressing surface (PROTOCOL §5.27). Unlike `pr.*`
     // (workspace/active-PR scoped), every data method takes `(owner, repo[,

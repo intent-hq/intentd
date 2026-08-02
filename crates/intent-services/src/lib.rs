@@ -17400,86 +17400,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn pr_wait_for_changes(
-        &self,
-        workspace_id: WorkspaceId,
-        timeout_seconds: Option<i64>,
-        poll_interval_seconds: Option<i64>,
-        watch: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let watch = pr_ops::validate_watch_mode(watch)?;
-            let timeout = pr_ops::clamp_timeout(timeout_seconds);
-            let poll_interval = pr_ops::clamp_poll_interval(poll_interval_seconds);
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
-
-            let timeout_ms = timeout * 1000;
-            let poll_ms = poll_interval * 1000;
-            let safety_ms = pr_ops::SAFETY_PADDING_SECONDS * 1000;
-            let effective_ms = timeout_ms.min(poll_ms.max(timeout_ms.saturating_sub(safety_ms)));
-
-            let start = tokio::time::Instant::now();
-            let initial = capture_pr_snapshot(&*sc, &repo_ref, number)
-                .await
-                .ok_or_else(|| {
-                    Error::Internal(format!("Could not fetch PR #{number} for {owner}/{repo}."))
-                })?;
-            let mut baseline = initial.clone();
-            let mut last = initial;
-            let mut iterations: u64 = 0;
-
-            loop {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                if elapsed_ms >= effective_ms {
-                    break;
-                }
-                iterations += 1;
-                let remaining = effective_ms - elapsed_ms;
-                tokio::time::sleep(std::time::Duration::from_millis(poll_ms.min(remaining))).await;
-                let current = match capture_pr_snapshot(&*sc, &repo_ref, number).await {
-                    Some(s) => s,
-                    None => continue,
-                };
-                last = current.clone();
-                if baseline.check_runs_fetch_failed && !current.check_runs_fetch_failed {
-                    baseline.check_runs = current.check_runs.clone();
-                    baseline.check_runs_fetch_failed = false;
-                }
-                let changes = pr_ops::detect_changes(&baseline, &current, &watch);
-                if !changes.is_empty() {
-                    let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
-                    let summary = pr_ops::format_change_summary(&changes, &current, elapsed_s);
-                    return Ok(serde_json::json!({
-                        "changed": true,
-                        "changes": changes,
-                        "elapsedSeconds": elapsed_s,
-                        "iterations": iterations,
-                        "snapshot": pr_ops::snapshot_json(&current),
-                        "summary": summary,
-                    }));
-                }
-            }
-
-            let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
-            Ok(serde_json::json!({
-                "changed": false,
-                "elapsedSeconds": elapsed_s,
-                "iterations": iterations,
-                "snapshot": pr_ops::snapshot_json(&last),
-                "summary": format!(
-                    "⏱️ Timeout reached after {elapsed_s} seconds without detecting changes.\n\
-                     Watched mode: {watch}\nPolls performed: {iterations}"
-                ),
-            }))
-        })
-    }
-
     // ------------------------------------------------------------------------
     // `github.*` explicit-addressing surface (PROTOCOL §5.27). Every method
     // takes `(owner, repo[, number])` directly (no workspace/active-PR
@@ -20676,26 +20596,6 @@ async fn ft_worktree(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBu
 /// The empty `file-tracking.getChanges` result (TS `emptyChangesResult`).
 fn empty_changes_result() -> serde_json::Value {
     serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
-}
-
-/// Capture a `pr.waitForChanges` poll snapshot (TS `captureSnapshot`): the PR
-/// plus its head-commit check-runs. Returns `None` when the PR cannot be
-/// fetched (the caller treats the initial `None` as fatal, later ones as a
-/// transient skip).
-async fn capture_pr_snapshot(
-    sc: &dyn intent_sourcecontrol::SourceControl,
-    repo_ref: &intent_sourcecontrol::RepoRef,
-    number: u64,
-) -> Option<pr_ops::PrSnapshot> {
-    let pr = sc.get_pr(repo_ref, number).await.ok()?;
-    let checks = match pr.head_sha.as_deref().filter(|s| !s.is_empty()) {
-        None => pr_ops::CheckFetch::NotAttempted,
-        Some(sha) => match sc.check_runs(repo_ref, sha).await {
-            Ok(runs) => pr_ops::CheckFetch::Ok(runs),
-            Err(_) => pr_ops::CheckFetch::Failed,
-        },
-    };
-    Some(pr_ops::build_snapshot(&pr, checks))
 }
 
 /// Load a workspace for a `pr.*` call, mapping a missing workspace onto the
