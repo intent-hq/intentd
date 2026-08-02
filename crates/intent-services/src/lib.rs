@@ -2956,7 +2956,7 @@ impl Services {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages or a busy in-flight turn (interim idle)"
                 );
                 continue;
             }
