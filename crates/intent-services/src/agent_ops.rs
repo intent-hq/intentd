@@ -8,6 +8,7 @@
 //! and auggie CLI parser respectively.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_PROCESSING,
@@ -131,6 +132,122 @@ fn resolve_default_model_from_settings(
 
     // 4. None → CLI default (session.model stays None)
     None
+}
+
+/// Single daemon-side default-model resolver (spec "New resolution policy").
+/// Applied by every creation path — `agent.create`, `agent.delegate`,
+/// `agent.wakeOrCreate`, `workspace.create` initialAgent — via
+/// [`Services::agent_create_op`]; step 1 (explicit client `model`) is handled
+/// by the caller. Also reusable standalone (e.g. `specialist.get/list`
+/// `resolvedModel`) so previews match what a no-model create actually pins.
+///
+/// Precedence (steps 2–5):
+/// 2. Specialist frontmatter `model` — only if it belongs to the resolved
+///    provider.
+/// 3. Specialist frontmatter `modelTier` — resolved strictly within the
+///    resolved provider's tier table; providers without a table (opencode,
+///    droid, grok) and claude-code's `"default"` smart-tier sentinel fall
+///    through. Never another provider's model.
+/// 4. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+///    provider-guarded.
+/// 5. `None` → provider CLI default (`session.model` stays unset).
+///
+/// The `specialist` id doubles as the `agent_type` for the settings chain's
+/// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
+/// when `None`, that tier is skipped and the chain falls through to
+/// `backgroundAgents.defaultModel` / `model.default`.
+pub(crate) fn resolve_agent_default_model(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+    provider: Option<&str>,
+    is_background: bool,
+) -> Option<String> {
+    // Normalize through provider_config so legacy default-provider aliases
+    // guard as the provider the spawn would actually run.
+    let effective_provider = intent_providers::provider_config(
+        provider.unwrap_or_else(|| intent_providers::default_provider_id()),
+    )
+    .id;
+
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+
+        // Step 2: specialist frontmatter `model` (3-tier: project > user >
+        // bundled) — only if it belongs to the resolved provider; a model
+        // owned by another provider falls through instead of leaking.
+        if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
+            if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+                return Some(m);
+            }
+            tracing::debug!(
+                model = m,
+                provider = effective_provider,
+                specialist = spec_id,
+                "specialist frontmatter model belongs to another provider; ignoring"
+            );
+        }
+
+        // Step 3: specialist frontmatter `modelTier` — strictly within the
+        // resolved provider's tier table (no cross-provider fallback).
+        // claude-code's smart tier is the literal "default" sentinel ("use
+        // the CLI default"), not a model id — it falls through too.
+        if let Some(tier) = specialists_svc.resolve_model_tier(spec_id, workspace_path) {
+            if let Some(m) = intent_providers::ModelTier::from_wire(&tier)
+                .and_then(|t| intent_providers::default_model_for_provider(effective_provider, t))
+                .filter(|m| *m != "default")
+            {
+                return Some(m.to_string());
+            }
+        }
+    }
+
+    // Step 4: settings chain, provider-guarded — a configured default owned
+    // by another provider must not be pinned (monorepo#607); drop to the CLI
+    // default instead of rejecting a model the caller never sent.
+    let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
+    if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+        return Some(m);
+    }
+    tracing::warn!(
+        model = m,
+        provider = effective_provider,
+        "configured default model belongs to another provider; \
+         falling back to the CLI default"
+    );
+    // Step 5: None → provider CLI default.
+    None
+}
+
+/// Ownership guard for resolver-derived defaults (never explicit client
+/// models). Compound ids must name the resolved provider — except when no
+/// provider was requested, where a known compound prefix *becomes* the
+/// resolved provider (`agent_create_op` derives `session.provider` from it).
+/// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
+/// evidence rules (static tiers + cached catalogs; absence of evidence
+/// passes).
+fn default_model_belongs_to_provider(
+    services: &Services,
+    provider_param: Option<&str>,
+    effective_provider: &str,
+    model: &str,
+) -> bool {
+    if model.contains(':') {
+        let (prefix, _) = intent_providers::parse_compound_model_id(model);
+        if intent_providers::find_provider(&prefix).is_none() {
+            return false;
+        }
+        provider_param.is_none()
+            || intent_providers::provider_config(&prefix).id == effective_provider
+    } else {
+        ensure_bare_model_matches_provider(
+            "agent.create",
+            &services.models_catalog,
+            effective_provider,
+            model,
+        )
+        .is_ok()
+    }
 }
 
 /// Reject a provider id that is not in the ACP registry with `-32602`
@@ -1801,56 +1918,35 @@ impl Services {
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
 
-        // Resolve default model from settings when none is explicitly supplied.
-        // The resolved model is persisted to session.model, pinning it for the
-        // agent's lifetime. Settings changes only affect new agents created
-        // afterwards; existing agents change model only via explicit agent.setModel.
-        //
-        // Precedence: explicit model > specialist frontmatter model > settings chain
+        // Resolve the default model when none is explicitly supplied, via the
+        // single daemon-side resolver (steps 2–5; see
+        // `resolve_agent_default_model`). The resolved model is persisted to
+        // session.model, pinning it for the agent's lifetime. Settings changes
+        // only affect new agents created afterwards; existing agents change
+        // model only via explicit agent.setModel.
         let model_explicit = model.is_some();
         let mut resolved_model = match model {
+            // Step 1: explicit model from the client (user picked it).
             Some(m) => Some(m),
             None => {
-                // Try specialist frontmatter model first (3-tier: project > user > bundled)
-                let specialist_model = if let Some(spec_id) = specialist.as_deref() {
-                    let specialists_svc = self.specialists_service();
-                    // SECURITY: derive workspace_path from the stored workspace record
-                    // rather than trusting the client-supplied value (review thread
-                    // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-                    // workspacePath and read specialist files from other workspaces.
-                    // Use worktree_path if available, otherwise repository_path.
-                    let wp = self
-                        .store
-                        .get_workspace(&workspace_id)
-                        .await
-                        .ok()
-                        .and_then(|w| crate::git_ops::worktree_path(&w));
-                    specialists_svc.resolve_model(spec_id, wp.as_deref())
-                } else {
-                    None
-                };
-
-                // If specialist declares a model, use it; otherwise fall through to settings
-                match specialist_model {
-                    Some(m) => Some(m),
-                    None => {
-                        // Pass `specialist` as the agent_type parameter for
-                        // backgroundAgents.typeOverrides lookup. The specialist value
-                        // (e.g., "implementor", "verifier") is used as-is in the override
-                        // map. When `specialist` is None, the type-specific override is
-                        // skipped and we fall through to backgroundAgents.defaultModel or
-                        // model.default. A full solution would require passing the derived
-                        // agent_type through AgentCreateExtra, but that's outside this
-                        // task's scope and the current specialist-based lookup covers the
-                        // common case.
-                        resolve_default_model_from_settings(
-                            self,
-                            is_background,
-                            specialist.as_deref(),
-                            provider.as_deref(),
-                        )
-                    }
-                }
+                // SECURITY: derive workspace_path from the stored workspace record
+                // rather than trusting the client-supplied value (review thread
+                // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+                // workspacePath and read specialist files from other workspaces.
+                // Use worktree_path if available, otherwise repository_path.
+                let wp = self
+                    .store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .ok()
+                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                resolve_agent_default_model(
+                    self,
+                    specialist.as_deref(),
+                    wp.as_deref(),
+                    provider.as_deref(),
+                    is_background,
+                )
             }
         };
 

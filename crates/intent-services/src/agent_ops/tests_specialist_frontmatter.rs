@@ -1,12 +1,15 @@
-//! Regression tests for specialist frontmatter `model` and display-name
-//! resolution at agent creation.
+//! Regression tests for specialist frontmatter `model`/`modelTier` and
+//! display-name resolution at agent creation.
 //!
 //! Model: when `agent.create` receives no explicit model but a specialist id,
-//! the specialist's resolved frontmatter `model` (3-tier: project > user > bundled) is used
-//! before the settings chain.
+//! the single daemon-side resolver (`resolve_agent_default_model`) applies the
+//! specialist's resolved frontmatter `model` (3-tier: project > user >
+//! bundled, provider-guarded), then `modelTier` (strictly within the resolved
+//! provider's tier table), before the settings chain.
 //!
 //! Full precedence:
-//! explicit model > specialist frontmatter model > settings chain > CLI default
+//! explicit model > specialist frontmatter model > specialist frontmatter
+//! modelTier > settings chain > CLI default
 //!
 //! Name: when `agent.create` receives no explicit name but a specialist id,
 //! the specialist's resolved display name (frontmatter `name`) is used before
@@ -93,6 +96,44 @@ fn create_specialist_without_model(dir: &Path, id: &str) {
     std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
 }
 
+/// Create a specialist file with a frontmatter modelTier (no model) in the
+/// user tier.
+fn create_specialist_with_tier(dir: &Path, id: &str, tier: &str) {
+    let content = format!(
+        "---\nname: \"{}\"\ndescription: \"Test specialist\"\nmodelTier: \"{}\"\n---\n\nTest prompt",
+        id, tier
+    );
+    std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
+}
+
+/// Create an agent with an explicit provider and no explicit model.
+async fn create_agent_with_provider(
+    svc: &Services,
+    ws: &WorkspaceId,
+    specialist: &str,
+    provider: &str,
+) -> AgentId {
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some(provider.to_string()),
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some(specialist.to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
 /// Specialist frontmatter model is used when no explicit model param is passed.
 #[tokio::test]
 async fn specialist_frontmatter_model_used_for_delegated_agent() {
@@ -155,6 +196,107 @@ async fn missing_frontmatter_falls_through_to_settings() {
     // Verify the settings chain default was used
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+}
+
+/// Specialist frontmatter `modelTier` resolves within the resolved provider's
+/// tier table (default provider auggie: smart → opus4.7).
+#[tokio::test]
+async fn specialist_model_tier_resolves_within_provider_table() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("opus4.7"));
+}
+
+/// The delegate path honors `modelTier` identically to direct create — it
+/// funnels through the same resolver in `agent_create_op`.
+#[tokio::test]
+async fn model_tier_honored_on_delegate_path() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("tiered".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(child.clone(), None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("opus4.7"));
+}
+
+/// A tier-declaring specialist on a provider without a tier table (grok)
+/// falls through to settings/CLI default — never another provider's model.
+#[tokio::test]
+async fn model_tier_never_leaks_across_providers() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+
+    let id = create_agent_with_provider(&svc, &ws, "tiered", "grok").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.model, None,
+        "expected CLI default, not auggie's opus4.7"
+    );
+}
+
+/// claude-code's smart tier is the literal "default" sentinel ("use the CLI
+/// default"), not a model id — it falls through instead of being pinned.
+#[tokio::test]
+async fn claude_code_default_sentinel_falls_through() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+
+    let id = create_agent_with_provider(&svc, &ws, "tiered", "claude-code").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.model, None,
+        "the \"default\" sentinel must not be pinned"
+    );
+}
+
+/// A specialist frontmatter model owned by another provider is ignored
+/// (provider guard) — resolution falls through to the tier step.
+#[tokio::test]
+async fn frontmatter_model_of_other_provider_falls_through_to_tier() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"auggie:opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
+    std::fs::write(specialists_dir.path().join("mixed.md"), content).expect("write specialist");
+
+    let id = create_agent_with_provider(&svc, &ws, "mixed", "codex").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("gpt-5.3-codex/xhigh"));
+}
+
+/// Bundled specialists no longer declare `modelTier` — they inherit the
+/// user's `model.default`; with nothing set, session.model stays unset (CLI
+/// default).
+#[tokio::test]
+async fn bundled_specialist_inherits_model_default() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+
+    // Nothing configured → CLI default.
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("implementor".into())).await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.model, None, "no settings → CLI default");
+
+    // With model.default set, the bundled specialist inherits it.
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[("model.default".to_string(), json!("sonnet4.5"))])
+        .expect("set model.default");
+    let id = create_agent(&svc, &ws, "TestAgent2", None, Some("implementor".into())).await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
 
 /// Malicious specialist id with path traversal is rejected.

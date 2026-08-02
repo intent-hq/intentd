@@ -44,7 +44,7 @@ pub(crate) async fn dispatch(
 async fn list(api: &Arc<dyn WorkspaceApi>, _args: &Value) -> Result<Value, String> {
     // Fetch all specialists from the 3-tier loader (no workspace_path for chief)
     let result = api
-        .specialist_list(None)
+        .specialist_list(None, None)
         .await
         .map_err(|e| format!("specialist.list failed: {e}"))?;
 
@@ -67,7 +67,7 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
 
     // Fetch the specialist from the 3-tier loader
     let result = api
-        .specialist_get(id.to_string(), None)
+        .specialist_get(id.to_string(), None, None)
         .await
         .map_err(|e| match e {
             intent_core::Error::NotFound(_) => format!("Specialist not found: {id}"),
@@ -205,7 +205,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .ok_or_else(|| "Specialist not found: (missing id)".to_string())?;
 
         let result = api
-            .specialist_get(specialist_id.clone(), None)
+            .specialist_get(specialist_id.clone(), None, None)
             .await
             .map_err(|e| {
                 if e.to_string().contains("not found") {
@@ -365,7 +365,11 @@ mod tests {
     struct FakeApi {}
 
     impl WorkspaceApi for FakeApi {
-        fn specialist_list(&self, _workspace_path: Option<String>) -> BoxFuture<'_, Result<Value>> {
+        fn specialist_list(
+            &self,
+            _workspace_path: Option<String>,
+            _provider: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
                     "specialists": [
@@ -398,6 +402,7 @@ mod tests {
             &self,
             id: String,
             _workspace_path: Option<String>,
+            _provider: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 match id.as_str() {

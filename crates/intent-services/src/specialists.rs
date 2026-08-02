@@ -602,6 +602,24 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's `modelTier` frontmatter scalar through the
+    /// 3-tier order (project > user > bundled), used at spawn time when the
+    /// specialist declares no usable `model`. Returns `None` when the
+    /// specialist is unknown or declares no `modelTier`, allowing the caller
+    /// to fall through to the settings chain.
+    pub(crate) fn resolve_model_tier(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("modelTier")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
     /// keyed by id (later tiers overwrite earlier — the precedence merge).
     /// `hidden` and the config scalars ([`INHERITED_CONFIG_KEYS`]) inherit
@@ -1454,7 +1472,9 @@ mod tests {
     #[test]
     fn user_override_of_embedded_inherits_scalars_at_spawn() {
         // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType/modelTier keeps the embedded values at spawn time.
+        // omits agentType keeps the embedded value at spawn time. Bundled
+        // specialists no longer declare modelTier (they inherit the user's
+        // default model), so no tier surfaces from the floor either.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
@@ -1469,10 +1489,11 @@ mod tests {
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
-        assert_eq!(
-            got["specialist"]["modelTier"], "smart",
-            "modelTier inherited from the embedded floor"
+        assert!(
+            got["specialist"].get("modelTier").is_none(),
+            "bundled specialists declare no modelTier"
         );
+        assert_eq!(svc.resolve_model_tier("ralph", None), None);
     }
 
     #[test]

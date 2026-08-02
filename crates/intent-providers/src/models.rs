@@ -36,6 +36,18 @@ impl ModelTier {
     /// All tiers in resolution order (`fast`, `balanced`, `smart`).
     pub const ALL: [ModelTier; 3] = [ModelTier::Fast, ModelTier::Balanced, ModelTier::Smart];
 
+    /// Parse the wire/frontmatter tier name (`"fast" | "balanced" | "smart"`,
+    /// the `modelTier` values in specialist frontmatter). `None` for anything
+    /// else.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "fast" => Some(ModelTier::Fast),
+            "balanced" => Some(ModelTier::Balanced),
+            "smart" => Some(ModelTier::Smart),
+            _ => None,
+        }
+    }
+
     fn pick(self, tiers: &ModelTiers) -> &'static str {
         match self {
             ModelTier::Fast => tiers.fast,
@@ -121,13 +133,14 @@ pub fn create_compound_model_id(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}:{model_id}")
 }
 
-/// Default model for a provider at a tier, falling back to auggie's tier when
-/// the provider has no tier mappings. Port of `getDefaultModelForProvider`.
-pub fn default_model_for_provider(provider_id: &str, tier: ModelTier) -> &'static str {
-    tiers_for(provider_id)
-        .or_else(|| tiers_for("auggie"))
-        .map(|t| tier.pick(t))
-        .expect("auggie tier mappings must exist")
+/// Default model for a provider at a tier, strictly within the provider's own
+/// tier table. `None` for providers without tier mappings (opencode, droid,
+/// grok) — tiers never resolve to another provider's model (the historical
+/// auggie fallback was a cross-provider leak; see the monorepo spec "New
+/// resolution policy"). Callers must also treat claude-code's smart-tier
+/// `"default"` sentinel as "no pinned model", not a model id.
+pub fn default_model_for_provider(provider_id: &str, tier: ModelTier) -> Option<&'static str> {
+    tiers_for(provider_id).map(|t| tier.pick(t))
 }
 
 /// Reverse-map a concrete model id to its tier, checking the preferred provider
