@@ -324,6 +324,232 @@ async fn interim_idle_with_pending_queue_neither_delivers_nor_retires_watch() {
     );
 }
 
+/// monorepo#1297 regression: an `agent:idle` delivered while the child is
+/// already BUSY in a new turn (the enqueue+drain raced the idle emit, so the
+/// queue is empty by delivery time) is an interim idle — no wake is
+/// delivered and the ungrouped watch survives, then fires exactly once at
+/// the running turn's terminal idle.
+#[tokio::test]
+async fn busy_interim_idle_neither_delivers_nor_retires_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // The raced enqueue was already dequeued and started: queue empty,
+    // worker busy in the redriven turn.
+    svc.set_test_busy(&child, true);
+    assert!(!svc.has_ready_to_send(&child));
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake on a busy-classified interim idle"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch survives a busy-classified interim idle"
+    );
+
+    // The redriven turn ends; its terminal idle is the real completion.
+    svc.set_test_busy(&child, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "exactly one wake at the real completion"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the completion wake"
+    );
+}
+
+/// monorepo#1297 heal path: production publishes the terminal `agent:idle`
+/// BEFORE the worker releases the busy slot, so the busy probe can
+/// misclassify the REAL completion as interim — and no further completion
+/// event arrives. The worker-exit redelivery hook
+/// (`redeliver_completion_after_queue_mutation` once the slot is released)
+/// must synthesize the real completion: exactly one wake, watch retired,
+/// open after_all group sealed and settled.
+#[tokio::test]
+async fn busy_misclassified_terminal_idle_heals_on_worker_exit_redelivery() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // The terminal idle is delivered while the slot is still held: the busy
+    // probe classifies it interim (queue empty), so nothing delivers.
+    svc.set_test_busy(&child, true);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Slot released, no more completion events: the worker-exit hook runs
+    // the mutation-path redelivery, which synthesizes the real completion.
+    svc.set_test_busy(&child, false);
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "worker-exit redelivery synthesizes exactly one completion wake"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired by the synthesized completion"
+    );
+}
+
+/// monorepo#1297 heal path (group sealing): a coordinator whose terminal
+/// idle was busy-misclassified still gets its open after_all group sealed
+/// and settled by the worker-exit redelivery.
+#[tokio::test]
+async fn busy_misclassified_terminal_idle_heal_seals_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    // The child settles first.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+
+    // The parent's terminal idle races the slot release: interim, no seal.
+    svc.set_test_busy(&parent, true);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives the misclassified idle");
+    assert!(!group.sealed);
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Worker exit: slot released, redelivery synthesizes the real
+    // completion — group seals and (already complete) settles.
+    svc.set_test_busy(&parent, false);
+    svc.redeliver_completion_after_queue_mutation(&parent).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "heal seals and settles the group with one aggregated wake"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1297 guard: busy-aware suppression is scoped to `agent:idle` —
+/// `agent:failed` and `agent:deleted` for a busy child still deliver their
+/// wakes (a failure/deletion wake must never be deferred by busy-ness).
+#[tokio::test]
+async fn failed_and_deleted_while_busy_still_deliver() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.set_test_busy(&child, true);
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "failed wake delivers despite the busy worker"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the failure wake"
+    );
+
+    // Re-arm and verify agent:deleted is not deferred either.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "deleted wake delivers despite the busy worker"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the deletion wake"
+    );
+}
+
 /// Queue-aware suppression is scoped to `agent:idle`: `agent:failed` for a
 /// child with queued messages still delivers its wake and retires the watch
 /// (a failed child is parked — its queue will not self-drain).
@@ -10108,6 +10334,89 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
     // Queue drains; the redriven turn's terminal idle is the real completion.
     svc.take_queued_message(&parent, &queued.id)
         .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("sealed group awaits its children");
+    assert!(group.sealed, "real completion seals the group");
+
+    // Both children settle → exactly one aggregated wake covering both.
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    }
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["eventCount"],
+        json!(2),
+        "settlement covers both children"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1297 regression: a coordinator idling while its worker is
+/// already BUSY in a redriven turn (the enqueue was drained before the idle
+/// was delivered, so the queue is empty) is an INTERIM idle — it must NOT
+/// seal the open after_all group. A delegation made in the redriven turn
+/// joins the same group, the redriven turn's terminal idle seals it, and
+/// settlement covers BOTH children with a single aggregated wake.
+#[tokio::test]
+async fn busy_interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let gid = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group exists")
+        .group_id;
+
+    // The raced enqueue was already dequeued and started: queue empty, busy
+    // worker. The parent's stale idle must not seal.
+    svc.set_test_busy(&parent, true);
+    assert!(!svc.has_ready_to_send(&parent));
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives the busy interim idle");
+    assert!(!group.sealed, "busy interim idle must not seal the group");
+
+    // The redriven turn delegates another child: it joins the SAME group.
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group exists");
+    assert_eq!(
+        group.group_id, gid,
+        "late delegate joins the still-open group"
+    );
+    assert!(group.expected_agent_ids.contains(&c2));
+
+    // The redriven turn ends; its terminal idle is the real completion.
+    svc.set_test_busy(&parent, false);
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,

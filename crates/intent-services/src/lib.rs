@@ -2463,8 +2463,9 @@ impl Services {
         // — covers the case where every child finished before the parent idled.
         //
         // monorepo#1281: an INTERIM idle (the agent still has ready-to-send
-        // queued messages) does NOT seal — the queued redrive may delegate
-        // more children into the open group, so the expected set is not final
+        // queued messages, or — monorepo#1297 — is already busy in a redriven
+        // turn) does NOT seal — the queued/redriven turn may delegate more
+        // children into the open group, so the expected set is not final
         // yet. The seal happens at the real completion: the idle after the
         // queue drains (this path), or the synthesized idle a queue
         // retraction/edit produces (`redeliver_completion_after_queue_mutation`
@@ -2634,10 +2635,13 @@ impl Services {
 
     /// Record that an `agent:idle` for `child_id` was classified as interim
     /// (monorepo#1280) — recorded up front, whether or not any ungrouped
-    /// watch matched (monorepo#1281) — so a later queue retraction that
-    /// empties the ready-to-send queue while the agent is idle synthesizes
-    /// the real completion: re-running watch delivery and sealing the
-    /// agent's open after_all group.
+    /// watch matched (monorepo#1281), and whether the classification came
+    /// from the queue probe or the busy probe (monorepo#1297) — so a later
+    /// queue retraction that empties the ready-to-send queue while the agent
+    /// is idle synthesizes the real completion: re-running watch delivery
+    /// and sealing the agent's open after_all group. A busy-classified
+    /// marker is superseded by the running turn's own terminal `agent:idle`
+    /// (the non-interim delivery takes the marker below).
     fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
         self.interim_skipped_idles
             .lock()
@@ -2765,11 +2769,16 @@ impl Services {
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
     ///
-    /// Queue-aware completion: an `agent:idle` for a child with ready-to-send
-    /// queued messages is an interim idle — ungrouped watches neither deliver
-    /// nor retire on it (they stay armed for the real completion after the
-    /// queue drains). Grouped watches are exempt: group settlement accounting
-    /// must see every completion or an `after_all` batch can hang.
+    /// Queue- and busy-aware completion: an `agent:idle` for a child with
+    /// ready-to-send queued messages OR a busy in-flight worker
+    /// (monorepo#1297: the queued message may already have been drained into
+    /// a running turn by the time the idle is delivered) is an interim idle —
+    /// ungrouped watches neither deliver nor retire on it (they stay armed
+    /// for the real completion after the queue drains / running turn ends).
+    /// Grouped watches are exempt: group settlement accounting must see every
+    /// completion or an `after_all` batch can hang. `agent:failed` /
+    /// `agent:deleted` are never classified interim — a failed child is
+    /// parked and a deleted one is gone, so their wakes must not be deferred.
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -2796,19 +2805,23 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> bool {
-        // Queue-aware completion: an `agent:idle` for a child whose pending
-        // message queue still holds ready-to-send entries is an interim idle —
-        // the drain loop is about to redrive the child, so ungrouped watches
-        // neither deliver nor retire (they stay armed for the real
-        // completion). Grouped watches are unaffected: group settlement owns
-        // their accounting and lifecycle. Narrows the enqueue-vs-idle-emit
-        // race: the turn-end emit checks the queue before publishing, and a
-        // message enqueued between that check and this delivery would
-        // otherwise consume the watch with a premature wake. (A snapshot,
-        // not a lock: an enqueue landing after this check can still race a
-        // premature wake, but the window shrinks from emit→delivery to
-        // check→wake.)
-        let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        // Queue- and busy-aware completion: an `agent:idle` for a child whose
+        // pending message queue still holds ready-to-send entries, OR whose
+        // worker is already busy in a new turn (monorepo#1297: an enqueue that
+        // raced the idle emit may have been dequeued and started before this
+        // delivery ran, leaving the queue empty but the busy slot held), is an
+        // interim idle — the child is about to be (or already is) redriven, so
+        // ungrouped watches neither deliver nor retire (they stay armed for
+        // the real completion). Grouped watches are unaffected: group
+        // settlement owns their accounting and lifecycle. Narrows the
+        // enqueue-vs-idle-emit race: the turn-end emit checks the queue before
+        // publishing, a message enqueued between that check and this delivery
+        // is caught by the queue probe, and a message already drained into a
+        // running turn is caught by the busy probe. (A snapshot, not a lock:
+        // an enqueue landing after both probes can still race a premature
+        // wake, but the window shrinks from emit→delivery to check→wake.)
+        let interim_idle = event.event_type == AGENT_IDLE
+            && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
         // monorepo#1280/#1281: record the interim skip up front — even when
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle can
@@ -2932,17 +2945,18 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-aware completion): the child still has
-            // ready-to-send queued messages, so this idle is not its real
-            // completion — deliver nothing and leave the watch (including a
-            // report_delivered one, which retires at the real completion)
-            // armed for the settlement that follows the queue drain. The
-            // interim-skip marker was recorded up front (monorepo#1280).
+            // Interim idle (queue-/busy-aware completion): the child still
+            // has ready-to-send queued messages or a turn already in flight,
+            // so this idle is not its real completion — deliver nothing and
+            // leave the watch (including a report_delivered one, which
+            // retires at the real completion) armed for the settlement that
+            // follows the queue drain / running turn. The interim-skip
+            // marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages or a busy in-flight turn (interim idle)"
                 );
                 continue;
             }
@@ -3030,6 +3044,16 @@ impl Services {
         // agent is idle). The indirect async recursion is depth-1: the
         // synthetic redelivery's event is non-interim by construction
         // (queue empty), so its own pass never re-enters here.
+        //
+        // monorepo#1297: a BUSY-classified interim skip reaches this re-check
+        // on every pass (its queue is empty by definition). While the turn is
+        // genuinely in flight the redelivery's `agent_is_busy` guard no-ops
+        // WITHOUT consuming the marker; when the busy probe misclassified the
+        // turn's own terminal idle (emitted before the slot release), this
+        // re-check and the worker-exit redelivery hook (`run_message_worker`'s
+        // empty raced-drain arm) together heal it — whichever runs after the
+        // slot release observes marker + empty queue + not busy and
+        // synthesizes the real completion.
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }

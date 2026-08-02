@@ -6194,6 +6194,21 @@ async fn run_message_worker(
             mgr.services.dequeue_message(&agent_id)
         };
         let Some(mut next) = raced else {
+            // monorepo#1297: heal a busy-misclassified terminal idle. The
+            // turn's `agent:idle` is published while this worker still holds
+            // the busy slot (`end_turn` above runs after `run_prompt_turn`
+            // returns), so an asynchronous delivery that raced ahead of the
+            // release classified it interim on the busy probe and recorded
+            // the interim-skip marker — with no further completion event
+            // coming. Re-run the mutation-path redelivery now that the slot
+            // is released and the queue is empty; its guards (marker set,
+            // queue empty, not busy) make it a no-op in every other
+            // interleaving, and the delivery pass's own post-skip re-check
+            // covers the complementary ordering (marker recorded after this
+            // hook ran ⇒ that re-check observes the released slot).
+            mgr.services
+                .redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
