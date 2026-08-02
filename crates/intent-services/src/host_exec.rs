@@ -423,6 +423,41 @@ pub async fn run_default(
     run(api, args, &POLICY).await
 }
 
+/// `WorkspaceApi::host_exec` seam for the `ws.host.exec` binding: parse the
+/// raw JS args object, pin the containment root to the calling workspace (any
+/// caller-supplied `workspaceId` is overwritten before parsing), run with the
+/// default policy, and fold [`HostExecError`] codes onto the domain error enum
+/// (`-32602` → `InvalidParams`, else `Internal`).
+pub async fn run_for_workspace(
+    api: &dyn WorkspaceApi,
+    workspace_id: WorkspaceId,
+    params: Value,
+) -> intent_core::Result<Value> {
+    let mut map = match params {
+        Value::Object(m) => m,
+        Value::Null => Map::new(),
+        _ => {
+            return Err(intent_core::Error::InvalidParams(
+                "host.exec args must be an object".to_string(),
+            ))
+        }
+    };
+    map.insert(
+        "workspaceId".to_string(),
+        Value::String(workspace_id.as_str().to_string()),
+    );
+    let args = parse_args(&map).map_err(domain_err)?;
+    run_default(api, args).await.map_err(domain_err)
+}
+
+/// Fold a [`HostExecError`] onto the domain error enum for the trait seam.
+fn domain_err(e: HostExecError) -> intent_core::Error {
+    match e.code {
+        INVALID_PARAMS => intent_core::Error::InvalidParams(e.message),
+        _ => intent_core::Error::Internal(e.message),
+    }
+}
+
 /// Small helper so callers can share an `Arc<dyn ExecPolicy>` seam later.
 #[allow(dead_code)]
 pub fn allow_all_policy() -> Arc<dyn ExecPolicy> {
