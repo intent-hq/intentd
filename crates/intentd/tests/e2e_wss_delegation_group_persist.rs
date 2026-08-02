@@ -132,7 +132,19 @@ fn descendant_pids(root: u32) -> Vec<i32> {
         .output()
     {
         Ok(out) if out.status.success() => out.stdout,
-        _ => return Vec::new(),
+        Ok(out) => {
+            eprintln!(
+                "descendant_pids: ps exited with {}; teardown degraded to empty descendant snapshot",
+                out.status
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            eprintln!(
+                "descendant_pids: failed to run ps ({err}); teardown degraded to empty descendant snapshot"
+            );
+            return Vec::new();
+        }
     };
     let table: Vec<(i32, i32)> = String::from_utf8_lossy(&out)
         .lines()
@@ -141,6 +153,11 @@ fn descendant_pids(root: u32) -> Vec<i32> {
             Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
         })
         .collect();
+    if table.is_empty() {
+        eprintln!(
+            "descendant_pids: parsed zero pid/ppid rows from ps output; teardown degraded to empty descendant snapshot"
+        );
+    }
     let mut pids = Vec::new();
     let mut queue = vec![root as i32];
     let mut seen: std::collections::HashSet<i32> = queue.iter().copied().collect();
