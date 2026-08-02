@@ -392,21 +392,28 @@ mod tests {
         (db, bus, sub)
     }
 
-    /// Drain `specialists:changed` events from the subscription until `quiet`
-    /// elapses with no new batch (or `deadline` passes).
+    /// Drain `specialists:changed` events from the subscription. Waits up to
+    /// the full `deadline` for the FIRST matching event; once at least one has
+    /// been collected, applies the `quiet` coalescing window (stop after
+    /// `quiet` elapses with no new batch, or when `deadline` passes).
     async fn drain_specialists_events(
         sub: &mut super::super::bus::Subscription,
         quiet: Duration,
         deadline: Duration,
     ) -> Vec<Event> {
-        let mut events = Vec::new();
+        let mut events: Vec<Event> = Vec::new();
         let end = Instant::now() + deadline;
         loop {
             let remaining = end.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match timeout(quiet.min(remaining), sub.recv()).await {
+            let wait = if events.is_empty() {
+                remaining
+            } else {
+                quiet.min(remaining)
+            };
+            match timeout(wait, sub.recv()).await {
                 Ok(Some(batch)) => {
                     for ev in batch {
                         if ev.event_type == SPECIALISTS_CHANGED {
