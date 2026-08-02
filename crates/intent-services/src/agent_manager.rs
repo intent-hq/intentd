@@ -2744,6 +2744,12 @@ impl AgentManager {
                         data["report"] = json!(report);
                     }
                 }
+                // Idle-visibility: same `waitingOnHooks` stamp as the
+                // settlement idle in `run_prompt_turn` (omitted when the
+                // agent owns no active hook).
+                self.services
+                    .annotate_waiting_on_hooks(agent_id, &mut data)
+                    .await;
                 self.services
                     .publish_agent_event(
                         &workspace_id,

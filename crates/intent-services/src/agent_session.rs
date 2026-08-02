@@ -1589,6 +1589,11 @@ impl Services {
                 // read can race the child's completion consuming the watch.
                 data["isWaitingForOtherAgents"] =
                     Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+                // Idle-visibility: an idle agent still owning active
+                // (scheduled/running) background hooks is waiting, not
+                // stalled — stamp `waitingOnHooks` (omitted when none) so
+                // subscribers and the completion-watch wake can surface it.
+                self.annotate_waiting_on_hooks(agent_id, &mut data).await;
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -1812,6 +1817,9 @@ impl Services {
         // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
         data["isWaitingForOtherAgents"] =
             Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+        // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
+        // idle (omitted when the agent owns no active hook).
+        self.annotate_waiting_on_hooks(agent_id, &mut data).await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)

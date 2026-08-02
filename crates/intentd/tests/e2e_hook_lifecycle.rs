@@ -282,6 +282,39 @@ where
     }
 }
 
+/// Drain frames until the next `agent:idle` for `agent_id`, returning its
+/// `data` payload (idle-visibility assertions, §6.5 `waitingOnHooks`).
+async fn next_agent_idle<S>(ws: &mut WebSocketStream<S>, agent_id: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
+    loop {
+        let next = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for agent:idle ({agent_id})"));
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] != "events.event" {
+                    continue;
+                }
+                let event = v["params"]["event"].clone();
+                if event["type"].as_str() == Some("agent:idle")
+                    && event["data"]["agentId"].as_str() == Some(agent_id)
+                {
+                    return event["data"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Mock-agent gate (parity with the WSS agent-lifecycle suite).
 fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -528,13 +561,14 @@ async fn hook_lifecycle_over_wss() {
 
     // SUBSCRIBER conn — `hook:*` prefix filter (plus agent stream noise we
     // skip) BEFORE any hook exists, proving the wildcard flows through the
-    // subscription engine.
+    // subscription engine. `agent:idle` rides along for the idle-visibility
+    // assertion (§6.5 `waitingOnHooks`).
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["hook:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["hook:*", "agent:idle"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -634,6 +668,43 @@ async fn hook_lifecycle_over_wss() {
         .as_str()
         .expect("watcher hookId")
         .to_string();
+
+    // Idle-visibility (§6.5): the SCHEDULE_WATCH turn's terminal agent:idle
+    // is emitted while the watcher hook is active — the payload carries the
+    // emit-time `waitingOnHooks` stamp naming the hook with its light
+    // metadata only.
+    let idle = next_agent_idle(&mut sub, &agent_id).await;
+    let waiting = idle["waitingOnHooks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent:idle carries waitingOnHooks with an active hook: {idle}"));
+    let watcher_entry = waiting
+        .iter()
+        .find(|h| h["hookId"] == json!(watcher_id))
+        .unwrap_or_else(|| panic!("waitingOnHooks names the active watcher: {idle}"));
+    assert_eq!(watcher_entry["name"], "watcher", "{idle}");
+    assert!(
+        watcher_entry["nextRunAt"].is_string() && watcher_entry["expiresAt"].is_string(),
+        "waitingOnHooks entries carry the schedule timestamps: {idle}"
+    );
+    assert!(
+        watcher_entry.get("code").is_none() && watcher_entry.get("lastLogs").is_none(),
+        "waitingOnHooks stays light — no code/logs: {idle}"
+    );
+
+    // agent.get overlays the same list on the AgentLite projection (§5.5).
+    let got = wss_rpc(
+        &mut rpc,
+        204,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        got["agent"]["waitingOnHooks"]
+            .as_array()
+            .is_some_and(|hooks| hooks.iter().any(|h| h["hookId"] == json!(watcher_id))),
+        "agent.get serves waitingOnHooks for the hook-owning agent: {got}"
+    );
 
     // FE read: hook.list reports both hooks with the wire `{ hooks }` shape.
     let listed = wss_rpc(&mut rpc, 201, "hook.list", json!({ "workspaceId": ws_id })).await;

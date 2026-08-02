@@ -2766,6 +2766,14 @@ impl Services {
         if self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()) {
             return;
         }
+        // Idle-visibility deferral: an idle agent still owning active
+        // background hooks has not settled — leave the marker in place (like
+        // the busy guard) so the hook's own terminal transition (dispatch /
+        // eviction / expiry wake → turn-end idle, or the external-cancel
+        // call into this function) synthesizes the completion later.
+        if !self.active_hooks_for_agent(child_id).await.is_empty() {
+            return;
+        }
         // Consume the marker only after the guards pass; losing this take to
         // a concurrent mutation path means that path owns the redelivery.
         if !self.take_interim_skipped_idle(child_id) {
@@ -2799,6 +2807,12 @@ impl Services {
             data["completionReport"] = serde_json::Value::String(report.clone());
             data["report"] = serde_json::Value::String(report);
         }
+        // Idle-visibility: the synthesized idle carries the same
+        // `waitingOnHooks` stamp as a real `agent:idle` emit — always empty
+        // (omitted) here, since the active-hooks guard above deferred when
+        // any hook was still active; kept for shape parity with the live
+        // emit sites should a hook be scheduled in the window.
+        self.annotate_waiting_on_hooks(child_id, &mut data).await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: session.workspace_id,
@@ -2855,6 +2869,26 @@ impl Services {
     /// `agent:deleted` are never classified interim — a failed child is
     /// parked and a deleted one is gone, so their wakes must not be deferred.
     ///
+    /// Idle-visibility deferral (within v3.1): an `agent:idle` for a child
+    /// that still owns ACTIVE (`scheduled`/`running`) background hooks is
+    /// not its real completion either — the child will run again when a
+    /// hook dispatches, fails, or expires (TTL-bounded, §5.40). Such a
+    /// hook-waiting idle defers like an interim idle: ungrouped watches
+    /// neither deliver nor retire, and — unlike the interim case — the
+    /// GROUPED path also skips recording, so an `after_all` group waits for
+    /// the child's genuine settlement (a later `agent:failed` /
+    /// `agent:deleted` still records normally). The interim-skip marker is
+    /// reused, and the hook's own terminal transitions re-run
+    /// [`Services::redeliver_completion_after_queue_mutation`] so an
+    /// external `hook.cancel` on an idle child settles the deferred watch.
+    /// The classification probes the hook store live at delivery time (not
+    /// the emit-time `waitingOnHooks` stamp), so a hook that settled
+    /// between emit and delivery never defers; a probe failure reads as no
+    /// hooks (fail-open: deferral is a nicety, a missed deferral only
+    /// yields the pre-deferral early wake). `agent:failed` /
+    /// `agent:deleted` — and the attention / reportToParent immediate
+    /// wakes, which run on their own paths — are never hook-deferred.
+    ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
     /// same-workspace delegation and `__chief__` for chief parents.
@@ -2895,13 +2929,24 @@ impl Services {
         // running turn is caught by the busy probe. (A snapshot, not a lock:
         // an enqueue landing after both probes can still race a premature
         // wake, but the window shrinks from emit→delivery to check→wake.)
-        let interim_idle = event.event_type == AGENT_IDLE
+        let queue_interim = event.event_type == AGENT_IDLE
             && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
+        // Idle-visibility deferral: probe the hook store LIVE (not the
+        // emit-time `waitingOnHooks` stamp — a hook that settled between
+        // emit and delivery must not defer). Probed even when the idle is
+        // already queue-interim, because the GROUPED branch below needs the
+        // hook classification independently (an interim idle still records
+        // for groups; a hook-waiting one must not).
+        let hook_waiting = event.event_type == AGENT_IDLE
+            && !self.active_hooks_for_agent(child_id).await.is_empty();
+        let interim_idle = queue_interim || hook_waiting;
         // monorepo#1280/#1281: record the interim skip up front — even when
         // no ungrouped watch matches — so a later queue retraction/edit that
-        // empties the ready-to-send queue while the agent is idle can
-        // synthesize the real completion (redelivering any skipped watches
-        // AND sealing a watchless coordinator's open after_all group).
+        // empties the ready-to-send queue while the agent is idle (or, for a
+        // hook-deferred idle, the last active hook's terminal transition)
+        // can synthesize the real completion (redelivering any skipped
+        // watches AND sealing a watchless coordinator's open after_all
+        // group).
         if interim_idle {
             self.mark_interim_skipped_idle(child_id);
         }
@@ -2951,6 +2996,25 @@ impl Services {
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
+                // Idle-visibility deferral: a hook-waiting idle is NOT
+                // settlement — the child will run again when a hook
+                // dispatches, fails, or expires, so recording it now would
+                // let the group fire while the child still works. Skip the
+                // record and leave the grouped watch armed; the child's
+                // genuine completion (post-hook idle, failure, deletion, or
+                // the external-cancel redelivery) records normally. Unlike
+                // the queue-interim case below, grouped watches DO defer
+                // here: a hook-waiting child is bounded by the hook TTL
+                // (§5.40), so the group cannot hang forever.
+                if hook_waiting && event.event_type == AGENT_IDLE {
+                    tracing::debug!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        group = %gid,
+                        "deferring grouped agent:idle settlement — child owns active background hooks"
+                    );
+                    continue;
+                }
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
                 // fire path removes these watches once it settles (AS-4).
@@ -3020,18 +3084,19 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-/busy-aware completion): the child still
-            // has ready-to-send queued messages or a turn already in flight,
-            // so this idle is not its real completion — deliver nothing and
-            // leave the watch (including a report_delivered one, which
-            // retires at the real completion) armed for the settlement that
-            // follows the queue drain / running turn. The interim-skip
-            // marker was recorded up front (monorepo#1280).
+            // Interim idle (queue-/busy-/hook-aware completion): the child
+            // still has ready-to-send queued messages, a turn already in
+            // flight, or active background hooks it is waiting on, so this
+            // idle is not its real completion — deliver nothing and leave
+            // the watch (including a report_delivered one, which retires at
+            // the real completion) armed for the settlement that follows
+            // the queue drain / running turn / hook resolution. The
+            // interim-skip marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages or a busy in-flight turn (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, or active background hooks (interim idle)"
                 );
                 continue;
             }

@@ -802,6 +802,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         is_waiting_on_tool: false,
         is_waiting_for_other_agents: false,
         waiting_for_agent_ids: vec![],
+        waiting_on_hooks: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         stats: None,

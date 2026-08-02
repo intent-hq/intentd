@@ -2242,6 +2242,15 @@ pub struct AgentLite {
     /// service projection.
     #[serde(default)]
     pub waiting_for_agent_ids: Vec<AgentId>,
+    /// Idle-visibility: light metadata for the agent's active
+    /// (`scheduled`/`running`) background hooks —
+    /// `[{ hookId, name, nextRunAt?, expiresAt? }]` — so a parent/client can
+    /// tell a hook-waiting idle agent from a stalled one. Omitted when the
+    /// agent owns no active hook. Stays empty in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by
+    /// the service projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_hooks: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -2350,6 +2359,7 @@ impl AgentLite {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: Vec::new(),
+            waiting_on_hooks: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: session.stats,
