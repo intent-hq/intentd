@@ -2632,10 +2632,12 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
-    /// Record that an `agent:idle` for `child_id` was skipped as interim for
-    /// at least one ungrouped watch (monorepo#1280), so a later queue
-    /// retraction that empties the ready-to-send queue while the child is
-    /// idle re-runs watch delivery for it.
+    /// Record that an `agent:idle` for `child_id` was classified as interim
+    /// (monorepo#1280) — recorded up front, whether or not any ungrouped
+    /// watch matched (monorepo#1281) — so a later queue retraction that
+    /// empties the ready-to-send queue while the agent is idle synthesizes
+    /// the real completion: re-running watch delivery and sealing the
+    /// agent's open after_all group.
     fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
         self.interim_skipped_idles
             .lock()
