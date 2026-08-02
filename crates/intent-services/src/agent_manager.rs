@@ -3461,6 +3461,16 @@ impl AgentManager {
                 // Raced with another mutation (e.g. remove) that emptied the
                 // ready-to-send queue between the check above and the dequeue.
                 self.end_turn(&agent_id).await;
+                // monorepo#1280: the racing retraction saw this drain's
+                // in-flight slot (`agent_is_busy` true) and skipped its own
+                // redelivery, expecting a turn to end with a terminal
+                // `agent:idle` — but this arm emits none. Re-run the
+                // mutation-path redelivery now that the slot is released;
+                // its guards (marker set, queue empty, not busy) make it a
+                // no-op in every other interleaving.
+                self.services
+                    .redeliver_completion_after_queue_mutation(&agent_id)
+                    .await;
                 return;
             }
         };

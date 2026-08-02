@@ -2683,6 +2683,10 @@ impl Services {
                     error = %e,
                     "queue-retraction redelivery: session lookup failed; watch stays armed"
                 );
+                // Restore the marker so a later queue mutation (or drain
+                // no-op) can retry the redelivery — a transient store error
+                // must not permanently strand the watch.
+                self.mark_interim_skipped_idle(child_id);
                 return;
             }
         };
@@ -2713,7 +2717,10 @@ impl Services {
             metadata: None,
             data,
         };
-        self.deliver_completion_to_watches(child_id, &event).await;
+        // Box::pin breaks the async-recursion cycles this edge closes
+        // (deliver → redeliver → deliver, and the drain's None-arm path
+        // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
+        Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
     }
 
     /// Wake every parent whose watch matches child_id, then drop that watch:
@@ -2967,6 +2974,18 @@ impl Services {
             }
             self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                 .await;
+        }
+        // monorepo#1280: `interim_idle` was snapshotted at entry, but the
+        // skip markers land after `.await` points (the stall lookup, earlier
+        // watches' group-branch awaits). A retraction that emptied the queue
+        // inside that window found no marker and no-op'd — re-check now that
+        // the markers are in place and hand off to the mutation-path
+        // redelivery (its guards make this a no-op unless the queue really
+        // emptied and the agent is idle). The indirect async recursion is
+        // depth-1: the synthetic redelivery's event is non-interim by
+        // construction (queue empty), so its own pass never re-enters here.
+        if interim_idle && !self.has_ready_to_send(child_id) {
+            Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
     }
 
