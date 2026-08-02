@@ -5,10 +5,12 @@
 //! `system.status` → `protocolVersion`. Version 3.0 removes the
 //! `pr.waitForChanges` router method (breaking; superseded by background
 //! hooks, §5.40), covering 311 dispatchable method names (275 router +
-//! 34 fast-path + 2 aliases) + 1 notification + 4 reverse RPCs.
+//! 34 fast-path + 2 aliases) + 1 notification + 4 reverse RPCs. Version 3.1
+//! adds the hook TTL (additive; §5.40): `ttlMs` / `expiresAt`, the terminal
+//! `expired` state, and the `hook:expired` event — no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "3.0";
+pub const PROTOCOL_VERSION: &str = "3.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

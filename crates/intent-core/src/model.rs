@@ -2688,8 +2688,8 @@ pub struct ScriptCreateParams {
 
 /// Lifecycle state of a background hook. `scheduled` and `running` are the
 /// active states (rehydrated into the scheduler at boot); `dispatched`,
-/// `evicted`, and `cancelled` are terminal. Wire/DB words are the lowercase
-/// variant names.
+/// `evicted`, `cancelled`, and `expired` are terminal. Wire/DB words are the
+/// lowercase variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookState {
@@ -2703,12 +2703,16 @@ pub enum HookState {
     Evicted,
     /// Cancelled by the owner or from the FE.
     Cancelled,
+    /// TTL elapsed (`expiresAt` passed); the owner was woken so it can
+    /// reschedule if the condition is still worth watching.
+    Expired,
 }
 
 /// A background hook: a small agent-owned script the daemon runs periodically
-/// (fixed `delayMs` between runs) until it signals a dispatch, fails, or is
-/// cancelled. Persisted to the `hook` table so schedules survive a daemon
-/// restart; the name length cap (≤19 chars) is enforced at the service layer.
+/// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
+/// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
+/// survive a daemon restart; the name length cap (≤19 chars) is enforced at
+/// the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hook {
@@ -2731,6 +2735,16 @@ pub struct Hook {
     /// (overwritten each run; capped/head-truncated at the service layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_logs: Option<String>,
+    /// JSON-serialized state returned by the most recent completed run and
+    /// injected into the next run as the `hookState` global (overwritten
+    /// each run; size-capped at the service layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<String>,
+    /// TTL deadline (`createdAt` + clamped `ttlMs`, ≤ 60 minutes): the hook
+    /// expires when this passes. `None` only on pre-TTL legacy rows, which
+    /// never expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that

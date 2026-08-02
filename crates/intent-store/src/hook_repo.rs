@@ -9,7 +9,8 @@ use sqlx::Row;
 use crate::Store;
 
 const COLUMNS: &str = "hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
-    created_at, last_run_at, next_run_at, run_count, last_error, last_logs";
+    created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, \
+    expires_at";
 
 fn state_to_db(state: HookState) -> &'static str {
     match state {
@@ -18,6 +19,7 @@ fn state_to_db(state: HookState) -> &'static str {
         HookState::Dispatched => "dispatched",
         HookState::Evicted => "evicted",
         HookState::Cancelled => "cancelled",
+        HookState::Expired => "expired",
     }
 }
 
@@ -28,6 +30,7 @@ fn state_from_db(s: &str) -> Result<HookState> {
         "dispatched" => Ok(HookState::Dispatched),
         "evicted" => Ok(HookState::Evicted),
         "cancelled" => Ok(HookState::Cancelled),
+        "expired" => Ok(HookState::Expired),
         _ => Err(intent_core::Error::Internal(format!(
             "invalid hook state: {s}"
         ))),
@@ -64,14 +67,17 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
         run_count: get_i64("run_count")?,
         last_error: get_opt("last_error")?,
         last_logs: get_opt("last_logs")?,
+        last_state: get_opt("last_state")?,
+        expires_at: get_opt("expires_at")?,
     })
 }
 
 impl Store {
     /// Insert a new hook row.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
-        let sql =
-            format!("INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = format!(
+            "INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
         sqlx::query(&sql)
             .bind(&h.hook_id.0)
             .bind(&h.workspace_id.0)
@@ -86,6 +92,8 @@ impl Store {
             .bind(h.run_count)
             .bind(&h.last_error)
             .bind(&h.last_logs)
+            .bind(&h.last_state)
+            .bind(&h.expires_at)
             .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("insert hook failed: {e}")))?;
@@ -241,6 +249,30 @@ impl Store {
             .await
             .map_err(|e| {
                 intent_core::Error::Internal(format!("update hook last logs failed: {e}"))
+            })?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a hook's `last_state`; `NotFound` when the row is
+    /// absent.
+    pub async fn update_hook_last_state(
+        &self,
+        hook_id: &HookId,
+        last_state: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET last_state = ? WHERE hook_id = ?")
+            .bind(last_state)
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("update hook last state failed: {e}"))
             })?;
         if res.rows_affected() == 0 {
             return Err(intent_core::Error::NotFound(format!(
