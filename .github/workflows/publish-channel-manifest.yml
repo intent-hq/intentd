@@ -101,8 +101,16 @@ jobs:
             exit 0
           fi
           # The dist checkout is shallow; the notifier needs full history and
-          # tags to compute the previous tag and scan the commit range.
-          git fetch --quiet --tags --unshallow 2>/dev/null || git fetch --quiet --tags
+          # tags to compute the previous tag and scan the commit range. The
+          # checkout does not persist credentials, so authenticate the fetch
+          # with the job's GH_TOKEN via a one-shot credential helper — the
+          # token is read from the environment at runtime and never appears
+          # in argv or gets persisted (intent-hq/monorepo#1279).
+          auth_helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
+          git -c credential.helper= -c credential.helper="$auth_helper" \
+            fetch --quiet --tags --unshallow 2>/dev/null \
+            || git -c credential.helper= -c credential.helper="$auth_helper" \
+              fetch --quiet --tags
           if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "::warning::Tag $TAG not found in checkout; skipping fixed-issue notifications"
             exit 0
