@@ -2159,6 +2159,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

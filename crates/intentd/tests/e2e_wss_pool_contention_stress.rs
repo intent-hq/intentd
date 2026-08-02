@@ -9,7 +9,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -117,18 +116,30 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-wss-stress-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = Store::open(&dir.join("intentd.db"))
+/// Create a temp dir with a recognizable prefix under the system temp root.
+/// The returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
+async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, Store, tempfile::TempDir) {
+    let dir = test_tempdir("intentd-wss-stress-");
+    let store = Store::open(&dir.path().join("intentd.db"))
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let workspaces_root = dir.join("workspaces");
+    let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
     let services = Services::new(store.clone())
-        .with_assets_root(dir.join("assets"))
+        .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, dir)
@@ -139,12 +150,12 @@ struct Server {
     port: u16,
     cfg: Arc<ClientConfig>,
     store: Store,
-    _dir: std::path::PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 async fn start() -> Server {
     let (api, bus, store, dir) = make_services().await;
-    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
