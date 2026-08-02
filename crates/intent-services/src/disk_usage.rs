@@ -10,6 +10,11 @@
 //! links are never followed (only the link's own allocation counts) and
 //! directory-inode allocation is excluded.
 //!
+//! On non-Unix targets (Windows) there is no `st_blocks`/`st_ino` in the
+//! portable metadata surface, so the walk falls back to **logical size**
+//! (`Metadata::len`) with no hard-link dedup — a documented best-effort
+//! approximation on those platforms.
+//!
 //! ## CoW-clone limitation (best effort)
 //!
 //! Clone-shared extents (APFS `clonefile`, btrfs/XFS reflink) are counted at
@@ -34,6 +39,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -209,11 +215,21 @@ fn walk_dir(dir: &Path, seen: &mut HashSet<(u64, u64)>, tally: &mut Tally) {
 
 /// Account one non-directory entry: allocated blocks for everything, file
 /// count for regular files only, multi-linked inodes counted once.
+#[cfg(unix)]
 fn tally_entry(meta: &Metadata, seen: &mut HashSet<(u64, u64)>, tally: &mut Tally) {
     if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
         return;
     }
     tally.bytes += meta.blocks() * 512;
+    if meta.is_file() {
+        tally.file_count += 1;
+    }
+}
+
+/// Non-Unix fallback (see module docs): logical size, no hard-link dedup.
+#[cfg(not(unix))]
+fn tally_entry(meta: &Metadata, _seen: &mut HashSet<(u64, u64)>, tally: &mut Tally) {
+    tally.bytes += meta.len();
     if meta.is_file() {
         tally.file_count += 1;
     }
@@ -230,6 +246,7 @@ mod tests {
         f.write_all(&vec![0xA5u8; len]).unwrap();
     }
 
+    #[cfg(unix)]
     fn physical(path: &Path) -> u64 {
         fs::metadata(path).unwrap().blocks() * 512
     }
@@ -256,6 +273,7 @@ mod tests {
         panic!("in-flight walk never drained");
     }
 
+    #[cfg(unix)]
     #[test]
     fn sums_physical_bytes_and_dedupes_hard_links() {
         let dir = tempfile::tempdir().unwrap();
@@ -267,6 +285,7 @@ mod tests {
         assert_eq!(usage.file_count, 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sparse_files_count_allocated_not_apparent_size() {
         let dir = tempfile::tempdir().unwrap();
