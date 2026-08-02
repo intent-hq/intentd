@@ -2846,6 +2846,13 @@ impl Services {
                         .await;
                 }
             }
+        } else if !was_editing && now_editing {
+            // editing: false → true ⇒ the entry left the ready-to-send queue.
+            // If that emptied it while the agent is idle, an interim-skipped
+            // watch (monorepo#1280) has no further completion coming — re-run
+            // delivery so it still gets its wake.
+            self.redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
         }
         Ok(json!({ "success": true, "queuedMessage": edited }))
     }
@@ -2877,6 +2884,11 @@ impl Services {
         };
         if removed {
             self.publish_queue_updated(&agent_id).await;
+            // monorepo#1280: a retraction that empties the ready-to-send
+            // queue while the agent is idle strands any watch whose
+            // `agent:idle` was skipped as interim — re-run delivery.
+            self.redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
         }
         Ok(json!({ "success": true }))
     }
@@ -2920,6 +2932,9 @@ impl Services {
             queue.remove(position);
         }
         self.publish_queue_updated(&agent_id).await;
+        // monorepo#1280: same strand guard as the FE removal op above.
+        self.redeliver_completion_after_queue_mutation(&agent_id)
+            .await;
         Ok(json!({ "success": true, "messageId": message_id }))
     }
 
