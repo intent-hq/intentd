@@ -1091,15 +1091,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getConversation`: `{ agentId, messages, truncated, totalMessages }`
-    /// capped to the most-recent `limit` (PROTOCOL §5.5).
+    /// capped to the most-recent `limit` (PROTOCOL §5.5). The optional
+    /// `around_message_id` seeks to the page containing that message instead
+    /// of the newest window; absent, behavior is byte-identical to before.
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, limit, workspace_id, page_token);
+        let _ = (agent_id, limit, workspace_id, page_token, around_message_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
@@ -4525,20 +4528,34 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.messages`: substring search over a workspace's persisted agent
-    /// session messages. Returns `{ requestId, matches: MessageMatch[] }` inline,
-    /// or `{ requestId, matches: [] }` (a prompt ack) when the result set is
+    /// `search.messages`: full-text (FTS5, bm25-ranked) search over persisted
+    /// user/assistant agent messages. `workspace_id` `None` → global across
+    /// all workspaces; `Some` → hard scope filter. `prefer_workspace_id` is a
+    /// soft ranking boost: results stay global but matches from that workspace
+    /// outrank equally-relevant matches elsewhere. Returns
+    /// `{ requestId, matches: MessageMatch[] }` inline, or
+    /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).
+    #[allow(clippy::too_many_arguments)]
     fn search_messages(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         query: String,
         agent_id: Option<String>,
         role: Option<String>,
         limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, query, agent_id, role, limit, request_id);
+        let _ = (
+            workspace_id,
+            query,
+            agent_id,
+            role,
+            limit,
+            prefer_workspace_id,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_messages not implemented".to_string(),

@@ -6,12 +6,12 @@
 
 use std::path::PathBuf;
 
-use intent_core::{AgentSession, Error, Event, Note, Result, RetrieveResult, WorkspaceId};
+use intent_core::{Error, Event, Note, Result, RetrieveResult, WorkspaceId};
 use intent_search::{
-    contains_ci, extract_symbol, make_preview, CodebaseMatch, ContentSearchResult, EventMatch,
-    MessageMatch, NoteMatch,
+    contains_ci, extract_symbol, fts_preview, make_preview, CodebaseMatch, ContentSearchResult,
+    EventMatch, MessageMatch, NoteMatch,
 };
-use intent_store::Store;
+use intent_store::{MessageFtsMatch, Store};
 use serde_json::Value;
 
 /// Result sets at or below this many matches are returned inline in the method
@@ -67,45 +67,27 @@ pub(crate) fn message_text(content: &Value) -> String {
     }
 }
 
-/// Build `search.messages` matches over a workspace's sessions. `agent_id`
-/// filters to a single session; `role` filters to a message role; `limit` caps
-/// the number of matches returned.
-pub(crate) fn message_matches(
-    sessions: &[AgentSession],
-    query: &str,
-    agent_id: Option<&str>,
-    role: Option<&str>,
-    limit: Option<usize>,
+/// Map ranked FTS hits ([`Store::search_agent_messages_fts`]) into
+/// `search.messages` wire matches: the preview windows onto the first
+/// raw-query token occurring in the extracted text, and the wire `score`
+/// negates the adjusted bm25 rank so higher = more relevant. One match per
+/// matching message — no per-agent collapse.
+pub(crate) fn message_fts_matches(
+    hits: Vec<MessageFtsMatch>,
+    raw_query: &str,
 ) -> Vec<MessageMatch> {
-    let mut out = Vec::new();
-    for session in sessions {
-        if let Some(want) = agent_id {
-            if session.id.as_str() != want {
-                continue;
-            }
-        }
-        for msg in &session.messages {
-            if let Some(want) = role {
-                if msg.role != want {
-                    continue;
-                }
-            }
-            let text = message_text(&msg.content);
-            if !contains_ci(&text, query) {
-                continue;
-            }
-            out.push(MessageMatch {
-                agent_id: session.id.as_str().to_string(),
-                message_id: msg.id.clone(),
-                preview: make_preview(&text, query),
-                score: None,
-            });
-            if limit.is_some_and(|n| out.len() >= n) {
-                return out;
-            }
-        }
-    }
-    out
+    hits.into_iter()
+        .map(|hit| MessageMatch {
+            agent_id: hit.agent_id,
+            message_id: hit.message_id,
+            preview: fts_preview(&message_text(&hit.content), raw_query),
+            score: Some(-hit.rank),
+            workspace_id: hit.workspace_id,
+            agent_name: hit.agent_name,
+            role: hit.role,
+            timestamp: hit.created_at,
+        })
+        .collect()
 }
 
 /// Build `search.events` matches over the event log. The searchable text is the
