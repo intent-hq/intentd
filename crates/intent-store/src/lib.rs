@@ -22,6 +22,7 @@ mod diffs_repo;
 mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
+mod hook_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;

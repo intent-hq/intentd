@@ -107,3 +107,7 @@ id_newtype!(
     /// bookkeeping — this is the key that disambiguates `drafts.*` (§5.16).
     ClientId
 );
+id_newtype!(
+    /// Identifier for a background hook (an agent-owned scheduled script).
+    HookId
+);
