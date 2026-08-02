@@ -843,8 +843,30 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
         json!({ "workspaceId": dup_id }),
     )
     .await;
-    let _ = std::fs::remove_dir_all(&root);
+
+    // `workspace.delete` trash-renames the duplicate's checkout asynchronously
+    // (`source-repo` → `source-repo.deleting-*` under `<root>/<dup_id>`) and
+    // removes it in the background, which can race the sweep below and
+    // resurrect entries after `remove_dir_all` (leaves `itd-wss-wt-dupwt-*`
+    // residue under /tmp). Wait (bounded) for the async delete to settle, kill
+    // the daemon so nothing can recreate files, then sweep with one retry.
+    let dup_dir = root.join(dup_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let busy = std::fs::read_dir(&dup_dir)
+            .map(|entries| entries.flatten().next().is_some())
+            .unwrap_or(false);
+        if !busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+    if root.exists() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// `workspace.duplicate` off a workspace created with `skipIsolation: true`
