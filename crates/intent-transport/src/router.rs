@@ -2973,6 +2973,30 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Background hooks (§6.8): the FE reads and manages hooks; there is
+        // NO wire `hook.schedule` — hooks are agent-authored via the
+        // `ws.hook.schedule` MCP binding only. An unknown/foreign `hookId`
+        // surfaces as `-32602` (`Error::NotFound` → invalid params).
+        "hook.list" => {
+            let ws = require_ws_note(params)?;
+            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+        }
+        "hook.cancel" => {
+            let ws = require_ws_note(params)?;
+            let hook_id = require_str_param(params, "hookId")?;
+            // FE cancel (`by_owner = false`): the owning agent is woken with
+            // a cancellation notice.
+            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), false)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "hook.runNow" => {
+            let ws = require_ws_note(params)?;
+            let hook_id = require_str_param(params, "hookId")?;
+            api.hook_run_now(ws, intent_core::HookId::from(hook_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "rules.list" => {
             // Optional workspaceId: present → include the workspace's read-only
             // rule files; omitted → global user-override set only.

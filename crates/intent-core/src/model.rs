@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -2684,6 +2684,53 @@ pub struct ScriptCreateParams {
     pub category: Option<String>,
     pub auto_start: Option<bool>,
     pub script_id: Option<String>,
+}
+
+/// Lifecycle state of a background hook. `scheduled` and `running` are the
+/// active states (rehydrated into the scheduler at boot); `dispatched`,
+/// `evicted`, and `cancelled` are terminal. Wire/DB words are the lowercase
+/// variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookState {
+    /// Waiting for its next run (sleeping `delayMs`).
+    Scheduled,
+    /// A run is currently executing.
+    Running,
+    /// A run signalled dispatch; the owner was woken and the hook terminated.
+    Dispatched,
+    /// Evicted after a throw/timeout; the owner was woken with the reason.
+    Evicted,
+    /// Cancelled by the owner or from the FE.
+    Cancelled,
+}
+
+/// A background hook: a small agent-owned script the daemon runs periodically
+/// (fixed `delayMs` between runs) until it signals a dispatch, fails, or is
+/// cancelled. Persisted to the `hook` table so schedules survive a daemon
+/// restart; the name length cap (≤19 chars) is enforced at the service layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hook {
+    pub hook_id: HookId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub code: String,
+    pub delay_ms: i64,
+    pub state: HookState,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    pub run_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Captured `console.*` output from the most recent completed run
+    /// (overwritten each run; capped/head-truncated at the service layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_logs: Option<String>,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that

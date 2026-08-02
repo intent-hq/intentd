@@ -116,14 +116,14 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
-    assert_eq!(local["protocolVersion"], "2.9");
+    assert_eq!(local["protocolVersion"], "2.10");
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
-    assert_eq!(remote["protocolVersion"], "2.9");
+    assert_eq!(remote["protocolVersion"], "2.10");
 }
 
 #[test]

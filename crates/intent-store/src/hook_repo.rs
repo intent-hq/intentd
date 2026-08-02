@@ -1,0 +1,284 @@
+//! Hook repository: CRUD for background hooks (agent-owned scheduled
+//! scripts). Rows are written through by the hook scheduler and rehydrated at
+//! boot via [`Store::load_active_hooks`].
+
+use intent_core::{AgentId, Hook, HookId, HookState, Result, WorkspaceId};
+use sqlx::sqlite::SqliteRow;
+use sqlx::Row;
+
+use crate::Store;
+
+const COLUMNS: &str = "hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
+    created_at, last_run_at, next_run_at, run_count, last_error, last_logs";
+
+fn state_to_db(state: HookState) -> &'static str {
+    match state {
+        HookState::Scheduled => "scheduled",
+        HookState::Running => "running",
+        HookState::Dispatched => "dispatched",
+        HookState::Evicted => "evicted",
+        HookState::Cancelled => "cancelled",
+    }
+}
+
+fn state_from_db(s: &str) -> Result<HookState> {
+    match s {
+        "scheduled" => Ok(HookState::Scheduled),
+        "running" => Ok(HookState::Running),
+        "dispatched" => Ok(HookState::Dispatched),
+        "evicted" => Ok(HookState::Evicted),
+        "cancelled" => Ok(HookState::Cancelled),
+        _ => Err(intent_core::Error::Internal(format!(
+            "invalid hook state: {s}"
+        ))),
+    }
+}
+
+fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
+    let state: String = r
+        .try_get("state")
+        .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))?;
+    let get = |col: &str| -> Result<String> {
+        r.try_get::<String, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    let get_opt = |col: &str| -> Result<Option<String>> {
+        r.try_get::<Option<String>, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    let get_i64 = |col: &str| -> Result<i64> {
+        r.try_get::<i64, _>(col)
+            .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
+    };
+    Ok(Hook {
+        hook_id: HookId(get("hook_id")?),
+        workspace_id: WorkspaceId(get("workspace_id")?),
+        agent_id: AgentId(get("agent_id")?),
+        name: get("name")?,
+        code: get("code")?,
+        delay_ms: get_i64("delay_ms")?,
+        state: state_from_db(&state)?,
+        created_at: get("created_at")?,
+        last_run_at: get_opt("last_run_at")?,
+        next_run_at: get_opt("next_run_at")?,
+        run_count: get_i64("run_count")?,
+        last_error: get_opt("last_error")?,
+        last_logs: get_opt("last_logs")?,
+    })
+}
+
+impl Store {
+    /// Insert a new hook row.
+    pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
+        let sql =
+            format!("INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        sqlx::query(&sql)
+            .bind(&h.hook_id.0)
+            .bind(&h.workspace_id.0)
+            .bind(&h.agent_id.0)
+            .bind(&h.name)
+            .bind(&h.code)
+            .bind(h.delay_ms)
+            .bind(state_to_db(h.state))
+            .bind(&h.created_at)
+            .bind(&h.last_run_at)
+            .bind(&h.next_run_at)
+            .bind(h.run_count)
+            .bind(&h.last_error)
+            .bind(&h.last_logs)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("insert hook failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Get a hook by id; `NotFound` when absent.
+    pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
+        let sql = format!("SELECT {COLUMNS} FROM hook WHERE hook_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&hook_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("get hook failed: {e}")))?;
+        match row {
+            Some(r) => hook_from_row(&r),
+            None => Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            ))),
+        }
+    }
+
+    /// List all hooks in a workspace, oldest first.
+    pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
+        let sql = format!("SELECT {COLUMNS} FROM hook WHERE workspace_id = ? ORDER BY created_at");
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("list hooks by workspace failed: {e}"))
+            })?;
+        rows.iter().map(hook_from_row).collect()
+    }
+
+    /// List all hooks owned by an agent, oldest first.
+    pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
+        let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
+        let rows = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("list hooks by agent failed: {e}"))
+            })?;
+        rows.iter().map(hook_from_row).collect()
+    }
+
+    /// Set a hook's lifecycle state; `NotFound` when the row is absent.
+    pub async fn update_hook_state(&self, hook_id: &HookId, state: HookState) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET state = ? WHERE hook_id = ?")
+            .bind(state_to_db(state))
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("update hook state failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record a completed run: bump `run_count`, set `last_run_at`, and set
+    /// (or clear) `next_run_at`; `NotFound` when the row is absent.
+    pub async fn update_hook_run(
+        &self,
+        hook_id: &HookId,
+        last_run_at: &str,
+        next_run_at: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE hook SET run_count = run_count + 1, last_run_at = ?, next_run_at = ? \
+             WHERE hook_id = ?",
+        )
+        .bind(last_run_at)
+        .bind(next_run_at)
+        .bind(&hook_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("update hook run failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a hook's `next_run_at`; `NotFound` when the row is
+    /// absent.
+    pub async fn update_hook_next_run(
+        &self,
+        hook_id: &HookId,
+        next_run_at: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET next_run_at = ? WHERE hook_id = ?")
+            .bind(next_run_at)
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("update hook next run failed: {e}"))
+            })?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a hook's `last_error`; `NotFound` when the row is
+    /// absent.
+    pub async fn update_hook_last_error(
+        &self,
+        hook_id: &HookId,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET last_error = ? WHERE hook_id = ?")
+            .bind(last_error)
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("update hook last error failed: {e}"))
+            })?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) a hook's `last_logs`; `NotFound` when the row is
+    /// absent.
+    pub async fn update_hook_last_logs(
+        &self,
+        hook_id: &HookId,
+        last_logs: Option<&str>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET last_logs = ? WHERE hook_id = ?")
+            .bind(last_logs)
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("update hook last logs failed: {e}"))
+            })?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete a hook row; `NotFound` when absent.
+    pub async fn delete_hook(&self, hook_id: &HookId) -> Result<()> {
+        let res = sqlx::query("DELETE FROM hook WHERE hook_id = ?")
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("delete hook failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load every active (`scheduled` or `running`) hook across all
+    /// workspaces, oldest first — the boot rehydration read for the hook
+    /// scheduler.
+    pub async fn load_active_hooks(&self) -> Result<Vec<Hook>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM hook WHERE state IN ('scheduled', 'running') \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("load active hooks failed: {e}")))?;
+        rows.iter().map(hook_from_row).collect()
+    }
+}

@@ -199,6 +199,14 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
+  ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
+
+  ws.hook.schedule({ name, code, delayMs }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), or is cancelled. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of polling in your own turn.
+  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled), `nextRunAt`, `runCount`, `lastError?`.
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
+
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
@@ -388,6 +396,12 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
+  ws.hook.schedule({ name, code, delayMs }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), or is cancelled. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of polling in your own turn.
+  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled), `nextRunAt`, `runCount`, `lastError?`.
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
+
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
@@ -479,6 +493,8 @@ mod tests {
     const BINDINGS_AGENT: &str = include_str!("bindings/agent.rs");
     const BINDINGS_EVENT: &str = include_str!("bindings/event.rs");
     const BINDINGS_GIT: &str = include_str!("bindings/git.rs");
+    const BINDINGS_HOST: &str = include_str!("bindings/host.rs");
+    const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
@@ -506,6 +522,8 @@ mod tests {
             ("agent", BINDINGS_AGENT),
             ("event", BINDINGS_EVENT),
             ("git", BINDINGS_GIT),
+            ("host", BINDINGS_HOST),
+            ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
             ("terminal", BINDINGS_TERMINAL),
             ("file", BINDINGS_FILE),

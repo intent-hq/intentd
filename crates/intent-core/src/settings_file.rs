@@ -35,7 +35,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
     DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
 use crate::error::{Error, Result};
@@ -63,6 +63,7 @@ pub struct SettingsFile {
     pub agents: AgentsSettings,
     pub events: EventsSettings,
     pub workspace_api: WorkspaceApiSettings,
+    pub hooks: HooksSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -477,6 +478,23 @@ impl Default for WorkspaceApiSettings {
     }
 }
 
+/// `[hooks]` — background-hook scheduler knobs (`hooks.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct HooksSettings {
+    /// `hooks.maxPerAgent` — cap on concurrently active (scheduled/running)
+    /// hooks per agent.
+    pub max_per_agent: u32,
+}
+
+impl Default for HooksSettings {
+    fn default() -> Self {
+        Self {
+            max_per_agent: DEFAULT_HOOKS_MAX_PER_AGENT,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -857,6 +875,11 @@ maxOutputChars = 100000
 # TOON output -- TOON-encode workspace_api tool results (token-efficient)
 # instead of plain JSON.
 toonOutput = true
+
+[hooks]
+# Max hooks per agent -- cap on concurrently active (scheduled/running)
+# background hooks per agent.
+maxPerAgent = 5
 "##;
 
 #[cfg(test)]
@@ -939,12 +962,13 @@ mod tests {
             d.workspace_api.toon_output,
             DEFAULT_WORKSPACE_API_TOON_OUTPUT
         );
+        assert_eq!(d.hooks.max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
     }
 
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
@@ -954,6 +978,7 @@ mod tests {
         assert!(!parsed.workspace_api.toon_output);
         assert!(parsed.server.ws_api.enabled);
         assert_eq!(parsed.server.ws_api.port, 2000);
+        assert_eq!(parsed.hooks.max_per_agent, 9);
     }
 
     #[test]

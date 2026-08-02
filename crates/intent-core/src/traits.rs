@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -5288,6 +5288,93 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::browser_exec not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.host.exec`: one-shot process exec on the daemon host for the
+    /// agent-JS binding, with the wire `host.exec` semantics (PROTOCOL §5.14):
+    /// argv-only (no shell interpolation), `timeoutMs` reaps the whole process
+    /// group, workspace-cwd containment, and secret-safe env (values never
+    /// logged or returned). `params` carries the raw
+    /// `{ command, args?, cwd?, env?, timeoutMs? }` object; `workspace_id`
+    /// anchors the cwd containment guard — a caller-supplied `workspaceId`
+    /// cannot retarget it. The concrete implementation delegates to
+    /// `intent-services::host_exec::run`.
+    fn host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_exec not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
+    /// (an agent-owned scheduled script) after one immediate real run.
+    /// `params` carries `{ name, code, delayMs }`; `agent_id` is the owning
+    /// agent (the MCP caller). Returns the persisted hook on success.
+    fn hook_schedule(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_schedule not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.list` / wire `hook.list`: hooks in a workspace, optionally
+    /// narrowed to one owning agent, as `{ hooks: [Hook] }`.
+    fn hook_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. When the
+    /// cancel does not come from the owning agent (`by_owner = false`, the FE
+    /// path) the owner is additionally woken with a cancellation notice.
+    fn hook_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+        by_owner: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id, by_owner);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_cancel not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
+    /// active hook, resetting its inter-run timer.
+    fn hook_run_now(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_run_now not implemented".to_string(),
             ))
         })
     }

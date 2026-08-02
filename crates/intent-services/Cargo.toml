@@ -15,6 +15,7 @@ intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.2.16" }
 intent-linear = { path = "../intent-linear", version = "0.2.16" }
 intent-sentry = { path = "../intent-sentry", version = "0.2.16" }
 intent-acp = { path = "../intent-acp", version = "0.2.16" }
+intent-js = { path = "../intent-js", version = "0.2.16" }
 intent-context = { path = "../intent-context", version = "0.2.16" }
 intent-providers = { path = "../intent-providers", version = "0.2.16" }
 intent-pty = { path = "../intent-pty", version = "0.2.16" }
