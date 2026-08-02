@@ -1,7 +1,8 @@
 //! Settings repository (§9.2 / §9.8). The `settings` table is a flat
 //! `key` → JSON `value` store for **state blobs + non-TOML dynamic keys
 //! only** (e.g. `workspace.changeHistory`, `workspaceInitializer.state`,
-//! `repos.known`, `endUserRules`, `permissions.rules`, `userRules`,
+//! `hardwareConsole.state`, `repos.known`, `endUserRules`,
+//! `permissions.rules`, `userRules`,
 //! `workspaceRules`). True configuration lives in `config.toml` (the
 //! `SettingsRegistry` in `intent-services`) and sensitive values (§9.8) live
 //! in the file-backed secrets store — neither ever reaches this table. The

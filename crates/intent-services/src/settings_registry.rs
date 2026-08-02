@@ -776,6 +776,7 @@ mod tests {
             "mcp.servers",
             "workspace.changeHistory",
             "workspaceInitializer.state",
+            "hardwareConsole.state",
             "repos.known",
             "endUserRules",
             "permissions.rules",

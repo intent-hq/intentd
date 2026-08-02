@@ -1096,6 +1096,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             Some(json!({})),
         ),
+        // --- Group A: hardware console state ----------------------------------
+        // Persisted FE-owned hardware-console (control surface) configuration:
+        // key assignments, action mappings, prompt-picker limit.
+        object(
+            "hardwareConsole.state",
+            "Hardware console state",
+            "Persisted hardware-console configuration (key assignments, action mappings, prompt-picker limit)",
+            "hardware",
+            Some(json!({})),
+        ),
         // --- Group B: context engine ----------------------------------------
         boolean(
             "context.enabled",
@@ -1743,7 +1753,8 @@ mod tests {
     /// The non-secret gap entries live in the catalog as opaque `Object`
     /// settings with a documented default. Each is validated by shape only;
     /// downstream consumers own the internal schema (permission rules, prompt
-    /// rules, known repos, change-history bags, workspace-initializer state).
+    /// rules, known repos, change-history bags, workspace-initializer state,
+    /// hardware-console state).
     #[test]
     fn non_secret_object_gap_entries_have_defaults() {
         for path in [
@@ -1753,6 +1764,7 @@ mod tests {
             "repos.known",
             "workspace.changeHistory",
             "workspaceInitializer.state",
+            "hardwareConsole.state",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
