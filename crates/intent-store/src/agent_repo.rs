@@ -2584,7 +2584,9 @@ mod tests {
                 return;
             }
             for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+                let mut sidecar = self.path.clone().into_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(&sidecar);
             }
         }
     }
@@ -6132,9 +6134,7 @@ mod tests {
     #[tokio::test]
     async fn fts_appends_indexed_with_message_text_semantics() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-append".to_string());
@@ -6223,8 +6223,6 @@ mod tests {
         assert!(fts_match_ids(&store, "excludedblockterm").await.is_empty());
         assert!(fts_match_ids(&store, "toolonlyterm").await.is_empty());
         assert!(fts_match_ids(&store, "systemonlyterm").await.is_empty());
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The `agent.replaceMessages` swap (DELETE + re-INSERT) drops every
@@ -6235,9 +6233,7 @@ mod tests {
     #[tokio::test]
     async fn fts_synced_on_replace_and_session_delete() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-swap".to_string());
@@ -6305,8 +6301,6 @@ mod tests {
             0,
             "cascade delete of agent_message empties the index"
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The 0074 migration backfills pre-existing rows: raw-inserted messages
@@ -6316,9 +6310,7 @@ mod tests {
     #[tokio::test]
     async fn fts_migration_backfills_existing_rows() {
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
         let ts = now_iso();
         let ws_id = WorkspaceId("ws-fts-backfill".to_string());
@@ -6378,8 +6370,6 @@ mod tests {
         assert_eq!(fts_match_ids(&store, "backfilledterm").await.len(), 1);
         assert!(fts_match_ids(&store, "backfilltoolterm").await.is_empty());
         assert_eq!(fts_row_count(&store).await, 1);
-
-        let _ = std::fs::remove_file(&tmp);
     }
 
     /// The one-time activation VACUUM (`activate_incremental_vacuum`) may
@@ -6390,14 +6380,12 @@ mod tests {
     async fn fts_rebuilt_after_vacuum_activation() {
         use crate::AutoVacuumActivation;
         use intent_core::now_iso;
-        use std::path::PathBuf;
-        use uuid::Uuid;
-        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let tmp = TempDb::new("test-agent-repo");
         // Legacy DB in auto_vacuum=NONE mode so activation runs a real VACUUM
         // (Store::open's pragma is recorded but inert on an existing file).
         {
             let opts = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&tmp)
+                .filename(&*tmp)
                 .create_if_missing(true);
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
@@ -6479,7 +6467,5 @@ mod tests {
             fts_match_ids(&store, "postvacuumterm").await,
             vec![after.id]
         );
-
-        let _ = std::fs::remove_file(&tmp);
     }
 }
