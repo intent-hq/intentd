@@ -4421,6 +4421,59 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
+/// Resolve the specialist preview provider context (`specialist.get`/`.list`
+/// optional `provider` param): a supplied id must be a registered provider
+/// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
+/// daemon's default provider.
+fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
+    match nonempty_owned(provider) {
+        Some(p) => {
+            if intent_providers::find_provider(&p).is_none() {
+                return Err(Error::InvalidParams(format!("unknown provider: {p}")));
+            }
+            Ok(p)
+        }
+        None => Ok(intent_providers::default_provider_id().to_string()),
+    }
+}
+
+/// Decorate one specialist def with the additive `resolvedModel`/
+/// `resolvedProvider` preview fields (PROTOCOL §5.11), computed by the same
+/// resolver every creation path uses ([`agent_ops::resolve_agent_default_model`],
+/// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
+/// so the preview matches what a no-model create would actually pin. Both
+/// fields are omitted when resolution yields the provider CLI default
+/// (clients render "Provider default"). Previews are context-free
+/// (`is_background = false`), so the background-only `backgroundAgents.*`
+/// settings steps do not apply.
+fn decorate_specialist_resolved(
+    services: &Services,
+    def: &mut serde_json::Value,
+    workspace_path: Option<&Path>,
+    provider: &str,
+) {
+    let Some(id) = def
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(model) = agent_ops::resolve_agent_default_model(
+        services,
+        Some(&id),
+        workspace_path,
+        Some(provider),
+        false,
+    ) else {
+        return;
+    };
+    if let Some(obj) = def.as_object_mut() {
+        obj.insert("resolvedModel".into(), serde_json::json!(model));
+        obj.insert("resolvedProvider".into(), serde_json::json!(provider));
+    }
+}
+
 /// Shared `primitive.*` glue: append the fenced `ws-block:<block_type>` JSON of
 /// `primitive` to the note, persist it, emit `note:updated`, and return the TS
 /// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
@@ -7992,10 +8045,21 @@ impl WorkspaceApi for Services {
     fn specialist_list(
         &self,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.specialists_service()
-                .list(workspace_path.as_deref().map(Path::new))
+            let provider = specialist_preview_provider(provider)?;
+            let ws_path = workspace_path.as_deref().map(Path::new);
+            let mut result = self.specialists_service().list(ws_path)?;
+            if let Some(specs) = result
+                .get_mut("specialists")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for def in specs {
+                    decorate_specialist_resolved(self, def, ws_path, &provider);
+                }
+            }
+            Ok(result)
         })
     }
 
@@ -8003,10 +8067,16 @@ impl WorkspaceApi for Services {
         &self,
         id: String,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.specialists_service()
-                .get(&id, workspace_path.as_deref().map(Path::new))
+            let provider = specialist_preview_provider(provider)?;
+            let ws_path = workspace_path.as_deref().map(Path::new);
+            let mut result = self.specialists_service().get(&id, ws_path)?;
+            if let Some(def) = result.get_mut("specialist") {
+                decorate_specialist_resolved(self, def, ws_path, &provider);
+            }
+            Ok(result)
         })
     }
 

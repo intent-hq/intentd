@@ -4138,12 +4138,16 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `specialist.list` → `{ specialists: SpecialistDef[] }` (user/project
     /// files override bundled). An optional `workspace_path` adds the project
-    /// tier (PROTOCOL §5.11).
+    /// tier (PROTOCOL §5.11). An optional `provider` supplies the resolution
+    /// context for the additive `resolvedModel`/`resolvedProvider` preview
+    /// fields (defaults to the daemon's default provider; omitted when
+    /// resolution yields the provider CLI default).
     fn specialist_list(
         &self,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_path;
+        let _ = (workspace_path, provider);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::specialist_list not implemented".to_string(),
@@ -4152,13 +4156,17 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
-    /// unknown id → `-32602` (PROTOCOL §5.11).
+    /// unknown id → `-32602` (PROTOCOL §5.11). An optional `provider` supplies
+    /// the resolution context for the additive `resolvedModel`/
+    /// `resolvedProvider` preview fields (defaults to the daemon's default
+    /// provider; omitted when resolution yields the provider CLI default).
     fn specialist_get(
         &self,
         id: String,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (id, workspace_path);
+        let _ = (id, workspace_path, provider);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::specialist_get not implemented".to_string(),

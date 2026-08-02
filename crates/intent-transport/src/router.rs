@@ -2988,13 +2988,22 @@ async fn dispatch(
             // Matches the TS WSS `specialist.list` signature: no params; merges
             // user > bundled tiers only (the project tier is not part of the live
             // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11).
-            api.specialist_list(None).await.map_err(domain_to_rpc)
+            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
+            // `provider` supplies the resolution context for the additive
+            // `resolvedModel`/`resolvedProvider` preview fields.
+            let provider = opt_str(params, "provider");
+            match api.specialist_list(None, provider).await {
+                Ok(v) => Ok(v),
+                // Unknown provider → -32602 with the raw message.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
         }
         "specialist.get" => {
             let id = require_str_param(params, "id")?;
             let workspace_path = opt_str(params, "workspacePath");
-            match api.specialist_get(id, workspace_path).await {
+            let provider = opt_str(params, "provider");
+            match api.specialist_get(id, workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown id / invalid id → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
