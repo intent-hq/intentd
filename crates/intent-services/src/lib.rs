@@ -2696,11 +2696,13 @@ impl Services {
                 tracing::warn!(
                     child = %child_id.0,
                     error = %e,
-                    "queue-retraction redelivery: session lookup failed; watch stays armed"
+                    "queue-retraction redelivery: session lookup failed; watch stays armed and any open after_all group stays unsealed"
                 );
                 // Restore the marker so a later queue mutation (or drain
                 // no-op) can retry the redelivery — a transient store error
-                // must not permanently strand the watch.
+                // must not permanently strand the watch or leave the agent's
+                // open after_all group unsealed forever (the retried
+                // redelivery seals it below).
                 self.mark_interim_skipped_idle(child_id);
                 return;
             }
@@ -2735,14 +2737,21 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-interim idle
-        // path (monorepo#1281). Box::pin breaks the async-recursion cycle
-        // this edge closes (try_drain_queue → redeliver → try_fire_group →
+        // path (monorepo#1281). Gated on the delivery pass's own interim
+        // classification: an enqueue landing between this function's
+        // `has_ready_to_send` guard and the delivery re-classifies the
+        // synthesized idle as interim (marker re-recorded, so a later
+        // mutation/drain retries), and the seal must agree with that
+        // snapshot. Box::pin breaks the async-recursion cycle this edge
+        // closes (try_drain_queue → redeliver → try_fire_group →
         // deliver_parent_wake → send_message → try_drain_queue).
-        if let Some(gid) = self.seal_group_for_parent(child_id).await {
-            Box::pin(self.try_fire_group(&gid)).await;
+        if !interim {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
         }
     }
 
