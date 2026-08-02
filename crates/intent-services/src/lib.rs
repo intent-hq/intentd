@@ -3044,6 +3044,16 @@ impl Services {
         // agent is idle). The indirect async recursion is depth-1: the
         // synthetic redelivery's event is non-interim by construction
         // (queue empty), so its own pass never re-enters here.
+        //
+        // monorepo#1297: a BUSY-classified interim skip reaches this re-check
+        // on every pass (its queue is empty by definition). While the turn is
+        // genuinely in flight the redelivery's `agent_is_busy` guard no-ops
+        // WITHOUT consuming the marker; when the busy probe misclassified the
+        // turn's own terminal idle (emitted before the slot release), this
+        // re-check and the worker-exit redelivery hook (`run_message_worker`'s
+        // empty raced-drain arm) together heal it — whichever runs after the
+        // slot release observes marker + empty queue + not busy and
+        // synthesizes the real completion.
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }

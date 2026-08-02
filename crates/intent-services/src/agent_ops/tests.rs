@@ -388,6 +388,103 @@ async fn busy_interim_idle_neither_delivers_nor_retires_watch() {
     );
 }
 
+/// monorepo#1297 heal path: production publishes the terminal `agent:idle`
+/// BEFORE the worker releases the busy slot, so the busy probe can
+/// misclassify the REAL completion as interim — and no further completion
+/// event arrives. The worker-exit redelivery hook
+/// (`redeliver_completion_after_queue_mutation` once the slot is released)
+/// must synthesize the real completion: exactly one wake, watch retired,
+/// open after_all group sealed and settled.
+#[tokio::test]
+async fn busy_misclassified_terminal_idle_heals_on_worker_exit_redelivery() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // The terminal idle is delivered while the slot is still held: the busy
+    // probe classifies it interim (queue empty), so nothing delivers.
+    svc.set_test_busy(&child, true);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Slot released, no more completion events: the worker-exit hook runs
+    // the mutation-path redelivery, which synthesizes the real completion.
+    svc.set_test_busy(&child, false);
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "worker-exit redelivery synthesizes exactly one completion wake"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired by the synthesized completion"
+    );
+}
+
+/// monorepo#1297 heal path (group sealing): a coordinator whose terminal
+/// idle was busy-misclassified still gets its open after_all group sealed
+/// and settled by the worker-exit redelivery.
+#[tokio::test]
+async fn busy_misclassified_terminal_idle_heal_seals_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    // The child settles first.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+
+    // The parent's terminal idle races the slot release: interim, no seal.
+    svc.set_test_busy(&parent, true);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives the misclassified idle");
+    assert!(!group.sealed);
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Worker exit: slot released, redelivery synthesizes the real
+    // completion — group seals and (already complete) settles.
+    svc.set_test_busy(&parent, false);
+    svc.redeliver_completion_after_queue_mutation(&parent).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "heal seals and settles the group with one aggregated wake"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
 /// monorepo#1297 guard: busy-aware suppression is scoped to `agent:idle` —
 /// `agent:failed` and `agent:deleted` for a busy child still deliver their
 /// wakes (a failure/deletion wake must never be deferred by busy-ness).
