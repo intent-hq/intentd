@@ -757,15 +757,22 @@ fn tier_table_and_resolution() {
     // Dynamic-model providers are intentionally absent.
     assert!(tiers_for("opencode").is_none() && tiers_for("droid").is_none());
     assert!(tiers_for("grok").is_none());
-    // Falls back to auggie's tier for providers without mappings.
+    // Strict per-provider resolution: providers without mappings resolve to
+    // None — never another provider's model (no auggie fallback).
     assert_eq!(
         default_model_for_provider("opencode", ModelTier::Fast),
-        "haiku4.5"
+        None
     );
     assert_eq!(
         default_model_for_provider("codex", ModelTier::Smart),
-        "gpt-5.3-codex/xhigh"
+        Some("gpt-5.3-codex/xhigh")
     );
+    // Tier names parse from their wire/frontmatter form; anything else is None.
+    assert_eq!(ModelTier::from_wire("smart"), Some(ModelTier::Smart));
+    assert_eq!(ModelTier::from_wire("balanced"), Some(ModelTier::Balanced));
+    assert_eq!(ModelTier::from_wire("fast"), Some(ModelTier::Fast));
+    assert_eq!(ModelTier::from_wire("high"), None);
+    assert_eq!(ModelTier::from_wire(""), None);
 
     assert_eq!(
         model_tier_from_model("sonnet4.5", None),
