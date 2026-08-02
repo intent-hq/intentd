@@ -648,16 +648,23 @@ async fn teardown(session: &PtySession) {
     {
         if let Some(pid) = session.pid {
             let _ = kill_group(pid, PtySignal::Terminate);
-            let mut exited = false;
+            // Escalation is keyed on the *process group* emptying, not on the
+            // direct child's exit: a descendant that survives SIGTERM must
+            // still be SIGKILLed even when the shell itself exited promptly
+            // (monorepo#1300). Keep reaping the direct child via `try_wait` —
+            // a zombie leader keeps the pgid occupied, so the ESRCH probe only
+            // reports empty once the leader is reaped.
+            let mut group_empty = false;
             let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
             for _ in 0..iters {
-                if matches!(session.child.lock().unwrap().try_wait(), Ok(Some(_))) {
-                    exited = true;
+                let _ = session.child.lock().unwrap().try_wait();
+                if process_group_empty(pid) {
+                    group_empty = true;
                     break;
                 }
                 tokio::time::sleep(REAP_POLL).await;
             }
-            if !exited {
+            if !group_empty {
                 let _ = kill_group(pid, PtySignal::Kill);
             }
         } else {
@@ -692,6 +699,20 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Kill => Signal::SIGKILL,
     };
     killpg(Pid::from_raw(pid as i32), signal)
+}
+
+/// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
+/// members left: probe with `killpg(pgid, 0)` (signal 0) and treat `ESRCH` as
+/// empty. A zombie leader still occupies the pgid, so callers must pair this
+/// probe with reaping the direct child.
+#[cfg(unix)]
+fn process_group_empty(pid: u32) -> bool {
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    matches!(
+        killpg(Pid::from_raw(pid as i32), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -1139,5 +1160,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "grandchild must die with its process group");
+    }
+
+    /// SIGKILL escalation is keyed on the *process group* being empty, not on
+    /// the direct child's exit: the shell dies to SIGTERM within the grace
+    /// period while its signal-trapping descendant survives, so teardown must
+    /// still escalate to SIGKILL (monorepo#1300).
+    #[tokio::test]
+    async fn teardown_kills_term_trapping_descendant_after_shell_exit() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("scope-trap", "sh");
+        // The descendant prints its PID *after* installing the traps so the
+        // test never signals it before TERM/HUP are ignored (HUP too: the
+        // session leader's death sends SIGHUP to the foreground group).
+        spec.args = vec![
+            "-c".into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; sleep 300' & sleep 300"#.into(),
+        ];
+        let id = host.spawn(spec).unwrap();
+
+        // Poll the scrollback snapshot for the descendant PID (see
+        // kill_scope_leaves_no_process_group_orphan for why not a live tail).
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let descendant: u32 = loop {
+            let out = host.scrollback(id).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert!(pid_alive(descendant), "descendant alive before teardown");
+
+        assert!(host.kill(id).await);
+        assert_eq!(host.count(), 0);
+
+        let mut dead = false;
+        for _ in 0..100 {
+            if !pid_alive(descendant) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "SIGKILL escalation must reap the TERM-trapping descendant"
+        );
     }
 }
