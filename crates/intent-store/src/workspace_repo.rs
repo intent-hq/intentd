@@ -534,5 +534,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
         checkout_mode,
+        // disk_usage is computed on the emit path (intent-services), never persisted.
+        disk_usage: None,
     })
 }

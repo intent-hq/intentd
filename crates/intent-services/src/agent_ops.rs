@@ -1636,12 +1636,23 @@ impl Services {
     /// transcript size. The token contract is unchanged from the in-memory
     /// implementation (`page_window` over the same oldest→newest indexing),
     /// so previously minted tokens still resolve to the same rows.
+    ///
+    /// Seek (`aroundMessageId`): when present it takes precedence over any
+    /// token and resolves to the page containing that message (`page_window_
+    /// around`). Seek pages — and the forward continuations minted from them —
+    /// additionally carry a `prevToken` cursor that walks newer toward the
+    /// live tail (`null` once the newest message has been returned); their
+    /// `nextToken` is the standard backward cursor, so older continuation is
+    /// ordinary paging. An unknown message id is `-32602` naming the id.
+    /// Absent the param (and any seek-minted forward token), the response is
+    /// byte-identical to before — no `prevToken` key is added.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -1661,24 +1672,58 @@ impl Services {
         // positions never shift — a racing `replace_agent_messages` degrades
         // no worse than an already-stale page token).
         let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
-        let win = crate::pagination::page_window(total, limit, page_token.as_deref());
+        // Seek resolution: `aroundMessageId` wins over any token; a forward
+        // (`prevToken`-minted) cursor is recognized next; otherwise the
+        // legacy backward contract applies unchanged. `prev_token` is
+        // `Some(..)` only on seek/forward pages — the legacy path never adds
+        // the `prevToken` key, keeping absent-param responses byte-identical.
+        let seek_win = if let Some(mid) = around_message_id {
+            let index = self
+                .store
+                .get_agent_message_index(&agent_id, &mid)
+                .await?
+                .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
+            Some(crate::pagination::page_window_around(
+                total,
+                limit,
+                index.max(0) as usize,
+            ))
+        } else {
+            page_token
+                .as_deref()
+                .and_then(|t| crate::pagination::forward_page_window(total, limit, t))
+        };
+        let (start, end, next_token, prev_token) = match seek_win {
+            Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
+            None => {
+                let w = crate::pagination::page_window(total, limit, page_token.as_deref());
+                (w.start, w.end, w.next_token, None)
+            }
+        };
         let page: Vec<AgentMessage> = self
             .store
-            .get_agent_messages_page(&agent_id, win.start as i64, (win.end - win.start) as i64)
+            .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
             .map(stamp_synthetic_block_ids)
             .collect();
-        Ok(json!({
+        let mut result = json!({
             "agentId": agent_id,
             "messages": page,
-            "truncated": win.next_token.is_some(),
+            "truncated": next_token.is_some(),
             "totalMessages": total,
-            "nextToken": win.next_token,
+            "nextToken": next_token,
             "turnInFlight": turn_in_flight,
             "lastStreamActivityAt": last_stream_activity_at,
-        }))
+        });
+        if let Some(prev) = prev_token {
+            result
+                .as_object_mut()
+                .expect("conversation result is an object")
+                .insert("prevToken".to_string(), json!(prev));
+        }
+        Ok(result)
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
@@ -6422,7 +6467,7 @@ impl Services {
     /// falls back to the pre-DELIV-1 store-only persist so hermetic tests
     /// keep working. Auto-queue-on-store-failure mirrors
     /// [`Services::agent_send_message_op`].
-    async fn deliver_wake_message(
+    pub(crate) async fn deliver_wake_message(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,

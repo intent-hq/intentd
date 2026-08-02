@@ -72,6 +72,7 @@ fn make_config(data_dir: &Path) -> Config {
         pid_path: data_dir.join("intentd.pid"),
         idle_reap_minutes: 0,
         stream_retention_hours: 0,
+        hooks_max_per_agent: 5,
     }
 }
 
@@ -116,6 +117,7 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

@@ -86,6 +86,7 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

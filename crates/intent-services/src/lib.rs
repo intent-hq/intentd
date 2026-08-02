@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod disk_usage;
 mod drafts;
 mod enhance_ops;
 mod event_ops;
@@ -77,6 +78,7 @@ mod github_browse_ops;
 
 mod agent_list_cache;
 mod history_xml;
+mod hook_manager;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -457,6 +459,12 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Per-workspace disk-usage cache backing `Workspace.diskUsage` on the
+    /// list/get emit path (§9.1): TTL'd stale-while-revalidate entries whose
+    /// walks run detached on the blocking pool, so serving the aggregate
+    /// never blocks a call (first compute omits and backfills). Shared
+    /// across clones.
+    disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
     /// memory instead of re-running the SQLite JSON window.
@@ -496,6 +504,19 @@ pub struct Services {
     /// tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
     git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Live per-hook scheduler tasks for the background hook service
+    /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
+    /// tasks themselves observe the same set; rehydrated from the `hook`
+    /// table at boot via [`Services::rehydrate_hooks`].
+    hook_tasks: hook_manager::HookTasks,
+    /// Cap on concurrently active (scheduled/running) hooks per agent
+    /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
+    /// composition root via [`Services::with_hooks_max_per_agent`].
+    hooks_max_per_agent: u32,
+    /// Wall-clock budget for one hook script run (60 s in production). Tests
+    /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
+    /// timeout-eviction coverage completes in milliseconds.
+    hook_eval_timeout: std::time::Duration,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -563,13 +584,32 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
+            hook_tasks: Arc::new(Mutex::new(HashMap::new())),
+            hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
         }
+    }
+
+    /// Override the per-agent active-hook cap (`[hooks] maxPerAgent`); wired
+    /// from `Config` by the composition root.
+    pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
+        self.hooks_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the hook script eval budget so timeout-eviction
+    /// coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.hook_eval_timeout = timeout;
+        self
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -1049,6 +1089,11 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
+        // diskUsage: cached physical footprint of the daemon-managed
+        // workspace directory. Omitted until the first walk completes —
+        // serving the cache never waits on a walk (computes run detached and
+        // backfill), so it can never exceed the per-call aggregate budget.
+        ws.disk_usage = self.compute_disk_usage(ws).await;
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1344,6 +1389,36 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
+    /// directory from the shared [`disk_usage::DiskUsageCache`]. Only rows
+    /// with such a directory qualify: remote / skip-isolation rows and the
+    /// virtual chief workspace omit the field. The directory is the
+    /// provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
+    /// `<parent>/<id>`, covering custom `workspace.worktreesLocation` roots)
+    /// when it is named for the workspace id, else `<workspaces_root>/<id>`
+    /// — a never-provisioned directory simply never yields a value.
+    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+        if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
+            return None;
+        }
+        let dir = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|wt| {
+                let parent = Path::new(wt).parent()?;
+                (parent.file_name()? == std::ffi::OsStr::new(ws.id.as_str()))
+                    .then(|| parent.to_path_buf())
+            })
+            .unwrap_or_else(|| {
+                self.workspaces_root
+                    .clone()
+                    .unwrap_or_else(default_workspaces_root)
+                    .join(ws.id.as_str())
+            });
+        self.disk_usage.usage(dir).await
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -2463,8 +2538,9 @@ impl Services {
         // — covers the case where every child finished before the parent idled.
         //
         // monorepo#1281: an INTERIM idle (the agent still has ready-to-send
-        // queued messages) does NOT seal — the queued redrive may delegate
-        // more children into the open group, so the expected set is not final
+        // queued messages, or — monorepo#1297 — is already busy in a redriven
+        // turn) does NOT seal — the queued/redriven turn may delegate more
+        // children into the open group, so the expected set is not final
         // yet. The seal happens at the real completion: the idle after the
         // queue drains (this path), or the synthesized idle a queue
         // retraction/edit produces (`redeliver_completion_after_queue_mutation`
@@ -2634,10 +2710,13 @@ impl Services {
 
     /// Record that an `agent:idle` for `child_id` was classified as interim
     /// (monorepo#1280) — recorded up front, whether or not any ungrouped
-    /// watch matched (monorepo#1281) — so a later queue retraction that
-    /// empties the ready-to-send queue while the agent is idle synthesizes
-    /// the real completion: re-running watch delivery and sealing the
-    /// agent's open after_all group.
+    /// watch matched (monorepo#1281), and whether the classification came
+    /// from the queue probe or the busy probe (monorepo#1297) — so a later
+    /// queue retraction that empties the ready-to-send queue while the agent
+    /// is idle synthesizes the real completion: re-running watch delivery
+    /// and sealing the agent's open after_all group. A busy-classified
+    /// marker is superseded by the running turn's own terminal `agent:idle`
+    /// (the non-interim delivery takes the marker below).
     fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
         self.interim_skipped_idles
             .lock()
@@ -2765,11 +2844,16 @@ impl Services {
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
     ///
-    /// Queue-aware completion: an `agent:idle` for a child with ready-to-send
-    /// queued messages is an interim idle — ungrouped watches neither deliver
-    /// nor retire on it (they stay armed for the real completion after the
-    /// queue drains). Grouped watches are exempt: group settlement accounting
-    /// must see every completion or an `after_all` batch can hang.
+    /// Queue- and busy-aware completion: an `agent:idle` for a child with
+    /// ready-to-send queued messages OR a busy in-flight worker
+    /// (monorepo#1297: the queued message may already have been drained into
+    /// a running turn by the time the idle is delivered) is an interim idle —
+    /// ungrouped watches neither deliver nor retire on it (they stay armed
+    /// for the real completion after the queue drains / running turn ends).
+    /// Grouped watches are exempt: group settlement accounting must see every
+    /// completion or an `after_all` batch can hang. `agent:failed` /
+    /// `agent:deleted` are never classified interim — a failed child is
+    /// parked and a deleted one is gone, so their wakes must not be deferred.
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -2796,19 +2880,23 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> bool {
-        // Queue-aware completion: an `agent:idle` for a child whose pending
-        // message queue still holds ready-to-send entries is an interim idle —
-        // the drain loop is about to redrive the child, so ungrouped watches
-        // neither deliver nor retire (they stay armed for the real
-        // completion). Grouped watches are unaffected: group settlement owns
-        // their accounting and lifecycle. Narrows the enqueue-vs-idle-emit
-        // race: the turn-end emit checks the queue before publishing, and a
-        // message enqueued between that check and this delivery would
-        // otherwise consume the watch with a premature wake. (A snapshot,
-        // not a lock: an enqueue landing after this check can still race a
-        // premature wake, but the window shrinks from emit→delivery to
-        // check→wake.)
-        let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        // Queue- and busy-aware completion: an `agent:idle` for a child whose
+        // pending message queue still holds ready-to-send entries, OR whose
+        // worker is already busy in a new turn (monorepo#1297: an enqueue that
+        // raced the idle emit may have been dequeued and started before this
+        // delivery ran, leaving the queue empty but the busy slot held), is an
+        // interim idle — the child is about to be (or already is) redriven, so
+        // ungrouped watches neither deliver nor retire (they stay armed for
+        // the real completion). Grouped watches are unaffected: group
+        // settlement owns their accounting and lifecycle. Narrows the
+        // enqueue-vs-idle-emit race: the turn-end emit checks the queue before
+        // publishing, a message enqueued between that check and this delivery
+        // is caught by the queue probe, and a message already drained into a
+        // running turn is caught by the busy probe. (A snapshot, not a lock:
+        // an enqueue landing after both probes can still race a premature
+        // wake, but the window shrinks from emit→delivery to check→wake.)
+        let interim_idle = event.event_type == AGENT_IDLE
+            && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
         // monorepo#1280/#1281: record the interim skip up front — even when
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle can
@@ -2932,17 +3020,18 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-aware completion): the child still has
-            // ready-to-send queued messages, so this idle is not its real
-            // completion — deliver nothing and leave the watch (including a
-            // report_delivered one, which retires at the real completion)
-            // armed for the settlement that follows the queue drain. The
-            // interim-skip marker was recorded up front (monorepo#1280).
+            // Interim idle (queue-/busy-aware completion): the child still
+            // has ready-to-send queued messages or a turn already in flight,
+            // so this idle is not its real completion — deliver nothing and
+            // leave the watch (including a report_delivered one, which
+            // retires at the real completion) armed for the settlement that
+            // follows the queue drain / running turn. The interim-skip
+            // marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages or a busy in-flight turn (interim idle)"
                 );
                 continue;
             }
@@ -3030,6 +3119,16 @@ impl Services {
         // agent is idle). The indirect async recursion is depth-1: the
         // synthetic redelivery's event is non-interim by construction
         // (queue empty), so its own pass never re-enters here.
+        //
+        // monorepo#1297: a BUSY-classified interim skip reaches this re-check
+        // on every pass (its queue is empty by definition). While the turn is
+        // genuinely in flight the redelivery's `agent_is_busy` guard no-ops
+        // WITHOUT consuming the marker; when the busy probe misclassified the
+        // turn's own terminal idle (emitted before the slot release), this
+        // re-check and the worker-exit redelivery hook (`run_message_worker`'s
+        // empty raced-drain arm) together heal it — whichever runs after the
+        // slot release observes marker + empty queue + not busy and
+        // synthesizes the real completion.
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
@@ -8316,11 +8415,12 @@ impl WorkspaceApi for Services {
 
     fn search_messages(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         query: String,
         agent_id: Option<String>,
         role: Option<String>,
         limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
@@ -8329,17 +8429,26 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
-            let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let sessions = store.list_agent_sessions(&workspace_id).await?;
-            let matches = search_ops::message_matches(
-                &sessions,
-                &query,
-                agent_id.as_deref(),
-                role.as_deref(),
-                limit,
-            );
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, Some(workspace_id), matches, token))
+            // User-typed queries are never handed to the FTS5 parser verbatim
+            // (as-you-type input would surface `fts5: syntax error`); a query
+            // with no searchable tokens yields empty matches, not an error.
+            let hits = match intent_search::fts_match_expr(&query) {
+                Some(expr) => {
+                    store
+                        .search_agent_messages_fts(
+                            &expr,
+                            workspace_id.as_ref(),
+                            agent_id.as_deref(),
+                            role.as_deref(),
+                            prefer_workspace_id.as_ref(),
+                            limit,
+                        )
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            let matches = to_value_vec(search_ops::message_fts_matches(hits, &query))?;
+            Ok(services.deliver_search(request_id, workspace_id, matches, token))
         })
     }
 
@@ -9603,6 +9712,7 @@ impl WorkspaceApi for Services {
                         cow_supported: None,
                         display_status: None,
                         checkout_mode: None,
+                        disk_usage: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -11121,6 +11231,7 @@ impl WorkspaceApi for Services {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                disk_usage: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
@@ -15728,10 +15839,17 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_get_conversation_op(agent_id, limit, workspace_id, page_token)
-                .await
+            self.agent_get_conversation_op(
+                agent_id,
+                limit,
+                workspace_id,
+                page_token,
+                around_message_id,
+            )
+            .await
         })
     }
 
@@ -18860,6 +18978,61 @@ impl WorkspaceApi for Services {
                     })?;
             browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
         })
+    }
+
+    /// `ws.host.exec` (agent-JS binding seam): delegate to the shared one-shot
+    /// exec primitive with the caller's workspace pinned as the cwd
+    /// containment root. Semantics are identical to the wire `host.exec`
+    /// (argv-only, `timeoutMs` process-group reap, secret-safe env).
+    fn host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { host_exec::run_for_workspace(self, workspace_id, params).await })
+    }
+
+    /// `hook.schedule`: validate + immediate real run + persist + spawn the
+    /// per-hook scheduler task (see `hook_manager`).
+    fn hook_schedule(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.hook_schedule_op(&workspace_id, &agent_id, &params)
+                .await
+        })
+    }
+
+    /// `hook.list`: hooks in a workspace, optionally one agent's.
+    fn hook_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
+    }
+
+    /// `hook.cancel`: stop an active hook; a non-owner (FE) cancel wakes the
+    /// owning agent with a notice.
+    fn hook_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        by_owner: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_cancel_op(&workspace_id, &hook_id, by_owner).await })
+    }
+
+    /// `hook.runNow`: trigger an immediate run of an active hook.
+    fn hook_run_now(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
     }
 }
 

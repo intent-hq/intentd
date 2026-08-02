@@ -31,7 +31,7 @@ pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, pars
 pub use config::Config;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 pub use model::extract_spec_task_ids;
 pub use model::MessageOrigin;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
@@ -46,13 +46,13 @@ pub use model::{
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
-    ContextItem, Draft, Event, EventActor, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus,
-    GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus,
-    KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
-    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    ContextItem, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
+    GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
+    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript,
     RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script, ScriptCreateParams, ScriptMode,
@@ -63,8 +63,9 @@ pub use model::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
     WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;

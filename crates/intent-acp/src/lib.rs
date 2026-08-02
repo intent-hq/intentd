@@ -53,7 +53,9 @@ pub use mcp_env::{
     build_baseline_mcp_env, build_baseline_mcp_env_from_process, is_likely_secret_env_key,
     merge_mcp_env, redact_mcp_env_for_logging, EnvMap, REDACTED_VALUE,
 };
-pub use mcp_server::{ToolDef, WorkspaceMcpServer, MCP_PROTOCOL_VERSION};
+pub use mcp_server::{
+    bindings_prelude, make_workspace_host, ToolDef, WorkspaceMcpServer, MCP_PROTOCOL_VERSION,
+};
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
     DEFAULT_PERMISSION_TIMEOUT,

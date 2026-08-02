@@ -143,6 +143,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -11403,7 +11404,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, None, None, Some("srch-1".into()))
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                None,
+                None,
+                None,
+                Some("srch-1".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-1");
@@ -11429,7 +11438,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, Some("user".into()), None, None)
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                Some("user".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let matches = r["matches"].as_array().unwrap();
@@ -11686,8 +11703,9 @@ mod search_adapters {
         let ack = h
             .services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
@@ -11728,8 +11746,9 @@ mod search_adapters {
         let mut sub = subscribe(&h);
         h.services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
@@ -13097,6 +13116,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -13230,6 +13250,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -13354,6 +13375,7 @@ mod rules {
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13473,6 +13495,7 @@ mod rules {
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13591,6 +13614,7 @@ mod rules {
             cow_supported: Some(true), // CoW capable!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -13714,6 +13738,7 @@ mod rules {
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -14286,6 +14311,7 @@ mod known_repo {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 

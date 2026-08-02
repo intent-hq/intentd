@@ -509,6 +509,28 @@ impl PtyHost {
         }
     }
 
+    /// Reap process-group members that outlived the direct child: once the
+    /// child has exited, any remaining group members get the same
+    /// SIGTERM→grace→SIGKILL escalation as teardown, keyed on the group being
+    /// empty (monorepo#1300). The session stays registered so its scrollback
+    /// and latched exit status remain readable. No-op when the session is
+    /// unknown, the child is still running (the group is legitimately
+    /// alive), or the group is already empty.
+    pub async fn reap_group_stragglers(&self, id: PtyId) {
+        let Ok(session) = self.get(id) else { return };
+        #[cfg(unix)]
+        {
+            if observe_exit(&session).is_none() {
+                return;
+            }
+            if let Some(pid) = session.pid {
+                escalate_group_kill(pid, &session).await;
+            }
+        }
+        #[cfg(not(unix))]
+        drop(session);
+    }
+
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
     /// number reaped. No process-group orphans are left behind.
     pub async fn kill_scope(&self, scope: &str) -> usize {
@@ -647,19 +669,7 @@ async fn teardown(session: &PtySession) {
     #[cfg(unix)]
     {
         if let Some(pid) = session.pid {
-            let _ = kill_group(pid, PtySignal::Terminate);
-            let mut exited = false;
-            let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
-            for _ in 0..iters {
-                if matches!(session.child.lock().unwrap().try_wait(), Ok(Some(_))) {
-                    exited = true;
-                    break;
-                }
-                tokio::time::sleep(REAP_POLL).await;
-            }
-            if !exited {
-                let _ = kill_group(pid, PtySignal::Kill);
-            }
+            escalate_group_kill(pid, session).await;
         } else {
             let _ = session.killer.lock().unwrap().kill();
         }
@@ -681,6 +691,33 @@ async fn teardown(session: &PtySession) {
     }
 }
 
+/// SIGTERM the process group, then escalate to SIGKILL when the group is
+/// non-empty after [`TERM_GRACE`]. Escalation is keyed on the *process
+/// group* emptying, not on the direct child's exit: a descendant that
+/// survives SIGTERM must still be SIGKILLed even when the shell itself
+/// exited promptly (monorepo#1300). Keep reaping the direct child — a zombie
+/// leader keeps the pgid occupied, so the ESRCH probe only reports empty
+/// once the leader is reaped. Reap via `observe_exit` so the one-shot exit
+/// status is latched for concurrent observers (`wait`/`try_exit`/the exit
+/// watcher) instead of discarded.
+#[cfg(unix)]
+async fn escalate_group_kill(pid: u32, session: &PtySession) {
+    let _ = kill_group(pid, PtySignal::Terminate);
+    let mut group_empty = false;
+    let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
+    for _ in 0..iters {
+        let _ = observe_exit(session);
+        if process_group_empty(pid) {
+            group_empty = true;
+            break;
+        }
+        tokio::time::sleep(REAP_POLL).await;
+    }
+    if !group_empty {
+        let _ = kill_group(pid, PtySignal::Kill);
+    }
+}
+
 /// Signal a whole process group by its leader pid (pgid == pid via `setsid`).
 #[cfg(unix)]
 fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::Errno> {
@@ -692,6 +729,20 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Kill => Signal::SIGKILL,
     };
     killpg(Pid::from_raw(pid as i32), signal)
+}
+
+/// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
+/// members left: probe with `killpg(pgid, 0)` (signal 0) and treat `ESRCH` as
+/// empty. A zombie leader still occupies the pgid, so callers must pair this
+/// probe with reaping the direct child.
+#[cfg(unix)]
+fn process_group_empty(pid: u32) -> bool {
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    matches!(
+        killpg(Pid::from_raw(pid as i32), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -1139,5 +1190,129 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "grandchild must die with its process group");
+    }
+
+    /// SIGKILL escalation is keyed on the *process group* being empty, not on
+    /// the direct child's exit: the shell dies to SIGTERM within the grace
+    /// period while its signal-trapping descendant survives, so teardown must
+    /// still escalate to SIGKILL (monorepo#1300).
+    #[tokio::test]
+    async fn teardown_kills_term_trapping_descendant_after_shell_exit() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("scope-trap", "sh");
+        // The descendant prints its PID *after* installing the traps so the
+        // test never signals it before TERM/HUP are ignored (HUP too: the
+        // session leader's death sends SIGHUP to the foreground group). It
+        // sleeps in a loop rather than one long `sleep`: the sleeps are
+        // separate children, so even if the shell's wait is interrupted by a
+        // sleep dying to SIGTERM, the trapped loop keeps running — only
+        // SIGKILL removes the descendant.
+        spec.args = vec![
+            "-c".into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; while :; do sleep 1; done' & sleep 300"#
+                .into(),
+        ];
+        let id = host.spawn(spec).unwrap();
+
+        // Poll the scrollback snapshot for the descendant PID (see
+        // kill_scope_leaves_no_process_group_orphan for why not a live tail).
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let descendant: u32 = loop {
+            let out = host.scrollback(id).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert!(pid_alive(descendant), "descendant alive before teardown");
+
+        assert!(host.kill(id).await);
+        assert_eq!(host.count(), 0);
+
+        let mut dead = false;
+        for _ in 0..100 {
+            if !pid_alive(descendant) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "SIGKILL escalation must reap the TERM-trapping descendant"
+        );
+    }
+
+    /// After the direct child exits on its own, `reap_group_stragglers`
+    /// SIGKILLs group members that trapped both SIGTERM and SIGHUP, while the
+    /// session (scrollback, latched exit) stays registered and readable
+    /// (monorepo#1300).
+    #[tokio::test]
+    async fn reap_group_stragglers_kills_survivors_and_keeps_session() {
+        let host = PtyHost::new();
+        // The straggler touches `flag` only after installing its traps; the
+        // leader echoes the straggler's pid while the tty is still attached,
+        // waits for the flag, then exits — so by the time `wait()` returns
+        // the pid is in scrollback and the traps are active.
+        let flag = std::env::temp_dir().join(format!(
+            "intent-pty-trap-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut spec = SpawnSpec::new("scope-straggler", "sh");
+        spec.args = vec![
+            "-c".into(),
+            format!(
+                r#"sh -c 'trap "" TERM HUP; : > "{f}"; sleep 300' & echo "straggler-$!"; while [ ! -e "{f}" ]; do sleep 0.05; done; exit 0"#,
+                f = flag.display()
+            ),
+        ];
+        let id = host.spawn(spec).unwrap();
+        let exit = host.wait(id).await.unwrap();
+        let _ = std::fs::remove_file(&flag);
+        assert!(exit.success, "shell exited cleanly");
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let straggler: u32 = loop {
+            let out = host.scrollback(id).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("straggler-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                panic!("straggler pid never printed within deadline; scrollback: {text:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(pid_alive(straggler), "straggler outlives the shell");
+
+        host.reap_group_stragglers(id).await;
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        while pid_alive(straggler) {
+            assert!(
+                Instant::now() < deadline,
+                "straggler {straggler} still alive after reap"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The session survives the reap: exit status and scrollback readable.
+        assert_eq!(host.try_exit(id).unwrap(), Some(exit));
+        assert!(host.scrollback(id).is_ok());
+        assert!(host.kill(id).await);
     }
 }

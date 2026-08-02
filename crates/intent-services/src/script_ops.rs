@@ -739,6 +739,12 @@ impl ScriptManager {
                     false
                 }
             };
+            // Group-keyed liveness (monorepo#1300): before the
+            // exit is recorded, reap group members that outlived the shell
+            // (a descendant trapping TERM+HUP) so `exited` means the whole
+            // group is gone. No-op after the timeout kill (session gone) or
+            // when the group is already empty.
+            mgr.pty.reap_group_stragglers(pty_id).await;
             let exit = mgr.pty.try_exit(pty_id).ok().flatten();
             mgr.mark_exited(&ws_task, &sid, generation, exit.clone())
                 .await;
@@ -800,6 +806,16 @@ impl ScriptManager {
                 return;
             }
             let exit = self.run_one(&ws, &script_id, pty_id, detect).await;
+            // The too-fast decision is based on the shell's actual runtime:
+            // capture it before the straggler reap below, whose TERM-grace
+            // wait must not inflate a genuinely quick exit past the floor.
+            let ran_for = started.elapsed();
+            // Group-keyed liveness (monorepo#1300): reap group
+            // members that outlived the shell (a descendant trapping
+            // TERM+HUP) before the exit is recorded, so `exited` means the
+            // whole group is gone — the script can never sit `running` (or
+            // flip to `exited`) while trapped survivors linger.
+            self.pty.reap_group_stragglers(pty_id).await;
             let (stopped_by_user, restart_count) =
                 match self.mark_exited(&ws, &script_id, generation, exit).await {
                     Some(v) => v,
@@ -808,8 +824,8 @@ impl ScriptManager {
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
-            if started.elapsed().as_millis() < self.too_fast_ms {
-                let ms = started.elapsed().as_millis();
+            if ran_for.as_millis() < self.too_fast_ms {
+                let ms = ran_for.as_millis();
                 self.emit_separator(
                     &ws,
                     &script_id,
@@ -1598,6 +1614,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         }
     }
 
@@ -2242,6 +2259,147 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Poll until `pid` is gone, failing after the `LIVENESS` deadline.
+    async fn await_pid_dead(pid: i64, what: &str) {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while pid_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} {pid} still alive after deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// SIGKILL a helper process on drop so a failed test cannot leak a
+    /// TERM/HUP-trapping `sleep 300` into the suite.
+    struct KillOnDrop(i64);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    /// Build a command whose shell backgrounds a TERM+HUP-trapping straggler:
+    /// the straggler touches `flag` only after its traps are installed, and
+    /// its pid is written to `pidfile`. `tail` runs in the direct shell after
+    /// the traps are confirmed active.
+    fn straggler_command(flag: &std::path::Path, pidfile: &std::path::Path, tail: &str) -> String {
+        format!(
+            r#"sh -c 'trap "" TERM HUP; : > "{f}"; sleep 300' & echo $! > "{p}"; while [ ! -e "{f}" ]; do sleep 0.05; done; {tail}"#,
+            f = flag.display(),
+            p = pidfile.display()
+        )
+    }
+
+    /// Poll `pidfile` (and the trap flag via the command's handshake) until it
+    /// yields the straggler's pid.
+    async fn await_straggler_pid(pidfile: &std::path::Path) -> i64 {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            if let Ok(s) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = s.trim().parse::<i64>() {
+                    return pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "straggler pid never written to {pidfile:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Unique temp paths for the straggler handshake files.
+    fn straggler_paths(tag: &str) -> (TempPath, TempPath) {
+        let unique = format!(
+            "{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        (
+            TempPath(std::env::temp_dir().join(format!("intent-script-flag-{unique}"))),
+            TempPath(std::env::temp_dir().join(format!("intent-script-pid-{unique}"))),
+        )
+    }
+
+    /// Removes the file on drop.
+    struct TempPath(std::path::PathBuf);
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Regression (monorepo#1300): `script.stop` must reap a descendant that
+    /// traps both SIGTERM and SIGHUP — the old escalation keyed SIGKILL on the
+    /// direct child still running, so a shell that exited within the grace
+    /// window left the trapped descendant alive forever.
+    #[tokio::test]
+    async fn script_stop_reaps_term_and_hup_trapping_descendant() {
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("stop");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "wait");
+        let id = create_simple(&h, "trapper", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        assert!(pid_alive(straggler), "straggler alive before stop");
+
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop");
+        await_pid_dead(straggler, "TERM+HUP-trapping descendant").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "running", "status reflects the dead group");
+    }
+
+    /// Regression (monorepo#1300): when the shell exits on its own but a
+    /// TERM+HUP-trapping group member lingers, the supervisor reaps the
+    /// group before recording the exit — the script cannot present as a
+    /// healthy `running` (or `exited`-with-survivors) while trapped
+    /// stragglers hold the group.
+    #[tokio::test]
+    async fn script_exit_with_trapped_straggler_reaps_group_before_exited() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let (flag, pidfile) = straggler_paths("exit");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "exit 0");
+        let id = create_simple(&h, "straggler", &cmd, ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+
+        // The shell exits immediately after the handshake; `exited` must not
+        // be recorded until the group has been reaped.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        await_pid_dead(straggler, "trapped straggler").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited");
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running

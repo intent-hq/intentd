@@ -744,7 +744,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_models_cache_dir(config.data_dir.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone())
-        .with_settings_registry(settings_registry.clone());
+        .with_settings_registry(settings_registry.clone())
+        .with_hooks_max_per_agent(config.hooks_max_per_agent);
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -865,6 +866,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(0) => {}
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
+    }
+    // Rehydrate active background hooks (`scheduled`/`running` rows) so their
+    // schedules resume after a restart; hooks whose owning agent is gone are
+    // cancelled instead. Best-effort: a failure is logged but never aborts
+    // startup (agents can re-schedule).
+    match services.rehydrate_hooks().await {
+        Ok(0) => {}
+        Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
+        Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
     }
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
@@ -3083,6 +3093,7 @@ mod tests {
             pid_path: dir.join("intentd.pid"),
             idle_reap_minutes: 30,
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
+            hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             data_dir: dir,
         }
     }

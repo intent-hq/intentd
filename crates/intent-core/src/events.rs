@@ -196,6 +196,19 @@ pub const TERMINAL_CWD: &str = "terminal:cwd";
 pub const SCRIPT_OUTPUT: &str = "script:output";
 pub const SCRIPT_STATE: &str = "script:state";
 
+// Background-hook lifecycle events (new in intentd). Emitted by the hook
+// scheduler on lifecycle transitions: `hook:scheduled` (schedule accepted),
+// `hook:run-started` / `hook:run-completed` (one run of the script),
+// `hook:dispatched` (script signalled dispatch; owner woken, hook terminated),
+// `hook:evicted` (throw/timeout; owner woken with the reason), and
+// `hook:cancelled` (owner- or FE-initiated cancel).
+pub const HOOK_SCHEDULED: &str = "hook:scheduled";
+pub const HOOK_RUN_STARTED: &str = "hook:run-started";
+pub const HOOK_RUN_COMPLETED: &str = "hook:run-completed";
+pub const HOOK_DISPATCHED: &str = "hook:dispatched";
+pub const HOOK_EVICTED: &str = "hook:evicted";
+pub const HOOK_CANCELLED: &str = "hook:cancelled";
+
 // Test events.
 pub const TEST_STARTED: &str = "test:started";
 pub const TEST_COMPLETED: &str = "test:completed";
@@ -410,6 +423,12 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TERMINAL_CWD,
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
+    HOOK_SCHEDULED,
+    HOOK_RUN_STARTED,
+    HOOK_RUN_COMPLETED,
+    HOOK_DISPATCHED,
+    HOOK_EVICTED,
+    HOOK_CANCELLED,
     TEST_STARTED,
     TEST_COMPLETED,
     BUILD_STARTED,

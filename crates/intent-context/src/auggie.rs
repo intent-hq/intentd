@@ -276,6 +276,21 @@ fn first_nonempty_line(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    #[cfg(unix)]
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-ctx-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        dir
+    }
+
     #[test]
     fn classify_available_parses_version() {
         let a = classify_availability("auggie v1.12.3", "", true);
@@ -337,13 +352,8 @@ mod tests {
     #[test]
     fn availability_available_via_fake_binary() {
         use std::os::unix::fs::PermissionsExt;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-ctx-avail-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("auggie");
+        let dir = unique_temp_dir("avail");
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, "#!/bin/sh\necho 'auggie 2.5.1'\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -365,14 +375,9 @@ mod tests {
     #[test]
     fn run_auggie_timeout_group_kills_grandchildren() {
         use std::os::unix::fs::PermissionsExt;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-ctx-groupkill-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("auggie");
-        let pidfile = dir.join("grandchild.pid");
+        let dir = unique_temp_dir("groupkill");
+        let bin = dir.path().join("auggie");
+        let pidfile = dir.path().join("grandchild.pid");
         std::fs::write(
             &bin,
             format!(

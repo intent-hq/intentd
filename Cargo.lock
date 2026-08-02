@@ -1897,6 +1897,7 @@ dependencies = [
  "intent-js",
  "intent-providers",
  "intent-pty",
+ "intent-services",
  "nix 0.31.3",
  "serde",
  "serde_json",
@@ -1917,6 +1918,7 @@ dependencies = [
  "intent-core",
  "nix 0.31.3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2033,6 +2035,7 @@ dependencies = [
  "intent-context",
  "intent-core",
  "intent-git",
+ "intent-js",
  "intent-linear",
  "intent-providers",
  "intent-pty",

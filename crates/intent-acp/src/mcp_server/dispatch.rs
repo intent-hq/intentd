@@ -366,7 +366,11 @@ fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> 
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
 /// `turn_attachments` is forwarded to bindings that register attachments
 /// mid-dispatch (`ws.app.question.ask`).
-fn make_workspace_host(
+///
+/// `pub` (re-exported as `intent_acp::make_workspace_host`) so callers that
+/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
+/// scheduler in `intent-services` — reuse the exact same host environment.
+pub fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,

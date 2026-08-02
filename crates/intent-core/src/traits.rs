@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -1091,15 +1091,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getConversation`: `{ agentId, messages, truncated, totalMessages }`
-    /// capped to the most-recent `limit` (PROTOCOL §5.5).
+    /// capped to the most-recent `limit` (PROTOCOL §5.5). The optional
+    /// `around_message_id` seeks to the page containing that message instead
+    /// of the newest window; absent, behavior is byte-identical to before.
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, limit, workspace_id, page_token);
+        let _ = (agent_id, limit, workspace_id, page_token, around_message_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
@@ -4533,20 +4536,34 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.messages`: substring search over a workspace's persisted agent
-    /// session messages. Returns `{ requestId, matches: MessageMatch[] }` inline,
-    /// or `{ requestId, matches: [] }` (a prompt ack) when the result set is
+    /// `search.messages`: full-text (FTS5, bm25-ranked) search over persisted
+    /// user/assistant agent messages. `workspace_id` `None` → global across
+    /// all workspaces; `Some` → hard scope filter. `prefer_workspace_id` is a
+    /// soft ranking boost: results stay global but matches from that workspace
+    /// outrank equally-relevant matches elsewhere. Returns
+    /// `{ requestId, matches: MessageMatch[] }` inline, or
+    /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).
+    #[allow(clippy::too_many_arguments)]
     fn search_messages(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         query: String,
         agent_id: Option<String>,
         role: Option<String>,
         limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, query, agent_id, role, limit, request_id);
+        let _ = (
+            workspace_id,
+            query,
+            agent_id,
+            role,
+            limit,
+            prefer_workspace_id,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_messages not implemented".to_string(),
@@ -5279,6 +5296,93 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::browser_exec not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.host.exec`: one-shot process exec on the daemon host for the
+    /// agent-JS binding, with the wire `host.exec` semantics (PROTOCOL §5.14):
+    /// argv-only (no shell interpolation), `timeoutMs` reaps the whole process
+    /// group, workspace-cwd containment, and secret-safe env (values never
+    /// logged or returned). `params` carries the raw
+    /// `{ command, args?, cwd?, env?, timeoutMs? }` object; `workspace_id`
+    /// anchors the cwd containment guard — a caller-supplied `workspaceId`
+    /// cannot retarget it. The concrete implementation delegates to
+    /// `intent-services::host_exec::run`.
+    fn host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_exec not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
+    /// (an agent-owned scheduled script) after one immediate real run.
+    /// `params` carries `{ name, code, delayMs }`; `agent_id` is the owning
+    /// agent (the MCP caller). Returns the persisted hook on success.
+    fn hook_schedule(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_schedule not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.list` / wire `hook.list`: hooks in a workspace, optionally
+    /// narrowed to one owning agent, as `{ hooks: [Hook] }`.
+    fn hook_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. When the
+    /// cancel does not come from the owning agent (`by_owner = false`, the FE
+    /// path) the owner is additionally woken with a cancellation notice.
+    fn hook_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+        by_owner: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id, by_owner);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_cancel not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.hook.runNow` / wire `hook.runNow`: trigger an immediate run of an
+    /// active hook, resetting its inter-run timer.
+    fn hook_run_now(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, hook_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_run_now not implemented".to_string(),
             ))
         })
     }

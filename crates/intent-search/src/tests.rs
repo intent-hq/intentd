@@ -131,3 +131,38 @@ fn filename_search_limit_sets_truncated() {
     assert_eq!(result.files.len(), 1);
     assert!(result.truncated);
 }
+
+#[test]
+fn fts_match_expr_sanitizes_user_input() {
+    use crate::adapters::fts_match_expr;
+    // Single token: stemmed-word branch OR prefix branch.
+    assert_eq!(
+        fts_match_expr("needle"),
+        Some(r#"("needle" OR "needle"*)"#.to_string())
+    );
+    // Multiple tokens: implicit-AND made explicit, last token prefixed.
+    assert_eq!(
+        fts_match_expr("staging environment"),
+        Some(r#""staging" AND ("environment" OR "environment"*)"#.to_string())
+    );
+    // FTS5 operators/quotes/punctuation are separators, never syntax.
+    assert_eq!(
+        fts_match_expr(r#"a:b AND (c" OR NOT -d"#),
+        Some(r#""a" AND "b" AND "AND" AND "c" AND "OR" AND "NOT" AND ("d" OR "d"*)"#.to_string())
+    );
+    // No searchable tokens → no expression (caller returns empty matches).
+    assert_eq!(fts_match_expr("*(\"-:"), None);
+    assert_eq!(fts_match_expr("   "), None);
+    assert_eq!(fts_match_expr(""), None);
+}
+
+#[test]
+fn fts_preview_windows_on_first_literal_token() {
+    use crate::adapters::fts_preview;
+    let text = format!("{} the needle sits here", "x".repeat(200));
+    let p = fts_preview(&text, "needle");
+    assert!(p.contains("needle"), "preview windows onto the match: {p}");
+    // No literal occurrence (stemmed match) → head-of-text fallback.
+    let p = fts_preview("deployment finished cleanly", "deploying");
+    assert!(p.starts_with("deployment"));
+}

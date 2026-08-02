@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use intent_core::{
     events, now_iso, ActorType, AgentId, AgentSession, AgentStatus, AuthorType, ClientId, Comment,
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, EventActor,
-    Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility, TaskMetadata, TaskStatus,
-    Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Hook, HookId, HookState, Note, NoteId, NoteMetadata, NoteVersionAuthor, NoteVisibility,
+    TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -80,6 +81,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -95,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73
+            69, 70, 71, 72, 73, 74, 75, 76
         ]
     );
     assert_eq!(
@@ -104,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73
+            69, 70, 71, 72, 73, 74, 75, 76
         ]
     );
 }
@@ -4477,6 +4479,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     cow_supported: None,
                     display_status: None,
                     checkout_mode: None,
+                    disk_usage: None,
                 };
                 store.insert_workspace(&workspace).await
             })
@@ -5153,4 +5156,229 @@ fn migrations_have_unique_versions() {
         dupes.is_empty(),
         "duplicate migration version numbers found: {dupes:?}"
     );
+}
+
+fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Hook {
+    Hook {
+        hook_id: id.clone(),
+        workspace_id: ws.clone(),
+        agent_id: agent.clone(),
+        name: name.to_string(),
+        code: "return { dispatch: false }".to_string(),
+        delay_ms: 60_000,
+        state: HookState::Scheduled,
+        created_at: now_iso(),
+        last_run_at: None,
+        next_run_at: Some(now_iso()),
+        run_count: 0,
+        last_error: None,
+        last_logs: None,
+    }
+}
+
+/// Seed a workspace + agent session (hooks cascade with both) and return
+/// their ids.
+async fn seed_hook_owner(store: &Store) -> (WorkspaceId, AgentId) {
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Hook WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId(format!("agent-{}", uuid::Uuid::new_v4()));
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert agent");
+    (ws, agent)
+}
+
+/// Insert → get round-trips every column, including optionals.
+#[tokio::test]
+async fn hook_insert_get_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    let id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let hook = sample_hook(&id, &ws, &agent, "poll-ci");
+    store.insert_hook(&hook).await.expect("insert hook");
+
+    let got = store.get_hook(&id).await.expect("get hook");
+    assert_eq!(got, hook);
+
+    let missing = HookId("hook-missing".to_string());
+    let err = store.get_hook(&missing).await.expect_err("missing hook");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// Workspace/agent list filters return only the matching rows.
+#[tokio::test]
+async fn hook_list_filters_by_workspace_and_agent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws_a, agent_a) = seed_hook_owner(&store).await;
+    let (ws_b, agent_b) = seed_hook_owner(&store).await;
+
+    let id_a1 = HookId("hook-a1".to_string());
+    let id_a2 = HookId("hook-a2".to_string());
+    let id_b = HookId("hook-b".to_string());
+    store
+        .insert_hook(&sample_hook(&id_a1, &ws_a, &agent_a, "a1"))
+        .await
+        .expect("insert a1");
+    store
+        .insert_hook(&sample_hook(&id_a2, &ws_a, &agent_a, "a2"))
+        .await
+        .expect("insert a2");
+    store
+        .insert_hook(&sample_hook(&id_b, &ws_b, &agent_b, "b"))
+        .await
+        .expect("insert b");
+
+    let ws_hooks = store.list_hooks_by_workspace(&ws_a).await.expect("list ws");
+    let mut ws_ids: Vec<&str> = ws_hooks.iter().map(|h| h.hook_id.0.as_str()).collect();
+    ws_ids.sort();
+    assert_eq!(ws_ids, vec!["hook-a1", "hook-a2"]);
+
+    let agent_hooks = store
+        .list_hooks_by_agent(&agent_b)
+        .await
+        .expect("list agent");
+    assert_eq!(agent_hooks.len(), 1);
+    assert_eq!(agent_hooks[0].hook_id, id_b);
+
+    let empty = store
+        .list_hooks_by_agent(&AgentId("agent-none".to_string()))
+        .await
+        .expect("list none");
+    assert!(empty.is_empty());
+}
+
+/// State transitions, run bookkeeping, and last-error updates persist; every
+/// updater maps an unknown id to `NotFound`.
+#[tokio::test]
+async fn hook_state_run_and_error_updates() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    let id = HookId("hook-upd".to_string());
+    store
+        .insert_hook(&sample_hook(&id, &ws, &agent, "upd"))
+        .await
+        .expect("insert");
+
+    store
+        .update_hook_state(&id, HookState::Running)
+        .await
+        .expect("scheduled -> running");
+    assert_eq!(store.get_hook(&id).await.unwrap().state, HookState::Running);
+
+    let ran_at = now_iso();
+    let next_at = now_iso();
+    store
+        .update_hook_run(&id, &ran_at, Some(&next_at))
+        .await
+        .expect("record run");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.run_count, 1);
+    assert_eq!(got.last_run_at.as_deref(), Some(ran_at.as_str()));
+    assert_eq!(got.next_run_at.as_deref(), Some(next_at.as_str()));
+
+    store
+        .update_hook_next_run(&id, None)
+        .await
+        .expect("clear next run");
+    assert_eq!(store.get_hook(&id).await.unwrap().next_run_at, None);
+
+    store
+        .update_hook_last_error(&id, Some("timeout after 5000ms"))
+        .await
+        .expect("set last error");
+    store
+        .update_hook_last_logs(&id, Some("checked 3 PRs\nall green"))
+        .await
+        .expect("set last logs");
+    store
+        .update_hook_state(&id, HookState::Evicted)
+        .await
+        .expect("running -> evicted");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.state, HookState::Evicted);
+    assert_eq!(got.last_error.as_deref(), Some("timeout after 5000ms"));
+    assert_eq!(got.last_logs.as_deref(), Some("checked 3 PRs\nall green"));
+
+    store
+        .update_hook_last_logs(&id, None)
+        .await
+        .expect("clear last logs");
+    assert_eq!(store.get_hook(&id).await.unwrap().last_logs, None);
+
+    let missing = HookId("hook-missing".to_string());
+    for err in [
+        store
+            .update_hook_state(&missing, HookState::Cancelled)
+            .await
+            .expect_err("state"),
+        store
+            .update_hook_run(&missing, &ran_at, None)
+            .await
+            .expect_err("run"),
+        store
+            .update_hook_next_run(&missing, None)
+            .await
+            .expect_err("next run"),
+        store
+            .update_hook_last_error(&missing, None)
+            .await
+            .expect_err("last error"),
+        store
+            .update_hook_last_logs(&missing, None)
+            .await
+            .expect_err("last logs"),
+        store.delete_hook(&missing).await.expect_err("delete"),
+    ] {
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+}
+
+/// `load_active_hooks` returns only `scheduled`/`running` rows (the boot
+/// rehydration read), and `delete_hook` removes a row.
+#[tokio::test]
+async fn hook_load_active_and_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    let states = [
+        ("hook-sched", HookState::Scheduled),
+        ("hook-run", HookState::Running),
+        ("hook-disp", HookState::Dispatched),
+        ("hook-evic", HookState::Evicted),
+        ("hook-canc", HookState::Cancelled),
+    ];
+    for (id, state) in &states {
+        let hook_id = HookId(id.to_string());
+        store
+            .insert_hook(&sample_hook(&hook_id, &ws, &agent, id))
+            .await
+            .expect("insert");
+        store
+            .update_hook_state(&hook_id, *state)
+            .await
+            .expect("set state");
+    }
+
+    let active = store.load_active_hooks().await.expect("load active");
+    let mut ids: Vec<&str> = active.iter().map(|h| h.hook_id.0.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["hook-run", "hook-sched"]);
+
+    store
+        .delete_hook(&HookId("hook-sched".to_string()))
+        .await
+        .expect("delete");
+    let active = store.load_active_hooks().await.expect("reload active");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].hook_id.0, "hook-run");
 }

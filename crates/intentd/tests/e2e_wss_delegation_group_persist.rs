@@ -49,16 +49,43 @@ impl Drop for Daemon {
         // The daemon was spawned with process_group(0), making it the group leader.
         #[cfg(unix)]
         {
+            use nix::errno::Errno;
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
+            // Snapshot descendants BEFORE killing: ACP providers (and their
+            // workspace-mcp bridge children) are spawned into their OWN
+            // process groups (`process_group(0)` in intent-acp), so killpg on
+            // the daemon's group misses them; post-kill they reparent to init
+            // and become invisible to a ppid walk. An orphaned provider waking
+            // from a mock `delayMs` respawns the bridge (an `intentd`
+            // invocation) whose tracing init recreates
+            // `<data_dir>/intentd.<date>.log` after the TempDir sweep,
+            // leaving `itd-delgrp-*` residue under /tmp.
+            let descendants = descendant_pids(self.child.id());
             let pid = Pid::from_raw(self.child.id() as i32);
             let _ = signal::killpg(pid, Signal::SIGKILL);
+            let _ = self.child.wait();
+            for &d in &descendants {
+                let _ = signal::kill(Pid::from_raw(d), Signal::SIGKILL);
+            }
+            // Bounded wait until the group AND the swept descendants are gone
+            // (signal-0 probes), so nothing can race the TempDir removal.
+            for _ in 0..200 {
+                let group_alive = signal::killpg(pid, None) != Err(Errno::ESRCH);
+                let straggler = descendants
+                    .iter()
+                    .any(|&d| signal::kill(Pid::from_raw(d), None).is_ok());
+                if !group_alive && !straggler {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         #[cfg(not(unix))]
         {
             let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.wait();
         // On test panic, print data-dir path + daemon log tail + agent stderr for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
@@ -89,6 +116,63 @@ impl Drop for Daemon {
             }
         }
     }
+}
+
+/// Snapshot `root`'s descendant pids (children, grandchildren, …) by walking
+/// one `ps -axo pid=,ppid=` table (portable across macOS and Linux). Must run
+/// while `root` is still alive — after the kill, escaped descendants reparent
+/// to init and are invisible to a ppid walk. Best-effort and bounded: any
+/// failure yields an empty snapshot.
+#[cfg(unix)]
+fn descendant_pids(root: u32) -> Vec<i32> {
+    let out = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => out.stdout,
+        Ok(out) => {
+            eprintln!(
+                "descendant_pids: ps exited with {}; teardown degraded to empty descendant snapshot",
+                out.status
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            eprintln!(
+                "descendant_pids: failed to run ps ({err}); teardown degraded to empty descendant snapshot"
+            );
+            return Vec::new();
+        }
+    };
+    let table: Vec<(i32, i32)> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+        })
+        .collect();
+    if table.is_empty() {
+        eprintln!(
+            "descendant_pids: parsed zero pid/ppid rows from ps output; teardown degraded to empty descendant snapshot"
+        );
+    }
+    let mut pids = Vec::new();
+    let mut queue = vec![root as i32];
+    let mut seen: std::collections::HashSet<i32> = queue.iter().copied().collect();
+    while let Some(parent) = queue.pop() {
+        for &(pid, ppid) in &table {
+            if ppid == parent && seen.insert(pid) {
+                pids.push(pid);
+                queue.push(pid);
+                if pids.len() >= 256 {
+                    return pids;
+                }
+            }
+        }
+    }
+    pids
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
@@ -340,6 +424,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

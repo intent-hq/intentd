@@ -63,6 +63,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -680,7 +681,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 
     // Pull the JS return value out of the persisted tool-result block.
     let transcript = services
-        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None)
+        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None, None)
         .await
         .expect("get conversation");
     let messages = transcript["messages"].as_array().expect("messages array");
@@ -995,7 +996,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
 
     // Pull the JS return value out of the persisted tool-result block.
     let transcript = services
-        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None)
+        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None, None)
         .await
         .expect("get conversation");
     let messages = transcript["messages"].as_array().expect("messages array");

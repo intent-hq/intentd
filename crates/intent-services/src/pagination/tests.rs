@@ -170,3 +170,94 @@ fn page_window_zero_length_source_emits_empty_window() {
     assert_eq!((win.start, win.end), (0, 0));
     assert!(win.next_token.is_none());
 }
+
+#[test]
+fn page_window_around_centers_target_mid_history() {
+    // Target 10 of 0..20 with limit 4: half the budget older ([8,9]), the
+    // rest at/after the target ([10,11]); both directions continue.
+    let win = page_window_around(20, Some(4), 10);
+    assert_eq!((win.start, win.end), (8, 12));
+    assert!(win.next_token.is_some(), "older rows remain");
+    assert!(win.prev_token.is_some(), "newer rows remain");
+}
+
+#[test]
+fn page_window_around_clamps_at_oldest_edge() {
+    // Target near the oldest end: window pins to the start but stays full.
+    let win = page_window_around(20, Some(6), 1);
+    assert_eq!((win.start, win.end), (0, 6));
+    assert!(win.next_token.is_none(), "nothing older than index 0");
+    assert!(win.prev_token.is_some());
+}
+
+#[test]
+fn page_window_around_clamps_at_newest_edge() {
+    // Target near the live tail: window pins to the end but stays full, and
+    // no prev token is minted once the newest row is inside the page.
+    let win = page_window_around(20, Some(6), 19);
+    assert_eq!((win.start, win.end), (14, 20));
+    assert!(win.next_token.is_some());
+    assert!(win.prev_token.is_none(), "newest row already in page");
+}
+
+#[test]
+fn page_window_around_small_history_fits_one_page() {
+    let win = page_window_around(3, Some(10), 1);
+    assert_eq!((win.start, win.end), (0, 3));
+    assert!(win.next_token.is_none());
+    assert!(win.prev_token.is_none());
+}
+
+#[test]
+fn seek_next_token_resolves_through_standard_backward_paging() {
+    // The seek page's nextToken is an ordinary backward cursor: feeding it to
+    // page_window continues into strictly older rows.
+    let seek = page_window_around(20, Some(4), 10);
+    let older = page_window(20, Some(4), seek.next_token.as_deref());
+    assert_eq!((older.start, older.end), (4, 8));
+}
+
+#[test]
+fn forward_page_window_walks_newer_to_the_live_tail() {
+    // Following prevToken pages toward newest; at the tail no prev remains.
+    let seek = page_window_around(10, Some(4), 4);
+    assert_eq!((seek.start, seek.end), (2, 6));
+    let fwd = forward_page_window(10, Some(4), seek.prev_token.as_deref().unwrap())
+        .expect("forward cursor");
+    assert_eq!((fwd.start, fwd.end), (6, 10));
+    assert!(fwd.prev_token.is_none(), "reached the newest row");
+    assert!(
+        fwd.next_token.is_some(),
+        "backward continuation still minted"
+    );
+}
+
+#[test]
+fn forward_page_window_is_append_stable() {
+    // The forward cursor indexes from the oldest end, so appends at the
+    // newest end never shift the rows a minted token resolves to (Q13).
+    let seek = page_window_around(10, Some(4), 4);
+    let token = seek.prev_token.clone().unwrap();
+    let fwd = forward_page_window(15, Some(4), &token).expect("forward cursor");
+    assert_eq!((fwd.start, fwd.end), (6, 10));
+    assert!(fwd.prev_token.is_some(), "appended rows are newer pages");
+}
+
+#[test]
+fn forward_page_window_rejects_backward_and_malformed_tokens() {
+    // Backward (`b`) and garbage tokens are not forward cursors: callers fall
+    // through to the legacy page_window contract.
+    let backward = encode_token(&json!({ "b": 6 }));
+    assert!(forward_page_window(10, Some(4), &backward).is_none());
+    assert!(forward_page_window(10, Some(4), "garbage!!!").is_none());
+}
+
+#[test]
+fn forward_page_window_clamps_stale_cursor_past_end() {
+    // A forward cursor minted against a longer (since-pruned) history
+    // degrades to an empty tail page rather than panicking.
+    let token = encode_token(&json!({ "f": 99 }));
+    let fwd = forward_page_window(5, Some(4), &token).expect("forward cursor");
+    assert_eq!((fwd.start, fwd.end), (5, 5));
+    assert!(fwd.prev_token.is_none());
+}

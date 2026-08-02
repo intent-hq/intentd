@@ -58,6 +58,7 @@ fn sample_ws() -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -1074,16 +1075,22 @@ impl WorkspaceApi for FakeApi {
 
     fn search_messages(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         _query: String,
         _agent_id: Option<String>,
         _role: Option<String>,
         _limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "matches": [],
+                "workspaceId": workspace_id.map(|w| w.0),
+                "preferWorkspaceId": prefer_workspace_id.map(|w| w.0),
+            }))
         })
     }
 
@@ -3834,32 +3841,32 @@ async fn search_cancel_requires_request_id_and_is_ok() {
 }
 
 #[tokio::test]
-async fn search_messages_requires_workspace_and_query() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"query":"x"}}"#)
+async fn search_messages_requires_query_only() {
+    // workspaceId is optional (absent → global search); missing query → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("workspaceId is required")
-    );
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
         serde_json::json!("Missing required parameter: query")
     );
-    // Routed + echoes the caller's requestId.
+    // Global (no workspaceId) routes + echoes the caller's requestId.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1","query":"x","requestId":"srch-9"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"query":"x","requestId":"srch-9"}}"#,
     )
     .await
     .unwrap();
     assert_eq!(v["result"]["requestId"], serde_json::json!("srch-9"));
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!(null));
+    // workspaceId and preferWorkspaceId both plumb through to the API.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1","preferWorkspaceId":"ws-2","query":"x"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!("ws-1"));
+    assert_eq!(v["result"]["preferWorkspaceId"], serde_json::json!("ws-2"));
 }
 
 #[tokio::test]

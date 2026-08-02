@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -235,6 +235,15 @@ pub struct Workspace {
     /// paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Disk footprint of the daemon-managed workspace directory
+    /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
+    /// sandboxes, everything). Computed on the `workspace.list` /
+    /// `workspace.get` emit path (§9.1) from a cached background walk; never
+    /// persisted. Omitted (not `null`) until the first walk completes and for
+    /// rows without a daemon-managed directory (remote / skip-isolation /
+    /// chief).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<WorkspaceDiskUsage>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -245,6 +254,35 @@ pub enum CheckoutMode {
     Worktree,
     /// Standalone copy-on-write clone of the source repository directory.
     Cow,
+}
+
+/// Disk footprint of a workspace's daemon-managed directory
+/// (`Workspace.diskUsage`). Reports **physical (allocated) bytes** — sparse
+/// regions excluded, hard links deduped within one walk — so the number is an
+/// upper bound for CoW-clone checkouts (clone-shared extents count at full
+/// size in every workspace that references them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiskUsage {
+    /// Physical (allocated) bytes for the whole workspace folder.
+    pub bytes: u64,
+    /// Regular files that contributed bytes (hard-link duplicates once).
+    pub file_count: u64,
+    /// RFC-3339 wall-clock time the walk completed.
+    pub computed_at: String,
+    /// Per top-level entry of the workspace folder, sorted by bytes desc
+    /// (loose top-level files grouped under `"other"`).
+    pub breakdown: Vec<DiskUsageBreakdownEntry>,
+}
+
+/// One top-level entry of a workspace folder's disk-usage breakdown
+/// (directory name, or `"other"` for loose files).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageBreakdownEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub file_count: u64,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -299,6 +337,7 @@ pub fn chief_workspace() -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -2647,6 +2686,53 @@ pub struct ScriptCreateParams {
     pub script_id: Option<String>,
 }
 
+/// Lifecycle state of a background hook. `scheduled` and `running` are the
+/// active states (rehydrated into the scheduler at boot); `dispatched`,
+/// `evicted`, and `cancelled` are terminal. Wire/DB words are the lowercase
+/// variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookState {
+    /// Waiting for its next run (sleeping `delayMs`).
+    Scheduled,
+    /// A run is currently executing.
+    Running,
+    /// A run signalled dispatch; the owner was woken and the hook terminated.
+    Dispatched,
+    /// Evicted after a throw/timeout; the owner was woken with the reason.
+    Evicted,
+    /// Cancelled by the owner or from the FE.
+    Cancelled,
+}
+
+/// A background hook: a small agent-owned script the daemon runs periodically
+/// (fixed `delayMs` between runs) until it signals a dispatch, fails, or is
+/// cancelled. Persisted to the `hook` table so schedules survive a daemon
+/// restart; the name length cap (≤19 chars) is enforced at the service layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hook {
+    pub hook_id: HookId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub code: String,
+    pub delay_ms: i64,
+    pub state: HookState,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    pub run_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Captured `console.*` output from the most recent completed run
+    /// (overwritten each run; capped/head-truncated at the service layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_logs: Option<String>,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
 /// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
@@ -3069,6 +3155,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -3083,6 +3170,7 @@ mod tests {
             "repositoryOwner",
             "lastActivity",
             "archivedAt",
+            "diskUsage",
         ] {
             assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
         }

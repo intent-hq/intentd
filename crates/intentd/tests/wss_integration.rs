@@ -356,7 +356,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.9",
+        sess[0]["result"]["protocolVersion"], "2.10",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -3063,6 +3063,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -5037,12 +5038,14 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 
 /// monorepo#958 — the bounded agent read paths over the real WSS transport:
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
-/// `agent.getConversation` multi-page `nextToken` walk, and the `chat.subscribe`
-/// seq-0 snapshot, all against one seeded 120-message session. Then the
-/// hydration regression at the wire level: with every row OLDER than the
-/// newest bounded page corrupted to non-JSON (which errors any path that
-/// decodes it — `agent.getSession` demonstrates), the bounded reads still
-/// answer correctly, proving they never fetch/decode beyond their page.
+/// `agent.getConversation` multi-page `nextToken` walk plus the
+/// `aroundMessageId` seek (centered page, `prevToken` walk newer, `-32602`
+/// on an unknown id), and the `chat.subscribe` seq-0 snapshot, all against
+/// one seeded 120-message session. Then the hydration regression at the wire
+/// level: with every row OLDER than the newest bounded page corrupted to
+/// non-JSON (which errors any path that decodes it — `agent.getSession`
+/// demonstrates), the bounded reads still answer correctly, proving they
+/// never fetch/decode beyond their page.
 #[tokio::test]
 async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use intent_core::AgentId;
@@ -5237,6 +5240,100 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let seqs: Vec<i64> = msgs.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
     assert_eq!(seqs, (110..=119).collect::<Vec<i64>>());
     assert_eq!(limited["result"]["truncated"], true);
+    assert!(
+        limited["result"].get("prevToken").is_none(),
+        "seek-free responses carry no prevToken key: {}",
+        limited["result"]
+    );
+
+    // agent.getConversation seek (§5.5): `aroundMessageId` returns the page
+    // containing the target with the standard backward `nextToken` plus a
+    // `prevToken` walking newer toward the live tail.
+    let target_id = srv
+        .store
+        .get_agent_messages_page(&agent, 60, 1)
+        .await
+        .expect("target row")
+        .pop()
+        .expect("seq 60 exists")
+        .id;
+    let seek = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"aroundMessageId":"{target_id}"}}}}"#
+        ),
+    )
+    .await;
+    let result = &seek["result"];
+    let seqs: Vec<i64> = result["messages"]
+        .as_array()
+        .expect("seek messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        (55..=64).collect::<Vec<i64>>(),
+        "half the budget older than seq 60, the rest at/after: {result}"
+    );
+    let seek_next = result["nextToken"].as_str().expect("older cursor");
+    let seek_prev = result["prevToken"].as_str().expect("newer cursor");
+
+    // prevToken pages newer (seq 65..=74); nextToken pages older (45..=54).
+    let newer = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"nextToken":"{seek_prev}"}}}}"#
+        ),
+    )
+    .await;
+    let seqs: Vec<i64> = newer["result"]["messages"]
+        .as_array()
+        .expect("newer messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (65..=74).collect::<Vec<i64>>());
+    assert!(
+        newer["result"]["prevToken"].is_string(),
+        "newer rows remain toward the tail: {}",
+        newer["result"]
+    );
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":23,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"nextToken":"{seek_next}"}}}}"#
+        ),
+    )
+    .await;
+    let seqs: Vec<i64> = older["result"]["messages"]
+        .as_array()
+        .expect("older messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (45..=54).collect::<Vec<i64>>());
+
+    // Unknown aroundMessageId → -32602 naming the id (PROTOCOL §9).
+    let bad_seek = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":24,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","aroundMessageId":"msg-nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_seek["error"]["code"], -32602);
+    assert!(
+        bad_seek["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("msg-nope"),
+        "error names the unknown id: {bad_seek}"
+    );
 
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
     // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
@@ -5358,6 +5455,183 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     assert_eq!(msgs.len(), 50, "newest page decodes only its own 50 rows");
     assert_eq!(msgs[0]["seq"], 70);
     assert_eq!(msgs[49]["seq"], 119);
+
+    srv.ws.stop().await;
+}
+
+/// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
+/// persisted user/assistant messages. Covers the reworked contract — global
+/// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,
+/// `preferWorkspaceId` as a soft ranking boost, the enriched match shape
+/// (`workspaceId`/`agentName`/`role`/`timestamp`/`score`), and that raw FTS5
+/// operator syntax in the query never surfaces as an error.
+#[tokio::test]
+async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
+    use intent_core::{AgentId, AgentSession, AgentStatus};
+
+    let srv = start(WsOptions::default()).await;
+
+    // Two workspaces, one agent each, both holding an identically-worded
+    // message (equal bm25 rank) so ordering under `preferWorkspaceId` is
+    // decided by the boost alone. The FTS index rows come from the 0074
+    // insert trigger — no manual rebuild.
+    let ws_a = WorkspaceId::new();
+    let ws_b = WorkspaceId::new();
+    let ts = now_iso();
+    let seed = |id: &str, ws: &WorkspaceId, name: &str| AgentSession {
+        id: AgentId(id.to_string()),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: name.to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        status: AgentStatus::Completed,
+        is_active: false,
+        system_prompt: None,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+        parent_agent_id: None,
+        specialist: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
+        messages: vec![],
+        stats: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+    };
+    for (ws, agent, name) in [
+        (&ws_a, "agent-fts-a", "Alpha Agent"),
+        (&ws_b, "agent-fts-b", "Beta Agent"),
+    ] {
+        srv.store
+            .insert_workspace(&fixture_workspace(ws))
+            .await
+            .expect("insert workspace");
+        srv.store
+            .insert_agent_session(&seed(agent, ws, name))
+            .await
+            .expect("insert session");
+    }
+    // ws-a: plain-string user message. ws-b: content-block assistant message
+    // with the same words (block extraction must index it identically).
+    srv.store
+        .append_agent_message(
+            &AgentId("agent-fts-a".into()),
+            "user",
+            &serde_json::json!("deploy pipeline status check"),
+            &ts,
+        )
+        .await
+        .expect("append ws-a message");
+    srv.store
+        .append_agent_message(
+            &AgentId("agent-fts-b".into()),
+            "assistant",
+            &serde_json::json!([{ "type": "text", "text": "deploy pipeline status check" }]),
+            &ts,
+        )
+        .await
+        .expect("append ws-b message");
+
+    // Global search (no workspaceId): both workspaces' matches, enriched shape.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":30,"method":"search.messages","params":{"query":"deploy pipeline","requestId":"srch-g"}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 30);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["requestId"], "srch-g");
+    let matches = resp["result"]["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 2, "global search spans workspaces: {resp}");
+    let ws_ids: Vec<&str> = matches
+        .iter()
+        .map(|m| m["workspaceId"].as_str().expect("workspaceId"))
+        .collect();
+    assert!(ws_ids.contains(&ws_a.0.as_str()) && ws_ids.contains(&ws_b.0.as_str()));
+    let a = matches
+        .iter()
+        .find(|m| m["workspaceId"] == ws_a.0.as_str())
+        .expect("ws-a match");
+    assert_eq!(a["agentId"], "agent-fts-a");
+    assert_eq!(a["agentName"], "Alpha Agent");
+    assert_eq!(a["role"], "user");
+    assert_eq!(a["timestamp"].as_str(), Some(ts.as_str()));
+    assert!(a["messageId"].is_string());
+    assert!(a["score"].is_number());
+    assert!(a["preview"].as_str().unwrap().contains("deploy"));
+
+    // preferWorkspaceId lifts the preferred workspace's (equally-relevant)
+    // match to the top — in both directions.
+    for (prefer, expect_first) in [(&ws_b, &ws_b), (&ws_a, &ws_a)] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"search.messages","params":{{"query":"deploy pipeline","preferWorkspaceId":"{}"}}}}"#,
+            prefer.0
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        let matches = resp["result"]["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 2, "boost never excludes: {resp}");
+        assert_eq!(
+            matches[0]["workspaceId"],
+            expect_first.0.as_str(),
+            "preferred workspace ranks first: {resp}"
+        );
+    }
+
+    // workspaceId is a hard scope filter.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":32,"method":"search.messages","params":{{"query":"deploy pipeline","workspaceId":"{}"}}}}"#,
+        ws_a.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let matches = resp["result"]["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1, "{resp}");
+    assert_eq!(matches[0]["workspaceId"], ws_a.0.as_str());
+
+    // Raw FTS5 operator/quote punctuation is sanitized (treated as token
+    // separators), never a wire error; a query with no searchable tokens
+    // yields empty matches.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":33,"method":"search.messages","params":{"query":"deploy:(pipeline\" -*"}}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(
+        resp["result"]["matches"].as_array().expect("matches").len(),
+        2
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":34,"method":"search.messages","params":{"query":"*(\"-:"}}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(
+        resp["result"]["matches"].as_array().expect("matches").len(),
+        0
+    );
 
     srv.ws.stop().await;
 }

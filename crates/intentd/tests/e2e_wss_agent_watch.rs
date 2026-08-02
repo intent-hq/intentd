@@ -298,6 +298,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         })
         .await
         .expect("insert ws");

@@ -953,8 +953,13 @@ async fn dispatch(
             let limit = opt_int(params, "limit");
             let ws = opt_workspace_id(params);
             let page_token = opt_str(params, "nextToken");
+            // Additive seek param: the page containing this message (§5.5).
+            // Unknown ids surface as `-32602` naming the id via domain_to_rpc;
+            // empty/whitespace ids are treated as absent.
+            let around_message_id =
+                opt_str(params, "aroundMessageId").filter(|s| !s.trim().is_empty());
             match api
-                .agent_get_conversation(agent_id, limit, ws, page_token)
+                .agent_get_conversation(agent_id, limit, ws, page_token, around_message_id)
                 .await
             {
                 Ok(v) => Ok(v),
@@ -2697,13 +2702,20 @@ async fn dispatch(
             Ok(r)
         }
         "search.messages" => {
-            let ws = require_ws_note(params)?;
+            // `workspaceId` is optional (absent → global search across all
+            // workspaces); `preferWorkspaceId` is a soft ranking boost.
+            let ws = opt_workspace_id(params);
             let query = require_str_param(params, "query")?;
             let agent_id = opt_str(params, "agentId");
             let role = opt_str(params, "role");
             let limit = opt_int(params, "limit");
+            let prefer_ws = params
+                .get("preferWorkspaceId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(WorkspaceId::from);
             let request_id = opt_str(params, "requestId");
-            api.search_messages(ws, query, agent_id, role, limit, request_id)
+            api.search_messages(ws, query, agent_id, role, limit, prefer_ws, request_id)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2958,6 +2970,30 @@ async fn dispatch(
             let timeout_seconds =
                 opt_int(params, "timeoutSeconds").or_else(|| opt_int(params, "timeout"));
             api.script_run(ws, script_id, max_lines, timeout_seconds)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        // Background hooks (§6.8): the FE reads and manages hooks; there is
+        // NO wire `hook.schedule` — hooks are agent-authored via the
+        // `ws.hook.schedule` MCP binding only. An unknown/foreign `hookId`
+        // surfaces as `-32602` (`Error::NotFound` → invalid params).
+        "hook.list" => {
+            let ws = require_ws_note(params)?;
+            api.hook_list(ws, None).await.map_err(domain_to_rpc)
+        }
+        "hook.cancel" => {
+            let ws = require_ws_note(params)?;
+            let hook_id = require_str_param(params, "hookId")?;
+            // FE cancel (`by_owner = false`): the owning agent is woken with
+            // a cancellation notice.
+            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), false)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "hook.runNow" => {
+            let ws = require_ws_note(params)?;
+            let hook_id = require_str_param(params, "hookId")?;
+            api.hook_run_now(ws, intent_core::HookId::from(hook_id.as_str()))
                 .await
                 .map_err(domain_to_rpc)
         }
