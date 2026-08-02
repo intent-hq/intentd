@@ -6371,7 +6371,7 @@ impl Services {
     /// falls back to the pre-DELIV-1 store-only persist so hermetic tests
     /// keep working. Auto-queue-on-store-failure mirrors
     /// [`Services::agent_send_message_op`].
-    async fn deliver_wake_message(
+    pub(crate) async fn deliver_wake_message(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,

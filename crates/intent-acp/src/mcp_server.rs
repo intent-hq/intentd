@@ -33,6 +33,12 @@ pub use bindings::app::proposal::{
 // `ws.app.question.ask` emits.
 pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 
+// Hook-scheduler seam: the background hook runner in `intent-services`
+// evaluates agent scripts with the same `ws.*` prelude + host dispatch the
+// `workspace_api` tool installs, so the two environments cannot drift.
+pub use bindings::prelude as bindings_prelude;
+pub use dispatch::make_workspace_host;
+
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
