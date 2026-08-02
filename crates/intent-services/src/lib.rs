@@ -235,6 +235,16 @@ pub struct Services {
     /// replayed. In-memory only, like the completion-watch registry's
     /// live delivery state.
     failure_wake_dedup: Arc<Mutex<HashMap<(AgentId, AgentId), String>>>,
+    /// Child agents whose most recent `agent:idle` was skipped as an interim
+    /// idle for at least one ungrouped watch (monorepo#1280). The follow-up
+    /// completion is normally guaranteed by the queue drain, but a retraction
+    /// (`agent.removeQueuedMessage` / the owned MCP variant) that empties the
+    /// ready-to-send queue while the child is idle leaves no further
+    /// `agent:idle` to deliver — the removal paths consult this marker and
+    /// re-run watch delivery so the skipped watch still gets its completion
+    /// wake. Cleared by any non-interim completion delivery. In-memory only,
+    /// like the other live delivery state.
+    interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -515,6 +525,7 @@ impl Services {
             )),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
+            interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
@@ -2611,6 +2622,107 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
+    /// Record that an `agent:idle` for `child_id` was skipped as interim for
+    /// at least one ungrouped watch (monorepo#1280), so a later queue
+    /// retraction that empties the ready-to-send queue while the child is
+    /// idle re-runs watch delivery for it.
+    fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
+    }
+
+    /// Whether an interim-skipped idle is recorded for `child_id`.
+    fn has_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .contains(child_id)
+    }
+
+    /// Take (check-and-clear) the interim-skip marker for `child_id`,
+    /// returning whether it was set. Clearing on read makes the retraction
+    /// redelivery at-most-once per skipped idle.
+    fn take_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .remove(child_id)
+    }
+
+    /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
+    /// queue mutation (retraction or an editing flip to under-edit) left an
+    /// idle agent with an empty ready-to-send queue. Without this, a watch
+    /// whose `agent:idle` was skipped as interim stays armed forever — the
+    /// queue drain that would have produced the follow-up completion never
+    /// runs because the mutation removed its input. No-op unless an
+    /// interim-skipped idle is recorded, the ready-to-send queue is empty,
+    /// and no worker is in flight (a busy agent emits its own terminal
+    /// `agent:idle` when the turn ends, which supersedes the marker).
+    /// Synthesizes a fresh `agent:idle` (same construction as the
+    /// rehydration reconcile path) rather than replaying the original event,
+    /// so the payload carries the session's current name/completionReport.
+    pub(crate) async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
+        if !self.has_interim_skipped_idle(child_id) {
+            return;
+        }
+        if self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()) {
+            return;
+        }
+        // Consume the marker only after the guards pass; losing this take to
+        // a concurrent mutation path means that path owns the redelivery.
+        if !self.take_interim_skipped_idle(child_id) {
+            return;
+        }
+        let session = match self.store.get_agent_session(child_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(
+                    child = %child_id.0,
+                    error = %e,
+                    "queue-retraction redelivery: session lookup failed; watch stays armed"
+                );
+                // Restore the marker so a later queue mutation (or drain
+                // no-op) can retry the redelivery — a transient store error
+                // must not permanently strand the watch.
+                self.mark_interim_skipped_idle(child_id);
+                return;
+            }
+        };
+        let mut data = serde_json::json!({
+            "agentId": child_id.0,
+            "reason": "queue_retraction",
+            "status": "idle",
+            "agentName": session.name,
+            "isBackground": session.is_background,
+        });
+        if let Some(report) = session.completion_report {
+            data["completionReport"] = serde_json::Value::String(report.clone());
+            data["report"] = serde_json::Value::String(report);
+        }
+        let event = Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: session.workspace_id,
+            timestamp: now_iso(),
+            event_type: AGENT_IDLE.to_string(),
+            actor: intent_core::EventActor {
+                actor_type: intent_core::ActorType::Agent,
+                id: Some(child_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(child_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        };
+        // Box::pin breaks the async-recursion cycles this edge closes
+        // (deliver → redeliver → deliver, and the drain's None-arm path
+        // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
+        Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+    }
+
     /// Wake every parent whose watch matches child_id, then drop that watch:
     /// every ungrouped watch is deliver-once-and-retire. group_id = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
@@ -2661,6 +2773,13 @@ impl Services {
         // duplicate wake through).
         if event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
+        }
+        // monorepo#1280: any non-interim completion supersedes a recorded
+        // interim skip — the delivery below settles the watches, so the
+        // retraction-redelivery marker must not linger and produce a stale
+        // synthetic wake later.
+        if !interim_idle {
+            self.take_interim_skipped_idle(child_id);
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
             event
@@ -2769,6 +2888,10 @@ impl Services {
             // report_delivered one, which retires at the real completion)
             // armed for the settlement that follows the queue drain.
             if interim_idle {
+                // monorepo#1280: record the skip so a queue retraction that
+                // later empties the ready-to-send queue while the child is
+                // idle can re-run delivery for this still-armed watch.
+                self.mark_interim_skipped_idle(child_id);
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
@@ -2851,6 +2974,18 @@ impl Services {
             }
             self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                 .await;
+        }
+        // monorepo#1280: `interim_idle` was snapshotted at entry, but the
+        // skip markers land after `.await` points (the stall lookup, earlier
+        // watches' group-branch awaits). A retraction that emptied the queue
+        // inside that window found no marker and no-op'd — re-check now that
+        // the markers are in place and hand off to the mutation-path
+        // redelivery (its guards make this a no-op unless the queue really
+        // emptied and the agent is idle). The indirect async recursion is
+        // depth-1: the synthetic redelivery's event is non-interim by
+        // construction (queue empty), so its own pass never re-enters here.
+        if interim_idle && !self.has_ready_to_send(child_id) {
+            Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
     }
 

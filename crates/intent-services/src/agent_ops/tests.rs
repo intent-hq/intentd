@@ -521,6 +521,302 @@ async fn grouped_watch_records_completion_on_interim_idle() {
     );
 }
 
+/// monorepo#1280 regression (retraction strand): a watch whose `agent:idle`
+/// was skipped as interim must still fire when a queue retraction
+/// (`agent.removeQueuedMessage`) empties the ready-to-send queue while the
+/// child is idle — no further `agent:idle` is coming, so the removal path
+/// re-runs delivery. Exactly one wake; the watch retires.
+#[tokio::test]
+async fn queue_retraction_after_interim_idle_fires_stranded_watch_once() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "interim idle skipped"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Retract the only ready-to-send message: the queue is now empty with the
+    // child idle — the removal path must redeliver the skipped completion.
+    svc.agent_remove_queued_message_op(child.clone(), queued.id.clone())
+        .await
+        .expect("remove queued message");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "retraction fires the stranded watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the redelivered wake"
+    );
+
+    // A repeat removal (idempotent no-op) delivers nothing further.
+    svc.agent_remove_queued_message_op(child.clone(), queued.id)
+        .await
+        .expect("idempotent remove");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no duplicate wake from a repeat retraction"
+    );
+}
+
+/// monorepo#1280: the ownership-checked MCP removal
+/// (`ws.agent.removeQueuedMessage`) is the retraction path an agent itself
+/// uses — it must redeliver the stranded completion the same way as the FE
+/// RPC.
+#[tokio::test]
+async fn owned_queue_retraction_after_interim_idle_fires_stranded_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // The parent enqueues a message onto the child (fromAgentId attribution
+    // makes it retractable via the owned op).
+    let (queued, _) = svc.enqueue_message(
+        &child,
+        "follow-up".into(),
+        None,
+        None,
+        Some(json!({ "fromAgentId": parent.0 })),
+        None,
+        false,
+    );
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "interim idle skipped"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    svc.agent_remove_queued_message_owned_op(child.clone(), queued.id, parent.clone())
+        .await
+        .expect("owned remove");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "owned retraction fires the stranded watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the redelivered wake"
+    );
+}
+
+/// monorepo#1280: the busy guard — a retraction while a worker is in flight
+/// must NOT redeliver (the turn's own terminal `agent:idle` supersedes the
+/// marker); once the agent is idle again, a later mutation-path check may
+/// still consume the retained marker.
+#[tokio::test]
+async fn queue_retraction_while_busy_defers_redelivery() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // A worker claims the in-flight slot (drain race): the retraction's
+    // redelivery must defer — the busy turn owns the terminal idle.
+    svc.set_test_busy(&child, true);
+    svc.agent_remove_queued_message_op(child.clone(), queued.id)
+        .await
+        .expect("remove queued message");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no redelivery while a worker is in flight"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed for the busy turn's terminal idle"
+    );
+
+    // Slot released with the queue still empty: the retained marker lets the
+    // redelivery path fire on its next invocation.
+    svc.set_test_busy(&child, false);
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "retained marker delivers once the agent is idle again"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+}
+
+/// monorepo#1280 regression (editing-flip variant): flipping the only
+/// ready-to-send entry to under-edit (`editing: false → true`) empties the
+/// ready-to-send queue just like a retraction — the edit path must redeliver
+/// the interim-skipped completion.
+#[tokio::test]
+async fn editing_flip_after_interim_idle_fires_stranded_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let q = svc
+        .agent_queue_message_op(child.clone(), "draft".into(), None, None)
+        .await
+        .expect("queue message");
+    let mid = q["queuedMessage"]["id"].as_str().unwrap().to_string();
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "interim idle skipped"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Flip the entry under edit: ready-to-send queue is now empty.
+    svc.agent_edit_queued_message_op(child.clone(), mid, "draft".into(), Some(true))
+        .await
+        .expect("flip to editing");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "editing flip fires the stranded watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired after the redelivered wake"
+    );
+}
+
+/// monorepo#1280 guard: when the drain runs normally after the interim skip,
+/// the real completion delivers the wake and clears the interim marker — a
+/// later queue mutation must not produce a second (duplicate) wake.
+#[tokio::test]
+async fn normal_drain_after_interim_idle_delivers_once_and_clears_marker() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let (queued, _) =
+        svc.enqueue_message(&child, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Normal drain path: dequeue then the real completion idle.
+    svc.take_queued_message(&child, &queued.id)
+        .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "exactly one wake at the real completion"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // A later enqueue + retraction must not synthesize a stale second wake:
+    // the non-interim completion above cleared the marker.
+    let (later, _) = svc.enqueue_message(&child, "later".into(), None, None, None, None, false);
+    svc.agent_remove_queued_message_op(child.clone(), later.id)
+        .await
+        .expect("remove later message");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no duplicate wake after a normal drain"
+    );
+}
+
 /// The immediate-path wake persists FE-shaped `event_notification` metadata on
 /// the parent's user-message row so `EventWakeupBanner` can render a real
 /// `eventCount` / `eventTypes` / per-agent `events` payload instead of the
