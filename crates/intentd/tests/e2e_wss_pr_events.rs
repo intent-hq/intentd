@@ -401,6 +401,7 @@ async fn boot_seeded(
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 

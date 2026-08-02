@@ -65,6 +65,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 

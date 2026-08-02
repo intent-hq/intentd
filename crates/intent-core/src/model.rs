@@ -235,6 +235,15 @@ pub struct Workspace {
     /// paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Disk footprint of the daemon-managed workspace directory
+    /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
+    /// sandboxes, everything). Computed on the `workspace.list` /
+    /// `workspace.get` emit path (§9.1) from a cached background walk; never
+    /// persisted. Omitted (not `null`) until the first walk completes and for
+    /// rows without a daemon-managed directory (remote / skip-isolation /
+    /// chief).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<WorkspaceDiskUsage>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -245,6 +254,35 @@ pub enum CheckoutMode {
     Worktree,
     /// Standalone copy-on-write clone of the source repository directory.
     Cow,
+}
+
+/// Disk footprint of a workspace's daemon-managed directory
+/// (`Workspace.diskUsage`). Reports **physical (allocated) bytes** — sparse
+/// regions excluded, hard links deduped within one walk — so the number is an
+/// upper bound for CoW-clone checkouts (clone-shared extents count at full
+/// size in every workspace that references them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiskUsage {
+    /// Physical (allocated) bytes for the whole workspace folder.
+    pub bytes: u64,
+    /// Regular files that contributed bytes (hard-link duplicates once).
+    pub file_count: u64,
+    /// RFC-3339 wall-clock time the walk completed.
+    pub computed_at: String,
+    /// Per top-level entry of the workspace folder, sorted by bytes desc
+    /// (loose top-level files grouped under `"other"`).
+    pub breakdown: Vec<DiskUsageBreakdownEntry>,
+}
+
+/// One top-level entry of a workspace folder's disk-usage breakdown
+/// (directory name, or `"other"` for loose files).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageBreakdownEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub file_count: u64,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -299,6 +337,7 @@ pub fn chief_workspace() -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -3069,6 +3108,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -3083,6 +3123,7 @@ mod tests {
             "repositoryOwner",
             "lastActivity",
             "archivedAt",
+            "diskUsage",
         ] {
             assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
         }

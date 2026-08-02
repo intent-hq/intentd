@@ -46,10 +46,10 @@ pub use model::{
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
-    ContextItem, Draft, Event, EventActor, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus,
-    GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus,
-    KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
+    ContextItem, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
+    GitStatus, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
     LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
@@ -63,8 +63,9 @@ pub use model::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
     WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;

@@ -80,6 +80,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -4477,6 +4478,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     cow_supported: None,
                     display_status: None,
                     checkout_mode: None,
+                    disk_usage: None,
                 };
                 store.insert_workspace(&workspace).await
             })

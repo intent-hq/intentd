@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod disk_usage;
 mod drafts;
 mod enhance_ops;
 mod event_ops;
@@ -457,6 +458,12 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Per-workspace disk-usage cache backing `Workspace.diskUsage` on the
+    /// list/get emit path (§9.1): TTL'd stale-while-revalidate entries whose
+    /// walks run detached on the blocking pool, so serving the aggregate
+    /// never blocks a call (first compute omits and backfills). Shared
+    /// across clones.
+    disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
     /// memory instead of re-running the SQLite JSON window.
@@ -563,6 +570,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
@@ -1049,6 +1057,11 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
+        // diskUsage: cached physical footprint of the daemon-managed
+        // workspace directory. Omitted until the first walk completes —
+        // serving the cache never waits on a walk (computes run detached and
+        // backfill), so it can never exceed the per-call aggregate budget.
+        ws.disk_usage = self.compute_disk_usage(ws).await;
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1344,6 +1357,36 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
+    /// directory from the shared [`disk_usage::DiskUsageCache`]. Only rows
+    /// with such a directory qualify: remote / skip-isolation rows and the
+    /// virtual chief workspace omit the field. The directory is the
+    /// provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
+    /// `<parent>/<id>`, covering custom `workspace.worktreesLocation` roots)
+    /// when it is named for the workspace id, else `<workspaces_root>/<id>`
+    /// — a never-provisioned directory simply never yields a value.
+    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+        if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
+            return None;
+        }
+        let dir = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|wt| {
+                let parent = Path::new(wt).parent()?;
+                (parent.file_name()? == std::ffi::OsStr::new(ws.id.as_str()))
+                    .then(|| parent.to_path_buf())
+            })
+            .unwrap_or_else(|| {
+                self.workspaces_root
+                    .clone()
+                    .unwrap_or_else(default_workspaces_root)
+                    .join(ws.id.as_str())
+            });
+        self.disk_usage.usage(dir).await
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -9567,6 +9610,7 @@ impl WorkspaceApi for Services {
                         cow_supported: None,
                         display_status: None,
                         checkout_mode: None,
+                        disk_usage: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -11085,6 +11129,7 @@ impl WorkspaceApi for Services {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                disk_usage: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
