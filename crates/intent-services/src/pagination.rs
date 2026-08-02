@@ -87,6 +87,59 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     }
 }
 
+/// A seek page window (`agent.getConversation` `aroundMessageId` and its
+/// forward continuations): the `start..end` slice plus BOTH continuation
+/// tokens — `next_token` walks older history using the standard backward
+/// cursor (`{"b": ..}`), so the older chain resolves through [`page_window`]
+/// exactly like ordinary paging, while `prev_token` walks newer toward the
+/// live tail using a forward cursor (`{"f": <start-from-oldest>}`). Both
+/// cursors index from the oldest end, so both are append-stable (Q13), and
+/// both are opaque base64 on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeekPageWindow {
+    pub start: usize,
+    pub end: usize,
+    pub next_token: Option<String>,
+    pub prev_token: Option<String>,
+}
+
+/// Build a [`SeekPageWindow`] over `start..end`, minting the older token while
+/// rows remain below `start` and the newer token while rows remain at/after
+/// `end`.
+fn seek_window(len: usize, start: usize, end: usize) -> SeekPageWindow {
+    SeekPageWindow {
+        start,
+        end,
+        next_token: (start > 0).then(|| encode_token(&json!({ "b": start }))),
+        prev_token: (end < len).then(|| encode_token(&json!({ "f": end }))),
+    }
+}
+
+/// Resolve the page window centered on `index` (0-based, oldest→newest) — the
+/// `aroundMessageId` seek. Half the page budget goes to rows older than the
+/// target and the rest to the target and newer rows, clamped at either edge so
+/// the page stays full whenever `len >= limit`; the target index is always
+/// inside `start..end` (given `index < len`).
+pub fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekPageWindow {
+    let limit = clamp_limit(limit);
+    let start = index.min(len).saturating_sub(limit / 2);
+    let end = (start + limit).min(len);
+    let start = end.saturating_sub(limit);
+    seek_window(len, start, end)
+}
+
+/// Try to resolve `token` as a forward continuation cursor (`{"f": ..}`)
+/// minted by a seek page's `prev_token`. Returns `None` for backward or
+/// malformed tokens, which callers fall through to the [`page_window`]
+/// contract — so pre-existing backward tokens keep byte-identical behavior.
+pub fn forward_page_window(len: usize, limit: Option<i64>, token: &str) -> Option<SeekPageWindow> {
+    let f = decode_token(token)?.get("f").and_then(Value::as_u64)? as usize;
+    let limit = clamp_limit(limit);
+    let start = f.min(len);
+    let end = (start + limit).min(len);
+    Some(seek_window(len, start, end))
+}
+
 /// A page of items plus the opaque token for the next (older) page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {

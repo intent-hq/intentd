@@ -11403,7 +11403,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, None, None, Some("srch-1".into()))
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                None,
+                None,
+                None,
+                Some("srch-1".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-1");
@@ -11429,7 +11437,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, Some("user".into()), None, None)
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                Some("user".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let matches = r["matches"].as_array().unwrap();
@@ -11686,8 +11702,9 @@ mod search_adapters {
         let ack = h
             .services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
@@ -11728,8 +11745,9 @@ mod search_adapters {
         let mut sub = subscribe(&h);
         h.services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
