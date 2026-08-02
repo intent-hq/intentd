@@ -41,3 +41,8 @@ git2 = { workspace = true }
 # dev-only edge introduces no dependency cycle.
 intent-pty = { path = "../intent-pty", version = "0.2.16" }
 tempfile = "3"
+# `ws.host.exec` binding tests drive the real exec semantics (spawn, timeout
+# reap, cwd containment) through the `WorkspaceApi::host_exec` seam.
+# `intent-services` depends on `intent-acp`, so this edge is a dev-dependency
+# cycle Cargo permits; kept version-less so it is stripped on publish.
+intent-services = { path = "../intent-services" }

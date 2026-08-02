@@ -78,6 +78,7 @@ mod github_browse_ops;
 
 mod agent_list_cache;
 mod history_xml;
+mod hook_manager;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -503,6 +504,19 @@ pub struct Services {
     /// tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
     git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Live per-hook scheduler tasks for the background hook service
+    /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
+    /// tasks themselves observe the same set; rehydrated from the `hook`
+    /// table at boot via [`Services::rehydrate_hooks`].
+    hook_tasks: hook_manager::HookTasks,
+    /// Cap on concurrently active (scheduled/running) hooks per agent
+    /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
+    /// composition root via [`Services::with_hooks_max_per_agent`].
+    hooks_max_per_agent: u32,
+    /// Wall-clock budget for one hook script run (60 s in production). Tests
+    /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
+    /// timeout-eviction coverage completes in milliseconds.
+    hook_eval_timeout: std::time::Duration,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -577,7 +591,25 @@ impl Services {
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
+            hook_tasks: Arc::new(Mutex::new(HashMap::new())),
+            hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
         }
+    }
+
+    /// Override the per-agent active-hook cap (`[hooks] maxPerAgent`); wired
+    /// from `Config` by the composition root.
+    pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
+        self.hooks_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the hook script eval budget so timeout-eviction
+    /// coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.hook_eval_timeout = timeout;
+        self
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -18876,6 +18908,61 @@ impl WorkspaceApi for Services {
                     })?;
             browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
         })
+    }
+
+    /// `ws.host.exec` (agent-JS binding seam): delegate to the shared one-shot
+    /// exec primitive with the caller's workspace pinned as the cwd
+    /// containment root. Semantics are identical to the wire `host.exec`
+    /// (argv-only, `timeoutMs` process-group reap, secret-safe env).
+    fn host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { host_exec::run_for_workspace(self, workspace_id, params).await })
+    }
+
+    /// `hook.schedule`: validate + immediate real run + persist + spawn the
+    /// per-hook scheduler task (see `hook_manager`).
+    fn hook_schedule(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.hook_schedule_op(&workspace_id, &agent_id, &params)
+                .await
+        })
+    }
+
+    /// `hook.list`: hooks in a workspace, optionally one agent's.
+    fn hook_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
+    }
+
+    /// `hook.cancel`: stop an active hook; a non-owner (FE) cancel wakes the
+    /// owning agent with a notice.
+    fn hook_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        by_owner: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_cancel_op(&workspace_id, &hook_id, by_owner).await })
+    }
+
+    /// `hook.runNow`: trigger an immediate run of an active hook.
+    fn hook_run_now(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
     }
 }
 

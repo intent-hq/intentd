@@ -72,6 +72,7 @@ fn make_config(data_dir: &Path) -> Config {
         pid_path: data_dir.join("intentd.pid"),
         idle_reap_minutes: 0,
         stream_retention_hours: 0,
+        hooks_max_per_agent: 5,
     }
 }
 

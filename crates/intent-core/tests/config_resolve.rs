@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use intent_core::config::{Config, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS};
+use intent_core::config::{
+    Config, DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+};
 use intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE;
 
 /// Serializes env-mutating tests in this binary. Cargo runs `#[test]`s on
@@ -63,6 +65,7 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
     // default template and used the documented defaults.
     assert_eq!(cfg.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
     assert_eq!(cfg.stream_retention_hours, DEFAULT_STREAM_RETENTION_HOURS);
+    assert_eq!(cfg.hooks_max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
     let written = std::fs::read_to_string(&config_path).expect("config.toml was initialized");
     assert_eq!(written, DEFAULT_CONFIG_TEMPLATE);
 
@@ -134,7 +137,7 @@ fn resolve_reads_config_file_when_present() {
     let config_path = config_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n",
+        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n",
     )
     .unwrap();
 
@@ -146,6 +149,7 @@ fn resolve_reads_config_file_when_present() {
     let cfg = Config::resolve().expect("resolve with populated config should succeed");
     assert_eq!(cfg.idle_reap_minutes, 7);
     assert_eq!(cfg.stream_retention_hours, 24);
+    assert_eq!(cfg.hooks_max_per_agent, 3);
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");

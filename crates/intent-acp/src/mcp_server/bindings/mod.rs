@@ -24,6 +24,8 @@ pub(crate) mod cross_workspace;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod git;
+pub(crate) mod hook;
+pub(crate) mod host;
 pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
@@ -37,9 +39,13 @@ pub(crate) mod workspace;
 /// global. Concatenation happens at call time because the per-namespace
 /// fragments are `const &str` expressions, and `concat!` only accepts
 /// literals.
-pub(crate) fn prelude() -> String {
+///
+/// `pub` (re-exported as `intent_acp::bindings_prelude`) so callers that
+/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
+/// scheduler in `intent-services` — install the exact same environment.
+pub fn prelude() -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         workspace::PRELUDE,
         note::PRELUDE,
         task::PRELUDE,
@@ -51,6 +57,8 @@ pub(crate) fn prelude() -> String {
         agent::PRELUDE,
         event::PRELUDE,
         git::PRELUDE,
+        host::PRELUDE,
+        hook::PRELUDE,
         script::PRELUDE,
         terminal::PRELUDE,
         file::PRELUDE,
@@ -128,6 +136,16 @@ pub(crate) async fn try_dispatch(
     }
     if let Some(rest) = method.strip_prefix("git.") {
         return git::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("host.") {
+        return host::dispatch(api, workspace_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("hook.") {
+        return hook::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
             .await
             .map(Some);
     }
