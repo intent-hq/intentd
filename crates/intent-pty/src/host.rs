@@ -651,13 +651,15 @@ async fn teardown(session: &PtySession) {
             // Escalation is keyed on the *process group* emptying, not on the
             // direct child's exit: a descendant that survives SIGTERM must
             // still be SIGKILLed even when the shell itself exited promptly
-            // (monorepo#1300). Keep reaping the direct child via `try_wait` —
-            // a zombie leader keeps the pgid occupied, so the ESRCH probe only
-            // reports empty once the leader is reaped.
+            // (monorepo#1300). Keep reaping the direct child — a zombie
+            // leader keeps the pgid occupied, so the ESRCH probe only reports
+            // empty once the leader is reaped. Reap via `observe_exit` so the
+            // one-shot exit status is latched for concurrent observers
+            // (`wait`/`try_exit`/the exit watcher) instead of discarded.
             let mut group_empty = false;
             let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
             for _ in 0..iters {
-                let _ = session.child.lock().unwrap().try_wait();
+                let _ = observe_exit(session);
                 if process_group_empty(pid) {
                     group_empty = true;
                     break;
@@ -1172,10 +1174,15 @@ mod tests {
         let mut spec = SpawnSpec::new("scope-trap", "sh");
         // The descendant prints its PID *after* installing the traps so the
         // test never signals it before TERM/HUP are ignored (HUP too: the
-        // session leader's death sends SIGHUP to the foreground group).
+        // session leader's death sends SIGHUP to the foreground group). It
+        // sleeps in a loop rather than one long `sleep`: the sleeps are
+        // separate children, so even if the shell's wait is interrupted by a
+        // sleep dying to SIGTERM, the trapped loop keeps running — only
+        // SIGKILL removes the descendant.
         spec.args = vec![
             "-c".into(),
-            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; sleep 300' & sleep 300"#.into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; while :; do sleep 1; done' & sleep 300"#
+                .into(),
         ];
         let id = host.spawn(spec).unwrap();
 
