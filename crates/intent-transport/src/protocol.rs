@@ -2,14 +2,15 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.10 adds the background-hook
-//! management router methods `hook.list` / `hook.cancel` / `hook.runNow`
-//! (hook *scheduling* stays MCP-only per §6.8) and the `hook:*` event family,
-//! covering 312 dispatchable method names (276 router + 34 fast-path +
-//! 2 aliases) + 1 notification + 4 reverse RPCs.
+//! `system.status` → `protocolVersion`. Version 3.0 removes the
+//! `pr.waitForChanges` router method (breaking; superseded by background
+//! hooks, §5.40), covering 311 dispatchable method names (275 router +
+//! 34 fast-path + 2 aliases) + 1 notification + 4 reverse RPCs. Version 3.1
+//! adds the hook TTL (additive; §5.40): `ttlMs` / `expiresAt`, the terminal
+//! `expired` state, and the `hook:expired` event — no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.10";
+pub const PROTOCOL_VERSION: &str = "3.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

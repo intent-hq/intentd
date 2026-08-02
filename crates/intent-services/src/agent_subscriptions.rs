@@ -1327,6 +1327,16 @@ impl Services {
                     return;
                 }
             };
+        let mut data = serde_json::json!({
+            "agentId": child_id.0,
+            "status": status_value,
+        });
+        // Idle-visibility: a synthesized idle carries the same
+        // `waitingOnHooks` stamp as a live `agent:idle` emit (omitted when
+        // the child owns no active hook).
+        if event_type == intent_core::events::AGENT_IDLE {
+            self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        }
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: event_ws,
@@ -1341,10 +1351,7 @@ impl Services {
             correlation_id: None,
             parent_event_id: None,
             metadata: None,
-            data: serde_json::json!({
-                "agentId": child_id.0,
-                "status": status_value,
-            }),
+            data,
         };
         self.deliver_completion_to_watches(child_id, &event).await;
     }
@@ -1513,6 +1520,21 @@ impl Services {
                             session.attention_request_kind.as_deref(),
                             session.attention_request_reason.as_deref(),
                         );
+                        // Idle-visibility deferral: an idle child that still
+                        // owns active background hooks has not settled — do
+                        // NOT record it at rehydration; resumed hooks keep
+                        // their original TTL (§5.40), so the child's genuine
+                        // completion (post-hook idle / failure / deletion)
+                        // records through the live delivery path later.
+                        // Failed/deleted children record regardless.
+                        if event_type == intent_core::events::AGENT_IDLE
+                            && !self
+                                .annotate_waiting_on_hooks(&child_id, &mut data)
+                                .await
+                                .is_empty()
+                        {
+                            continue;
+                        }
                         let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
@@ -1600,6 +1622,20 @@ impl Services {
         agent_id: &AgentId,
         event_data: &serde_json::Value,
     ) {
+        // Idle-visibility deferral: a hook-waiting idle (the emit sites stamp
+        // `waitingOnHooks` onto the data before calling here) is NOT the
+        // child's settlement — it will run again when a hook dispatches,
+        // fails, or expires (TTL-bounded, §5.40) — so its group completion
+        // must not be recorded yet. The genuine completion (post-hook idle,
+        // failure, deletion, or the external-cancel redelivery) records
+        // through this path or the watch-delivery grouped branch later.
+        if event_data
+            .get("waitingOnHooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hooks| !hooks.is_empty())
+        {
+            return;
+        }
         // Find which group (if any) this agent belongs to — global lookup,
         // so a chief-anchored group finds its workspace-scoped child too.
         let group_id = {

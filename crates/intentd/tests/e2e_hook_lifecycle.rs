@@ -22,6 +22,15 @@
 //!     woken with the cancellation notice.
 //!  5. Error arms: unknown `hookId` → -32602 on cancel/runNow; `runNow` on a
 //!     cancelled hook → -32602; missing params → -32602.
+//!  6. State carry-over: agent turn 4 schedules a counter hook that threads
+//!     `{ n }` through `hookState` (`{ dispatch: false, state: { n } }` until
+//!     `n` reaches 2, then `{ dispatch: true, message }`) — `lastState`
+//!     advances in `hook.list` after each run and the hook dispatches on the
+//!     run where the carried count reaches the threshold.
+//!  7. TTL expiry (v3.1): agent turn 5 schedules a hook with `ttlMs: 1`
+//!     (clamped to the 10s floor) — `expiresAt` surfaces in `hook.list`, the
+//!     deadline passes, `hook:expired` fires, the row goes terminal
+//!     (`runNow` → -32602), and the owner is woken with the expiry notice.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -273,6 +282,39 @@ where
     }
 }
 
+/// Drain frames until the next `agent:idle` for `agent_id`, returning its
+/// `data` payload (idle-visibility assertions, §6.5 `waitingOnHooks`).
+async fn next_agent_idle<S>(ws: &mut WebSocketStream<S>, agent_id: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
+    loop {
+        let next = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for agent:idle ({agent_id})"));
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] != "events.event" {
+                    continue;
+                }
+                let event = v["params"]["event"].clone();
+                if event["type"].as_str() == Some("agent:idle")
+                    && event["data"]["agentId"].as_str() == Some(agent_id)
+                {
+                    return event["data"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Mock-agent gate (parity with the WSS agent-lifecycle suite).
 fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -430,6 +472,20 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: 'cancelme', code: {}, delayMs: 60000 }});",
         json!("return { dispatch: false };")
     );
+    let counter_inner = "const n = (hookState === null) ? 0 : hookState.n; \
+                         if (n >= 2) { return { dispatch: true, message: 'counted ' + n }; } \
+                         return { dispatch: false, state: { n: n + 1 } };";
+    let schedule_counter_js = format!(
+        "return await ws.hook.schedule({{ name: 'counter', code: {}, delayMs: 60000 }});",
+        json!(counter_inner)
+    );
+    // TTL section: `ttlMs: 1` clamps to the 10s floor, so the hook expires
+    // ~10s after creation — well inside the event-read budget — while the
+    // 60s delayMs guarantees no second run ever starts.
+    let schedule_ttl_js = format!(
+        "return await ws.hook.schedule({{ name: 'shortttl', code: {}, delayMs: 60000, ttlMs: 1 }});",
+        json!("return { dispatch: false };")
+    );
     // `firstTurnDelayMs` holds turn 1 open after the schedule tool call so the
     // dispatch wake stays QUEUED behind the in-flight turn long enough for the
     // `agent.getQueue` assertion; queue-drain turns (the wake text matches no
@@ -462,6 +518,22 @@ async fn hook_lifecycle_over_wss() {
                 },
                 "response": "scheduled cancelme",
             },
+            {
+                "ifPromptContains": "SCHEDULE_COUNTER",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": schedule_counter_js, "summary": "schedule counter" },
+                },
+                "response": "scheduled counter",
+            },
+            {
+                "ifPromptContains": "SCHEDULE_SHORTTTL",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": schedule_ttl_js, "summary": "schedule shortttl" },
+                },
+                "response": "scheduled shortttl",
+            },
         ],
     })
     .to_string();
@@ -489,13 +561,14 @@ async fn hook_lifecycle_over_wss() {
 
     // SUBSCRIBER conn — `hook:*` prefix filter (plus agent stream noise we
     // skip) BEFORE any hook exists, proving the wildcard flows through the
-    // subscription engine.
+    // subscription engine. `agent:idle` rides along for the idle-visibility
+    // assertion (§6.5 `waitingOnHooks`).
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["hook:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["hook:*", "agent:idle"], "workspaceId": ws_id }),
     )
     .await;
     assert!(
@@ -595,6 +668,43 @@ async fn hook_lifecycle_over_wss() {
         .as_str()
         .expect("watcher hookId")
         .to_string();
+
+    // Idle-visibility (§6.5): the SCHEDULE_WATCH turn's terminal agent:idle
+    // is emitted while the watcher hook is active — the payload carries the
+    // emit-time `waitingOnHooks` stamp naming the hook with its light
+    // metadata only.
+    let idle = next_agent_idle(&mut sub, &agent_id).await;
+    let waiting = idle["waitingOnHooks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent:idle carries waitingOnHooks with an active hook: {idle}"));
+    let watcher_entry = waiting
+        .iter()
+        .find(|h| h["hookId"] == json!(watcher_id))
+        .unwrap_or_else(|| panic!("waitingOnHooks names the active watcher: {idle}"));
+    assert_eq!(watcher_entry["name"], "watcher", "{idle}");
+    assert!(
+        watcher_entry["nextRunAt"].is_string() && watcher_entry["expiresAt"].is_string(),
+        "waitingOnHooks entries carry the schedule timestamps: {idle}"
+    );
+    assert!(
+        watcher_entry.get("code").is_none() && watcher_entry.get("lastLogs").is_none(),
+        "waitingOnHooks stays light — no code/logs: {idle}"
+    );
+
+    // agent.get overlays the same list on the AgentLite projection (§5.5).
+    let got = wss_rpc(
+        &mut rpc,
+        204,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        got["agent"]["waitingOnHooks"]
+            .as_array()
+            .is_some_and(|hooks| hooks.iter().any(|h| h["hookId"] == json!(watcher_id))),
+        "agent.get serves waitingOnHooks for the hook-owning agent: {got}"
+    );
 
     // FE read: hook.list reports both hooks with the wire `{ hooks }` shape.
     let listed = wss_rpc(&mut rpc, 201, "hook.list", json!({ "workspaceId": ws_id })).await;
@@ -784,4 +894,165 @@ async fn hook_lifecycle_over_wss() {
         err["error"]["code"], -32602,
         "missing workspaceId ⇒ -32602: {err}"
     );
+
+    // ── 6. State carry-over: counter hook dispatches when n reaches 2 ────
+    let sent = wss_rpc(
+        &mut rpc,
+        600,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SCHEDULE_COUNTER" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Validation run persists { n: 1 } and the hook stays scheduled.
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("counter")).await;
+    assert_eq!(completed["data"]["state"], "scheduled", "{completed}");
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("counter")).await;
+    let counter_id = scheduled["data"]["hookId"]
+        .as_str()
+        .expect("counter hookId")
+        .to_string();
+    let listed = wss_rpc(&mut rpc, 601, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let counter = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(counter_id))
+        .unwrap_or_else(|| panic!("counter in hook.list: {listed}"))
+        .clone();
+    assert_eq!(
+        counter["lastState"],
+        json!("{\"n\":1}"),
+        "validation run persisted its state: {counter}"
+    );
+
+    // Run 2: reads the injected { n: 1 }, persists { n: 2 }, stays scheduled.
+    let ran = wss_rpc(
+        &mut rpc,
+        602,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": counter_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "runNow ok: {ran}");
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("counter")).await;
+    assert_eq!(completed["data"]["state"], "scheduled", "{completed}");
+    let listed = wss_rpc(&mut rpc, 603, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let counter = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(counter_id))
+        .unwrap_or_else(|| panic!("counter in hook.list: {listed}"))
+        .clone();
+    assert_eq!(
+        counter["lastState"],
+        json!("{\"n\":2}"),
+        "carried state advanced: {counter}"
+    );
+
+    // Run 3: the carried count reaches the threshold — dispatch.
+    let ran = wss_rpc(
+        &mut rpc,
+        604,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": counter_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "runNow ok: {ran}");
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("counter")).await;
+    assert_eq!(completed["data"]["state"], "dispatched", "{completed}");
+    let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("counter")).await;
+    assert_eq!(dispatched["data"]["hookId"], json!(counter_id));
+    // The wake carries the count threaded through hookState.
+    await_conversation_contains(
+        &mut rpc,
+        610,
+        &ws_id,
+        &agent_id,
+        "[Background hook \\\"counter\\\"] counted 2",
+    )
+    .await;
+    let listed = wss_rpc(&mut rpc, 630, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let counter = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(counter_id))
+        .unwrap_or_else(|| panic!("counter in hook.list: {listed}"))
+        .clone();
+    assert_eq!(counter["state"], "dispatched");
+    assert_eq!(counter["runCount"], 3, "dispatched on run 3: {counter}");
+
+    // ── 7. TTL expiry: short-TTL hook expires, owner woken (v3.1) ────────
+    let sent = wss_rpc(
+        &mut rpc,
+        700,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SCHEDULE_SHORTTTL" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("shortttl")).await;
+    let ttl_id = scheduled["data"]["hookId"]
+        .as_str()
+        .expect("shortttl hookId")
+        .to_string();
+
+    // hook.list surfaces the persisted expiresAt (ttlMs: 1 clamps to the
+    // 10s floor: expiresAt ≈ createdAt + 10s, well under the 60-min cap).
+    let listed = wss_rpc(&mut rpc, 701, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let ttl_hook = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(ttl_id))
+        .unwrap_or_else(|| panic!("shortttl in hook.list: {listed}"))
+        .clone();
+    assert!(
+        ttl_hook["expiresAt"].is_string(),
+        "expiresAt persisted: {ttl_hook}"
+    );
+
+    // The deadline (~10s out) passes without another run: hook:expired with
+    // payload parity with hook:cancelled (base data object, no extras).
+    let expired = next_hook_event(&mut sub, "hook:expired", Some("shortttl")).await;
+    assert_eq!(expired["data"]["state"], "expired", "{expired}");
+    assert_eq!(expired["data"]["hookId"], json!(ttl_id));
+    assert_eq!(expired["data"]["agentId"], json!(agent_id));
+
+    // Terminal in hook.list; runNow on an expired hook is -32602.
+    let listed = wss_rpc(&mut rpc, 702, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let ttl_hook = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(ttl_id))
+        .unwrap_or_else(|| panic!("shortttl in hook.list: {listed}"))
+        .clone();
+    assert_eq!(ttl_hook["state"], "expired");
+    assert_eq!(
+        ttl_hook.get("nextRunAt"),
+        None,
+        "nextRunAt cleared on expiry: {ttl_hook}"
+    );
+    let err = wss_rpc_raw(
+        &mut rpc,
+        703,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": ttl_id }),
+    )
+    .await;
+    assert_eq!(err["error"]["code"], -32602, "expired hook ⇒ -32602: {err}");
+
+    // The owner is woken with the expiry notice naming the reschedule option.
+    await_conversation_contains(
+        &mut rpc,
+        710,
+        &ws_id,
+        &agent_id,
+        "expired after reaching its TTL",
+    )
+    .await;
 }

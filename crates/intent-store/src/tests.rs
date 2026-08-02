@@ -97,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
         ]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
         ]
     );
 }
@@ -5173,6 +5173,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         run_count: 0,
         last_error: None,
         last_logs: None,
+        last_state: None,
+        expires_at: Some(now_iso()),
     }
 }
 
@@ -5300,6 +5302,10 @@ async fn hook_state_run_and_error_updates() {
         .await
         .expect("set last logs");
     store
+        .update_hook_last_state(&id, Some("{\"seen\":3}"))
+        .await
+        .expect("set last state");
+    store
         .update_hook_state(&id, HookState::Evicted)
         .await
         .expect("running -> evicted");
@@ -5307,12 +5313,19 @@ async fn hook_state_run_and_error_updates() {
     assert_eq!(got.state, HookState::Evicted);
     assert_eq!(got.last_error.as_deref(), Some("timeout after 5000ms"));
     assert_eq!(got.last_logs.as_deref(), Some("checked 3 PRs\nall green"));
+    assert_eq!(got.last_state.as_deref(), Some("{\"seen\":3}"));
 
     store
         .update_hook_last_logs(&id, None)
         .await
         .expect("clear last logs");
     assert_eq!(store.get_hook(&id).await.unwrap().last_logs, None);
+
+    store
+        .update_hook_last_state(&id, None)
+        .await
+        .expect("clear last state");
+    assert_eq!(store.get_hook(&id).await.unwrap().last_state, None);
 
     let missing = HookId("hook-missing".to_string());
     for err in [
@@ -5336,6 +5349,10 @@ async fn hook_state_run_and_error_updates() {
             .update_hook_last_logs(&missing, None)
             .await
             .expect_err("last logs"),
+        store
+            .update_hook_last_state(&missing, None)
+            .await
+            .expect_err("last state"),
         store.delete_hook(&missing).await.expect_err("delete"),
     ] {
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");

@@ -1393,11 +1393,18 @@ impl Services {
             .agent_list_cache
             .get_or_load(&self.store, &workspace_id)
             .await?;
+        // Idle-visibility: overlay each agent's active-hook metadata
+        // (`waitingOnHooks`, omitted when empty) from one workspace-wide
+        // hook query.
+        let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
         Ok(sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
-                self.project_lite_with_flags_from_projection(s, &projection)
+                let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
+                let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
+                lite.waiting_on_hooks = waiting_on_hooks;
+                lite
             })
             .collect())
     }
@@ -1433,7 +1440,12 @@ impl Services {
             .store
             .get_agent_session_message_projection(&agent_id)
             .await?;
-        Ok(self.project_lite_with_flags_from_projection(session, &projection))
+        // Idle-visibility: overlay the agent's active-hook metadata
+        // (`waitingOnHooks`, omitted when empty).
+        let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
+        let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
+        lite.waiting_on_hooks = waiting_on_hooks;
+        Ok(lite)
     }
 
     /// Project an [`AgentSession`] into [`AgentLite`] and overlay the daemon-owned
@@ -5561,6 +5573,9 @@ impl Services {
 
         // agents rows.
         all_agent_ids.sort();
+        // Idle-visibility: per-agent active-hook metadata (`waitingOnHooks`,
+        // omitted when empty) from one workspace-wide hook query.
+        let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -5624,6 +5639,11 @@ impl Services {
             );
             if let Some(la) = &last_activity {
                 row.insert("lastActivity".into(), json!(la));
+            }
+            if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
+                if !hooks.is_empty() {
+                    row.insert("waitingOnHooks".into(), Value::Array(hooks));
+                }
             }
             agent_rows.push(Value::Object(row));
         }

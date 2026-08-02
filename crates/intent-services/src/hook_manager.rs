@@ -1,8 +1,10 @@
 //! Background hook scheduler (spec: "JS kernel" watchers). A hook is a small
 //! agent-owned JavaScript script the daemon runs periodically (fixed
-//! `delayMs` between runs) until it signals a dispatch, fails, or is
-//! cancelled. Each active hook owns one tokio task; schedules persist to the
-//! `hook` table and rehydrate at boot ([`Services::rehydrate_hooks`]).
+//! `delayMs` between runs) until it signals a dispatch, fails, is cancelled,
+//! or its TTL expires (`expiresAt` = creation + clamped `ttlMs`, capped at
+//! 60 minutes — on expiry the owner is woken so it can reschedule). Each
+//! active hook owns one tokio task; schedules persist to the `hook` table
+//! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
 //! Scripts evaluate in QuickJS via `intent_js::eval` with the exact same
 //! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs
@@ -15,15 +17,17 @@
 //! `last_error`, emits `hook:evicted`, and wakes the owner with the reason.
 //! Scripts may call `console.log/info/warn/error`; the last run's captured
 //! output persists to `last_logs` (overwritten each run, capped) and is
-//! appended to dispatch/evict wake messages.
+//! appended to dispatch/evict wake messages. A run may also return a `state`
+//! field: its JSON serialization persists to `last_state` (size-capped) and
+//! is injected into the next run as the `hookState` global.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::events::{
-    HOOK_CANCELLED, HOOK_DISPATCHED, HOOK_EVICTED, HOOK_RUN_COMPLETED, HOOK_RUN_STARTED,
-    HOOK_SCHEDULED,
+    HOOK_CANCELLED, HOOK_DISPATCHED, HOOK_EVICTED, HOOK_EXPIRED, HOOK_RUN_COMPLETED,
+    HOOK_RUN_STARTED, HOOK_SCHEDULED,
 };
 use intent_core::{
     now_iso, AgentId, AgentStatus, Error, Hook, HookId, HookState, Result, WorkspaceApi,
@@ -40,6 +44,13 @@ use crate::{publish_event, system_actor, Services};
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
 /// rejected at schedule time.
 pub(crate) const MIN_HOOK_DELAY_MS: i64 = 10_000;
+
+/// Default and maximum hook TTL: every hook expires at most 60 minutes after
+/// creation. A schedulable `ttlMs` is clamped into
+/// `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]` (the floor is shared with
+/// `delayMs`); expiry counts from creation, not the last run.
+pub(crate) const MAX_HOOK_TTL_MS: i64 = 3_600_000;
+pub(crate) const DEFAULT_HOOK_TTL_MS: i64 = MAX_HOOK_TTL_MS;
 
 /// Maximum hook name length (spec: name > 19 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 19;
@@ -58,6 +69,11 @@ const HOOK_LOG_MAX_BYTES: usize = 8 * 1024;
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wake messages; longer captures are head-truncated to the most recent tail.
 const HOOK_WAKE_LOGS_CAP: usize = 2048;
+
+/// Cap (in bytes) on a run's JSON-serialized carry-over state. An oversized
+/// `state` is dropped (the previous state is kept) with a warning line
+/// appended to that run's logs.
+const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
 
 /// Control frames the service ops send to a hook's scheduler task.
 enum HookControl {
@@ -79,14 +95,41 @@ pub(crate) type HookTasks = Arc<Mutex<HashMap<HookId, HookHandle>>>;
 /// console output (`None` when the script logged nothing).
 enum RunOutcome {
     /// `{ dispatch: false }` / `undefined` — sleep and re-run.
-    Continue { logs: Option<String> },
+    Continue {
+        logs: Option<String>,
+        state: StateUpdate,
+    },
     /// `{ dispatch: true, message }` — wake the owner, terminate the hook.
     Dispatch {
         message: String,
         logs: Option<String>,
+        state: StateUpdate,
     },
     /// Throw or timeout — evict, persist the error, wake the owner.
     Failed { error: String, logs: RunLogs },
+}
+
+/// How a completed run updates the hook's persisted carry-over state
+/// (`last_state`).
+enum StateUpdate {
+    /// No `state` field returned (or it was oversized) — keep the previous
+    /// state.
+    Keep,
+    /// `state: null` — clear the persisted state.
+    Clear,
+    /// Replace the persisted state with this JSON serialization.
+    Set(String),
+}
+
+impl StateUpdate {
+    /// Fold this update into the in-memory hook.
+    fn apply(self, hook: &mut Hook) {
+        match self {
+            StateUpdate::Keep => {}
+            StateUpdate::Clear => hook.last_state = None,
+            StateUpdate::Set(s) => hook.last_state = Some(s),
+        }
+    }
 }
 
 /// Console capture attached to a failed run. A script throw is caught inside
@@ -104,6 +147,36 @@ fn next_run_at_iso(delay_ms: i64) -> String {
     (OffsetDateTime::now_utc() + time::Duration::milliseconds(delay_ms))
         .format(&Rfc3339)
         .unwrap_or_default()
+}
+
+/// Clamp a schedulable `ttlMs` into `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]`;
+/// `None` (omitted) takes the default (= the 60-minute cap).
+fn clamp_ttl_ms(ttl_ms: Option<i64>) -> i64 {
+    ttl_ms
+        .unwrap_or(DEFAULT_HOOK_TTL_MS)
+        .clamp(MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS)
+}
+
+/// Time remaining until `expires_at`, or `None` when the hook has no
+/// deadline (pre-TTL legacy rows). An unparseable or already-passed deadline
+/// returns `Some(Duration::ZERO)` — expire immediately.
+fn time_to_expiry(expires_at: Option<&str>) -> Option<Duration> {
+    let raw = expires_at?;
+    let Ok(deadline) = OffsetDateTime::parse(raw, &Rfc3339) else {
+        return Some(Duration::ZERO);
+    };
+    let remaining = deadline - OffsetDateTime::now_utc();
+    Some(if remaining.is_positive() {
+        Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
+    } else {
+        Duration::ZERO
+    })
+}
+
+/// Whether `expires_at` has passed (never true for deadline-free legacy
+/// rows).
+fn is_expired(expires_at: Option<&str>) -> bool {
+    time_to_expiry(expires_at) == Some(Duration::ZERO)
 }
 
 /// Evaluate one hook script in QuickJS with the full `ws.*` environment and
@@ -125,6 +198,16 @@ async fn run_hook_script(api: Arc<dyn WorkspaceApi>, hook: &Hook, timeout: Durat
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
+    // The previous run's carry-over state, injected as the `hookState`
+    // global. Embedded as a JSON.parse of a string literal so arbitrary
+    // persisted JSON can never break the envelope; a corrupt row (should
+    // never happen) falls back to null in Rust rather than throwing in JS.
+    let hook_state_literal = hook
+        .last_state
+        .as_deref()
+        .filter(|s| serde_json::from_str::<Value>(s).is_ok())
+        .map(|s| format!("JSON.parse({})", Value::String(s.to_string())))
+        .unwrap_or_else(|| "null".to_string());
     let full_code = format!(
         "{prelude}\n\
          const __hook_logs = [];\n\
@@ -155,6 +238,7 @@ async fn run_hook_script(api: Arc<dyn WorkspaceApi>, hook: &Hook, timeout: Durat
            }}\n\
          }};\n\
          const console = {{ log: __hook_log, info: __hook_log, warn: __hook_log, error: __hook_log }};\n\
+         const hookState = {hook_state_literal};\n\
          let __hook_user;\n\
          let __hook_threw = false;\n\
          let __hook_err = '';\n\
@@ -181,7 +265,10 @@ async fn run_hook_script(api: Arc<dyn WorkspaceApi>, hook: &Hook, timeout: Durat
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             match v.get("__k").and_then(Value::as_str) {
-                Some("u") => RunOutcome::Continue { logs },
+                Some("u") => RunOutcome::Continue {
+                    logs,
+                    state: StateUpdate::Keep,
+                },
                 Some("v") => parse_outcome(v.get("__v").cloned().unwrap_or(Value::Null), logs),
                 Some("e") => RunOutcome::Failed {
                     error: v
@@ -209,15 +296,65 @@ async fn run_hook_script(api: Arc<dyn WorkspaceApi>, hook: &Hook, timeout: Durat
 /// Interpret the script's returned value: only `{ dispatch: true }` fires a
 /// dispatch; everything else (including `null` and non-objects) re-runs.
 fn parse_outcome(v: Value, logs: Option<String>) -> RunOutcome {
+    let mut logs = logs;
+    let state = parse_state(&v, &mut logs);
     if v.get("dispatch").and_then(Value::as_bool) == Some(true) {
         let message = v
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("(hook dispatched with no message)")
             .to_string();
-        return RunOutcome::Dispatch { message, logs };
+        return RunOutcome::Dispatch {
+            message,
+            logs,
+            state,
+        };
     }
-    RunOutcome::Continue { logs }
+    RunOutcome::Continue { logs, state }
+}
+
+/// Interpret a returned `state` field: absent keeps the previous carry-over
+/// state, `null` clears it, anything else replaces it with its JSON
+/// serialization — unless that exceeds [`HOOK_STATE_MAX_BYTES`], in which
+/// case the previous state is kept and a warning line is appended to the
+/// run's logs (the combined capture is re-trimmed to [`HOOK_LOG_MAX_BYTES`],
+/// dropping the oldest output first, so `last_logs` stays bounded).
+fn parse_state(v: &Value, logs: &mut Option<String>) -> StateUpdate {
+    let Some(state) = v.as_object().and_then(|o| o.get("state")) else {
+        return StateUpdate::Keep;
+    };
+    if state.is_null() {
+        return StateUpdate::Clear;
+    }
+    let serialized = state.to_string();
+    if serialized.len() > HOOK_STATE_MAX_BYTES {
+        let warning = format!(
+            "[hook state dropped: {} bytes exceeds the {HOOK_STATE_MAX_BYTES}-byte cap; \
+             previous state kept]",
+            serialized.len()
+        );
+        let combined = match logs.take() {
+            Some(l) => format!("{l}\n{warning}"),
+            None => warning,
+        };
+        *logs = Some(tail_truncate(combined, HOOK_LOG_MAX_BYTES));
+        return StateUpdate::Keep;
+    }
+    StateUpdate::Set(serialized)
+}
+
+/// Keep at most the last `max_bytes` bytes of `s` (on a char boundary),
+/// dropping the oldest content first — the same tail-keep policy as the
+/// console shim's line buffer.
+fn tail_truncate(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
 }
 
 /// Append a run's captured console output to a wake message as a
@@ -241,6 +378,23 @@ fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
         "{message}\n\n[hook logs]\n[earlier log lines truncated]\n{}",
         &logs[start..]
     )
+}
+
+/// Project one active hook into its idle-visibility `waitingOnHooks` entry:
+/// `{ hookId, name, nextRunAt?, expiresAt? }` — light metadata only, no
+/// code/lastState/logs.
+fn waiting_on_hooks_entry(h: Hook) -> Value {
+    let mut v = json!({
+        "hookId": h.hook_id,
+        "name": h.name,
+    });
+    if let Some(next) = h.next_run_at {
+        v["nextRunAt"] = Value::String(next);
+    }
+    if let Some(exp) = h.expires_at {
+        v["expiresAt"] = Value::String(exp);
+    }
+    v
 }
 
 impl Services {
@@ -278,6 +432,9 @@ impl Services {
                 "hook.schedule: `delayMs` must be at least {MIN_HOOK_DELAY_MS}"
             )));
         }
+        // TTL (spec: 60-minute cap): optional `ttlMs`, clamped — never
+        // rejected — into [10s, 60min]; omitted takes the 60-minute default.
+        let ttl_ms = clamp_ttl_ms(params.get("ttlMs").and_then(Value::as_i64));
         // Per-agent cap on active hooks (`[hooks] maxPerAgent`).
         let cap = self.hooks_max_per_agent as usize;
         let active = self
@@ -293,6 +450,12 @@ impl Services {
             )));
         }
 
+        // expiresAt counts from creation: one instant feeds both fields.
+        let created = OffsetDateTime::now_utc();
+        let created_at = created.format(&Rfc3339).unwrap_or_else(|_| now_iso());
+        let expires_at = (created + time::Duration::milliseconds(ttl_ms))
+            .format(&Rfc3339)
+            .unwrap_or_default();
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: workspace_id.clone(),
@@ -301,12 +464,14 @@ impl Services {
             code: code.to_string(),
             delay_ms,
             state: HookState::Running,
-            created_at: now_iso(),
+            created_at,
             last_run_at: None,
             next_run_at: None,
             run_count: 0,
             last_error: None,
             last_logs: None,
+            last_state: None,
+            expires_at: Some(expires_at),
         };
 
         // Validation run (spec decision 4): a REAL run, before anything
@@ -319,12 +484,17 @@ impl Services {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
             ))),
-            RunOutcome::Dispatch { message, logs } => {
+            RunOutcome::Dispatch {
+                message,
+                logs,
+                state,
+            } => {
                 let mut hook = hook;
                 hook.state = HookState::Dispatched;
                 hook.last_run_at = Some(now_iso());
                 hook.run_count = 1;
                 hook.last_logs = logs;
+                state.apply(&mut hook);
                 self.store.insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
@@ -332,13 +502,24 @@ impl Services {
                 self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
                 Ok(json!({ "hook": hook, "dispatched": true }))
             }
-            RunOutcome::Continue { logs } => {
+            RunOutcome::Continue { logs, state } => {
                 let mut hook = hook;
-                hook.state = HookState::Scheduled;
                 hook.last_run_at = Some(now_iso());
-                hook.next_run_at = Some(next_run_at_iso(delay_ms));
                 hook.run_count = 1;
                 hook.last_logs = logs;
+                state.apply(&mut hook);
+                // A validation run that outlasts a short TTL completes
+                // normally, but a continue at/after expiresAt expires
+                // instead of scheduling (the in-flight-run-at-expiry rule).
+                if is_expired(hook.expires_at.as_deref()) {
+                    hook.state = HookState::Expired;
+                    self.store.insert_hook(&hook).await?;
+                    self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
+                    self.finish_expiry(&hook).await;
+                    return Ok(json!({ "hook": hook, "dispatched": false }));
+                }
+                hook.state = HookState::Scheduled;
+                hook.next_run_at = Some(next_run_at_iso(delay_ms));
                 self.store.insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, hook.next_run_at.clone())
                     .await;
@@ -366,6 +547,88 @@ impl Services {
             .filter(|h| &h.workspace_id == workspace_id)
             .collect();
         Ok(json!({ "hooks": hooks }))
+    }
+
+    /// Light metadata for `agent_id`'s ACTIVE (`scheduled`/`running`) hooks —
+    /// the idle-visibility `waitingOnHooks` payload: one
+    /// `{ hookId, name, nextRunAt?, expiresAt? }` object per active hook,
+    /// oldest first (no code/lastState/logs — payloads stay light). Empty when
+    /// the agent owns no active hook; a store failure is logged and reads as
+    /// empty (visibility is best-effort and must never block an idle emit or
+    /// wake delivery).
+    pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
+        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+            Ok(hooks) => hooks,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "active-hooks lookup failed; waitingOnHooks reads as empty"
+                );
+                return Vec::new();
+            }
+        };
+        hooks
+            .into_iter()
+            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
+            .map(waiting_on_hooks_entry)
+            .collect()
+    }
+
+    /// Workspace-batched variant of
+    /// [`active_hooks_for_agent`](Self::active_hooks_for_agent) for
+    /// `agent.list`: one store query for the whole workspace, grouped by
+    /// owning agent id (agents with no active hook are absent). A store
+    /// failure is logged and reads as empty, same as the per-agent lookup.
+    pub(crate) async fn active_hooks_by_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> HashMap<String, Vec<Value>> {
+        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+            Ok(hooks) => hooks,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-hooks workspace lookup failed; waitingOnHooks reads as empty"
+                );
+                return HashMap::new();
+            }
+        };
+        let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for h in hooks
+            .into_iter()
+            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
+        {
+            let agent = h.agent_id.0.clone();
+            by_agent
+                .entry(agent)
+                .or_default()
+                .push(waiting_on_hooks_entry(h));
+        }
+        by_agent
+    }
+
+    /// Stamp `waitingOnHooks` onto an `agent:idle`-style event `data` object
+    /// when `agent_id` owns at least one active hook (the field is omitted —
+    /// never `[]` — otherwise, and an existing stamp is left untouched).
+    /// Returns the stamped list (empty when nothing was stamped and no stamp
+    /// was present).
+    pub(crate) async fn annotate_waiting_on_hooks(
+        &self,
+        agent_id: &AgentId,
+        data: &mut Value,
+    ) -> Vec<Value> {
+        if let Some(existing) = data.get("waitingOnHooks").and_then(Value::as_array) {
+            return existing.clone();
+        }
+        let hooks = self.active_hooks_for_agent(agent_id).await;
+        if !hooks.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("waitingOnHooks".to_string(), Value::Array(hooks.clone()));
+            }
+        }
+        hooks
     }
 
     /// `hook.cancel`: stop an active hook's task, mark it cancelled, and emit
@@ -397,8 +660,15 @@ impl Services {
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
         if !by_owner {
+            // The FE-cancel wake runs the deferral backstop itself (inside
+            // `wake_hook_owner`, after the delivery attempt).
             self.wake_hook_owner(&hook, "This hook was cancelled from the app.", "cancelled")
                 .await;
+        } else {
+            // Owner-side cancel delivers no wake, so a deferred completion
+            // watch on the (idle) owner would otherwise never settle when
+            // this was its last active hook — run the backstop directly.
+            self.resettle_owner_after_hook_terminal(&hook).await;
         }
         Ok(json!({ "ok": true, "hook": hook }))
     }
@@ -439,9 +709,11 @@ impl Services {
 
     /// Boot rehydration: reload every active (`scheduled`/`running`) hook row
     /// and respawn its scheduler task. Rows whose owning agent is gone are
-    /// cancelled instead of resumed. `running` rows (daemon died mid-run) are
-    /// reset to `scheduled`; every resumed hook starts a fresh `delayMs`
-    /// countdown. Returns the number of resumed hooks.
+    /// cancelled instead of resumed; rows whose `expiresAt` passed while the
+    /// daemon was down are expired (owner woken). `running` rows (daemon died
+    /// mid-run) are reset to `scheduled`; every resumed hook starts a fresh
+    /// `delayMs` countdown but keeps its ORIGINAL `expiresAt` (the TTL does
+    /// not reset on restart). Returns the number of resumed hooks.
     pub async fn rehydrate_hooks(&self) -> Result<usize> {
         let hooks = self.store.load_active_hooks().await?;
         let mut resumed = 0;
@@ -466,6 +738,12 @@ impl Services {
                 hook.state = HookState::Cancelled;
                 hook.next_run_at = None;
                 self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
+                continue;
+            }
+            // Expired while the daemon was down: expire at boot (owner
+            // woken), never resume.
+            if is_expired(hook.expires_at.as_deref()) {
+                self.expire_hook(&mut hook).await;
                 continue;
             }
             let next_run_at = next_run_at_iso(hook.delay_ms);
@@ -500,7 +778,9 @@ impl Services {
     }
 
     /// Spawn the per-hook scheduler task: sleep `delayMs` (or a `runNow`
-    /// control frame), run the script, and act on the outcome. The task
+    /// control frame) raced against the TTL deadline, run the script, and
+    /// act on the outcome. A run is never STARTED at/after `expiresAt` (a
+    /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
@@ -510,8 +790,21 @@ impl Services {
             let mut hook = hook;
             loop {
                 let delay = Duration::from_millis(hook.delay_ms.max(0) as u64);
+                // Race the inter-run sleep against the time to `expiresAt`
+                // (deadline-free legacy rows never take the expiry arm).
+                let to_expiry = time_to_expiry(hook.expires_at.as_deref());
+                let expiry = async {
+                    match to_expiry {
+                        Some(d) => tokio::time::sleep(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
+                    _ = expiry => {
+                        services.expire_hook(&mut hook).await;
+                        break;
+                    }
                     ctl = control_rx.recv() => {
                         match ctl {
                             Some(HookControl::RunNow) => {}
@@ -521,6 +814,12 @@ impl Services {
                             None => break,
                         }
                     }
+                }
+                // Never start a run at/after expiresAt (guards a `runNow`
+                // — or a sleep expiry — racing the deadline).
+                if is_expired(hook.expires_at.as_deref()) {
+                    services.expire_hook(&mut hook).await;
+                    break;
                 }
                 match services.execute_hook_run(&mut hook).await {
                     Ok(true) => {}
@@ -548,7 +847,7 @@ impl Services {
 
     /// One scheduled run of `hook`'s script. Returns `Ok(true)` to keep the
     /// loop alive (script continued), `Ok(false)` on a terminal outcome
-    /// (dispatched or evicted).
+    /// (dispatched, evicted, or expired).
     async fn execute_hook_run(&self, hook: &mut Hook) -> Result<bool> {
         // A cancel can race the sleep expiry: re-read the persisted state and
         // stop silently if this hook is no longer active.
@@ -567,7 +866,31 @@ impl Services {
         let outcome = run_hook_script(api, hook, self.hook_eval_timeout).await;
         let last_run_at = now_iso();
         match outcome {
-            RunOutcome::Continue { logs } => {
+            RunOutcome::Continue { logs, state } => {
+                // In-flight-run-at-expiry: a run already executing when the
+                // TTL passes completes normally, but a continue at/after
+                // `expiresAt` expires the hook instead of rescheduling it
+                // (a dispatch still wins — see the Dispatch arm).
+                if is_expired(hook.expires_at.as_deref()) {
+                    self.store
+                        .update_hook_run(&hook.hook_id, &last_run_at, None)
+                        .await?;
+                    self.store
+                        .update_hook_last_logs(&hook.hook_id, logs.as_deref())
+                        .await?;
+                    self.persist_hook_state(hook, state).await?;
+                    self.store
+                        .update_hook_state(&hook.hook_id, HookState::Expired)
+                        .await?;
+                    hook.state = HookState::Expired;
+                    hook.last_run_at = Some(last_run_at);
+                    hook.next_run_at = None;
+                    hook.run_count += 1;
+                    hook.last_logs = logs;
+                    self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
+                    self.finish_expiry(hook).await;
+                    return Ok(false);
+                }
                 let next_run_at = next_run_at_iso(hook.delay_ms);
                 self.store
                     .update_hook_run(&hook.hook_id, &last_run_at, Some(&next_run_at))
@@ -575,6 +898,7 @@ impl Services {
                 self.store
                     .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                     .await?;
+                self.persist_hook_state(hook, state).await?;
                 self.store
                     .update_hook_state(&hook.hook_id, HookState::Scheduled)
                     .await?;
@@ -587,13 +911,18 @@ impl Services {
                     .await;
                 Ok(true)
             }
-            RunOutcome::Dispatch { message, logs } => {
+            RunOutcome::Dispatch {
+                message,
+                logs,
+                state,
+            } => {
                 self.store
                     .update_hook_run(&hook.hook_id, &last_run_at, None)
                     .await?;
                 self.store
                     .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                     .await?;
+                self.persist_hook_state(hook, state).await?;
                 self.store
                     .update_hook_state(&hook.hook_id, HookState::Dispatched)
                     .await?;
@@ -649,6 +978,27 @@ impl Services {
         }
     }
 
+    /// Apply a run's [`StateUpdate`] to the persisted row and the in-memory
+    /// hook (`Keep` writes nothing).
+    async fn persist_hook_state(&self, hook: &mut Hook, state: StateUpdate) -> Result<()> {
+        match state {
+            StateUpdate::Keep => {}
+            StateUpdate::Clear => {
+                self.store
+                    .update_hook_last_state(&hook.hook_id, None)
+                    .await?;
+                hook.last_state = None;
+            }
+            StateUpdate::Set(s) => {
+                self.store
+                    .update_hook_last_state(&hook.hook_id, Some(&s))
+                    .await?;
+                hook.last_state = Some(s);
+            }
+        }
+        Ok(())
+    }
+
     /// Best-effort terminalization after a store error killed the scheduler
     /// loop: without this the row can sit in `running`/`scheduled` with no
     /// live task behind it. Every step here is itself best-effort (the store
@@ -681,10 +1031,83 @@ impl Services {
         self.wake_hook_owner(hook, &notice, "evicted").await;
     }
 
+    /// Expire an active hook whose TTL deadline has passed and no run is in
+    /// flight: persist the terminal state, then emit + wake via
+    /// [`Services::finish_expiry`]. A cancel can race the expiry timer, so
+    /// the persisted state is re-read first and a no-longer-active hook is
+    /// left untouched. Persistence is best-effort (mirrors
+    /// `evict_hook_after_store_error`): the scheduler task is exiting either
+    /// way, so log rather than propagate.
+    async fn expire_hook(&self, hook: &mut Hook) {
+        match self.store.get_hook(&hook.hook_id).await {
+            Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
+            Ok(_) | Err(Error::NotFound(_)) => return,
+            Err(e) => {
+                tracing::warn!(hook = %hook.hook_id.0, error = %e, "expiry state re-read failed");
+            }
+        }
+        if let Err(e) = self
+            .store
+            .update_hook_state(&hook.hook_id, HookState::Expired)
+            .await
+        {
+            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expired state");
+        }
+        if let Err(e) = self.store.update_hook_next_run(&hook.hook_id, None).await {
+            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to clear hook nextRunAt");
+        }
+        hook.state = HookState::Expired;
+        hook.next_run_at = None;
+        self.finish_expiry(hook).await;
+    }
+
+    /// Terminal-expiry tail shared by every expiry path (the caller has
+    /// already persisted `state = expired`): emit `hook:expired` (payload
+    /// shape parity with `hook:cancelled`) and wake the owner so the model
+    /// can consciously reschedule. The wake names the hook, its run count,
+    /// and the reschedule option, with `[hook logs]` per the existing wake
+    /// conventions (`reason: "expired"` in messageMetadata).
+    async fn finish_expiry(&self, hook: &Hook) {
+        self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
+        let notice = format!(
+            "Your background hook \"{}\" expired after reaching its TTL ({} run{} completed \
+             without a dispatch). Schedule a new hook via ws.hook.schedule if the condition \
+             is still worth watching.",
+            hook.name,
+            hook.run_count,
+            if hook.run_count == 1 { "" } else { "s" }
+        );
+        let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
+        self.wake_hook_owner(hook, &notice, "expired").await;
+    }
+
+    /// Idle-visibility deferral backstop: after a hook reaches a terminal
+    /// state, re-run the deferred-completion redelivery for the owner. A
+    /// completion watch on an idle owner defers while it owns active hooks;
+    /// the wake-carrying transitions (dispatch/eviction/expiry — and the FE
+    /// cancel notice) resolve via the owner's wake turn ending, but a
+    /// terminal transition whose wake was not delivered (owner-side cancel
+    /// of the last hook, or a failed wake delivery) would otherwise strand
+    /// the deferred watch forever. Routes through
+    /// [`Services::redeliver_completion_after_queue_mutation`], whose guards
+    /// (interim-skip marker recorded, queue empty, not busy, no REMAINING
+    /// active hooks) make this a no-op in every other situation.
+    async fn resettle_owner_after_hook_terminal(&self, hook: &Hook) {
+        self.redeliver_completion_after_queue_mutation(&hook.agent_id)
+            .await;
+    }
+
     /// Wake the hook's owning agent via the automatic-delivery
     /// `agent.sendMessage` path (queue behind an in-flight turn, question
     /// hold respected). Best-effort: a delivery failure is logged, never
     /// propagated — the hook's own lifecycle transition already persisted.
+    ///
+    /// Every wake reason (`dispatched` / `evicted` / `expired` /
+    /// `cancelled`) marks a terminal hook transition, so the deferral
+    /// backstop runs after the delivery attempt: a FAILED wake on an idle
+    /// owner whose last hook just terminated must still settle the owner's
+    /// deferred completion watches (a successful wake makes the backstop a
+    /// no-op — the queued/running wake turn owns the settlement).
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
         let metadata = json!({
             "type": "hook_wake",
@@ -709,6 +1132,7 @@ impl Services {
                 "hook owner wake delivery failed"
             );
         }
+        self.resettle_owner_after_hook_terminal(hook).await;
     }
 
     /// Emit one `hook:*` lifecycle event with the canonical
@@ -1032,6 +1456,76 @@ mod tests {
         assert_eq!(listed["hooks"].as_array().unwrap().len(), 1);
     }
 
+    /// Idle-visibility gating: the `waitingOnHooks` stamp applied by every
+    /// `agent:idle` emit site carries the owner's ACTIVE (scheduled/running)
+    /// hooks only — light metadata, no code/logs — and is omitted entirely
+    /// (never `[]`) when the agent owns no active hook.
+    #[tokio::test]
+    async fn annotate_waiting_on_hooks_stamps_only_when_active_hooks_exist() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // No hooks at all: nothing stamped.
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_hooks(&owner, &mut data).await;
+        assert!(stamped.is_empty());
+        assert!(
+            data.get("waitingOnHooks").is_none(),
+            "field omitted when no active hooks: {data}"
+        );
+
+        // A terminal (dispatched) hook is not active: still nothing stamped.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "done-now",
+                    "code": "return { dispatch: true, message: 'done' };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule dispatching hook");
+        assert_eq!(out["dispatched"], json!(true));
+        let mut data = json!({ "agentId": owner.0 });
+        svc.annotate_waiting_on_hooks(&owner, &mut data).await;
+        assert!(
+            data.get("waitingOnHooks").is_none(),
+            "terminal hooks never stamp: {data}"
+        );
+
+        // An active (scheduled) hook stamps the light entry.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule active hook");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_hooks(&owner, &mut data).await;
+        assert_eq!(stamped.len(), 1);
+        let entry = &data["waitingOnHooks"][0];
+        assert_eq!(entry["hookId"], json!(hook.hook_id));
+        assert_eq!(entry["name"], json!("watcher"));
+        assert!(entry["nextRunAt"].is_string(), "{entry}");
+        assert!(entry["expiresAt"].is_string(), "{entry}");
+        // Payloads stay light: no code/lastState/logs.
+        assert!(entry.get("code").is_none());
+        assert!(entry.get("lastState").is_none());
+        assert!(entry.get("lastLogs").is_none());
+        // Another agent's idle is unaffected by this owner's hooks.
+        let other = AgentId::from("agent-other");
+        let mut data = json!({ "agentId": other.0 });
+        svc.annotate_waiting_on_hooks(&other, &mut data).await;
+        assert!(data.get("waitingOnHooks").is_none());
+    }
+
     #[tokio::test]
     async fn immediate_dispatch_short_circuits_schedule() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
@@ -1177,6 +1671,8 @@ mod tests {
             run_count: 0,
             last_error: None,
             last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -1209,6 +1705,8 @@ mod tests {
             run_count: 0,
             last_error: None,
             last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -1310,6 +1808,8 @@ mod tests {
             run_count: 3,
             last_error: None,
             last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
         };
         let scheduled = mk("sched", HookState::Scheduled, &owner);
         let running = mk("mid-run", HookState::Running, &owner);
@@ -1476,6 +1976,8 @@ mod tests {
             run_count: 0,
             last_error: None,
             last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -1537,5 +2039,492 @@ mod tests {
             out.len(),
             "msg\n\n[hook logs]\n[earlier log lines truncated]\n".len() + HOOK_WAKE_LOGS_CAP
         );
+    }
+
+    #[tokio::test]
+    async fn state_persists_from_validation_run_and_carries_into_next_run() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // The validation run sees `hookState === null`, persists a counter,
+        // and each later run increments it — dispatching once it reaches 2.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "counter",
+                    "code": "const n = (hookState === null) ? 0 : hookState.n; \
+                             if (n >= 2) { \
+                               return { dispatch: true, message: 'count ' + n }; \
+                             } \
+                             return { dispatch: false, state: { n: n + 1 } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        // The validation (arming) run persisted its state.
+        assert_eq!(hook.last_state.as_deref(), Some("{\"n\":1}"));
+        // hook.list serializes lastState.
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        assert_eq!(listed["hooks"][0]["lastState"], json!("{\"n\":1}"));
+        // Second run reads the injected state and advances it.
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.last_state.as_deref() == Some("{\"n\":2}")
+        })
+        .await;
+        // Third run dispatches with the carried-over count.
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow again");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        wait_for_wake(&svc, &owner, "count 2").await;
+    }
+
+    #[tokio::test]
+    async fn absent_state_keeps_and_null_state_clears() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Validation run sets state; the note-driven script then omits
+        // `state` (keep) and finally returns `state: null` (clear).
+        let mut probe = note(&ws, "state-note", "keep");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "keep-clear",
+                    "code": "const n = await ws.note.read('state-note'); \
+                             if (hookState === null) { \
+                               return { dispatch: false, state: { armed: true } }; \
+                             } \
+                             if (n.content.includes('clear')) { \
+                               return { dispatch: false, state: null }; \
+                             } \
+                             return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.last_state.as_deref(), Some("{\"armed\":true}"));
+        // Omitted `state` keeps the previous value.
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
+        assert_eq!(hook.last_state.as_deref(), Some("{\"armed\":true}"));
+        // `state: null` clears it.
+        probe.content = "clear".to_string();
+        svc.store().update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow again");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 3).await;
+        assert_eq!(hook.last_state, None);
+    }
+
+    #[tokio::test]
+    async fn oversized_state_is_dropped_with_a_log_warning() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // First run persists a small state; the second returns one beyond
+        // the 16 KiB cap — the previous state must survive and the run's
+        // logs must carry the warning line.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "too-big",
+                    "code": "if (hookState === null) { \
+                               return { dispatch: false, state: { small: true } }; \
+                             } \
+                             return { dispatch: false, state: { big: 'x'.repeat(20000) } };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.last_state.as_deref(), Some("{\"small\":true}"));
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
+        assert_eq!(
+            hook.last_state.as_deref(),
+            Some("{\"small\":true}"),
+            "previous state kept on overflow"
+        );
+        let logs = hook.last_logs.expect("warning logged");
+        assert!(logs.contains("[hook state dropped:"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn rehydrated_hook_injects_persisted_state_into_next_run() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Seed a scheduled row whose last_state was persisted by a previous
+        // daemon lifetime, rehydrate to spawn its task, and prove the next
+        // run sees the injected hookState by dispatching with its value.
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "rehydrated".to_string(),
+            code: "return { dispatch: true, message: 'saw n=' + hookState.n };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 1,
+            last_error: None,
+            last_logs: None,
+            last_state: Some("{\"n\":7}".to_string()),
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        // A null/missing hookState would throw on `.n` and evict instead.
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        wait_for_wake(&svc, &owner, "saw n=7").await;
+    }
+
+    #[test]
+    fn ttl_clamp_defaults_and_bounds() {
+        assert_eq!(clamp_ttl_ms(None), MAX_HOOK_TTL_MS);
+        assert_eq!(clamp_ttl_ms(Some(7_200_000)), MAX_HOOK_TTL_MS);
+        assert_eq!(clamp_ttl_ms(Some(1)), MIN_HOOK_DELAY_MS);
+        assert_eq!(clamp_ttl_ms(Some(0)), MIN_HOOK_DELAY_MS);
+        assert_eq!(clamp_ttl_ms(Some(-5)), MIN_HOOK_DELAY_MS);
+        assert_eq!(clamp_ttl_ms(Some(300_000)), 300_000);
+    }
+
+    /// Milliseconds between a hook's `created_at` and `expires_at`.
+    fn ttl_of(hook: &Hook) -> i64 {
+        let created = OffsetDateTime::parse(&hook.created_at, &Rfc3339).expect("created_at");
+        let expires =
+            OffsetDateTime::parse(hook.expires_at.as_deref().expect("expires_at"), &Rfc3339)
+                .expect("expires_at");
+        (expires - created).whole_milliseconds() as i64
+    }
+
+    #[tokio::test]
+    async fn schedule_persists_clamped_expires_at() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Omitted ttlMs → the 60-minute default.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "default-ttl", "code": "return { dispatch: false };",
+                         "delayMs": 10_000 }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(ttl_of(&hook), MAX_HOOK_TTL_MS);
+        // Oversized ttlMs → clamped to the cap; undersized → the 10s floor.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "big-ttl", "code": "return { dispatch: false };",
+                         "delayMs": 10_000, "ttlMs": 7_200_000 }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(ttl_of(&hook), MAX_HOOK_TTL_MS);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "small-ttl", "code": "return { dispatch: false };",
+                         "delayMs": 10_000, "ttlMs": 1 }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(ttl_of(&hook), MIN_HOOK_DELAY_MS);
+        // In-range ttlMs persists as-is; the row round-trips and hook.list
+        // serializes expiresAt.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "mid-ttl", "code": "return { dispatch: false };",
+                         "delayMs": 10_000, "ttlMs": 300_000 }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(ttl_of(&hook), 300_000);
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.expires_at, hook.expires_at);
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let mid = listed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == json!("mid-ttl"))
+            .expect("mid-ttl listed");
+        assert_eq!(mid["expiresAt"], json!(hook.expires_at.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn hook_expires_during_sleep_and_wakes_owner() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Deadline 300ms out, inter-run delay 10s: the scheduler's expiry arm
+        // must win the select and expire the hook without another run.
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "short-ttl".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 2,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(300)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(expired.run_count, 2, "no run at/after expiry");
+        assert!(expired.next_run_at.is_none());
+        let types = hook_event_types(&svc, &ws).await;
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        assert!(!types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
+        let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        assert!(text.contains("2 runs completed"), "{text}");
+        assert!(text.contains("ws.hook.schedule"), "{text}");
+        // Task deregistered after the terminal outcome.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while svc.hook_task_alive(&hook.hook_id) {
+            assert!(std::time::Instant::now() < deadline, "task not removed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn run_now_after_expiry_is_rejected_and_no_run_starts() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // The hook expires 250ms after rehydration; once expired, runNow must
+        // reject (not active) and no run may ever have started.
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "expired-runnow".to_string(),
+            code: "return { dispatch: true, message: 'must never run' };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(250)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(expired.run_count, 0, "the dispatching script never ran");
+        let err = svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap_err();
+        assert!(err.to_string().contains("not active"), "{err}");
+        let types = hook_event_types(&svc, &ws).await;
+        assert!(!types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
+        assert!(!types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        assert!(!text.contains("must never run"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn in_flight_run_at_expiry_completes_then_expires_on_continue() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Deadline 1s out; the run busy-waits past it and returns continue —
+        // the run completes normally but the hook expires instead of
+        // rescheduling.
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "slow-continue".to_string(),
+            code: "const t = Date.now(); while (Date.now() - t < 1500) {} \
+                   return { dispatch: false };"
+                .to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(1_000)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(expired.run_count, 1, "the in-flight run completed");
+        assert!(expired.last_run_at.is_some());
+        assert!(expired.next_run_at.is_none(), "no reschedule after expiry");
+        let types = hook_event_types(&svc, &ws).await;
+        assert!(types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_RUN_COMPLETED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_dispatch_at_expiry_still_wins() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "slow-dispatch".to_string(),
+            code: "const t = Date.now(); while (Date.now() - t < 1500) {} \
+                   return { dispatch: true, message: 'made it in time' };"
+                .to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(1_000)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        assert_eq!(hook.run_count, 1);
+        wait_for_wake(&svc, &owner, "made it in time").await;
+        let types = hook_event_types(&svc, &ws).await;
+        assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
+        assert!(!types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+    }
+
+    #[tokio::test]
+    async fn rehydration_expires_past_deadline_and_keeps_original_expiry() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let mk = |name: &str, expires_at: String| Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: name.to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 4,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(expires_at),
+        };
+        // Expired while the daemon was down vs. still inside its TTL.
+        let stale = mk("stale", next_run_at_iso(-60_000));
+        let fresh = mk("fresh", next_run_at_iso(MAX_HOOK_TTL_MS));
+        svc.store().insert_hook(&stale).await.unwrap();
+        svc.store().insert_hook(&fresh).await.unwrap();
+
+        let resumed = svc.rehydrate_hooks().await.expect("rehydrate");
+        assert_eq!(resumed, 1, "only the unexpired hook resumes");
+        assert!(!svc.hook_task_alive(&stale.hook_id));
+        assert!(svc.hook_task_alive(&fresh.hook_id));
+        let expired = svc.store().get_hook(&stale.hook_id).await.unwrap();
+        assert_eq!(expired.state, HookState::Expired);
+        assert!(expired.next_run_at.is_none());
+        let types = hook_event_types(&svc, &ws).await;
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        // The boot expiry wakes the owner too.
+        let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        assert!(text.contains("4 runs completed"), "{text}");
+        // The resumed hook keeps its ORIGINAL expiresAt (TTL never resets).
+        let kept = svc.store().get_hook(&fresh.hook_id).await.unwrap();
+        assert_eq!(kept.expires_at, fresh.expires_at);
+    }
+
+    #[test]
+    fn time_to_expiry_handles_missing_past_and_future() {
+        assert_eq!(time_to_expiry(None), None);
+        assert!(!is_expired(None), "legacy rows never expire");
+        assert_eq!(
+            time_to_expiry(Some("not-a-timestamp")),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            time_to_expiry(Some(&next_run_at_iso(-5_000))),
+            Some(Duration::ZERO)
+        );
+        assert!(is_expired(Some(&next_run_at_iso(-5_000))));
+        let future = next_run_at_iso(30_000);
+        let remaining = time_to_expiry(Some(&future)).expect("future deadline");
+        assert!(remaining > Duration::from_secs(25), "{remaining:?}");
+        assert!(!is_expired(Some(&future)));
+    }
+
+    #[test]
+    fn parse_state_keeps_clears_sets_and_caps() {
+        let mut logs = None;
+        assert!(matches!(
+            parse_state(&json!({ "dispatch": false }), &mut logs),
+            StateUpdate::Keep
+        ));
+        assert!(matches!(
+            parse_state(&json!({ "state": null }), &mut logs),
+            StateUpdate::Clear
+        ));
+        match parse_state(&json!({ "state": { "a": 1 } }), &mut logs) {
+            StateUpdate::Set(s) => assert_eq!(s, "{\"a\":1}"),
+            _ => panic!("expected Set"),
+        }
+        assert_eq!(logs, None);
+        // Oversized: kept, with the warning appended to existing logs.
+        let mut logs = Some("prior line".to_string());
+        let big = json!({ "state": "y".repeat(HOOK_STATE_MAX_BYTES + 1) });
+        assert!(matches!(parse_state(&big, &mut logs), StateUpdate::Keep));
+        let logs = logs.unwrap();
+        assert!(
+            logs.starts_with("prior line\n[hook state dropped:"),
+            "{logs}"
+        );
+        // Appending the warning never grows the capture past the log cap:
+        // the combined text is tail-truncated (oldest output dropped first).
+        let mut logs = Some("x".repeat(HOOK_LOG_MAX_BYTES));
+        assert!(matches!(parse_state(&big, &mut logs), StateUpdate::Keep));
+        let logs = logs.unwrap();
+        assert!(logs.len() <= HOOK_LOG_MAX_BYTES, "len = {}", logs.len());
+        assert!(logs.contains("[hook state dropped:"), "{logs}");
     }
 }

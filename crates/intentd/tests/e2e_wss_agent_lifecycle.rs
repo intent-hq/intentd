@@ -887,6 +887,13 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!(false),
         "agent:idle carries isWaitingForOtherAgents=false with no pending watches: {idle}"
     );
+    // Idle-visibility: `waitingOnHooks` is stamped only when the idle agent
+    // owns active background hooks — this agent owns none, so the field is
+    // omitted entirely (absent, never `[]`).
+    assert!(
+        idle.get("waitingOnHooks").is_none(),
+        "agent:idle omits waitingOnHooks when the agent owns no active hook: {idle}"
+    );
     assert!(
         transitions.contains(&("active".to_string(), true)),
         "saw active/isActive=true transition (got {transitions:?})"

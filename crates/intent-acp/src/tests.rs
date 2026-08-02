@@ -6686,7 +6686,6 @@ mod wsapi6_bindings_tests {
         Option<String>,
     );
     type PrReviewCommentsCall = (Option<String>, Option<String>);
-    type PrWaitCall = (Option<i64>, Option<i64>, Option<String>);
     type PrResolveThreadCall = (String, Option<String>);
     type PrReplyCall = (u64, String);
     type CrossReadCall = (String, String);
@@ -6702,7 +6701,6 @@ mod wsapi6_bindings_tests {
         pr_resolve_thread_calls: Mutex<Vec<PrResolveThreadCall>>,
         pr_list_comments_calls: Mutex<Vec<Option<i64>>>,
         pr_post_comment_calls: Mutex<Vec<String>>,
-        pr_wait_calls: Mutex<Vec<PrWaitCall>>,
         cross_list_siblings_calls: Mutex<u32>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
@@ -6788,28 +6786,6 @@ mod wsapi6_bindings_tests {
                     "alreadyUpToDate": false,
                     "message": "PR branch updated.",
                     "url": null,
-                }))
-            })
-        }
-
-        fn pr_wait_for_changes(
-            &self,
-            _ws: WorkspaceId,
-            timeout_seconds: Option<i64>,
-            poll_interval_seconds: Option<i64>,
-            watch: Option<String>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_wait_calls.lock().unwrap().push((
-                timeout_seconds,
-                poll_interval_seconds,
-                watch,
-            ));
-            Box::pin(async {
-                Ok(json!({
-                    "changed": false,
-                    "elapsedSeconds": 0,
-                    "iterations": 0,
-                    "summary": "no changes",
                 }))
             })
         }
@@ -7176,32 +7152,6 @@ mod wsapi6_bindings_tests {
     }
 
     #[tokio::test]
-    async fn pr_wait_for_changes_validates_watch_mode() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.waitForChanges({ watch: 'bogus' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("watch must be one of"));
-        assert!(api.pr_wait_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pr_wait_for_changes_forwards_options() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.waitForChanges({ timeoutSeconds: 60, pollIntervalSeconds: 15, watch: 'checks' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.pr_wait_calls.lock().unwrap();
-        assert_eq!(calls[0], (Some(60), Some(15), Some("checks".to_string())));
-    }
-
-    #[tokio::test]
     async fn pr_list_review_comments_validates_status() {
         let (srv, _api) = server();
         let resp = call(
@@ -7448,6 +7398,7 @@ mod wsapi4_bindings_tests {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: vec![],
+            waiting_on_hooks: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: None,

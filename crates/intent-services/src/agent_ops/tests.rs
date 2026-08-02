@@ -10279,6 +10279,490 @@ async fn parent_messages_text(svc: &Services, parent: &AgentId) -> String {
     serde_json::to_string(&blocks).expect("serialize content blocks")
 }
 
+/// Seed one ACTIVE (scheduled) hook row owned by `agent` directly in the
+/// store — the idle-visibility lookups read persisted hook rows, so no
+/// scheduler task is needed.
+async fn seed_active_hook(
+    svc: &Services,
+    ws: &WorkspaceId,
+    agent: &AgentId,
+    name: &str,
+) -> intent_core::Hook {
+    let hook = intent_core::Hook {
+        hook_id: intent_core::HookId::new(),
+        workspace_id: ws.clone(),
+        agent_id: agent.clone(),
+        name: name.to_string(),
+        code: "return { dispatch: false };".to_string(),
+        delay_ms: 10_000,
+        state: intent_core::HookState::Scheduled,
+        created_at: now_iso(),
+        last_run_at: None,
+        next_run_at: Some("2026-08-02T14:00:00Z".to_string()),
+        run_count: 1,
+        last_error: None,
+        last_logs: None,
+        last_state: None,
+        expires_at: Some("2026-08-02T15:00:00Z".to_string()),
+    };
+    svc.store().insert_hook(&hook).await.expect("insert hook");
+    hook
+}
+
+/// Idle-visibility deferral (a)+(b): a watched child going idle while owning
+/// an active hook delivers NO wake and the watch STAYS ARMED; the child's
+/// later idle with no active hooks fires the watch exactly once as a normal
+/// completion.
+#[tokio::test]
+async fn hook_waiting_idle_defers_watch_until_hookless_idle() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // (a) Idle while the hook is active: deferred — no wake, watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake while the child waits on its hook"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed through the deferred idle"
+    );
+
+    // (b) The hook dispatches (terminal) and the wake turn ends: the next
+    // idle is the child's real completion — the watch fires once.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "handled the dispatch" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retires at the real completion"
+    );
+}
+
+/// Idle-visibility does not fabricate the flag: a hookless child's completion
+/// wake stays the plain "completed" text with no waitingOnHooks mention.
+#[tokio::test]
+async fn completion_wake_without_hooks_stays_plain() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        !text.contains("waiting on background hook"),
+        "no fabricated waiting line: {text}"
+    );
+}
+
+/// Idle-visibility deferral (c) in after_all groups: a hook-waiting child
+/// does NOT count as settled — the sealed group stays open past its idle —
+/// and the group settles with one aggregated wake when the child later
+/// completes for real (idle with no active hooks).
+#[tokio::test]
+async fn after_all_group_waits_for_hook_waiting_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // Child idles while its hook is active: NOT recorded as settled.
+    let mut data = json!({ "agentId": child.0 });
+    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
+    svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+        .await;
+
+    // Parent idles: the group seals but stays open — the hook-waiting child
+    // is unsettled, so no aggregated wake fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "sealed group waits for the hook-waiting child"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The hook expires and the child's expiry-wake turn ends hookless: the
+    // group records the real completion and fires exactly one wake.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Expired)
+        .await
+        .expect("expire hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "hook expired, wrapped up" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "grouped watches removed at settlement"
+    );
+}
+
+/// Idle-visibility deferral (d): terminal signals are never hook-deferred —
+/// a watched child that FAILS while owning an active hook still wakes the
+/// parent immediately.
+#[tokio::test]
+async fn agent_failed_wakes_immediately_despite_active_hooks() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "turn exploded" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "failure wake is immediate regardless of active hooks"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("failed"), "{text}");
+}
+
+/// Idle-visibility deferral (d, continued): the immediate wake paths that
+/// bypass agent:idle settlement — `reportToParent`, the blocker/discussion
+/// attention fan-out, and `agent:deleted` — are never hook-deferred.
+#[tokio::test]
+async fn immediate_wake_paths_ignore_active_hooks() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // reportToParent wakes immediately despite the active hook.
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "reportToParent wake is immediate"
+    );
+
+    // Blocker attention fan-out wakes immediately despite the active hook.
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox broke".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("blocker");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "blocker attention wake is immediate"
+    );
+
+    // agent:deleted settles the (report_delivered) watch despite the hook.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "agent:deleted retires the watch regardless of active hooks"
+    );
+}
+
+/// Idle-visibility deferral (e): an external (FE) `hook.cancel` on an idle
+/// child whose watch was deferred fires the deferred watch — the cancel was
+/// the last active hook's terminal transition, and its owner wake +
+/// redelivery backstop settle the completion.
+#[tokio::test]
+async fn external_hook_cancel_settles_deferred_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle with the hook active: deferred (marker recorded, watch armed).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // FE cancels the hook (by_owner = false). In this store-only wiring the
+    // owner wake persists directly (no runtime turn), so the terminal-
+    // transition backstop synthesizes the child's completion and the
+    // deferred watch fires.
+    svc.hook_cancel_op(&ws, &hook.hook_id, false)
+        .await
+        .expect("cancel hook");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "deferred watch fires when the last active hook is cancelled"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("completed"),
+        "parent got the completion wake: {text}"
+    );
+}
+
+/// Idle-visibility deferral (f): a rehydrated watch on a child that is idle
+/// WITH active hooks must not refire at boot — reconciliation defers to the
+/// child's genuine completion (resumed hooks keep their TTL).
+#[tokio::test]
+async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        // The child looks genuinely complete by the STAB-108 predicate
+        // (Completed + report) — only its active hook defers the refire.
+        let mut s = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::Completed;
+        s.completion_report = Some("waiting on my hook".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+        (parent, child)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &parent).await,
+        0,
+        "no synthetic wake at boot while the child owns an active hook"
+    );
+    assert_eq!(
+        restarted.find_watches_for_child(&child).len(),
+        1,
+        "rehydrated watch stays armed for the post-hook completion"
+    );
+}
+
+/// Idle-visibility on the read surfaces: `agent.get`/`agent.list` overlay
+/// `waitingOnHooks` for hook-owning agents (omitted when empty) and
+/// `agent.diagnostics` agent rows carry the same list.
+#[tokio::test]
+async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
+    let (_t, svc, ws) = setup().await;
+    let hooked = create_agent(&svc, &ws, "Hooked").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let hook = seed_active_hook(&svc, &ws, &hooked, "inbox-poll").await;
+
+    // agent.get (the projection behind ws.agent.status).
+    let lite = svc
+        .agent_get_op(hooked.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert_eq!(lite.waiting_on_hooks.len(), 1);
+    let entry = &lite.waiting_on_hooks[0];
+    assert_eq!(entry["hookId"], json!(hook.hook_id));
+    assert_eq!(entry["name"], json!("inbox-poll"));
+    assert_eq!(entry["nextRunAt"], json!("2026-08-02T14:00:00Z"));
+    assert_eq!(entry["expiresAt"], json!("2026-08-02T15:00:00Z"));
+    assert!(entry.get("code").is_none(), "payload stays light");
+    // Omitted (not `[]`) on the wire when empty.
+    let wire = serde_json::to_value(&lite).unwrap();
+    assert!(wire.get("waitingOnHooks").is_some());
+    let bare_lite = svc
+        .agent_get_op(bare.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(bare_lite.waiting_on_hooks.is_empty());
+    let bare_wire = serde_json::to_value(&bare_lite).unwrap();
+    assert!(
+        bare_wire.get("waitingOnHooks").is_none(),
+        "field omitted for hookless agents: {bare_wire}"
+    );
+
+    // agent.list overlays the same data from the workspace-batched query.
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let by_id = |id: &AgentId| {
+        listed
+            .iter()
+            .find(|a| &a.id == id)
+            .expect("agent listed")
+            .clone()
+    };
+    assert_eq!(by_id(&hooked).waiting_on_hooks.len(), 1);
+    assert_eq!(
+        by_id(&hooked).waiting_on_hooks[0]["name"],
+        json!("inbox-poll")
+    );
+    assert!(by_id(&bare).waiting_on_hooks.is_empty());
+
+    // agent.diagnostics agent rows.
+    let diag = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .unwrap();
+    let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
+    let row = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(
+        row(&hooked)["waitingOnHooks"][0]["name"],
+        json!("inbox-poll")
+    );
+    assert!(
+        row(&bare).get("waitingOnHooks").is_none(),
+        "diagnostics omits the field for hookless agents"
+    );
+}
+
 /// Two after_all delegates from one parent share a single group whose expected
 /// set has both children, with two grouped watches and zero ungrouped watches.
 #[tokio::test]

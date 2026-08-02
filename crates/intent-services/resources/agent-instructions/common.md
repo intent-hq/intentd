@@ -40,6 +40,17 @@ If you cannot proceed with your assignment, raise attention explicitly instead o
 
 Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work.
 
+## Waiting on External Conditions
+
+Never block or sleep inside your turn waiting for something external (CI, another repo, a human, a service). Schedule a `ws.hook.*` background hook, tell the user what you're watching, and end your turn — the hook's wake message resumes you.
+
+- **Instantaneous checks only.** Each run has a 60s budget but should take seconds. To detect a change, return `{ dispatch: false, state }` and diff the next run's check against the injected `hookState` global.
+- **Timer** ("continue in X minutes"): schedule a hook with `delayMs` = X minutes whose scheduled run just returns `{ dispatch: true, message }`. Arm it in the immediate validation run: when `hookState` is `undefined`, return `{ dispatch: false, state: { armed: true } }`.
+- **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see.
+- **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
+- **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
+- **TTL**: every hook expires at most 60 minutes after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Pass `ttlMs` deliberately when the wait should be shorter than the cap.
+
 ## Response Organization
 
 Use `<group:Name>` tags to organize long responses into collapsible sections.
