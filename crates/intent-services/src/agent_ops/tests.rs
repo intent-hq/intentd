@@ -10065,6 +10065,216 @@ async fn group_no_double_fire() {
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
 }
 
+/// monorepo#1281 regression: a coordinator idling with a ready-to-send queued
+/// redrive is an INTERIM idle — it must NOT seal the open after_all group. A
+/// delegation made in the redriven turn joins the same group, the real
+/// (queue-drained) completion seals it, and settlement covers BOTH children
+/// with a single aggregated wake.
+#[tokio::test]
+async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let gid = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group exists")
+        .group_id;
+
+    // A queued redrive makes the parent's next idle interim: no seal.
+    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives the interim idle");
+    assert!(!group.sealed, "interim idle must not seal the group");
+
+    // The redriven turn delegates another child: it joins the SAME group.
+    let c2 = delegate_after_all(&svc, &ws, &parent).await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group exists");
+    assert_eq!(
+        group.group_id, gid,
+        "late delegate joins the still-open group"
+    );
+    assert!(group.expected_agent_ids.contains(&c2));
+
+    // Queue drains; the redriven turn's terminal idle is the real completion.
+    svc.take_queued_message(&parent, &queued.id)
+        .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("sealed group awaits its children");
+    assert!(group.sealed, "real completion seals the group");
+
+    // Both children settle → exactly one aggregated wake covering both.
+    for c in [&c1, &c2] {
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    }
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["eventCount"],
+        json!(2),
+        "settlement covers both children"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1281 guard (unchanged behavior): a coordinator's `agent:failed` /
+/// `agent:deleted` never seals its open group — only an idle real completion
+/// does.
+#[tokio::test]
+async fn parent_failed_or_deleted_does_not_seal_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let _c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &parent,
+        json!({ "agentId": parent.0, "error": "boom" }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives parent failure");
+    assert!(!group.sealed, "agent:failed must not seal the group");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives parent deletion event");
+    assert!(!group.sealed, "agent:deleted must not seal the group");
+}
+
+/// monorepo#1281 no-strand guard: when the redriven turn delegates nothing,
+/// the group still seals at the real (queue-drained) completion and settles
+/// normally — deferring the seal past the interim idle must not strand it.
+#[tokio::test]
+async fn group_seals_at_real_completion_when_redriven_turn_delegates_nothing() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no fire while the group is unsealed"
+    );
+
+    // The redriven turn delegates nothing; its terminal idle seals and the
+    // already-complete group fires.
+    svc.take_queued_message(&parent, &queued.id)
+        .expect("drain queue");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles at the real completion"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1281 (#841 interaction): a queue retraction that empties the
+/// coordinator's ready-to-send queue while it is idle synthesizes the REAL
+/// completion — the synthesized idle must seal the open group and settle it,
+/// even though the coordinator has no watchers of its own.
+#[tokio::test]
+async fn queue_retraction_synthesized_idle_seals_group() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    let (queued, _) = svc.enqueue_message(&parent, "redrive".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group survives the interim idle");
+    assert!(!group.sealed);
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // Retract the queued redrive: no further agent:idle is coming, so the
+    // retraction path's synthesized real completion must seal + fire.
+    svc.agent_remove_queued_message_op(parent.clone(), queued.id)
+        .await
+        .expect("remove queued message");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "synthesized real completion seals and settles the group"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
 /// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
 /// refreshed waiting flags: `true` + the child id on registration (delegate),
 /// `false` + empty after the aggregated wake clears the group watches.

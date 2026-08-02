@@ -2457,11 +2457,21 @@ impl Services {
             }
         }
 
-        self.deliver_completion_to_watches(&child, event).await;
+        let interim_idle = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
-        if event.event_type == AGENT_IDLE {
+        //
+        // monorepo#1281: an INTERIM idle (the agent still has ready-to-send
+        // queued messages) does NOT seal — the queued redrive may delegate
+        // more children into the open group, so the expected set is not final
+        // yet. The seal happens at the real completion: the idle after the
+        // queue drains (this path), or the synthesized idle a queue
+        // retraction/edit produces (`redeliver_completion_after_queue_mutation`
+        // seals there). The classification is the snapshot
+        // `deliver_completion_to_watches` returned, so the seal path and the
+        // watch-delivery path always agree on interim vs. real.
+        if event.event_type == AGENT_IDLE && !interim_idle {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
                 self.try_fire_group(&gid).await;
             }
@@ -2622,10 +2632,12 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
-    /// Record that an `agent:idle` for `child_id` was skipped as interim for
-    /// at least one ungrouped watch (monorepo#1280), so a later queue
-    /// retraction that empties the ready-to-send queue while the child is
-    /// idle re-runs watch delivery for it.
+    /// Record that an `agent:idle` for `child_id` was classified as interim
+    /// (monorepo#1280) — recorded up front, whether or not any ungrouped
+    /// watch matched (monorepo#1281) — so a later queue retraction that
+    /// empties the ready-to-send queue while the agent is idle synthesizes
+    /// the real completion: re-running watch delivery and sealing the
+    /// agent's open after_all group.
     fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
         self.interim_skipped_idles
             .lock()
@@ -2663,6 +2675,11 @@ impl Services {
     /// Synthesizes a fresh `agent:idle` (same construction as the
     /// rehydration reconcile path) rather than replaying the original event,
     /// so the payload carries the session's current name/completionReport.
+    ///
+    /// monorepo#1281: the synthesized idle IS the agent's real completion
+    /// (queue empty, no worker in flight), so after re-running watch delivery
+    /// this also seals the agent's open `after_all` group — the mutation
+    /// removed the redrive whose terminal idle would otherwise have sealed it.
     pub(crate) async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
         if !self.has_interim_skipped_idle(child_id) {
             return;
@@ -2681,11 +2698,13 @@ impl Services {
                 tracing::warn!(
                     child = %child_id.0,
                     error = %e,
-                    "queue-retraction redelivery: session lookup failed; watch stays armed"
+                    "queue-retraction redelivery: session lookup failed; watch stays armed and any open after_all group stays unsealed"
                 );
                 // Restore the marker so a later queue mutation (or drain
                 // no-op) can retry the redelivery — a transient store error
-                // must not permanently strand the watch.
+                // must not permanently strand the watch or leave the agent's
+                // open after_all group unsealed forever (the retried
+                // redelivery seals it below).
                 self.mark_interim_skipped_idle(child_id);
                 return;
             }
@@ -2720,7 +2739,22 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        // Real completion: seal the agent's open after_all group and try to
+        // fire it, mirroring `handle_completion_event`'s non-interim idle
+        // path (monorepo#1281). Gated on the delivery pass's own interim
+        // classification: an enqueue landing between this function's
+        // `has_ready_to_send` guard and the delivery re-classifies the
+        // synthesized idle as interim (marker re-recorded, so a later
+        // mutation/drain retries), and the seal must agree with that
+        // snapshot. Box::pin breaks the async-recursion cycle this edge
+        // closes (try_drain_queue → redeliver → try_fire_group →
+        // deliver_parent_wake → send_message → try_drain_queue).
+        if !interim {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
+        }
     }
 
     /// Wake every parent whose watch matches child_id, then drop that watch:
@@ -2753,7 +2787,15 @@ impl Services {
     /// on a different error or a non-failure completion); non-failure
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
-    pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
+    ///
+    /// Returns whether the event was classified as an interim idle, so the
+    /// caller's group-seal decision (`handle_completion_event`) shares this
+    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    pub(crate) async fn deliver_completion_to_watches(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+    ) -> bool {
         // Queue-aware completion: an `agent:idle` for a child whose pending
         // message queue still holds ready-to-send entries is an interim idle —
         // the drain loop is about to redrive the child, so ungrouped watches
@@ -2767,6 +2809,14 @@ impl Services {
         // premature wake, but the window shrinks from emit→delivery to
         // check→wake.)
         let interim_idle = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
+        // monorepo#1280/#1281: record the interim skip up front — even when
+        // no ungrouped watch matches — so a later queue retraction/edit that
+        // empties the ready-to-send queue while the agent is idle can
+        // synthesize the real completion (redelivering any skipped watches
+        // AND sealing a watchless coordinator's open after_all group).
+        if interim_idle {
+            self.mark_interim_skipped_idle(child_id);
+        }
         // The dedup clear is completion-scoped: an interim idle is not a
         // completion, so it must not clear failure-dedup state (a poisoned
         // child's replayed identical failure could otherwise slip a
@@ -2886,12 +2936,9 @@ impl Services {
             // ready-to-send queued messages, so this idle is not its real
             // completion — deliver nothing and leave the watch (including a
             // report_delivered one, which retires at the real completion)
-            // armed for the settlement that follows the queue drain.
+            // armed for the settlement that follows the queue drain. The
+            // interim-skip marker was recorded up front (monorepo#1280).
             if interim_idle {
-                // monorepo#1280: record the skip so a queue retraction that
-                // later empties the ready-to-send queue while the child is
-                // idle can re-run delivery for this still-armed watch.
-                self.mark_interim_skipped_idle(child_id);
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
@@ -2975,18 +3022,18 @@ impl Services {
             self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                 .await;
         }
-        // monorepo#1280: `interim_idle` was snapshotted at entry, but the
-        // skip markers land after `.await` points (the stall lookup, earlier
-        // watches' group-branch awaits). A retraction that emptied the queue
-        // inside that window found no marker and no-op'd — re-check now that
-        // the markers are in place and hand off to the mutation-path
-        // redelivery (its guards make this a no-op unless the queue really
-        // emptied and the agent is idle). The indirect async recursion is
-        // depth-1: the synthetic redelivery's event is non-interim by
-        // construction (queue empty), so its own pass never re-enters here.
+        // monorepo#1280: `interim_idle` was snapshotted at entry; a
+        // retraction that emptied the queue in the window between that
+        // snapshot and the marker landing found no marker and no-op'd —
+        // re-check now and hand off to the mutation-path redelivery (its
+        // guards make this a no-op unless the queue really emptied and the
+        // agent is idle). The indirect async recursion is depth-1: the
+        // synthetic redelivery's event is non-interim by construction
+        // (queue empty), so its own pass never re-enters here.
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
+        interim_idle
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
