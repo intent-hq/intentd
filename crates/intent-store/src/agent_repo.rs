@@ -1880,7 +1880,158 @@ fn encode_metadata(value: Option<&serde_json::Value>) -> Result<Option<String>> 
 }
 
 const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
+
+/// SQL scalar expression extracting the searchable plain text of an
+/// `agent_message` row (aliased `m`) for the `agent_message_fts` index
+/// (0074). Mirrors the search-side `message_text` extraction
+/// (intent-services `search_ops`) so index and preview agree: a bare JSON
+/// string is used as-is, an array of content blocks contributes each block's
+/// string `text` field joined by single spaces (order pinned to the array
+/// index via aggregate `ORDER BY`, SQLite 3.44+), and any other shape falls
+/// back to its compact JSON encoding. The `json_valid` guard keeps non-JSON
+/// content (impossible from the store's serde-encoded write paths) from
+/// erroring the statement. The 0074 migration's triggers/backfill embed the
+/// same expression; keep them in sync.
+const MESSAGE_FTS_TEXT_SQL: &str = "CASE \
+    WHEN json_valid(m.content) = 0 THEN m.content \
+    WHEN json_type(m.content) = 'text' THEN m.content ->> '$' \
+    WHEN json_type(m.content) = 'array' THEN COALESCE(\
+        (SELECT group_concat(m.content ->> (je.fullkey || '.text'), ' ' ORDER BY je.key) \
+           FROM json_each(m.content) AS je \
+          WHERE json_type(m.content, je.fullkey || '.text') = 'text'), '') \
+    ELSE json(m.content) END";
+
+/// `search.messages` `preferWorkspaceId` ranking boost, in bm25 units,
+/// subtracted from the bm25 rank (lower = better) of matches owned by the
+/// preferred workspace. Large enough to lift a preferred-workspace match above
+/// equally-relevant (and modestly better-scoring) matches elsewhere, small
+/// enough that a decisively better match from another workspace still wins.
+const PREFER_WORKSPACE_BOOST: f64 = 1.0;
+
+/// One `search.messages` hit from [`Store::search_agent_messages_fts`]: the
+/// message/agent ids and result-row context (owning workspace, agent display
+/// name, role, decoded content, timestamp) plus the adjusted bm25 rank
+/// (lower = more relevant).
+#[derive(Debug, Clone)]
+pub struct MessageFtsMatch {
+    pub message_id: String,
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub agent_name: String,
+    pub role: String,
+    pub content: serde_json::Value,
+    pub created_at: String,
+    pub rank: f64,
+}
+
 impl Store {
+    /// Rebuild the `agent_message_fts` full-text index (0074) from scratch:
+    /// delete-all, then re-insert the extracted text of every
+    /// user/assistant `agent_message` row keyed by its current rowid.
+    ///
+    /// The index is trigger-maintained on every message write, so this is
+    /// only needed after an operation that renumbers `agent_message`'s
+    /// implicit rowids — in practice the one-time activation `VACUUM` in
+    /// [`Store::activate_incremental_vacuum`] (`agent_message` has a TEXT
+    /// primary key, so `VACUUM` may reassign its rowids and silently desync
+    /// the rowid-keyed index). Runs in one write transaction.
+    pub async fn rebuild_agent_message_fts(&self) -> Result<()> {
+        let pool = self.write_pool();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("fts rebuild begin failed: {e}")))?;
+            sqlx::query("INSERT INTO agent_message_fts(agent_message_fts) VALUES('delete-all')")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("fts rebuild delete-all failed: {e}")))?;
+            let backfill = format!(
+                "INSERT INTO agent_message_fts(rowid, text) \
+                 SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
+                 WHERE m.role IN ('user', 'assistant')"
+            );
+            sqlx::query(&backfill)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("fts rebuild commit failed: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `search.messages` backing query: bm25-ranked hits from the
+    /// `agent_message_fts` index (0074), joined back to `agent_message` /
+    /// `agent_session` for the ids and result-row context. `match_expr` must
+    /// already be valid FTS5 query syntax (callers sanitize user input —
+    /// see `intent_search::fts_match_expr`). `workspace_id` is a hard scope
+    /// filter (`None` → all workspaces); `agent_id`/`role` narrow further.
+    /// `prefer_workspace_id` is a soft ranking boost: matches from that
+    /// workspace get [`PREFER_WORKSPACE_BOOST`] subtracted from their bm25
+    /// rank (lower = better), so they outrank equally-relevant matches from
+    /// other workspaces without excluding anyone. Rows order by adjusted rank,
+    /// then newest-first, one row per matching message. `limit` `None` → no
+    /// cap.
+    pub async fn search_agent_messages_fts(
+        &self,
+        match_expr: &str,
+        workspace_id: Option<&WorkspaceId>,
+        agent_id: Option<&str>,
+        role: Option<&str>,
+        prefer_workspace_id: Option<&WorkspaceId>,
+        limit: Option<i64>,
+    ) -> Result<Vec<MessageFtsMatch>> {
+        let rows = sqlx::query(
+            "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
+                    s.workspace_id, s.name AS agent_name, \
+                    bm25(agent_message_fts) \
+                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) AS adjusted_rank \
+             FROM agent_message_fts \
+             JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
+             JOIN agent_session s ON s.id = m.agent_id \
+             WHERE agent_message_fts MATCH ? \
+               AND (? IS NULL OR s.workspace_id = ?) \
+               AND (? IS NULL OR m.agent_id = ?) \
+               AND (? IS NULL OR m.role = ?) \
+             ORDER BY adjusted_rank ASC, m.created_at DESC, m.id ASC \
+             LIMIT ?",
+        )
+        .bind(prefer_workspace_id.map(|w| w.0.as_str()))
+        .bind(PREFER_WORKSPACE_BOOST)
+        .bind(match_expr)
+        .bind(workspace_id.map(|w| w.0.as_str()))
+        .bind(workspace_id.map(|w| w.0.as_str()))
+        .bind(agent_id)
+        .bind(agent_id)
+        .bind(role)
+        .bind(role)
+        .bind(limit.map_or(-1, |n| n.max(0)))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("search agent messages failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                let content: serde_json::Value =
+                    serde_json::from_str(&col::<String>(row, "content")?).map_err(|e| {
+                        Error::Internal(format!("decode message content failed: {e}"))
+                    })?;
+                Ok(MessageFtsMatch {
+                    message_id: col(row, "message_id")?,
+                    agent_id: col(row, "agent_id")?,
+                    workspace_id: col(row, "workspace_id")?,
+                    agent_name: col(row, "agent_name")?,
+                    role: col(row, "role")?,
+                    content,
+                    created_at: col(row, "created_at")?,
+                    rank: col(row, "adjusted_rank")?,
+                })
+            })
+            .collect()
+    }
+
     /// Append a message to an agent's insert-only log, minting a UUIDv7 id and
     /// the next monotonic `seq`, and return the persisted [`AgentMessage`].
     pub async fn append_agent_message(
@@ -2079,6 +2230,30 @@ impl Store {
             .map_err(|e| Error::Internal(format!("count agent messages failed: {e}")))?
             .get::<i64, _>("n");
         Ok(n)
+    }
+
+    /// 0-based chronological (`seq` ascending) position of one message within
+    /// an agent's log — the `aroundMessageId` seek anchor for
+    /// `agent.getConversation` (PROTOCOL §5.5). Metadata-only: counts earlier
+    /// rows over the `UNIQUE(agent_id, seq)` index without fetching or
+    /// decoding any `content`. An unknown message id (or a row belonging to a
+    /// different agent) resolves to `None`.
+    pub async fn get_agent_message_index(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM agent_message p \
+             WHERE p.agent_id = m.agent_id AND p.seq < m.seq) AS idx \
+             FROM agent_message m WHERE m.agent_id = ? AND m.id = ?",
+        )
+        .bind(&agent_id.0)
+        .bind(message_id)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get agent message index failed: {e}")))?;
+        Ok(row.map(|r| r.get::<i64, _>("idx")))
     }
 
     /// Read one offset window of an agent's messages in chronological (`seq`
@@ -5967,6 +6142,392 @@ mod tests {
             read_preview_columns(&store, &user_only).await,
             (None, Some("[\"only\"]".to_string())),
             "stale assistant value cleared to NULL; corrupt user value repaired"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Message ids whose `agent_message_fts` (0074) row matches `query`,
+    /// joined back through the rowid mapping (the FTS table is contentless,
+    /// so text is never read back directly — matches are the observable).
+    async fn fts_match_ids(store: &Store, query: &str) -> Vec<String> {
+        sqlx::query(
+            "SELECT m.id FROM agent_message_fts JOIN agent_message m \
+             ON m.rowid = agent_message_fts.rowid \
+             WHERE agent_message_fts MATCH ? ORDER BY m.id",
+        )
+        .bind(query)
+        .fetch_all(store.read_pool())
+        .await
+        .expect("fts match query")
+        .iter()
+        .map(|row| row.get::<String, _>("id"))
+        .collect()
+    }
+
+    async fn fts_row_count(store: &Store) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS n FROM agent_message_fts")
+            .fetch_one(store.read_pool())
+            .await
+            .expect("fts count")
+            .get("n")
+    }
+
+    /// Append-path FTS maintenance (0074): user/assistant appends are
+    /// indexed with the search-side `message_text` extraction semantics —
+    /// bare-string content as-is, content-block arrays as their string
+    /// `text` fields joined by single spaces (non-text blocks contribute
+    /// nothing), other shapes as compact JSON — while tool/system rows are
+    /// never indexed.
+    #[tokio::test]
+    async fn fts_appends_indexed_with_message_text_semantics() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-fts-append".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-fts-append".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        let user = store
+            .append_agent_message(
+                &agent,
+                "user",
+                &serde_json::json!([
+                    {"type": "text", "text": "please deploy the"},
+                    {"type": "tool_use", "name": "excludedblockterm"},
+                    {"type": "text", "text": "staging environment"},
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append user");
+        let assistant = store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!("bare string reply zebrafish"),
+                &ts,
+            )
+            .await
+            .expect("append assistant");
+        let fallback = store
+            .append_agent_message(
+                &agent,
+                "user",
+                &serde_json::json!({"unexpected": "shape", "word": "quokka"}),
+                &ts,
+            )
+            .await
+            .expect("append fallback-shape user");
+        store
+            .append_agent_message(
+                &agent,
+                "tool",
+                &serde_json::json!([{"type": "text", "text": "toolonlyterm"}]),
+                &ts,
+            )
+            .await
+            .expect("append tool");
+        store
+            .append_agent_message(
+                &agent,
+                "system",
+                &serde_json::json!([{"type": "text", "text": "systemonlyterm"}]),
+                &ts,
+            )
+            .await
+            .expect("append system");
+
+        assert_eq!(
+            fts_row_count(&store).await,
+            3,
+            "only the user/assistant rows are indexed"
+        );
+        // Phrase across the block boundary proves single-space joining.
+        assert_eq!(
+            fts_match_ids(&store, "\"the staging\"").await,
+            vec![user.id.clone()]
+        );
+        assert_eq!(
+            fts_match_ids(&store, "zebrafish").await,
+            vec![assistant.id.clone()]
+        );
+        // Porter stemming: "deploy" indexed, query with a stemmed variant.
+        assert_eq!(
+            fts_match_ids(&store, "deploying").await,
+            vec![user.id.clone()]
+        );
+        // Non-string/array content falls back to its compact JSON encoding.
+        assert_eq!(fts_match_ids(&store, "quokka").await, vec![fallback.id]);
+        // Non-text blocks and non-user/assistant roles contribute nothing.
+        assert!(fts_match_ids(&store, "excludedblockterm").await.is_empty());
+        assert!(fts_match_ids(&store, "toolonlyterm").await.is_empty());
+        assert!(fts_match_ids(&store, "systemonlyterm").await.is_empty());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The `agent.replaceMessages` swap (DELETE + re-INSERT) drops every
+    /// stale FTS row and indexes only the replacement batch's
+    /// user/assistant rows; deleting the session cascades `agent_message`
+    /// away and the cascade fires the FTS delete trigger, emptying the
+    /// index.
+    #[tokio::test]
+    async fn fts_synced_on_replace_and_session_delete() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-fts-swap".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-fts-swap".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        for text in ["staleterm one", "staleterm two"] {
+            store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append original");
+        }
+        assert_eq!(fts_match_ids(&store, "staleterm").await.len(), 2);
+
+        let replacement_user = serde_json::json!([{"type": "text", "text": "freshterm"}]);
+        let replacement_tool = serde_json::json!([{"type": "text", "text": "swappedtoolterm"}]);
+        let replaced = store
+            .replace_agent_messages(
+                &agent,
+                &[
+                    ReplaceMessage {
+                        role: "user",
+                        content: &replacement_user,
+                        metadata: None,
+                        created_at: &ts,
+                    },
+                    ReplaceMessage {
+                        role: "tool",
+                        content: &replacement_tool,
+                        metadata: None,
+                        created_at: &ts,
+                    },
+                ],
+            )
+            .await
+            .expect("replace messages");
+        assert!(
+            fts_match_ids(&store, "staleterm").await.is_empty(),
+            "stale rows are gone after the swap"
+        );
+        assert_eq!(
+            fts_match_ids(&store, "freshterm").await,
+            vec![replaced[0].id.clone()]
+        );
+        assert!(fts_match_ids(&store, "swappedtoolterm").await.is_empty());
+        assert_eq!(fts_row_count(&store).await, 1);
+
+        assert!(store
+            .delete_agent_session(&ws_id, &agent)
+            .await
+            .expect("delete session"));
+        assert_eq!(
+            fts_row_count(&store).await,
+            0,
+            "cascade delete of agent_message empties the index"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The 0074 migration backfills pre-existing rows: raw-inserted messages
+    /// (triggers dropped to simulate a pre-0074 database) become searchable
+    /// after re-running the migration file verbatim, with the same role
+    /// filter and extraction semantics as the write-time triggers.
+    #[tokio::test]
+    async fn fts_migration_backfills_existing_rows() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-fts-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-fts-backfill".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // Recreate the pre-0074 shape (no FTS table, no triggers), then
+        // raw-insert rows the way a pre-0074 daemon would have.
+        for stmt in [
+            "DROP TRIGGER agent_message_fts_after_insert",
+            "DROP TRIGGER agent_message_fts_after_delete",
+            "DROP TRIGGER agent_message_fts_after_update",
+            "DROP TABLE agent_message_fts",
+        ] {
+            sqlx::query(stmt)
+                .execute(store.write_pool())
+                .await
+                .expect("drop 0074 objects");
+        }
+        for (seq, (role, content)) in [
+            ("user", "[{\"type\":\"text\",\"text\":\"backfilledterm\"}]"),
+            (
+                "tool",
+                "[{\"type\":\"text\",\"text\":\"backfilltoolterm\"}]",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+                 VALUES (?,?,?,?,?,?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&agent.0)
+            .bind(seq as i64)
+            .bind(*role)
+            .bind(*content)
+            .bind(&ts)
+            .execute(store.write_pool())
+            .await
+            .expect("insert raw pre-0074 row");
+        }
+
+        sqlx::raw_sql(include_str!("../migrations/0074_agent_message_fts.sql"))
+            .execute(store.write_pool())
+            .await
+            .expect("re-run 0074 migration");
+
+        assert_eq!(fts_match_ids(&store, "backfilledterm").await.len(), 1);
+        assert!(fts_match_ids(&store, "backfilltoolterm").await.is_empty());
+        assert_eq!(fts_row_count(&store).await, 1);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The one-time activation VACUUM (`activate_incremental_vacuum`) may
+    /// renumber `agent_message`'s implicit rowids (TEXT primary key), so it
+    /// rebuilds the rowid-keyed FTS index afterwards: matches keep resolving
+    /// to the correct message rows even when rowids actually shifted.
+    #[tokio::test]
+    async fn fts_rebuilt_after_vacuum_activation() {
+        use crate::AutoVacuumActivation;
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        // Legacy DB in auto_vacuum=NONE mode so activation runs a real VACUUM
+        // (Store::open's pragma is recorded but inert on an existing file).
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&tmp)
+                .create_if_missing(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .expect("open legacy pool");
+            sqlx::query("CREATE TABLE filler (id INTEGER PRIMARY KEY, data BLOB)")
+                .execute(&pool)
+                .await
+                .expect("create filler");
+            pool.close().await;
+        }
+        let store = Store::open(&tmp).await.expect("open store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-fts-vacuum".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-fts-vacuum".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        // A deleted low-rowid row leaves a gap, so the VACUUM renumbers the
+        // survivor's implicit rowid — the desync the rebuild guards against.
+        let doomed = store
+            .append_agent_message(
+                &agent,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "doomed"}]),
+                &ts,
+            )
+            .await
+            .expect("append doomed");
+        let survivor = store
+            .append_agent_message(
+                &agent,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "survivorterm"}]),
+                &ts,
+            )
+            .await
+            .expect("append survivor");
+        sqlx::query("DELETE FROM agent_message WHERE id = ?")
+            .bind(&doomed.id)
+            .execute(store.write_pool())
+            .await
+            .expect("delete doomed row");
+
+        match store
+            .activate_incremental_vacuum()
+            .await
+            .expect("activation")
+        {
+            AutoVacuumActivation::Activated { .. } => {}
+            AutoVacuumActivation::AlreadyIncremental => {
+                panic!("first activation on a NONE DB should run VACUUM")
+            }
+        }
+
+        assert_eq!(
+            fts_match_ids(&store, "survivorterm").await,
+            vec![survivor.id.clone()],
+            "post-VACUUM matches resolve to the correct message row"
+        );
+        assert_eq!(fts_row_count(&store).await, 1);
+        // And the rebuilt index keeps tracking subsequent writes.
+        let after = store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": "postvacuumterm"}]),
+                &ts,
+            )
+            .await
+            .expect("append after rebuild");
+        assert_eq!(
+            fts_match_ids(&store, "postvacuumterm").await,
+            vec![after.id]
         );
 
         let _ = std::fs::remove_file(&tmp);

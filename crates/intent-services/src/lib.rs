@@ -8270,11 +8270,12 @@ impl WorkspaceApi for Services {
 
     fn search_messages(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         query: String,
         agent_id: Option<String>,
         role: Option<String>,
         limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
@@ -8283,17 +8284,26 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
-            let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let sessions = store.list_agent_sessions(&workspace_id).await?;
-            let matches = search_ops::message_matches(
-                &sessions,
-                &query,
-                agent_id.as_deref(),
-                role.as_deref(),
-                limit,
-            );
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, Some(workspace_id), matches, token))
+            // User-typed queries are never handed to the FTS5 parser verbatim
+            // (as-you-type input would surface `fts5: syntax error`); a query
+            // with no searchable tokens yields empty matches, not an error.
+            let hits = match intent_search::fts_match_expr(&query) {
+                Some(expr) => {
+                    store
+                        .search_agent_messages_fts(
+                            &expr,
+                            workspace_id.as_ref(),
+                            agent_id.as_deref(),
+                            role.as_deref(),
+                            prefer_workspace_id.as_ref(),
+                            limit,
+                        )
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            let matches = to_value_vec(search_ops::message_fts_matches(hits, &query))?;
+            Ok(services.deliver_search(request_id, workspace_id, matches, token))
         })
     }
 
@@ -15682,10 +15692,17 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_get_conversation_op(agent_id, limit, workspace_id, page_token)
-                .await
+            self.agent_get_conversation_op(
+                agent_id,
+                limit,
+                workspace_id,
+                page_token,
+                around_message_id,
+            )
+            .await
         })
     }
 

@@ -169,7 +169,13 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
 
     // Fetch full conversation (use agent.getConversation which returns { messages, ... })
     let conversation_result = api
-        .agent_get_conversation(agent_id.clone(), None, Some(workspace_id.clone()), None)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(workspace_id.clone()),
+            None,
+            None,
+        )
         .await
         .map_err(map_err)?;
     let all_messages = conversation_result
@@ -404,6 +410,7 @@ mod tests {
             _last_n: Option<i64>,
             _workspace_id: Option<WorkspaceId>,
             _include_tool_calls: Option<String>,
+            _around_message_id: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             let messages = self.conversation_messages.lock().unwrap().clone();
             Box::pin(async move { Ok(json!({ "messages": messages })) })

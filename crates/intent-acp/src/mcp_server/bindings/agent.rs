@@ -611,6 +611,7 @@ async fn read_conversation(
             last_n,
             Some(ws.clone()),
             page_token,
+            None,
         )
         .await
         .map_err(map_err)?;

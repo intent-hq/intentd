@@ -437,7 +437,7 @@ pub(crate) async fn channel_snapshot(
 /// [`channel_snapshot`]'s degrade-to-empty pattern).
 pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None)
+        .agent_get_conversation(agent_id.clone(), None, None, None, None)
         .await
     {
         Ok(v) => v,
@@ -622,7 +622,13 @@ impl ChatDeltaState {
         }
         let message_id = d.get("messageId").and_then(Value::as_str)?.to_string();
         let conv = api
-            .agent_get_conversation(AgentId::from(self.agent_id.as_str()), None, None, None)
+            .agent_get_conversation(
+                AgentId::from(self.agent_id.as_str()),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .ok()?;
         let messages = conv.get("messages").and_then(Value::as_array)?;
@@ -847,7 +853,13 @@ impl ChatDeltaState {
     async fn reconcile(&self, api: &dyn WorkspaceApi) -> Option<Value> {
         let message_id = self.message_id.clone()?;
         let conv = api
-            .agent_get_conversation(AgentId::from(self.agent_id.as_str()), None, None, None)
+            .agent_get_conversation(
+                AgentId::from(self.agent_id.as_str()),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .ok()?;
         let messages = conv.get("messages").and_then(Value::as_array)?;

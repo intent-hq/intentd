@@ -6,8 +6,12 @@
 
 use serde::Serialize;
 
-/// `search.messages` hit: the owning agent + message ids, a preview snippet, and
-/// an optional relevance score.
+/// `search.messages` hit: the owning agent + message ids, a preview snippet,
+/// an optional relevance score, plus the context fields a global (cross-
+/// workspace) result row needs to render — the owning workspace, the agent's
+/// display name, the message role, and its timestamp. The trailing fields are
+/// additive: existing callers reading `agentId`/`messageId`/`preview`/`score`
+/// are unaffected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageMatch {
@@ -16,6 +20,10 @@ pub struct MessageMatch {
     pub preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    pub workspace_id: String,
+    pub agent_name: String,
+    pub role: String,
+    pub timestamp: String,
 }
 
 /// `search.events` hit: the event id, a preview snippet, and an optional score.
@@ -90,6 +98,40 @@ pub fn make_preview(text: &str, query: &str) -> String {
         out.push('…');
     }
     out.trim().to_string()
+}
+
+/// Build a safe FTS5 MATCH expression from a raw user-typed query, or `None`
+/// when the query has no searchable tokens. User input is never passed to the
+/// FTS5 query parser verbatim — operators, quotes, and punctuation would
+/// surface as `fts5: syntax error` (§9 Internal) on every as-you-type
+/// keystroke. Instead the query is reduced to its alphanumeric tokens (the
+/// `unicode61` tokenizer's separator model), each emitted as a quoted phrase
+/// token joined with `AND`. The final token — presumed mid-typing — also
+/// matches as a prefix (`("tok" OR "tok"*)`): the plain branch is porter-
+/// stemmed like the index, while the starred branch catches partial words the
+/// stemmer would miss.
+pub fn fts_match_expr(raw: &str) -> Option<String> {
+    let tokens: Vec<&str> = raw
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let (last, init) = tokens.split_last()?;
+    let mut parts: Vec<String> = init.iter().map(|t| format!("\"{t}\"")).collect();
+    parts.push(format!("(\"{last}\" OR \"{last}\"*)"));
+    Some(parts.join(" AND "))
+}
+
+/// Build a preview snippet for an FTS hit: window around the first raw-query
+/// token that occurs literally (case-insensitively) in `text`, falling back to
+/// the head of the text when no token appears verbatim (porter stemming can
+/// match without a literal occurrence).
+pub fn fts_preview(text: &str, raw_query: &str) -> String {
+    let term = raw_query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .find(|t| contains_ci(text, t))
+        .unwrap_or("");
+    make_preview(text, term)
 }
 
 /// Collapse runs of spaces into a single space.
