@@ -6431,11 +6431,16 @@ mod github_token_source_tests {
     use super::*;
     use intent_sourcecontrol::TokenSource;
 
-    fn registry_with(value: Option<&str>) -> Arc<SettingsRegistry> {
-        // Persist the directory (no RAII cleanup) so the config file outlives
-        // the registry handle without leaking the allocation.
-        let dir = tempfile::tempdir().expect("temp config dir").keep();
-        let registry = SettingsRegistry::load(dir.join("config.toml")).expect("load registry");
+    /// A registry backed by a fresh temp config dir; the returned guard keeps
+    /// the dir alive for the test and removes it on drop. Set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn registry_with(value: Option<&str>) -> (Arc<SettingsRegistry>, tempfile::TempDir) {
+        let mut dir = tempfile::tempdir().expect("temp config dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        let registry =
+            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
         if let Some(v) = value {
             registry
                 .apply(&[(
@@ -6444,7 +6449,7 @@ mod github_token_source_tests {
                 )])
                 .expect("apply tokenSource");
         }
-        Arc::new(registry)
+        (Arc::new(registry), dir)
     }
 
     /// No registry and the schema default both resolve to the full `Auto`
@@ -6453,7 +6458,7 @@ mod github_token_source_tests {
     #[test]
     fn defaults_to_auto() {
         assert_eq!(github_token_source(None), TokenSource::Auto);
-        let registry = registry_with(None);
+        let (registry, _dir) = registry_with(None);
         assert_eq!(github_token_source(Some(&registry)), TokenSource::Auto);
     }
 
@@ -6467,7 +6472,7 @@ mod github_token_source_tests {
             ("gh-cli", TokenSource::GhCli),
             ("explicit", TokenSource::Explicit),
         ] {
-            let registry = registry_with(Some(wire));
+            let (registry, _dir) = registry_with(Some(wire));
             assert_eq!(
                 github_token_source(Some(&registry)),
                 expected,

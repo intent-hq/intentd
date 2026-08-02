@@ -40,3 +40,4 @@ git2 = { workspace = true }
 # real unified PTY host. `intent-pty` depends only on `intent-core`, so this
 # dev-only edge introduces no dependency cycle.
 intent-pty = { path = "../intent-pty", version = "0.2.16" }
+tempfile = "3"

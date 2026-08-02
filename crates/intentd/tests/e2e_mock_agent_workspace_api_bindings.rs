@@ -97,8 +97,9 @@ async fn task_bindings_update_status_and_get() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-task-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -233,8 +234,9 @@ async fn comment_bindings_add_and_list() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-comment-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

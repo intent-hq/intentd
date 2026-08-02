@@ -204,10 +204,16 @@ async fn send(socket: &Path, frame: &str) -> Value {
 async fn start(
     engine: Arc<dyn SentryEngine>,
     tag: &str,
-) -> (PathBuf, tokio::sync::oneshot::Sender<()>) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-sentry-{tag}-{}", &short[..8]));
-    let data_dir = base.join("data");
+) -> (
+    PathBuf,
+    tokio::sync::oneshot::Sender<()>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    // Short prefix under /tmp: the daemon's UDS socket lives inside this base
+    // and macOS caps UDS paths at ~104 bytes (SUN_LEN).
+    let base = common::test_tempdir_in("/tmp", &format!("itd-sen-{tag}-"));
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = {
         let _g = ENV_LOCK.lock().unwrap();
@@ -216,9 +222,10 @@ async fn start(
     };
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_sentry_engine(engine),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -237,7 +244,7 @@ async fn start(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (socket, tx)
+    (socket, tx, base, ws_root)
 }
 
 #[tokio::test]
@@ -246,7 +253,7 @@ async fn uds_sentry_read_surface_round_trip() {
     let seen_request = engine.seen_request.clone();
     let seen_query = engine.seen_query.clone();
     let seen_search_project = engine.seen_search_project.clone();
-    let (socket, _tx) = start(engine, "ok").await;
+    let (socket, _tx, _base, _ws_root) = start(engine, "ok").await;
 
     // (a) authStatus returns derived identity — never the token.
     let resp = send(
@@ -351,7 +358,7 @@ async fn uds_sentry_read_surface_round_trip() {
 #[tokio::test]
 async fn uds_sentry_not_configured_is_internal() {
     let engine = Arc::new(StubEngine::new(true));
-    let (socket, _tx) = start(engine, "unconfigured").await;
+    let (socket, _tx, _base, _ws_root) = start(engine, "unconfigured").await;
 
     // A credential pair that is absent / fails the org probe surfaces as -32603.
     // All P0/P1/P2 arms share the same not-configured mapping once param
@@ -403,7 +410,7 @@ async fn uds_sentry_p1_p2_round_trip() {
     let seen_resolve_id = engine.seen_resolve_id.clone();
     let seen_ignore_id = engine.seen_ignore_id.clone();
     let seen_assign = engine.seen_assign.clone();
-    let (socket, _tx) = start(engine, "p1p2").await;
+    let (socket, _tx, _base, _ws_root) = start(engine, "p1p2").await;
 
     // (a) listProjects with an explicit limit → bare array; engine sees the limit.
     let resp = send(

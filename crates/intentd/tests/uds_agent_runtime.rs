@@ -200,10 +200,11 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let db_path = data_dir.join("intentd.db");
     let ws = WorkspaceId::new();
+    let ws_root = common::hermetic_workspaces_root();
     let note_id = {
         let store = Store::open(&db_path).await.expect("open store");
         let services =
-            Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
+            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
         store
             .insert_workspace(&workspace(&ws))
             .await

@@ -124,9 +124,10 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let bus = EventBus::new(store.clone());
     // Publish onto the SAME bus the transport reads; inject an in-memory secret
     // store so sensitive settings never touch the real keychain.
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

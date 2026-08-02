@@ -116,11 +116,12 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let bus = EventBus::new(store.clone());
     let secrets = Arc::new(BlockingSecrets::default());
     let secrets_dyn: Arc<dyn SecretStore> = secrets.clone();
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
             .with_secret_store(secrets_dyn)
-            .with_workspaces_root(common::hermetic_workspaces_root()),
+            .with_workspaces_root(ws_root.path().to_path_buf()),
     );
     // Short suffix so the full socket path fits under macOS `SUN_LEN`.
     let socket = std::env::temp_dir().join(format!(

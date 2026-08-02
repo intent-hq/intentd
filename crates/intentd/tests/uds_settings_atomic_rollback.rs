@@ -125,10 +125,11 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // Attach a mock ServerControl that always fails start_ws_listener
     services.attach_server_control(Arc::new(FailingServerControl));
@@ -257,10 +258,11 @@ async fn successful_mixed_batch_persists_all() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // No ServerControl attached, so no hooks run → success
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -324,10 +326,11 @@ async fn single_key_failure_reverts() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -381,10 +384,11 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -505,10 +509,11 @@ async fn db_read_error_during_capture_fails_batch() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 

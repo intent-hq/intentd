@@ -34,7 +34,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -266,11 +265,10 @@ where
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-delgrp-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
+/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-delgrp-")
 }
 
 fn gate(test: &str) -> Option<String> {
@@ -352,7 +350,8 @@ async fn baseline_plus_aggregated_wake() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
     const CHILD_B: &str = "WAKE1_CHILD_BETA";

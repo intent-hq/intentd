@@ -43,7 +43,21 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Kill the whole process group (daemon + any Node.js ACP provider
+        // children) BEFORE removing the data dir, so an orphaned child can't
+        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
+        // after cleanup. The daemon is spawned with process_group(0).
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            let pid = Pid::from_raw(self.child.id() as i32);
+            let _ = signal::killpg(pid, Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -72,6 +86,12 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // Group leader so Daemon::drop can killpg the daemon + ACP children.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -4211,8 +4231,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services =
-        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))

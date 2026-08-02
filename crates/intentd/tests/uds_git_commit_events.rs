@@ -188,11 +188,13 @@ async fn boot(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
     EventBus,
+    tempfile::TempDir,
 ) {
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
@@ -205,7 +207,7 @@ async fn boot(
         })
         .await;
     });
-    (socket, shutdown_tx, server, bus)
+    (socket, shutdown_tx, server, bus, ws_root)
 }
 
 /// `git.commit` inside a workspace worktree publishes both `git:commit`
@@ -245,7 +247,7 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     let ws = workspace_row(&ws_id, repo, "main");
     store.insert_workspace(&ws).await.expect("insert workspace");
 
-    let (socket, shutdown, server, bus) = boot(store).await;
+    let (socket, shutdown, server, bus, _ws_root) = boot(store).await;
 
     // Subscriber first (change events are point-in-time; no replay).
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();

@@ -131,6 +131,20 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
+/// Create a temp dir with a recognizable prefix under the system temp root.
+/// The returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
@@ -145,18 +159,16 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 async fn make_services(
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
-) -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-wss-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = Store::open(&dir.join("intentd.db"))
+) -> (Arc<dyn WorkspaceApi>, EventBus, Store, tempfile::TempDir) {
+    let dir = test_tempdir("intentd-wss-");
+    let store = Store::open(&dir.path().join("intentd.db"))
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let workspaces_root = dir.join("workspaces");
+    let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
     let mut services = Services::new(store.clone())
-        .with_assets_root(dir.join("assets"))
+        .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
@@ -178,7 +190,7 @@ struct Server {
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     store: Store,
-    _dir: std::path::PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 /// Build + start a WSS listener with the given options on a free base port.
@@ -200,7 +212,7 @@ async fn start_with_auggie_and_models_cache(
     models_cache_dir: Option<std::path::PathBuf>,
 ) -> Server {
     let (api, bus, store, dir) = make_services(auggie_bin, models_cache_dir).await;
-    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
@@ -1224,15 +1236,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 /// entry (absence of evidence is not a mismatch).
 #[tokio::test]
 async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
-    struct DirGuard(std::path::PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let dir = Path::new("/tmp").join(format!("intentd-wss-bare-cache-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _guard = DirGuard(dir.clone());
+    let dir = test_tempdir("intentd-wss-bare-cache-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
@@ -1251,12 +1255,16 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
         }
     });
     std::fs::write(
-        dir.join("models-cache.json"),
+        dir.path().join("models-cache.json"),
         serde_json::to_vec(&cache).unwrap(),
     )
     .unwrap();
-    let srv =
-        start_with_auggie_and_models_cache(WsOptions::default(), None, Some(dir.clone())).await;
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
 
     let created_ws = wss_call(
         srv.port,
@@ -1869,9 +1877,9 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     let srv = start(WsOptions::default()).await;
 
     // Serve UDS on the SAME shared services + bus so the wire result is
-    // produced by one router; only the framing differs.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let socket = Path::new("/tmp").join(format!("intentd-wss-{}.sock", &short[..8]));
+    // produced by one router; only the framing differs. The socket lives in
+    // the harness TempDir so it is cleaned up with the rest of the fixture.
+    let socket = srv._dir.path().join("intentd-wss.sock");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (api, bus, sock) = (srv.api.clone(), srv.bus.clone(), socket.clone());
     let uds = tokio::spawn(async move {
@@ -2369,10 +2377,9 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
     // and re-probes. The fake auggie appends to a counter file per
     // invocation and always fails, making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
-    let dir = Path::new("/tmp").join(format!("intentd-wss-models-neg-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let count = dir.join("count");
-    let bin = dir.join("auggie");
+    let dir = test_tempdir("intentd-wss-models-neg-");
+    let count = dir.path().join("count");
+    let bin = dir.path().join("auggie");
     std::fs::write(
         &bin,
         format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
@@ -2419,7 +2426,6 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
         calls() > after_probe,
         "forceRefresh must bypass the negative window and re-probe"
     );
-    let _ = std::fs::remove_dir_all(&dir);
     srv.ws.stop().await;
 }
 
@@ -2434,17 +2440,8 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
     // entry is seeded through the persisted cache file (fetchedAtMs: 0 →
     // expired but present) and the fake auggie always fails.
     use std::os::unix::fs::PermissionsExt;
-    // Drop-guard so the fixture dir is removed even when an assertion panics.
-    struct DirGuard(std::path::PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let dir = Path::new("/tmp").join(format!("intentd-wss-models-stale-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let _guard = DirGuard(dir.clone());
-    let bin = dir.join("auggie");
+    let dir = test_tempdir("intentd-wss-models-stale-");
+    let bin = dir.path().join("auggie");
     std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let last_good = serde_json::json!({
@@ -2458,13 +2455,16 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
         }
     });
     std::fs::write(
-        dir.join("models-cache.json"),
+        dir.path().join("models-cache.json"),
         serde_json::to_vec(&last_good).unwrap(),
     )
     .unwrap();
-    let srv =
-        start_with_auggie_and_models_cache(WsOptions::default(), Some(bin), Some(dir.clone()))
-            .await;
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        Some(bin),
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
 
     let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
@@ -2492,14 +2492,13 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]
-fn fake_auggie_script(tag: &str, body: &str) -> std::path::PathBuf {
+fn fake_auggie_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = Path::new("/tmp").join(format!("intentd-wss-auggie-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("auggie");
+    let dir = test_tempdir(&format!("intentd-wss-auggie-{tag}-"));
+    let bin = dir.path().join("auggie");
     std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin
+    (dir, bin)
 }
 
 #[cfg(unix)]
@@ -2509,7 +2508,7 @@ async fn wss_agent_enhance_prompt_round_trip() {
     // `<augment-enhanced-prompt>` payload; `mode: "layout"` returns the full
     // cleaned reply. Both `{ enhanced, original, mode }` shapes ride the same
     // deterministic fixture CLI.
-    let bin = fake_auggie_script(
+    let (_auggie_dir, bin) = fake_auggie_script(
         "ok",
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\n<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>\\n'",
     );
@@ -2556,7 +2555,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
     // Provider-neutrality gate: with a non-auggie active provider,
     // agent.enhancePrompt returns a typed `{ available: false, reason }`
     // result instead of an error, so the FE can hide the affordance.
-    let bin = fake_auggie_script(
+    let (_auggie_dir, bin) = fake_auggie_script(
         "gated-enhance",
         "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
     );
@@ -2588,7 +2587,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
 async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // A reply without the `<augment-enhanced-prompt>` tags in enhance mode is
     // the documented -32603 parse failure (§5.31).
-    let bin = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
+    let (_auggie_dir, bin) = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     srv.store
         .set_setting("providers.active", "\"auggie\"")
@@ -2670,7 +2669,7 @@ async fn wss_agent_complete_once_round_trip() {
     // agent.completeOnce (§5.32) — stateless one-shot prompt→completion.
     // `{ prompt }` returns `{ text }` with the cleaned CLI reply verbatim,
     // over the real pinned-TLS WSS transport.
-    let bin = fake_auggie_script(
+    let (_auggie_dir, bin) = fake_auggie_script(
         "complete-ok",
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
     );
@@ -2698,7 +2697,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
     // Provider-neutrality gate: with a non-auggie active provider,
     // agent.completeOnce returns a typed `{ available: false, reason }`
     // result instead of an error.
-    let bin = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
+    let (_auggie_dir, bin) = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     srv.store
         .set_setting("providers.active", "\"claude-code\"")
@@ -2753,7 +2752,7 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // response is a -32603 whose `data` carries the timeout message. Proves
     // the standing design principle — the daemon owns cleanup on in-flight
     // failure, no session/agent state is leaked.
-    let bin = fake_auggie_script("complete-slow", "sleep 30");
+    let (_auggie_dir, bin) = fake_auggie_script("complete-slow", "sleep 30");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     srv.store
         .set_setting("providers.active", "\"auggie\"")
@@ -2860,7 +2859,7 @@ async fn bind_fails_fast_on_occupied_port() {
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let base = _hog.local_addr().unwrap().port();
     let (api, bus, _store, dir) = make_services(None, None).await;
-    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
@@ -2944,7 +2943,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
     // whole scenario on a fresh port within a bounded number of attempts
     // (monorepo#466); any non-`AddrInUse` error still fails immediately.
     let (api, bus, _store, dir) = make_services(None, None).await;
-    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
@@ -3537,9 +3536,8 @@ async fn wss_git_commit_details_round_trip() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a real git repo with two commits so HEAD has a non-empty parent diff.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wssgit-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wssgit-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -3636,7 +3634,6 @@ async fn wss_git_commit_details_round_trip() {
     assert_eq!(resp["error"]["code"], -32602);
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
@@ -3649,9 +3646,8 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a repo with one commit, then two tracked edits + one untracked file.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wssdiffs-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wssdiffs-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -3789,7 +3785,6 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
     }
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// `accept-changes.getStatus` over WSS: proves the wire shape from PROTOCOL
@@ -3801,9 +3796,8 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a repo: one commit on main, then a feature branch with one commit.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wssacgs-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wssacgs-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -3864,7 +3858,6 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     assert!(c.get("filesChanged").is_none());
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
@@ -3875,9 +3868,8 @@ async fn wss_file_tracking_load_commits_bounded() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a real git repo with a base commit on main + workspace commit on a branch.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wssftlc-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wssftlc-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -4069,7 +4061,6 @@ async fn wss_file_tracking_load_commits_bounded() {
     );
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// `git.branchStatus` + `git.getBranches` over WSS — the path-based
@@ -4082,9 +4073,8 @@ async fn wss_git_branch_status_round_trip() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a real git repo with one commit so the worktree has a valid HEAD.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wssbs-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wssbs-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -4186,8 +4176,8 @@ async fn wss_git_branch_status_round_trip() {
     // (e) `git.getBranches` on a valid local repo the daemon has never seen →
     // succeeds (the workspace-create flow lists branches before the repo is
     // registered; PROTOCOL §5.6).
-    let unreg = Path::new("/tmp").join(format!("intentd-wssgb-{}", &short[..8]));
-    std::fs::create_dir_all(&unreg).unwrap();
+    let unreg_dir = test_tempdir("intentd-wssgb-");
+    let unreg = unreg_dir.path().to_path_buf();
     let git_in = |dir: &Path, args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(dir)
@@ -4232,8 +4222,8 @@ async fn wss_git_branch_status_round_trip() {
 
     // (f) `git.getBranches` on an existing non-git directory → -32602 with the
     // distinct message.
-    let plain = Path::new("/tmp").join(format!("intentd-wsspl-{}", &short[..8]));
-    std::fs::create_dir_all(&plain).unwrap();
+    let plain_dir = test_tempdir("intentd-wsspl-");
+    let plain = plain_dir.path().to_path_buf();
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -4250,9 +4240,6 @@ async fn wss_git_branch_status_round_trip() {
     );
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
-    std::fs::remove_dir_all(&unreg).ok();
-    std::fs::remove_dir_all(&plain).ok();
 }
 
 /// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
@@ -4264,9 +4251,8 @@ async fn wss_git_branch_status_round_trip() {
 async fn wss_git_pull_round_trip() {
     let srv = start(WsOptions::default()).await;
 
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-wsspull-{}", &short[..8]));
-    std::fs::create_dir_all(&base).unwrap();
+    let base_dir = test_tempdir("intentd-wsspull-");
+    let base = base_dir.path().to_path_buf();
     let git_in = |dir: &Path, args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(dir)
@@ -4360,7 +4346,6 @@ async fn wss_git_pull_round_trip() {
     );
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Note version history over WSS (PROTOCOL §5.2 version-history extensions):
@@ -4620,9 +4605,8 @@ async fn wss_git_show_file_round_trip() {
     let srv = start(WsOptions::default()).await;
 
     // Seed a real git repo with two commits so HEAD and HEAD^ differ.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let repo = Path::new("/tmp").join(format!("intentd-wsssf-{}", &short[..8]));
-    std::fs::create_dir_all(&repo).unwrap();
+    let repo_dir = test_tempdir("intentd-wsssf-");
+    let repo = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
             .current_dir(&repo)
@@ -4706,7 +4690,6 @@ async fn wss_git_show_file_round_trip() {
     assert_eq!(resp["error"]["code"], -32602);
 
     srv.ws.stop().await;
-    std::fs::remove_dir_all(&repo).ok();
 }
 
 /// `note.saveAsset` over WSS (PROTOCOL §5.2 — additive asset write): the write

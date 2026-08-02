@@ -74,6 +74,7 @@ base64 = { workspace = true }
 # (lexicographic comparison can be wrong with differing fractional-second precision).
 chrono = "0.4"
 ctor = "1.0.10"
+tempfile = "3"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }

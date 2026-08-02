@@ -240,10 +240,16 @@ async fn send(socket: &Path, frame: &str) -> Value {
 async fn start(
     engine: Arc<dyn LinearEngine>,
     tag: &str,
-) -> (PathBuf, tokio::sync::oneshot::Sender<()>) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-linear-{tag}-{}", &short[..8]));
-    let data_dir = base.join("data");
+) -> (
+    PathBuf,
+    tokio::sync::oneshot::Sender<()>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    // Short prefix under /tmp: the daemon's UDS socket lives inside this base
+    // and macOS caps UDS paths at ~104 bytes (SUN_LEN).
+    let base = common::test_tempdir_in("/tmp", &format!("itd-lin-{tag}-"));
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = {
         let _g = ENV_LOCK.lock().unwrap();
@@ -252,9 +258,10 @@ async fn start(
     };
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_linear_engine(engine),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -273,7 +280,7 @@ async fn start(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (socket, tx)
+    (socket, tx, base, ws_root)
 }
 
 #[tokio::test]
@@ -295,7 +302,7 @@ async fn uds_linear_read_surface_round_trip() {
         seen_create: seen_create.clone(),
         seen_update: seen_update.clone(),
     });
-    let (socket, _tx) = start(engine, "ok").await;
+    let (socket, _tx, _base, _ws_root) = start(engine, "ok").await;
 
     // (a) authStatus returns derived identity — never the key.
     let resp = send(
@@ -503,7 +510,7 @@ async fn uds_linear_not_configured_is_internal() {
         seen_create: Arc::new(Mutex::new(None)),
         seen_update: Arc::new(Mutex::new(None)),
     });
-    let (socket, _tx) = start(engine, "unconfigured").await;
+    let (socket, _tx, _base, _ws_root) = start(engine, "unconfigured").await;
 
     // A key that is absent / fails the viewer probe surfaces as -32603. The P1
     // reads share the same not-configured mapping once param validation passes.

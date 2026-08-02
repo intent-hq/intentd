@@ -32,15 +32,13 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-resume-all-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wra-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -322,7 +320,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Simple mock behavior: just respond with a message
     let behavior = json!({

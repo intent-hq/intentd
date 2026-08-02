@@ -142,10 +142,11 @@ async fn port_setting_crud() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
@@ -220,10 +221,11 @@ async fn port_change_restarts_listener() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // Attach a mock ServerControl that returns a running port
     let requested_port = Arc::new(tokio::sync::Mutex::new(None));
@@ -283,10 +285,11 @@ async fn port_bind_failure_friendly_error() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // Attach a mock ServerControl that fails with EADDRINUSE
     let requested_port = Arc::new(tokio::sync::Mutex::new(None));
