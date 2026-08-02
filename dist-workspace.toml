@@ -21,6 +21,17 @@ hosting = "github"
 # sitter releases. Note: this renames the generated workflow to
 # .github/workflows/v-release.yml.
 tag-namespace = "v"
+# Self-referential on purpose (monorepo#1277): pointing github-releases-repo at
+# this same repo makes dist generate a release-create step that (a) authenticates
+# with the GH_RELEASES_TOKEN secret (a PAT) instead of the runner's GITHUB_TOKEN,
+# and (b) passes --target from the manifest's external_repo_commit, which is
+# absent here (no submodule path), so `gh` sends no target_commitish at all.
+# Both changes sidestep the 403 that GITHUB_TOKEN hits when the tagged commit
+# touches .github/workflows/* (cli/cli#9514); the tag always exists by the time
+# this workflow runs (release-plz pushes it), so no target is needed.
+# REQUIRES: a repo secret named GH_RELEASES_TOKEN (name is hardcoded by dist)
+# holding a PAT with contents:write on intent-hq/intentd.
+github-releases-repo = "intent-hq/intentd"
 # Whether to install an updater program
 install-updater = false
 # Post-announce: publish/update the stable.json / beta.json channel manifests
