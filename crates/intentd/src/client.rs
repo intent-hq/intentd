@@ -11,7 +11,8 @@ use std::path::Path;
 use serde_json::Value;
 
 /// Send one JSON-RPC request over an established local-transport stream and
-/// return the parsed response envelope. The request `id` is auto-generated.
+/// return the parsed response envelope. The request `id` is fixed at `1`
+/// (one request per connection).
 #[cfg(any(unix, windows))]
 async fn exchange<S>(stream: S, method: &str, params: Value) -> anyhow::Result<Value>
 where

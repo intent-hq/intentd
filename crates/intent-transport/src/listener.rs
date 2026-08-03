@@ -372,8 +372,11 @@ where
 /// daemon on the same data dir fails fast at bind time — the single-instance
 /// guard equivalent of the UDS bind conflict. Named pipes are per-boot kernel
 /// objects scoped to the creating process, so there is no stale-file removal
-/// before bind and nothing to unlink on shutdown; access is limited to the
-/// same user by the default pipe security descriptor (the 0600 analogue).
+/// before bind and nothing to unlink on shutdown. The default pipe security
+/// descriptor grants full control to the creating user, SYSTEM, and
+/// Administrators, and read-only to Everyone (who therefore cannot open a
+/// duplex pipe) — so other non-admin users cannot connect, though this is not
+/// a strict 0600 equivalent.
 #[cfg(windows)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
@@ -445,7 +448,7 @@ where
 {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "UDS transport is not supported on this platform",
+        "local IPC transport is not supported on this platform",
     ))
 }
 
