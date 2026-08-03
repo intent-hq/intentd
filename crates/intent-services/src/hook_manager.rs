@@ -1384,12 +1384,18 @@ mod tests {
         (tmp, root, services, ws, owner)
     }
 
+    /// Fixed deadline for the polling helpers below. Generous on purpose:
+    /// under a loaded host (e.g. a parallel `cargo build`) persistence can
+    /// lag far behind the happy path, and a short deadline fails
+    /// otherwise-passing tests (intent-hq/monorepo#1358).
+    const POLL_DEADLINE: Duration = Duration::from_secs(10);
+
     /// Poll the persisted hook until `pred` holds or the timeout elapses.
     async fn wait_for_hook<F>(svc: &Services, id: &HookId, pred: F) -> Hook
     where
         F: Fn(&Hook) -> bool,
     {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         loop {
             let hook = svc.store().get_hook(id).await.expect("get hook");
             if pred(&hook) {
@@ -1408,7 +1414,7 @@ mod tests {
     /// `needle`, returning the serialized messages. The wake lands after the
     /// terminal state persists, so a plain read can race it.
     async fn wait_for_wake(svc: &Services, owner: &AgentId, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         loop {
             let session = svc.store().get_agent_session(owner).await.unwrap();
             let text = serde_json::to_string(&session.messages).unwrap();
@@ -1429,7 +1435,7 @@ mod tests {
     /// helper polls until all are present (on deadline it returns whatever
     /// was seen — the caller's asserts then report the shortfall).
     async fn hook_event_types(svc: &Services, ws: &WorkspaceId, expected: &[&str]) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         loop {
             let mut evs = svc
                 .store()
@@ -1703,7 +1709,7 @@ mod tests {
         assert!(hook.next_run_at.is_none());
         wait_for_wake(&svc, &owner, "CI is green").await;
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2013,7 +2019,7 @@ mod tests {
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         loop {
             let evs = display_status_events(&svc, &ws).await;
             if evs == vec!["in_progress", "idle", "in_progress", "idle"] {
@@ -2360,7 +2366,11 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow again");
-        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 3).await;
+        // run_count persists before the state clear — wait on both.
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 3 && h.last_state.is_none()
+        })
+        .await;
         assert_eq!(hook.last_state, None);
     }
 
@@ -2390,7 +2400,14 @@ mod tests {
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
-        let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
+        // run_count persists before last_logs — wait for the warning too.
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2
+                && h.last_logs
+                    .as_deref()
+                    .is_some_and(|l| l.contains("[hook state dropped:"))
+        })
+        .await;
         assert_eq!(
             hook.last_state.as_deref(),
             Some("{\"small\":true}"),
@@ -2549,7 +2566,7 @@ mod tests {
         assert!(text.contains("2 runs completed"), "{text}");
         assert!(text.contains("ws.hook.schedule"), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2559,8 +2576,12 @@ mod tests {
     #[tokio::test]
     async fn run_now_after_expiry_is_rejected_and_no_run_starts() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // The hook expires 250ms after rehydration; once expired, runNow must
-        // reject (not active) and no run may ever have started.
+        // Deterministic expiry (monorepo#1358): the deadline is far out and
+        // the injected clock skew moves "now" past it while the scheduler
+        // sleeps — no wall-clock race. Once expired, runNow must reject
+        // (not active) and no run may ever have started.
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws.clone(),
@@ -2576,10 +2597,13 @@ mod tests {
             last_error: None,
             last_logs: None,
             last_state: None,
-            expires_at: Some(next_run_at_iso(250)),
+            expires_at: Some(next_run_at_iso(60_000)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
-        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        // Skewed past the deadline before rehydration: the boot pass expires
+        // the hook (owner woken) without ever spawning its scheduler task.
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 0);
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 0, "the dispatching script never ran");
         let err = svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap_err();
@@ -2657,14 +2681,24 @@ mod tests {
     #[tokio::test]
     async fn in_flight_dispatch_at_expiry_still_wins() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Same clock choreography as the continue variant above, but the
+        // released run returns a dispatch — which wins over the passed TTL.
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut gate = note(&ws, "disp-gate", "wait");
+        svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws.clone(),
             agent_id: owner.clone(),
             name: "slow-dispatch".to_string(),
-            code: "const t = Date.now(); while (Date.now() - t < 1500) {} \
-                   return { dispatch: true, message: 'made it in time' };"
-                .to_string(),
+            code: "for (;;) { \
+                     const n = await ws.note.read('disp-gate'); \
+                     if (n.content.includes('go')) { \
+                       return { dispatch: true, message: 'made it in time' }; \
+                     } \
+                   }"
+            .to_string(),
             delay_ms: 10_000,
             state: HookState::Scheduled,
             created_at: now_iso(),
@@ -2674,13 +2708,20 @@ mod tests {
             last_error: None,
             last_logs: None,
             last_state: None,
-            expires_at: Some(next_run_at_iso(1_000)),
+            expires_at: Some(next_run_at_iso(60_000)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
+        // Running persisted ⇒ the pre-run expiry guard already passed. Pass
+        // the deadline, then release the script — its dispatch lands
+        // strictly after expiry and must still win.
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        gate.content = "go".to_string();
+        svc.store().update_note(&gate).await.unwrap();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;
