@@ -6476,7 +6476,11 @@ enum FlushPrep {
 /// `agent:queue:updated` (the fully-shrunk queue) and ONE
 /// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
 /// turn's id). Each row persist emits its normal `agent:message`, so clients
-/// render N stacked user rows.
+/// render N stacked user rows — and every row echo carries the COMBINED
+/// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
+/// correlate with the single `agent:queue:processing`/`agent:stream:*`
+/// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
+/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
 ///
 /// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
 /// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
@@ -6520,6 +6524,10 @@ async fn prepare_flush_turn(
     mgr.services
         .publish_queue_processing(agent_id, workspace_id, &entries[0])
         .await;
+    // All rows persist under the combined turn's id — the provider turn runs
+    // once, under the head entry's `turn_id`, so a per-entry id on row #2+
+    // would never match any processing/stream event.
+    let combined_turn_id = entries[0].turn_id.clone();
     for i in 0..entries.len() {
         if entries[i].persisted {
             continue;
@@ -6532,7 +6540,7 @@ async fn prepare_flush_turn(
             entries[i].image_blocks.as_ref(),
             entries[i].file_blocks.as_ref(),
             entries[i].message_metadata.as_ref(),
-            Some(&entries[i].turn_id),
+            Some(&combined_turn_id),
         )
         .await
         {

@@ -485,10 +485,13 @@ fn user_row_texts(conv: &Value) -> Vec<String> {
 /// Drain-phase observation shared by both cases: consume subscription events
 /// until `want_stream_ends` terminal `agent:stream:end`s for the agent have
 /// been seen (kick-off turn + drained turn(s)), recording every non-empty
-/// `agent:queue:updated` queue length and every `agent:queue:processing`.
+/// `agent:queue:updated` queue length, every `agent:queue:processing`
+/// `turnId`, and the `turnId` of every user-row `agent:message` echo (the
+/// kick-off send's echo carries its own turn's id, so it appears first).
 struct DrainObservation {
     queue_lengths: Vec<usize>,
-    processing_count: usize,
+    processing_turn_ids: Vec<String>,
+    user_row_turn_ids: Vec<String>,
 }
 
 async fn observe_drain(
@@ -497,7 +500,8 @@ async fn observe_drain(
     want_stream_ends: usize,
 ) -> DrainObservation {
     let mut queue_lengths = Vec::new();
-    let mut processing_count = 0usize;
+    let mut processing_turn_ids = Vec::new();
+    let mut user_row_turn_ids = Vec::new();
     let mut stream_ends = 0usize;
     for _ in 0..400 {
         let frame = wss_event(sub, 30).await;
@@ -511,7 +515,19 @@ async fn observe_drain(
                 queue_lengths.push(len);
             }
             Some("agent:queue:processing") => {
-                processing_count += 1;
+                processing_turn_ids.push(
+                    event["data"]["turnId"]
+                        .as_str()
+                        .expect("queue:processing carries a turnId")
+                        .to_string(),
+                );
+            }
+            Some("agent:message") => {
+                if event["data"]["role"] == "user" {
+                    if let Some(tid) = event["data"]["turnId"].as_str() {
+                        user_row_turn_ids.push(tid.to_string());
+                    }
+                }
             }
             Some("agent:stream:end") => {
                 stream_ends += 1;
@@ -528,7 +544,8 @@ async fn observe_drain(
     );
     DrainObservation {
         queue_lengths,
-        processing_count,
+        processing_turn_ids,
+        user_row_turn_ids,
     }
 }
 
@@ -556,6 +573,10 @@ fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
 ///    for the queued messages — the combined prompt is wire-only.
 /// 3. `agent:queue:updated` empties in ONE snapshot (2 → 0, never through
 ///    1) and exactly ONE `agent:queue:processing` fires for the batch.
+/// 4. Turn correlation (monorepo#1022): BOTH user-row `agent:message`
+///    echoes carry the combined turn's `turnId` — the one named by the
+///    single `agent:queue:processing` — never a per-entry id that matches
+///    no processing/stream lifecycle.
 #[tokio::test]
 async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     let Some(script) = gate("WSS queued-message flush E2E") else {
@@ -584,8 +605,24 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
         obs.queue_lengths
     );
     assert_eq!(
-        obs.processing_count, 1,
-        "exactly ONE agent:queue:processing for the combined turn"
+        obs.processing_turn_ids.len(),
+        1,
+        "exactly ONE agent:queue:processing for the combined turn: {:?}",
+        obs.processing_turn_ids
+    );
+    // (4) Every flushed row's echo correlates with the combined turn. The
+    // first user-row echo is the kick-off's (its own direct turn's id).
+    let combined_turn_id = &obs.processing_turn_ids[0];
+    assert_eq!(
+        obs.user_row_turn_ids.len(),
+        3,
+        "kick-off + two flushed user-row echoes: {:?}",
+        obs.user_row_turn_ids
+    );
+    assert_eq!(
+        &obs.user_row_turn_ids[1..],
+        &[combined_turn_id.clone(), combined_turn_id.clone()],
+        "both flushed user-row echoes carry the combined turn's turnId"
     );
 
     // (1) Outbound-prompt contract: prompt #2 is the combined flush prompt.
@@ -704,8 +741,24 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
         obs.queue_lengths
     );
     assert_eq!(
-        obs.processing_count, 2,
-        "one agent:queue:processing per drained message"
+        obs.processing_turn_ids.len(),
+        2,
+        "one agent:queue:processing per drained message: {:?}",
+        obs.processing_turn_ids
+    );
+    // Legacy one-at-a-time correlation: each drained row's echo carries its
+    // own turn's turnId, matching the processing signals in drain order (the
+    // first user-row echo is the kick-off's, from its own direct turn).
+    assert_eq!(
+        obs.user_row_turn_ids.len(),
+        3,
+        "kick-off + one echo per drained message: {:?}",
+        obs.user_row_turn_ids
+    );
+    assert_eq!(
+        &obs.user_row_turn_ids[1..],
+        &obs.processing_turn_ids[..],
+        "each user-row echo correlates with its own turn"
     );
 
     // Prompts #2 and #3 carry one queued message each, FIFO, and neither
