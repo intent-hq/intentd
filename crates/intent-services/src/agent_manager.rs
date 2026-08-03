@@ -7158,11 +7158,11 @@ mod role_reminder_tests {
     use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
     use intent_store::Store;
 
-    /// Seed a hermetic specialists dir under temp with one `<id>.md`.
-    fn write_specialist(id: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("intentd-spc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{id}.md")), content).unwrap();
+    /// Seed a hermetic specialists dir under temp with one `<id>.md`. Keep the
+    /// returned RAII guard alive for the test (dropping it removes the dir).
+    fn write_specialist(id: &str, content: &str) -> tempfile::TempDir {
+        let dir = crate::tests::test_tempdir("intentd-spc-");
+        std::fs::write(dir.path().join(format!("{id}.md")), content).unwrap();
         dir
     }
 
@@ -7257,12 +7257,15 @@ mod role_reminder_tests {
         }
     }
 
-    /// Build a manager over a temp store seeded with a workspace + agent session.
+    /// Build a manager over a temp store seeded with a workspace + agent
+    /// session. The returned RAII guard owns the db dir (db + `-wal`/`-shm`
+    /// sidecars); keep it alive for the duration of the test.
     pub(super) async fn manager_with(
         specialist: Option<&str>,
         specialists_dir: Option<PathBuf>,
-    ) -> (AgentManager, AgentId) {
-        let path = std::env::temp_dir().join(format!("intentd-rr-{}.db", uuid::Uuid::new_v4()));
+    ) -> (AgentManager, AgentId, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-rr-");
+        let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone())
@@ -7282,7 +7285,7 @@ mod role_reminder_tests {
             .await
             .unwrap();
         let sink = Arc::new(BusEventSink::new(bus));
-        (AgentManager::new(services, sink, 4), agent_id)
+        (AgentManager::new(services, sink, 4), agent_id, db_dir)
     }
 
     /// First text block's text from a built prompt.
@@ -7300,7 +7303,7 @@ mod role_reminder_tests {
     /// turn.
     #[tokio::test]
     async fn stop_preserves_force_recreate_but_clears_recreated() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         mgr.force_recreate.lock().unwrap().insert(agent_id.clone());
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         mgr.stop(&agent_id).await;
@@ -7320,7 +7323,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
             let prompt = mgr
@@ -7346,7 +7350,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         let prompt = mgr
@@ -7368,7 +7373,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn no_injection_without_specialist() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let prompt = mgr
             .build_turn_prompt(
                 &agent_id,
@@ -7385,7 +7390,7 @@ mod role_reminder_tests {
         // Reference-parity `acp-provider.ts` §5.5: `stdinContext` is prepended
         // to the outbound prompt as `Context:\n<ctx>\n\n---\n\n<body>` before
         // any role reminder. Applies to both plain and specialist agents.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some("hello ctx".to_string()),
             ..TurnOptions::default()
@@ -7406,7 +7411,7 @@ mod role_reminder_tests {
     async fn stdin_context_empty_string_is_not_prepended() {
         // An empty `stdinContext` is treated as absent so we do not emit a
         // stray `Context:` header with nothing under it.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some(String::new()),
             ..TurnOptions::default()
@@ -7425,7 +7430,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let opts = TurnOptions {
             stdin_context: Some("ctx".to_string()),
             ..TurnOptions::default()
@@ -7449,7 +7455,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nImplement the task.",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let inj = mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7468,7 +7475,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nFile body.",
         );
-        let (mgr, _first) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let agent_id = AgentId::from("agent-2");
         let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), Some("implementor"));
         s.metadata = Some(serde_json::json!({ "behaviorPrompt": "Custom override." }));
@@ -7489,7 +7497,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn specialist_injection_none_for_plain_agent() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         assert!(mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7519,7 +7527,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_fires_once_per_fresh_session() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "You are helpful.").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -7556,7 +7564,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_refires_after_recreate() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "SP body").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         // Fresh session → fires; consumed by the first turn.
@@ -7590,7 +7598,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_not_armed_for_native_mechanism_providers() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "native SP").await;
         // Native-mechanism providers (rules file / _meta / env) never arm the
         // fallback — no double injection.
@@ -7709,7 +7717,7 @@ mod role_reminder_tests {
     async fn first_turn_prepend_skipped_when_no_system_prompt() {
         // Armed but the session has no persisted system_prompt (or blank) —
         // no stray empty <system> block; the flag is still consumed.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
         let text = prompt_text(
@@ -7733,7 +7741,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         set_system_prompt(&mgr, &agent_id, "SP").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -7844,7 +7853,7 @@ mod dead_child_respawn_tests {
     async fn reuses_cached_session_when_child_alive() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-alive");
         seed_mock_session(&mgr, &agent_id, "acp-cached").await;
         let _ends = install_fake_handle(&mgr, &agent_id, None);
@@ -7867,7 +7876,7 @@ mod dead_child_respawn_tests {
     async fn respawns_when_cached_child_is_dead() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-dead");
         seed_mock_session(&mgr, &agent_id, "acp-stale").await;
 
@@ -8715,12 +8724,15 @@ mod agent_retry_tests {
         }
     }
 
+    /// The returned RAII guard owns the db dir (db + `-wal`/`-shm` sidecars);
+    /// keep it alive for the duration of the test.
     async fn manager_with_session(
         agent_id: &AgentId,
         ws: &WorkspaceId,
         status: AgentStatus,
-    ) -> Arc<AgentManager> {
-        let path = std::env::temp_dir().join(format!("intentd-retry-{}.db", uuid::Uuid::new_v4()));
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-retry-");
+        let path = db_dir.path().join("store.db");
         let db = Store::open(&path).await.expect("temp store");
         db.insert_workspace(&workspace(ws))
             .await
@@ -8731,14 +8743,14 @@ mod agent_retry_tests {
         let bus = EventBus::new(db.clone());
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
-        Arc::new(AgentManager::new(services, sink, 8))
+        (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
     #[tokio::test]
     async fn retry_from_error_status_with_empty_queue_clears_to_idle() {
         let agent_id = AgentId::from("agent-1");
         let ws = WorkspaceId::from("ws-1");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -8764,7 +8776,7 @@ mod agent_retry_tests {
     async fn retry_from_error_status_with_queued_message_redrives() {
         let agent_id = AgentId::from("agent-redrive");
         let ws = WorkspaceId::from("ws-redrive");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services.enqueue_message(
@@ -8804,7 +8816,7 @@ mod agent_retry_tests {
             let id = format!("agent-race-{yields}");
             let agent_id = AgentId::from(id.as_str());
             let ws = WorkspaceId::from("ws-race");
-            let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+            let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
             let retry_fut = mgr.agent_retry(agent_id.clone(), ws.clone());
             let enqueue_fut = async {
@@ -8851,7 +8863,7 @@ mod agent_retry_tests {
     async fn retry_from_pending_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-2");
         let ws = WorkspaceId::from("ws-2");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -8873,7 +8885,7 @@ mod agent_retry_tests {
     async fn retry_from_active_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-3");
         let ws = WorkspaceId::from("ws-3");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())

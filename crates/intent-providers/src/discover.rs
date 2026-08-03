@@ -564,13 +564,17 @@ mod find_provider_binary_tests {
     use super::*;
     use std::fs;
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-providers-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
         dir
     }
 
@@ -600,7 +604,7 @@ mod find_provider_binary_tests {
     #[test]
     fn find_provider_binary_prefers_explicit_setting() {
         let dir = unique_temp_dir("explicit");
-        let bin = dir.join("my-provider");
+        let bin = dir.path().join("my-provider");
         make_executable(&bin);
         let result = find_provider_binary("test", "my-provider", Some(bin.to_str().unwrap()));
         assert_eq!(result, Some(bin));
@@ -755,17 +759,23 @@ mod find_provider_binary_tests {
         // End-to-end against a fake home: `<home>/.grok/bin/grok` resolves
         // only once it is executable (non-executable files must not resolve).
         let home = unique_temp_dir("grok-home");
-        let bin_dir = home.join(".grok").join("bin");
+        let bin_dir = home.path().join(".grok").join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        assert_eq!(find_provider_native_binary_in("grok", "grok", &home), None);
+        assert_eq!(
+            find_provider_native_binary_in("grok", "grok", home.path()),
+            None
+        );
 
         let bin = bin_dir.join("grok");
         fs::write(&bin, "not executable").unwrap();
-        assert_eq!(find_provider_native_binary_in("grok", "grok", &home), None);
+        assert_eq!(
+            find_provider_native_binary_in("grok", "grok", home.path()),
+            None
+        );
 
         make_executable(&bin);
         assert_eq!(
-            find_provider_native_binary_in("grok", "grok", &home),
+            find_provider_native_binary_in("grok", "grok", home.path()),
             Some(bin)
         );
     }
@@ -777,23 +787,23 @@ mod find_provider_binary_tests {
         // (`<home>/.opencode/bin/opencode`, no PATH entry): resolution must
         // find it, and only once it is executable.
         let home = unique_temp_dir("opencode-home");
-        let bin_dir = home.join(".opencode").join("bin");
+        let bin_dir = home.path().join(".opencode").join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         assert_eq!(
-            find_provider_native_binary_in("opencode", "opencode", &home),
+            find_provider_native_binary_in("opencode", "opencode", home.path()),
             None
         );
 
         let bin = bin_dir.join("opencode");
         fs::write(&bin, "not executable").unwrap();
         assert_eq!(
-            find_provider_native_binary_in("opencode", "opencode", &home),
+            find_provider_native_binary_in("opencode", "opencode", home.path()),
             None
         );
 
         make_executable(&bin);
         assert_eq!(
-            find_provider_native_binary_in("opencode", "opencode", &home),
+            find_provider_native_binary_in("opencode", "opencode", home.path()),
             Some(bin)
         );
     }
@@ -804,12 +814,12 @@ mod find_provider_binary_tests {
         // Only grok/opencode have native-installer tiers; other providers must
         // not resolve from a lookalike dot-dir layout.
         let home = unique_temp_dir("native-other");
-        let bin_dir = home.join(".auggie").join("bin");
+        let bin_dir = home.path().join(".auggie").join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let bin = bin_dir.join("auggie");
         make_executable(&bin);
         assert_eq!(
-            find_provider_native_binary_in("auggie", "auggie", &home),
+            find_provider_native_binary_in("auggie", "auggie", home.path()),
             None
         );
     }
@@ -821,24 +831,25 @@ mod find_provider_binary_tests {
         // explicit `providers.paths` setting still wins; without the explicit
         // setting, the native tier resolves.
         let home = unique_temp_dir("opencode-precedence-home");
-        let native_dir = home.join(".opencode").join("bin");
+        let native_dir = home.path().join(".opencode").join("bin");
         fs::create_dir_all(&native_dir).unwrap();
         let native = native_dir.join("opencode");
         make_executable(&native);
 
         let explicit_dir = unique_temp_dir("opencode-explicit");
-        let explicit = explicit_dir.join("opencode");
+        let explicit = explicit_dir.path().join("opencode");
         make_executable(&explicit);
 
         let result = find_provider_binary_with_home(
             "opencode",
             "opencode",
             Some(explicit.to_str().unwrap()),
-            Some(&home),
+            Some(home.path()),
         );
         assert_eq!(result, Some(explicit), "explicit setting must beat native");
 
-        let result = find_provider_binary_with_home("opencode", "opencode", None, Some(&home));
+        let result =
+            find_provider_binary_with_home("opencode", "opencode", None, Some(home.path()));
         assert_eq!(
             result,
             Some(native),
@@ -854,10 +865,13 @@ mod find_provider_binary_tests {
         // list — no real login shell is spawned, same seam pattern as
         // `intent_core::path_utils` tests).
         let login_dir = unique_temp_dir("login-shell-bin");
-        let bin = login_dir.join("opencode");
+        let bin = login_dir.path().join("opencode");
         make_executable(&bin);
 
-        let dirs = vec![PathBuf::from("/nonexistent/first"), login_dir];
+        let dirs = vec![
+            PathBuf::from("/nonexistent/first"),
+            login_dir.path().to_path_buf(),
+        ];
         assert_eq!(find_in_dirs(&dirs, "opencode"), Some(bin));
         assert_eq!(find_in_dirs(&dirs, "intent-test-absent-cmd"), None);
     }
@@ -1008,13 +1022,17 @@ mod override_aware_discovery_tests {
     use super::*;
     use std::fs;
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-providers-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
         dir
     }
 
@@ -1050,8 +1068,8 @@ mod override_aware_discovery_tests {
     #[test]
     fn valid_unsloth_override_flips_installed_without_touching_paths() {
         let dir = unique_temp_dir("override-valid");
-        let opencode = dir.join("opencode");
-        let unsloth = dir.join("unsloth");
+        let opencode = dir.path().join("opencode");
+        let unsloth = dir.path().join("unsloth");
         make_executable(&opencode);
         make_executable(&unsloth);
         let overrides = |key: &str| match key {
@@ -1105,10 +1123,10 @@ mod override_aware_discovery_tests {
     #[test]
     fn override_and_auto_detection_coexist_with_auto_paths_reported() {
         let dir = unique_temp_dir("override-coexist");
-        let override_bin = dir.join("unsloth-override");
+        let override_bin = dir.path().join("unsloth-override");
         make_executable(&override_bin);
-        let auto_opencode = dir.join("auto").join("opencode");
-        let auto_unsloth = dir.join("auto").join("unsloth");
+        let auto_opencode = dir.path().join("auto").join("opencode");
+        let auto_unsloth = dir.path().join("auto").join("unsloth");
         let resolve_auto = |_: &str, cmd: &str| match cmd {
             "opencode" => Some(auto_opencode.clone()),
             "unsloth" => Some(auto_unsloth.clone()),
@@ -1141,7 +1159,7 @@ mod override_aware_discovery_tests {
     #[test]
     fn valid_primary_override_flips_installed_for_single_binary_provider() {
         let dir = unique_temp_dir("override-auggie");
-        let auggie = dir.join("auggie");
+        let auggie = dir.path().join("auggie");
         make_executable(&auggie);
         let overrides = |key: &str| (key == "auggie").then(|| auggie.display().to_string());
         let availability = availability_for(auggie_config(), None, &|_, _| None, &overrides);
@@ -1154,7 +1172,7 @@ mod override_aware_discovery_tests {
     #[test]
     fn gated_provider_ignores_overrides() {
         let dir = unique_temp_dir("override-gated");
-        let bin = dir.join("unsloth");
+        let bin = dir.path().join("unsloth");
         make_executable(&bin);
         let overrides = |_: &str| Some(bin.display().to_string());
         let availability = availability_for(
@@ -1173,8 +1191,8 @@ mod override_aware_discovery_tests {
     #[test]
     fn discover_providers_with_overrides_reports_unsloth_installed() {
         let dir = unique_temp_dir("override-e2e");
-        let opencode = dir.join("opencode");
-        let unsloth = dir.join("unsloth");
+        let opencode = dir.path().join("opencode");
+        let unsloth = dir.path().join("unsloth");
         make_executable(&opencode);
         make_executable(&unsloth);
         let overrides = |key: &str| match key {
@@ -1207,13 +1225,17 @@ mod windows_resolution_tests {
     use super::*;
     use std::fs;
 
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-providers-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
         dir
     }
 
@@ -1252,9 +1274,9 @@ mod windows_resolution_tests {
     #[test]
     fn is_executable_file_windows_requires_runnable_extension() {
         let dir = unique_temp_dir("win-exec");
-        let bare = dir.join("auggie");
-        let cmd = dir.join("auggie.cmd");
-        let exe_upper = dir.join("tool.EXE");
+        let bare = dir.path().join("auggie");
+        let cmd = dir.path().join("auggie.cmd");
+        let exe_upper = dir.path().join("tool.EXE");
         fs::write(&bare, "#!/bin/sh\nexit 0\n").unwrap();
         fs::write(&cmd, "@echo off\r\n").unwrap();
         fs::write(&exe_upper, "MZ").unwrap();
@@ -1267,9 +1289,12 @@ mod windows_resolution_tests {
             is_executable_file_for(&exe_upper, true),
             "extension matching must be case-insensitive"
         );
-        assert!(!is_executable_file_for(&dir.join("missing.exe"), true));
+        assert!(!is_executable_file_for(
+            &dir.path().join("missing.exe"),
+            true
+        ));
         assert!(
-            !is_executable_file_for(&dir, true),
+            !is_executable_file_for(dir.path(), true),
             "directories never resolve"
         );
     }
@@ -1280,11 +1305,11 @@ mod windows_resolution_tests {
         // next to the runnable `auggie.cmd` shim in the same dir; the .cmd
         // shim must win (the bare file used to be resolved first).
         let dir = unique_temp_dir("win-shim-pair");
-        fs::write(dir.join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
-        let cmd = dir.join("auggie.cmd");
+        fs::write(dir.path().join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
+        let cmd = dir.path().join("auggie.cmd");
         fs::write(&cmd, "@echo off\r\n").unwrap();
         assert_eq!(
-            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", true),
+            find_in_dirs_for(&[dir.path().to_path_buf()], "auggie", true),
             Some(cmd)
         );
     }
@@ -1292,9 +1317,9 @@ mod windows_resolution_tests {
     #[test]
     fn find_in_dirs_windows_extensionless_file_alone_does_not_resolve() {
         let dir = unique_temp_dir("win-bare-only");
-        fs::write(dir.join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(dir.path().join("auggie"), "#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(
-            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", true),
+            find_in_dirs_for(&[dir.path().to_path_buf()], "auggie", true),
             None,
             "CreateProcess cannot run a bare extensionless file"
         );
@@ -1303,10 +1328,10 @@ mod windows_resolution_tests {
     #[test]
     fn find_in_dirs_windows_resolves_command_carrying_executable_extension() {
         let dir = unique_temp_dir("win-explicit-ext");
-        let cmd = dir.join("auggie.cmd");
+        let cmd = dir.path().join("auggie.cmd");
         fs::write(&cmd, "@echo off\r\n").unwrap();
         assert_eq!(
-            find_in_dirs_for(std::slice::from_ref(&dir), "auggie.cmd", true),
+            find_in_dirs_for(&[dir.path().to_path_buf()], "auggie.cmd", true),
             Some(cmd)
         );
     }
@@ -1318,12 +1343,12 @@ mod windows_resolution_tests {
         // executable, and no extension variants are probed.
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("posix-bare");
-        let bin = dir.join("auggie");
+        let bin = dir.path().join("auggie");
         fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(dir.join("auggie.cmd"), "@echo off\r\n").unwrap();
+        fs::write(dir.path().join("auggie.cmd"), "@echo off\r\n").unwrap();
         assert_eq!(
-            find_in_dirs_for(std::slice::from_ref(&dir), "auggie", false),
+            find_in_dirs_for(&[dir.path().to_path_buf()], "auggie", false),
             Some(bin)
         );
     }

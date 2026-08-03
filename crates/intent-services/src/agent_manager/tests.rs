@@ -7334,12 +7334,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let assets_dir =
-        std::env::temp_dir().join(format!("intentd-note-img-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&assets_dir).expect("assets tempdir");
+    let assets_dir = crate::tests::test_tempdir("intentd-note-img-");
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_assets_root(assets_dir.clone());
+        .with_assets_root(assets_dir.path().to_path_buf());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = AgentManager::new(services, sink, 8);
 
@@ -7350,7 +7348,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     // Write an on-disk asset the note will reference.
     let asset_id = "asset-abc.png";
     let asset_bytes: &[u8] = b"pretend-png";
-    let ws_dir = assets_dir.join(&ws.0);
+    let ws_dir = assets_dir.path().join(&ws.0);
     std::fs::create_dir_all(&ws_dir).expect("asset dir");
     std::fs::write(ws_dir.join(asset_id), asset_bytes).expect("write asset");
 

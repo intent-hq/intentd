@@ -1982,6 +1982,7 @@ version = "0.3.0"
 dependencies = [
  "intent-core",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
