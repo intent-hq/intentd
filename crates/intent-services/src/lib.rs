@@ -523,6 +523,12 @@ pub struct Services {
     /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
     /// timeout-eviction coverage completes in milliseconds.
     hook_eval_timeout: std::time::Duration,
+    /// Test-only clock skew (milliseconds) added to the instant hook TTL
+    /// expiry math measures against. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_hook_clock_skew` so a TTL
+    /// race can be decided by moving the deadline instead of racing wall
+    /// clock.
+    hook_clock_skew: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -601,6 +607,7 @@ impl Services {
             hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
+            hook_clock_skew: None,
         }
     }
 
@@ -617,6 +624,27 @@ impl Services {
     pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.hook_eval_timeout = timeout;
         self
+    }
+
+    /// Test-only: inject a shared clock skew (milliseconds) into the hook
+    /// TTL expiry math so a test can move a deadline deterministically
+    /// instead of racing wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_hook_clock_skew(
+        mut self,
+        skew_ms: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        self.hook_clock_skew = Some(skew_ms);
+        self
+    }
+
+    /// The current hook-expiry clock skew in milliseconds (0 when no test
+    /// skew is injected).
+    pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
+        self.hook_clock_skew
+            .as_ref()
+            .map(|s| s.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the

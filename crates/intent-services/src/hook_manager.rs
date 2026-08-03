@@ -159,13 +159,16 @@ fn clamp_ttl_ms(ttl_ms: Option<i64>) -> i64 {
 
 /// Time remaining until `expires_at`, or `None` when the hook has no
 /// deadline (pre-TTL legacy rows). An unparseable or already-passed deadline
-/// returns `Some(Duration::ZERO)` — expire immediately.
-fn time_to_expiry(expires_at: Option<&str>) -> Option<Duration> {
+/// returns `Some(Duration::ZERO)` — expire immediately. `skew_ms` shifts the
+/// "now" the deadline is measured against; production callers always pass 0
+/// (via [`Services::hook_clock_skew_ms`]) — tests inject a skew so expiry
+/// can be forced deterministically instead of racing wall clock.
+fn time_to_expiry(expires_at: Option<&str>, skew_ms: i64) -> Option<Duration> {
     let raw = expires_at?;
     let Ok(deadline) = OffsetDateTime::parse(raw, &Rfc3339) else {
         return Some(Duration::ZERO);
     };
-    let remaining = deadline - OffsetDateTime::now_utc();
+    let remaining = deadline - OffsetDateTime::now_utc() - time::Duration::milliseconds(skew_ms);
     Some(if remaining.is_positive() {
         Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
     } else {
@@ -174,9 +177,9 @@ fn time_to_expiry(expires_at: Option<&str>) -> Option<Duration> {
 }
 
 /// Whether `expires_at` has passed (never true for deadline-free legacy
-/// rows).
-fn is_expired(expires_at: Option<&str>) -> bool {
-    time_to_expiry(expires_at) == Some(Duration::ZERO)
+/// rows). Same `skew_ms` contract as [`time_to_expiry`].
+fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
+    time_to_expiry(expires_at, skew_ms) == Some(Duration::ZERO)
 }
 
 /// Evaluate one hook script in QuickJS with the full `ws.*` environment and
@@ -514,7 +517,7 @@ impl Services {
                 // A validation run that outlasts a short TTL completes
                 // normally, but a continue at/after expiresAt expires
                 // instead of scheduling (the in-flight-run-at-expiry rule).
-                if is_expired(hook.expires_at.as_deref()) {
+                if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
                     hook.state = HookState::Expired;
                     self.store.insert_hook(&hook).await?;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
@@ -774,7 +777,7 @@ impl Services {
             }
             // Expired while the daemon was down: expire at boot (owner
             // woken), never resume.
-            if is_expired(hook.expires_at.as_deref()) {
+            if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
                 self.expire_hook(&mut hook).await;
                 continue;
             }
@@ -824,7 +827,8 @@ impl Services {
                 let delay = Duration::from_millis(hook.delay_ms.max(0) as u64);
                 // Race the inter-run sleep against the time to `expiresAt`
                 // (deadline-free legacy rows never take the expiry arm).
-                let to_expiry = time_to_expiry(hook.expires_at.as_deref());
+                let to_expiry =
+                    time_to_expiry(hook.expires_at.as_deref(), services.hook_clock_skew_ms());
                 let expiry = async {
                     match to_expiry {
                         Some(d) => tokio::time::sleep(d).await,
@@ -849,7 +853,7 @@ impl Services {
                 }
                 // Never start a run at/after expiresAt (guards a `runNow`
                 // — or a sleep expiry — racing the deadline).
-                if is_expired(hook.expires_at.as_deref()) {
+                if is_expired(hook.expires_at.as_deref(), services.hook_clock_skew_ms()) {
                     services.expire_hook(&mut hook).await;
                     break;
                 }
@@ -903,7 +907,7 @@ impl Services {
                 // TTL passes completes normally, but a continue at/after
                 // `expiresAt` expires the hook instead of rescheduling it
                 // (a dispatch still wins — see the Dispatch arm).
-                if is_expired(hook.expires_at.as_deref()) {
+                if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
                     self.store
                         .update_hook_run(&hook.hook_id, &last_run_at, None)
                         .await?;
@@ -1419,9 +1423,13 @@ mod tests {
         }
     }
 
-    /// Persisted `hook:*` event types for a workspace, oldest-first.
-    async fn hook_event_types(svc: &Services, ws: &WorkspaceId) -> Vec<String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    /// Persisted `hook:*` event types for a workspace, oldest-first. Event
+    /// persistence is asynchronous relative to the hook-state writes tests
+    /// gate on, so callers pass the types they positively assert and the
+    /// helper polls until all are present (on deadline it returns whatever
+    /// was seen — the caller's asserts then report the shortfall).
+    async fn hook_event_types(svc: &Services, ws: &WorkspaceId, expected: &[&str]) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let mut evs = svc
                 .store()
@@ -1433,8 +1441,10 @@ mod tests {
                 .expect("query events");
             evs.retain(|e| e.event_type.starts_with("hook:"));
             evs.reverse();
-            if !evs.is_empty() || std::time::Instant::now() >= deadline {
-                return evs.into_iter().map(|e| e.event_type).collect();
+            let types: Vec<String> = evs.into_iter().map(|e| e.event_type).collect();
+            let all_present = expected.iter().all(|t| types.iter().any(|ty| ty == t));
+            if all_present || std::time::Instant::now() >= deadline {
+                return types;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1496,7 +1506,7 @@ mod tests {
         assert!(hook.next_run_at.is_some(), "nextRunAt persisted");
         assert!(svc.hook_task_alive(&hook.hook_id), "task registered");
         // Immediate first run emitted run-completed + scheduled.
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_RUN_COMPLETED, HOOK_SCHEDULED]).await;
         assert!(types.contains(&HOOK_RUN_COMPLETED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
         // list surfaces it.
@@ -1599,7 +1609,7 @@ mod tests {
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("done already"), "{text}");
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
     }
 
@@ -1729,7 +1739,7 @@ mod tests {
             .expect("runNow");
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Evicted).await;
         assert!(hook.last_error.as_deref().unwrap().contains("kaput"));
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_EVICTED]).await;
         assert!(types.contains(&HOOK_EVICTED.to_string()), "{types:?}");
         let text = wait_for_wake(&svc, &owner, "evicted").await;
         assert!(text.contains("kaput"), "{text}");
@@ -1800,7 +1810,7 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.state, HookState::Cancelled);
         assert!(stored.next_run_at.is_none());
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
         assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
         let session = svc.store().get_agent_session(&owner).await.unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
@@ -2532,7 +2542,7 @@ mod tests {
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 2, "no run at/after expiry");
         assert!(expired.next_run_at.is_none());
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_EXPIRED]).await;
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
         assert!(!types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
@@ -2574,7 +2584,7 @@ mod tests {
         assert_eq!(expired.run_count, 0, "the dispatching script never ran");
         let err = svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap_err();
         assert!(err.to_string().contains("not active"), "{err}");
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_EXPIRED]).await;
         assert!(!types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
         assert!(!types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
@@ -2585,17 +2595,26 @@ mod tests {
     #[tokio::test]
     async fn in_flight_run_at_expiry_completes_then_expires_on_continue() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Deadline 1s out; the run busy-waits past it and returns continue —
-        // the run completes normally but the hook expires instead of
-        // rescheduling.
+        // Deterministic in-flight expiry (monorepo#1355): the deadline is far
+        // out, the script gates on a note, and the test moves the expiry
+        // clock past the deadline while the run is provably in flight —
+        // no assertion races the wall clock. Order is enforced end-to-end:
+        // the skew is stored before the note flips to "go", so the script's
+        // continue always lands after the deadline "passed".
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut gate = note(&ws, "exp-gate", "wait");
+        svc.store().insert_note(&gate).await.unwrap();
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws.clone(),
             agent_id: owner.clone(),
             name: "slow-continue".to_string(),
-            code: "const t = Date.now(); while (Date.now() - t < 1500) {} \
-                   return { dispatch: false };"
-                .to_string(),
+            code: "for (;;) { \
+                     const n = await ws.note.read('exp-gate'); \
+                     if (n.content.includes('go')) { return { dispatch: false }; } \
+                   }"
+            .to_string(),
             delay_ms: 10_000,
             state: HookState::Scheduled,
             created_at: now_iso(),
@@ -2605,18 +2624,30 @@ mod tests {
             last_error: None,
             last_logs: None,
             last_state: None,
-            expires_at: Some(next_run_at_iso(1_000)),
+            expires_at: Some(next_run_at_iso(60_000)),
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
+        // The run is in flight (state persists to `running` before the script
+        // starts; the note gate keeps it there). Now pass the deadline, then
+        // release the script — the continue lands strictly after expiry.
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        gate.content = "go".to_string();
+        svc.store().update_note(&gate).await.unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
         assert!(expired.next_run_at.is_none(), "no reschedule after expiry");
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(
+            &svc,
+            &ws,
+            &[HOOK_RUN_STARTED, HOOK_RUN_COMPLETED, HOOK_EXPIRED],
+        )
+        .await;
         assert!(types.contains(&HOOK_RUN_STARTED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_RUN_COMPLETED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
@@ -2653,7 +2684,7 @@ mod tests {
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(!types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
     }
@@ -2691,7 +2722,7 @@ mod tests {
         let expired = svc.store().get_hook(&stale.hook_id).await.unwrap();
         assert_eq!(expired.state, HookState::Expired);
         assert!(expired.next_run_at.is_none());
-        let types = hook_event_types(&svc, &ws).await;
+        let types = hook_event_types(&svc, &ws, &[HOOK_EXPIRED]).await;
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
         // The boot expiry wakes the owner too.
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
@@ -2703,21 +2734,25 @@ mod tests {
 
     #[test]
     fn time_to_expiry_handles_missing_past_and_future() {
-        assert_eq!(time_to_expiry(None), None);
-        assert!(!is_expired(None), "legacy rows never expire");
+        assert_eq!(time_to_expiry(None, 0), None);
+        assert!(!is_expired(None, 0), "legacy rows never expire");
         assert_eq!(
-            time_to_expiry(Some("not-a-timestamp")),
+            time_to_expiry(Some("not-a-timestamp"), 0),
             Some(Duration::ZERO)
         );
         assert_eq!(
-            time_to_expiry(Some(&next_run_at_iso(-5_000))),
+            time_to_expiry(Some(&next_run_at_iso(-5_000)), 0),
             Some(Duration::ZERO)
         );
-        assert!(is_expired(Some(&next_run_at_iso(-5_000))));
+        assert!(is_expired(Some(&next_run_at_iso(-5_000)), 0));
         let future = next_run_at_iso(30_000);
-        let remaining = time_to_expiry(Some(&future)).expect("future deadline");
+        let remaining = time_to_expiry(Some(&future), 0).expect("future deadline");
         assert!(remaining > Duration::from_secs(25), "{remaining:?}");
-        assert!(!is_expired(Some(&future)));
+        assert!(!is_expired(Some(&future), 0));
+        // A skew past the deadline expires it; one short of it does not.
+        assert!(is_expired(Some(&future), 60_000));
+        assert!(!is_expired(Some(&future), 5_000));
+        assert!(!is_expired(None, 60_000), "skew never expires legacy rows");
     }
 
     #[test]
