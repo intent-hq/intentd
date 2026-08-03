@@ -18349,3 +18349,117 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     );
     assert_eq!(watches[0].child_agent_id, target);
 }
+
+/// Batch-flush dequeue (`agents.flushQueuedMessages`): pops every
+/// ready-to-send entry in stored (drain) order — interrupt-priority entries
+/// first, then FIFO — while `editing: true` entries stay queued.
+#[tokio::test]
+async fn dequeue_ready_batch_pops_ready_in_drain_order_and_skips_editing() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Batch").await;
+
+    svc.enqueue_message(&agent, "first".into(), None, None, None, None, false);
+    let (edited, _) = svc.enqueue_message(&agent, "held".into(), None, None, None, None, false);
+    svc.enqueue_message(&agent, "second".into(), None, None, None, None, false);
+    // Interrupt entry inserts at the queue head (drain order).
+    svc.enqueue_message(&agent, "urgent".into(), None, None, None, None, true);
+    svc.agent_edit_queued_message_op(agent.clone(), edited.id, "held".into(), Some(true))
+        .await
+        .expect("mark editing");
+
+    let batch = svc
+        .dequeue_ready_batch(&agent, false, 2)
+        .expect("three ready entries meet the min");
+    let contents: Vec<_> = batch.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["urgent", "first", "second"],
+        "interrupt-priority first, then FIFO; editing entry skipped"
+    );
+    let snap = svc.queue_snapshot(&agent);
+    assert_eq!(snap.len(), 1, "editing entry stays queued");
+    assert_eq!(snap[0]["content"], json!("held"));
+}
+
+/// Below `min_ready` the batch dequeue is a no-op returning `None`, so the
+/// single-entry drain path handles the lone message unchanged.
+#[tokio::test]
+async fn dequeue_ready_batch_returns_none_below_min_ready() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "BatchMin").await;
+    svc.enqueue_message(&agent, "only".into(), None, None, None, None, false);
+
+    assert!(
+        svc.dequeue_ready_batch(&agent, false, 2).is_none(),
+        "one ready entry < min_ready 2"
+    );
+    assert_eq!(
+        svc.queue_snapshot(&agent).len(),
+        1,
+        "queue untouched on the None path"
+    );
+}
+
+/// Under an active question hold the flush drains ONLY user-origin entries
+/// (`user_origin_only`); automatic entries stay parked, preserving the hold
+/// contract.
+#[tokio::test]
+async fn dequeue_ready_batch_user_origin_only_leaves_automatic_parked() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "BatchHold").await;
+
+    svc.enqueue_message(&agent, "auto-1".into(), None, None, None, None, false);
+    svc.enqueue_message_with_origin(
+        &agent,
+        "answer-1".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    );
+    svc.enqueue_message_with_origin(
+        &agent,
+        "answer-2".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    );
+
+    let batch = svc
+        .dequeue_ready_batch(&agent, true, 2)
+        .expect("two user-origin entries meet the min");
+    let contents: Vec<_> = batch.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, vec!["answer-1", "answer-2"]);
+    let snap = svc.queue_snapshot(&agent);
+    assert_eq!(snap.len(), 1, "automatic entry stays parked under the hold");
+    assert_eq!(snap[0]["content"], json!("auto-1"));
+}
+
+/// `requeue_front_batch` re-inserts a drained remainder at the queue front in
+/// original order (never-lost, persist-failure path).
+#[tokio::test]
+async fn requeue_front_batch_preserves_order_ahead_of_existing_entries() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "BatchRequeue").await;
+
+    svc.enqueue_message(&agent, "a".into(), None, None, None, None, false);
+    svc.enqueue_message(&agent, "b".into(), None, None, None, None, false);
+    svc.enqueue_message(&agent, "later".into(), None, None, None, None, false);
+    let mut batch = svc
+        .dequeue_ready_batch(&agent, false, 3)
+        .expect("all three ready");
+    // Keep "later" queued; hand back ["a", "b"] at the front.
+    let later = batch.pop().expect("later");
+    assert_eq!(later.content, "later");
+    svc.requeue_front(&agent, later);
+    svc.requeue_front_batch(&agent, batch);
+
+    let snap = svc.queue_snapshot(&agent);
+    let contents: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
+    assert_eq!(contents, vec![json!("a"), json!("b"), json!("later")]);
+}

@@ -6928,6 +6928,60 @@ impl Services {
         Some(queue.remove(idx))
     }
 
+    /// Batch-flush dequeue (`agents.flushQueuedMessages`, PROTOCOL §5.5): pop
+    /// EVERY ready-to-send entry in stored order — which IS the drain order
+    /// (interrupt-priority first, then FIFO); `editing: true` entries stay
+    /// queued — so the drain can deliver them as one combined provider turn.
+    /// `user_origin_only` mirrors the question-hold contract: while the hold
+    /// is active only user-origin entries are eligible; automatic entries
+    /// stay parked. Returns `None` — leaving the queue untouched — unless at
+    /// least `min_ready` entries match, so callers keep the single-entry
+    /// drain path byte-for-byte when too few messages are waiting.
+    pub(crate) fn dequeue_ready_batch(
+        &self,
+        agent_id: &AgentId,
+        user_origin_only: bool,
+        min_ready: usize,
+    ) -> Option<Vec<QueuedMessage>> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let eligible = |m: &QueuedMessage| !m.editing && (!user_origin_only || m.user_origin);
+        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
+            return None;
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            if eligible(&queue[i]) {
+                drained.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        Some(drained)
+    }
+
+    /// Re-insert a batch of messages at the front of an agent's queue,
+    /// preserving their order (`messages[0]` becomes the queue head). Used by
+    /// the batch-flush persist-failure path to hand back the undelivered
+    /// remainder in original order (never-lost).
+    pub(crate) fn requeue_front_batch(&self, agent_id: &AgentId, messages: Vec<QueuedMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.entry(agent_id.clone()).or_default();
+        for (i, m) in messages.into_iter().enumerate() {
+            queue.insert(i, m);
+        }
+    }
+
     /// Atomically remove and return the queued entry with id `message_id`
     /// (any position, including entries under edit), or `None` when the agent
     /// has no such entry. Backs `agent.sendQueuedMessageNow` (PROTOCOL §5.5):

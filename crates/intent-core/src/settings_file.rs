@@ -428,6 +428,10 @@ pub struct AgentsSettings {
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
+    /// `agents.flushQueuedMessages` — deliver the whole queued-message
+    /// backlog in one batched turn when an idle agent drains its queue
+    /// (off = one turn per queued message).
+    pub flush_queued_messages: bool,
 }
 
 impl Default for AgentsSettings {
@@ -435,6 +439,7 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
+            flush_queued_messages: true,
         }
     }
 }
@@ -861,6 +866,9 @@ maxConcurrent = 0
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
+# Flush queued messages -- deliver the whole queued-message backlog in one
+# batched turn when an idle agent drains its queue.
+flushQueuedMessages = true
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
@@ -950,6 +958,7 @@ mod tests {
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
+        assert!(d.agents.flush_queued_messages);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
@@ -968,11 +977,12 @@ mod tests {
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
+        assert!(!parsed.agents.flush_queued_messages);
         assert_eq!(parsed.events.stream_retention_hours, 24);
         assert_eq!(parsed.workspace_api.max_output_chars, 5000);
         assert!(!parsed.workspace_api.toon_output);
