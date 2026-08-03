@@ -11849,12 +11849,17 @@ mod terminal {
             .expect("resize");
 
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let terminals = list.as_array().expect("bare terminals array");
+        // Envelope shape: { terminals: [{ id, name, cwd, isExecutingCommand }],
+        // daemonBootId } (monorepo#1334).
+        assert!(
+            list["daemonBootId"].as_str().is_some_and(|s| !s.is_empty()),
+            "daemonBootId is a non-empty string: {list}"
+        );
+        let terminals = list["terminals"].as_array().expect("terminals array");
         let entry = terminals
             .iter()
             .find(|t| t["id"].as_str() == Some(terminal_id.as_str()))
             .expect("list contains terminal");
-        // Bare-array shape: { id, name, cwd, isExecutingCommand }.
         assert_eq!(entry["name"], "Terminal");
         assert!(entry["cwd"].is_string(), "cwd is a string");
         assert!(
@@ -11863,6 +11868,44 @@ mod terminal {
         );
 
         h.services.terminal_kill(terminal_id).await.expect("kill");
+    }
+
+    /// `terminal.list` reports the same `daemonBootId` on every call within
+    /// one `Services` instance (one daemon boot) and a fresh id for a new
+    /// instance (a restart) — the authoritative-lifetime signal clients use to
+    /// tell a same-boot empty list from a post-restart one (monorepo#1334).
+    #[tokio::test]
+    async fn list_boot_id_stable_within_boot_and_fresh_across_boots() {
+        let h1 = harness().await;
+        let first = h1
+            .services
+            .terminal_list(h1.ws.clone())
+            .await
+            .expect("list");
+        let second = h1
+            .services
+            .terminal_list(h1.ws.clone())
+            .await
+            .expect("list");
+        let boot1 = first["daemonBootId"].as_str().expect("daemonBootId string");
+        assert_eq!(
+            boot1,
+            second["daemonBootId"].as_str().unwrap(),
+            "bootId stable across calls within one instance"
+        );
+        assert!(first["terminals"].is_array(), "terminals array present");
+
+        let h2 = harness().await;
+        let other = h2
+            .services
+            .terminal_list(h2.ws.clone())
+            .await
+            .expect("list");
+        assert_ne!(
+            boot1,
+            other["daemonBootId"].as_str().unwrap(),
+            "a new Services instance mints a fresh bootId"
+        );
     }
 
     /// `terminal.readOutput` returns a formatted, ANSI-stripped string: a header
@@ -12391,7 +12434,7 @@ mod script {
         // Script-owned PTYs do not hydrate as generic terminal tabs.
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
         assert!(
-            list.as_array().is_some_and(Vec::is_empty),
+            list["terminals"].as_array().is_some_and(Vec::is_empty),
             "script PTY must not be listed: {list}"
         );
 

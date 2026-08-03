@@ -229,14 +229,20 @@ pub(crate) fn get_buffer(
     Ok(json!({ "terminalId": terminal_id, "data": data }))
 }
 
-/// The workspace's live terminals as a bare array. Exited PTYs are omitted
-/// while their sessions remain retained for post-exit output and release.
-/// `[{ id, name, cwd, isExecutingCommand }]` (TS `ws.terminal.list`). `name` is
-/// the display name given at spawn (`SpawnSpec::name`, e.g. "Setup Script"),
-/// else the constant `"Terminal"`; `cwd` is the working directory resolved at
-/// spawn; `isExecutingCommand` is the child's liveness (the spawned process is
-/// the running command).
-pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
+/// The workspace's live terminals wrapped in the per-boot envelope
+/// `{ terminals: [{ id, name, cwd, isExecutingCommand }], daemonBootId }`
+/// (§5.13; monorepo#1334). Exited PTYs are omitted while their sessions remain
+/// retained for post-exit output and release. `name` is the display name given
+/// at spawn (`SpawnSpec::name`, e.g. "Setup Script"), else the constant
+/// `"Terminal"`; `cwd` is the working directory resolved at spawn;
+/// `isExecutingCommand` is the child's liveness (the spawned process is the
+/// running command). `daemon_boot_id` is the daemon's per-process boot id, so
+/// clients can tell which daemon lifetime a (possibly empty) list belongs to.
+pub(crate) fn list(
+    pty: &PtyHost,
+    workspace_id: &WorkspaceId,
+    daemon_boot_id: &str,
+) -> Result<Value> {
     let mut terminals: Vec<(String, Value)> = pty
         .list_scope(workspace_id.as_str())
         .into_iter()
@@ -260,7 +266,7 @@ pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
         .collect();
     terminals.sort_by(|a, b| a.0.cmp(&b.0));
     let terminals: Vec<Value> = terminals.into_iter().map(|(_, v)| v).collect();
-    Ok(Value::Array(terminals))
+    Ok(json!({ "terminals": terminals, "daemonBootId": daemon_boot_id }))
 }
 
 /// `terminal.readOutput`: a formatted, ANSI-stripped view of a terminal's
@@ -1036,8 +1042,9 @@ mod tests {
         .unwrap();
         let id = term_id(&res);
 
-        let listed = list(pty.as_ref(), &ws("ws-1")).unwrap();
-        let arr = listed.as_array().unwrap();
+        let listed = list(pty.as_ref(), &ws("ws-1"), "boot-test").unwrap();
+        assert_eq!(listed["daemonBootId"], json!("boot-test"));
+        let arr = listed["terminals"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], json!(id));
         assert_eq!(arr[0]["name"], json!("Terminal"));
@@ -1046,8 +1053,11 @@ mod tests {
         kill(pty.as_ref(), &id).await.unwrap();
         let empty = poll_until(
             || {
-                let v = list(pty.as_ref(), &ws("ws-1")).unwrap();
-                v.as_array().filter(|a| a.is_empty()).map(|_| ())
+                let v = list(pty.as_ref(), &ws("ws-1"), "boot-test").unwrap();
+                v["terminals"]
+                    .as_array()
+                    .filter(|a| a.is_empty())
+                    .map(|_| ())
             },
             TIMEOUT,
         )
@@ -1077,8 +1087,8 @@ mod tests {
         .unwrap();
         let id = term_id(&res);
 
-        let arr = list(pty.as_ref(), &ws("ws-1")).unwrap();
-        let entry = &arr.as_array().unwrap()[0];
+        let listed = list(pty.as_ref(), &ws("ws-1"), "boot-test").unwrap();
+        let entry = &listed["terminals"].as_array().unwrap()[0];
         assert_eq!(entry["cwd"], json!("/"));
 
         kill(pty.as_ref(), &id).await.unwrap();
@@ -1109,8 +1119,8 @@ mod tests {
         .unwrap();
         let unnamed_id = term_id(&res);
 
-        let listed = list(pty.as_ref(), &ws("ws-named")).unwrap();
-        let arr = listed.as_array().unwrap();
+        let listed = list(pty.as_ref(), &ws("ws-named"), "boot-test").unwrap();
+        let arr = listed["terminals"].as_array().unwrap();
         let by_id = |id: &str| {
             arr.iter()
                 .find(|e| e["id"] == json!(id))
@@ -1121,6 +1131,19 @@ mod tests {
 
         kill(pty.as_ref(), &named_id).await.unwrap();
         kill(pty.as_ref(), &unnamed_id).await.unwrap();
+    }
+
+    /// `list` always returns the `{ terminals, daemonBootId }` envelope —
+    /// even for a workspace with no PTYs — echoing the caller's boot id
+    /// verbatim (monorepo#1334).
+    #[test]
+    fn list_returns_envelope_even_when_empty() {
+        let pty = host();
+        let listed = list(pty.as_ref(), &ws("ws-empty"), "boot-abc").unwrap();
+        assert_eq!(
+            listed,
+            json!({ "terminals": [], "daemonBootId": "boot-abc" })
+        );
     }
 
     /// The setup script wrapper appends a newline-prefixed completion summary
@@ -1261,8 +1284,8 @@ mod tests {
         .unwrap();
         let id = term_id(&res);
 
-        let arr = list(pty.as_ref(), &wsid).unwrap();
-        let entry = &arr.as_array().unwrap()[0];
+        let listed = list(pty.as_ref(), &wsid, "boot-test").unwrap();
+        let entry = &listed["terminals"].as_array().unwrap()[0];
         assert_eq!(entry["cwd"], json!(worktree.display().to_string()));
 
         kill(pty.as_ref(), &id).await.unwrap();
@@ -1389,9 +1412,9 @@ mod tests {
         assert_eq!(exit.data["exitCode"], json!(0));
         assert!(exit.data["signal"].is_null());
 
-        let listed = list(pty.as_ref(), &ws("ws-1")).unwrap();
+        let listed = list(pty.as_ref(), &ws("ws-1"), "boot-test").unwrap();
         assert!(
-            listed
+            listed["terminals"]
                 .as_array()
                 .is_some_and(|terminals| terminals.iter().all(|terminal| terminal["id"] != id)),
             "naturally exited terminal must not remain in terminal.list: {listed}"
