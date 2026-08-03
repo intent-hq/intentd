@@ -23,6 +23,8 @@ pub use host::{
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
 };
 pub use host_env::{detect_display_server, detect_has_display};
+#[cfg(windows)]
+pub use listener::pipe_name_for_socket_path;
 pub use listener::{derive_pipe_name, serve_uds, serve_uds_with_reverse};
 pub use pairing::{build_pairing_uri, PAIRING_PAYLOAD_VERSION};
 pub use protocol::{MAX_INBOUND_MESSAGE_BYTES, MAX_OUTBOUND_MESSAGE_BYTES, PROTOCOL_VERSION};

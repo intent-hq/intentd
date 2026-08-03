@@ -69,8 +69,10 @@ pub fn derive_pipe_name(resolved_socket_path: &str) -> String {
 }
 
 /// Resolve `socket_path` to absolute form and derive the pipe name it maps to.
+/// Public so local clients (the `intentd` CLI) connect to the exact same pipe
+/// the listener binds, without re-implementing the resolution.
 #[cfg(windows)]
-fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> {
+pub fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> {
     let absolute = std::path::absolute(socket_path)?;
     Ok(derive_pipe_name(&absolute.to_string_lossy()))
 }
