@@ -221,7 +221,56 @@ jobs:
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
 
+  # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
+  # only version strings + changelog, so the compiled code is identical to
+  # what main already tested and the heavy jobs (build matrix, coverage-all,
+  # coverage-e2e) add no signal — their ~20 min wall time just makes the PR
+  # lose the strict up-to-date race against main. This job diffs the PR
+  # against its base and emits fast_path=true only when the diff has exactly
+  # the release shape (files ⊆ {CHANGELOG.md, Cargo.lock, crates/*/Cargo.toml}
+  # and every non-changelog change is a uniform old→new version-string flip;
+  # see scripts/release-pr-fast-path.sh). The diff shape is the ONLY signal —
+  # never branch name or author — so a PR can't spoof its way past the heavy
+  # checks: any real code change breaks the shape. Fail-safe, not fail-open:
+  # the heavy jobs skip only when the output is exactly 'true' (script error,
+  # missing output, or job failure falls back to full CI), push / merge_group
+  # runs are never gated, and check / pr-title / conflict-markers /
+  # deb-packaging still run on every PR. Job names are unchanged, so skipped
+  # heavy jobs satisfy the required-check ruleset without edits.
+  release-fast-path:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    outputs:
+      fast_path: ${{ steps.decide.outputs.fast_path }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch PR base commit
+        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+      - name: Evaluate diff shape
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Script contract: prints fast_path=true|false; non-zero exit means
+          # no-match. Never fail this step — a broken checker must degrade to
+          # full CI, not block the PR.
+          out=$(./scripts/release-pr-fast-path.sh "$BASE_SHA" HEAD) || {
+            echo "release-pr-fast-path.sh exited non-zero — falling back to full CI"
+            out="fast_path=false"
+          }
+          printf '%s\n' "$out"
+          line=$(printf '%s\n' "$out" | grep -E '^fast_path=(true|false)$' | tail -n1 || true)
+          echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
+
   build:
+    # Skipped when the diff is release-PR-shaped (see release-fast-path).
+    # Runs unless the output is exactly 'true': on push / merge_group the
+    # fast-path job is skipped and the output is empty, and a fast-path
+    # failure leaves it empty too, so both fall back to running this job.
+    needs: release-fast-path
+    if: ${{ !cancelled() && needs.release-fast-path.outputs.fast_path != 'true' }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -300,7 +349,11 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    needs: route
+    # Skipped when the diff is release-PR-shaped (see release-fast-path);
+    # fail-safe as in the build job. The route.result guard preserves the
+    # pre-existing behavior that a route failure skips this job.
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -444,7 +497,11 @@ jobs:
           retention-days: 3
 
   coverage-all:
-    needs: route
+    # Skipped when the diff is release-PR-shaped (see release-fast-path);
+    # fail-safe as in the build job. The route.result guard preserves the
+    # pre-existing behavior that a route failure skips this job.
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
