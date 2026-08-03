@@ -1376,6 +1376,31 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
 }
 
 impl Services {
+    /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
+    /// the runtime manager's busy set. Only the small busy set reaches SQLite,
+    /// and each lookup selects `updated_at` alone.
+    pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
+        let Some(manager) = self.agent_manager() else {
+            return Ok(json!({ "streams": [] }));
+        };
+        let busy = manager.list_busy();
+        if busy.is_empty() {
+            return Ok(json!({ "streams": [] }));
+        }
+
+        let mut streams = Vec::with_capacity(busy.len());
+        for (agent_id, workspace_id) in busy {
+            let updated_at = self.store.get_agent_session_updated_at(&agent_id).await?;
+            streams.push(json!({
+                "agentId": agent_id,
+                "sessionId": agent_id,
+                "workspaceId": workspace_id,
+                "startTime": iso_ms(&updated_at),
+            }));
+        }
+        Ok(json!({ "streams": streams }))
+    }
+
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
     /// a fixed number of store queries regardless of session count, and no

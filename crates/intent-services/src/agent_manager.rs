@@ -2847,6 +2847,25 @@ impl AgentManager {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
+    /// Snapshot every agent with a turn currently in flight together with its
+    /// owning workspace. This is the daemon-global source for
+    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let busy = self.busy.lock().unwrap();
+        let agent_ws = self.agent_ws.lock().unwrap();
+        let mut active = busy
+            .iter()
+            .filter_map(|agent_id| {
+                agent_ws
+                    .get(agent_id)
+                    .cloned()
+                    .map(|workspace_id| (agent_id.clone(), workspace_id))
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        active
+    }
+
     /// Atomically claim the in-flight slot for `agent_id` in `workspace_id`:
     /// `true` when the agent was idle (now marked busy), `false` when a turn is
     /// already running. On a successful claim the agent's workspace is recorded

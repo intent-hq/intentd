@@ -25,6 +25,16 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp";
 
+/// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
+/// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
+/// and loading it made `agent.list` scale with the stored prompt bytes.
+const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
+    name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
+    specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
+    attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
+    initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
+    sandbox_branch, stop_reason, stop_reason_timestamp";
+
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
 /// `message_contents` is non-empty only for sessions whose decoded snapshot
@@ -517,14 +527,14 @@ impl Store {
     /// checks — monorepo#958), skipping the full transcript hydration that
     /// `get_agent_session` performs.
     pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSession> {
-        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session summary failed: {e}")))?;
         match row {
-            Some(r) => map_session_row(&r),
+            Some(r) => map_session_summary_row(&r),
             None => Err(Error::NotFound(format!("agent session {id}"))),
         }
     }
@@ -542,6 +552,20 @@ impl Store {
             .map_err(|e| Error::Internal(format!("get agent session status failed: {e}")))?;
         match row {
             Some(r) => enum_from_db::<AgentStatus>(&r.get::<String, _>("status")),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
+    /// Lightweight timestamp-only lookup for daemon-global active-agent probes.
+    /// Selects no session metadata or transcript content.
+    pub async fn get_agent_session_updated_at(&self, id: &AgentId) -> Result<String> {
+        let row = sqlx::query("SELECT updated_at FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session updated_at failed: {e}")))?;
+        match row {
+            Some(r) => Ok(r.get("updated_at")),
             None => Err(Error::NotFound(format!("agent session {id}"))),
         }
     }
@@ -591,14 +615,14 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
         let sql = format!(
-            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
-        rows.iter().map(map_session_row).collect()
+        rows.iter().map(map_session_summary_row).collect()
     }
 
     /// Get message count and whether any assistant message exists for each session in
@@ -1810,6 +1834,17 @@ impl Store {
 }
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
+    map_session_row_with_system_prompt(row, col(row, "system_prompt")?)
+}
+
+fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
+    map_session_row_with_system_prompt(row, None)
+}
+
+fn map_session_row_with_system_prompt(
+    row: &SqliteRow,
+    system_prompt: Option<String>,
+) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
     let task_note: Option<String> = col(row, "task_note_id")?;
@@ -1835,7 +1870,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
         is_active: col::<i64>(row, "is_active")? != 0,
-        system_prompt: col(row, "system_prompt")?,
+        system_prompt,
         // Loaded separately by the caller; derived `stats` is never persisted.
         messages: Vec::new(),
         stats: None,
@@ -3986,6 +4021,7 @@ mod tests {
 
         // Insert agent session
         let agent_id = AgentId("agent-summary-test".to_string());
+        let system_prompt = "large system prompt".repeat(4096);
         let session = AgentSession {
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
@@ -3997,7 +4033,7 @@ mod tests {
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
-            system_prompt: None,
+            system_prompt: Some(system_prompt.clone()),
             created_at: ts.clone(),
             updated_at: ts.clone(),
             messages: vec![],
@@ -4047,6 +4083,11 @@ mod tests {
             .expect("list_agent_sessions");
         assert_eq!(full.len(), 1, "should have one session");
         assert_eq!(
+            full[0].system_prompt.as_deref(),
+            Some(system_prompt.as_str()),
+            "full session reads should retain system_prompt"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -4065,6 +4106,14 @@ mod tests {
         );
         assert_eq!(summaries[0].id, agent_id, "id should match");
         assert_eq!(summaries[0].name, "Test Agent", "name should match");
+        assert_eq!(
+            summaries[0].system_prompt, None,
+            "summary reads should not load system_prompt"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
+            "the summary SELECT must not mention system_prompt"
+        );
     }
 
     #[tokio::test]
