@@ -87,6 +87,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "logging.level",
     "agents.maxConcurrent",
     "agents.idleReapMinutes",
+    "agents.flushQueuedMessages",
     "events.streamRetentionHours",
     "workspaceApi.maxOutputChars",
     "workspaceApi.toonOutput",
@@ -983,6 +984,37 @@ mod tests {
         assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
         assert_eq!(reg.get("server.wsApi.enabled"), Some(json!(true)));
         assert!(rx.has_changed().expect("sender alive"));
+    }
+
+    #[test]
+    fn flush_queued_messages_defaults_on_overrides_and_reloads() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        // Schema default: on.
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(true)));
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::Default)
+        );
+
+        // File override via apply, surviving a fresh load from disk.
+        reg.apply(&set("agents.flushQueuedMessages", json!(false)))
+            .expect("apply");
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(false)));
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
+        let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
+        assert_eq!(
+            reloaded.get("agents.flushQueuedMessages"),
+            Some(json!(false))
+        );
+
+        // External reload without the key restores the schema default.
+        let notice = reg.reload("").expect("reload");
+        assert!(notice.changed.contains("agents.flushQueuedMessages"));
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(true)));
     }
 
     #[test]

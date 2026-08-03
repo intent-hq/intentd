@@ -1169,6 +1169,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             30.0,
         ),
+        boolean(
+            "agents.flushQueuedMessages",
+            "Flush queued messages",
+            "Deliver the whole queued-message backlog in one batched turn when an idle agent drains its queue",
+            "agents",
+            true,
+        ),
         number(
             "events.streamRetentionHours",
             "Event stream retention hours",
@@ -2083,6 +2090,73 @@ mod tests {
         let reset = svc.reset("workspaceApi.toonOutput").await.expect("reset");
         assert_eq!(reset["value"], json!(true));
         let got = svc.get("workspaceApi.maxOutputChars").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `agents.flushQueuedMessages` is a TOML-backed boolean defaulting to
+    /// `true`: the catalog entry and wire round-trip through the
+    /// registry-wired service (default origin → file override → reset).
+    #[tokio::test]
+    async fn agents_flush_queued_messages_round_trip_via_registry() {
+        let def = find_definition("agents.flushQueuedMessages")
+            .expect("agents.flushQueuedMessages missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(def.ty, SettingType::Boolean));
+        assert_eq!(def.default_value, Some(json!(true)));
+        assert!(KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default with `default` origin.
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+
+        // Update persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([
+            { "path": "agents.flushQueuedMessages", "value": false },
+        ]))
+        .await
+        .expect("update");
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("flushQueuedMessages"), "{text}");
+        assert_eq!(
+            store
+                .get_setting("agents.flushQueuedMessages")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Reset restores the default.
+        let reset = svc
+            .reset("agents.flushQueuedMessages")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(true));
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
         assert_eq!(got["origin"], json!("default"));
 
         let _ = std::fs::remove_file(&config_path);
