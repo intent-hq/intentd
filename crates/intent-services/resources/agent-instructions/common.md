@@ -49,7 +49,7 @@ Never block or sleep inside your turn waiting for something external (CI, anothe
 - **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see.
 - **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
 - **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
-- **TTL**: every hook expires at most 60 minutes after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Pass `ttlMs` deliberately when the wait should be shorter than the cap.
+- **TTL**: every hook expires at most 60 minutes after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 60-minute cap — so expiry doubles as an "overdue — reassess" wake.
 
 ## Response Organization
 
