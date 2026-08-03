@@ -56,14 +56,16 @@ mod tests {
     /// `intent-services` seam so the tests exercise the wire `host.exec`
     /// semantics (spawn, timeout reap, cwd containment) end-to-end;
     /// `get_workspace` roots the workspace at a temp dir so the containment
-    /// guard has a real absolute root to check against.
+    /// guard has a real absolute root to check against. Owning the `TempDir`
+    /// guard removes the dir when the test's api drops (monorepo#1302 —
+    /// nothing else ever reclaimed these).
     struct FakeApi {
-        root: String,
+        root: tempfile::TempDir,
     }
 
     impl WorkspaceApi for FakeApi {
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-            let ws = make_workspace(id.as_str(), &self.root);
+            let ws = make_workspace(id.as_str(), &self.root.path().to_string_lossy());
             Box::pin(async move { Ok(ws) })
         }
 
@@ -122,20 +124,12 @@ mod tests {
         }
     }
 
-    fn temp_root(tag: &str) -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-acp-hostexec-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.to_string_lossy().into_owned()
-    }
-
     fn api(tag: &str) -> (Arc<dyn WorkspaceApi>, WorkspaceId) {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi {
-            root: temp_root(tag),
-        });
+        let root = tempfile::Builder::new()
+            .prefix(&format!("intent-acp-hostexec-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi { root });
         (api, WorkspaceId::from_string("ws-host"))
     }
 

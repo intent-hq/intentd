@@ -131,6 +131,18 @@ async fn subscribe_push_filter_unsubscribe_and_disconnect_cleanup() {
     let (read_half, mut write_half) = connect_retry(&socket).await.into_split();
     let mut reader = BufReader::new(read_half);
 
+    // Invalid subscription params (missing eventTypes) → -32602 with the
+    // machine-readable discriminator (PROTOCOL §3.3, monorepo#1364).
+    send(
+        &mut write_half,
+        r#"{"jsonrpc":"2.0","id":0,"method":"events.subscribe","params":{}}"#,
+    )
+    .await;
+    let bad = read_json(&mut reader).await;
+    assert_eq!(bad["id"], 0);
+    assert_eq!(bad["error"]["code"], json!(-32602));
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params");
+
     send(&mut write_half, r#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{"eventTypes":["note:*"],"workspaceId":"ws-1"}}"#).await;
     let resp = read_json(&mut reader).await;
     assert_eq!(resp["id"], 1);

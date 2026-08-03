@@ -4583,10 +4583,16 @@ async fn router_read_lifecycle_arms_over_wss() {
     .await;
     poll_id += 1;
     assert_eq!(
-        script_terminals,
+        script_terminals["terminals"],
         json!([]),
         "running script PTY must not be exposed as a terminal tab"
     );
+    // `terminal.list` responds with the `{ terminals, daemonBootId }` envelope
+    // (PROTOCOL §5.13; monorepo#1334) — even for an empty workspace.
+    let script_boot_id = script_terminals["daemonBootId"]
+        .as_str()
+        .expect("daemonBootId string")
+        .to_string();
     let script_output = wss_rpc(
         &mut rpc,
         poll_id,
@@ -4632,10 +4638,15 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id }),
     )
     .await;
-    let terms = term_list.as_array().expect("terminals array");
+    let terms = term_list["terminals"].as_array().expect("terminals array");
     assert!(
         terms.iter().any(|t| t["id"] == json!(terminal_id)),
         "created terminal listed: {term_list}"
+    );
+    assert_eq!(
+        term_list["daemonBootId"].as_str(),
+        Some(script_boot_id.as_str()),
+        "daemonBootId stable across calls within one daemon boot"
     );
     // `terminal.write` accepts base64-encoded stdin bytes (PROTOCOL §5.13).
     // "ZWNobyBoaQo=" is base64 for "echo hi\n" — short and stable.
@@ -4839,10 +4850,14 @@ async fn terminal_create_env_over_wss() {
     )
     .await;
     assert!(
-        listed
+        listed["terminals"]
             .as_array()
             .is_some_and(|terms| terms.iter().all(|term| term["id"] != terminal_id)),
         "naturally exited terminal must be omitted from terminal.list: {listed}"
+    );
+    assert!(
+        listed["daemonBootId"].is_string(),
+        "terminal.list envelope carries daemonBootId: {listed}"
     );
 
     let buffer = wss_rpc(
@@ -7560,10 +7575,10 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
 /// `agent_manager::create_agent` for a top-level (non-sub-agent) interactive
 /// agent MUST contain the `## Suggested Next Steps` heading — the directive
 /// that tells the model to emit a `<!-- suggested-prompts ... -->` block at
-/// the end of user-facing responses. The daemon writes the temp file into
-/// `std::env::temp_dir()` and keeps it alive for the lifetime of the agent
-/// handle, so we redirect the daemon's `TMPDIR` to a test-controlled
-/// directory and scan it after the first turn kicks off spawning.
+/// the end of user-facing responses. The daemon writes the file into
+/// `<data_dir>/agent-configs` (monorepo#1302) and keeps it alive for the
+/// lifetime of the agent handle, so we scan that directory after the first
+/// turn kicks off spawning.
 #[tokio::test]
 async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     let Some(script) = gate("WSS SP-1 rules-file E2E") else {
@@ -7572,9 +7587,9 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    // Dedicated TMPDIR so the daemon's `std::env::temp_dir()` writes the
-    // `intentd-rules-*.md` and `intentd-mcp-*.json` files where this test
-    // can inspect them.
+    // Dedicated TMPDIR keeps the daemon's residual temp usage hermetic and
+    // lets this test assert the generated rules file no longer lands there
+    // (monorepo#1302 moved it under `<data_dir>/agent-configs`).
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp dir");
     let tmp_dir_s = tmp_dir.to_string_lossy().into_owned();
@@ -7628,19 +7643,23 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Poll the redirected TMPDIR for the `intentd-rules-*.md` the daemon
-    // writes during spawn. Bounded wait so a hung spawn fails loudly.
+    // Poll `<data_dir>/agent-configs` for the `intentd-rules-*.md` the daemon
+    // writes during spawn (the directory is created on demand at first spawn,
+    // so tolerate it not existing yet). Bounded wait so a hung spawn fails
+    // loudly.
+    let rules_dir = data_dir.join("agent-configs");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut rules_body: Option<String> = None;
     while std::time::Instant::now() < deadline {
-        let entries = std::fs::read_dir(&tmp_dir).expect("read TMPDIR");
         let mut hit: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_s = name.to_string_lossy();
-            if name_s.starts_with("intentd-rules-") && name_s.ends_with(".md") {
-                hit = Some(entry.path());
-                break;
+        if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_s = name.to_string_lossy();
+                if name_s.starts_with("intentd-rules-") && name_s.ends_with(".md") {
+                    hit = Some(entry.path());
+                    break;
+                }
             }
         }
         if let Some(path) = hit {
@@ -7654,8 +7673,22 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         sleep(Duration::from_millis(100)).await;
     }
     let body = rules_body.expect(
-        "expected `intentd-rules-*.md` to be written under the redirected TMPDIR \
+        "expected `intentd-rules-*.md` to be written under <data_dir>/agent-configs \
          during agent spawn",
+    );
+    // Regression guard for monorepo#1302: the generated per-agent files must
+    // no longer land in the (redirected) OS temp dir.
+    let leaked_in_tmp = std::fs::read_dir(&tmp_dir)
+        .expect("read TMPDIR")
+        .flatten()
+        .any(|e| {
+            let name = e.file_name();
+            let name_s = name.to_string_lossy();
+            name_s.starts_with("intentd-rules-") || name_s.starts_with("intentd-mcp-")
+        });
+    assert!(
+        !leaked_in_tmp,
+        "generated agent config files must not be written into the OS temp dir"
     );
     // Debug tail walks forward to the next char boundary so the slice never
     // lands mid-multi-byte (the rules text includes non-ASCII like "2–4").

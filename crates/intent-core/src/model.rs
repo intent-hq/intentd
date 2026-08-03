@@ -2611,13 +2611,18 @@ pub enum ScriptMode {
     Command,
 }
 
-/// Runtime status of a script process (ported from the TS `ScriptStatus`).
+/// Runtime status of a script process (ported from the TS `ScriptStatus`,
+/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
+/// restart-in-flight window (the auto-restart backoff and the `script.restart`
+/// stop→start gap) so clients can distinguish it from a final exit; the
+/// respawn flips it back to `running`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
     Running,
+    Restarting,
     Exited,
 }
 
@@ -2877,6 +2882,18 @@ mod tests {
         );
         let back: Event = serde_json::from_value(wire).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn script_status_serializes_restarting_lowercase() {
+        // The restart-in-flight window (monorepo#1318) rides the same
+        // lowercase wire encoding as the ported statuses.
+        assert_eq!(
+            serde_json::to_value(ScriptStatus::Restarting).unwrap(),
+            json!("restarting")
+        );
+        let back: ScriptStatus = serde_json::from_value(json!("restarting")).unwrap();
+        assert_eq!(back, ScriptStatus::Restarting);
     }
 
     #[test]

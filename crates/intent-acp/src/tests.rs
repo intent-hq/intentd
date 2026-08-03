@@ -907,6 +907,37 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_rewrites_codex_dot_separated_mcp_titles() {
+        // Codex titles MCP tools `mcp.<server>.<tool>`; the title is
+        // rewritten to `{server}_{tool}` and fed through the affix strip —
+        // the same treatment as the codex nested-input unwrap.
+        assert_eq!(
+            session::derive_tool_name("mcp.workspace-mcp.workspace_api", None),
+            "workspace_api"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp.some-server.read_note", None),
+            "some-server_read_note"
+        );
+        // Prose titles containing dots (with whitespace) never match.
+        assert_eq!(
+            session::derive_tool_name("Read config.toml and summarize", None),
+            "Read config.toml and summarize"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp.workspace-mcp.some tool", None),
+            "mcp.workspace-mcp.some tool"
+        );
+        // Missing server or tool segment → no match, title passes through.
+        assert_eq!(session::derive_tool_name("mcp.server", None), "mcp.server");
+        assert_eq!(session::derive_tool_name("mcp..tool", None), "mcp..tool");
+        assert_eq!(
+            session::derive_tool_name("mcp.server.", None),
+            "mcp.server."
+        );
+    }
+
+    #[test]
     fn derive_tool_name_recognizes_opencode_input_shapes() {
         // Captured from opencode 1.18.3: once arguments stream in, titles
         // turn into raw prose (the command line, a file path, a regex), so

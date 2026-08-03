@@ -38,6 +38,27 @@ fn rpc(code: i32, message: impl Into<String>) -> RpcErr {
     }
 }
 
+/// `-32602` for bad or missing request params, carrying the machine-readable
+/// discriminator `error.data.code = "invalid-params"` (monorepo#1320).
+fn invalid_params(message: impl Into<String>) -> RpcErr {
+    RpcErr {
+        code: INVALID_PARAMS,
+        message: message.into(),
+        data: Some(json!({ "code": "invalid-params" })),
+    }
+}
+
+/// `-32602` for a lookup of an entity that does not exist, carrying the
+/// machine-readable discriminator `error.data.code = "not-found"` so clients
+/// can distinguish deletion from bad params (monorepo#1320).
+fn not_found(message: impl Into<String>) -> RpcErr {
+    RpcErr {
+        code: INVALID_PARAMS,
+        message: message.into(),
+        data: Some(json!({ "code": "not-found" })),
+    }
+}
+
 /// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
@@ -74,6 +95,10 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": category.as_str(), "detail": detail })),
         },
+        // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
+        // nonexistent entity from bad request params; messages are unchanged.
+        e @ Error::NotFound(_) => not_found(e.to_string()),
+        e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -147,7 +172,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
                 echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
-                None,
+                Some(json!({ "code": "invalid-params" })),
             ));
         }
     };
@@ -202,14 +227,13 @@ async fn dispatch(
                 .and_then(|a| a.get("agentId"))
                 .is_some_and(|v| !v.is_null())
             {
-                return Err(rpc(
-                    INVALID_PARAMS,
+                return Err(invalid_params(
                     "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
                 ));
             }
             let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
             let res = api
                 .create_workspace(input, idempotency_key)
                 .await
@@ -225,7 +249,7 @@ async fn dispatch(
             let mut rest = params.clone();
             rest.remove("workspaceId");
             let update: WorkspaceUpdate = serde_json::from_value(Value::Object(rest))
-                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
             let ws = api
                 .update_workspace(id, update)
                 .await
@@ -275,14 +299,12 @@ async fn dispatch(
             let enabled = match params.get("enabled") {
                 Some(Value::Bool(b)) => *b,
                 Some(_) => {
-                    return Err(rpc(
-                        INVALID_PARAMS,
+                    return Err(invalid_params(
                         "Invalid parameter: enabled must be a boolean",
                     ))
                 }
                 None => {
-                    return Err(rpc(
-                        INVALID_PARAMS,
+                    return Err(invalid_params(
                         "Missing required parameter: enabled (boolean)",
                     ))
                 }
@@ -326,16 +348,16 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let config_value = params
                 .get("config")
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: config"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: config"))?;
             // Keep the raw JSON object so the service can distinguish absent
             // keys (preserve) from explicit `null` (clear) when merging.
             let patch = config_value
                 .as_object()
                 .cloned()
-                .ok_or_else(|| rpc(INVALID_PARAMS, "invalid config: expected a JSON object"))?;
+                .ok_or_else(|| invalid_params("invalid config: expected a JSON object"))?;
             // Validate field types up front so malformed payloads fail with -32602.
             serde_json::from_value::<intent_core::RepoConfig>(Value::Object(patch.clone()))
-                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid config: {e}")))?;
+                .map_err(|e| invalid_params(format!("invalid config: {e}")))?;
             let saved_config = api
                 .save_repo_config(id, patch)
                 .await
@@ -380,7 +402,7 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ui_context = params
                 .get("uiContext")
-                .ok_or_else(|| rpc(INVALID_PARAMS, "uiContext required"))?
+                .ok_or_else(|| invalid_params("uiContext required"))?
                 .clone();
             let persisted = api
                 .update_workspace_ui_context(id, ui_context)
@@ -425,7 +447,7 @@ async fn dispatch(
         "note.list" => {
             let ws_id = match params.get("workspaceId").and_then(Value::as_str) {
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),
-                _ => return Err(rpc(INVALID_PARAMS, "workspaceId is required")),
+                _ => return Err(invalid_params("workspaceId is required")),
             };
             let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
             Ok(json!({ "notes": notes }))
@@ -435,7 +457,7 @@ async fn dispatch(
             let note_id = require_note_id(params)?;
             match api.get_note(ws, note_id).await {
                 Ok(note) => Ok(json!({ "note": note })),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Note not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -746,7 +768,7 @@ async fn dispatch(
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             match api.task_get(ws, task_note_id).await {
                 Ok(task) => Ok(json!({ "task": task })),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Task not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Task not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -944,7 +966,7 @@ async fn dispatch(
             let ws = opt_workspace_id(params);
             match api.agent_get(agent_id, ws).await {
                 Ok(agent) => Ok(json!({ "agent": agent })),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -963,7 +985,7 @@ async fn dispatch(
                 .await
             {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -973,7 +995,7 @@ async fn dispatch(
             let ws = opt_workspace_id(params);
             match api.agent_get_session_stats(session_id, ws).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Session not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Session not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -982,7 +1004,7 @@ async fn dispatch(
             let ws = opt_workspace_id(params);
             match api.agent_get_session(agent_id, ws).await {
                 Ok(session) => Ok(json!({ "session": session })),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -992,10 +1014,10 @@ async fn dispatch(
             let changes = params
                 .get("changes")
                 .cloned()
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: changes"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: changes"))?;
             match api.agent_update(agent_id, ws, changes).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1007,14 +1029,14 @@ async fn dispatch(
                 .get("contentBlocks")
                 .or_else(|| params.get("content"))
                 .cloned()
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: contentBlocks"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: contentBlocks"))?;
             let metadata = opt_value(params, "metadata");
             match api
                 .agent_append_message(agent_id, ws, role, content, metadata)
                 .await
             {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1024,10 +1046,10 @@ async fn dispatch(
             let messages = params
                 .get("messages")
                 .cloned()
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: messages"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: messages"))?;
             match api.agent_replace_messages(agent_id, ws, messages).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(_)) => Err(rpc(INVALID_PARAMS, "Agent not found")),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1037,8 +1059,7 @@ async fn dispatch(
             // ahead of every other param so the stale-client signal is
             // unambiguous even on otherwise-malformed requests).
             if params.get("agentId").is_some_and(|v| !v.is_null()) {
-                return Err(rpc(
-                    INVALID_PARAMS,
+                return Err(invalid_params(
                     "agentId: agent IDs are server-assigned and the field must be omitted",
                 ));
             }
@@ -1085,7 +1106,7 @@ async fn dispatch(
             let mut rest = params.clone();
             rest.remove("workspaceId");
             let input: AgentDelegateInput = serde_json::from_value(Value::Object(rest))
-                .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
                 .agent_delegate(ws, input, None)
@@ -1286,7 +1307,7 @@ async fn dispatch(
                 None | Some(Value::Null) => 0,
                 Some(v) => v
                     .as_i64()
-                    .ok_or_else(|| rpc(INVALID_PARAMS, "tzOffsetMinutes must be an integer"))?,
+                    .ok_or_else(|| invalid_params("tzOffsetMinutes must be an integer"))?,
             };
             let result = api
                 .stats_get_usage(period, key, tz_offset_minutes)
@@ -1302,7 +1323,7 @@ async fn dispatch(
                 None | Some(Value::Null) => None,
                 Some(v) => Some(
                     v.as_i64()
-                        .ok_or_else(|| rpc(INVALID_PARAMS, "limit must be an integer"))?,
+                        .ok_or_else(|| invalid_params("limit must be an integer"))?,
                 ),
             };
             let result = api
@@ -1315,24 +1336,22 @@ async fn dispatch(
             // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
             let prompt = require_str_param(params, "prompt")?;
             if prompt.trim().is_empty() {
-                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+                return Err(invalid_params("prompt cannot be empty"));
             }
             let mode = opt_str(params, "mode").unwrap_or_else(|| "enhance".to_string());
             if mode != "enhance" && mode != "layout" {
-                return Err(rpc(
-                    INVALID_PARAMS,
-                    "mode must be \"enhance\" or \"layout\"",
-                ));
+                return Err(invalid_params("mode must be \"enhance\" or \"layout\""));
             }
             let model = opt_str(params, "model");
             let ws = opt_workspace_id(params);
-            let timeout_ms =
-                match params.get("timeoutMs") {
-                    None | Some(Value::Null) => None,
-                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
-                    })?),
-                };
+            let timeout_ms = match params.get("timeoutMs") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("timeoutMs must be a positive integer"))?,
+                ),
+            };
             let result = api
                 .agent_enhance_prompt(prompt, mode, model, ws, timeout_ms)
                 .await
@@ -1348,18 +1367,19 @@ async fn dispatch(
             // garbage-collect on error.
             let prompt = require_str_param(params, "prompt")?;
             if prompt.trim().is_empty() {
-                return Err(rpc(INVALID_PARAMS, "prompt cannot be empty"));
+                return Err(invalid_params("prompt cannot be empty"));
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
             let ws = opt_workspace_id(params);
-            let timeout_ms =
-                match params.get("timeoutMs") {
-                    None | Some(Value::Null) => None,
-                    Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        rpc(INVALID_PARAMS, "timeoutMs must be a positive integer")
-                    })?),
-                };
+            let timeout_ms = match params.get("timeoutMs") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("timeoutMs must be a positive integer"))?,
+                ),
+            };
             let result = api
                 .agent_complete_once(prompt, system_prompt, model, ws, timeout_ms)
                 .await
@@ -1394,7 +1414,7 @@ async fn dispatch(
             let name = require_str_param(params, "name")?;
             let trimmed = name.trim().to_string();
             if trimmed.is_empty() {
-                return Err(rpc(INVALID_PARAMS, "Name cannot be empty"));
+                return Err(invalid_params("Name cannot be empty"));
             }
             // `skipIfExplicitlySet` (optional, default false): leave an
             // already-explicitly-named session untouched (P3-1.2b; the FE
@@ -1436,10 +1456,7 @@ async fn dispatch(
                 .map(serde_json::from_value::<AgentWakeCreateOptions>)
                 .transpose()
                 .map_err(|e| {
-                    rpc(
-                        INVALID_PARAMS,
-                        format!("agent.wakeOrCreate: invalid `create` payload: {e}"),
-                    )
+                    invalid_params(format!("agent.wakeOrCreate: invalid `create` payload: {e}"))
                 })?;
             let input = AgentWakeOrCreateInput {
                 model: opt_nonempty_str(params, "model"),
@@ -1494,12 +1511,12 @@ async fn dispatch(
             let subscription_id = match params.get("subscriptionId") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(s)) => Some(s.clone()),
-                Some(_) => return Err(rpc(INVALID_PARAMS, "subscriptionId must be a string")),
+                Some(_) => return Err(invalid_params("subscriptionId must be a string")),
             };
             let group_id = match params.get("groupId") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(s)) => Some(s.clone()),
-                Some(_) => return Err(rpc(INVALID_PARAMS, "groupId must be a string")),
+                Some(_) => return Err(invalid_params("groupId must be a string")),
             };
             let result = api
                 .agent_cancel_subscriptions(ws, agent_id, subscription_id, group_id)
@@ -1534,16 +1551,16 @@ async fn dispatch(
                         match v.as_str() {
                             Some(s) => ids.push(s.to_string()),
                             None => {
-                                return Err(rpc(
-                                    INVALID_PARAMS,
-                                    format!("resume[{}] must be a string", i),
-                                ))
+                                return Err(invalid_params(format!(
+                                    "resume[{}] must be a string",
+                                    i
+                                )))
                             }
                         }
                     }
                     Some(ids)
                 }
-                Some(_) => return Err(rpc(INVALID_PARAMS, "resume must be an array")),
+                Some(_) => return Err(invalid_params("resume must be an array")),
             };
             let abandon = match params.get("abandon") {
                 None => None,
@@ -1553,16 +1570,16 @@ async fn dispatch(
                         match v.as_str() {
                             Some(s) => ids.push(s.to_string()),
                             None => {
-                                return Err(rpc(
-                                    INVALID_PARAMS,
-                                    format!("abandon[{}] must be a string", i),
-                                ))
+                                return Err(invalid_params(format!(
+                                    "abandon[{}] must be a string",
+                                    i
+                                )))
                             }
                         }
                     }
                     Some(ids)
                 }
-                Some(_) => return Err(rpc(INVALID_PARAMS, "abandon must be an array")),
+                Some(_) => return Err(invalid_params("abandon must be an array")),
             };
             let result = api
                 .agent_resolve_interrupted(resume, abandon)
@@ -1579,7 +1596,7 @@ async fn dispatch(
                     .filter_map(Value::as_str)
                     .map(str::to_string)
                     .collect::<Vec<_>>(),
-                _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
+                _ => return Err(invalid_params("eventTypes must be an array")),
             };
             // Optional subscriber identity (monorepo#937): when present, the
             // named agent receives batched wake messages on matching events;
@@ -1750,7 +1767,7 @@ async fn dispatch(
                 // Nonexistent / non-git repo path → -32602 with the service
                 // message verbatim (no `invalid params:` prefix from
                 // `domain_to_rpc`).
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1762,7 +1779,7 @@ async fn dispatch(
                 // Same validation as `git.getBranches`: nonexistent / non-git
                 // repo path surfaces verbatim as `-32602` without the
                 // `invalid params:` prefix `domain_to_rpc` would add.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1777,7 +1794,7 @@ async fn dispatch(
                 // Same validation as `git.getBranches`: nonexistent / non-git
                 // repo path surfaces verbatim as `-32602` without the
                 // `invalid params:` prefix `domain_to_rpc` would add.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -1932,8 +1949,7 @@ async fn dispatch(
             let base_ref = opt_nonempty_str(params, "baseRef");
             let base_sha = opt_nonempty_str(params, "baseCommitSha");
             if base_ref.is_none() && base_sha.is_none() {
-                return Err(rpc(
-                    INVALID_PARAMS,
+                return Err(invalid_params(
                     "git.branchDiff requires baseRef or baseCommitSha".to_string(),
                 ));
             }
@@ -1953,7 +1969,7 @@ async fn dispatch(
             let remote_name = opt_nonempty_str(params, "remoteName");
             match api.git_get_remote_url(repo_path, remote_name).await {
                 Ok(r) => Ok(r),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2045,7 +2061,7 @@ async fn dispatch(
             let comment_id = params
                 .get("commentId")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: commentId"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: commentId"))?;
             let body = require_str_param(params, "body")?;
             let r = api
                 .pr_reply_to_review_comment(ws, comment_id, body)
@@ -2326,7 +2342,7 @@ async fn dispatch(
             let next_token = opt_str(params, "nextToken");
             match api.linear_list_issues(filter, limit, next_token).await {
                 Ok(page) => Ok(page),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2343,7 +2359,7 @@ async fn dispatch(
         "linear.getIssue" => {
             let id = opt_str(params, "id")
                 .or_else(|| opt_str(params, "identifier"))
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: id"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: id"))?;
             let r = api.linear_get_issue(id).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -2388,7 +2404,7 @@ async fn dispatch(
             let request = Value::Object(params.clone());
             match api.linear_create_issue(request).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2399,7 +2415,7 @@ async fn dispatch(
             let request = Value::Object(params.clone());
             match api.linear_update_issue(request).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2422,7 +2438,7 @@ async fn dispatch(
                 .await
             {
                 Ok(page) => Ok(page),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2449,7 +2465,7 @@ async fn dispatch(
             // Either `id` or `shortId` is required; both missing → `-32602`.
             let id = opt_str(params, "id")
                 .or_else(|| opt_str(params, "shortId"))
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: id"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: id"))?;
             let r = api.sentry_get_issue(id).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -2563,7 +2579,7 @@ async fn dispatch(
             match api.settings_get(path).await {
                 Ok(v) => Ok(v),
                 // Unknown path → -32602 with the raw message (no prefix).
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2573,7 +2589,7 @@ async fn dispatch(
             match api.settings_update(changes).await {
                 Ok(v) => Ok(v),
                 // Unknown path / read-only / failed validation → -32602.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2581,7 +2597,7 @@ async fn dispatch(
             let path = require_str_param(params, "path")?;
             match api.settings_reset(path).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2642,7 +2658,7 @@ async fn dispatch(
             let pr_number = params
                 .get("prNumber")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: prNumber"))?;
+                .ok_or_else(|| invalid_params("Missing required parameter: prNumber"))?;
             let merge_method = opt_str(params, "mergeMethod");
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
@@ -2670,7 +2686,7 @@ async fn dispatch(
                 Ok(v) => Ok(v),
                 // Malformed regex / glob → -32602 with the raw message
                 // ("Invalid regex"), not the `invalid params:` prefix.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2681,7 +2697,7 @@ async fn dispatch(
             let request_id = opt_str(params, "requestId");
             match api.search_file_names(ws, pattern, limit, request_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -2731,7 +2747,7 @@ async fn dispatch(
             match api.search_codebase(ws, query, request_id).await {
                 Ok(v) => Ok(v),
                 // A malformed regex from the content-search reuse surfaces raw.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3005,7 +3021,7 @@ async fn dispatch(
             match api.rules_update(ws, rule_type, content, enabled).await {
                 Ok(v) => Ok(v),
                 // Empty ruleType / over-long content → -32602 with the raw message.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3020,7 +3036,7 @@ async fn dispatch(
             match api.specialist_list(None, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
-                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3031,9 +3047,8 @@ async fn dispatch(
             match api.specialist_get(id, workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown id / invalid id → -32602 with the raw message.
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3045,9 +3060,8 @@ async fn dispatch(
             let workspace_path = opt_str(params, "workspacePath");
             match api.specialist_create(id, spec, scope, workspace_path).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3059,9 +3073,8 @@ async fn dispatch(
             let workspace_path = opt_str(params, "workspacePath");
             match api.specialist_edit(id, spec, scope, workspace_path).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3071,9 +3084,8 @@ async fn dispatch(
             let workspace_path = opt_str(params, "workspacePath");
             match api.specialist_delete(id, scope, workspace_path).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3081,7 +3093,7 @@ async fn dispatch(
             let ws_id = require_workspace_id(params)?;
             match api.skill_list(ws_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3097,9 +3109,8 @@ async fn dispatch(
             let config = params.get("config").cloned().unwrap_or(Value::Null);
             match api.mcp_servers_create(config).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3109,9 +3120,8 @@ async fn dispatch(
             let config = params.get("config").cloned().unwrap_or(Value::Null);
             match api.mcp_servers_update(server_id, config).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3119,7 +3129,7 @@ async fn dispatch(
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_servers_delete(server_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3128,12 +3138,11 @@ async fn dispatch(
             let enabled = params
                 .get("enabled")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| rpc(INVALID_PARAMS, "enabled is required"))?;
+                .ok_or_else(|| invalid_params("enabled is required"))?;
             match api.mcp_servers_toggle(server_id, enabled).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3141,7 +3150,7 @@ async fn dispatch(
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_servers_restart(server_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3149,7 +3158,7 @@ async fn dispatch(
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_servers_get_status(server_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3158,9 +3167,8 @@ async fn dispatch(
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_oauth_get(server_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3170,9 +3178,8 @@ async fn dispatch(
             let token_bag = params.get("tokenBag").cloned().unwrap_or(Value::Null);
             match api.mcp_oauth_set(server_id, token_bag).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3180,9 +3187,8 @@ async fn dispatch(
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_oauth_delete(server_id).await {
                 Ok(v) => Ok(v),
-                Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
-                    Err(rpc(INVALID_PARAMS, m))
-                }
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
@@ -3195,7 +3201,7 @@ async fn dispatch(
 fn require_ws_note(params: &Map<String, Value>) -> Result<WorkspaceId, RpcErr> {
     match params.get("workspaceId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(WorkspaceId::from(s)),
-        _ => Err(rpc(INVALID_PARAMS, "workspaceId is required")),
+        _ => Err(invalid_params("workspaceId is required")),
     }
 }
 
@@ -3254,19 +3260,15 @@ fn merge_user_app_message_id(
         return Ok(message_metadata);
     };
     if id.len() > MAX_USER_APP_MESSAGE_ID_LEN {
-        return Err(rpc(
-            INVALID_PARAMS,
-            format!(
-                "userAppMessageId exceeds maximum length of {MAX_USER_APP_MESSAGE_ID_LEN} bytes"
-            ),
-        ));
+        return Err(invalid_params(format!(
+            "userAppMessageId exceeds maximum length of {MAX_USER_APP_MESSAGE_ID_LEN} bytes"
+        )));
     }
     let mut obj = match message_metadata {
         None => Map::new(),
         Some(Value::Object(m)) => m,
         Some(_) => {
-            return Err(rpc(
-                INVALID_PARAMS,
+            return Err(invalid_params(
                 "messageMetadata must be an object when userAppMessageId is supplied",
             ))
         }
@@ -3282,10 +3284,9 @@ fn merge_user_app_message_id(
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
-        _ => Err(rpc(
-            INVALID_PARAMS,
-            format!("Missing required parameter: {name}"),
-        )),
+        _ => Err(invalid_params(format!(
+            "Missing required parameter: {name}"
+        ))),
     }
 }
 
@@ -3293,10 +3294,9 @@ fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, 
 fn require_int_param(params: &Map<String, Value>, name: &str) -> Result<i64, RpcErr> {
     match params.get(name).and_then(Value::as_i64) {
         Some(v) => Ok(v),
-        None => Err(rpc(
-            INVALID_PARAMS,
-            format!("Missing required parameter: {name}"),
-        )),
+        None => Err(invalid_params(format!(
+            "Missing required parameter: {name}"
+        ))),
     }
 }
 
@@ -3305,31 +3305,27 @@ fn require_int_param(params: &Map<String, Value>, name: &str) -> Result<i64, Rpc
 fn require_non_empty_str(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.clone()),
-        _ => Err(rpc(
-            INVALID_PARAMS,
-            format!("Missing required parameter: {name}"),
-        )),
+        _ => Err(invalid_params(format!(
+            "Missing required parameter: {name}"
+        ))),
     }
 }
 
 /// Require a `u64` param (used for the explicit `github.*` `number` /
 /// `commentId`); absent/non-numeric → `-32602`.
 fn require_u64(params: &Map<String, Value>, name: &str) -> Result<u64, RpcErr> {
-    params.get(name).and_then(Value::as_u64).ok_or_else(|| {
-        rpc(
-            INVALID_PARAMS,
-            format!("Missing required parameter: {name}"),
-        )
-    })
+    params
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_params(format!("Missing required parameter: {name}")))
 }
 
 /// Require a param be present and non-null (used for numeric `start`/`end`).
 fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr> {
     match params.get(name) {
-        Some(Value::Null) | None => Err(rpc(
-            INVALID_PARAMS,
-            format!("Missing required parameter: {name}"),
-        )),
+        Some(Value::Null) | None => Err(invalid_params(format!(
+            "Missing required parameter: {name}"
+        ))),
         Some(_) => Ok(()),
     }
 }
@@ -3359,31 +3355,26 @@ fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
 fn require_context_items(params: &Map<String, Value>) -> Result<Vec<ContextItem>, RpcErr> {
     let raw = params
         .get("items")
-        .ok_or_else(|| rpc(INVALID_PARAMS, "items is required"))?;
+        .ok_or_else(|| invalid_params("items is required"))?;
     let arr = raw
         .as_array()
-        .ok_or_else(|| rpc(INVALID_PARAMS, "items must be an array"))?;
+        .ok_or_else(|| invalid_params("items must be an array"))?;
     let mut out = Vec::with_capacity(arr.len());
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
-        let item: ContextItem = serde_json::from_value(entry.clone()).map_err(|e| {
-            rpc(
-                INVALID_PARAMS,
-                format!("items[{idx}] is not a valid ContextItem: {e}"),
-            )
-        })?;
+        let item: ContextItem = serde_json::from_value(entry.clone())
+            .map_err(|e| invalid_params(format!("items[{idx}] is not a valid ContextItem: {e}")))?;
         if item.id.trim().is_empty() {
-            return Err(rpc(
-                INVALID_PARAMS,
-                format!("items[{idx}].id must be a non-empty string"),
-            ));
+            return Err(invalid_params(format!(
+                "items[{idx}].id must be a non-empty string"
+            )));
         }
         if !seen.insert(item.id.clone()) {
-            return Err(rpc(
-                INVALID_PARAMS,
-                format!("items[{idx}].id is a duplicate: {:?}", item.id),
-            ));
+            return Err(invalid_params(format!(
+                "items[{idx}].id is a duplicate: {:?}",
+                item.id
+            )));
         }
         out.push(item);
     }
@@ -3438,21 +3429,15 @@ fn strict_opt_str_array(
         None | Some(Value::Null) => return Ok(None),
         Some(v) => v,
     };
-    let items = value.as_array().ok_or_else(|| {
-        rpc(
-            INVALID_PARAMS,
-            format!("`{name}` must be an array of strings"),
-        )
-    })?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| invalid_params(format!("`{name}` must be an array of strings")))?;
     items
         .iter()
         .map(|item| {
-            item.as_str().map(str::to_string).ok_or_else(|| {
-                rpc(
-                    INVALID_PARAMS,
-                    format!("`{name}` must be an array of strings"),
-                )
-            })
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid_params(format!("`{name}` must be an array of strings")))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -3467,10 +3452,9 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
         "service" => ScriptMode::Service,
         "command" => ScriptMode::Command,
         other => {
-            return Err(rpc(
-                INVALID_PARAMS,
-                format!("Invalid mode: {other} (expected \"service\" or \"command\")"),
-            ))
+            return Err(invalid_params(format!(
+                "Invalid mode: {other} (expected \"service\" or \"command\")"
+            )))
         }
     };
     Ok(ScriptCreateParams {
@@ -3498,7 +3482,7 @@ fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<boo
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
-        Some(_) => Err(rpc(INVALID_PARAMS, format!("{name} must be a boolean"))),
+        Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
     }
 }
 
@@ -3648,10 +3632,7 @@ fn to_result_value<T: serde::Serialize>(value: &T) -> Result<Value, RpcErr> {
 fn require_workspace_id(params: &Map<String, Value>) -> Result<WorkspaceId, RpcErr> {
     match params.get("workspaceId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(WorkspaceId::from(s)),
-        _ => Err(rpc(
-            INVALID_PARAMS,
-            "Missing required parameter: workspaceId",
-        )),
+        _ => Err(invalid_params("Missing required parameter: workspaceId")),
     }
 }
 
@@ -3659,7 +3640,7 @@ fn require_workspace_id(params: &Map<String, Value>) -> Result<WorkspaceId, RpcE
 /// as `-32602 "Workspace not found"`, matching the TS handler (PROTOCOL §5.1).
 fn workspace_err(e: Error) -> RpcErr {
     match e {
-        Error::NotFound(_) => rpc(INVALID_PARAMS, "Workspace not found"),
+        Error::NotFound(_) => not_found("Workspace not found"),
         other => domain_to_rpc(other),
     }
 }

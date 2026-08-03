@@ -356,7 +356,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "3.1",
+        sess[0]["result"]["protocolVersion"], "4.0",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -590,6 +590,50 @@ async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
         sess[4]["result"].is_null(),
         "cleared sentinel draft reads back null"
     );
+    srv.ws.stop().await;
+}
+
+/// Fast-path `-32602` discriminator (PROTOCOL §3.3, monorepo#1364): every
+/// fast-path family that rejects invalid params — subscription params
+/// (`events.subscribe`), `drafts.*`, `forward.*`, `host.*`, `browser.exec`,
+/// `client.hello` — carries the machine-readable `error.data.code =
+/// "invalid-params"` on the wire, mirroring the dispatcher. `browser.exec`
+/// validation short-circuits before the FE reverse RPC, so no frontend is
+/// needed.
+#[tokio::test]
+async fn wss_fast_path_invalid_params_carry_data_code() {
+    let srv = start(WsOptions::default()).await;
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // events.subscribe: missing eventTypes.
+            r#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{}}"#.to_string(),
+            // drafts.set: missing workspaceId/agentId.
+            r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"text":"x"}}"#.to_string(),
+            // forward.create: missing remotePort.
+            r#"{"jsonrpc":"2.0","id":3,"method":"forward.create","params":{}}"#.to_string(),
+            // host.directoryStatus: missing path.
+            r#"{"jsonrpc":"2.0","id":4,"method":"host.directoryStatus","params":{}}"#.to_string(),
+            // browser.exec: missing actions (rejected before the reverse RPC).
+            r#"{"jsonrpc":"2.0","id":5,"method":"browser.exec","params":{}}"#.to_string(),
+            // client.hello: non-string clientId.
+            r#"{"jsonrpc":"2.0","id":6,"method":"client.hello","params":{"clientId":42}}"#
+                .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "frame {i} is -32602: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["code"], "invalid-params",
+            "frame {i} carries the data.code discriminator: {resp}"
+        );
+    }
     srv.ws.stop().await;
 }
 
@@ -5631,6 +5675,80 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     assert_eq!(
         resp["result"]["matches"].as_array().expect("matches").len(),
         0
+    );
+
+    srv.ws.stop().await;
+}
+
+/// PROTOCOL §3.3/§9 (monorepo#1320): router-constructed `-32602` errors carry
+/// the machine-readable `error.data.code` discriminator on the real WSS wire —
+/// `"not-found"` for lookups of nonexistent entities (`agent.get`, `note.get`)
+/// and `"invalid-params"` for missing required params — while the rest of the
+/// envelope (`jsonrpc`, `id`, numeric `code`, `message`) is unchanged.
+#[tokio::test]
+async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Error Discriminator"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    // agent.get with an unknown agentId → -32602 + data.code "not-found".
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.get","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Agent not found", "{resp}");
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "not-found" }),
+        "unknown agent must carry the not-found discriminator: {resp}"
+    );
+
+    // note.get with an unknown noteId in a real workspace → the same
+    // not-found shape.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"note.get","params":{{"workspaceId":"{ws_id}","noteId":"note-nonexistent"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 3, "envelope: {resp}");
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Note not found", "{resp}");
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "not-found" }),
+        "unknown note must carry the not-found discriminator: {resp}"
+    );
+
+    // note.get missing the required noteId → -32602 + data.code
+    // "invalid-params"; the message is byte-identical to before.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"note.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 4, "envelope: {resp}");
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(
+        resp["error"]["message"], "Missing required parameter: noteId",
+        "{resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "invalid-params" }),
+        "missing param must carry the invalid-params discriminator: {resp}"
     );
 
     srv.ws.stop().await;

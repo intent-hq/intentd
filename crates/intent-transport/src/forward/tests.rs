@@ -106,10 +106,12 @@ async fn create_requires_remote_port_and_close_requires_id() {
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "forward.create" })).unwrap();
     let err = parsed(handle(create, &mut reg, false).await);
     assert_eq!(err["error"]["code"], -32602);
+    assert_eq!(err["error"]["data"]["code"], "invalid-params");
 
     let close = classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "forward.close" })).unwrap();
     let err = parsed(handle(close, &mut reg, false).await);
     assert_eq!(err["error"]["code"], -32602);
+    assert_eq!(err["error"]["data"]["code"], "invalid-params");
 }
 
 #[test]

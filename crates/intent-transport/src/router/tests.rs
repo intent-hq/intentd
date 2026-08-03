@@ -1590,6 +1590,24 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    // `specialist.get`: unknown id → `NotFound`, empty id → `InvalidParams`,
+    // so the router tests can assert the formerly collapsed
+    // `InvalidParams | NotFound` arm carries per-origin discriminators
+    // (monorepo#1320).
+    fn specialist_get(
+        &self,
+        id: String,
+        _workspace_path: Option<String>,
+        _provider: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.is_empty() {
+                return Err(Error::InvalidParams("Invalid specialist id".to_string()));
+            }
+            Err(Error::NotFound(format!("Specialist not found: {id}")))
+        })
+    }
+
     fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<RepoConfig>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -2483,6 +2501,76 @@ async fn note_get_not_found_is_minus_32602_with_message() {
     .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(v["error"]["message"], serde_json::json!("Note not found"));
+}
+
+/// -32602 discriminator (monorepo#1320): a lookup of a nonexistent entity
+/// carries `error.data.code = "not-found"`; the message is unchanged.
+#[tokio::test]
+async fn not_found_minus_32602_carries_not_found_discriminator() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], serde_json::json!("Note not found"));
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+
+    // `workspace_err` path: missing workspace on `workspace.get`.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+}
+
+/// -32602 discriminator (monorepo#1320): param validation carries
+/// `error.data.code = "invalid-params"`; the message is unchanged.
+#[tokio::test]
+async fn invalid_params_minus_32602_carries_invalid_params_discriminator() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.get","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
+}
+
+/// The formerly collapsed `InvalidParams | NotFound` arms (e.g.
+/// `specialist.get`) are split so each origin carries its own discriminator
+/// (monorepo#1320).
+#[tokio::test]
+async fn specialist_get_splits_not_found_from_invalid_params() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"specialist.get","params":{"id":"nope"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Specialist not found: nope")
+    );
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"specialist.get","params":{"id":""}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Invalid specialist id")
+    );
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
 }
 
 #[tokio::test]

@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-08-03
+
+### 🚀 Features
+
+- Windows named-pipe local transport (listener + CLI client) ([#855](https://github.com/intent-hq/intentd/pull/855))
+- Add restarting script status for auto-restart backoff window ([#861](https://github.com/intent-hq/intentd/pull/861))
+- [**breaking**] Terminal.list returns { terminals, daemonBootId } envelope ([#862](https://github.com/intent-hq/intentd/pull/862))
+- Add structured error.data.code discriminator to -32602 errors ([#863](https://github.com/intent-hq/intentd/pull/863))
+- Add host.createDirectory RPC for remote folder creation ([#864](https://github.com/intent-hq/intentd/pull/864))
+- Add error.data.code discriminator to fast-path -32602 errors ([#865](https://github.com/intent-hq/intentd/pull/865))
+
+### 🐛 Bug Fixes
+
+- Keep displayStatus in_progress while workspace owns active hooks ([#856](https://github.com/intent-hq/intentd/pull/856))
+
+### 📚 Documentation
+
+- *(agents)* Explain turn idle timeout in hook guidance and timeout warning ([#858](https://github.com/intent-hq/intentd/pull/858))
+- *(agents)* Advise estimating hook ttlMs instead of defaulting to the cap ([#860](https://github.com/intent-hq/intentd/pull/860))
+
+### 🧪 Testing
+
+- *(services)* Make in-flight hook TTL expiry test deterministic ([#866](https://github.com/intent-hq/intentd/pull/866))
+
+
 ## [0.3.0] - 2026-08-02
 
 ### 🚀 Features
