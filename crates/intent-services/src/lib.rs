@@ -709,6 +709,13 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// Whether queue drains should deliver the whole queued-message backlog
+    /// in one batched turn (`agents.flushQueuedMessages`, default on). Read
+    /// at drain time by the agent manager; cheap registry-snapshot read.
+    pub fn flush_queued_messages_enabled(&self) -> bool {
+        self.effective_settings().agents.flush_queued_messages
+    }
+
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
     /// §3b): the persisted per-workspace override when set (mirrored from the
     /// global `git.autoCommit` at create time, toggled via
