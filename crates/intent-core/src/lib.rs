@@ -5,6 +5,17 @@
 //! and the cross-layer traits (`WorkspaceApi`, `ContextEngine`) that higher
 //! layers implement and consume.
 
+/// Test-binary-wide guard: export `NODE_DISABLE_COMPILE_CACHE=1` before any
+/// test runs. `path_utils::login_shell_dirs()` spawns the user's interactive
+/// login shell, whose rc files may run node CLIs (nvm/npm, ng completion);
+/// those inherit this and skip `module.enableCompileCache()`, which would
+/// otherwise leave a `node-compile-cache/` residue at the TMPDIR root.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 pub mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;

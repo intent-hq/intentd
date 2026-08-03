@@ -13,4 +13,5 @@ serde_json = { workspace = true }
 tracing.workspace = true
 
 [dev-dependencies]
+ctor = "1.0.10"
 tempfile = "3"

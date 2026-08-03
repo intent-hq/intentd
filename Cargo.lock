@@ -1930,6 +1930,7 @@ name = "intent-core"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "ctor",
  "directories",
  "libc",
  "serde",
@@ -1982,6 +1983,7 @@ dependencies = [
 name = "intent-providers"
 version = "0.3.0"
 dependencies = [
+ "ctor",
  "intent-core",
  "serde_json",
  "tempfile",
