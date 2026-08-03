@@ -2051,10 +2051,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "similar",
  "sqlx",
  "sysinfo",
  "tempfile",
+ "thiserror 1.0.69",
  "time",
  "tokio",
  "toml_edit",
@@ -2172,6 +2174,15 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "intentd-microvm-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
