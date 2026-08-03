@@ -456,13 +456,19 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
-///  2. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///  2. Codex titles MCP tools `mcp.<server>.<tool>` (dot-separated, no
+///     whitespace — prose titles containing dots never match); the title is
+///     rewritten to `{server}_{tool}` and fed through the affix strip below,
+///     the same downstream treatment as [`unwrap_codex_mcp_input`]'s
+///     rewritten name (`mcp.workspace-mcp.workspace_api` → `workspace_api`,
+///     `mcp.other-server.some_tool` → `other-server_some_tool`).
+///  3. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  3. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  4. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  4. When none of the above yielded an identifier (the title is prose
+///  5. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -483,7 +489,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  5. Otherwise the title passes through as-is.
+///  6. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -495,6 +501,9 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);
+    }
+    if let Some(rewritten) = split_codex_mcp_title(title) {
+        return strip_workspace_mcp_affix(&rewritten);
     }
     let stripped = strip_workspace_mcp_affix(title);
     if stripped != title {
@@ -612,6 +621,23 @@ fn split_name_prefix(title: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+/// Recognize codex's dot-separated ACP title form for MCP tools —
+/// `mcp.<server>.<tool>`, where the server segment contains no dots and the
+/// title carries no whitespace (so prose titles containing dots never match)
+/// — and rewrite it to the `{server}_{tool}` name shared with
+/// [`unwrap_codex_mcp_input`]. Returns `None` for any other title.
+fn split_codex_mcp_title(title: &str) -> Option<String> {
+    if title.contains(char::is_whitespace) {
+        return None;
+    }
+    let rest = title.strip_prefix("mcp.")?;
+    let (server, tool) = rest.split_once('.')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{server}_{tool}"))
 }
 
 /// Strip `workspace-mcp` server affixes from an MCP tool name: auggie appends
