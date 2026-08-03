@@ -15,8 +15,12 @@ use tokio::sync::Mutex;
 /// status/end/tool:call rows exist.
 #[tokio::test]
 async fn agent_stream_chunks_are_transient() {
-    let tmp = tempfile::NamedTempFile::new().expect("temp db");
-    let store = Store::open(tmp.path()).await.expect("open store");
+    // Dir-based guard: dropping it also sweeps SQLite's `-wal`/`-shm`
+    // sidecars, which a NamedTempFile would leave behind.
+    let tmp = tempfile::tempdir().expect("temp db dir");
+    let store = Store::open(&tmp.path().join("events.db"))
+        .await
+        .expect("open store");
     let bus = EventBus::new(store.clone());
     let ws = WorkspaceId::new();
     let agent_id = "agent-123";

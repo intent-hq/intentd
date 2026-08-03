@@ -151,7 +151,10 @@ async fn event_bindings_recent_files_and_query() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -267,7 +270,10 @@ async fn file_bindings_read_write_list() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -427,7 +433,10 @@ async fn agent_bindings_list_and_status() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -642,7 +651,10 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -954,7 +966,10 @@ async fn agent_bindings_send_single_pending_message_guard() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -1212,7 +1227,10 @@ async fn git_bindings_status_stage_commit() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -1361,7 +1379,10 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -1525,7 +1546,10 @@ async fn note_bindings_edit_and_edit_lines() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;

@@ -15,6 +15,16 @@ use intent_store::Store;
 
 use crate::Services;
 
+/// Runs before `main()` — and therefore before any test threads exist, making
+/// `set_var` race-free. Node children spawned by lib tests (e.g. the real
+/// `auggie` CLI in `auto_commit` tests) inherit this and skip
+/// `module.enableCompileCache()`, which would otherwise leave a
+/// `node-compile-cache/` residue at the TMPDIR root after the suite.
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 /// Guard for tests that mutate debounce env vars to prevent parallel test
 /// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
 /// WORKSPACE_IDLE debounce vars.
@@ -56,6 +66,20 @@ impl Drop for DebounceEnvGuard {
             std::env::remove_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         }
     }
+}
+
+/// Create a temp dir with a recognizable `prefix` under the system temp root.
+/// The returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
 }
 
 struct TempDb {
@@ -8313,7 +8337,8 @@ mod pr {
         let store = Store::open(&tmp.path).await.expect("store");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
-        ws.worktree_path = Some(unique_dir("intentd-ac-empty").to_string_lossy().to_string());
+        let empty_dir = crate::tests::test_tempdir("intentd-ac-empty-");
+        ws.worktree_path = Some(empty_dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
 
@@ -11132,19 +11157,16 @@ mod usage_stats_recording {
 mod search {
     use super::*;
 
-    struct TempTree(PathBuf);
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn worktree() -> TempTree {
-        let dir = std::env::temp_dir().join(format!("intentd-search-svc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    // TODO: x\n}\n").unwrap();
-        std::fs::write(dir.join("README.md"), "# readme\nTODO later\n").unwrap();
-        TempTree(dir)
+    fn worktree() -> tempfile::TempDir {
+        let dir = test_tempdir("intentd-search-svc-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    // TODO: x\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# readme\nTODO later\n").unwrap();
+        dir
     }
 
     async fn services_with_worktree(dir: &std::path::Path) -> (TempDb, Services, WorkspaceId) {
@@ -11161,7 +11183,7 @@ mod search {
     #[tokio::test]
     async fn in_files_echoes_request_id_and_returns_matches() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_in_files(ws, "TODO".into(), None, Some("srch-xyz".into()))
             .await
@@ -11174,7 +11196,7 @@ mod search {
     #[tokio::test]
     async fn in_files_mints_request_id_when_absent() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_in_files(ws, "TODO".into(), None, None)
             .await
@@ -11185,7 +11207,7 @@ mod search {
     #[tokio::test]
     async fn file_names_glob_returns_relative_paths() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_file_names(ws, "*.rs".into(), None, Some("srch-f".into()))
             .await
@@ -11453,14 +11475,18 @@ mod search_adapters {
     /// ripgrep/symbol output (§5.15, §8).
     #[tokio::test]
     async fn codebase_search_uses_context_engine_when_available() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-eng-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-eng-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Available {
@@ -11489,7 +11515,6 @@ mod search_adapters {
         assert_eq!(matches[0]["symbol"], "Widget");
         assert_eq!(matches[0]["line"], 7);
         assert_eq!(matches[0]["score"], 0.87);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (b) When the engine is `Unavailable`, `search.codebase` degrades to the
@@ -11497,14 +11522,18 @@ mod search_adapters {
     /// engine makes this deterministic regardless of the host PATH.
     #[tokio::test]
     async fn codebase_search_returns_symbol_matches() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-cb-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-cb-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Unavailable {
@@ -11522,7 +11551,6 @@ mod search_adapters {
         assert_eq!(matches[0]["file"], "src/main.rs");
         assert_eq!(matches[0]["symbol"], "main");
         assert!(matches[0]["score"].is_number());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (c) When the engine reports `Available` (binary present — e.g. auggie on
@@ -11533,14 +11561,18 @@ mod search_adapters {
     /// `Available` for `intentd doctor` (§8.3).
     #[tokio::test]
     async fn codebase_search_degrades_when_available_engine_cannot_retrieve() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-deg-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-deg-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Available {
@@ -11560,7 +11592,6 @@ mod search_adapters {
         assert_eq!(matches[0]["file"], "src/main.rs");
         assert_eq!(matches[0]["symbol"], "main");
         assert!(matches[0]["score"].is_number());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct StreamHarness {
@@ -20907,16 +20938,9 @@ mod provider_discovery_payload {
     /// override path.
     #[test]
     fn overrides_flip_installed_but_paths_stay_auto_detected() {
-        let dir = std::env::temp_dir().join(format!(
-            "provider-discovery-payload-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let opencode = dir.join("opencode");
-        let unsloth_bin = dir.join("unsloth");
+        let dir = crate::tests::test_tempdir("provider-discovery-payload-");
+        let opencode = dir.path().join("opencode");
+        let unsloth_bin = dir.path().join("unsloth");
         for bin in [&opencode, &unsloth_bin] {
             #[cfg(unix)]
             {

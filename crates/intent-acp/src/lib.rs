@@ -79,6 +79,17 @@ mod tests;
 #[cfg(test)]
 mod tests_wsapi5;
 
+/// Test-only process-global env setup. Runs before `main()` — and therefore
+/// before any test threads exist, making `set_var` race-free. Node children
+/// spawned by lib tests (e.g. MCP fixture servers) inherit this and skip
+/// `module.enableCompileCache()`, which would otherwise leave a
+/// `node-compile-cache/` residue at the TMPDIR root after the suite.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 /// ACP client handle. Holds the `WorkspaceApi` callback supplied by the
 /// composition root (§6.8). Provider configuration is resolved on demand from
 /// the static `intent_providers` registry (§6.9).

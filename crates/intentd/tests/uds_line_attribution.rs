@@ -111,8 +111,12 @@ async fn boot(
     tokio::task::JoinHandle<()>,
     oneshot::Sender<()>,
     tempfile::TempDir,
+    tempfile::TempDir,
 ) {
-    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");
+    let socket = sock_dir.path().join("uds.sock");
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
         Services::new(bus.store().clone())
@@ -130,7 +134,7 @@ async fn boot(
             .await;
         }
     });
-    (socket, server, shutdown_tx, ws_root)
+    (socket, server, shutdown_tx, ws_root, sock_dir)
 }
 
 #[tokio::test]
@@ -138,7 +142,7 @@ async fn line_attribution_compute_now_persists_and_emits_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
 
     // RPC connection (mutations + their responses).
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();

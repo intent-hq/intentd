@@ -17,39 +17,33 @@ use crate::auto_commit::{
 };
 use crate::Services;
 
+/// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in a
+/// guarded temp dir removed on drop — including on panic — unless
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-acommit-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = crate::tests::test_tempdir("intentd-acommit-");
+        let path = dir.path().join("store.db");
+        Self { _dir: dir, path }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
+/// RAII git repo in a guarded temp dir (removed on drop, including on panic,
+/// unless `INTENTD_TEST_KEEP_TMP` is set). `dir` mirrors the guard's path so
+/// call sites keep reading `repo.dir`.
 struct GitRepo {
+    _guard: tempfile::TempDir,
     dir: PathBuf,
 }
 
-impl Drop for GitRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 fn init_git_repo() -> GitRepo {
-    let dir = std::env::temp_dir().join(format!("intentd-ac-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = crate::tests::test_tempdir("intentd-ac-");
+    let dir = guard.path().to_path_buf();
     let repo = Repository::init(&dir).unwrap();
     let mut cfg = repo.config().unwrap();
     cfg.set_str("user.name", "Test").unwrap();
@@ -63,7 +57,7 @@ fn init_git_repo() -> GitRepo {
     let sig = Signature::now("Test", "test@example.com").unwrap();
     repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
         .unwrap();
-    GitRepo { dir }
+    GitRepo { _guard: guard, dir }
 }
 
 fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
@@ -283,15 +277,16 @@ async fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<
     (head.agent_id, head.linked_note_id, head.message)
 }
 
+/// Fake auggie CLI inside an RAII temp dir; keep the returned guard alive for
+/// the duration of the test (dropping it removes the dir).
 #[cfg(unix)]
-fn fake_auggie(tag: &str, body: &str) -> PathBuf {
+fn fake_auggie(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("intentd-acommit-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("auggie");
+    let dir = crate::tests::test_tempdir(&format!("intentd-acommit-{tag}-"));
+    let bin = dir.path().join("auggie");
     std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin
+    (dir, bin)
 }
 
 #[tokio::test]
@@ -572,7 +567,7 @@ fn parse_commit_message_rejects_empty() {
 async fn generated_message_replaces_fallback_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let bin = fake_auggie(
+    let (_bin_dir, bin) = fake_auggie(
         "gen-ok",
         "printf '<<<COMMIT_MESSAGE>>>\\nfeat: implement auto-commit\\n<<</COMMIT_MESSAGE>>>'",
     );
@@ -594,7 +589,7 @@ async fn generated_message_replaces_fallback_subject() {
 async fn generation_timeout_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let bin = fake_auggie("timeout", "sleep 60");
+    let (_bin_dir, bin) = fake_auggie("timeout", "sleep 60");
     // Compressed generation budget so the timeout-fallback path runs in
     // milliseconds; the hung CLI is group-reaped when the budget elapses.
     let svc = svc.with_auggie_bin(bin).with_auto_commit_timeout_ms(250);
@@ -613,7 +608,7 @@ async fn generation_timeout_falls_back_to_subject() {
 async fn malformed_output_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let bin = fake_auggie("malformed", "printf 'no tags at all'");
+    let (_bin_dir, bin) = fake_auggie("malformed", "printf 'no tags at all'");
     let svc = svc.with_auggie_bin(bin);
     let agent = session("agent-m1", &ws_id, None, false, "Malformed Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
@@ -634,7 +629,7 @@ async fn no_changes_skips_generation_and_commit() {
     let ws = workspace_with_repo(&ws_id, &repo);
     store.insert_workspace(&ws).await.unwrap();
     // No dirty files — the CLI should not be spawned.
-    let bin = fake_auggie("nochanges", "exit 99");
+    let (_bin_dir, bin) = fake_auggie("nochanges", "exit 99");
     let svc = Services::new(store).with_auggie_bin(bin);
     let agent = session("agent-n1", &ws_id, None, false, "X", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
@@ -652,7 +647,7 @@ async fn generated_message_preserves_trailers() {
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let note = task_note(&ws_id, "task-gen", "LLM commit task");
     svc.store().insert_note(&note).await.unwrap();
-    let bin = fake_auggie(
+    let (_bin_dir, bin) = fake_auggie(
         "trailers",
         "printf '<<<COMMIT_MESSAGE>>>\\nchore: generated commit\\n<<</COMMIT_MESSAGE>>>'",
     );

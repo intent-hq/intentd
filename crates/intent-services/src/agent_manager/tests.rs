@@ -30,22 +30,26 @@ use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
 
+/// SQLite db inside an RAII temp dir: the dir sweep (on drop, including on
+/// panic) also covers `-wal`/`-shm` sidecars, and a background task that
+/// lazily reopens a pool connection after drop cannot recreate the file at
+/// the TMPDIR root. Set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-mgr-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+        let mut dir = tempfile::Builder::new()
+            .prefix("intentd-mgr-")
+            .tempdir()
+            .expect("create test tempdir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
         }
+        let path = dir.path().join("mgr.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -7334,12 +7338,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let assets_dir =
-        std::env::temp_dir().join(format!("intentd-note-img-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&assets_dir).expect("assets tempdir");
+    let assets_dir = crate::tests::test_tempdir("intentd-note-img-");
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_assets_root(assets_dir.clone());
+        .with_assets_root(assets_dir.path().to_path_buf());
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let mgr = AgentManager::new(services, sink, 8);
 
@@ -7350,7 +7352,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     // Write an on-disk asset the note will reference.
     let asset_id = "asset-abc.png";
     let asset_bytes: &[u8] = b"pretend-png";
-    let ws_dir = assets_dir.join(&ws.0);
+    let ws_dir = assets_dir.path().join(&ws.0);
     std::fs::create_dir_all(&ws_dir).expect("asset dir");
     std::fs::write(ws_dir.join(asset_id), asset_bytes).expect("write asset");
 

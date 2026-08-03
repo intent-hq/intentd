@@ -364,12 +364,26 @@ mod tests {
 
     use intent_core::{AgentId, NoteId, WorkspaceId};
 
+    /// A fresh RAII temp directory for `prefix` under the system temp root.
+    /// The returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create test tempdir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        dir
+    }
+
     /// Build a self-contained fixture `userData` dir with one workspace holding
     /// two notes (one a child of the other), one agent session with two
-    /// messages, and one comment. Returns the source dir path.
-    fn write_fixture() -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("intentd-import-{}", uuid::Uuid::new_v4().simple()));
+    /// messages, and one comment. Returns the guarded source dir.
+    fn write_fixture() -> tempfile::TempDir {
+        let guard = test_tempdir("intentd-import-");
+        let root = guard.path();
         let ws_dir = root.join("workspaces").join("ws-1").join(".workspace");
         for sub in ["notes", "agents", "comments"] {
             std::fs::create_dir_all(ws_dir.join(sub)).unwrap();
@@ -436,7 +450,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        root
+        guard
     }
 
     /// A sorted snapshot of every file under `dir` as `(relative path, bytes)`,
@@ -463,17 +477,20 @@ mod tests {
         out
     }
 
-    async fn open_store() -> Store {
-        let db = std::env::temp_dir().join(format!("intentd-import-{}.db", uuid::Uuid::new_v4()));
-        Store::open(&db).await.expect("open store")
+    /// Open a store backed by a guarded temp dir; the returned guard removes
+    /// the db plus its `-wal`/`-shm` sidecars on drop.
+    async fn open_store() -> (Store, tempfile::TempDir) {
+        let dir = test_tempdir("intentd-import-db-");
+        let db = dir.path().join("import.db");
+        (Store::open(&db).await.expect("open store"), dir)
     }
 
     #[tokio::test]
     async fn imports_all_domains_with_correct_counts() {
         let source = write_fixture();
-        let store = open_store().await;
+        let (store, _db_dir) = open_store().await;
 
-        let summary = run(&store, &source).await.expect("import");
+        let summary = run(&store, source.path()).await.expect("import");
         assert_eq!(summary.workspaces_imported, 1);
         assert_eq!(summary.notes_imported, 2);
         assert_eq!(summary.agents_imported, 1);
@@ -502,17 +519,15 @@ mod tests {
                 .len(),
             1
         );
-
-        std::fs::remove_dir_all(&source).ok();
     }
 
     #[tokio::test]
     async fn second_run_is_idempotent() {
         let source = write_fixture();
-        let store = open_store().await;
-        run(&store, &source).await.expect("first import");
+        let (store, _db_dir) = open_store().await;
+        run(&store, source.path()).await.expect("first import");
 
-        let summary = run(&store, &source).await.expect("second import");
+        let summary = run(&store, source.path()).await.expect("second import");
         // Everything already exists → all updates, nothing newly imported.
         assert_eq!(summary.workspaces_imported, 0);
         assert_eq!(summary.workspaces_updated, 1);
@@ -536,26 +551,22 @@ mod tests {
                 .len(),
             2,
         );
-
-        std::fs::remove_dir_all(&source).ok();
     }
 
     #[tokio::test]
     async fn source_is_never_mutated() {
         let source = write_fixture();
-        let store = open_store().await;
+        let (store, _db_dir) = open_store().await;
 
-        let before = snapshot(&source);
-        run(&store, &source).await.expect("import");
-        let after = snapshot(&source);
+        let before = snapshot(source.path());
+        run(&store, source.path()).await.expect("import");
+        let after = snapshot(source.path());
         assert_eq!(before, after, "import must be read-only toward the source");
-
-        std::fs::remove_dir_all(&source).ok();
     }
 
     #[tokio::test]
     async fn missing_source_dir_is_a_hard_error() {
-        let store = open_store().await;
+        let (store, _db_dir) = open_store().await;
         let missing =
             std::env::temp_dir().join(format!("intentd-missing-{}", uuid::Uuid::new_v4()));
         let err = run(&store, &missing)
@@ -566,14 +577,13 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_workspaces_json_is_a_hard_error() {
-        let store = open_store().await;
-        let root =
-            std::env::temp_dir().join(format!("intentd-bad-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("workspaces.json"), "{ this is not json ]").unwrap();
-        let err = run(&store, &root).await.expect_err("garbage must error");
+        let (store, _db_dir) = open_store().await;
+        let root = test_tempdir("intentd-bad-");
+        std::fs::write(root.path().join("workspaces.json"), "{ this is not json ]").unwrap();
+        let err = run(&store, root.path())
+            .await
+            .expect_err("garbage must error");
         assert!(err.to_string().contains("invalid JSON"), "{err}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -581,14 +591,17 @@ mod tests {
         let source = write_fixture();
         // A malformed note file must not abort the run — it is counted skipped.
         let notes = source
+            .path()
             .join("workspaces")
             .join("ws-1")
             .join(".workspace")
             .join("notes");
         std::fs::write(notes.join("broken.json"), "{ nope").unwrap();
-        let store = open_store().await;
+        let (store, _db_dir) = open_store().await;
 
-        let summary = run(&store, &source).await.expect("import still succeeds");
+        let summary = run(&store, source.path())
+            .await
+            .expect("import still succeeds");
         assert_eq!(summary.workspaces_imported, 1);
         assert_eq!(summary.notes_imported, 2);
         assert_eq!(summary.skipped, 1);
@@ -597,7 +610,5 @@ mod tests {
             "{:?}",
             summary.errors
         );
-
-        std::fs::remove_dir_all(&source).ok();
     }
 }

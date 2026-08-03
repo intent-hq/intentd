@@ -162,9 +162,10 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
-    // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
-    let id = Uuid::new_v4().simple().to_string();
-    let socket_path = std::path::Path::new("/tmp").join(format!("itd-rc-{}.sock", &id[..8]));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn({
         let services = services.clone();
@@ -224,9 +225,10 @@ async fn test_workspace_create_setup_script_fallback() {
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
-    // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
-    let id = Uuid::new_v4().simple().to_string();
-    let socket_path = std::path::Path::new("/tmp").join(format!("itd-rc-{}.sock", &id[..8]));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn({
         let services = services.clone();
@@ -355,9 +357,10 @@ async fn test_script_list_bootstrap_from_repo() {
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
-    // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
-    let id = Uuid::new_v4().simple().to_string();
-    let socket_path = std::path::Path::new("/tmp").join(format!("itd-rc-{}.sock", &id[..8]));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn({
         let services = services.clone();
@@ -446,9 +449,10 @@ async fn test_repo_instructions_in_system_prompt() {
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
 
-    // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
-    let id = Uuid::new_v4().simple().to_string();
-    let socket_path = std::path::Path::new("/tmp").join(format!("itd-rc-{}.sock", &id[..8]));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn({
         let services = services.clone();
@@ -497,7 +501,10 @@ async fn concurrent_script_list_no_duplicates() {
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
         Arc::new(Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()));
-    let socket_path = std::env::temp_dir().join(format!("intentd-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");
+    let socket_path = sock_dir.path().join("uds.sock");
 
     let repo = create_test_repo_with_config(
         r#"{"scripts": [
