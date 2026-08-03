@@ -555,10 +555,10 @@ mod tests {
         // Runs the real resolve path: on hosts without grok the probe is
         // skipped (authenticated: null); with grok installed, `grok models`
         // actually runs, bounded by the probe timeout. The assertions are
-        // shape-only so the test passes in both environments.
-        // The spawned Node CLI inherits this and skips its compile cache,
-        // which would otherwise leave `node-compile-cache/` in TMPDIR.
-        std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+        // shape-only so the test passes in both environments. The spawned
+        // Node CLI skips its compile cache (which would otherwise leave
+        // `node-compile-cache/` in TMPDIR) via the crate-wide ctor in
+        // `src/tests.rs` that exports NODE_DISABLE_COMPILE_CACHE=1.
         let result = provider_auth_status(Some("grok"), false, &HashMap::new())
             .await
             .expect("grok is a known provider");
