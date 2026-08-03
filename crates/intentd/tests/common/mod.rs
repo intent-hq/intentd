@@ -25,6 +25,10 @@ use std::time::Duration;
 #[ctor::ctor(unsafe)]
 fn force_hermetic_root_guard() {
     std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    // Node children spawned by tests (mock ACP agents, MCP fixtures) inherit
+    // this and skip `module.enableCompileCache()`, which would otherwise leave
+    // a `node-compile-cache/` residue at the TMPDIR root after the suite.
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
 /// Apply the timeout multiplier from the environment for coverage

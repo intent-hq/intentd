@@ -137,7 +137,10 @@ async fn settings_rollback_on_failed_listener_start() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("intentd-ctl-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-ctl-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 

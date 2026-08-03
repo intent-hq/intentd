@@ -556,6 +556,9 @@ mod tests {
         // skipped (authenticated: null); with grok installed, `grok models`
         // actually runs, bounded by the probe timeout. The assertions are
         // shape-only so the test passes in both environments.
+        // The spawned Node CLI inherits this and skips its compile cache,
+        // which would otherwise leave `node-compile-cache/` in TMPDIR.
+        std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
         let result = provider_auth_status(Some("grok"), false, &HashMap::new())
             .await
             .expect("grok is a known provider");
@@ -567,17 +570,16 @@ mod tests {
         );
     }
 
-    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
-        // nanos + process-wide counter: unique across parallel tests even on
-        // platforms with coarse clock resolution.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-provider-auth-{tag}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A fresh RAII temp dir; removed on drop (including on panic). Set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-provider-auth-{tag}-"))
+            .tempdir()
+            .expect("create test tempdir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
         dir
     }
 
@@ -609,7 +611,7 @@ mod tests {
     #[test]
     fn valid_override_resolves_install_gate() {
         let dir = unique_temp_dir("valid-override");
-        let bin = dir.join("droid");
+        let bin = dir.path().join("droid");
         make_executable(&bin);
         let resolved = resolve_probe_binary("droid", Some(bin.to_str().unwrap()));
         assert_eq!(resolved, Some(bin.into_os_string()));
@@ -650,7 +652,7 @@ mod tests {
                 "{id}: gate command matches registry primary; drop it from this test"
             );
             let dir = unique_temp_dir(&format!("adapter-override-{id}"));
-            let adapter = dir.join(cfg.command);
+            let adapter = dir.path().join(cfg.command);
             make_executable(&adapter);
             let baseline = resolve_probe_binary(id, None);
             assert_eq!(
@@ -667,7 +669,7 @@ mod tests {
     #[test]
     fn auggie_override_matches_check_auggie_semantics() {
         let dir = unique_temp_dir("auggie-override");
-        let bin = dir.join("auggie");
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, "").unwrap();
         assert_eq!(
             resolve_probe_binary("auggie", Some(bin.to_str().unwrap())),
