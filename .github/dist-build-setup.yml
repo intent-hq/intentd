@@ -1,10 +1,10 @@
 # Steps injected into v-release.yml's build-local-artifacts job via the
 # `github-build-setup` dist setting (dist-workspace.toml). NOT a standalone
-# workflow. Needed because the self-hosted runners (tinybox / m1mac / 5090pc)
-# don't guarantee the preinstalled toolchain state of GitHub-hosted images:
-# tinybox has no rustup at all, and none of them necessarily have the pinned
-# toolchain or the cross targets (x86_64-apple-darwin on the arm64 Mac, musl
-# on Linux) installed.
+# workflow. Needed because the self-hosted runners (tinybox / 5090pc) don't
+# guarantee the preinstalled toolchain state of GitHub-hosted images:
+# tinybox has no rustup at all, and no runner (self-hosted or GitHub-hosted
+# macOS) necessarily has the pinned toolchain or the cross targets
+# (x86_64-apple-darwin on the arm64 Mac, musl on Linux) installed.
 #
 # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the WSL
 # stub) shadows Git Bash in PATH, and WSL bash can't execute the runner's
