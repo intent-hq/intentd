@@ -232,6 +232,57 @@ fn list_directory_with_returns_error_for_missing_path() {
 }
 
 #[test]
+fn create_directory_with_creates_directory() {
+    let home = unique_temp_dir("mkdir-basic");
+    let home = home.path();
+    let target = home.join("newdir");
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_creates_nested_parents() {
+    let home = unique_temp_dir("mkdir-nested");
+    let home = home.path();
+    let target = home.join("a").join("b").join("c");
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_succeeds_when_already_exists() {
+    let home = unique_temp_dir("mkdir-exists");
+    let home = home.path();
+    let target = home.join("existing");
+    std::fs::create_dir_all(&target).unwrap();
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_expands_tilde() {
+    let home = unique_temp_dir("mkdir-tilde");
+    let home = home.path();
+    let v = create_directory_with("~/projects/new", home).unwrap();
+    let expected = home.join("projects").join("new");
+    assert!(expected.is_dir());
+    assert_eq!(v["path"], expected.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_returns_error_when_path_is_a_file() {
+    let home = unique_temp_dir("mkdir-file");
+    let home = home.path();
+    let file = home.join("occupied");
+    std::fs::write(&file, "hi").unwrap();
+    let err = create_directory_with(file.to_str().unwrap(), home).unwrap_err();
+    assert!(err.contains("occupied"));
+}
+
+#[test]
 fn directory_status_with_reports_existing_git_repo() {
     let home = unique_temp_dir("ds-repo");
     let home = home.path();

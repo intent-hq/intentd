@@ -1496,3 +1496,121 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 
     drop(daemon);
 }
+
+/// WSS e2e for host.createDirectory (§5.14): success with an absolute path,
+/// `~` expansion against the daemon-host home (pinned via `HOME` on the spawned
+/// daemon), idempotent already-exists success, `-32602` on a missing/empty
+/// `path`, and `-32603` when the path collides with an existing file.
+#[tokio::test]
+async fn host_create_directory_over_wss() {
+    let data_dir = temp_data_dir();
+
+    // Pin the daemon-host home so the tilde-expansion assertion is exact.
+    let home = data_dir.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir fake home");
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", home.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // 1) Absolute path — assert the exact success envelope: `result.path` is
+    // the fully expanded created path and the directory exists on disk (the
+    // daemon runs on this host). Parents are created (`create_dir_all`).
+    let target = data_dir.join("created").join("nested");
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 500, "method": "host.createDirectory",
+        "params": { "path": target.to_str().unwrap() }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let resp = wss_expect_error(&mut ws, 500).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 500, "envelope: {resp}");
+    assert!(resp.get("error").is_none(), "no error: {resp}");
+    assert_eq!(
+        resp["result"]["path"],
+        json!(target.to_str().unwrap()),
+        "result.path is the fully expanded created path: {resp}"
+    );
+    assert!(target.is_dir(), "directory created on the daemon host");
+
+    // 2) Idempotent repeat — an already-existing directory still succeeds.
+    let again = wss_rpc(
+        &mut ws,
+        501,
+        "host.createDirectory",
+        json!({ "path": target.to_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(
+        again["path"],
+        json!(target.to_str().unwrap()),
+        "already-exists is success (create_dir_all semantics): {again}"
+    );
+
+    // 3) `~/…` expands against the daemon-host home (PROTOCOL §5.14 — exactly
+    // like host.listDirectory), and the returned path is the expanded one.
+    let tilde = wss_rpc(
+        &mut ws,
+        502,
+        "host.createDirectory",
+        json!({ "path": "~/projects/from-wss" }),
+    )
+    .await;
+    let expanded = home.join("projects").join("from-wss");
+    assert_eq!(
+        tilde["path"],
+        json!(expanded.to_str().unwrap()),
+        "tilde expanded against the daemon-host home: {tilde}"
+    );
+    assert!(expanded.is_dir(), "tilde-expanded directory created");
+
+    // 4) Missing `path` ⇒ -32602 (PROTOCOL §9), same as the sibling arms.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 503, "method": "host.createDirectory", "params": {} });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 503).await;
+    assert_eq!(err["error"]["code"], -32602, "missing path ⇒ -32602: {err}");
+
+    // 5) Empty `path` ⇒ -32602 as well.
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 504, "method": "host.createDirectory",
+        "params": { "path": "" }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 504).await;
+    assert_eq!(err["error"]["code"], -32602, "empty path ⇒ -32602: {err}");
+
+    // 6) Path colliding with an existing file ⇒ -32603 with the IO message.
+    let file = data_dir.join("occupied");
+    std::fs::write(&file, "hi").expect("write collision file");
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 505, "method": "host.createDirectory",
+        "params": { "path": file.to_str().unwrap() }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 505).await;
+    assert_eq!(
+        err["error"]["code"], -32603,
+        "file collision ⇒ -32603: {err}"
+    );
+
+    drop(daemon);
+}

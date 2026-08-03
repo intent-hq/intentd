@@ -246,6 +246,7 @@ async fn missing_params_are_invalid_params() {
         .await,
     );
     assert_eq!(no_agent["error"]["code"], json!(-32602));
+    assert_eq!(no_agent["error"]["data"]["code"], "invalid-params");
     let no_text = parsed(
         handle(
             req(
@@ -259,6 +260,7 @@ async fn missing_params_are_invalid_params() {
         .await,
     );
     assert_eq!(no_text["error"]["code"], json!(-32602));
+    assert_eq!(no_text["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -456,6 +458,7 @@ async fn non_array_attachments_is_invalid_params() {
         .await,
     );
     assert_eq!(r["error"]["code"], json!(-32602));
+    assert_eq!(r["error"]["data"]["code"], "invalid-params");
     assert!(api.drafts.lock().unwrap().is_empty(), "nothing was stored");
 }
 
@@ -481,5 +484,6 @@ async fn oversized_attachments_are_rejected() {
         json!(-32602),
         "a serialized payload above the cap is invalid params"
     );
+    assert_eq!(r["error"]["data"]["code"], "invalid-params");
     assert!(api.drafts.lock().unwrap().is_empty(), "nothing was stored");
 }
