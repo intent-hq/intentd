@@ -37,7 +37,8 @@ jobs:
   # deadlocked entirely with tinybox offline). The probe fails open to
   # tinybox on API errors; if the job itself fails (runner outage, timeout),
   # the routed jobs are skipped and need a re-run — a deliberate trade-off.
-  # The mac build is intentionally not routed — it stays pinned to m1mac.
+  # The mac build is intentionally not routed — it runs on a GitHub-hosted
+  # macOS runner (see the build job's matrix).
   route:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -229,8 +230,10 @@ jobs:
           # temporarily disabled — re-enable when needed
           # - target: x86_64-unknown-linux-gnu
           #   os: ubuntu-latest
+          # GitHub-hosted Apple Silicon runner: the self-hosted m1mac went
+          # offline and PRs queued indefinitely behind it.
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64, m1mac]
+            os: macos-14
           - target: x86_64-pc-windows-msvc
             os: [self-hosted, Windows, X64]
     runs-on: ${{ matrix.os }}
@@ -253,14 +256,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale; re-add swatinem/rust-cache, keyed
-      # per target, if a GH-hosted matrix entry is re-enabled). The mac and
-      # Windows runners are single-slot, so no $RUNNER_NAME key. On the Windows
-      # runner this runs under Git Bash, where $HOME is an MSYS-style path
-      # cargo (spawned from the default pwsh shell) can't use — $USERPROFILE
-      # carries the native C:\Users\... form, so prefer it when set.
-      - name: Point CARGO_TARGET_DIR outside the work dir
+      # Per-job persistent target dir outside the work dir, self-hosted
+      # runners only (see the `check` job's comment for the rationale). The
+      # self-hosted runners are single-slot, so no $RUNNER_NAME key. On the
+      # Windows runner this runs under Git Bash, where $HOME is an MSYS-style
+      # path cargo (spawned from the default pwsh shell) can't use —
+      # $USERPROFILE carries the native C:\Users\... form, so prefer it when
+      # set.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: contains(matrix.os, 'self-hosted')
         shell: bash
         run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
@@ -273,6 +277,14 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there instead (mirrors the `check` job's
+      # burst-runner caching; pure overhead on the self-hosted runners).
+      - name: Rust cache (GitHub-hosted runner only)
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gh-build-${{ matrix.target }}
       # On PRs a cheap `cargo check` proves per-target compilation; the full
       # `--release` build (the expensive part, esp. on Windows) only runs on
       # push to main and in the merge queue. The "Warm PR check cache" step
