@@ -1107,9 +1107,12 @@ impl Services {
             // Derive from the row's own `activity` (set by every caller just
             // before enrichment) so a single response can never pair
             // `activity: "agent_running"` with `displayStatus: "idle"`.
+            // Active background hooks fold into the promotion (§6.5): an
+            // idle agent still watching via a hook reads as active work.
             let display_status = compute_display_status(
                 self.workspace_needs_attention(&ws.id).await,
-                ws.activity == WorkspaceActivity::AgentRunning,
+                ws.activity == WorkspaceActivity::AgentRunning
+                    || self.workspace_has_active_hooks(&ws.id).await,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1136,7 +1139,8 @@ impl Services {
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
     /// the derivation (task/note status updates, task-note deletion, PR
-    /// link/status changes, agent activity begin/debounced end) — never from
+    /// link/status changes, agent activity begin/debounced end, hook
+    /// lifecycle transitions) — never from
     /// a polling loop. The first
     /// observation for a workspace seeds the cache without emitting (no
     /// baseline to transition from); a read
@@ -1160,7 +1164,8 @@ impl Services {
         let needs_attention = self.workspace_needs_attention(workspace_id).await;
         let status = compute_display_status(
             needs_attention,
-            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
+                || self.workspace_has_active_hooks(workspace_id).await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -4742,7 +4747,9 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 ///    agent waiting on the user outranks everything, including a running
 ///    agent ([`Services::workspace_needs_attention`]).
 /// 1. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says.
+///    work, whatever the PR/task rollup says. Callers fold active-hook
+///    state into this flag ([`Services::workspace_has_active_hooks`]) so an
+///    idle agent still watching via a background hook reads the same.
 /// 2. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
@@ -9341,7 +9348,8 @@ impl WorkspaceApi for Services {
                 if ws.task_stats.is_some() {
                     let display_status = compute_display_status(
                         this.workspace_needs_attention(&ws.id).await,
-                        ws.activity == WorkspaceActivity::AgentRunning,
+                        ws.activity == WorkspaceActivity::AgentRunning
+                            || this.workspace_has_active_hooks(&ws.id).await,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
                         ws.pr_status,
