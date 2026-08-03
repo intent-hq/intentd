@@ -4692,8 +4692,11 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `terminal.list`: the workspace's live terminals as a bare array
-    /// `[{ id, name, cwd, isExecutingCommand }]` (PROTOCOL §5.9).
+    /// `terminal.list`: the workspace's live terminals wrapped in the per-boot
+    /// envelope `{ terminals: [{ id, name, cwd, isExecutingCommand }],
+    /// daemonBootId }` (PROTOCOL §5.13; monorepo#1334). `daemonBootId` is the
+    /// daemon's per-process boot id, stable within one daemon lifetime and
+    /// fresh after a restart.
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = workspace_id;
         Box::pin(async {

@@ -404,7 +404,12 @@ impl WorkspaceApi for FakeApi {
 
     fn terminal_list(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         *self.terminal_list_calls.lock().unwrap() += 1;
-        Box::pin(async { Ok(json!([{ "id": "t-1", "name": "Terminal" }])) })
+        Box::pin(async {
+            Ok(json!({
+                "terminals": [{ "id": "t-1", "name": "Terminal" }],
+                "daemonBootId": "boot-fixed",
+            }))
+        })
     }
 
     fn terminal_read_output(
@@ -1310,8 +1315,11 @@ async fn terminal_list_returns_array() {
     let (srv, api) = server();
     let resp = call(&srv, "return await ws.terminal.list();").await;
     assert_eq!(resp["result"]["isError"], json!(false));
+    // The binding unwraps the wire `{ terminals, daemonBootId }` envelope so
+    // agents keep seeing the bare terminals array (monorepo#1334).
     let arr = body(&resp);
     assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["id"], json!("t-1"));
     assert_eq!(*api.terminal_list_calls.lock().unwrap(), 1);
 }
 

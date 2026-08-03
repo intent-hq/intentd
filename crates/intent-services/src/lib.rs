@@ -295,6 +295,12 @@ pub struct Services {
     /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
     /// terminals.
     pty: Arc<intent_pty::PtyHost>,
+    /// Per-boot daemon identifier (UUID v4) minted once at construction and
+    /// surfaced as `daemonBootId` on the `terminal.list` envelope so clients
+    /// can tell which daemon lifetime a (possibly empty) list belongs to
+    /// (monorepo#1334). Never persisted; clones carry the same value, so every
+    /// service handle in one process reports the same boot id.
+    daemon_boot_id: String,
     /// The shared `script.*` registry (definitions + runtime + supervisor tasks),
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
@@ -556,6 +562,7 @@ impl Services {
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
@@ -8707,7 +8714,8 @@ impl WorkspaceApi for Services {
 
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
+        let boot_id = self.daemon_boot_id.clone();
+        Box::pin(async move { terminal_ops::list(&pty, &workspace_id, &boot_id) })
     }
 
     fn terminal_read_output(
