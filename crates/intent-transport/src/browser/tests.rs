@@ -142,6 +142,21 @@ async fn exec_rejects_empty_actions_before_forwarding() {
 }
 
 #[tokio::test]
+async fn handle_frames_invalid_params_with_data_code() {
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    let reverse = ReverseChannel::new(out_tx);
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 5, "method": "browser.exec", "params": {}
+    }))
+    .unwrap();
+    let frame = handle(req, &reverse).await.expect("error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 5);
+    assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
+}
+
+#[tokio::test]
 async fn exec_surfaces_no_frontend_connected_as_proxy_error() {
     let (out_tx, out_rx) = mpsc::channel(8);
     // Drop the receiver immediately: mirrors "no frontend connected" — the

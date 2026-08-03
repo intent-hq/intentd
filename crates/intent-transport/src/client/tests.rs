@@ -104,6 +104,7 @@ async fn non_string_client_id_is_invalid_params() {
     .unwrap();
     let resp = parsed(handle(req, &api, &mut binding, true).await);
     assert_eq!(resp["error"]["code"], json!(-32602));
+    assert_eq!(resp["error"]["data"]["code"], "invalid-params");
     assert!(
         binding.is_none(),
         "an invalid hello leaves the binding unset"

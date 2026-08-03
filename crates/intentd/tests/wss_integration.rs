@@ -593,6 +593,50 @@ async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
     srv.ws.stop().await;
 }
 
+/// Fast-path `-32602` discriminator (PROTOCOL §3.3, monorepo#1364): every
+/// fast-path family that rejects invalid params — subscription params
+/// (`events.subscribe`), `drafts.*`, `forward.*`, `host.*`, `browser.exec`,
+/// `client.hello` — carries the machine-readable `error.data.code =
+/// "invalid-params"` on the wire, mirroring the dispatcher. `browser.exec`
+/// validation short-circuits before the FE reverse RPC, so no frontend is
+/// needed.
+#[tokio::test]
+async fn wss_fast_path_invalid_params_carry_data_code() {
+    let srv = start(WsOptions::default()).await;
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // events.subscribe: missing eventTypes.
+            r#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{}}"#.to_string(),
+            // drafts.set: missing workspaceId/agentId.
+            r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"text":"x"}}"#.to_string(),
+            // forward.create: missing remotePort.
+            r#"{"jsonrpc":"2.0","id":3,"method":"forward.create","params":{}}"#.to_string(),
+            // host.directoryStatus: missing path.
+            r#"{"jsonrpc":"2.0","id":4,"method":"host.directoryStatus","params":{}}"#.to_string(),
+            // browser.exec: missing actions (rejected before the reverse RPC).
+            r#"{"jsonrpc":"2.0","id":5,"method":"browser.exec","params":{}}"#.to_string(),
+            // client.hello: non-string clientId.
+            r#"{"jsonrpc":"2.0","id":6,"method":"client.hello","params":{"clientId":42}}"#
+                .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "frame {i} is -32602: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["code"], "invalid-params",
+            "frame {i} carries the data.code discriminator: {resp}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 /// Transport size-limit regression (monorepo#472, monorepo#495): a text
 /// message past the 40 MiB cap terminates the connection with a 1009
 /// (Message Too Big) close frame; a large-but-legit single-frame message

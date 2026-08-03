@@ -294,6 +294,7 @@ async fn handle_directory_status_requires_path() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 11);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -347,6 +348,7 @@ async fn handle_create_directory_requires_path() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 15);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -386,6 +388,7 @@ async fn handle_find_binary_requires_name() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 20);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -462,6 +465,7 @@ async fn handle_provider_auth_status_unknown_provider_is_invalid_params() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 24);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -479,6 +483,7 @@ async fn handle_provider_auth_status_rejects_non_string_provider_id() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 25);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -496,6 +501,7 @@ async fn handle_provider_auth_status_rejects_non_bool_force() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 27);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -532,6 +538,7 @@ async fn handle_find_app_requires_name() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 30);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 }
 
 #[tokio::test]
@@ -1039,6 +1046,7 @@ async fn handle_open_in_editor_missing_params_are_invalid() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 9);
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
     assert!(parsed["error"]["message"]
         .as_str()
         .unwrap()
@@ -1055,6 +1063,7 @@ async fn handle_open_in_editor_missing_params_are_invalid() {
         .expect("error response");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
     assert!(parsed["error"]["message"]
         .as_str()
         .unwrap()

@@ -240,6 +240,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     let parsed: Value =
         serde_json::from_str(&handle(invalid, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
     let positional = classify(&json!({
         "jsonrpc": "2.0", "id": 13, "method": "system.importLegacy", "params": []
@@ -248,6 +249,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     let parsed: Value =
         serde_json::from_str(&handle(positional, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
     let remote = classify(&json!({
         "jsonrpc": "2.0", "id": 14, "method": "system.importLegacy",
