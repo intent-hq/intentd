@@ -500,6 +500,9 @@ impl Services {
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
                 self.wake_hook_owner(&hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
+                // Hook settled terminal: recompute the derived displayStatus
+                // (§6.5) — best-effort, transition-only emission.
+                self.maybe_emit_display_status_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": true }))
             }
             RunOutcome::Continue { logs, state } => {
@@ -526,6 +529,9 @@ impl Services {
                 self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
                     .await;
                 self.spawn_hook_task(hook.clone());
+                // A newly persisted active hook can promote the derived
+                // displayStatus to `in_progress` (§6.5).
+                self.maybe_emit_display_status_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": false }))
             }
         }
@@ -609,6 +615,28 @@ impl Services {
         by_agent
     }
 
+    /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
+    /// the `displayStatus` promotion signal (§6.5): an idle agent still
+    /// watching via a background hook reads as active work. Best-effort: a
+    /// store read failure is logged and fails open to `false` (mirrors
+    /// [`Services::workspace_needs_attention`]) so list/get emission is
+    /// never wedged and activity is never fabricated.
+    pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
+        match self.store.list_hooks_by_workspace(workspace_id).await {
+            Ok(hooks) => hooks
+                .iter()
+                .any(|h| matches!(h.state, HookState::Scheduled | HookState::Running)),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-hooks displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
     /// Stamp `waitingOnHooks` onto an `agent:idle`-style event `data` object
     /// when `agent_id` owns at least one active hook (the field is omitted —
     /// never `[]` — otherwise, and an existing stamp is left untouched).
@@ -670,6 +698,10 @@ impl Services {
             // this was its last active hook — run the backstop directly.
             self.resettle_owner_after_hook_terminal(&hook).await;
         }
+        // The last active hook settling can demote the derived displayStatus
+        // (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(&hook.workspace_id)
+            .await;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
@@ -935,6 +967,10 @@ impl Services {
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
                 self.wake_hook_owner(hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
+                // The last active hook settling can demote the derived
+                // displayStatus (§6.5).
+                self.maybe_emit_display_status_changed(&hook.workspace_id)
+                    .await;
                 Ok(false)
             }
             RunOutcome::Failed { error, logs } => {
@@ -973,6 +1009,10 @@ impl Services {
                     RunLogs::Lost => notice,
                 };
                 self.wake_hook_owner(hook, &notice, "evicted").await;
+                // The last active hook settling can demote the derived
+                // displayStatus (§6.5).
+                self.maybe_emit_display_status_changed(&hook.workspace_id)
+                    .await;
                 Ok(false)
             }
         }
@@ -1029,6 +1069,10 @@ impl Services {
             hook.name
         );
         self.wake_hook_owner(hook, &notice, "evicted").await;
+        // The last active hook settling can demote the derived displayStatus
+        // (§6.5) — best-effort like everything else on this path.
+        self.maybe_emit_display_status_changed(&hook.workspace_id)
+            .await;
     }
 
     /// Expire an active hook whose TTL deadline has passed and no run is in
@@ -1079,6 +1123,10 @@ impl Services {
         );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
+        // The last active hook settling can demote the derived displayStatus
+        // (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(&hook.workspace_id)
+            .await;
     }
 
     /// Idle-visibility deferral backstop: after a hook reaches a terminal
@@ -1789,6 +1837,184 @@ mod tests {
             session.messages.is_empty(),
             "owner-initiated cancel must not wake the owner"
         );
+    }
+
+    /// Persisted `workspace:displayStatus-changed` payload statuses for a
+    /// workspace, oldest-first.
+    async fn display_status_events(svc: &Services, ws: &WorkspaceId) -> Vec<String> {
+        let mut evs =
+            svc.store()
+                .query_events(&intent_store::EventQuery {
+                    workspace_id: Some(ws.clone()),
+                    event_types: vec![
+                        intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED.to_string()
+                    ],
+                    ..Default::default()
+                })
+                .await
+                .expect("query displayStatus events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data["displayStatus"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// An active (`scheduled`) hook promotes the derived `displayStatus` to
+    /// `in_progress` on the list/get enrichment path even with the owner
+    /// idle; the promotion drops back to `idle` once the hook settles.
+    #[tokio::test]
+    async fn active_hook_promotes_display_status_to_in_progress() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.workspace_has_active_hooks(&ws).await);
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::InProgress),
+            "idle owner with an active hook must read in_progress"
+        );
+
+        // Settle the hook: the promotion lapses and the base rollup runs.
+        svc.hook_cancel_op(&ws, &hook.hook_id, true)
+            .await
+            .expect("cancel");
+        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Idle),
+            "terminal hooks never promote"
+        );
+    }
+
+    /// `needs_attention` (step 0) still outranks the hook promotion: a
+    /// top-level agent with a pending attention request wins over its own
+    /// active hook.
+    #[tokio::test]
+    async fn needs_attention_outranks_hook_promotion() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        svc.hook_schedule_op(
+            &ws,
+            &owner,
+            &json!({
+                "name": "watcher",
+                "code": "return { dispatch: false };",
+                "delayMs": 10_000,
+            }),
+        )
+        .await
+        .expect("schedule");
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.attention_request_kind = Some("discussion".to_string());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::NeedsAttention),
+        );
+    }
+
+    /// Hook lifecycle transitions emit `workspace:displayStatus-changed`
+    /// exactly once per transition: schedule promotes (idle → in_progress),
+    /// settle demotes (in_progress → idle) — for both the synchronous cancel
+    /// path and the spawned-task dispatch path.
+    #[tokio::test]
+    async fn hook_transitions_emit_display_status_changed_once() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        // Re-running the recompute without a transition emits nothing.
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        svc.hook_cancel_op(&ws, &hook.hook_id, true)
+            .await
+            .expect("cancel");
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle"]
+        );
+
+        // The spawned-task dispatch settle path emits too. The script polls
+        // a note: schedule-time validation sees "wait" and continues; the
+        // test flips it to "go" and `runNow` drives the dispatch.
+        let mut probe = note(&ws, "gate-note", "wait");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "gate-watch",
+                    "code": "const n = await ws.note.read('gate-note'); \
+                             if (n.content.includes('go')) { \
+                               return { dispatch: true, message: 'done' }; \
+                             } \
+                             return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress"]
+        );
+        probe.content = "go".to_string();
+        svc.store().update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let evs = display_status_events(&svc, &ws).await;
+            if evs == vec!["in_progress", "idle", "in_progress", "idle"] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dispatch settle never demoted; events = {evs:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]
