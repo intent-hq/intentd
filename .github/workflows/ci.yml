@@ -283,8 +283,20 @@ jobs:
           # offline and PRs queued indefinitely behind it.
           - target: aarch64-apple-darwin
             os: macos-14
+            name: build (aarch64-apple-darwin, macos-14)
+          # Interim (intent-hq/monorepo#1382): the self-hosted Windows runner
+          # (5090pc) is offline, so run this leg on windows-latest. The
+          # explicit `name` keeps the rendered check context identical to the
+          # self-hosted era because the main ruleset requires that exact
+          # string. Revert os to [self-hosted, Windows, X64] (and drop this
+          # comment) when 5090pc is back.
           - target: x86_64-pc-windows-msvc
-            os: [self-hosted, Windows, X64]
+            os: windows-latest
+            name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
+    # Explicit per-entry names (instead of the default matrix-value join) so
+    # the required-check contexts in the main ruleset stay stable even when a
+    # matrix entry's runner labels change.
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Keeps the cargo-check steps free of debuginfo/incremental artifacts
