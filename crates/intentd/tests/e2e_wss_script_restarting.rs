@@ -154,8 +154,8 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 }
 
 /// One round-trip RPC that must succeed: send, await the response envelope
-/// (skipping interleaved `events.event` notifications), assert no error,
-/// return `result`.
+/// (skipping interleaved `events.event` notifications), assert the envelope
+/// (`jsonrpc: "2.0"`, `result` present, no `error`), return `result`.
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string()))
@@ -169,7 +169,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "response envelope: {v}");
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+                    assert!(
+                        v.get("result").is_some(),
+                        "rpc {method} missing result: {v}"
+                    );
                     return v["result"].clone();
                 }
             }
