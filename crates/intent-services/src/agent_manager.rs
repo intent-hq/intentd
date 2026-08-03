@@ -7097,7 +7097,10 @@ fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     };
     format!(
         "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
-         and was interrupted. Assess where you left off and continue the work."
+         and was interrupted. If you were waiting on something external, schedule a \
+         `ws.hook.schedule` background hook to watch the condition and end your turn instead \
+         of blocking — the hook's wake message resumes you. Assess where you left off and \
+         continue the work."
     )
 }
 
@@ -8465,7 +8468,10 @@ mod turn_failure_tests {
         assert_eq!(
             text,
             "[SYSTEM WARNING] Your turn exceeded the inactivity timeout (1800s of silence) and \
-             was interrupted. Assess where you left off and continue the work."
+             was interrupted. If you were waiting on something external, schedule a \
+             `ws.hook.schedule` background hook to watch the condition and end your turn \
+             instead of blocking — the hook's wake message resumes you. Assess where you left \
+             off and continue the work."
         );
         // The window is the actual configured value, not a hardcoded literal,
         // and sub-second precision is preserved rather than truncated.
