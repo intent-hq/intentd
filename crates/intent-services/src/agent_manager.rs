@@ -916,22 +916,20 @@ struct PiExtensionDelivery {
 }
 
 impl PiExtensionDelivery {
-    /// Write the extension + wrapper (0755) temp files. The wrapper only
+    /// Write the extension + wrapper (0755) files into `dir`. The wrapper only
     /// appends our `-e` flag — user-installed pi extensions stay enabled.
     #[cfg(unix)]
-    fn write(real_pi_command: &str) -> Result<Self> {
+    fn write(real_pi_command: &str, dir: &Path) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
-        let extension_path =
-            std::env::temp_dir().join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
+        let extension_path = dir.join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
         std::fs::write(&extension_path, PI_MCP_EXTENSION_SOURCE)
             .map_err(|e| Error::Internal(format!("write pi extension failed: {e}")))?;
         let extension = TempConfigFile {
             path: extension_path,
         };
 
-        let wrapper_path =
-            std::env::temp_dir().join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
+        let wrapper_path = dir.join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
         let script = format!(
             "#!/bin/sh\nexec {} -e {} \"$@\"\n",
             sh_squote(real_pi_command),
@@ -952,7 +950,7 @@ impl PiExtensionDelivery {
     /// non-unix equivalent, so fail with a clear error instead of spawning pi
     /// with a script it cannot execute.
     #[cfg(not(unix))]
-    fn write(_real_pi_command: &str) -> Result<Self> {
+    fn write(_real_pi_command: &str, _dir: &Path) -> Result<Self> {
         Err(Error::Internal(
             "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
         ))
@@ -973,15 +971,19 @@ impl PiExtensionDelivery {
     }
 }
 
-/// Write the pi-extension delivery files for providers flagged
+/// Write the pi-extension delivery files into `dir` for providers flagged
 /// `mcp_via_pi_extension`; `None` for every other provider.
-fn pi_extension_delivery(provider: &ProviderConfig) -> Result<Option<PiExtensionDelivery>> {
+fn pi_extension_delivery(
+    provider: &ProviderConfig,
+    dir: &Path,
+) -> Result<Option<PiExtensionDelivery>> {
     if !provider.mcp_via_pi_extension {
         return Ok(None);
     }
-    Ok(Some(
-        PiExtensionDelivery::write(&resolve_real_pi_command())?,
-    ))
+    Ok(Some(PiExtensionDelivery::write(
+        &resolve_real_pi_command(),
+        dir,
+    )?))
 }
 
 /// Single-quote a string for inert interpolation into a `sh` script: quotes
@@ -1090,6 +1092,12 @@ pub struct AgentManager {
     /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
     /// `<data_dir>/agent-logs`; `None` (tests / bare wiring) disables capture.
     agent_log_root: Option<PathBuf>,
+    /// Daemon-owned directory the per-agent generated config files
+    /// (`--mcp-config`, `--rules`, pi-extension delivery) are written into
+    /// (monorepo#1302). The composition root wires `<data_dir>/agent-configs`
+    /// and sweeps leftovers at startup; `None` (tests / bare wiring) falls
+    /// back to the OS temp dir.
+    agent_config_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
@@ -1215,6 +1223,7 @@ impl AgentManager {
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
+            agent_config_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -1254,12 +1263,40 @@ impl AgentManager {
         self
     }
 
+    /// Set the daemon-owned directory the per-agent generated config files
+    /// are written into (monorepo#1302). The composition root passes
+    /// `intent_core::agent_configs_root(&config.data_dir)` after sweeping
+    /// leftovers; the directory is created on demand right before a spawn
+    /// writes into it.
+    pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_config_root = Some(root.into());
+        self
+    }
+
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
     /// The composition root passes `intent_core::chief_cwd_root(&config.data_dir)`;
     /// the directory is created on demand right before a chief spawn resolves.
     pub fn with_chief_cwd_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.chief_cwd_root = Some(root.into());
         self
+    }
+
+    /// Directory the per-agent generated config files are written into: the
+    /// wired `<data_dir>/agent-configs` dir, created on demand — or the OS
+    /// temp dir when no root is wired (tests / bare wiring) or creation fails.
+    fn agent_config_dir(&self) -> PathBuf {
+        let Some(root) = self.agent_config_root.as_ref() else {
+            return std::env::temp_dir();
+        };
+        if let Err(e) = intent_core::agent_configs::create_agent_configs_dir(root) {
+            tracing::warn!(
+                error = %e,
+                path = %root.display(),
+                "failed to create agent-configs dir; falling back to temp dir"
+            );
+            return std::env::temp_dir();
+        }
+        root.clone()
     }
 
     /// Stderr capture directory for `agent_id`, when capture is enabled —
@@ -1357,13 +1394,18 @@ impl AgentManager {
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
 
+        // Directory the generated per-agent files below are written into:
+        // `<data_dir>/agent-configs` when wired (swept at startup so a killed
+        // daemon's leftovers don't accumulate, monorepo#1302), else temp dir.
+        let config_dir = self.agent_config_dir();
+
         // Generated MCP config (auggie format) pointing at the bridge
         // subcommand, written only for providers that consume an MCP-config flag.
         let mut mcp_config: Option<TempConfigFile> = None;
         let mut mcp_config_path: Option<String> = None;
         if opts.provider.supports_mcp_config {
             let config = self.generate_mcp_config(&bridge).await?;
-            let path = std::env::temp_dir().join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
+            let path = config_dir.join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
                 .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
             std::fs::write(&path, bytes)
@@ -1386,7 +1428,7 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
-        let pi_extension = pi_extension_delivery(opts.provider)?;
+        let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup
         // (claude-code, codex, droid, grok), the same normalized server set is
@@ -1444,8 +1486,7 @@ impl AgentManager {
             )
             .await
             {
-                let path =
-                    std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
+                let path = config_dir.join(format!("intentd-rules-{}.md", Uuid::new_v4()));
                 std::fs::write(&path, prompt.as_bytes())
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
                 rules_file_path = Some(path.to_string_lossy().into_owned());
@@ -8026,7 +8067,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn write_creates_extension_and_executable_wrapper() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
 
         let ext = std::fs::read_to_string(&delivery._extension.path).unwrap();
         assert_eq!(ext, PI_MCP_EXTENSION_SOURCE);
@@ -8053,7 +8094,8 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn wrapper_single_quotes_special_characters() {
-        let delivery = PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi").unwrap();
+        let delivery =
+            PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi", &std::env::temp_dir()).unwrap();
         let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
         assert!(
             script.contains("exec '/opt/pi'\\''s \"odd$\" bin/pi' -e '"),
@@ -8062,8 +8104,19 @@ mod pi_extension_delivery_tests {
     }
 
     #[test]
+    fn write_places_files_in_the_given_dir() {
+        let dir = std::env::temp_dir().join(format!("intentd-pi-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &dir).unwrap();
+        assert_eq!(delivery._extension.path.parent().unwrap(), dir);
+        assert_eq!(delivery.wrapper.path.parent().unwrap(), dir);
+        drop(delivery);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn temp_files_removed_when_delivery_drops() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let ext = delivery._extension.path.clone();
         let wrapper = delivery.wrapper.path.clone();
         drop(delivery);
@@ -8073,7 +8126,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let mut extra_env = BTreeMap::new();
         delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
         assert_eq!(
@@ -8091,7 +8144,7 @@ mod pi_extension_delivery_tests {
     #[test]
     fn delivery_gated_on_capability_flag() {
         let pi = intent_providers::find_provider("pi").unwrap();
-        let delivery = pi_extension_delivery(pi).unwrap();
+        let delivery = pi_extension_delivery(pi, &std::env::temp_dir()).unwrap();
         assert!(delivery.is_some(), "pi must get the extension delivery");
 
         for provider in intent_providers::ACP_PROVIDERS
@@ -8099,7 +8152,9 @@ mod pi_extension_delivery_tests {
             .filter(|p| p.id != "pi")
         {
             assert!(
-                pi_extension_delivery(provider).unwrap().is_none(),
+                pi_extension_delivery(provider, &std::env::temp_dir())
+                    .unwrap()
+                    .is_none(),
                 "{} must not get a wrapper or extension",
                 provider.id
             );

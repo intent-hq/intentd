@@ -5,6 +5,7 @@
 //! and the cross-layer traits (`WorkspaceApi`, `ContextEngine`) that higher
 //! layers implement and consume.
 
+pub mod agent_configs;
 pub mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;
@@ -22,6 +23,9 @@ pub mod tilde;
 pub mod traits;
 pub mod turn_attachments;
 
+pub use agent_configs::{
+    agent_configs_root, create_agent_configs_dir, sweep_agent_configs, AGENT_CONFIGS_DIR_NAME,
+};
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
