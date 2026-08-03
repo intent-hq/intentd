@@ -772,6 +772,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        // Per-agent generated config files (`--mcp-config`, `--rules`,
+        // pi-extension delivery) are written under the daemon-owned
+        // `<data_dir>/agent-configs` instead of the global OS temp dir
+        // (monorepo#1302). Swept at startup (no agent child is live yet)
+        // so files leaked by a killed daemon don't accumulate.
+        .with_agent_config_root({
+            let root = intent_core::agent_configs_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_agent_configs(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "agent-configs sweep failed");
+            }
+            root
+        })
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider
