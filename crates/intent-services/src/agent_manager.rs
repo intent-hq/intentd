@@ -34,7 +34,7 @@ use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
     BoxFuture, Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
-use intent_providers::{InjectionMechanism, ProviderConfig};
+use intent_providers::{build_provider_env_with_unsloth, InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
 use serde_json::{json, Value};
 use tokio::process::Child;
@@ -45,6 +45,9 @@ use uuid::Uuid;
 use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
 use crate::agent_session::agent_actor;
 use crate::events::EventBus;
+use crate::microvm::{
+    self, orchestrator::GUEST_MCP_BRIDGE_PATH, MicrovmSpawnSpec, MicrovmVm, GUEST_WORKSPACE_DIR,
+};
 use crate::Services;
 
 #[cfg(test)]
@@ -992,6 +995,26 @@ fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The guest-side MCP server set for microVM spawns (monorepo#1120, EE-5):
+/// the `workspace-mcp` bridge is the staged node shim
+/// (`node /intent/mcp-bridge.mjs <host:port>`) — the macOS daemon binary
+/// cannot run in the Linux guest, and libkrun TSI transparently routes the
+/// guest's outbound TCP connect to the host loopback listener. User MCP
+/// servers are host-side processes/paths and are deliberately NOT forwarded
+/// into the guest.
+fn guest_mcp_servers(bridge_connect_addr: String) -> NormalizedMcpServers {
+    let mut servers = NormalizedMcpServers::new();
+    servers.insert(
+        "workspace-mcp".to_string(),
+        NormalizedMcpServer::Stdio {
+            command: "node".to_string(),
+            args: vec![GUEST_MCP_BRIDGE_PATH.to_string(), bridge_connect_addr],
+            env: EnvMap::new(),
+        },
+    );
+    servers
+}
+
 /// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
 /// daemon env (the value pi-acp itself would have used, which the wrapper
 /// override shadows) or `pi` from the child's PATH — pi-acp's own fallback.
@@ -1016,6 +1039,13 @@ struct AgentHandle {
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
     _child: Option<Child>,
+    /// The agent's microVM when it was spawned in one (monorepo#1120, EE-5):
+    /// the per-VM rootfs/exec-socket state and the credential rotation
+    /// watcher (the helper child itself lives in `_child` so every existing
+    /// kill/reap path signals the VM's process group). Dropping the handle
+    /// drops this, which scrubs the per-VM directory — staged credentials
+    /// included — and emits `sandbox:vm:stopped`.
+    _vm: Option<MicrovmVm>,
     /// The child's pid captured at spawn: `Child::id()` reads `None` once a
     /// `try_wait` liveness probe reaps the exit status, and the pgid-based
     /// teardown (`kill_child_tree`) still needs it to sweep same-group
@@ -1088,6 +1118,10 @@ pub struct AgentManager {
     permissions: Arc<PermissionRegistry>,
     policy: PermissionPolicy,
     mcp_bridge_exe: PathBuf,
+    /// Daemon data dir for microVM state (guest-image cache + per-VM dirs,
+    /// monorepo#1120 EE-5). Wired by the composition root; `None` (tests /
+    /// bare wiring) makes a microVM spawn a structured hard error.
+    data_dir: Option<PathBuf>,
     /// Root the per-agent stderr capture files live under (STAB-53), laid out
     /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
     /// `<data_dir>/agent-logs`; `None` (tests / bare wiring) disables capture.
@@ -1222,6 +1256,7 @@ impl AgentManager {
             // `AutoByRisk` / `DenyAll` remain selectable via the same env var.
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
+            data_dir: None,
             agent_log_root: None,
             agent_config_root: None,
             chief_cwd_root: None,
@@ -1270,6 +1305,15 @@ impl AgentManager {
     /// writes into it.
     pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_config_root = Some(root.into());
+        self
+    }
+
+    /// Enable microVM spawns (monorepo#1120, EE-5): the daemon data dir hosts
+    /// the guest-image cache (`<data_dir>/guest-images`) and per-VM state
+    /// (`<data_dir>/microvm/<agent-id>`). Unset (tests / bare wiring) makes a
+    /// microVM-workspace spawn fail with a structured error.
+    pub fn with_data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(dir.into());
         self
     }
 
@@ -1378,6 +1422,18 @@ impl AgentManager {
     ) -> Result<()> {
         self.registry.acquire(&agent_id).await;
 
+        // microVM workspaces (monorepo#1120, EE-5) spawn the provider inside a
+        // per-agent libkrun VM instead of a host child: MCP delivery, rules
+        // staging, and the spawn transport all differ, so the decision is
+        // made once up front.
+        let microvm_ws = self
+            .services
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .filter(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm));
+
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
@@ -1400,10 +1456,12 @@ impl AgentManager {
         let config_dir = self.agent_config_dir();
 
         // Generated MCP config (auggie format) pointing at the bridge
-        // subcommand, written only for providers that consume an MCP-config flag.
+        // subcommand, written only for providers that consume an MCP-config
+        // flag. microVM spawns stage a guest-path variant into the VM rootfs
+        // instead (`spawn_in_microvm`), so the host temp file is skipped.
         let mut mcp_config: Option<TempConfigFile> = None;
         let mut mcp_config_path: Option<String> = None;
-        if opts.provider.supports_mcp_config {
+        if opts.provider.supports_mcp_config && microvm_ws.is_none() {
             let config = self.generate_mcp_config(&bridge).await?;
             let path = config_dir.join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
@@ -1419,7 +1477,9 @@ impl AgentManager {
         // as an `mcp` block instead of an `--mcp-config` file, pointing at the
         // same bridge endpoint.
         let mut env_mcp_config: Option<String> = None;
-        if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig {
+        if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig
+            && microvm_ws.is_none()
+        {
             env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
         }
 
@@ -1428,18 +1488,31 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
-        let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
+        // microVM spawns stage the extension + wrapper into the VM rootfs
+        // instead.
+        let pi_extension = if microvm_ws.is_none() {
+            pi_extension_delivery(opts.provider, &config_dir)?
+        } else {
+            None
+        };
 
         // For providers that consume MCP servers from the ACP session setup
         // (claude-code, codex, droid, grok), the same normalized server set is
         // carried as the typed `session/new` / `session/load` `mcpServers`
         // field, pointing at the same bridge endpoint. Kept on the handle so
         // `start_session` (which runs after `create_agent`) can pass it into
-        // every session-open branch.
+        // every session-open branch. microVM spawns instead carry the guest
+        // bridge shim (`node /intent/mcp-bridge.mjs <addr>`; TSI routes the
+        // guest's TCP connect to the host loopback listener).
         let mut session_mcp_servers: Vec<McpServer> = Vec::new();
         if opts.provider.supports_session_mcp_servers {
-            let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
-            session_mcp_servers = to_acp_session_mcp_servers(&servers);
+            if microvm_ws.is_some() {
+                session_mcp_servers =
+                    to_acp_session_mcp_servers(&guest_mcp_servers(bridge.connect_addr()));
+            } else {
+                let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+                session_mcp_servers = to_acp_session_mcp_servers(&servers);
+            }
         }
 
         // Assemble the effective system prompt (the §18.1 injection pipeline:
@@ -1549,24 +1622,57 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let spawned = spawn_provider(&spawn_opts, hooks)
-            .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
-        let (child, connection) = spawned.into_parts();
-        // Pin the spawned child's pid for the exit watcher armed below: the
-        // watcher stands down when the handle's child no longer matches it
-        // (a respawn installed a newer child with its own watcher).
-        let child_pid = child.id();
-        let connection = Arc::new(connection);
+        // Spawn transport fork: microVM workspaces boot a per-agent VM and
+        // exec the provider over vsock; everything else spawns a host child.
+        // Both paths converge on the same `Connection` type — the vsock
+        // stream IS the provider's stdio, framed identically.
+        let (child, child_pid, connection, vm) = match &microvm_ws {
+            Some(ws) => {
+                let (mut vm, connection) = self
+                    .spawn_in_microvm(
+                        &agent_id,
+                        &workspace_id,
+                        ws,
+                        &cwd,
+                        &spawn_opts,
+                        bridge.connect_addr(),
+                        hooks,
+                    )
+                    .await?;
+                let child = vm.take_child();
+                let child_pid = child.as_ref().and_then(|c| c.id());
+                (child, child_pid, Arc::new(connection), Some(vm))
+            }
+            None => {
+                let spawned = spawn_provider(&spawn_opts, hooks)
+                    .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+                let (child, connection) = spawned.into_parts();
+                // Pin the spawned child's pid for the exit watcher armed
+                // below: the watcher stands down when the handle's child no
+                // longer matches it (a respawn installed a newer child with
+                // its own watcher).
+                let child_pid = child.id();
+                (Some(child), child_pid, Arc::new(connection), None)
+            }
+        };
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
             crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
         );
+        // microVM sessions run the provider against guest paths
+        // (`/workspace/...`): alias that prefix onto the host-side CoW clone
+        // so `fs/read_text_file` / `fs/write_text_file` resolve correctly.
+        let file_service = if vm.is_some() {
+            FileService::new(cwd).with_alias(GUEST_WORKSPACE_DIR)
+        } else {
+            FileService::new(cwd)
+        };
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
                 agent_id.clone(),
                 agent_name.into(),
-                FileService::new(cwd),
+                file_service,
                 self.permissions.clone(),
                 self.policy,
                 self.sink.clone(),
@@ -1588,7 +1694,8 @@ impl AgentManager {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
-            _child: Some(child),
+            _child: child,
+            _vm: vm,
             child_pid,
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
@@ -1635,6 +1742,258 @@ impl AgentManager {
             None => listener.abort(),
         }
         Ok(())
+    }
+
+    /// Boot a per-agent microVM and exec the provider inside it over vsock
+    /// (monorepo#1120, EE-5). Returns the VM handle plus a [`Connection`]
+    /// wired over the vsock byte stream (stdin/stdout = the socket halves,
+    /// stderr = a host-side tail of the guest `/intent/acp.err` log).
+    ///
+    /// Provider gating happens FIRST (before any boot cost): opencode/unsloth
+    /// are structurally unavailable in-guest (libkrunfw#137), claude-code
+    /// requires the `providers.claudeCodeOauthToken` sensitive setting, and
+    /// any provider the image manifest does not include is rejected. A
+    /// backend failure is a hard spawn error — no silent host fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_in_microvm(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        workspace: &intent_core::Workspace,
+        cwd: &Path,
+        spawn_opts: &SpawnOptions<'_>,
+        bridge_addr: String,
+        hooks: ConnectionHooks,
+    ) -> Result<(MicrovmVm, Connection)> {
+        let provider = spawn_opts.provider;
+        let unavailable = |reason: String| Error::ExecutionEnvironmentUnavailable {
+            environment: "microvm".to_string(),
+            reason,
+        };
+        // Structural gating: opencode (and unsloth, which rides the opencode
+        // runtime) cannot run in the libkrun guest (libkrunfw#137).
+        if provider.id == "opencode" || provider.id == "unsloth" {
+            return Err(unavailable(format!(
+                "the {} provider is not available in microVM sandboxes \
+                 (guest runtime limitation); pick another provider or a \
+                 non-microVM execution environment",
+                provider.id
+            )));
+        }
+        // claude-code cannot use the macOS Keychain in-guest: require the
+        // long-lived OAuth token minted via `claude setup-token`.
+        let mut claude_token: Option<String> = None;
+        if provider.id == "claude-code" {
+            claude_token = self
+                .services
+                .secrets
+                .load("providers.claudeCodeOauthToken")
+                .await
+                .ok()
+                .flatten()
+                .filter(|t| !t.trim().is_empty());
+            if claude_token.is_none() {
+                return Err(unavailable(
+                    "claude-code in a microVM requires a long-lived OAuth token: run \
+                     `claude setup-token` on the host and save the result under the \
+                     `providers.claudeCodeOauthToken` setting"
+                        .to_string(),
+                ));
+            }
+        }
+        let data_dir = self.data_dir.clone().ok_or_else(|| {
+            Error::Internal("microVM spawn requires a configured data dir".to_string())
+        })?;
+        let helper_exe =
+            microvm::orchestrator::resolve_helper_exe().map_err(|e| unavailable(e.to_string()))?;
+
+        // Image resolution at spawn: repo `.intent/config.json` → profile
+        // default (`sandbox.microvm.image`) → built-in pin.
+        let repo_config = match workspace.repository_path.as_deref() {
+            Some(p) if !p.is_empty() => crate::repo_config::read_repo_config(Path::new(p)).await,
+            _ => intent_core::RepoConfig::default(),
+        };
+        let settings = self.services.effective_settings();
+        let profile_default =
+            settings
+                .sandbox
+                .microvm
+                .image
+                .as_ref()
+                .map(|o| intent_core::GuestImageRef {
+                    manifest_url: o.manifest_url.clone(),
+                    sha256: Some(o.sha256.clone()),
+                });
+        let (image_ref, source) =
+            crate::sandbox_image::resolve_image_ref(&repo_config, profile_default.as_ref());
+        let image = crate::sandbox_image::ensure_image(
+            &data_dir,
+            &image_ref,
+            &source,
+            self.services.event_bus.as_ref(),
+            Some(workspace_id),
+        )
+        .await
+        .map_err(|e| unavailable(e.to_string()))?;
+        // The manifest names which providers the image ships.
+        if !image
+            .manifest
+            .providers
+            .get(provider.id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(unavailable(format!(
+                "guest image {} v{} does not include the {} provider",
+                image.manifest.id, image.manifest.version, provider.id
+            )));
+        }
+
+        let vm_event = |event_type: &'static str, data: Value| {
+            let services = self.services.clone();
+            let ws = workspace_id.clone();
+            let aid = agent_id.clone();
+            async move {
+                services
+                    .publish_agent_event(&ws, &aid, event_type, data)
+                    .await;
+            }
+        };
+        vm_event(
+            intent_core::events::SANDBOX_VM_STARTING,
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "agentId": agent_id.as_str(),
+                "imageId": image.manifest.id,
+                "imageVersion": image.manifest.version,
+            }),
+        )
+        .await;
+
+        let host_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::Internal("HOME not set; cannot stage credentials".to_string()))?;
+        let spec = MicrovmSpawnSpec {
+            vm_dir: microvm::vm_dir(&data_dir, agent_id.as_str()),
+            helper_exe,
+            image: image.clone(),
+            workspace_dir: cwd.to_path_buf(),
+            host_home,
+            stage_claude_onboarding: claude_token.is_some(),
+            vcpus: 2,
+            mem_mib: 2048,
+        };
+        let boot = async {
+            let vm = MicrovmVm::boot(&spec).await?;
+            vm.guest_setup().await?;
+            vm.stage_mcp_bridge().await?;
+            Ok::<_, microvm::MicrovmError>(vm)
+        }
+        .await;
+        let mut vm = match boot {
+            Ok(vm) => vm,
+            Err(e) => {
+                vm_event(
+                    intent_core::events::SANDBOX_VM_ERROR,
+                    json!({
+                        "workspaceId": workspace_id.as_str(),
+                        "agentId": agent_id.as_str(),
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+
+        // Stage guest-side spawn material and assemble guest argv/env from
+        // the SAME provider registry as host spawns. Host paths in the spawn
+        // options (rules file, MCP config) are replaced by their staged
+        // guest-path equivalents.
+        let start = async {
+            let mut guest_rules: Option<String> = None;
+            if let Some(host_rules) = spawn_opts.rules_file {
+                let content = tokio::fs::read(host_rules)
+                    .await
+                    .map_err(|e| microvm::MicrovmError::Io(format!("read rules file: {e}")))?;
+                guest_rules = Some(vm.stage_intent_file("rules.md", &content).await?);
+            }
+            let mut guest_mcp_config: Option<String> = None;
+            if provider.supports_mcp_config {
+                let config = to_auggie_mcp_config(&guest_mcp_servers(bridge_addr.clone()));
+                let bytes = serde_json::to_vec_pretty(&config).map_err(|e| {
+                    microvm::MicrovmError::Io(format!("serialize guest mcp config: {e}"))
+                })?;
+                guest_mcp_config = Some(vm.stage_intent_file("mcp.json", &bytes).await?);
+            }
+            let mut guest_opts = SpawnOptions::new(provider);
+            guest_opts.model = spawn_opts.model;
+            guest_opts.rules_file = guest_rules.as_deref();
+            guest_opts.mcp_config_file = guest_mcp_config.as_deref();
+            guest_opts.quiet = spawn_opts.quiet;
+            guest_opts.tools_to_remove = spawn_opts.tools_to_remove.clone();
+            let mut argv = vec![provider.command.to_string()];
+            argv.extend(intent_acp::spawn::build_args(&guest_opts));
+
+            let mut env: BTreeMap<String, String> = build_provider_env_with_unsloth(
+                provider,
+                guest_opts.model,
+                guest_opts.rules_file,
+                None,
+                None,
+            );
+            for (k, v) in &spawn_opts.extra_env {
+                // Host-binary credential-helper env cannot work in-guest
+                // (the daemon binary is macOS); guest git auth comes from
+                // the staged gh hosts.yml + `gh auth setup-git` instead.
+                if k == intent_git::auth::GIT_CONFIG_PARAMETERS_ENV {
+                    continue;
+                }
+                env.insert(k.clone(), v.clone());
+            }
+            env.insert("HOME".to_string(), "/root".to_string());
+            env.insert(
+                "PATH".to_string(),
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            );
+            if let Some(token) = &claude_token {
+                env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
+            }
+            vm.start_provider(&argv, &env).await
+        }
+        .await;
+        let (stdin, stdout, stderr) = match start {
+            Ok(parts) => parts,
+            Err(e) => {
+                vm_event(
+                    intent_core::events::SANDBOX_VM_ERROR,
+                    json!({
+                        "workspaceId": workspace_id.as_str(),
+                        "agentId": agent_id.as_str(),
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+        let connection = Connection::new(stdin, stdout, Some(stderr), hooks);
+
+        vm_event(
+            intent_core::events::SANDBOX_VM_STARTED,
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "agentId": agent_id.as_str(),
+                "imageId": image.manifest.id,
+                "imageVersion": image.manifest.version,
+                "bootMs": vm.boot_ms,
+            }),
+        )
+        .await;
+        if let Some(bus) = self.services.event_bus.clone() {
+            vm.stop_event = Some((bus, workspace_id.clone(), agent_id.clone()));
+        }
+        Ok((vm, connection))
     }
 
     /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape) from
@@ -4606,8 +4965,50 @@ impl AgentManager {
         // settled sandbox fields. No-op when no provisioning is in flight —
         // the common case for every turn after the first.
         self.services.await_sandbox_provisioning(agent_id).await;
-        let session = self.services.store.get_agent_session(agent_id).await?;
+        let mut session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        // microVM workspaces (monorepo#1120, EE-5): every agent REQUIRES its
+        // own CoW sandbox clone — the VM virtio-fs-mounts it as `/workspace`,
+        // and a shared-checkout fallback would break isolation. Provision
+        // synchronously on first spawn (unlike the CoW delegate path, which
+        // provisions in the background and tolerates fallback); failure is a
+        // hard error, not a silent host fallback.
+        let is_microvm_ws = workspace
+            .as_ref()
+            .map(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm))
+            .unwrap_or(false);
+        if is_microvm_ws && session.sandbox_path.is_none() {
+            match self
+                .services
+                .provision_sandbox(workspace_id, agent_id)
+                .await?
+            {
+                crate::sandbox_ops::ProvisionOutcome::Supported { path, branch, .. } => {
+                    // Persist the sandbox fields onto the session (the
+                    // delegate path does this in its background settle;
+                    // here provisioning is synchronous so persist inline).
+                    session.sandbox_id = Some(format!(
+                        "sandbox-{}-{}",
+                        workspace_id.as_str(),
+                        agent_id.as_str()
+                    ));
+                    session.sandbox_path = Some(path.to_string_lossy().to_string());
+                    session.sandbox_branch = Some(branch);
+                    self.services
+                        .store
+                        .update_agent_session(workspace_id, &session)
+                        .await?;
+                }
+                crate::sandbox_ops::ProvisionOutcome::Unsupported => {
+                    return Err(Error::ExecutionEnvironmentUnavailable {
+                        environment: "microvm".to_string(),
+                        reason: "per-agent CoW sandbox provisioning is unavailable for this \
+                                 workspace (microVM agents require a CoW workspace clone)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
         let settings = self.services.effective_settings();
         let mut resolved = resolve_spawn(
             &session,
@@ -7248,6 +7649,7 @@ mod role_reminder_tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         }
     }
@@ -7863,6 +8265,7 @@ mod dead_child_respawn_tests {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             _child: child,
+            _vm: None,
             child_pid,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -8723,6 +9126,7 @@ mod agent_retry_tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
             task_stats: None,
         }

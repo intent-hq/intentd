@@ -344,6 +344,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     store.insert_workspace(&ws).await.unwrap();
@@ -682,6 +683,7 @@ fn mock_handle() -> AgentHandle {
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
         _child: None,
+        _vm: None,
         child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
@@ -1161,6 +1163,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     store.insert_workspace(&ws).await.unwrap();
@@ -1388,6 +1391,7 @@ fn track_mock_agent_inner(
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             _child: None,
+            _vm: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -1453,6 +1457,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     let session = AgentSession {
@@ -4472,6 +4477,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     store
@@ -6976,6 +6982,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
@@ -7198,6 +7205,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
 
@@ -8472,6 +8480,7 @@ mod harness_wake_tests {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             _child: None,
+            _vm: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,

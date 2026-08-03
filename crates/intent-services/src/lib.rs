@@ -81,6 +81,7 @@ mod history_xml;
 mod hook_manager;
 mod line_attribution;
 mod linear_ops;
+pub mod microvm;
 mod model_catalog;
 mod note_ops;
 mod pagination;

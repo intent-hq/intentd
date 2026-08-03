@@ -793,6 +793,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             }
             root
         })
+        // microVM sandboxes (monorepo#1120, EE-5): guest-image cache +
+        // per-VM state live under the data dir.
+        .with_data_dir(config.data_dir.clone())
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider

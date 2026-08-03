@@ -2366,6 +2366,32 @@ mod client_served_tests {
         );
     }
 
+    /// microVM guest-path alias (monorepo#1120, EE-5): `/workspace/...`
+    /// requests rebase onto the host root; escapes THROUGH the alias are
+    /// still rejected, and non-aliased absolute paths keep failing.
+    #[test]
+    fn sandbox_alias_rebases_guest_paths() {
+        let root = temp_dir();
+        let svc = FileService::new(root.path()).with_alias("/workspace");
+        let ok = svc
+            .resolve(std::path::Path::new("/workspace/src/main.rs"))
+            .expect("aliased guest path resolves");
+        assert!(ok.starts_with(root.path()));
+        assert!(ok.ends_with("src/main.rs"));
+        assert!(
+            svc.resolve(std::path::Path::new("/workspace/../escape.txt"))
+                .is_err(),
+            "traversal through the alias must still be rejected"
+        );
+        assert!(
+            svc.resolve(std::path::Path::new("/etc/passwd")).is_err(),
+            "non-aliased absolute path outside the worktree is rejected"
+        );
+        // Relative paths keep resolving against the root as before.
+        let rel = svc.resolve(std::path::Path::new("sub/ok.txt")).unwrap();
+        assert!(rel.starts_with(root.path()));
+    }
+
     #[test]
     fn headless_policy_default_denies_destructive_and_medium() {
         use crate::permission::{assess_risk_level, RiskLevel};
