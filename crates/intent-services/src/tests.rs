@@ -15,6 +15,16 @@ use intent_store::Store;
 
 use crate::Services;
 
+/// Runs before `main()` — and therefore before any test threads exist, making
+/// `set_var` race-free. Node children spawned by lib tests (e.g. the real
+/// `auggie` CLI in `auto_commit` tests) inherit this and skip
+/// `module.enableCompileCache()`, which would otherwise leave a
+/// `node-compile-cache/` residue at the TMPDIR root after the suite.
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 /// Guard for tests that mutate debounce env vars to prevent parallel test
 /// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
 /// WORKSPACE_IDLE debounce vars.

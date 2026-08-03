@@ -45,6 +45,7 @@ uuid = { workspace = true }
 async-trait = "0.1"
 git2.workspace = true
 sqlx.workspace = true
+ctor = "1.0.10"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
