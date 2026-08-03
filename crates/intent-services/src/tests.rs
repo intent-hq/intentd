@@ -13771,6 +13771,156 @@ mod rules {
             "sandbox path included"
         );
     }
+
+    /// EE-5 (monorepo#1120): a microVM workspace injects the microVM isolation
+    /// hint for every agent — keyed off workspace.execution_environment, and it
+    /// wins over the CoW implementor hint (the session's sandbox fields hold
+    /// host-side paths that are meaningless inside the guest).
+    #[tokio::test]
+    async fn assembly_injects_microvm_hint_for_microvm_workspace() {
+        let tree = worktree();
+        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+
+        let injection = crate::rules::SpecialistPromptInjection {
+            behavior_prompt: Some("Implement your task.".into()),
+            specialist_name: Some("Implementor".into()),
+            role_reminder: Some("Stay in scope.".into()),
+        };
+
+        // microVM workspace
+        let workspace = intent_core::Workspace {
+            id: intent_core::WorkspaceId::from("ws-1"),
+            title: "Test".into(),
+            branch: "main".into(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: None,
+            tags: vec![],
+            path: Some("/test/path".into()),
+            repository_path: Some("/test/repo".into()),
+            repository_owner: None,
+            repository_name: Some("test-repo".into()),
+            worktree_path: None,
+            scope: None,
+            skip_worktree: true,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+            display_status: None,
+            checkout_mode: None,
+            execution_environment: Some(intent_core::SandboxType::Microvm),
+            disk_usage: None,
+        };
+
+        // microVM agents also carry sandbox fields (host-side CoW clone the VM
+        // mounts); the microVM hint must still win over the CoW implementor hint.
+        let agent_session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-1"),
+            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: Some("implementor".into()),
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: Some("sandbox-123".into()),
+            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
+            sandbox_branch: Some("sb/agent-1".into()),
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            is_background: false,
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            Some(&workspace),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("## Workspace Isolation"),
+            "isolation header"
+        );
+        assert!(
+            prompt.contains("isolated inside a microVM sandbox"),
+            "microVM mention"
+        );
+        assert!(
+            prompt.contains("`/workspace`"),
+            "guest workspace mountpoint"
+        );
+        assert!(
+            prompt.contains("copy-on-write clone of the canonical checkout"),
+            "CoW clone mention"
+        );
+        assert!(
+            prompt.contains("merges your changes back"),
+            "merge-back mention"
+        );
+        assert!(
+            prompt.contains("host filesystem outside your workspace is not accessible"),
+            "host FS inaccessible"
+        );
+        // The CoW implementor hint must NOT fire (its host-side paths are
+        // meaningless inside the guest).
+        assert!(
+            !prompt.contains("isolated CoW (copy-on-write) sandbox"),
+            "no CoW implementor hint"
+        );
+        assert!(
+            !prompt.contains("/test/sandboxes/agent-1/test-repo"),
+            "no host sandbox path"
+        );
+    }
 }
 
 mod known_repo {

@@ -278,7 +278,12 @@ pub(crate) struct SpecialistPromptInjection {
 /// not just the workspace cowIsolation setting, so it reflects what the agent is
 /// actually running under.
 ///
-/// Hint matrix (per spec line 104-110):
+/// Hint matrix (per spec line 104-110; microVM per monorepo#1120, EE-5):
+/// - microVM workspace (workspace.execution_environment=microvm): every agent
+///   runs inside its own VM with a CoW workspace clone mounted at the guest
+///   workspace dir, so all agents get a microVM isolation block. Checked first:
+///   the session's sandbox fields hold host-side paths that are meaningless
+///   inside the guest.
 /// - Sandboxed implementor (session.sandbox_path present + specialist="implementor"):
 ///   isolation context block with sandbox path, branch, base commit, caches-warm
 ///   notice, branch-switching warning, and conflict-bounce resolution instructions.
@@ -299,7 +304,22 @@ fn build_isolation_hint(
         .and_then(|s| s.specialist_name.as_deref())
         .unwrap_or("");
 
-    // Case 1: Sandboxed implementor — inject isolation context
+    // Case 1: microVM workspace — every agent runs isolated in its own VM
+    if workspace
+        .is_some_and(|ws| ws.execution_environment == Some(intent_core::SandboxType::Microvm))
+    {
+        let guest_dir = crate::microvm::GUEST_WORKSPACE_DIR;
+        return Some(format!(
+            "## Workspace Isolation\n\n\
+             You are running **isolated inside a microVM sandbox**. The workspace at `{guest_dir}` \
+             is your own copy-on-write clone of the canonical checkout, mounted into the VM. \
+             When your work completes, the system automatically merges your changes back to the \
+             canonical checkout. The host filesystem outside your workspace is not accessible \
+             from inside the VM."
+        ));
+    }
+
+    // Case 2: Sandboxed implementor — inject isolation context
     if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
@@ -326,7 +346,7 @@ fn build_isolation_hint(
         ));
     }
 
-    // Case 2: Coordinator in CoW-enabled direct-mode workspace
+    // Case 3: Coordinator in CoW-enabled direct-mode workspace
     // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
     if specialist_name.eq_ignore_ascii_case("coordinator")
         || specialist_name.eq_ignore_ascii_case("spec-writer")
@@ -358,7 +378,7 @@ fn build_isolation_hint(
         }
     }
 
-    // Case 3: Worktree mode or shared-mode direct — no hint (behavior unchanged)
+    // Case 4: Worktree mode or shared-mode direct — no hint (behavior unchanged)
     None
 }
 
