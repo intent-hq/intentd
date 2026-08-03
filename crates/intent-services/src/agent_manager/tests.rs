@@ -10105,3 +10105,359 @@ mod attention_request_clear_gates {
         assert_eq!(session.attention_request_timestamp, None);
     }
 }
+
+/// Batch flush (`agents.flushQueuedMessages`, default on): ≥2 ready-to-send
+/// entries drain into ONE combined provider turn (header + `Message #N:`
+/// sections) while the transcript persists one user row per entry; the
+/// setting off restores the one-turn-per-message behavior; a persist failure
+/// mid-flush parks in Error with every entry requeued in original order
+/// (never-lost).
+mod flush_queued_messages_tests {
+    use super::*;
+    use crate::agent_ops::QueuedMessage;
+
+    fn queued_msg(content: &str) -> QueuedMessage {
+        QueuedMessage {
+            id: "qm-flush-test".to_string(),
+            turn_id: "qm-flush-test".to_string(),
+            content: content.to_string(),
+            image_blocks: None,
+            file_blocks: None,
+            queued_at: "2026-01-01T00:00:00Z".to_string(),
+            editing: false,
+            persisted: false,
+            requeued_after_failure: false,
+            message_metadata: None,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
+            interrupt_priority: false,
+            user_origin: false,
+        }
+    }
+
+    #[test]
+    fn combined_prompt_carries_header_and_labeled_sections_in_order() {
+        let entries = vec![queued_msg("first body"), queued_msg("second body")];
+        let prompt = super::super::flush_combined_prompt(&entries);
+        assert!(
+            prompt.starts_with("2 queued messages while you were working"),
+            "header names the flushed count: {prompt}"
+        );
+        let m1 = prompt.find("Message #1:\nfirst body").expect("entry 1");
+        let m2 = prompt.find("Message #2:\nsecond body").expect("entry 2");
+        assert!(m1 < m2, "delivery order preserved: {prompt}");
+    }
+
+    /// Read the mock fixture's prompt log: one JSON line per received prompt.
+    fn read_prompt_log(path: &PathBuf) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).expect("prompt log line")["text"]
+                    .as_str()
+                    .expect("text")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    async fn seed_mock_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        seed_agent(mgr, ws, id).await;
+        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(ws, &session)
+            .await
+            .expect("set mock provider");
+    }
+
+    #[tokio::test]
+    async fn drain_flushes_two_ready_entries_into_one_combined_turn() {
+        let script = mock_agent_script();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-flush-on-{}.log", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-on"),
+            AgentId::from("a-flush-on"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services.enqueue_message(
+            &id,
+            "first message".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        mgr.services.enqueue_message(
+            &id,
+            "second message".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("combined turn completes");
+
+        // ONE provider turn carrying the combined prompt.
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
+        let text = &prompts[0];
+        assert!(
+            text.contains("2 queued messages while you were working"),
+            "combined header: {text}"
+        );
+        let m1 = text.find("Message #1:").expect("label #1");
+        let m2 = text.find("Message #2:").expect("label #2");
+        let p1 = text.find("first message").expect("entry 1 content");
+        let p2 = text.find("second message").expect("entry 2 content");
+        assert!(m1 < p1 && p1 < m2 && m2 < p2, "labeled in order: {text}");
+
+        // The transcript gains one user row PER entry — never the combined
+        // prompt — plus the turn's assistant output.
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let user_texts: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content[0]["text"].as_str())
+            .collect();
+        assert_eq!(user_texts.len(), 2, "one row per entry: {user_texts:?}");
+        assert!(user_texts[0].starts_with("first message"), "{user_texts:?}");
+        assert!(
+            user_texts[1].starts_with("second message"),
+            "{user_texts:?}"
+        );
+        assert!(
+            user_texts
+                .iter()
+                .all(|t| !t.contains("queued messages while you were working")),
+            "combined prompt is wire-only, never persisted: {user_texts:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.role == "assistant"),
+            "the combined turn completed: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_off_keeps_one_turn_per_message() {
+        let script = mock_agent_script();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-flush-off-{}.log", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        // A manager whose settings registry has the flush setting OFF.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!(false))])
+            .expect("disable flush");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-off"),
+            AgentId::from("a-flush-off"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services.enqueue_message(
+            &id,
+            "first message".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        mgr.services.enqueue_message(
+            &id,
+            "second message".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both turns complete");
+
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(
+            prompts.len(),
+            2,
+            "setting off: one turn per message: {prompts:?}"
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|t| !t.contains("queued messages while you were working")),
+            "no combined header on the single-entry path: {prompts:?}"
+        );
+    }
+
+    /// Fail closed (#547) mid-flush: the head entry's row append fails
+    /// terminally, so the agent parks in Error WITHOUT starting the turn and
+    /// BOTH flushed entries are requeued in original order; `agent.retry`
+    /// against a restored store then delivers both exactly once.
+    #[tokio::test]
+    async fn mid_flush_persist_failure_requeues_all_entries_in_order() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "10,10"),
+        ]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-547"),
+            AgentId::from("a-flush-547"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services
+            .enqueue_message(&id, "boom-1".to_string(), None, None, None, None, false);
+        mgr.services
+            .enqueue_message(&id, "boom-2".to_string(), None, None, None, None, false);
+        sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("hide agent_message table");
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap();
+                if status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flush parks the session in error without a worker");
+
+        // Both entries back in the queue, original order, unpersisted.
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(snap.len(), 2, "never-lost: both entries requeued: {snap:?}");
+        assert!(
+            snap[0]["content"].as_str().unwrap().starts_with("boom-1"),
+            "original order preserved: {snap:?}"
+        );
+        assert!(
+            snap[1]["content"].as_str().unwrap().starts_with("boom-2"),
+            "original order preserved: {snap:?}"
+        );
+
+        // Restore the store; agent.retry redrives BOTH entries.
+        sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("restore agent_message table");
+        let result = mgr
+            .agent_retry(id.clone(), ws.clone())
+            .await
+            .expect("agent.retry");
+        assert_eq!(result["redriven"], json!(true));
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retry delivers the requeued batch");
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        for needle in ["boom-1", "boom-2"] {
+            let rows = messages
+                .iter()
+                .filter(|m| {
+                    m.role == "user"
+                        && m.content[0]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with(needle))
+                })
+                .count();
+            assert_eq!(rows, 1, "{needle} lands exactly once: {messages:?}");
+        }
+    }
+}

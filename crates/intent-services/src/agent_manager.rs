@@ -169,6 +169,22 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     }
 }
 
+/// Combined provider prompt for a batch flush (`agents.flushQueuedMessages`):
+/// a header naming the flushed count, then each entry's content under a
+/// `Message #N:` label in delivery order. Entry contents already carry their
+/// per-entry [`dequeue_wait_note`] (and any #576 stale-redrive note), so each
+/// section retains its own queuedAt time and wait duration. Wire-only — the
+/// transcript persists each entry as its own user row; this combined text is
+/// never persisted.
+fn flush_combined_prompt(entries: &[QueuedMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("{} queued messages while you were working", entries.len());
+    for (i, m) in entries.iter().enumerate() {
+        let _ = write!(out, "\n\nMessage #{}:\n{}", i + 1, m.content);
+    }
+    out
+}
+
 const GB: u64 = 1024 * 1024 * 1024;
 
 /// Whether a `session/cancel` error means the child's transport is already
@@ -331,6 +347,27 @@ fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
         intent_core::MessageOrigin::User
     } else {
         intent_core::MessageOrigin::Automatic
+    }
+}
+
+/// Rebuild the single-entry drain [`TurnOptions`] for one queue entry — the
+/// exact shape the non-flush drain arms construct inline. Used by the
+/// batch-flush persist-failure path so the failed entry is parked/requeued
+/// with the same options a single-entry drain would have used.
+fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
+    TurnOptions {
+        image_blocks: entry.image_blocks.clone(),
+        file_blocks: entry.file_blocks.clone(),
+        message_metadata: entry.message_metadata.clone(),
+        suppress_report_clear: stale,
+        queued_at: Some(entry.queued_at.clone()),
+        prepend_content: entry.prepend_content.clone(),
+        prepend_image_blocks: entry.prepend_image_blocks.clone(),
+        prepend_file_blocks: entry.prepend_file_blocks.clone(),
+        turn_id: Some(entry.turn_id.clone()),
+        interrupt_priority: entry.interrupt_priority,
+        origin: origin_from_user_flag(entry.user_origin),
+        ..TurnOptions::default()
     }
 }
 
@@ -3495,6 +3532,29 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
+        // Batch flush (`agents.flushQueuedMessages`, default on): with the
+        // setting on and MORE THAN ONE ready-to-send entry waiting (under an
+        // active hold: user-origin entries only — the hold contract is
+        // unchanged), drain them all into ONE combined provider turn while
+        // persisting each entry as its own transcript row. A single ready
+        // entry (or the setting off) falls through to the existing
+        // single-entry path unchanged.
+        if self.services.flush_queued_messages_enabled() {
+            if let Some(batch) = self.services.dequeue_ready_batch(&agent_id, hold_drain, 2) {
+                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn { content, options } => {
+                        self.spawn_worker(agent_id, workspace_id, content, *options, true);
+                    }
+                    FlushPrep::Parked => {
+                        // Release the slot without overwriting the Error
+                        // status just persisted, so `agent.retry` (or a
+                        // future message) can redrive.
+                        self.release_in_flight_slot(&agent_id).await;
+                    }
+                }
+                return;
+            }
+        }
         // Under an active hold only a user-origin entry may drain; the
         // normal path pops the queue head as before.
         let dequeued = if hold_drain {
@@ -6143,7 +6203,34 @@ async fn run_message_worker(
         // between `has_user_origin_ready` returning false and the slot's
         // release would otherwise strand behind a gone worker with nothing to
         // kick `try_drain_queue`.
-        let drained = if mgr.services.question_hold_active(&agent_id).await {
+        let hold_active = mgr.services.question_hold_active(&agent_id).await;
+        // Batch flush (`agents.flushQueuedMessages`): same contract as the
+        // `try_drain_queue` flush arm — ≥2 ready entries (user-origin only
+        // under an active hold) drain into one combined provider turn;
+        // otherwise the single-entry arm below runs unchanged.
+        if mgr.services.flush_queued_messages_enabled() {
+            if let Some(batch) = mgr.services.dequeue_ready_batch(&agent_id, hold_active, 2) {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let drained = if hold_active {
             if mgr.services.has_user_origin_ready(&agent_id) {
                 mgr.services.dequeue_user_origin_message(&agent_id)
             } else {
@@ -6259,6 +6346,36 @@ async fn run_message_worker(
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
+            // Batch flush (`agents.flushQueuedMessages`): `next` was popped
+            // before the slot re-claim, so fold any FURTHER ready entries in
+            // behind it (min 1 more ⇒ ≥2 total, matching the other flush
+            // arms; user-origin only under an active hold) and run them as
+            // one combined turn. With no extra entry (or the setting off)
+            // the single-entry path below runs unchanged.
+            if mgr.services.flush_queued_messages_enabled() {
+                let hold = mgr.services.question_hold_active(&agent_id).await;
+                if let Some(mut batch) = mgr.services.dequeue_ready_batch(&agent_id, hold, 1) {
+                    batch.insert(0, next);
+                    match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                        FlushPrep::Turn {
+                            content: c,
+                            options: o,
+                        } => {
+                            content = c;
+                            options = *o;
+                            user_persisted = true;
+                            // New messages → fresh silent-redrive budget
+                            // (monorepo#764).
+                            silent_redrive_used = false;
+                            continue 'outer;
+                        }
+                        FlushPrep::Parked => {
+                            mgr.release_in_flight_slot(&agent_id).await;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -6336,6 +6453,154 @@ async fn run_message_worker(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    }
+}
+
+/// Outcome of [`prepare_flush_turn`]: either the combined turn is ready to
+/// run, or a persist failure parked the agent in `Error` (the caller must
+/// release the in-flight slot without starting a turn).
+enum FlushPrep {
+    Turn {
+        content: String,
+        options: Box<TurnOptions>,
+    },
+    Parked,
+}
+
+/// Prepare a batch-flushed turn (`agents.flushQueuedMessages`, default on):
+/// the caller has already claimed the in-flight slot and batch-dequeued ≥2
+/// ready-to-send entries in drain order. This mirrors the single-entry drain
+/// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
+/// then the transcript row append (`persist_user`; entries already persisted
+/// by a terminal-failure requeue are not re-appended) — while emitting ONE
+/// `agent:queue:updated` (the fully-shrunk queue) and ONE
+/// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
+/// turn's id). Each row persist emits its normal `agent:message`, so clients
+/// render N stacked user rows.
+///
+/// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
+/// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
+/// `prepend_*` payloads from all entries in message order; head entry's
+/// `turn_id` / `queued_at` / `interrupt_priority` / `messageMetadata`;
+/// `origin` is User when ANY entry is user-origin (a user message is being
+/// delivered); the turn-begin report clear is suppressed only when EVERY
+/// entry is a stale redrive (any fresh entry means the clear should happen).
+///
+/// Fail closed (#547, never-lost): when an entry's row append exhausts the
+/// bounded retry, the agent parks in `Error` via
+/// [`handle_drain_persist_failure`] (which requeues the FAILED entry at the
+/// queue front, `persisted: false`) and the other flushed entries are
+/// requeued around it in original order — entries whose rows already
+/// persisted carry `persisted: true` so the retry drain never
+/// double-appends. Returns [`FlushPrep::Parked`].
+async fn prepare_flush_turn(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    mut entries: Vec<QueuedMessage>,
+) -> FlushPrep {
+    mgr.services
+        .publish_queue_updated_for(
+            agent_id,
+            workspace_id,
+            mgr.services.queue_snapshot(agent_id),
+        )
+        .await;
+    // Per-entry annotations, same order as the single-entry drain arms: the
+    // stale check before the wait note, both before the row persist so the
+    // persisted row and the provider prompt carry the same content.
+    let mut stale_flags = Vec::with_capacity(entries.len());
+    for entry in entries.iter_mut() {
+        let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
+        annotate_dequeue_wait(entry);
+        stale_flags.push(stale);
+    }
+    // Drain-start signal (monorepo#1022): one event for the combined turn,
+    // keyed on the head entry (its `turn_id` IS the turn's id below).
+    mgr.services
+        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .await;
+    for i in 0..entries.len() {
+        if entries[i].persisted {
+            continue;
+        }
+        if persist_user(
+            mgr,
+            agent_id,
+            workspace_id,
+            &entries[i].content,
+            entries[i].image_blocks.as_ref(),
+            entries[i].file_blocks.as_ref(),
+            entries[i].message_metadata.as_ref(),
+            Some(&entries[i].turn_id),
+        )
+        .await
+        {
+            // The row is durable: a later mid-flush failure requeues this
+            // entry with `persisted: true` so the retry drain skips the
+            // duplicate append (STAB-51).
+            entries[i].persisted = true;
+            continue;
+        }
+        // Fail closed: restore the queue in original order — tail first,
+        // then the failed entry (the handler's own front requeue), then the
+        // already-persisted head entries ahead of it.
+        let stale = stale_flags[i];
+        let failed = entries.remove(i);
+        let tail = entries.split_off(i);
+        let head = entries;
+        let options = turn_options_for_entry(&failed, stale);
+        mgr.services.requeue_front_batch(agent_id, tail);
+        handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options).await;
+        mgr.services.requeue_front_batch(agent_id, head);
+        // The handler's queue publish preceded the head requeue: re-publish
+        // so clients see the fully-restored queue.
+        mgr.services
+            .publish_queue_updated_for(
+                agent_id,
+                workspace_id,
+                mgr.services.queue_snapshot(agent_id),
+            )
+            .await;
+        return FlushPrep::Parked;
+    }
+    let content = flush_combined_prompt(&entries);
+    let mut image_blocks = None;
+    let mut file_blocks = None;
+    let mut prepend_content: Option<String> = None;
+    let mut prepend_image_blocks = None;
+    let mut prepend_file_blocks = None;
+    for entry in &entries {
+        image_blocks = merge_block_arrays(image_blocks, entry.image_blocks.clone());
+        file_blocks = merge_block_arrays(file_blocks, entry.file_blocks.clone());
+        if let Some(p) = entry.prepend_content.as_deref().filter(|p| !p.is_empty()) {
+            prepend_content = Some(match prepend_content.take() {
+                Some(existing) => format!("{existing}\n\n{p}"),
+                None => p.to_string(),
+            });
+        }
+        prepend_image_blocks =
+            merge_block_arrays(prepend_image_blocks, entry.prepend_image_blocks.clone());
+        prepend_file_blocks =
+            merge_block_arrays(prepend_file_blocks, entry.prepend_file_blocks.clone());
+    }
+    let options = TurnOptions {
+        image_blocks,
+        file_blocks,
+        message_metadata: entries[0].message_metadata.clone(),
+        suppress_report_clear: stale_flags.iter().all(|&s| s),
+        queued_at: Some(entries[0].queued_at.clone()),
+        prepend_content,
+        prepend_image_blocks,
+        prepend_file_blocks,
+        turn_id: Some(entries[0].turn_id.clone()),
+        interrupt_priority: entries[0].interrupt_priority,
+        origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
+        ..TurnOptions::default()
+    };
+    FlushPrep::Turn {
+        content,
+        options: Box::new(options),
     }
 }
 
