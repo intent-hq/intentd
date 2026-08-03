@@ -403,24 +403,19 @@ mod tests {
 
     // ---- op-level tests over a temp store + fake auggie script ----
 
+    /// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in
+    /// a guarded temp dir removed on drop — including on panic — unless
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {
+        _dir: tempfile::TempDir,
         path: PathBuf,
     }
 
     impl TempDb {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("intentd-enhanceops-{}.db", uuid::Uuid::new_v4()));
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ =
-                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-            }
+            let dir = crate::tests::test_tempdir("intentd-enhanceops-");
+            let path = dir.path().join("store.db");
+            Self { _dir: dir, path }
         }
     }
 
@@ -431,16 +426,16 @@ mod tests {
         (tmp, services)
     }
 
+    /// Fake auggie CLI inside an RAII temp dir; keep the returned guard alive
+    /// for the duration of the test (dropping it removes the dir).
     #[cfg(unix)]
-    fn fake_auggie(tag: &str, body: &str) -> PathBuf {
+    fn fake_auggie(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("intentd-enhance-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("auggie");
+        let dir = crate::tests::test_tempdir(&format!("intentd-enhance-{tag}-"));
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin
+        (dir, bin)
     }
 
     #[tokio::test]
@@ -457,7 +452,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn enhance_op_extracts_tagged_prompt() {
-        let bin = fake_auggie(
+        let (_bin_dir, bin) = fake_auggie(
             "ok",
             "printf '🤖\\n<augment-enhanced-prompt>Enhanced: do the thing</augment-enhanced-prompt>\\n'",
         );
@@ -474,7 +469,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn layout_op_returns_full_cleaned_reply() {
-        let bin = fake_auggie("layout", "printf '🤖\\n{\"layout\":\"two-column\"}\\n'");
+        let (_bin_dir, bin) = fake_auggie("layout", "printf '🤖\\n{\"layout\":\"two-column\"}\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
             .agent_enhance_prompt_op("make a layout".into(), "layout".into(), None, None, None)
@@ -487,7 +482,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn enhance_op_errors_when_tags_missing() {
-        let bin = fake_auggie("notags", "printf '🤖\\nno tags here\\n'");
+        let (_bin_dir, bin) = fake_auggie("notags", "printf '🤖\\nno tags here\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, None)
@@ -502,7 +497,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn enhance_op_times_out() {
-        let bin = fake_auggie("slow", "sleep 30");
+        let (_bin_dir, bin) = fake_auggie("slow", "sleep 30");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, Some(200))
@@ -517,7 +512,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn enhance_op_errors_on_nonzero_exit() {
-        let bin = fake_auggie("fail", "exit 3");
+        let (_bin_dir, bin) = fake_auggie("fail", "exit 3");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
             .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, None)

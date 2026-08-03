@@ -114,6 +114,7 @@ struct Harness {
     bundled_dir: PathBuf,
     work_dir: PathBuf,
     socket: PathBuf,
+    _sock_dir: tempfile::TempDir,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
@@ -155,7 +156,10 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
         services = services.with_settings_registry(Arc::new(registry));
     }
     let services: Arc<dyn WorkspaceApi> = Arc::new(services);
-    let socket = std::env::temp_dir().join(format!("is-{tag}.sock"));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "is-");
+    let socket = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
         let socket = socket.clone();
@@ -176,6 +180,7 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
         _tmp: tmp,
         _ws_root: ws_root,
         socket,
+        _sock_dir: sock_dir,
         shutdown_tx: Some(shutdown_tx),
         server: Some(server),
     }

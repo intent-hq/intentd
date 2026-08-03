@@ -125,24 +125,19 @@ mod tests {
     use super::*;
     use intent_store::Store;
 
+    /// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in
+    /// a guarded temp dir removed on drop — including on panic — unless
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {
+        _dir: tempfile::TempDir,
         path: PathBuf,
     }
 
     impl TempDb {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("intentd-completeops-{}.db", uuid::Uuid::new_v4()));
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ =
-                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-            }
+            let dir = crate::tests::test_tempdir("intentd-completeops-");
+            let path = dir.path().join("store.db");
+            Self { _dir: dir, path }
         }
     }
 
@@ -153,16 +148,16 @@ mod tests {
         (tmp, services)
     }
 
+    /// Fake auggie CLI inside an RAII temp dir; keep the returned guard alive
+    /// for the duration of the test (dropping it removes the dir).
     #[cfg(unix)]
-    fn fake_auggie(tag: &str, body: &str) -> PathBuf {
+    fn fake_auggie(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("intentd-complete-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("auggie");
+        let dir = crate::tests::test_tempdir(&format!("intentd-complete-{tag}-"));
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bin
+        (dir, bin)
     }
 
     #[tokio::test]
@@ -179,7 +174,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_returns_cleaned_reply() {
-        let bin = fake_auggie("ok", "printf '🤖\\nslug-goes-here\\n'");
+        let (_bin_dir, bin) = fake_auggie("ok", "printf '🤖\\nslug-goes-here\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
             .agent_complete_once_op("make a slug".into(), None, None, None, None)
@@ -191,7 +186,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_times_out_and_reaps() {
-        let bin = fake_auggie("slow", "sleep 30");
+        let (_bin_dir, bin) = fake_auggie("slow", "sleep 30");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
             .agent_complete_once_op("hi".into(), None, None, None, Some(200))
@@ -206,7 +201,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_errors_on_nonzero_exit() {
-        let bin = fake_auggie("fail", "exit 3");
+        let (_bin_dir, bin) = fake_auggie("fail", "exit 3");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
             .agent_complete_once_op("hi".into(), None, None, None, None)
@@ -224,7 +219,7 @@ mod tests {
         use serde_json::json;
         use std::sync::Arc;
 
-        let fake = fake_auggie("setting", "printf 'from-setting\\n'");
+        let (_fake_dir, fake) = fake_auggie("setting", "printf 'from-setting\\n'");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -267,8 +262,6 @@ mod tests {
 
         // Case 3: context.auggiePath empty → fall through to discovery
         // (skip this case since a real auggie on the system would make it nondeterministic)
-
-        std::fs::remove_file(&fake).ok();
     }
 
     #[tokio::test]
@@ -294,12 +287,8 @@ mod tests {
         // Fake CLI echoes stdin back so we can confirm the "System: …\n\n<prompt>"
         // composition rides on the wire when systemPrompt is supplied.
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "intentd-complete-sysprompt-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("auggie");
+        let dir = crate::tests::test_tempdir("intentd-complete-sysprompt-");
+        let bin = dir.path().join("auggie");
         std::fs::write(&bin, "#!/bin/sh\nprintf '🤖\\n'\ncat\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (_tmp, services) = services_with_bin(bin).await;

@@ -25,6 +25,15 @@ use std::time::Duration;
 #[ctor::ctor(unsafe)]
 fn force_hermetic_root_guard() {
     std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    // Node children spawned by tests (mock ACP agents, MCP fixtures) inherit
+    // this and skip `module.enableCompileCache()`, which would otherwise leave
+    // a `node-compile-cache/` residue at the TMPDIR root after the suite.
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+    // Daemon-spawned provider probes can exec a real `pi` CLI, whose jiti
+    // extension loader transpile-caches `.mjs` files under `$TMPDIR/jiti/`.
+    // jiti honors this boolean env (`_booleanEnv("JITI_FS_CACHE", ...)`), so
+    // disabling the fs cache keeps the TMPDIR root clean after e2e suites.
+    std::env::set_var("JITI_FS_CACHE", "false");
 }
 
 /// Apply the timeout multiplier from the environment for coverage
