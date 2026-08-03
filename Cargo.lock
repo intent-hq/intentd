@@ -1891,6 +1891,7 @@ name = "intent-acp"
 version = "0.3.0"
 dependencies = [
  "agent-client-protocol",
+ "ctor",
  "git2",
  "intent-core",
  "intent-git",
@@ -1914,6 +1915,7 @@ name = "intent-context"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "ctor",
  "directories",
  "intent-core",
  "nix 0.31.3",
@@ -2102,6 +2104,7 @@ name = "intent-transport"
 version = "0.3.0"
 dependencies = [
  "base64 0.23.0",
+ "ctor",
  "futures",
  "futures-util",
  "getrandom 0.2.17",

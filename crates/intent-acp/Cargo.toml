@@ -46,3 +46,4 @@ tempfile = "3"
 # `intent-services` depends on `intent-acp`, so this edge is a dev-dependency
 # cycle Cargo permits; kept version-less so it is stripped on publish.
 intent-services = { path = "../intent-services" }
+ctor = "1.0.10"

@@ -19,5 +19,6 @@ tracing = { workspace = true }
 nix = { workspace = true, features = ["signal", "process"] }
 
 [dev-dependencies]
+ctor = "1.0.10"
 tempfile = "3"
 tokio = { workspace = true }
