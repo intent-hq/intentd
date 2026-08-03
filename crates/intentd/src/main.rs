@@ -720,6 +720,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     intent_services::cleanup_retired_settings(&store)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time migration of the legacy CoW opt-in into the execution
+    // environment group: `workspace.cowIsolation = true` with an untouched
+    // `sandbox.*` group seeds `sandbox.cow.enabled = true` +
+    // `sandbox.defaultType = "cow"` into config.toml. Best-effort — a failed
+    // seed (e.g. read-only file) is logged and startup continues; the next
+    // boot retries.
+    if let Err(e) = intent_services::migrate_cow_isolation_to_sandbox(&settings_registry) {
+        tracing::warn!(error = %e, "cowIsolation → sandbox settings migration failed; continuing");
+    }
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An

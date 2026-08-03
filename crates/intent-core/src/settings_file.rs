@@ -50,6 +50,7 @@ pub struct SettingsFile {
     pub specialists: SpecialistsSettings,
     pub workspace: WorkspaceSettings,
     pub git: GitSettings,
+    pub sandbox: SandboxSettings,
     pub mcp: McpSettings,
     pub notifications: NotificationsSettings,
     pub rtk: RtkSettings,
@@ -143,6 +144,110 @@ impl Default for GitSettings {
     fn default() -> Self {
         Self { auto_commit: true }
     }
+}
+
+/// `[sandbox]` — execution-environment profiles (`sandbox.*`): which
+/// environment types are enabled and which one workspace creation defaults
+/// to. Availability (CoW filesystem support, microVM host capability) is
+/// probed at runtime and resolved via `sandbox.options` — these settings
+/// express user intent only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SandboxSettings {
+    /// `sandbox.defaultType` — execution environment preselected at
+    /// workspace creation. Must name an enabled type (validated).
+    pub default_type: SandboxType,
+    /// `[sandbox.direct]` — direct (in-repo, no isolation) environment.
+    pub direct: SandboxDirectSettings,
+    /// `[sandbox.worktree]` — linked-worktree environment.
+    pub worktree: SandboxWorktreeSettings,
+    /// `[sandbox.cow]` — CoW-clone workspaces + per-agent sandboxes.
+    pub cow: SandboxCowSettings,
+    /// `[sandbox.microvm]` — microVM (libkrun) agent sandboxes.
+    pub microvm: SandboxMicrovmSettings,
+}
+
+/// `sandbox.defaultType` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxType {
+    Direct,
+    #[default]
+    Worktree,
+    Cow,
+    Microvm,
+}
+
+impl SandboxType {
+    /// Wire spelling of the type (`direct` | `worktree` | `cow` | `microvm`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SandboxType::Direct => "direct",
+            SandboxType::Worktree => "worktree",
+            SandboxType::Cow => "cow",
+            SandboxType::Microvm => "microvm",
+        }
+    }
+}
+
+/// `[sandbox.direct]` — direct environment (`sandbox.direct.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SandboxDirectSettings {
+    /// `sandbox.direct.enabled` — offer the direct environment.
+    pub enabled: bool,
+}
+
+impl Default for SandboxDirectSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[sandbox.worktree]` — worktree environment (`sandbox.worktree.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SandboxWorktreeSettings {
+    /// `sandbox.worktree.enabled` — offer the worktree environment.
+    pub enabled: bool,
+}
+
+impl Default for SandboxWorktreeSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[sandbox.cow]` — CoW environment (`sandbox.cow.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SandboxCowSettings {
+    /// `sandbox.cow.enabled` — offer the CoW environment (requires CoW
+    /// filesystem support on the workspaces root).
+    pub enabled: bool,
+}
+
+/// `[sandbox.microvm]` — microVM environment (`sandbox.microvm.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SandboxMicrovmSettings {
+    /// `sandbox.microvm.enabled` — offer the microVM environment (requires
+    /// microVM host capability AND CoW filesystem support).
+    pub enabled: bool,
+    /// `sandbox.microvm.image` — optional default guest-image override
+    /// (`{ manifestUrl, sha256 }`); `None` uses the built-in image pin.
+    /// Resolution order: repo `.intent/config.json` → this override → pin.
+    pub image: Option<MicrovmImageOverride>,
+}
+
+/// `sandbox.microvm.image` value — a pinned guest-image manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MicrovmImageOverride {
+    /// URL of the guest-image manifest.
+    pub manifest_url: String,
+    /// Expected SHA-256 of the manifest.
+    pub sha256: String,
 }
 
 /// `[mcp]` — MCP server lifecycle knobs (`mcp.*`). The server catalog itself
@@ -646,6 +751,21 @@ impl SettingsFile {
                 format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
+        let default_type_enabled = match self.sandbox.default_type {
+            SandboxType::Direct => self.sandbox.direct.enabled,
+            SandboxType::Worktree => self.sandbox.worktree.enabled,
+            SandboxType::Cow => self.sandbox.cow.enabled,
+            SandboxType::Microvm => self.sandbox.microvm.enabled,
+        };
+        if !default_type_enabled {
+            return Err(bad(
+                "sandbox.defaultType",
+                format!(
+                    "must name an enabled execution environment, but `{}` is disabled",
+                    self.sandbox.default_type.as_str()
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -763,6 +883,33 @@ cowIsolation = false
 [git]
 # Auto-commit -- allow agents to commit without explicit user request.
 autoCommit = true
+
+[sandbox]
+# Default execution environment -- environment preselected at workspace
+# creation: "direct", "worktree", "cow", or "microvm". Must name an enabled
+# type.
+defaultType = "worktree"
+
+[sandbox.direct]
+# Direct enabled -- offer the direct (in-repo, no isolation) environment.
+enabled = true
+
+[sandbox.worktree]
+# Worktree enabled -- offer the linked-worktree environment.
+enabled = true
+
+[sandbox.cow]
+# CoW enabled -- offer CoW-clone workspaces + per-agent sandboxes (requires
+# CoW filesystem support on the workspaces root).
+enabled = false
+
+[sandbox.microvm]
+# microVM enabled -- offer microVM (libkrun) agent sandboxes (requires
+# microVM host capability and CoW filesystem support).
+enabled = false
+# microVM image override -- optional default guest-image override; unset uses
+# the built-in image pin.
+# image = { manifestUrl = "https://example.com/manifest.json", sha256 = "..." }
 
 [mcp]
 # Enable user MCP servers -- start user-scoped MCP servers.
@@ -913,6 +1060,12 @@ mod tests {
         assert!(!d.workspace.auto_fetch);
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
+        assert_eq!(d.sandbox.default_type, SandboxType::Worktree);
+        assert!(d.sandbox.direct.enabled);
+        assert!(d.sandbox.worktree.enabled);
+        assert!(!d.sandbox.cow.enabled);
+        assert!(!d.sandbox.microvm.enabled);
+        assert_eq!(d.sandbox.microvm.image, None);
         assert!(d.mcp.enable_user_servers);
         assert!(d.mcp.disabled_servers.is_empty());
         assert!(d.notifications.enabled);
@@ -1053,6 +1206,51 @@ mod tests {
     fn workspace_api_max_output_chars_zero_means_unlimited() {
         let parsed = SettingsFile::parse_str("[workspaceApi]\nmaxOutputChars = 0\n").unwrap();
         assert_eq!(parsed.workspace_api.max_output_chars, 0);
+    }
+
+    #[test]
+    fn sandbox_settings_parse() {
+        let parsed = SettingsFile::parse_str(
+            "[sandbox]\ndefaultType = \"cow\"\n\n[sandbox.cow]\nenabled = true\n\n[sandbox.microvm]\nenabled = true\nimage = { manifestUrl = \"https://example.com/m.json\", sha256 = \"abc\" }\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.sandbox.default_type, SandboxType::Cow);
+        assert!(parsed.sandbox.cow.enabled);
+        assert!(parsed.sandbox.microvm.enabled);
+        let image = parsed.sandbox.microvm.image.expect("image override");
+        assert_eq!(image.manifest_url, "https://example.com/m.json");
+        assert_eq!(image.sha256, "abc");
+    }
+
+    #[test]
+    fn sandbox_default_type_rejects_bad_enum_value() {
+        let err = SettingsFile::parse_str("[sandbox]\ndefaultType = \"vm\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sandbox.defaultType"), "names the key: {msg}");
+        assert!(msg.contains("microvm"), "lists the variants: {msg}");
+    }
+
+    #[test]
+    fn sandbox_default_type_must_name_an_enabled_type() {
+        let err = SettingsFile::parse_str(
+            "[sandbox]\ndefaultType = \"microvm\"\n\n[sandbox.microvm]\nenabled = false\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sandbox.defaultType"), "names the key: {msg}");
+        assert!(msg.contains("microvm"), "names the type: {msg}");
+        // A disabled built-in default is equally rejected.
+        let err = SettingsFile::parse_str("[sandbox.worktree]\nenabled = false\n").unwrap_err();
+        assert!(err.to_string().contains("sandbox.defaultType"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_image_override_rejects_unknown_fields() {
+        let err = SettingsFile::parse_str(
+            "[sandbox.microvm]\nenabled = true\nimage = { manifestUrl = \"u\", sha256 = \"s\", extra = 1 }\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("extra"), "{err}");
     }
 
     #[test]

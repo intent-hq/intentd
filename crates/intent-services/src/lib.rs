@@ -110,8 +110,8 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents, InMemorySecretStore,
-    SecretStore,
+    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
+    migrate_cow_isolation_to_sandbox, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -1429,6 +1429,21 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// Whether the host can run microVM agent sandboxes
+    /// (`system.capabilities.microvmSupported`, §5.7): the platform check
+    /// (macOS ARM64 / Linux with `/dev/kvm`) ANDed with the CoW probe —
+    /// microVM requires CoW because each agent VM virtio-fs-mounts its own
+    /// reflink clone. `Some(false)` on an incapable platform regardless of
+    /// the CoW probe; on a capable platform this mirrors
+    /// [`Self::compute_cow_supported`] (`None` when the probe cannot run).
+    async fn compute_microvm_supported(&self) -> Option<bool> {
+        let (platform_ok, _) = microvm_platform_supported();
+        if !platform_ok {
+            return Some(false);
+        }
+        self.compute_cow_supported().await
     }
 
     /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
@@ -5189,6 +5204,89 @@ fn workspace_dir_candidates(
     dirs
 }
 
+/// The execution-environment types in wire/catalog order (`sandbox.profiles.*`
+/// / `sandbox.options` row order, PROTOCOL §5.5b).
+const SANDBOX_TYPES: &[&str] = &["direct", "worktree", "cow", "microvm"];
+
+/// Whether `ty` is enabled in the sandbox settings group.
+fn sandbox_type_enabled(sandbox: &intent_core::settings_file::SandboxSettings, ty: &str) -> bool {
+    match ty {
+        "direct" => sandbox.direct.enabled,
+        "worktree" => sandbox.worktree.enabled,
+        "cow" => sandbox.cow.enabled,
+        "microvm" => sandbox.microvm.enabled,
+        _ => false,
+    }
+}
+
+/// The `sandbox.profiles.list` result shape (§5.5b): `{ defaultType,
+/// profiles: [{ type, enabled, image? }] }` — one row per type in
+/// [`SANDBOX_TYPES`] order; `image` only on the `microvm` row (`null` when
+/// unset).
+fn sandbox_profiles_json(
+    sandbox: &intent_core::settings_file::SandboxSettings,
+) -> serde_json::Value {
+    let profiles: Vec<serde_json::Value> = SANDBOX_TYPES
+        .iter()
+        .map(|&ty| {
+            let mut row = serde_json::json!({
+                "type": ty,
+                "enabled": sandbox_type_enabled(sandbox, ty),
+            });
+            if ty == "microvm" {
+                row["image"] = sandbox
+                    .microvm
+                    .image
+                    .as_ref()
+                    .and_then(|i| serde_json::to_value(i).ok())
+                    .unwrap_or(serde_json::Value::Null);
+            }
+            row
+        })
+        .collect();
+    serde_json::json!({
+        "defaultType": sandbox.default_type.as_str(),
+        "profiles": profiles,
+    })
+}
+
+/// Whether the host **platform** can run microVM agent sandboxes, plus a
+/// structured reason when it cannot. macOS: Apple Silicon only (libkrun via
+/// Hypervisor.framework is arm64-only upstream); Linux: `/dev/kvm` must be
+/// present; every other OS is unsupported. Purely the platform half of
+/// `microvmSupported` — the CoW requirement is ANDed in by the caller.
+fn microvm_platform_supported() -> (bool, Option<&'static str>) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        (true, None)
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        (
+            false,
+            Some("microVM sandboxes require Apple Silicon on macOS"),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::path::Path::new("/dev/kvm").exists() {
+            (true, None)
+        } else {
+            (
+                false,
+                Some("microVM sandboxes require KVM (/dev/kvm) on Linux"),
+            )
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (
+            false,
+            Some("microVM sandboxes are not supported on this operating system"),
+        )
+    }
+}
+
 /// Default root for daemon-provisioned worktrees: `$INTENTD_WORKSPACES_DIR`
 /// override, else `~/intent/workspaces` — the FE's
 /// `WorkspaceConfig.WORKSPACES_BASE` layout (`<root>/<workspaceId>/<repo-slug>`).
@@ -8150,11 +8248,171 @@ impl WorkspaceApi for Services {
             // the same cached workspaces-root probe as Workspace.cowSupported
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
+            // `microvmSupported` = platform check AND cowSupported; false on
+            // an incapable platform even when the CoW probe could not run.
             let mut caps = serde_json::Map::new();
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
+            if let Some(microvm_supported) = self.compute_microvm_supported().await {
+                caps.insert(
+                    "microvmSupported".to_string(),
+                    serde_json::json!(microvm_supported),
+                );
+            }
             Ok(serde_json::Value::Object(caps))
+        })
+    }
+
+    fn sandbox_profiles_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { Ok(sandbox_profiles_json(&self.effective_settings().sandbox)) })
+    }
+
+    fn sandbox_profiles_update(
+        &self,
+        changes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Translate the profile-shaped params into `settings.update`
+            // changes on the `sandbox.*` paths, validating the envelope here
+            // (unknown type / field → -32602 before anything mutates). The
+            // typed registry schema then enforces the deeper invariants
+            // (defaultType must name an enabled type, image shape).
+            let obj = changes
+                .as_object()
+                .ok_or_else(|| Error::InvalidParams("params must be an object".to_string()))?;
+            // The registry validates its batch change-by-change, so order the
+            // translated updates to keep every intermediate state valid:
+            // enables first, then `defaultType`, then disables (e.g. enabling
+            // `cow` + `defaultType: "cow"` + disabling the old default all in
+            // one call). Image changes are order-insensitive.
+            let mut enables: Vec<serde_json::Value> = Vec::new();
+            let mut default_type: Vec<serde_json::Value> = Vec::new();
+            let mut disables: Vec<serde_json::Value> = Vec::new();
+            let mut resets: Vec<&'static str> = Vec::new();
+            for (key, value) in obj {
+                match key.as_str() {
+                    "workspaceId" => {}
+                    "defaultType" => {
+                        default_type.push(
+                            serde_json::json!({ "path": "sandbox.defaultType", "value": value }),
+                        );
+                    }
+                    "profiles" => {
+                        let profiles = value.as_object().ok_or_else(|| {
+                            Error::InvalidParams("profiles must be an object".to_string())
+                        })?;
+                        for (ty, cfg) in profiles {
+                            if !SANDBOX_TYPES.contains(&ty.as_str()) {
+                                return Err(Error::InvalidParams(format!(
+                                    "unknown execution environment type: {ty}"
+                                )));
+                            }
+                            let cfg = cfg.as_object().ok_or_else(|| {
+                                Error::InvalidParams(format!("profiles.{ty} must be an object"))
+                            })?;
+                            for (field, field_value) in cfg {
+                                match field.as_str() {
+                                    "enabled" => {
+                                        let change = serde_json::json!({
+                                            "path": format!("sandbox.{ty}.enabled"),
+                                            "value": field_value,
+                                        });
+                                        if field_value.as_bool() == Some(false) {
+                                            disables.push(change);
+                                        } else {
+                                            enables.push(change);
+                                        }
+                                    }
+                                    "image" if ty == "microvm" => {
+                                        if field_value.is_null() {
+                                            resets.push("sandbox.microvm.image");
+                                        } else {
+                                            enables.push(serde_json::json!({
+                                                "path": "sandbox.microvm.image",
+                                                "value": field_value,
+                                            }));
+                                        }
+                                    }
+                                    "image" => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.image: image override is only \
+                                             supported on the microvm type"
+                                        )))
+                                    }
+                                    other => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.{other}: unknown field"
+                                        )))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(Error::InvalidParams(format!("unknown param: {other}")));
+                    }
+                }
+            }
+            let updates: Vec<serde_json::Value> = enables
+                .into_iter()
+                .chain(default_type)
+                .chain(disables)
+                .collect();
+            if !updates.is_empty() {
+                self.settings_update(serde_json::Value::Array(updates))
+                    .await?;
+            }
+            for path in resets {
+                self.settings_reset(path.to_string()).await?;
+            }
+            Ok(sandbox_profiles_json(&self.effective_settings().sandbox))
+        })
+    }
+
+    fn sandbox_options(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Capability-resolved availability matrix (§5.5b): the settings
+            // intent (`enabled`) joined with what the host can actually run.
+            let sandbox = self.effective_settings().sandbox;
+            let cow_supported = self.compute_cow_supported().await;
+            let cow_reason = match cow_supported {
+                Some(true) => None,
+                Some(false) => Some(
+                    "the workspaces root filesystem does not support copy-on-write clones"
+                        .to_string(),
+                ),
+                None => Some("CoW filesystem support could not be determined".to_string()),
+            };
+            let (platform_ok, platform_reason) = microvm_platform_supported();
+            let microvm_reason = if platform_ok {
+                cow_reason.clone()
+            } else {
+                platform_reason.map(str::to_string)
+            };
+            let mut options = Vec::with_capacity(SANDBOX_TYPES.len());
+            for &ty in SANDBOX_TYPES {
+                let enabled = sandbox_type_enabled(&sandbox, ty);
+                let reason = match ty {
+                    "cow" => cow_reason.clone(),
+                    "microvm" => microvm_reason.clone(),
+                    _ => None,
+                };
+                let mut row = serde_json::json!({
+                    "type": ty,
+                    "enabled": enabled,
+                    "available": reason.is_none(),
+                    "default": sandbox.default_type.as_str() == ty,
+                });
+                if let Some(reason) = reason {
+                    row["reason"] = serde_json::json!(reason);
+                }
+                options.push(row);
+            }
+            Ok(serde_json::json!({
+                "defaultType": sandbox.default_type.as_str(),
+                "options": options,
+            }))
         })
     }
 

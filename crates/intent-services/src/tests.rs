@@ -14780,6 +14780,191 @@ mod worktree_provisioning {
         );
     }
 
+    /// `system.capabilities.microvmSupported` (§5.7): platform check ANDed
+    /// with the CoW probe. On a capable platform (macOS arm64 / Linux with
+    /// /dev/kvm) it mirrors `cowSupported`; on an incapable platform it is
+    /// `false` regardless.
+    #[tokio::test]
+    async fn system_capabilities_reports_microvm_supported() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-syscap-mvm-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let caps = svc.system_capabilities().await.expect("capabilities");
+        let obj = caps.as_object().expect("result is an object");
+        let cow = obj.get("cowSupported").and_then(|v| v.as_bool());
+        let microvm = obj.get("microvmSupported").and_then(|v| v.as_bool());
+        let platform_capable = (cfg!(all(target_os = "macos", target_arch = "aarch64")))
+            || (cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+        if platform_capable {
+            assert_eq!(microvm, cow, "capable platform mirrors cowSupported");
+        } else {
+            assert_eq!(microvm, Some(false), "incapable platform is always false");
+        }
+    }
+
+    /// `sandbox.profiles.list` (§5.35): the default settings yield one row
+    /// per type in catalog order — direct/worktree enabled, cow/microvm
+    /// disabled, `defaultType: "worktree"`, and a `null` microvm image.
+    /// Registry-less wiring serves schema defaults (no error).
+    #[tokio::test]
+    async fn sandbox_profiles_list_serves_defaults() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+
+        let result = svc.sandbox_profiles_list().await.expect("list");
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "defaultType": "worktree",
+                "profiles": [
+                    { "type": "direct", "enabled": true },
+                    { "type": "worktree", "enabled": true },
+                    { "type": "cow", "enabled": false },
+                    { "type": "microvm", "enabled": false, "image": null },
+                ],
+            })
+        );
+    }
+
+    /// `sandbox.profiles.update` (§5.35): a batch update persists through the
+    /// settings registry and returns the updated list shape; an explicit
+    /// `image: null` clears the override; unknown types/fields → InvalidParams
+    /// with nothing applied.
+    #[tokio::test]
+    async fn sandbox_profiles_update_persists_and_validates() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let svc = Services::new(store).with_settings_registry(registry.clone());
+
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "defaultType": "cow",
+                "profiles": {
+                    "cow": { "enabled": true },
+                    "microvm": {
+                        "enabled": true,
+                        "image": { "manifestUrl": "https://example.com/m.json", "sha256": "abc" },
+                    },
+                },
+            }))
+            .await
+            .expect("update");
+        assert_eq!(result["defaultType"], "cow");
+        assert_eq!(result["profiles"][2]["enabled"], true);
+        assert_eq!(result["profiles"][3]["enabled"], true);
+        assert_eq!(
+            result["profiles"][3]["image"],
+            serde_json::json!({ "manifestUrl": "https://example.com/m.json", "sha256": "abc" })
+        );
+        // Persisted, not just echoed.
+        assert_eq!(
+            registry.get("sandbox.defaultType"),
+            Some(serde_json::json!("cow"))
+        );
+
+        // Explicit null clears the image override.
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "image": null } },
+            }))
+            .await
+            .expect("clear image");
+        assert_eq!(result["profiles"][3]["image"], serde_json::Value::Null);
+
+        // Unknown type → InvalidParams, nothing applied.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "vm": { "enabled": true } },
+            }))
+            .await
+            .expect_err("unknown type rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Unknown field → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "bogus": true } },
+            }))
+            .await
+            .expect_err("unknown field rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // image on a non-microvm type → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "image": { "manifestUrl": "u", "sha256": "s" } } },
+            }))
+            .await
+            .expect_err("image on cow rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Schema invariant holds: disabling the current default fails.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "enabled": false } },
+            }))
+            .await
+            .expect_err("disabling the default type rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("sandbox.defaultType"), "{msg}");
+    }
+
+    /// `sandbox.options` (§5.35): joins the settings intent with host
+    /// capability — direct/worktree always available, `cow` gated on the CoW
+    /// probe, `microvm` on platform AND CoW; `reason` present exactly when
+    /// unavailable.
+    #[tokio::test]
+    async fn sandbox_options_resolves_availability() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-sbopt-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let cow_supported = svc.compute_cow_supported().await;
+        let result = svc.sandbox_options().await.expect("options");
+        assert_eq!(result["defaultType"], "worktree");
+        let options = result["options"].as_array().expect("options array");
+        assert_eq!(options.len(), 4);
+        for (i, ty) in ["direct", "worktree", "cow", "microvm"].iter().enumerate() {
+            assert_eq!(options[i]["type"], *ty);
+            assert_eq!(options[i]["default"], (*ty == "worktree"));
+            let available = options[i]["available"].as_bool().expect("available bool");
+            assert_eq!(
+                options[i].get("reason").is_some(),
+                !available,
+                "reason present exactly when unavailable: {}",
+                options[i]
+            );
+        }
+        // direct/worktree are unconditionally available.
+        assert_eq!(options[0]["available"], true);
+        assert_eq!(options[1]["available"], true);
+        // cow availability mirrors the probe.
+        assert_eq!(
+            options[2]["available"].as_bool(),
+            Some(cow_supported == Some(true))
+        );
+        // microvm is available only on a capable platform with CoW.
+        let platform_capable = (cfg!(all(target_os = "macos", target_arch = "aarch64")))
+            || (cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+        assert_eq!(
+            options[3]["available"].as_bool(),
+            Some(platform_capable && cow_supported == Some(true))
+        );
+    }
+
     /// `unsloth.status` (monorepo#878 follow-up): with no `AgentManager`
     /// attached (read-only/test wiring), the RPC degrades to `{ running:
     /// false }` rather than erroring — mirrors `agent_manager()`'s `None`

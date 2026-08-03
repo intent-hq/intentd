@@ -1640,6 +1640,29 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "sandbox.profiles.list" => {
+            // Global namespace (no workspaceId): the configured execution
+            // environment profiles (PROTOCOL §5.5b).
+            let r = api.sandbox_profiles_list().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sandbox.profiles.update" => {
+            match api
+                .sandbox_profiles_update(Value::Object(params.clone()))
+                .await
+            {
+                Ok(v) => Ok(v),
+                // Unknown type/field or failed validation → -32602.
+                Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "sandbox.options" => {
+            // Global namespace (no workspaceId): the capability-resolved
+            // execution environment availability matrix (PROTOCOL §5.5b).
+            let r = api.sandbox_options().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "git.status" => {
             let ws = require_ws_note(params)?;
             let status = api.git_status(ws).await.map_err(domain_to_rpc)?;

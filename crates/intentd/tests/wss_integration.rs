@@ -167,9 +167,17 @@ async fn make_services(
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    // Wire a settings registry over a hermetic config.toml (matching the
+    // production composition root), so TOML-backed `settings.*` /
+    // `sandbox.profiles.*` writes persist and are served back.
+    let settings_registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
     let mut services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
+        .with_settings_registry(settings_registry)
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
@@ -1679,6 +1687,83 @@ async fn wss_system_capabilities_reports_cow_supported() {
         result.get("cowSupported").is_some_and(Value::is_boolean),
         "cowSupported present as a boolean when the probe ran (hermetic root exists): {resp}"
     );
+    // `microvmSupported` (§5.7, v4.1): platform check AND cowSupported. On an
+    // incapable platform it is always false; on a capable one it mirrors
+    // cowSupported — either way it is a boolean here (probe ran).
+    assert!(
+        result
+            .get("microvmSupported")
+            .is_some_and(Value::is_boolean),
+        "microvmSupported present as a boolean when the probe ran: {resp}"
+    );
+    srv.ws.stop().await;
+}
+
+/// `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options`
+/// (PROTOCOL §5.5b, v4.1): daemon-global (no workspaceId) execution
+/// environment profile surface. Asserts the documented result shapes, the
+/// update round-trip through the settings registry, and -32602 on a bad
+/// update.
+#[tokio::test]
+async fn wss_sandbox_profiles_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Defaults: worktree preselected, direct/worktree enabled, cow/microvm off.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"sandbox.profiles.list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["result"]["defaultType"], "worktree", "{resp}");
+    let profiles = resp["result"]["profiles"].as_array().expect("profiles");
+    assert_eq!(profiles.len(), 4, "{resp}");
+    assert_eq!(profiles[0]["type"], "direct");
+    assert_eq!(profiles[3]["type"], "microvm");
+    assert_eq!(profiles[3]["image"], Value::Null, "{resp}");
+
+    // Update: enable cow and make it the default in one batch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"sandbox.profiles.update","params":{"defaultType":"cow","profiles":{"cow":{"enabled":true}}}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["defaultType"], "cow", "{resp}");
+    assert_eq!(resp["result"]["profiles"][2]["enabled"], true, "{resp}");
+
+    // Options: capability-resolved matrix; reason present exactly when
+    // unavailable, and the moved default is reflected.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"sandbox.options","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["defaultType"], "cow", "{resp}");
+    let options = resp["result"]["options"].as_array().expect("options");
+    assert_eq!(options.len(), 4, "{resp}");
+    for opt in options {
+        let available = opt["available"].as_bool().expect("available");
+        assert_eq!(
+            opt.get("reason").is_some(),
+            !available,
+            "reason present exactly when unavailable: {opt}"
+        );
+    }
+    assert_eq!(options[0]["available"], true, "direct always available");
+    assert_eq!(options[1]["available"], true, "worktree always available");
+
+    // Bad update (unknown type) → -32602, nothing applied.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"sandbox.profiles.update","params":{"profiles":{"vm":{"enabled":true}}}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+
     srv.ws.stop().await;
 }
 
