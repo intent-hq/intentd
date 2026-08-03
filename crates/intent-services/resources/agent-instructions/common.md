@@ -66,3 +66,22 @@ Here's what I'm doing...
 ```
 
 Rules: one group per phase, no nesting, keep names to 1-3 words. Both `</group:Name>` and `</group>` work as closing tags.
+
+## Rich Chat Rendering
+
+Your chat responses render rich blocks directly — not just notes. Supported fenced blocks (3+ backticks or tildes; the closing fence must start its own line):
+
+| Block | Fence keyword | Body |
+|-------|---------------|------|
+| Mermaid diagram | `mermaid` | Mermaid diagram source |
+| CLI command | `ws-block:cli` | JSON: `{"command": "...", "description": "...", "cwd": "..."}` (description/cwd optional) |
+| Code reference | `ws-block:reference` | JSON: `{"semanticId": "src/file.ts#symbol:Foo", "description": "..."}` (or `"filePath"`; `#L10-20` line ranges supported) |
+
+Use mermaid to sketch architecture/flows, cli for a command the user can run, reference to point at code. Example:
+
+```mermaid
+flowchart LR
+  A[Client] --> B[Daemon]
+```
+
+Mermaid renders live and invalid source shows a parse error inline — keep node/edge labels plain (no backticks or quotes).
