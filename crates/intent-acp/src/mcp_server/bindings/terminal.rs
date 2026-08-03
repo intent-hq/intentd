@@ -27,7 +27,18 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "list" => api.terminal_list(ws.clone()).await.map_err(map_err),
+        "list" => {
+            // The wire method returns the `{ terminals, daemonBootId }`
+            // envelope (PROTOCOL §5.13; monorepo#1334); agents keep the bare
+            // terminals array, so unwrap here to leave the agent-visible
+            // contract unchanged.
+            let mut listed = api.terminal_list(ws.clone()).await.map_err(map_err)?;
+            let terminals = listed
+                .as_object_mut()
+                .and_then(|o| o.remove("terminals"))
+                .unwrap_or(listed);
+            Ok(terminals)
+        }
         "readOutput" => {
             let terminal_id =
                 req_str(args, "terminalId").map_err(|_| "terminalId is required".to_string())?;

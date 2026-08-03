@@ -4583,10 +4583,16 @@ async fn router_read_lifecycle_arms_over_wss() {
     .await;
     poll_id += 1;
     assert_eq!(
-        script_terminals,
+        script_terminals["terminals"],
         json!([]),
         "running script PTY must not be exposed as a terminal tab"
     );
+    // `terminal.list` responds with the `{ terminals, daemonBootId }` envelope
+    // (PROTOCOL §5.13; monorepo#1334) — even for an empty workspace.
+    let script_boot_id = script_terminals["daemonBootId"]
+        .as_str()
+        .expect("daemonBootId string")
+        .to_string();
     let script_output = wss_rpc(
         &mut rpc,
         poll_id,
@@ -4632,10 +4638,15 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id }),
     )
     .await;
-    let terms = term_list.as_array().expect("terminals array");
+    let terms = term_list["terminals"].as_array().expect("terminals array");
     assert!(
         terms.iter().any(|t| t["id"] == json!(terminal_id)),
         "created terminal listed: {term_list}"
+    );
+    assert_eq!(
+        term_list["daemonBootId"].as_str(),
+        Some(script_boot_id.as_str()),
+        "daemonBootId stable across calls within one daemon boot"
     );
     // `terminal.write` accepts base64-encoded stdin bytes (PROTOCOL §5.13).
     // "ZWNobyBoaQo=" is base64 for "echo hi\n" — short and stable.
@@ -4839,10 +4850,14 @@ async fn terminal_create_env_over_wss() {
     )
     .await;
     assert!(
-        listed
+        listed["terminals"]
             .as_array()
             .is_some_and(|terms| terms.iter().all(|term| term["id"] != terminal_id)),
         "naturally exited terminal must be omitted from terminal.list: {listed}"
+    );
+    assert!(
+        listed["daemonBootId"].is_string(),
+        "terminal.list envelope carries daemonBootId: {listed}"
     );
 
     let buffer = wss_rpc(

@@ -243,7 +243,9 @@ where
         )
         .await;
         attempt += 1;
-        let terminals = list_resp["result"].as_array().expect("terminal.list array");
+        let terminals = list_resp["result"]["terminals"]
+            .as_array()
+            .expect("terminal.list terminals array");
         if let Some(entry) = terminals
             .iter()
             .find(|t| t["name"] == json!("Setup Script") && t["isExecutingCommand"] == json!(true))
@@ -302,7 +304,9 @@ async fn await_terminal_omitted<S>(
         )
         .await;
         attempt += 1;
-        let terminals = list_resp["result"].as_array().expect("terminal.list array");
+        let terminals = list_resp["result"]["terminals"]
+            .as_array()
+            .expect("terminal.list terminals array");
         if terminals.iter().all(|entry| entry["id"] != terminal_id) {
             return;
         }

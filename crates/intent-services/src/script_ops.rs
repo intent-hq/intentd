@@ -2063,7 +2063,7 @@ mod tests {
             .await
             .expect("terminal list");
         assert_eq!(
-            terminals,
+            terminals["terminals"],
             json!([]),
             "script PTY must not become a terminal tab"
         );
