@@ -614,21 +614,27 @@ impl ScriptManager {
     }
 
     /// `script.restart`: stop, reset the restart counter, then start. Scoped to
-    /// `workspace_id`.
+    /// `workspace_id`. The stop→start gap is surfaced as `restarting`
+    /// (monorepo#1318) so a snapshot taken mid-restart never reports
+    /// `exited`/`idle`; `mark_running` flips it to `running` once the respawn
+    /// is up.
     pub(crate) async fn restart(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
     ) -> Result<Value> {
         self.stop(workspace_id, script_id).await?;
-        {
+        let state = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&(workspace_id.clone(), script_id.to_string()))
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.state.restart_count = 0;
             m.stopped_by_user = false;
-        }
+            m.state.status = ScriptStatus::Restarting;
+            m.state.clone()
+        };
+        self.emit_state(workspace_id, script_id, &state).await;
         self.start(workspace_id, script_id).await
     }
 
@@ -839,14 +845,22 @@ impl ScriptManager {
                 break;
             }
             let key = (ws.clone(), script_id.clone());
-            let attempt = {
+            // The restart is committed (service mode, not user-stopped, not
+            // too-fast, retries left): surface the backoff window as
+            // `restarting` (monorepo#1318) so clients can distinguish it from
+            // a final exit. The generation filter keeps a retired supervisor
+            // from overwriting a successor's status; `mark_running` flips the
+            // status back to `running` after the respawn.
+            let (attempt, state) = {
                 let mut guard = self.scripts.lock().unwrap();
                 let Some(m) = guard.get_mut(&key).filter(|m| m.generation == generation) else {
                     return;
                 };
                 m.state.restart_count += 1;
-                m.state.restart_count
+                m.state.status = ScriptStatus::Restarting;
+                (m.state.restart_count, m.state.clone())
             };
+            self.emit_state(&ws, &script_id, &state).await;
             tokio::time::sleep(AUTO_RESTART_DELAY).await;
             {
                 let guard = self.scripts.lock().unwrap();
@@ -2114,6 +2128,110 @@ mod tests {
             .script_stop(h.ws.clone(), id)
             .await
             .expect("stop");
+    }
+
+    /// The `script.restart` stop→start gap reports `restarting` (monorepo#1318):
+    /// the status flips before `start()` is invoked and holds until the respawn's
+    /// `mark_running`, so a snapshot taken mid-restart never reads `exited`/`idle`.
+    /// The supervise park holds the respawn pre-`mark_running` so the window is
+    /// open deterministically.
+    #[tokio::test]
+    async fn script_restart_gap_reports_restarting() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let v = services
+            .script_restart(h.ws.clone(), id.clone())
+            .await
+            .expect("restart");
+        assert_eq!(v["ok"], true);
+        // The old run's `exited` precedes the gap's `restarting` on the bus.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "restarting").await;
+        // With the respawn parked pre-`mark_running`, a snapshot inside the
+        // gap reads `restarting`.
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("respawn parked");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "restarting");
+        assert_eq!(st["restartCount"], 0, "restart() resets the counter");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
+    }
+
+    /// The auto-restart backoff window reports `restarting` (monorepo#1318):
+    /// once the supervise loop commits to a restart (service mode, not
+    /// user-stopped, not too-fast, retries left) the status flips before the
+    /// backoff sleep and holds until the respawn's `mark_running`. The
+    /// too-fast floor is injected as 0 so the immediate exit always restarts,
+    /// and the supervise park holds the respawn pre-`mark_running` so the
+    /// window is open deterministically. The flag file makes the second run
+    /// long-lived so teardown is a clean `script.stop`.
+    #[tokio::test]
+    async fn auto_restart_backoff_window_reports_restarting() {
+        let mut h = harness().await;
+        h.services = h.services.with_script_too_fast_ms(0);
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let flag = std::env::temp_dir().join(format!(
+            "intentd-scriptops-flag-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _flag = PidFile(flag.clone());
+        let cmd = format!(
+            "if [ -e \"{p}\" ]; then exec sleep 3600; else : > \"{p}\"; fi",
+            p = flag.display()
+        );
+        let id = create_simple(&h, "crashy", &cmd, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        // The immediate exit commits an auto-restart: `exited` then
+        // `restarting` (with the bumped counter) are emitted before the
+        // backoff sleep.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "restarting").await;
+        assert_eq!(ev["data"]["restartCount"], 1);
+        // With the respawn parked pre-`mark_running`, a snapshot inside the
+        // backoff window reads `restarting`.
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("respawn parked");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "restarting");
+        assert_eq!(st["restartCount"], 1);
+        park.release.notify_one();
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        assert_eq!(ev["data"]["restartCount"], 1);
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
     }
 
     #[tokio::test]
