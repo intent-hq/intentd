@@ -1938,14 +1938,28 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-/// UDS liveness probe: a successful connect means a daemon is listening.
-/// UDS is Unix-only; on other platforms there is no socket to probe.
+/// Local-transport liveness probe: a successful connect means a daemon is
+/// listening. Probes the UDS on Unix and the derived named pipe on Windows.
 #[cfg(unix)]
 async fn uds_is_live(socket_path: &Path) -> bool {
     tokio::net::UnixStream::connect(socket_path).await.is_ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn uds_is_live(socket_path: &Path) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let Ok(pipe) = intent_transport::pipe_name_for_socket_path(socket_path) else {
+        return false;
+    };
+    match ClientOptions::new().open(&pipe) {
+        Ok(_) => true,
+        // Every instance momentarily taken still means a live daemon owns it.
+        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn uds_is_live(_socket_path: &Path) -> bool {
     false
 }
@@ -1954,6 +1968,18 @@ async fn uds_is_live(_socket_path: &Path) -> bool {
 /// owns the UDS or a live pid holds the pidfile; otherwise removes a stale
 /// socket/pidfile whose owner is gone and claims the pidfile with our pid.
 async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
+    // On Unix a leftover socket file marks a candidate daemon: probe it, and
+    // remove it when its owner is gone. On Windows named pipes are per-boot
+    // kernel objects with no filesystem entry, so probe the pipe directly —
+    // there is nothing stale to remove.
+    #[cfg(windows)]
+    if uds_is_live(&config.socket_path).await {
+        anyhow::bail!(
+            "intentd is already running on {} — refusing to start a second instance",
+            config.socket_path.display()
+        );
+    }
+    #[cfg(not(windows))]
     if config.socket_path.exists() {
         if uds_is_live(&config.socket_path).await {
             anyhow::bail!(
@@ -1966,7 +1992,15 @@ async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
     }
 
     if let Some(pid) = read_pid(&config.pid_path) {
-        if pid != std::process::id() && pid_is_alive(pid) {
+        // On Windows `pid_is_alive` cannot probe (no signal-0), and the pipe
+        // probe above is the authoritative liveness check — a pidfile that
+        // survives it is stale by definition and must not block startup.
+        let holder_is_alive = if cfg!(windows) {
+            false
+        } else {
+            pid_is_alive(pid)
+        };
+        if pid != std::process::id() && holder_is_alive {
             anyhow::bail!(
                 "intentd is already running (pid {pid}, pidfile {}) — refusing to start a second instance",
                 config.pid_path.display()
