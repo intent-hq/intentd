@@ -185,6 +185,10 @@ fn classify_matches_host_status_and_host_services() {
         &json!({ "jsonrpc": "2.0", "id": 4, "method": "host.directoryStatus", "params": { "path": "/tmp" } })
     )
     .is_some());
+    assert!(classify(
+        &json!({ "jsonrpc": "2.0", "id": 4, "method": "host.createDirectory", "params": { "path": "/tmp/new" } })
+    )
+    .is_some());
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 5, "method": "host.checkAuggie" })).is_some()
     );
@@ -329,6 +333,20 @@ async fn handle_list_directory_returns_entries_for_cwd() {
     assert_eq!(parsed["id"], 13);
     assert!(parsed["result"]["entries"].is_array());
     assert!(parsed["result"]["path"].is_string());
+}
+
+#[tokio::test]
+async fn handle_create_directory_requires_path() {
+    let req = classify(
+        &json!({ "jsonrpc": "2.0", "id": 15, "method": "host.createDirectory", "params": {} }),
+    )
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("missing path produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 15);
+    assert_eq!(parsed["error"]["code"], -32602);
 }
 
 #[tokio::test]

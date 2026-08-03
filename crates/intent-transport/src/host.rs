@@ -29,10 +29,11 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
 }
 
 /// The `host.*` capability-probe methods, once classified. `Status` is the
-/// original host probe (§5.14); `CheckGit`/`ListDirectory`/`DirectoryStatus`/
-/// `CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env`/`FindApp`/
-/// `ListInstalledEditors` are additive host-services that let the FE delegate
-/// Git detection, repo-folder browsing, auggie-binary discovery, generic binary
+/// original host probe (§5.14); `CheckGit`/`ListDirectory`/`CreateDirectory`/
+/// `DirectoryStatus`/`CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env`/
+/// `FindApp`/`ListInstalledEditors` are additive host-services that let the FE
+/// delegate Git detection, repo-folder browsing/creation, auggie-binary
+/// discovery, generic binary
 /// resolution, a batch tool-availability probe, the daemon's PATH/environment,
 /// macOS `.app` bundle lookup, and the cross-platform editor catalog to the
 /// daemon host (cross-transport, like the rest of `host.*`).
@@ -40,6 +41,7 @@ pub(crate) enum HostMethod {
     Status,
     CheckGit,
     ListDirectory,
+    CreateDirectory,
     DirectoryStatus,
     CheckAuggie,
     FindBinary,
@@ -72,7 +74,7 @@ pub(crate) enum HostMethod {
 /// A classified `host.*` request awaiting handling by the connection task.
 /// `params` is the raw params object (already coerced to an empty map when the
 /// frame had no params or non-object params), consumed by the methods that
-/// take input (`ListDirectory`/`DirectoryStatus`).
+/// take input (`ListDirectory`/`CreateDirectory`/`DirectoryStatus`).
 pub(crate) struct HostRequest {
     pub method: HostMethod,
     pub id_present: bool,
@@ -100,6 +102,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.status" => HostMethod::Status,
         "host.checkGit" => HostMethod::CheckGit,
         "host.listDirectory" => HostMethod::ListDirectory,
+        "host.createDirectory" => HostMethod::CreateDirectory,
         "host.directoryStatus" => HostMethod::DirectoryStatus,
         "host.checkAuggie" => HostMethod::CheckAuggie,
         "host.findBinary" => HostMethod::FindBinary,
@@ -159,8 +162,9 @@ pub(crate) fn host_status_json(
 /// Handle a classified `host.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `is_local` is the resolved
 /// locality of the serving connection (§5.14). The host-services methods
-/// (`checkGit`/`listDirectory`/`directoryStatus`/`checkAuggie`/`findBinary`/
-/// `toolAvailability`/`env`/`findApp`/`listInstalledEditors`) run their
+/// (`checkGit`/`listDirectory`/`createDirectory`/`directoryStatus`/
+/// `checkAuggie`/`findBinary`/`toolAvailability`/`env`/`findApp`/
+/// `listInstalledEditors`) run their
 /// filesystem / subprocess work on a blocking thread so the async runtime stays
 /// free; `checkAuggie` consults `api.settings_get` for `context.auggiePath` and
 /// `providers.paths.auggie` before falling back to the canonical resolver in
@@ -212,6 +216,27 @@ pub(crate) async fn handle(
                 Ok(Ok(v)) => success_frame(id_echo, v),
                 Ok(Err(msg)) => error_frame(id_echo, -32603, &msg),
                 Err(e) => error_frame(id_echo, -32603, &format!("listDirectory join error: {e}")),
+            }
+        }
+        HostMethod::CreateDirectory => {
+            let path = match params.get("path").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Missing required parameter: path",
+                    ));
+                }
+            };
+            let join = tokio::task::spawn_blocking(move || host_ops::create_directory(&path)).await;
+            match join {
+                Ok(Ok(v)) => success_frame(id_echo, v),
+                Ok(Err(msg)) => error_frame(id_echo, -32603, &msg),
+                Err(e) => error_frame(id_echo, -32603, &format!("createDirectory join error: {e}")),
             }
         }
         HostMethod::DirectoryStatus => {
