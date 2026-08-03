@@ -48,10 +48,14 @@ github-custom-job-permissions = { "publish-channel-manifest" = { contents = "wri
 # toolchains (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Linux/macOS build jobs run on the org's self-hosted runners: tinybox
-# (Linux x64, Ubuntu 22.04) and m1mac (macOS arm64). Runner values must be
-# single labels here (the generated workflow interpolates them as strings),
-# and each machine exposes its hostname as a label.
+# Linux build jobs run on the org's self-hosted tinybox runner (Linux x64,
+# Ubuntu 22.04). Runner values must be single labels here (the generated
+# workflow interpolates them as strings), and each machine exposes its
+# hostname as a label.
+#
+# The macOS builds run on GitHub-hosted Apple Silicon runners (macos-14):
+# the self-hosted m1mac went offline and release builds queued forever
+# behind it.
 #
 # The Windows build runs on a GitHub-hosted runner: the self-hosted 5090pc
 # lacks PowerShell 7, so default-shell steps fall back to Windows PowerShell
@@ -68,7 +72,9 @@ github-build-setup = "../dist-build-setup.yml"
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
-# - m1mac is arm64, so x86_64-apple-darwin is a cross build (rustup target).
+# - macos-14 is arm64 (host pinned explicitly on both apple targets so the
+#   arch never depends on dist's runner-name heuristic), so
+#   x86_64-apple-darwin is a cross build (rustup target).
 # - tinybox runs the musl builds as cross builds from the glibc host triple,
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
@@ -76,10 +82,11 @@ github-build-setup = "../dist-build-setup.yml"
 global = "tinybox"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
-runner = "m1mac"
+runner = "macos-14"
+host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
-runner = "m1mac"
+runner = "macos-14"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
