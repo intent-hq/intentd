@@ -1,8 +1,8 @@
-//! Unix-domain-socket listener (§5.1).
+//! Local listener (§5.1): Unix domain socket on Unix, named pipe on Windows.
 //!
-//! Binds a `tokio::net::UnixListener` at the resolved socket path with mode
-//! `0600`, removes a stale socket before bind, and serves newline-delimited
-//! JSON-RPC frames. One task is spawned per connection.
+//! On Unix this binds a `tokio::net::UnixListener` at the resolved socket path
+//! with mode `0600`, removes a stale socket before bind, and serves
+//! newline-delimited JSON-RPC frames. One task is spawned per connection.
 //!
 //! A connection is no longer strictly request/response: in addition to reading
 //! requests and writing their responses, the daemon PUSHES server-initiated
@@ -11,10 +11,12 @@
 //! the JSON-RPC dispatcher (mirroring `websocket-api-server.ts`). Per-connection
 //! subscription state is runtime-only and dropped when the connection closes.
 //!
-//! UDS is Unix-only. The listener is gated behind `#[cfg(unix)]`; on other
-//! platforms (e.g. Windows) the crate still builds and `serve_uds` returns an
-//! `Unsupported` error at runtime. A Windows transport (TCP/TLS) is deferred to
-//! M5 and intentionally not provided here.
+//! On Windows the same per-connection frame loop is served over a named pipe
+//! (`tokio::net::windows::named_pipe`) whose name is derived from the resolved
+//! socket path via [`derive_pipe_name`], so the daemon and cloudlands-fe agree
+//! on the rendezvous point without exchanging extra state. On targets that are
+//! neither unix nor windows, `serve_uds` still returns an `Unsupported` error
+//! at runtime.
 
 use std::future::Future;
 use std::path::Path;
@@ -22,6 +24,7 @@ use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
 use intent_services::EventBus;
+use sha2::{Digest, Sha256};
 
 use crate::control::SystemControl;
 use crate::reverse::PrimaryReverseRegistry;
@@ -29,29 +32,59 @@ use crate::reverse::PrimaryReverseRegistry;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
+use tokio::net::UnixListener;
+
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::sync::mpsc;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::conn::{process_frame, ConnSubs, OUTBOUND_CAPACITY};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::forward::ForwardRegistry;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::reverse::ReverseChannel;
 
-/// Serve JSON-RPC over a UDS until `shutdown` resolves. `bus` is the shared
-/// in-process event bus that connection subscriptions are wired to. `control`,
-/// when present, exposes the `system.status`/`system.shutdown` control surface
-/// (§5.7) to local UDS clients (`intentd status`/`stop`).
+/// Derive the Windows named-pipe name for a resolved socket path (the spec's
+/// pipe-name contract, mirrored byte-for-byte by cloudlands-fe):
+/// `\\.\pipe\intentd-<hash16>` where `<hash16>` = first 16 hex chars of the
+/// SHA-256 of the socket path after normalization — absolute form, backslash
+/// separators, lowercased. Hashing (instead of embedding the path) isolates
+/// instances per data dir (prod vs dev vs tests) without pipe-name length or
+/// charset concerns.
+///
+/// Known vector (the cloudlands-fe unit test mirrors this exact pair):
+///   input:      `C:\Users\Alice\AppData\Roaming\intentd\intentd.sock`
+///   normalized: `c:\users\alice\appdata\roaming\intentd\intentd.sock`
+///   pipe name:  `\\.\pipe\intentd-f763fc173ce41365`
+///
+/// The caller must pass an ABSOLUTE path (the Windows listener resolves via
+/// `std::path::absolute` first); this function only normalizes separators and
+/// case so it compiles and is unit-tested on every platform.
+pub fn derive_pipe_name(resolved_socket_path: &str) -> String {
+    let normalized = resolved_socket_path.replace('/', "\\").to_lowercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!(r"\\.\pipe\intentd-{}", hex::encode(&digest[..8]))
+}
+
+/// Resolve `socket_path` to absolute form and derive the pipe name it maps to.
+#[cfg(windows)]
+fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> {
+    let absolute = std::path::absolute(socket_path)?;
+    Ok(derive_pipe_name(&absolute.to_string_lossy()))
+}
+
+/// Serve JSON-RPC over the local transport (UDS on Unix, named pipe on
+/// Windows) until `shutdown` resolves. `bus` is the shared in-process event
+/// bus that connection subscriptions are wired to. `control`, when present,
+/// exposes the `system.status`/`system.shutdown` control surface (§5.7) to
+/// local clients (`intentd status`/`stop`).
 ///
 /// This wrapper installs a fresh (empty) [`PrimaryReverseRegistry`] so tests
 /// and other lightweight callers stay one-liner. Composition roots that share
 /// a registry across the UDS + WSS listeners (REV-1) call
 /// [`serve_uds_with_reverse`] instead.
-#[cfg(unix)]
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -119,7 +152,8 @@ where
                         let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, api, bus, control, server_pairing_info, reverse_registry).await {
+                            let (read_half, write_half) = stream.into_split();
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -138,16 +172,22 @@ where
 
 /// Serve one connection: read newline-delimited frames, answer requests, push
 /// matching `events.event` notifications, and clean up all subscriptions on exit.
-#[cfg(unix)]
-async fn handle_connection(
-    stream: UnixStream,
+/// Generic over the split stream halves so the Unix socket and Windows named
+/// pipe share one frame loop byte-for-byte.
+#[cfg(any(unix, windows))]
+async fn handle_connection<R, W>(
+    read_half: R,
+    write_half: W,
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     control: Option<Arc<dyn SystemControl>>,
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
-) -> std::io::Result<()> {
-    let (read_half, write_half) = stream.into_split();
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(read_half);
 
     // One writer task drains the outbound queue so responses and pushed
@@ -266,7 +306,7 @@ async fn handle_connection(
 }
 
 /// Outcome of one bounded line read (see [`read_line_bounded`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum BoundedLine {
     /// A complete line (newline consumed, not included in the buffer) — or the
     /// final unterminated line before EOF.
@@ -281,7 +321,7 @@ enum BoundedLine {
 /// `limit` bytes (monorepo#472). Unlike `read_line`, an over-limit line yields
 /// [`BoundedLine::TooLong`] with at most `limit` bytes consumed, so a hostile
 /// or buggy client cannot make the daemon buffer an unbounded frame.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn read_line_bounded<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -320,30 +360,75 @@ where
     }
 }
 
-/// Non-Unix fallback: UDS is unavailable, so report a clear runtime error
-/// instead of failing to compile. A real Windows transport (TCP/TLS) is M5.
-#[cfg(not(unix))]
-pub async fn serve_uds<F>(
-    _api: Arc<dyn WorkspaceApi>,
-    _bus: EventBus,
-    _socket_path: &Path,
-    _control: Option<Arc<dyn SystemControl>>,
-    _shutdown: F,
+/// Windows implementation of [`serve_uds_with_reverse`]: serve the same
+/// newline-delimited JSON-RPC frame loop over a named pipe whose name is
+/// derived from `socket_path` (see [`derive_pipe_name`]). Loop of
+/// create-instance → connect → spawn handler; the next instance is created
+/// BEFORE the connected one is handed to its task so there is no accept gap.
+///
+/// The first instance is created with `first_pipe_instance(true)` so a second
+/// daemon on the same data dir fails fast at bind time — the single-instance
+/// guard equivalent of the UDS bind conflict. Named pipes are per-boot kernel
+/// objects scoped to the creating process, so there is no stale-file removal
+/// before bind and nothing to unlink on shutdown; access is limited to the
+/// same user by the default pipe security descriptor (the 0600 analogue).
+#[cfg(windows)]
+pub async fn serve_uds_with_reverse<F>(
+    api: Arc<dyn WorkspaceApi>,
+    bus: EventBus,
+    socket_path: &Path,
+    control: Option<Arc<dyn SystemControl>>,
+    server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
+    reverse_registry: Arc<PrimaryReverseRegistry>,
+    shutdown: F,
 ) -> std::io::Result<()>
 where
     F: Future<Output = ()>,
 {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "UDS transport is not supported on this platform",
-    ))
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let pipe_name = pipe_name_for_socket_path(socket_path)?;
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)?;
+    tracing::info!(pipe = %pipe_name, path = %socket_path.display(), "intentd listening on named pipe");
+
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            connected = server.connect() => {
+                match connected {
+                    Ok(()) => {
+                        let next = ServerOptions::new().create(&pipe_name)?;
+                        let stream = std::mem::replace(&mut server, next);
+                        let api = api.clone();
+                        let bus = bus.clone();
+                        let control = control.clone();
+                        let server_pairing_info = server_pairing_info.clone();
+                        let reverse_registry = reverse_registry.clone();
+                        tokio::spawn(async move {
+                            let (read_half, write_half) = tokio::io::split(stream);
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry).await {
+                                tracing::debug!(error = %e, "named-pipe connection ended");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!(error = %e, "named-pipe connect failed"),
+                }
+            }
+            _ = &mut shutdown => break,
+        }
+    }
+
+    tracing::info!("intentd named-pipe listener stopped");
+    Ok(())
 }
 
-/// Non-Unix fallback for [`serve_uds_with_reverse`]: the composition root
-/// (`intentd/src/main.rs`) references this symbol unconditionally, so the
-/// crate must expose it on every platform. UDS is Unix-only; on non-Unix
-/// targets any attempt to serve reports an `Unsupported` error at runtime.
-#[cfg(not(unix))]
+/// Fallback for targets that are neither unix nor windows: the composition
+/// root (`intentd/src/main.rs`) references this symbol unconditionally, so the
+/// crate must expose it on every platform. Any attempt to serve reports an
+/// `Unsupported` error at runtime.
+#[cfg(not(any(unix, windows)))]
 pub async fn serve_uds_with_reverse<F>(
     _api: Arc<dyn WorkspaceApi>,
     _bus: EventBus,
@@ -362,7 +447,42 @@ where
     ))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+mod pipe_name_tests {
+    use super::derive_pipe_name;
+
+    /// Known vector from the spec's pipe-name contract — the cloudlands-fe
+    /// unit test mirrors this exact input → output pair.
+    #[test]
+    fn derives_known_vector() {
+        assert_eq!(
+            derive_pipe_name(r"C:\Users\Alice\AppData\Roaming\intentd\intentd.sock"),
+            r"\\.\pipe\intentd-f763fc173ce41365"
+        );
+    }
+
+    #[test]
+    fn normalizes_separators_and_case() {
+        assert_eq!(
+            derive_pipe_name("C:/Dev/Intent Data/intentd.sock"),
+            r"\\.\pipe\intentd-3f81294c4c07e710"
+        );
+        assert_eq!(
+            derive_pipe_name(r"c:\dev\intent data\intentd.sock"),
+            derive_pipe_name("C:/DEV/Intent Data/intentd.sock"),
+        );
+    }
+
+    #[test]
+    fn distinct_paths_get_distinct_pipes() {
+        assert_ne!(
+            derive_pipe_name(r"c:\a\intentd.sock"),
+            derive_pipe_name(r"c:\b\intentd.sock")
+        );
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::{read_line_bounded, BoundedLine};
     use tokio::io::BufReader;
