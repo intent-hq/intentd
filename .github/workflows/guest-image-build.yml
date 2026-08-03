@@ -1,0 +1,50 @@
+# PR build check for the guest image (monorepo#1120, EE-3): whenever the
+# image inputs change, build the full rootfs + manifest on a native arm64
+# runner (chroot smoke test included in the build script) without publishing
+# anything. Publishing is release-guest-image.yml (manual dispatch).
+name: Guest image build check
+
+on:
+  pull_request:
+    paths:
+      - 'guest-image/**'
+      - 'scripts/build-guest-image.sh'
+      - '.github/workflows/guest-image-build.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build guest image (no publish)
+        shell: bash
+        run: ./scripts/build-guest-image.sh 0.0.0-ci
+      - name: Validate manifest shape
+        shell: bash
+        run: |
+          jq -e '
+            .schema == 1 and .arch == "aarch64"
+            and (.rootfs.sha256 | test("^[0-9a-f]{64}$"))
+            and .rootfs.format == "tar.xz"
+            and .vsockExec.protocol == "intent-exec/1"
+            and (.vsockExec.init | startswith("/"))
+            and (.vsockExec.port > 0)
+            and .providers.auggie == true
+            and .providers.unsloth == false
+            and (.tools.node | startswith("24."))
+          ' guest-image/out/manifest.json
+          echo "manifest conforms to guest-image contract v1"
+      - name: Verify rootfs digest matches manifest
+        shell: bash
+        run: |
+          actual=$(sha256sum guest-image/out/rootfs.tar.xz | cut -d' ' -f1)
+          expected=$(jq -r '.rootfs.sha256' guest-image/out/manifest.json)
+          [[ "$actual" == "$expected" ]] || { echo "::error::digest mismatch"; exit 1; }
+          echo "rootfs sha256 verified: $actual"

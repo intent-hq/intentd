@@ -91,6 +91,7 @@ pub mod provider_catalog;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
+pub mod sandbox_image;
 mod sandbox_ops;
 mod script_ops;
 mod search_ops;

@@ -1,0 +1,123 @@
+# Manual (workflow_dispatch) build + publish of the Intent guest image
+# (monorepo#1120, EE-3): builds guest-image/ via scripts/build-guest-image.sh
+# into a reproducible aarch64 rootfs.tar.xz + manifest.json, publishes them as
+# assets on a guest-image-vX.Y.Z release here, and mirrors them to the public
+# intent-hq/intentd-releases repo (dual-publish per AGENTS.md).
+#
+# Dual-published manifests: the source release's manifest.json points at the
+# MIRROR assets (the built-in pin in intent-services::sandbox_image fetches
+# the mirror; it is the canonical public URL), and a manifest-intentd.json
+# sidecar pointing at this repo's assets is uploaded alongside for consumers
+# without mirror access. The mirrored release carries the same manifest.json.
+#
+# The daemon downloads images on first use from the manifest URL and verifies
+# the rootfs sha256, so re-running this workflow for an existing tag is safe
+# only if the bytes are identical (the build is reproducible) — uploads use
+# --clobber.
+name: Release guest image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Guest image version to build and publish (e.g. 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  MIRROR_REPO: intent-hq/intentd-releases
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    concurrency:
+      group: intentd-release-guest-image
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate version format
+        shell: bash
+        run: |
+          # Charset-restricted prerelease suffix (semver identifiers), so a
+          # version that passes validation is safe to echo in logs.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version input. Expected X.Y.Z with optional -<prerelease> limited to [0-9A-Za-z.-]."
+            exit 1
+          fi
+          echo "Version $VERSION is valid"
+      - name: Check mirror token
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -z "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "::error::INTENTD_RELEASES_TOKEN secret is not configured; cannot mirror to $MIRROR_REPO"
+            exit 1
+          fi
+      - name: Build guest image (reproducible)
+        shell: bash
+        run: |
+          # Native arm64 runner: no QEMU needed for the linux/arm64 build.
+          # --base-url points the manifest at the public mirror (the built-in
+          # pin's canonical URL).
+          ./scripts/build-guest-image.sh "$VERSION" \
+            --base-url "https://github.com/$MIRROR_REPO/releases/download/guest-image-v$VERSION"
+      - name: Build intentd-repo manifest sidecar
+        shell: bash
+        run: |
+          # Same manifest with rootfs.url rewritten to this repo's release
+          # assets, for consumers without access to the public mirror.
+          jq --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/guest-image-v$VERSION/rootfs.tar.xz" \
+            '.rootfs.url = $url' \
+            guest-image/out/manifest.json > guest-image/out/manifest-intentd.json
+      - name: Publish release on intentd
+        shell: bash
+        run: |
+          tag="guest-image-v$VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --latest=false \
+              --title "Intent guest image v$VERSION" \
+              --notes "aarch64 Debian-slim guest rootfs for microVM agent sandboxing (intent-hq/monorepo#1120). Assets: rootfs.tar.xz (+.sha256), manifest.json (rootfs URL on the public mirror), manifest-intentd.json (rootfs URL on this repo). Built reproducibly by scripts/build-guest-image.sh."
+          fi
+          gh release upload "$tag" \
+            --repo "$GITHUB_REPOSITORY" --clobber \
+            guest-image/out/rootfs.tar.xz \
+            guest-image/out/rootfs.tar.xz.sha256 \
+            guest-image/out/manifest.json \
+            guest-image/out/manifest-intentd.json
+      - name: Mirror release assets to intentd-releases
+        shell: bash
+        env:
+          DEST_REPO: ${{ env.MIRROR_REPO }}
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          # manifest.json already points at the mirror's assets, so the
+          # straight asset copy dual-publishes correctly (manifest-intentd.json
+          # deliberately excluded: its URLs target the private repo).
+          ASSET_REGEX='^(rootfs\.tar\.xz(\.sha256)?|manifest\.json)$' \
+          RELEASE_TITLE="Intent guest image v$VERSION" \
+            ./scripts/mirror-release-assets.sh "guest-image-v$VERSION"
+      - name: Post summary
+        shell: bash
+        run: |
+          sha=$(cut -d' ' -f1 guest-image/out/rootfs.tar.xz.sha256)
+          {
+            echo "## Guest image v$VERSION published"
+            echo ""
+            echo "- rootfs sha256: \`$sha\`"
+            echo "- manifest (mirror): https://github.com/$MIRROR_REPO/releases/download/guest-image-v$VERSION/manifest.json"
+            echo "- manifest (intentd): https://github.com/$GITHUB_REPOSITORY/releases/download/guest-image-v$VERSION/manifest-intentd.json"
+            echo ""
+            echo "If this version is the new built-in pin, bump BUILTIN_IMAGE_VERSION in crates/intent-services/src/sandbox_image.rs."
+          } >> "$GITHUB_STEP_SUMMARY"
