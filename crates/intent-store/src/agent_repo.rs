@@ -2645,6 +2645,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store
@@ -2756,6 +2757,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store
@@ -2901,6 +2903,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         }
     }
@@ -3769,6 +3772,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store
@@ -3897,6 +3901,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store
@@ -3977,6 +3982,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store
@@ -4121,6 +4127,7 @@ mod tests {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                execution_environment: None,
                 disk_usage: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
@@ -4333,6 +4340,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store.insert_workspace(&workspace).await.expect("insert");

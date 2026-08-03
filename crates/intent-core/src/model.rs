@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::settings_file::SandboxType;
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -235,6 +236,13 @@ pub struct Workspace {
     /// paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// The execution environment selected for this workspace at creation
+    /// (§5.1): `direct` | `worktree` | `cow` | `microvm`. Persisted from the
+    /// `workspace.create` `executionEnvironment` param (or derived from the
+    /// legacy `skipIsolation`/CoW-settings path when the param is omitted).
+    /// Omitted for pre-existing rows created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<SandboxType>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
     /// sandboxes, everything). Computed on the `workspace.list` /
@@ -337,6 +345,7 @@ pub fn chief_workspace() -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     }
 }
@@ -495,9 +504,44 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cow_clone_exclude: Option<Vec<String>>,
 
+    /// Execution-environment overrides for microVM-sandboxed workspaces
+    /// (monorepo#1120). Today only carries the guest-image override; absent ⇒
+    /// profile default → built-in pin (see
+    /// `intent-services::sandbox_image::resolve_image_ref`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<ExecutionEnvironmentRepoConfig>,
+
     /// Unknown/extra keys preserved on round-trip to avoid dropping fields other tools add.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `executionEnvironment` block of `.intent/config.json` (monorepo#1120).
+/// Unknown keys round-trip via `extra` like the parent [`RepoConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecutionEnvironmentRepoConfig {
+    /// Guest-image override: the repo pins its own conforming image manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<GuestImageRef>,
+
+    /// Unknown/extra keys preserved on round-trip.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// A reference to a guest-image manifest: where to fetch it and (optionally)
+/// the expected sha256 of the manifest document itself. The rootfs digest
+/// lives inside the manifest; this outer pin protects the manifest fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GuestImageRef {
+    /// Absolute URL of the image `manifest.json`.
+    pub manifest_url: String,
+    /// Hex sha256 of the manifest document; absent ⇒ manifest fetched
+    /// unpinned (rootfs is still always sha256-verified via the manifest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// One chat-context attachment for a workspace (PROTOCOL §5.1 —
@@ -694,6 +738,12 @@ pub struct WorkspaceCreate {
     /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
     /// an existing git repo is a no-op.
     pub is_new_repo: Option<bool>,
+    /// Explicit execution-environment selection (PROTOCOL §5.1):
+    /// `direct` | `worktree` | `cow` | `microvm`. Validated against the
+    /// enabled sandbox profiles and host capabilities; `microvm` is not yet
+    /// implemented and returns a structured error. When omitted the legacy
+    /// `skipIsolation`/CoW-settings derivation applies.
+    pub execution_environment: Option<SandboxType>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }
@@ -3196,6 +3246,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
@@ -3521,6 +3572,7 @@ mod tests {
                 "node_modules".to_string(),
                 "packages/big/cache".to_string(),
             ]),
+            execution_environment: None,
             extra: {
                 let mut m = BTreeMap::new();
                 m.insert("customKey".to_string(), serde_json::json!("customValue"));

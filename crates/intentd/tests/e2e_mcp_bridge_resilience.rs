@@ -76,6 +76,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
         display_status: None,
     }

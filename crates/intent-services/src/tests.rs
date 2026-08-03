@@ -143,6 +143,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     }
 }
@@ -13071,6 +13072,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -13205,6 +13207,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -13330,6 +13333,7 @@ mod rules {
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -13450,6 +13454,7 @@ mod rules {
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -13569,6 +13574,7 @@ mod rules {
             cow_supported: Some(true), // CoW capable!
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -13693,6 +13699,7 @@ mod rules {
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
 
@@ -14266,6 +14273,7 @@ mod known_repo {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            execution_environment: None,
             disk_usage: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
@@ -15143,6 +15151,326 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Worktree)
+        );
+    }
+
+    /// Build [`Services`] with a live settings registry seeded with the given
+    /// setting changes (execution-environment selection tests, §5.1 v4.2).
+    fn services_with_settings(
+        store: Store,
+        root: PathBuf,
+        changes: &[(&str, serde_json::Value)],
+    ) -> (Services, tempfile::TempDir) {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let changes: Vec<(String, serde_json::Value)> = changes
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        registry.apply(&changes).expect("apply settings");
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_settings_registry(registry);
+        (svc, config_dir)
+    }
+
+    /// `executionEnvironment: "direct"` (§5.1 v4.2) behaves like
+    /// `skipIsolation: true`: no checkout is provisioned, `skipWorktree` is
+    /// set, and the selection persists as `executionEnvironment: "direct"`.
+    #[tokio::test]
+    async fn create_with_execution_environment_direct_skips_provisioning() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eedirect-repo");
+        let root = unique_dir("intentd-eedirect-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Direct),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert!(ws.skip_worktree, "direct selection implies skipWorktree");
+        assert!(ws.worktree_path.is_none(), "no checkout provisioned");
+        assert!(ws.checkout_mode.is_none());
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Direct)
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Direct),
+            "selection round-trips through the store"
+        );
+    }
+
+    /// `executionEnvironment: "worktree"` (§5.1 v4.2) forces the
+    /// linked-worktree path even with `workspace.cowIsolation` on.
+    #[tokio::test]
+    async fn create_with_execution_environment_worktree_overrides_cow_setting() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eewt-repo");
+        let root = unique_dir("intentd-eewt-root");
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("workspace.cowIsolation", serde_json::json!(true))],
+        );
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "explicit worktree wins over cowIsolation on"
+        );
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Worktree)
+        );
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree opens");
+        assert!(wt_repo.is_worktree());
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Worktree)
+        );
+    }
+
+    /// Legacy derivation (§5.1 v4.2): when `executionEnvironment` is omitted,
+    /// the provisioning outcome fills the persisted field (`worktree` here).
+    #[tokio::test]
+    async fn create_without_execution_environment_derives_from_provisioning() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eederive-repo");
+        let root = unique_dir("intentd-eederive-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Worktree),
+            "omitted param derives the environment from the provisioning outcome"
+        );
+    }
+
+    /// A disabled type (§5.1 v4.2): `sandbox.cow.enabled` defaults to false,
+    /// so `executionEnvironment: "cow"` fails structured (`-32602`,
+    /// `execution-environment-unavailable`) before any provisioning.
+    #[tokio::test]
+    async fn create_with_disabled_execution_environment_fails_structured() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eedis-repo");
+        let root = unique_dir("intentd-eedis-root");
+        let (svc, _config) = services_with_settings(store.clone(), root.0.clone(), &[]);
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Cow),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("disabled cow must be rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, .. }
+                if environment == "cow"),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// `skipIsolation: true` combined with a non-direct
+    /// `executionEnvironment` (§5.1 v4.2) is contradictory → InvalidParams.
+    #[tokio::test]
+    async fn create_with_skip_isolation_conflicting_environment_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eeconf-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    skip_isolation: Some(true),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("conflicting selection rejected");
+        assert!(matches!(&err, Error::InvalidParams(_)), "got: {err}");
+    }
+
+    /// `executionEnvironment: "microvm"` (§5.1 v4.2 + EE-5): disabled by
+    /// default → structured unavailable; enabled on a capable host → the
+    /// workspace provisions a CoW checkout and persists the microvm
+    /// selection (agents then spawn in per-agent VMs at `ensure_started`).
+    #[tokio::test]
+    async fn create_with_microvm_environment_is_structured() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eemvm-repo");
+        let root = unique_dir("intentd-eemvm-root");
+
+        // Disabled (default) → unavailable.
+        let (svc, _config) = services_with_settings(store.clone(), root.0.clone(), &[]);
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    execution_environment: Some(intent_core::SandboxType::Microvm),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("disabled microvm must be rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, .. }
+                if environment == "microvm"),
+            "got: {err}"
+        );
+
+        // Enabled on a capable host → creates the workspace with a CoW
+        // checkout and the persisted microvm selection (EE-5). Gated on the
+        // same platform + CoW conjunction the daemon validates.
+        let (platform_ok, _) = crate::microvm_platform_supported();
+        if !platform_ok
+            || intent_git::cow_probe(&root.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping live arm: microVM prerequisites absent on this host");
+            return;
+        }
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("sandbox.microvm.enabled", serde_json::json!(true))],
+        );
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Microvm),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("enabled microvm create must succeed")
+            .workspace;
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Microvm),
+            "explicit microvm selection must persist"
+        );
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow),
+            "microvm workspaces provision a CoW checkout"
+        );
+        assert!(
+            ws.worktree_path.is_some(),
+            "microvm workspaces get a real checkout"
+        );
+    }
+
+    /// `executionEnvironment: "cow"` on a CoW-capable filesystem (§5.1 v4.2):
+    /// provisions the CoW clone and persists the selection — no
+    /// `workspace.cowIsolation` involvement. Gated on filesystem support.
+    #[tokio::test]
+    async fn create_with_explicit_cow_environment_provisions_cow() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-eecow-repo");
+        let root = unique_dir("intentd-eecow-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("sandbox.cow.enabled", serde_json::json!(true))],
+        );
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    execution_environment: Some(intent_core::SandboxType::Cow),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Cow)
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Cow)
         );
     }
 

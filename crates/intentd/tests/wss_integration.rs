@@ -364,7 +364,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "4.0",
+        sess[0]["result"]["protocolVersion"], "4.2",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -3192,6 +3192,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     }
 }

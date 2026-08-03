@@ -388,6 +388,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");

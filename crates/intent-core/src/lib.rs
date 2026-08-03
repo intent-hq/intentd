@@ -51,12 +51,13 @@ pub use model::{
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
     ContextItem, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
-    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    EventSubscribeResult, EventUnsubscribeResult, ExecutionEnvironmentRepoConfig, FileActivity,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitPullResult, GitStatus, GuestImageRef, Hook, HookState, KnownRepo,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript,
     RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script, ScriptCreateParams, ScriptMode,
@@ -74,7 +75,7 @@ pub use model::{
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use settings_file::{
-    LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
+    LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{

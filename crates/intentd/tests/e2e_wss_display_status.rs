@@ -399,6 +399,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");

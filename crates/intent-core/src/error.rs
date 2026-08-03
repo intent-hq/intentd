@@ -57,6 +57,22 @@ pub enum Error {
         category: CloneErrorCategory,
         detail: String,
     },
+
+    /// A `workspace.create` `executionEnvironment` selection names a type
+    /// that is disabled in settings or unavailable on this host. Surfaces as
+    /// `-32602` with machine-readable `error.data = { code:
+    /// "execution-environment-unavailable", environment, reason }` (PROTOCOL
+    /// §5.1/§9).
+    #[error("execution environment '{environment}' unavailable: {reason}")]
+    ExecutionEnvironmentUnavailable { environment: String, reason: String },
+
+    /// A `workspace.create` `executionEnvironment` selection names a type the
+    /// daemon recognizes but has not implemented yet (`microvm`). Surfaces as
+    /// `-32603` with `error.data = { code:
+    /// "execution-environment-not-implemented", environment }` (PROTOCOL
+    /// §5.1/§9).
+    #[error("execution environment '{environment}' is not implemented yet")]
+    ExecutionEnvironmentNotImplemented { environment: String },
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -126,6 +142,8 @@ impl Error {
             Error::Internal(_) => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
+            Error::ExecutionEnvironmentUnavailable { .. } => -32602,
+            Error::ExecutionEnvironmentNotImplemented { .. } => -32603,
         }
     }
 }

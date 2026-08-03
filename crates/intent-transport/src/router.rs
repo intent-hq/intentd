@@ -99,6 +99,29 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
         e @ (Error::InvalidParams(_) | Error::InvalidInput(_)) => invalid_params(e.to_string()),
+        // Execution-environment selection failures (§5.1): machine-readable
+        // `data.code` plus the offending environment so clients key off the
+        // structured payload instead of prose.
+        ref e @ Error::ExecutionEnvironmentUnavailable {
+            ref environment,
+            ref reason,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "execution-environment-unavailable",
+                "environment": environment,
+                "reason": reason,
+            })),
+        },
+        ref e @ Error::ExecutionEnvironmentNotImplemented { ref environment } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "execution-environment-not-implemented",
+                "environment": environment,
+            })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),

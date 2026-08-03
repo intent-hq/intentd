@@ -9716,6 +9716,69 @@ impl WorkspaceApi for Services {
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
 
+            // Execution-environment selection (§5.1): validate the explicit
+            // choice against enabled profiles + host availability up front,
+            // before the idempotent op body runs. `direct` and `worktree`
+            // need only be enabled; `cow` additionally requires the
+            // workspaces-root CoW probe; `microvm` requires the platform
+            // check AND the CoW probe, and — being not implemented yet —
+            // then returns a structured NOT_IMPLEMENTED error.
+            if let Some(env) = input.execution_environment {
+                if input.skip_isolation == Some(true) && env != intent_core::SandboxType::Direct {
+                    return Err(Error::InvalidParams(format!(
+                        "skipIsolation conflicts with executionEnvironment '{}'; omit one",
+                        env.as_str()
+                    )));
+                }
+                let sandbox = services.effective_settings().sandbox;
+                if !sandbox_type_enabled(&sandbox, env.as_str()) {
+                    return Err(Error::ExecutionEnvironmentUnavailable {
+                        environment: env.as_str().to_string(),
+                        reason: format!(
+                            "the '{}' execution environment is disabled in settings",
+                            env.as_str()
+                        ),
+                    });
+                }
+                match env {
+                    intent_core::SandboxType::Cow => {
+                        if services.compute_cow_supported().await != Some(true) {
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason: "the workspaces root filesystem does not support \
+                                         copy-on-write clones"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    intent_core::SandboxType::Microvm => {
+                        let (platform_ok, platform_reason) = microvm_platform_supported();
+                        if !platform_ok {
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason: platform_reason
+                                    .unwrap_or("microVM sandboxes are not supported on this host")
+                                    .to_string(),
+                            });
+                        }
+                        if services.compute_cow_supported().await != Some(true) {
+                            return Err(Error::ExecutionEnvironmentUnavailable {
+                                environment: env.as_str().to_string(),
+                                reason: "microVM sandboxes require copy-on-write clone \
+                                         support, and the workspaces root filesystem does \
+                                         not support copy-on-write clones"
+                                    .to_string(),
+                            });
+                        }
+                        // Enabled and available: the workspace provisions a
+                        // CoW checkout below (same arm as `cow`), and agents
+                        // spawn inside per-agent microVMs (EE-5,
+                        // monorepo#1120).
+                    }
+                    _ => {}
+                }
+            }
+
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
             let result = with_idempotency(
@@ -9727,6 +9790,31 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Explicit execution-environment selection (§5.1),
+                    // validated above. `direct` opts out of isolation (same
+                    // as `skipIsolation`); `worktree`/`cow` force the
+                    // checkout mode below regardless of the legacy
+                    // `workspace.cowIsolation` setting; `microvm` provisions
+                    // a CoW checkout (validated CoW-capable above) that each
+                    // agent VM mounts its own reflink clone of (EE-5).
+                    let requested_env = input.execution_environment;
+                    let explicit_cow = matches!(
+                        requested_env,
+                        Some(intent_core::SandboxType::Cow)
+                            | Some(intent_core::SandboxType::Microvm)
+                    );
+                    // Structured-error label for the explicit CoW-checkout
+                    // arms below: names the environment the caller actually
+                    // requested (`cow` or `microvm`).
+                    let explicit_env_label = requested_env
+                        .map(|e| e.as_str().to_string())
+                        .unwrap_or_else(|| "cow".to_string());
+                    let want_cow = match requested_env {
+                        Some(intent_core::SandboxType::Cow)
+                        | Some(intent_core::SandboxType::Microvm) => true,
+                        Some(_) => false,
+                        None => cow_isolation,
+                    };
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
@@ -10061,7 +10149,10 @@ impl WorkspaceApi for Services {
                         repository_name: input.repository_name,
                         worktree_path: input.worktree_path,
                         scope: input.scope,
-                        skip_worktree: input.skip_isolation.unwrap_or(false),
+                        // `executionEnvironment: direct` is the explicit
+                        // spelling of the `skipIsolation` opt-out (§5.1).
+                        skip_worktree: input.skip_isolation.unwrap_or(false)
+                            || requested_env == Some(intent_core::SandboxType::Direct),
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
@@ -10080,6 +10171,10 @@ impl WorkspaceApi for Services {
                         cow_supported: None,
                         display_status: None,
                         checkout_mode: None,
+                        // Explicit selection persists as-is; the legacy
+                        // derivation below fills it from the provisioning
+                        // outcome when the param was omitted.
+                        execution_environment: requested_env,
                         disk_usage: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
@@ -10121,7 +10216,7 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                let mut mode = if cow_isolation
+                                let mut mode = if want_cow
                                     && repo_dir.join(".git").is_file()
                                 {
                                     // A linked worktree's `.git` is a gitfile
@@ -10130,21 +10225,37 @@ impl WorkspaceApi for Services {
                                     // would give the clone a `.git` that still
                                     // points at the ORIGINAL repo, so the
                                     // branch switch + hard reset would rewrite
-                                    // the user's source checkout. Provision a
-                                    // linked worktree instead.
+                                    // the user's source checkout. An explicit
+                                    // `executionEnvironment: cow` fails
+                                    // structured instead of silently changing
+                                    // mode; the settings-derived path
+                                    // provisions a linked worktree.
+                                    if explicit_cow {
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: "repositoryPath has a gitfile .git (linked \
+                                                     worktree or submodule checkout); CoW-cloning \
+                                                     it would corrupt the source checkout"
+                                                .to_string(),
+                                        });
+                                    }
                                     tracing::warn!(
                                         repository_path = %repo_dir.display(),
                                         "workspace.create: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
                                     );
                                     intent_core::CheckoutMode::Worktree
-                                } else if cow_isolation {
+                                } else if want_cow {
                                     // CoW probe: repo dir → `<root>/<wsId>` (the
                                     // clone's parent). The repository can live on
                                     // any filesystem and reflinks cannot cross
-                                    // volumes, so Unsupported (or a probe error)
-                                    // falls back to a linked worktree instead of
-                                    // failing the create — `workspace.cowIsolation`
-                                    // is a preference, not a guarantee.
+                                    // volumes. On the settings-derived path an
+                                    // Unsupported (or errored) probe falls back
+                                    // to a linked worktree instead of failing
+                                    // the create — `workspace.cowIsolation` is
+                                    // a preference, not a guarantee. An explicit
+                                    // `executionEnvironment: cow` selection
+                                    // never falls back silently: it fails with
+                                    // a structured error instead.
                                     std::fs::create_dir_all(&ws_dir).map_err(|e| {
                                         Error::Internal(format!(
                                             "cannot create workspace dir for CoW probe: {e}"
@@ -10166,6 +10277,18 @@ impl WorkspaceApi for Services {
                                             intent_core::CheckoutMode::Cow
                                         }
                                         Ok(intent_git::CowSupport::Unsupported) => {
+                                            if explicit_cow {
+                                                remove_workspace_dir_if_empty(&ws_dir);
+                                                return Err(
+                                                    Error::ExecutionEnvironmentUnavailable {
+                                                        environment: explicit_env_label.clone(),
+                                                        reason: "the repository's filesystem \
+                                                                 cannot CoW-clone into the \
+                                                                 workspaces root"
+                                                            .to_string(),
+                                                    },
+                                                );
+                                            }
                                             tracing::warn!(
                                                 repository_path = %repo_dir.display(),
                                                 workspaces_root = %workspaces_root_pathbuf.display(),
@@ -10174,6 +10297,15 @@ impl WorkspaceApi for Services {
                                             intent_core::CheckoutMode::Worktree
                                         }
                                         Err(e) => {
+                                            if explicit_cow {
+                                                remove_workspace_dir_if_empty(&ws_dir);
+                                                return Err(
+                                                    Error::ExecutionEnvironmentUnavailable {
+                                                        environment: explicit_env_label.clone(),
+                                                        reason: format!("CoW probe failed: {e}"),
+                                                    },
+                                                );
+                                            }
                                             tracing::warn!(
                                                 repository_path = %repo_dir.display(),
                                                 error = %e,
@@ -10261,6 +10393,21 @@ impl WorkspaceApi for Services {
                                 let sha = match provision(mode).await {
                                     Ok(sha) => sha,
                                     Err(Error::Unsupported(reason))
+                                        if mode == intent_core::CheckoutMode::Cow
+                                            && explicit_cow =>
+                                    {
+                                        // Explicit `executionEnvironment: cow`
+                                        // never silently degrades to a linked
+                                        // worktree — surface the structured
+                                        // unavailability instead (#774 cleanup
+                                        // still applies).
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason,
+                                        });
+                                    }
+                                    Err(Error::Unsupported(reason))
                                         if mode == intent_core::CheckoutMode::Cow =>
                                     {
                                         // Safety net: the pre-provisioning
@@ -10320,7 +10467,7 @@ impl WorkspaceApi for Services {
                                         // is left empty, so a failed create
                                         // leaves the workspaces root clean
                                         // (#774).
-                                        if cow_isolation {
+                                        if want_cow {
                                             remove_workspace_dir_if_empty(&ws_dir);
                                         }
                                         return Err(e);
@@ -10329,6 +10476,19 @@ impl WorkspaceApi for Services {
                                 ws.worktree_path =
                                     Some(wt_path.to_string_lossy().to_string());
                                 ws.checkout_mode = Some(mode);
+                                // Legacy derivation: when `executionEnvironment`
+                                // was omitted, persist the environment the
+                                // settings-driven path actually provisioned.
+                                if ws.execution_environment.is_none() {
+                                    ws.execution_environment = Some(match mode {
+                                        intent_core::CheckoutMode::Cow => {
+                                            intent_core::SandboxType::Cow
+                                        }
+                                        intent_core::CheckoutMode::Worktree => {
+                                            intent_core::SandboxType::Worktree
+                                        }
+                                    });
+                                }
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
@@ -11599,6 +11759,7 @@ impl WorkspaceApi for Services {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                execution_environment: None,
                 disk_usage: None,
             };
             // Provision the checkout for the duplicate (TS

@@ -82,6 +82,7 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     }
 }

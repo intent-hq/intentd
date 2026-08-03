@@ -220,6 +220,36 @@ where
     }
 }
 
+/// Send one JSON-RPC frame and return the `error` member; panics on success.
+async fn wss_rpc_err<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(20), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert!(v.get("error").is_some(), "rpc {method} succeeded: {v}");
+                    return v["error"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 /// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
@@ -1446,6 +1476,271 @@ async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight()
         "duplicate fallback is a linked worktree (gitfile .git)"
     );
     assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Flip a `sandbox.*` setting over the wire and assert the change applied.
+async fn set_sandbox_setting<S>(ws: &mut WebSocketStream<S>, id: i64, path: &str, value: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = wss_rpc(
+        ws,
+        id,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": value }] }),
+    )
+    .await;
+    assert_eq!(resp["applied"][0]["path"], json!(path), "applied: {resp}");
+}
+
+/// Scenario H — execution-environment selection matrix over WSS (§5.1 v4.2):
+/// explicit `worktree` overrides `workspace.cowIsolation` ON; explicit
+/// `direct` provisions nothing and persists the selection; a disabled type
+/// (`cow` is disabled by default) fails `-32602` with the structured
+/// `execution-environment-unavailable` payload; `microvm` disabled fails the
+/// same way. Runs on any filesystem (no CoW dependency in these arms).
+#[tokio::test]
+async fn workspace_create_execution_environment_selection_over_wss() {
+    const TEST: &str = "workspace.create executionEnvironment WSS e2e";
+    if !git_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eesel");
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    // Explicit worktree wins over cowIsolation ON.
+    let result = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "explicit worktree overrides cowIsolation: {workspace}"
+    );
+    assert_eq!(
+        workspace["executionEnvironment"],
+        json!("worktree"),
+        "selection persisted on the row: {workspace}"
+    );
+    let wt_path = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+    assert!(wt_path.join(".git").is_file(), "linked worktree gitfile");
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    // Explicit direct: nothing provisioned, selection persisted.
+    let result = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.create",
+        json!({
+            "title": "EE Direct E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "direct",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert!(
+        workspace["worktreePath"].is_null(),
+        "direct: no checkout provisioned: {workspace}"
+    );
+    assert!(workspace["checkoutMode"].is_null());
+    assert_eq!(workspace["executionEnvironment"], json!("direct"));
+    assert_eq!(workspace["skipWorktree"], json!(true));
+
+    // Round-trip through workspace.get (store persistence on the wire).
+    let got = wss_rpc(
+        &mut ws,
+        4,
+        "workspace.get",
+        json!({ "workspaceId": workspace["id"] }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["executionEnvironment"], json!("direct"));
+
+    // Disabled type (`sandbox.cow.enabled` defaults to false): structured
+    // -32602 with the machine-readable payload.
+    let err = wss_rpc_err(
+        &mut ws,
+        5,
+        "workspace.create",
+        json!({
+            "title": "EE Disabled CoW E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "disabled cow: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("cow"));
+    assert!(err["data"]["reason"].is_string(), "reason present: {err}");
+
+    // Disabled microvm: same structured unavailability.
+    let err = wss_rpc_err(
+        &mut ws,
+        6,
+        "workspace.create",
+        json!({
+            "title": "EE Disabled MicroVM E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "microvm",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "disabled microvm: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable")
+    );
+    assert_eq!(err["data"]["environment"], json!("microvm"));
+
+    // Contradictory skipIsolation + non-direct environment: plain -32602.
+    let err = wss_rpc_err(
+        &mut ws,
+        7,
+        "workspace.create",
+        json!({
+            "title": "EE Conflict E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "skipIsolation": true,
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "conflicting params: {err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario H2 — explicit `executionEnvironment: "cow"` over WSS on a
+/// CoW-capable filesystem: enabling `sandbox.cow.enabled` makes the selection
+/// pass validation and provision a standalone CoW clone with the selection
+/// persisted. Gated on CoW support.
+#[tokio::test]
+async fn workspace_create_explicit_cow_environment_over_wss() {
+    const TEST: &str = "workspace.create explicit-cow WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eecow");
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_sandbox_setting(&mut ws, 1, "sandbox.cow.enabled", json!(true)).await;
+    // cowIsolation stays OFF: the explicit selection alone drives CoW.
+    set_cow_isolation(&mut ws, 2, false).await;
+
+    let result = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.create",
+        json!({
+            "title": "EE Explicit CoW E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &result["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("cow"),
+        "explicit cow provisions a CoW clone with cowIsolation off: {workspace}"
+    );
+    assert_eq!(workspace["executionEnvironment"], json!("cow"));
+    let wt_path = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+    assert!(
+        wt_path.join(".git").is_dir(),
+        "standalone clone (not a worktree gitfile)"
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario H3 — explicit `executionEnvironment: "cow"` with the clone forced
+/// to fail as unsupported mid-flight (same daemon seam as Scenario B2): the
+/// explicit selection must NOT silently fall back to a worktree — the create
+/// fails `-32602` with the structured `execution-environment-unavailable`
+/// payload. Gated on CoW support (the probe must pass for the mid-flight arm
+/// to be reachable).
+#[tokio::test]
+async fn workspace_create_explicit_cow_never_falls_back_over_wss() {
+    const TEST: &str = "workspace.create explicit-cow no-fallback WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("eecownf");
+    let (daemon, port, cfg) = boot(
+        &root,
+        &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
+    )
+    .await;
+    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_sandbox_setting(&mut ws, 1, "sandbox.cow.enabled", json!(true)).await;
+
+    let err = wss_rpc_err(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "EE CoW No-Fallback E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "explicit cow fails: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload instead of a silent worktree fallback: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("cow"));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

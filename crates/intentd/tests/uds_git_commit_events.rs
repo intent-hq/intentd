@@ -130,6 +130,7 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        execution_environment: None,
         disk_usage: None,
     }
 }
