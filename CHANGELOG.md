@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-08-02
+
+### 🚀 Features
+
+- Queue-aware retire-on-completion delivery for ungrouped watches ([#836](https://github.com/intent-hq/intentd/pull/836))
+- Register hardwareConsole.state settings bag key ([#853](https://github.com/intent-hq/intentd/pull/853))
+- Stamp queueInfo metadata on drained queue entries ([#834](https://github.com/intent-hq/intentd/pull/834))
+- Full-text search over agent chat transcripts ([#845](https://github.com/intent-hq/intentd/pull/845))
+- Expose physical workspace disk usage on workspace.list/get ([#849](https://github.com/intent-hq/intentd/pull/849))
+- Background hook scheduler with console capture ([#850](https://github.com/intent-hq/intentd/pull/850))
+- Daemon-owned specialist default-model resolution with provider guards ([#852](https://github.com/intent-hq/intentd/pull/852))
+- [**breaking**] Hook state, 60-min TTL, and hook-aware parent settlement ([#854](https://github.com/intent-hq/intentd/pull/854))
+
+### 🐛 Bug Fixes
+
+- *(services)* Redeliver stranded completion watch after queue retraction/edit ([#841](https://github.com/intent-hq/intentd/pull/841))
+- Interim coordinator idle no longer seals the after_all group ([#842](https://github.com/intent-hq/intentd/pull/842))
+- Busy-aware interim classification for completion delivery and sealing ([#846](https://github.com/intent-hq/intentd/pull/846))
+- *(pty)* Escalate to SIGKILL when the process group is non-empty after grace ([#847](https://github.com/intent-hq/intentd/pull/847))
+- *(services)* Reap group stragglers before recording a script exit ([#851](https://github.com/intent-hq/intentd/pull/851))
+
+### 🔧 Refactor
+
+- Remove one_shot from completion-watch registry, registration paths, and store ([#832](https://github.com/intent-hq/intentd/pull/832))
+- Drop oneShot from subscription wire payloads and stale watch docs ([#837](https://github.com/intent-hq/intentd/pull/837))
+
+### 🧪 Testing
+
+- Deflake specialists/skills watcher drain helpers ([#839](https://github.com/intent-hq/intentd/pull/839))
+- Stop leaking test temp dirs (/tmp) across the suite ([#843](https://github.com/intent-hq/intentd/pull/843))
+- Fix residual temp-file leaks (intent-ctx/intent-host, sqlite sidecars, teardown races) ([#848](https://github.com/intent-hq/intentd/pull/848))
+
+
 ## [0.2.16] - 2026-08-01
 
 ### 🚀 Features
