@@ -625,6 +625,22 @@ pub(crate) fn list_directory(path: Option<&str>) -> Result<Value, String> {
     list_directory_with(path, &home_dir())
 }
 
+/// Build the `host.createDirectory` result. Creates the directory with parents
+/// (`create_dir_all` semantics — succeeding when the directory already exists)
+/// after `~` expansion against `home`, and returns `{ path }` with the fully
+/// expanded created path so the FE can navigate into it. Returns the error
+/// message (mapped to `-32603` by the caller) on IO errors.
+pub(crate) fn create_directory_with(path: &str, home: &Path) -> Result<Value, String> {
+    let target = expand_path(path, home);
+    std::fs::create_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    Ok(json!({ "path": target.to_string_lossy() }))
+}
+
+/// Production `create_directory` — resolves `home` from the environment.
+pub(crate) fn create_directory(path: &str) -> Result<Value, String> {
+    create_directory_with(path, &home_dir())
+}
+
 /// Build the `host.directoryStatus` result. Mirrors the FE
 /// `file:getDirectoryStatus` handler — worktree-aware `.git` detection, a
 /// parent-git-root walk, and a `relativePathFromGitRoot` only when the path is
