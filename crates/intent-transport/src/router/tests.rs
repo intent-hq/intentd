@@ -90,6 +90,19 @@ fn ws_with(id: &WorkspaceId) -> Workspace {
 }
 
 impl WorkspaceApi for FakeApi {
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "streams": [{
+                    "agentId": "agent-active",
+                    "sessionId": "agent-active",
+                    "workspaceId": "ws-active",
+                    "startTime": 1_750_000_000_000_i64,
+                }],
+            }))
+        })
+    }
+
     fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async { Ok(vec![sample_ws()]) })
     }
@@ -3147,6 +3160,22 @@ async fn agent_methods_are_routed_not_method_not_found() {
             .await
             .unwrap();
     assert_eq!(err_code(&v), -32603);
+
+    // agent.listActive is daemon-global and accepts an empty params object.
+    let v = call(r#"{"jsonrpc":"2.0","id":7,"method":"agent.listActive","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "streams": [{
+                "agentId": "agent-active",
+                "sessionId": "agent-active",
+                "workspaceId": "ws-active",
+                "startTime": 1_750_000_000_000_i64,
+            }],
+        })
+    );
 
     // agent.getModels takes no params and must route too.
     let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.getModels"}"#)

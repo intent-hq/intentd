@@ -2847,6 +2847,32 @@ impl AgentManager {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
+    /// Snapshot every agent with a turn currently in flight together with its
+    /// owning workspace. This is the daemon-global source for
+    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    ///
+    /// Lock-order invariant: `busy` is always acquired before `agent_ws`
+    /// (here and in every busy/agent_ws mutator — `try_begin`,
+    /// `release_in_flight_slot`, `end_turn`), and mutators update both maps
+    /// while holding the `busy` lock. That makes a claim/release visible
+    /// atomically from this snapshot's perspective: a busy agent always has
+    /// its `agent_ws` entry.
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let busy = self.busy.lock().unwrap();
+        let agent_ws = self.agent_ws.lock().unwrap();
+        let mut active = busy
+            .iter()
+            .filter_map(|agent_id| {
+                agent_ws
+                    .get(agent_id)
+                    .cloned()
+                    .map(|workspace_id| (agent_id.clone(), workspace_id))
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        active
+    }
+
     /// Atomically claim the in-flight slot for `agent_id` in `workspace_id`:
     /// `true` when the agent was idle (now marked busy), `false` when a turn is
     /// already running. On a successful claim the agent's workspace is recorded
@@ -2857,12 +2883,21 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
+        // Insert into `agent_ws` while still holding the `busy` lock
+        // (busy → agent_ws order, matching `list_busy`) so a concurrent
+        // `list_busy` never observes a busy agent without its workspace.
+        let claimed = {
+            let mut busy = self.busy.lock().unwrap();
+            let claimed = busy.insert(agent_id.clone());
+            if claimed {
+                self.agent_ws
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), workspace_id.clone());
+            }
+            claimed
+        };
         if claimed {
-            self.agent_ws
-                .lock()
-                .unwrap()
-                .insert(agent_id.clone(), workspace_id.clone());
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -2881,14 +2916,24 @@ impl AgentManager {
     /// terminal spawn failure already persisted Error status and we only need
     /// to release busy/agent_ws so a future message can restart the worker).
     async fn release_in_flight_slot(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
         }
+    }
+
+    /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
+    /// `list_busy` (both maps mutated under the `busy` lock, busy → agent_ws
+    /// order). Returns `None` when the agent was not busy, otherwise the
+    /// removed `agent_ws` entry.
+    fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
+        let mut busy = self.busy.lock().unwrap();
+        if !busy.remove(agent_id) {
+            return None;
+        }
+        Some(self.agent_ws.lock().unwrap().remove(agent_id))
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
@@ -2897,11 +2942,9 @@ impl AgentManager {
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
