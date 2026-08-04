@@ -1,15 +1,16 @@
-//! Regression tests for specialist frontmatter `model`/`modelTier` and
-//! display-name resolution at agent creation.
+//! Regression tests for specialist frontmatter `model` and display-name
+//! resolution at agent creation.
 //!
 //! Model: when `agent.create` receives no explicit model but a specialist id,
 //! the single daemon-side resolver (`resolve_agent_default_model`) applies the
 //! specialist's resolved frontmatter `model` (3-tier: project > user >
-//! bundled, provider-guarded), then `modelTier` (strictly within the resolved
-//! provider's tier table), before the settings chain.
+//! bundled, provider-guarded) before the settings chain. `modelTier` is
+//! retired (PROTOCOL §5.11): a lingering frontmatter line is
+//! tolerated-and-ignored and never participates in resolution.
 //!
 //! Full precedence:
-//! explicit model > specialist frontmatter model > specialist frontmatter
-//! modelTier > settings chain > CLI default
+//! explicit model > specialist frontmatter model > settings chain > CLI
+//! default
 //!
 //! Name: when `agent.create` receives no explicit name but a specialist id,
 //! the specialist's resolved display name (frontmatter `name`) is used before
@@ -96,9 +97,9 @@ fn create_specialist_without_model(dir: &Path, id: &str) {
     std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
 }
 
-/// Create a specialist file with a frontmatter modelTier (no model) in the
-/// user tier.
-fn create_specialist_with_tier(dir: &Path, id: &str, tier: &str) {
+/// Create a specialist file with a retired frontmatter modelTier (no model)
+/// in the user tier.
+fn create_specialist_with_retired_tier(dir: &Path, id: &str, tier: &str) {
     let content = format!(
         "---\nname: \"{}\"\ndescription: \"Test specialist\"\nmodelTier: \"{}\"\n---\n\nTest prompt",
         id, tier
@@ -198,24 +199,48 @@ async fn missing_frontmatter_falls_through_to_settings() {
     assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
 }
 
-/// Specialist frontmatter `modelTier` resolves within the resolved provider's
-/// tier table (default provider auggie: smart → opus4.7).
+/// Retirement regression (PROTOCOL §5.11): a lingering frontmatter
+/// `modelTier` never resolves through the provider tier table — with nothing
+/// else configured, session.model stays unset (CLI default).
 #[tokio::test]
-async fn specialist_model_tier_resolves_within_provider_table() {
+async fn retired_model_tier_never_resolves() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+    create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("opus4.7"));
+    assert_eq!(
+        got.model, None,
+        "retired modelTier must not pin auggie's smart-tier model"
+    );
 }
 
-/// The delegate path honors `modelTier` identically to direct create — it
-/// funnels through the same resolver in `agent_create_op`.
+/// Retirement regression: a tier-declaring specialist falls through to the
+/// settings chain (the retired key never shadows configured defaults).
 #[tokio::test]
-async fn model_tier_honored_on_delegate_path() {
+async fn retired_model_tier_falls_through_to_settings() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
+    create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
+
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[(
+            "backgroundAgents.defaultModel".to_string(),
+            json!("auggie:haiku"),
+        )])
+        .expect("set background");
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+}
+
+/// The delegate path ignores the retired `modelTier` identically to direct
+/// create — it funnels through the same resolver in `agent_create_op`.
+#[tokio::test]
+async fn retired_model_tier_ignored_on_delegate_path() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
 
     let resp = svc
         .agent_delegate_op(
@@ -231,50 +256,24 @@ async fn model_tier_honored_on_delegate_path() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let got = svc.agent_get_op(child.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("opus4.7"));
-}
-
-/// A tier-declaring specialist on a provider without a tier table (grok)
-/// falls through to settings/CLI default — never another provider's model.
-#[tokio::test]
-async fn model_tier_never_leaks_across_providers() {
-    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
-
-    let id = create_agent_with_provider(&svc, &ws, "tiered", "grok").await;
-    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(
-        got.model, None,
-        "expected CLI default, not auggie's opus4.7"
-    );
-}
-
-/// claude-code's smart tier is the literal "default" sentinel ("use the CLI
-/// default"), not a model id — it falls through instead of being pinned.
-#[tokio::test]
-async fn claude_code_default_sentinel_falls_through() {
-    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_with_tier(specialists_dir.path(), "tiered", "smart");
-
-    let id = create_agent_with_provider(&svc, &ws, "tiered", "claude-code").await;
-    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(
-        got.model, None,
-        "the \"default\" sentinel must not be pinned"
-    );
+    assert_eq!(got.model, None, "retired modelTier must not pin a model");
 }
 
 /// A specialist frontmatter model owned by another provider is ignored
-/// (provider guard) — resolution falls through to the tier step.
+/// (provider guard) — resolution falls through to the settings chain; a
+/// lingering `modelTier` no longer bridges the gap.
 #[tokio::test]
-async fn frontmatter_model_of_other_provider_falls_through_to_tier() {
+async fn frontmatter_model_of_other_provider_falls_through_to_settings() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     let content = "---\nname: \"Mixed\"\ndescription: \"d\"\nmodel: \"auggie:opus\"\nmodelTier: \"smart\"\n---\n\nTest prompt";
     std::fs::write(specialists_dir.path().join("mixed.md"), content).expect("write specialist");
 
     let id = create_agent_with_provider(&svc, &ws, "mixed", "codex").await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("gpt-5.3-codex/xhigh"));
+    assert_eq!(
+        got.model, None,
+        "auggie-owned model ignored and retired modelTier never resolves"
+    );
 }
 
 /// Bundled specialists no longer declare `modelTier` — they inherit the
