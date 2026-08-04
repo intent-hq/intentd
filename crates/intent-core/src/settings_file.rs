@@ -64,6 +64,7 @@ pub struct SettingsFile {
     pub events: EventsSettings,
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
+    pub agent_features: AgentFeaturesSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -500,6 +501,49 @@ impl Default for HooksSettings {
     }
 }
 
+/// `[agentFeatures]` — per-feature toggles for what agents see and may call
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentFeaturesSettings {
+    /// `agentFeatures.backgroundHooks` — expose background hooks
+    /// (`ws.hook.*`) to agents.
+    pub background_hooks: bool,
+    /// `agentFeatures.hostExec` — expose one-shot host command execution
+    /// (`ws.host.exec`) to agents.
+    pub host_exec: bool,
+    /// `agentFeatures.scripts` — expose saved scripts (`ws.script.*`) to
+    /// agents.
+    pub scripts: bool,
+    /// `agentFeatures.terminalAccess` — expose terminal read access
+    /// (`ws.terminal.*`) to agents.
+    pub terminal_access: bool,
+    /// `agentFeatures.browserAutomation` — expose browser automation
+    /// (`ws.browser.*`) to agents.
+    pub browser_automation: bool,
+    /// `agentFeatures.richChatBlocks` — include rich chat block guidance
+    /// (mermaid, ws-block, nav-link) in agent prompts.
+    pub rich_chat_blocks: bool,
+    /// `agentFeatures.structuredQuestions` — expose structured questions
+    /// (`ws.app.question.ask`) to agents.
+    pub structured_questions: bool,
+}
+
+impl Default for AgentFeaturesSettings {
+    fn default() -> Self {
+        Self {
+            background_hooks: true,
+            host_exec: true,
+            scripts: true,
+            terminal_access: true,
+            browser_automation: true,
+            rich_chat_blocks: true,
+            structured_questions: true,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -888,6 +932,26 @@ toonOutput = true
 # Max hooks per agent -- cap on concurrently active (scheduled/running)
 # background hooks per agent.
 maxPerAgent = 5
+
+[agentFeatures]
+# All toggles default to on; changes apply to new agent sessions only.
+# Background hooks -- expose background hooks (ws.hook.*) to agents.
+backgroundHooks = true
+# Host exec -- expose one-shot host command execution (ws.host.exec) to
+# agents.
+hostExec = true
+# Saved scripts -- expose saved scripts (ws.script.*) to agents.
+scripts = true
+# Terminal access -- expose terminal read access (ws.terminal.*) to agents.
+terminalAccess = true
+# Browser automation -- expose browser automation (ws.browser.*) to agents.
+browserAutomation = true
+# Rich chat blocks -- include rich chat block guidance (mermaid, ws-block,
+# nav-link) in agent prompts.
+richChatBlocks = true
+# Structured questions -- expose structured questions (ws.app.question.ask)
+# to agents.
+structuredQuestions = true
 "##;
 
 #[cfg(test)]
@@ -972,12 +1036,19 @@ mod tests {
             DEFAULT_WORKSPACE_API_TOON_OUTPUT
         );
         assert_eq!(d.hooks.max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
+        assert!(d.agent_features.background_hooks);
+        assert!(d.agent_features.host_exec);
+        assert!(d.agent_features.scripts);
+        assert!(d.agent_features.terminal_access);
+        assert!(d.agent_features.browser_automation);
+        assert!(d.agent_features.rich_chat_blocks);
+        assert!(d.agent_features.structured_questions);
     }
 
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
@@ -989,6 +1060,22 @@ mod tests {
         assert!(parsed.server.ws_api.enabled);
         assert_eq!(parsed.server.ws_api.port, 2000);
         assert_eq!(parsed.hooks.max_per_agent, 9);
+        assert!(!parsed.agent_features.background_hooks);
+        assert!(!parsed.agent_features.host_exec);
+        assert!(!parsed.agent_features.rich_chat_blocks);
+        // Keys absent from a partial [agentFeatures] table keep their default.
+        assert!(parsed.agent_features.scripts);
+        assert!(parsed.agent_features.terminal_access);
+        assert!(parsed.agent_features.browser_automation);
+        assert!(parsed.agent_features.structured_questions);
+    }
+
+    #[test]
+    fn agent_features_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[agentFeatures]\nhostExek = false\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agentFeatures"), "names the table: {msg}");
+        assert!(msg.contains("hostExek"), "names the bad key: {msg}");
     }
 
     #[test]
