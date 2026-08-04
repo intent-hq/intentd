@@ -280,6 +280,9 @@ jobs:
             fi
           fi
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          # Re-stamp published_at so the fixed release reflects this refresh
+          # (GitHub never updates it on asset uploads).
+          ./scripts/refresh-release-published-at.sh sitter-latest "$GITHUB_REPOSITORY"
 
   # Mirror the sitter installer assets to the public intent-hq/intentd-releases
   # repo (same pattern as the daemon mirroring in publish-channel-manifest.yml
@@ -355,6 +358,9 @@ jobs:
           PRUNE_STALE: "true"
         run: |
           ./scripts/mirror-release-assets.sh sitter-latest
+          # Re-stamp published_at on the mirrored fixed release too.
+          GH_TOKEN="$DEST_GH_TOKEN" \
+            ./scripts/refresh-release-published-at.sh sitter-latest "$DEST_REPO"
 
   # Render the hand-maintained formula template with the real version +
   # sha256s and push it to the tap as Formula/intentd.rb. Skipped on
@@ -497,3 +503,6 @@ jobs:
             intentd_amd64.deb intentd_amd64.deb.sha256 \
             intentd_arm64.deb intentd_arm64.deb.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
+          # Re-stamp published_at so the fixed release reflects this refresh
+          # (GitHub never updates it on asset uploads).
+          ./scripts/refresh-release-published-at.sh sitter-latest "$GITHUB_REPOSITORY"

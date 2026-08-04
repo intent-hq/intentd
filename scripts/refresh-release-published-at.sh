@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Re-stamp a release's published_at by toggling it through draft and back.
+#
+# Usage: refresh-release-published-at.sh <tag> [repo]
+#
+# GitHub sets published_at only on the draft->published transition, so rolling
+# releases that are refreshed in place (channel-beta / channel-stable /
+# sitter-latest) keep their original publish date forever and look stale in
+# the releases UI. PATCHing draft:true then draft:false re-publishes the
+# release, refreshing published_at without touching the tag, assets, or notes.
+#
+# The un-draft re-applies the release's prior `prerelease` flag and always
+# sends make_latest:false — every rolling release is created with
+# --latest=false and must never shadow real releases. The un-draft is retried
+# (5 attempts with backoff) and the script exits non-zero if the release is
+# left drafted, since a drafted release is invisible to consumers. [repo]
+# defaults to GITHUB_REPOSITORY; pass it explicitly to refresh a release on
+# another repo (e.g. the public intent-hq/intentd-releases mirror).
+# Requires: gh (authenticated via GH_TOKEN) and jq.
+set -euo pipefail
+
+usage="usage: refresh-release-published-at.sh <tag> [repo]"
+TAG="${1:?$usage}"
+REPO="${2:-${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set (or pass [repo])}}"
+
+# releases/tags/<tag> resolves only published releases, which is exactly what
+# a refresh needs (a draft has no published_at to refresh).
+if ! release_json=$(gh api "repos/$REPO/releases/tags/$TAG"); then
+  echo "error: no published release for tag $TAG on $REPO" >&2
+  exit 1
+fi
+release_id=$(jq -r '.id' <<<"$release_json")
+prerelease=$(jq -r '.prerelease' <<<"$release_json")
+
+gh api --method PATCH "repos/$REPO/releases/$release_id" \
+  -F draft=true --silent
+
+# From here the release is drafted; every failure path below must end in the
+# loud non-zero exit so a release can never silently stay in draft.
+undrafted=false
+for attempt in 1 2 3 4 5; do
+  # make_latest is a string enum ("true"/"false"/"legacy"), hence -f not -F.
+  if patched=$(gh api --method PATCH "repos/$REPO/releases/$release_id" \
+      -F draft=false -F "prerelease=$prerelease" -f make_latest=false) \
+    && [[ $(jq -r '.draft' <<<"$patched") == "false" ]]; then
+    undrafted=true
+    break
+  fi
+  echo "warning: un-draft attempt $attempt/5 failed for $TAG on $REPO; retrying" >&2
+  sleep $((attempt * 2))
+done
+
+if [[ "$undrafted" != "true" ]]; then
+  echo "error: release $TAG on $REPO is stuck in DRAFT after 5 un-draft attempts;" \
+    "fix manually: gh release edit $TAG --repo $REPO --draft=false" >&2
+  exit 1
+fi
+echo "refreshed published_at on $TAG ($REPO)" >&2
