@@ -56,6 +56,7 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
+    pub voice: VoiceSettings,
     pub context: ContextSettings,
     pub storage: StorageSettings,
     pub workspaces: WorkspacesSettings,
@@ -359,6 +360,48 @@ pub struct SentrySettings {
     /// `accounts.sentry.organization` — Sentry organization slug (non-secret
     /// companion of `accounts.sentry.token`).
     pub organization: Option<String>,
+}
+
+/// `[voice]` — speech-to-text (`voice.*`). The provider API keys
+/// (`voice.elevenlabs.apiKey`, `voice.openai.apiKey`) are secrets and live in
+/// `secrets.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceSettings {
+    /// `voice.provider` — active speech-to-text provider.
+    pub provider: VoiceProvider,
+    /// `[voice.openai]` — OpenAI provider tuning.
+    pub openai: VoiceOpenAiSettings,
+}
+
+/// `voice.provider` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceProvider {
+    #[default]
+    Elevenlabs,
+    Openai,
+}
+
+/// `[voice.openai]` — OpenAI speech-to-text tuning (`voice.openai.*`,
+/// non-secret; the API key is a secret in `secrets.json`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceOpenAiSettings {
+    /// `voice.openai.model` — transcription model.
+    pub model: VoiceOpenAiModel,
+}
+
+/// `voice.openai.model` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VoiceOpenAiModel {
+    #[default]
+    #[serde(rename = "gpt-4o-transcribe")]
+    Gpt4oTranscribe,
+    #[serde(rename = "gpt-4o-mini-transcribe")]
+    Gpt4oMiniTranscribe,
+    #[serde(rename = "whisper-1")]
+    Whisper1,
 }
 
 /// `[context]` — context engine (`context.*`).
@@ -886,6 +929,17 @@ exposeGitCredentialToChildren = true
 # accounts.sentry.token secret).
 # organization = "my-org"
 
+[voice]
+# Voice provider -- active speech-to-text provider: "elevenlabs" or "openai".
+# The API keys are secrets and live in secrets.json (voice.elevenlabs.apiKey /
+# voice.openai.apiKey).
+provider = "elevenlabs"
+
+[voice.openai]
+# OpenAI voice model -- transcription model: "gpt-4o-transcribe",
+# "gpt-4o-mini-transcribe", or "whisper-1".
+model = "gpt-4o-transcribe"
+
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -1024,6 +1078,8 @@ mod tests {
         );
         assert!(d.source_control.github.expose_git_credential_to_children);
         assert_eq!(d.accounts.sentry.organization, None);
+        assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
+        assert_eq!(d.voice.openai.model, VoiceOpenAiModel::Gpt4oTranscribe);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);

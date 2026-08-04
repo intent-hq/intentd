@@ -1093,19 +1093,34 @@ pub(crate) fn user_message_blocks(
     Value::Array(blocks)
 }
 
-/// `true` iff a message's content-block array carries at least one pending
-/// question resource block (`application/vnd.intent.question+json` — the MIME
-/// type `ws.app.question.ask` emits; reused from `intent-acp` so hold
-/// detection cannot drift from the binding). Non-array content is `false`.
-pub(crate) fn has_question_blocks(content: &Value) -> bool {
-    content.as_array().is_some_and(|blocks| {
-        blocks.iter().any(|b| {
-            b.get("type").and_then(Value::as_str) == Some("resource")
-                && b.pointer("/resource/mimeType").and_then(Value::as_str)
-                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
-        })
+/// Number of question resource blocks (`application/vnd.intent.question+json`
+/// — the MIME type `ws.app.question.ask` emits; reused from `intent-acp` so
+/// hold detection cannot drift from the binding) in a message's content-block
+/// array. Non-array content counts zero.
+pub(crate) fn question_block_count(content: &Value) -> usize {
+    content.as_array().map_or(0, |blocks| {
+        blocks
+            .iter()
+            .filter(|b| {
+                b.get("type").and_then(Value::as_str) == Some("resource")
+                    && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                        == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+            })
+            .count()
     })
 }
+
+/// `true` iff a message's content-block array carries at least one pending
+/// question resource block.
+pub(crate) fn has_question_blocks(content: &Value) -> bool {
+    question_block_count(content) > 0
+}
+
+/// `messageMetadata.type` marker on the questions-dismissed system notice
+/// (PROTOCOL §5.5, `agent.dismissQuestions`) — the FE keys on it to render
+/// the notice as a system chip instead of a plain user message. Follows the
+/// `hook_wake` / `event_notification` metadata conventions.
+pub(crate) const QUESTIONS_DISMISSED_METADATA_TYPE: &str = "questions_dismissed";
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
 /// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
@@ -1800,6 +1815,14 @@ impl Services {
     /// polling (PROTOCOL §6.5). Emitted when watches are added (delegate /
     /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
+    ///
+    /// The watch set is also a `displayStatus` in-progress promotion input
+    /// (an idle parent still waiting on delegated children reads as active
+    /// work), so every publish recomputes the anchor workspace's derived
+    /// status — transition-only and best-effort
+    /// ([`Services::maybe_emit_display_status_changed`] dedupes against the
+    /// last observation and swallows errors), so a no-op recompute stays
+    /// silent and can never break the watch lifecycle.
     pub(crate) async fn publish_subscriptions_changed(
         &self,
         workspace_id: &WorkspaceId,
@@ -1823,6 +1846,7 @@ impl Services {
             }),
         )
         .await;
+        self.maybe_emit_display_status_changed(workspace_id).await;
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
@@ -3393,8 +3417,11 @@ impl Services {
     /// (`message_id` — the assistant message whose trailing question resource
     /// blocks the user dismissed) on the agent session so the dismissed
     /// question set never re-surfaces (survives reload), emit `agent:updated`,
-    /// and kick the queue drain so messages held by the question hold resume.
-    /// Idempotent: re-dismissing the same message succeeds. Fails closed on a
+    /// deliver the questions-dismissed system notice to the agent
+    /// ([`Services::notify_questions_dismissed`] — marker persists FIRST so
+    /// the question hold cannot re-park the notice), and kick the queue drain
+    /// so messages held by the question hold resume. Idempotent: re-dismissing
+    /// the same message succeeds without a duplicate notice. Fails closed on a
     /// nonexistent target or a workspace mismatch (`NotFound`).
     pub(crate) async fn agent_dismiss_questions_op(
         &self,
@@ -3417,6 +3444,26 @@ impl Services {
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {agent_id}")));
         }
+        // Idempotency for the notice below: a repeat dismissal of the same
+        // messageId re-persists the marker (harmless) but must NOT deliver a
+        // duplicate dismissal notice. The claim is atomic — a check-and-insert
+        // into the per-agent notice registry under one lock acquisition — so
+        // concurrent dismissals of the same id race to a single winner, and
+        // the registry remembers OLDER ids the single-slot persisted marker
+        // has since been overwritten by (A -> B -> A). The persisted marker
+        // still short-circuits ids dismissed before a daemon restart.
+        let already_dismissed = {
+            let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
+            let mut guard = self
+                .dismissal_notices_sent
+                .lock()
+                .expect("dismissal notice registry poisoned");
+            let claimed = !guard
+                .entry(agent_id.clone())
+                .or_default()
+                .insert(message_id.clone());
+            persisted || claimed
+        };
         // Preserve non-object metadata verbatim under a side key rather than
         // discarding it: the column is documented/typed as a free-form
         // object today, but silently replacing a non-object value (should
@@ -3444,9 +3491,24 @@ impl Services {
         // summary projection (no `system_prompt`), so a full-row
         // `update_agent_session` write-back would clear the stored prompt.
         let metadata = Value::Object(metadata);
-        self.store
+        if let Err(e) = self
+            .store
             .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
-            .await?;
+            .await
+        {
+            // Release the notice claim so a retried dismissal (after this
+            // store failure) still delivers the notice.
+            if !already_dismissed {
+                let mut guard = self
+                    .dismissal_notices_sent
+                    .lock()
+                    .expect("dismissal notice registry poisoned");
+                if let Some(sent) = guard.get_mut(&agent_id) {
+                    sent.remove(&message_id);
+                }
+            }
+            return Err(e);
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -3461,6 +3523,14 @@ impl Services {
         // retire the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.
         self.maybe_emit_display_status_changed(&workspace_id).await;
+        // Deliver the questions-dismissed system notice (first dismissal of
+        // this messageId only) BEFORE the drain kick, so an idle agent's next
+        // turn is the notice rather than a previously held entry. The marker
+        // above is already persisted, so the hold cannot re-park it.
+        if !already_dismissed {
+            self.notify_questions_dismissed(&workspace_id, &agent_id, &message_id)
+                .await;
+        }
         // The hold (if it was gating this message's questions) is now released:
         // kick the drain so held queue entries resume without waiting for the
         // next end-of-turn drain.
@@ -3473,6 +3543,89 @@ impl Services {
             "success": true,
             "dismissedQuestionsMessageId": message_id,
         }))
+    }
+
+    /// Number of question resource blocks on the dismissed assistant message.
+    /// Bounded cost: an index seek plus a single-row page — no transcript
+    /// hydration. Unknown or unreadable messages count zero, which routes the
+    /// notice to its countless fallback wording.
+    async fn dismissed_question_count(&self, agent_id: &AgentId, message_id: &str) -> usize {
+        let Ok(Some(idx)) = self
+            .store
+            .get_agent_message_index(agent_id, message_id)
+            .await
+        else {
+            return 0;
+        };
+        let Ok(page) = self.store.get_agent_messages_page(agent_id, idx, 1).await else {
+            return 0;
+        };
+        page.first()
+            .filter(|m| m.id == message_id)
+            .map_or(0, |m| question_block_count(&m.content))
+    }
+
+    /// Deliver the questions-dismissed system notice (`agent.dismissQuestions`,
+    /// PROTOCOL §5.5): a system-origin message telling the agent the user
+    /// dismissed its N pending questions without answering, so it proceeds on
+    /// its own judgment instead of waiting for answers that will never come.
+    /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
+    /// an idle agent gets the notice as an immediate turn; when it lands in
+    /// the queue instead (busy turn, store-append fallback, or a NEWER pending
+    /// question re-holding automatic deliveries) the entry is promoted to the
+    /// FRONT of the queue so the notice is the next delivery, ahead of parked
+    /// interrupts and held wakes. The promotion is a separate queue-lock
+    /// acquisition from the enqueue, so a concurrent drain can pop a
+    /// previously parked entry (or the notice itself) in the window between
+    /// them — benign: the notice still delivers, just not strictly first, and
+    /// [`Services::move_queued_message_front`] returns `false` when the entry
+    /// is already gone. Fail-soft: delivery problems are logged, never
+    /// surfaced to the RPC — the durable dismissal marker is the source of
+    /// truth.
+    async fn notify_questions_dismissed(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        dismissed_message_id: &str,
+    ) {
+        let count = self
+            .dismissed_question_count(agent_id, dismissed_message_id)
+            .await;
+        let noun = match count {
+            0 => "questions".to_string(),
+            1 => "1 question".to_string(),
+            n => format!("{n} questions"),
+        };
+        let content = format!(
+            "User dismissed your {noun} without answering. Do not re-ask; \
+             continue with your best judgment."
+        );
+        let metadata = json!({
+            "type": QUESTIONS_DISMISSED_METADATA_TYPE,
+            "source": "system",
+            "dismissedQuestionsMessageId": dismissed_message_id,
+        });
+        match self
+            .deliver_wake_message(workspace_id, agent_id, &content, Some(&metadata))
+            .await
+        {
+            Ok(result) => {
+                if result["queued"] == json!(true) {
+                    if let Some(qid) = result["queuedMessage"]["id"].as_str() {
+                        if self.move_queued_message_front(agent_id, qid) {
+                            self.publish_queue_updated(agent_id).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "questions-dismissed notice delivery failed"
+                );
+            }
+        }
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -5296,9 +5449,27 @@ impl Services {
         group_id: Option<String>,
     ) -> Result<Value> {
         if subscription_id.is_none() && group_id.is_none() {
+            // Snapshot the anchor workspaces BEFORE the sweep: dropping the
+            // caller's last watch/group can demote its home workspace's
+            // displayStatus, so recompute each distinct anchor afterwards
+            // (transition-only, best-effort — a no-op recompute stays silent).
+            let mut anchors: Vec<WorkspaceId> = Vec::new();
+            for w in self.list_watches_for_parent(&agent_id) {
+                if !anchors.contains(&w.parent_workspace_id) {
+                    anchors.push(w.parent_workspace_id);
+                }
+            }
+            for g in self.list_groups_for_parent(&agent_id) {
+                if !anchors.contains(&g.workspace_id) {
+                    anchors.push(g.workspace_id);
+                }
+            }
             self.remove_all_for_parent(&agent_id);
             self.remove_groups_for_parent(&agent_id);
             self.remove_event_subscriptions_for_agent(&agent_id).await;
+            for anchor in &anchors {
+                self.maybe_emit_display_status_changed(anchor).await;
+            }
             return Ok(json!({ "success": true }));
         }
 
@@ -6962,6 +7133,40 @@ impl Services {
             queue.len() - 1
         };
         (queued, position)
+    }
+
+    /// Move an already-enqueued entry to position 0 (the head of the queue,
+    /// ahead of every other entry — including leading interrupts, even
+    /// user-origin ones: the dismissal context must precede whatever drains
+    /// next) so it is the next delivery, and mark it `interrupt_priority` so
+    /// a later interrupt enqueue (which inserts after the leading interrupt
+    /// run) cannot slot ahead of it. That flag surfaces as
+    /// `interruptPriority: true` on the `agent.getQueue` wire shape even for
+    /// a solitary promoted entry that never was an interrupt enqueue —
+    /// deliberate: it encodes drain precedence, not enqueue provenance. Used
+    /// by the questions-dismissed notice
+    /// ([`Services::notify_questions_dismissed`]) when the notice falls back
+    /// to the queue: the dismissal context must reach the agent before any
+    /// previously parked entry. Returns `true` iff the entry was found and
+    /// the queue changed (callers republish the queue snapshot on `true`).
+    pub(crate) fn move_queued_message_front(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let Some(queue) = guard.get_mut(agent_id) else {
+            return false;
+        };
+        let Some(idx) = queue.iter().position(|m| m.id == message_id) else {
+            return false;
+        };
+        if idx == 0 && queue[0].interrupt_priority {
+            return false;
+        }
+        let mut entry = queue.remove(idx);
+        entry.interrupt_priority = true;
+        queue.insert(0, entry);
+        true
     }
 
     /// Pop the oldest **ready-to-send** queued message for an agent, if any. Used

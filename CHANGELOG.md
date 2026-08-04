@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-08-04
+
+### 🚀 Features
+
+- Promote displayStatus to in_progress for top-level agents with child completion watches ([#891](https://github.com/intent-hq/intentd/pull/891))
+- Add ws.pr.snapshot for hook-based PR monitoring ([#887](https://github.com/intent-hq/intentd/pull/887))
+- *(services)* Bridge file:* events to debounced changes:git-status ([#882](https://github.com/intent-hq/intentd/pull/882))
+- *(intentd)* Warn on RPC dispatches exceeding statement or duration budgets ([#884](https://github.com/intent-hq/intentd/pull/884))
+- On-demand workspace.diskUsage method; drop diskUsage from list/get ([#886](https://github.com/intent-hq/intentd/pull/886))
+- Retire modelTier from specialist frontmatter and resolution ([#889](https://github.com/intent-hq/intentd/pull/889))
+- Agent feature toggles in config.toml ([agentFeatures]) ([#890](https://github.com/intent-hq/intentd/pull/890))
+- Voice.transcribe RPC with pluggable speech-to-text providers ([#893](https://github.com/intent-hq/intentd/pull/893))
+- Notify model on agent.dismissQuestions ([#892](https://github.com/intent-hq/intentd/pull/892))
+
+### ⚡ Performance
+
+- Thin agent.list, add listActive, cap diskUsage walks ([#881](https://github.com/intent-hq/intentd/pull/881))
+
+
 ## [0.4.1] - 2026-08-03
 
 ### 🚀 Features

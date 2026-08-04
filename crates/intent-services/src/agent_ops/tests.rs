@@ -11284,6 +11284,122 @@ async fn watch_set_changes_emit_subscriptions_changed() {
     assert_eq!(last.data["waitingForAgentIds"], json!([]));
 }
 
+/// Subscribe to only `workspace:displayStatus-changed` for `ws`.
+fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(ws.0.clone()),
+        event_types: vec![intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED.to_string()],
+        ..Default::default()
+    })
+}
+
+async fn recv_display_status(sub: &mut crate::Subscription) -> serde_json::Value {
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("displayStatus event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1, "expected exactly one displayStatus event");
+    serde_json::to_value(&batch[0]).expect("serialize event")
+}
+
+async fn assert_display_status_silent(sub: &mut crate::Subscription) {
+    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    assert!(res.is_err(), "expected no displayStatus event: {res:?}");
+}
+
+/// Registering the first watch for an otherwise-idle workspace promotes its
+/// derived `displayStatus` to `in_progress` (exactly one
+/// `workspace:displayStatus-changed`); a second registration while already
+/// promoted is a no-op recompute and stays silent.
+#[tokio::test]
+async fn watch_registration_emits_display_status_promotion() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Seed the last-observed cache (first observation never emits).
+    svc.maybe_emit_display_status_changed(&ws).await;
+
+    let mut sub = subscribe_display_status(&bus, &ws);
+    delegate_after_all(&svc, &ws, &parent).await;
+    let ev = recv_display_status(&mut sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
+    );
+
+    // A second watch while already promoted: transition-only, so silent.
+    delegate_after_all(&svc, &ws, &parent).await;
+    assert_display_status_silent(&mut sub).await;
+}
+
+/// The coordinator flow end to end: the parent delegates (watch registered →
+/// promotion), goes idle while the child is still out (workspace STAYS
+/// `in_progress` — no event), and the child settling retires the group's
+/// watches, demoting the workspace back to its base rollup (exactly one
+/// demotion event).
+#[tokio::test]
+async fn watch_settlement_emits_display_status_demotion() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    svc.maybe_emit_display_status_changed(&ws).await;
+
+    let mut sub = subscribe_display_status(&bus, &ws);
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+    let ev = recv_display_status(&mut sub).await;
+    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+
+    // Parent idles first (seals the group; child still expected): the
+    // workspace keeps waiting on the child, so no demotion yet.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_display_status_silent(&mut sub).await;
+
+    // Child settles: the group fires, its watches retire, and the workspace
+    // demotes back to the base rollup.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+    let ev = recv_display_status(&mut sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
+    );
+    assert_display_status_silent(&mut sub).await;
+}
+
+/// The unscoped `agent.cancelSubscriptions` sweep drops the caller's last
+/// watch, demoting the anchor workspace's derived `displayStatus`.
+#[tokio::test]
+async fn cancel_subscriptions_emits_display_status_demotion() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    svc.maybe_emit_display_status_changed(&ws).await;
+
+    let mut sub = subscribe_display_status(&bus, &ws);
+    delegate_after_all(&svc, &ws, &parent).await;
+    let ev = recv_display_status(&mut sub).await;
+    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+
+    svc.agent_cancel_subscriptions_op(ws.clone(), parent.clone(), None, None)
+        .await
+        .expect("cancel subscriptions");
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+    let ev = recv_display_status(&mut sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
+    );
+}
+
 /// `reportToParent` from a child enrolled in an undelivered after_all group is
 /// suppressed: no immediate parent message, the report is still persisted, and
 /// it reaches the parent only inside the single aggregated wake (as that
@@ -17632,6 +17748,302 @@ async fn dismiss_questions_fails_closed() {
         svc.agent_dismiss_questions_op(ws, id, oversized).await,
         Err(Error::InvalidParams(_))
     ));
+}
+
+/// An assistant content-block array carrying `n` question resource blocks.
+fn question_blocks_n(n: usize) -> serde_json::Value {
+    let mut blocks = vec![json!({ "type": "text", "text": "I have questions." })];
+    for i in 0..n {
+        blocks.push(json!({
+            "type": "resource",
+            "resource": {
+                "uri": format!("intent-question://q-{i}"),
+                "name": format!("Q{i}"),
+                "mimeType": "application/vnd.intent.question+json",
+                "text": "{\"question\":\"?\"}"
+            }
+        }));
+    }
+    json!(blocks)
+}
+
+/// The dismissal notice `messageMetadata` for a dismissed message id.
+fn dismissal_metadata(message_id: &str) -> serde_json::Value {
+    json!({
+        "type": "questions_dismissed",
+        "source": "system",
+        "dismissedQuestionsMessageId": message_id,
+    })
+}
+
+/// Idle agent, empty queue, hold released by the marker: the dismissal
+/// notice is delivered immediately — the transcript gains a user row with
+/// the singular "1 question" wording and the `questions_dismissed`
+/// metadata on both the block and the row.
+#[tokio::test]
+async fn dismiss_questions_notifies_agent_immediately_when_idle() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("non-empty transcript");
+    assert_eq!(
+        last.role, "user",
+        "notice delivered as a user row: {last:?}"
+    );
+    assert_eq!(
+        last.content[0]["text"],
+        json!(
+            "User dismissed your 1 question without answering. Do not re-ask; \
+             continue with your best judgment."
+        ),
+        "singular wording with the derived count"
+    );
+    assert_eq!(
+        last.content[0]["messageMetadata"],
+        dismissal_metadata(&asked.id),
+        "block carries the questions_dismissed metadata"
+    );
+    assert_eq!(
+        last.metadata,
+        Some(dismissal_metadata(&asked.id)),
+        "row-level metadata matches the block fold"
+    );
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "immediate delivery never queues"
+    );
+}
+
+/// Multiple question blocks on the dismissed message pluralize the count.
+#[tokio::test]
+async fn dismiss_questions_notice_pluralizes_count() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks_n(3), &now_iso())
+        .await
+        .expect("append questions");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("non-empty transcript");
+    assert!(
+        last.content[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your 3 questions without answering.")),
+        "plural wording with the derived count: {last:?}"
+    );
+}
+
+/// Underivable count (unknown message id) falls back to the countless
+/// wording — the notice still delivers.
+#[tokio::test]
+async fn dismiss_questions_notice_falls_back_without_count() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-unknown".to_string())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("notice delivered");
+    assert_eq!(last.role, "user");
+    assert!(
+        last.content[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your questions without answering.")),
+        "fallback wording when the count cannot be derived: {last:?}"
+    );
+}
+
+/// Re-dismissing the same messageId re-persists the marker but never
+/// appends a duplicate notice.
+#[tokio::test]
+async fn dismiss_questions_repeat_dismissal_sends_no_duplicate_notice() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("re-dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let notices = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("User dismissed your"))
+        })
+        .count();
+    assert_eq!(notices, 1, "exactly one notice despite the re-dismiss");
+    assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
+}
+
+/// Interleaved re-dismissal (A -> B -> A): the persisted marker is
+/// single-slot (B overwrote A), so only the in-memory notice registry stops
+/// the third call from re-delivering A's notice (PR #892 review). Each
+/// question is dismissed while it is the newest, so the first two notices
+/// deliver immediately rather than parking.
+#[tokio::test]
+async fn dismiss_questions_interleaved_redismissal_sends_no_duplicate_notice() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked_a = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question A");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_a.id.clone())
+        .await
+        .expect("dismiss A");
+
+    let asked_b = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question B");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_b.id.clone())
+        .await
+        .expect("dismiss B");
+
+    // Marker now names B; only the registry remembers A was already noticed.
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_a.id.clone())
+        .await
+        .expect("re-dismiss A");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let notices = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("User dismissed your"))
+        })
+        .count();
+    assert_eq!(
+        notices, 2,
+        "one notice per distinct messageId; A's re-dismissal adds none"
+    );
+    assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
+}
+
+/// A NEWER pending question keeps holding automatic deliveries after an
+/// older message's dismissal — the notice parks instead of delivering, and
+/// is promoted to the FRONT of the queue (ahead of previously parked
+/// entries), exposing the metadata on the `agent.getQueue` wire shape.
+#[tokio::test]
+async fn dismiss_questions_notice_parks_front_of_queue_when_still_held() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked_old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append older question");
+    svc.enqueue_message(
+        &id,
+        "parked wake".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    svc.store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append newer question");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "hold armed by the newer question"
+    );
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_old.id.clone())
+        .await
+        .expect("dismiss older");
+
+    // Still held (the marker names the OLDER message), so no user row landed.
+    assert!(
+        svc.question_hold_active(&id).await,
+        "newer question still holds"
+    );
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages.iter().all(|m| m.role != "user"),
+        "notice must not reach the transcript while held"
+    );
+
+    // The notice parked at the FRONT, ahead of the earlier entry, with the
+    // metadata (and the front-promotion marker) on the wire shape.
+    let queue = svc.queue_snapshot(&id);
+    assert_eq!(
+        queue.len(),
+        2,
+        "notice + previously parked entry: {queue:?}"
+    );
+    assert!(
+        queue[0]["content"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your 1 question")),
+        "notice drains first: {queue:?}"
+    );
+    assert_eq!(
+        queue[0]["messageMetadata"],
+        dismissal_metadata(&asked_old.id),
+        "queue entry exposes the questions_dismissed metadata: {queue:?}"
+    );
+    assert_eq!(queue[0]["interruptPriority"], json!(true));
+    assert_eq!(queue[1]["content"], json!("parked wake"));
 }
 
 // ---------------------------------------------------------------------------
