@@ -79,8 +79,11 @@ docker run --rm --platform "$PLATFORM" \
     # TSI-compatible resolv.conf (docker build cannot write it: bind-mounted
     # read-only during build; docker export leaves it empty).
     printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > /tree/etc/resolv.conf
-    # Baseline device nodes (docker export strips /dev): used by the chroot
-    # smoke test below and as a fallback before devtmpfs mounts in-guest.
+    # Baseline device nodes (docker export strips /dev): needed only by the
+    # chroot smoke test below — removed again before repack. The guest mounts
+    # devtmpfs over /dev at boot (intent-init), and device nodes in the
+    # tarball would break the daemon-side non-root extraction on macOS
+    # (mknod requires root, so bsdtar exits non-zero).
     mknod -m 666 /tree/dev/null c 1 3 2>/dev/null || true
     mknod -m 666 /tree/dev/zero c 1 5 2>/dev/null || true
     mknod -m 666 /tree/dev/random c 1 8 2>/dev/null || true
@@ -124,6 +127,10 @@ docker run --rm --platform "$PLATFORM" \
     # /root/.local/state/gh), which would break reproducibility.
     rm -rf /tree/root/.local /tree/root/.cache /tree/root/.config /tree/root/.npm
     find /tree -name "__pycache__" -type d -prune -exec rm -rf {} +
+    # Drop everything under /dev before packing (see the mknod note above):
+    # keep the empty /dev directory itself — intent-init needs it as the
+    # devtmpfs mountpoint.
+    find /tree/dev -mindepth 1 -delete
 
     echo "--- deterministic repack ---"
     tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
