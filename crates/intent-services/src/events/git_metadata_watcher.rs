@@ -121,7 +121,6 @@ mod tests {
 
     use super::super::bus::{EventBus, Subscription};
     use super::super::filter::SubscriptionFilter;
-    use super::super::watcher::FileWatcher;
     use super::*;
 
     /// Self-cleaning temp directory (workspace worktrees).
@@ -348,14 +347,10 @@ mod tests {
         let ws = test_workspace("ws-repo", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
         let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
-        // The main recursive watcher runs alongside to prove `.git` metadata
-        // churn produces no `file:*` events (IGNORED_DIRS keeps `.git` out).
-        let _file_watcher = FileWatcher::start(bus.clone(), ws.id.clone(), root.path.clone())
-            .expect("start file watcher");
         let _watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
             .expect("start git metadata watcher")
             .expect("git repo must gain a metadata watch");
-        // Let the OS watches settle before mutating.
+        // Let the OS watch settle before mutating.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
@@ -369,7 +364,11 @@ mod tests {
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
         assert!(ev.data["status"].get("uncommittedCount").is_some());
 
-        // No `file:*` event may surface for `.git`-internal paths.
+        // The metadata watcher routes through the refresher only — no
+        // `file:*` event may surface for `.git`-internal paths. (The main
+        // recursive watcher independently keeps `.git` out via IGNORED_DIRS,
+        // covered by its own tests; no FileWatcher runs here to keep
+        // real-watcher pressure low under nextest parallelism.)
         let file_ev = next_event(&mut file_sub, &ws.id, Duration::from_secs(1)).await;
         assert!(
             file_ev.is_none(),
