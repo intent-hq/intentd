@@ -6,6 +6,19 @@
 //! instead — PowerShell first (`pwsh`, then `powershell`), then `%COMSPEC%`,
 //! then `cmd.exe` — so daemon-spawned shells never point at `/bin/sh`.
 
+/// Environment variables removed from daemon-spawned PTY children.
+/// `npm_config_prefix` is set by the app launcher and makes nvm abort shell
+/// initialization; removing it keeps scripts and interactive terminals aligned.
+pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
+
+/// Owned environment-removal list for [`intent_pty::SpawnSpec`].
+pub(crate) fn scrubbed_env_vars() -> Vec<String> {
+    SCRUBBED_ENV_VARS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 /// The default shell for daemon-spawned terminals and scripts, resolved from
 /// the host platform and environment.
 pub(crate) fn default_shell() -> String {
@@ -84,5 +97,10 @@ mod tests {
             default_shell_for(true, Some("/bin/zsh"), None, never),
             "cmd.exe"
         );
+    }
+
+    #[test]
+    fn scrubbed_env_removes_launcher_npm_prefix() {
+        assert_eq!(scrubbed_env_vars(), ["npm_config_prefix"]);
     }
 }

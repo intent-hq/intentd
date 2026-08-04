@@ -28,7 +28,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::events::EventBus;
-use crate::shell::default_shell;
+use crate::shell::{default_shell, scrubbed_env_vars};
 use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
@@ -1108,17 +1108,11 @@ impl ScriptManager {
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.clone();
         spec.env = spawn_env_overlay(def.env.as_ref());
-        spec.env_remove = SCRUBBED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        spec.env_remove = scrubbed_env_vars();
         spec.listed = false;
         spec
     }
 }
-
-/// Environment variables removed from daemon-spawned shells. `npm_config_prefix`
-/// (set by the app's launcher) makes nvm abort its `~/.zshrc` init, which breaks
-/// the wrapped git/node tools agents rely on; the overlay can only add keys, so
-/// this is applied via `SpawnSpec::env_remove` at the PTY spawn site.
-const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
 
 /// Build the env overlay for a spawned script/agent shell: FORCE_COLOR/TERM, an
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
@@ -1505,7 +1499,9 @@ mod tests {
     #[test]
     fn spawn_overlay_strips_npm_config_prefix_and_enhances_path() {
         // npm_config_prefix is scrubbed via env_remove, not present as an overlay key.
-        assert!(SCRUBBED_ENV_VARS.contains(&"npm_config_prefix"));
+        assert!(scrubbed_env_vars()
+            .iter()
+            .any(|name| name == "npm_config_prefix"));
         let env = spawn_env_overlay(None);
         assert!(!env.iter().any(|(k, _)| k == "npm_config_prefix"));
 
