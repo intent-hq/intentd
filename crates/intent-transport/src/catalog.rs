@@ -36,6 +36,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.getSessionStats",
     "agent.getSubscriptions",
     "agent.list",
+    "agent.listActive",
     "agent.listInterrupted",
     "agent.pendingPermissions",
     "agent.queueMessage",

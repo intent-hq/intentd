@@ -33,8 +33,9 @@
 //! recompute refreshes it (stale-while-revalidate); the first-ever
 //! computation returns `None` (field omitted on the wire) and backfills for
 //! the next poll. Refreshes are single-flight per directory and run the walk
-//! on the blocking pool; a failed walk keeps the last-good entry (retry on
-//! the next poll) and a missing directory simply never produces an entry.
+//! on the blocking pool, with walks across directories globally serialized;
+//! a failed walk keeps the last-good entry (retry on the next poll) and a
+//! missing directory simply never produces an entry.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
@@ -46,11 +47,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use intent_core::{DiskUsageBreakdownEntry, WorkspaceDiskUsage};
+use tokio::sync::Semaphore;
 
 use crate::workspace_aggregates::try_begin;
 
 /// How long a computed entry is served without triggering a refresh.
 const DISK_USAGE_TTL: Duration = Duration::from_secs(60);
+
+/// Sequential walks are sufficient because disk usage is stale-while-revalidate
+/// and first paint omits it; concurrent full-tree walks only create disk contention.
+const MAX_CONCURRENT_DISK_USAGE_WALKS: usize = 1;
 
 /// Name grouping loose top-level files (and unfollowed symlinks).
 const OTHER_BUCKET: &str = "other";
@@ -65,7 +71,10 @@ struct CacheEntry {
 pub(crate) struct DiskUsageCache {
     entries: Mutex<HashMap<PathBuf, CacheEntry>>,
     in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+    walk_permits: Arc<Semaphore>,
     ttl: Duration,
+    #[cfg(test)]
+    walk_probe: Option<Arc<WalkProbe>>,
 }
 
 impl DiskUsageCache {
@@ -77,7 +86,18 @@ impl DiskUsageCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            walk_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DISK_USAGE_WALKS)),
             ttl,
+            #[cfg(test)]
+            walk_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_probe(ttl: Duration, walk_probe: Arc<WalkProbe>) -> Self {
+        Self {
+            walk_probe: Some(walk_probe),
+            ..Self::with_ttl(ttl)
         }
     }
 
@@ -105,9 +125,22 @@ impl DiskUsageCache {
             let cache = Arc::clone(self);
             tokio::spawn(async move {
                 let _in_flight = guard;
+                let walk_permit = Arc::clone(&cache.walk_permits)
+                    .acquire_owned()
+                    .await
+                    .expect("disk usage walk semaphore is never closed");
                 let dir = workspace_dir.clone();
                 let started = Instant::now();
-                match tokio::task::spawn_blocking(move || compute_dir_usage(&dir)).await {
+                #[cfg(test)]
+                let walk_probe = cache.walk_probe.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    let _probe_guard = walk_probe.as_ref().map(|probe| probe.enter());
+                    compute_dir_usage(&dir)
+                })
+                .await;
+                drop(walk_permit);
+                match result {
                     Ok(Ok(usage)) => {
                         tracing::debug!(
                             workspace_dir = %workspace_dir.display(),
@@ -143,6 +176,47 @@ impl DiskUsageCache {
             });
         }
         cached
+    }
+}
+
+#[cfg(test)]
+struct WalkProbe {
+    current: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+    delay: Duration,
+}
+
+#[cfg(test)]
+impl WalkProbe {
+    fn new(delay: Duration) -> Self {
+        Self {
+            current: std::sync::atomic::AtomicUsize::new(0),
+            max: std::sync::atomic::AtomicUsize::new(0),
+            delay,
+        }
+    }
+
+    fn enter(&self) -> WalkProbeGuard<'_> {
+        use std::sync::atomic::Ordering;
+
+        let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(current, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        WalkProbeGuard { probe: self }
+    }
+}
+
+#[cfg(test)]
+struct WalkProbeGuard<'a> {
+    probe: &'a WalkProbe,
+}
+
+#[cfg(test)]
+impl Drop for WalkProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .current
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -400,6 +474,33 @@ mod tests {
         );
         drop(guard);
         poll_until_some(&cache, dir.path()).await;
+    }
+
+    /// Cold misses for distinct directories share the global walk permit.
+    #[tokio::test]
+    async fn concurrent_cold_walks_are_globally_serialized() {
+        const DIR_COUNT: usize = 8;
+
+        let root = tempfile::tempdir().unwrap();
+        let probe = Arc::new(WalkProbe::new(Duration::from_millis(50)));
+        let cache = Arc::new(DiskUsageCache::with_probe(
+            Duration::from_secs(3600),
+            Arc::clone(&probe),
+        ));
+        for index in 0..DIR_COUNT {
+            let dir = root.path().join(format!("ws-{index}"));
+            fs::create_dir(&dir).unwrap();
+            write_file(&dir.join("f.bin"), 8192);
+            assert!(cache.usage(dir).await.is_none());
+        }
+
+        assert_eq!(cache.in_flight.lock().unwrap().len(), DIR_COUNT);
+        drain_in_flight(&cache).await;
+        assert_eq!(
+            probe.max.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONCURRENT_DISK_USAGE_WALKS
+        );
+        assert_eq!(cache.entries.lock().unwrap().len(), DIR_COUNT);
     }
 
     /// A failed walk keeps the last-good entry (missing dir after compute).
