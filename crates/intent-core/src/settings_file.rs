@@ -472,10 +472,12 @@ pub struct AgentsSettings {
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
-    /// `agents.flushQueuedMessages` — deliver the whole queued-message
-    /// backlog in one batched turn when an idle agent drains its queue
-    /// (off = one turn per queued message).
-    pub flush_queued_messages: bool,
+    /// `agents.flushQueuedMessages` — how the whole queued-message backlog
+    /// is delivered when an idle agent drains its queue: `all` batches every
+    /// ready entry into one turn, `systemOnly` batches only system-origin
+    /// entries (user-origin entries stay FIFO), `off` is one turn per queued
+    /// message.
+    pub flush_queued_messages: FlushQueuedMessagesMode,
 }
 
 impl Default for AgentsSettings {
@@ -483,7 +485,50 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
-            flush_queued_messages: true,
+            flush_queued_messages: FlushQueuedMessagesMode::All,
+        }
+    }
+}
+
+/// `agents.flushQueuedMessages` values. Serializes as camelCase strings
+/// (`"all"`, `"systemOnly"`, `"off"`); deserialization also accepts the
+/// legacy boolean shape (`true` → [`FlushQueuedMessagesMode::All`], `false` →
+/// [`FlushQueuedMessagesMode::Off`]) so an existing `config.toml` written by
+/// an older daemon still loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FlushQueuedMessagesMode {
+    /// Batch every ready-to-send entry into one combined turn.
+    #[default]
+    All,
+    /// Batch only system-origin ready entries; user-origin entries stay FIFO.
+    SystemOnly,
+    /// One turn per queued message (legacy `false`).
+    Off,
+}
+
+impl<'de> Deserialize<'de> for FlushQueuedMessagesMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            String(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(FlushQueuedMessagesMode::All),
+            Repr::Bool(false) => Ok(FlushQueuedMessagesMode::Off),
+            Repr::String(s) => match s.as_str() {
+                "all" => Ok(FlushQueuedMessagesMode::All),
+                "systemOnly" => Ok(FlushQueuedMessagesMode::SystemOnly),
+                "off" => Ok(FlushQueuedMessagesMode::Off),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown variant `{other}`, expected one of `all`, `systemOnly`, `off`"
+                ))),
+            },
         }
     }
 }
@@ -968,9 +1013,9 @@ maxConcurrent = 0
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
-# Flush queued messages -- deliver the whole queued-message backlog in one
-# batched turn when an idle agent drains its queue.
-flushQueuedMessages = true
+# Flush queued messages -- how the queued-message backlog is delivered when
+# an idle agent drains its queue: "all", "systemOnly", or "off".
+flushQueuedMessages = "all"
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
@@ -1085,7 +1130,7 @@ mod tests {
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
-        assert!(d.agents.flush_queued_messages);
+        assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
@@ -1117,7 +1162,10 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
-        assert!(!parsed.agents.flush_queued_messages);
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::Off
+        );
         assert_eq!(parsed.events.stream_retention_hours, 24);
         assert_eq!(parsed.workspace_api.max_output_chars, 5000);
         assert!(!parsed.workspace_api.toon_output);
@@ -1179,6 +1227,43 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("logging.level"), "names the key: {msg}");
         assert!(msg.contains("info"), "lists the variants: {msg}");
+    }
+
+    #[test]
+    fn flush_queued_messages_accepts_string_variants() {
+        for (raw, expected) in [
+            ("\"all\"", FlushQueuedMessagesMode::All),
+            ("\"systemOnly\"", FlushQueuedMessagesMode::SystemOnly),
+            ("\"off\"", FlushQueuedMessagesMode::Off),
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nflushQueuedMessages = {raw}\n"))
+                    .expect("parses");
+            assert_eq!(parsed.agents.flush_queued_messages, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn flush_queued_messages_accepts_legacy_booleans() {
+        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = true\n")
+            .expect("legacy true parses");
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::All
+        );
+        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = false\n")
+            .expect("legacy false parses");
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::Off
+        );
+    }
+
+    #[test]
+    fn flush_queued_messages_rejects_unknown_string() {
+        let err =
+            SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
+        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
     }
 
     #[test]

@@ -728,10 +728,9 @@ impl Services {
             .unwrap_or_default()
     }
 
-    /// Whether queue drains should deliver the whole queued-message backlog
-    /// in one batched turn (`agents.flushQueuedMessages`, default on). Read
+    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_enabled(&self) -> bool {
+    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 

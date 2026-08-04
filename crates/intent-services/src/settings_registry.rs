@@ -1000,17 +1000,20 @@ mod tests {
     fn flush_queued_messages_defaults_on_overrides_and_reloads() {
         let (_dir, path) = temp_config(Some(""));
         let reg = SettingsRegistry::load(&path).expect("load");
-        // Schema default: on.
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(true)));
+        // Schema default: "all".
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
         assert_eq!(
             reg.origin("agents.flushQueuedMessages"),
             Some(SettingOrigin::Default)
         );
 
         // File override via apply, surviving a fresh load from disk.
-        reg.apply(&set("agents.flushQueuedMessages", json!(false)))
+        reg.apply(&set("agents.flushQueuedMessages", json!("systemOnly")))
             .expect("apply");
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(false)));
+        assert_eq!(
+            reg.get("agents.flushQueuedMessages"),
+            Some(json!("systemOnly"))
+        );
         assert_eq!(
             reg.origin("agents.flushQueuedMessages"),
             Some(SettingOrigin::File)
@@ -1018,13 +1021,34 @@ mod tests {
         let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
         assert_eq!(
             reloaded.get("agents.flushQueuedMessages"),
-            Some(json!(false))
+            Some(json!("systemOnly"))
         );
 
         // External reload without the key restores the schema default.
         let notice = reg.reload("").expect("reload");
         assert!(notice.changed.contains("agents.flushQueuedMessages"));
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!(true)));
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
+    }
+
+    #[test]
+    fn flush_queued_messages_legacy_boolean_file_loads_and_reapplies() {
+        // A `config.toml` written by an older daemon still loads, reporting
+        // the equivalent string value with `File` origin.
+        let (_dir, path) = temp_config(Some("[agents]\nflushQueuedMessages = true\n"));
+        let reg = SettingsRegistry::load(&path).expect("load legacy true");
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
+
+        let (_dir2, path2) = temp_config(Some("[agents]\nflushQueuedMessages = false\n"));
+        let reg2 = SettingsRegistry::load(&path2).expect("load legacy false");
+        assert_eq!(reg2.get("agents.flushQueuedMessages"), Some(json!("off")));
+        assert_eq!(
+            reg2.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
     }
 
     #[test]
