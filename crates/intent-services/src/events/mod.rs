@@ -5,6 +5,8 @@
 
 pub mod bus;
 pub mod filter;
+pub mod git_metadata_watcher;
+pub mod git_status_refresher;
 pub mod registry;
 mod root_watch;
 pub mod skills_watcher;
@@ -17,6 +19,8 @@ pub use filter::{
     resolve_event_types_for_agent, SubscriptionFilter, AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS,
     DEFAULT_BATCH_WINDOW, VALID_EVENT_CATEGORY_WILDCARDS,
 };
+pub use git_metadata_watcher::GitMetadataWatcher;
+pub use git_status_refresher::GitStatusRefresher;
 pub use registry::WatcherRegistry;
 pub use skills_watcher::SkillsWatcher;
 pub use specialists_watcher::SpecialistsWatcher;
