@@ -1425,7 +1425,11 @@ impl AgentManager {
                 .with_caller_agent_id(Some(agent_id.clone()))
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
-                .with_turn_attachments(Some(self.services.turn_attachments())),
+                .with_turn_attachments(Some(self.services.turn_attachments()))
+                // `[agentFeatures]` toggles are captured here, at bridge
+                // creation, so they apply to new sessions only — a settings
+                // change never mutates a live agent's surface.
+                .with_agent_features(self.services.effective_settings().agent_features),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await

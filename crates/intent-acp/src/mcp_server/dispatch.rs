@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     new_attachment_id, now_iso, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
     WorkspaceApi, WorkspaceId, ATTACHMENT_ID_KEY,
@@ -66,18 +67,19 @@ impl WorkspaceMcpServer {
         // `summary` is required by the input schema but is not fed into the
         // engine — it is a UI hint for the caller, not part of the eval
         // environment. Accept and ignore for now.
-        let host = make_workspace_host(
+        let host = make_workspace_host_for(
             self.api.clone(),
             self.workspace_id.clone(),
             self.caller_agent_id.clone(),
             self.turn_attachments.clone(),
+            self.agent_features.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude();
+        let bindings_prelude = super::bindings::prelude_for(&self.agent_features);
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
@@ -370,37 +372,69 @@ fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> 
 /// `pub` (re-exported as `intent_acp::make_workspace_host`) so callers that
 /// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
 /// scheduler in `intent-services` — reuse the exact same host environment.
+/// All `[agentFeatures]` toggles are treated as on; feature-gated callers use
+/// [`make_workspace_host_for`].
 pub fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
 ) -> HostFn {
+    make_workspace_host_for(
+        api,
+        workspace_id,
+        caller_agent_id,
+        turn_attachments,
+        AgentFeaturesSettings::default(),
+    )
+}
+
+/// Feature-aware variant of [`make_workspace_host`]: frames whose method is
+/// gated by a disabled `[agentFeatures]` toggle are denied with an explicit
+/// "disabled in settings" error before reaching the bindings (defense in
+/// depth behind the description/prelude pruning — a raw `host({...})` call
+/// cannot bypass the gate).
+pub fn make_workspace_host_for(
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    caller_agent_id: Option<AgentId>,
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    agent_features: AgentFeaturesSettings,
+) -> HostFn {
+    let features = Arc::new(agent_features);
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
         let caller = caller_agent_id.clone();
         let registry = turn_attachments.clone();
-        Box::pin(
-            async move { workspace_host_dispatch(api, workspace_id, caller, registry, arg).await },
-        ) as BoxFuture<'static, std::result::Result<Value, String>>
+        let features = features.clone();
+        Box::pin(async move {
+            workspace_host_dispatch(api, workspace_id, caller, registry, &features, arg).await
+        }) as BoxFuture<'static, std::result::Result<Value, String>>
     })
 }
 
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
-/// trait mapping.
+/// trait mapping. Methods gated by a disabled `[agentFeatures]` toggle are
+/// denied before dispatch.
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    agent_features: &AgentFeaturesSettings,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
+    if let Some(feature) = super::tools::denied_feature(agent_features, method) {
+        return Err(format!(
+            "host: method `{method}` is disabled in settings ({feature} = false)"
+        ));
+    }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
     if let Some(v) = super::bindings::try_dispatch(
         &api,

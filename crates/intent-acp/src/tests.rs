@@ -5271,6 +5271,122 @@ mod workspace_api_tool_tests {
             .unwrap()
             .contains("`summary` is required and must be a string"));
     }
+
+    // ---- [agentFeatures] surface gating (description / prelude / dispatch) --
+
+    fn no_hooks_features() -> intent_core::settings_file::AgentFeaturesSettings {
+        intent_core::settings_file::AgentFeaturesSettings {
+            background_hooks: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_description_prunes_disabled_feature() {
+        // Layer (a): a bridge created with `backgroundHooks = false` must not
+        // advertise `ws.hook.*` in its `workspace_api` description, while an
+        // all-defaults bridge advertises it verbatim.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("ws.hook."),
+            "pruned description still advertises ws.hook.*"
+        );
+        assert!(
+            desc.contains("ws.note.read("),
+            "un-gated surface must stay advertised"
+        );
+
+        let default_srv = server("amber-forest", None);
+        let resp = default_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            crate::mcp_server::WORKSPACE_API_DESCRIPTION,
+            "all-defaults tools/list description must be byte-identical to the static const"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_namespace_is_absent_from_prelude() {
+        // Layer (b): with the toggle off, `ws.hook` is not installed, so
+        // touching it fails with the clear namespace-missing TypeError.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.hook.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("undefined"),
+            "expected undefined-namespace error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_method_is_denied_at_dispatch() {
+        // Layer (c): a raw `host({...})` frame cannot bypass the pruned
+        // prelude — dispatch denies it with the explicit settings error.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'hook.list', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings") && text.contains("agentFeatures.backgroundHooks"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_features_dispatch_unaffected_by_other_toggles() {
+        // Disabling hooks must not disturb un-gated namespaces on the same
+        // bridge — `ws.workspace.info()` still round-trips.
+        let srv = server("amber-forest", Some("/tmp/amber-forest"))
+            .with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn structured_questions_off_denies_question_ask() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                structured_questions: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: ws.app.question is not installed.
+        let resp = call_workspace_api(
+            &srv,
+            "return await ws.app.question.ask({ question: 'q', header: 'h', options: [{label:'a'},{label:'b'}] });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        // Dispatch: the raw frame is denied with the settings error.
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'app.question.ask', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings")
+                && text.contains("agentFeatures.structuredQuestions"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,

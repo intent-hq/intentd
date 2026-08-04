@@ -4,6 +4,9 @@
 //! suffix every tool with its MCP server name, so agents see
 //! `workspace_api_workspace-mcp`; baking the suffix in here would double it.
 
+use std::borrow::Cow;
+
+use intent_core::settings_file::AgentFeaturesSettings;
 use serde_json::{json, Map, Value};
 
 /// One input parameter of a tool, used to synthesize an MCP `inputSchema`.
@@ -472,9 +475,111 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
     params: &[p("code", "string", true), p("summary", "string", true)],
 }];
 
+/// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
+/// Shared by the description assembler below, the prelude assembler in
+/// [`super::bindings`], and the dispatch deny in [`super::bindings`] (via
+/// [`denied_feature`]), so the three layers cannot drift.
+fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    if !features.background_hooks {
+        out.push(("ws.hook.", "agentFeatures.backgroundHooks"));
+    }
+    if !features.host_exec {
+        out.push(("ws.host.", "agentFeatures.hostExec"));
+    }
+    if !features.scripts {
+        out.push(("ws.script.", "agentFeatures.scripts"));
+    }
+    if !features.terminal_access {
+        out.push(("ws.terminal.", "agentFeatures.terminalAccess"));
+    }
+    if !features.browser_automation {
+        out.push(("ws.browser.", "agentFeatures.browserAutomation"));
+    }
+    if !features.structured_questions {
+        out.push(("ws.app.question.", "agentFeatures.structuredQuestions"));
+    }
+    out
+}
+
+/// The `[agentFeatures]` settings path whose toggle is off and gates `method`
+/// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
+/// method is not feature-gated or its toggle is on. The dispatch-deny layer
+/// in [`super::bindings::try_dispatch`] uses this as defense in depth behind
+/// the description/prelude pruning.
+pub(super) fn denied_feature(
+    features: &AgentFeaturesSettings,
+    method: &str,
+) -> Option<&'static str> {
+    gated_prefixes(features)
+        .into_iter()
+        .find_map(|(prefix, feature)| {
+            // Frame methods carry no `ws.` prefix.
+            let ns = prefix.strip_prefix("ws.").unwrap_or(prefix);
+            method.starts_with(ns).then_some(feature)
+        })
+}
+
+/// Assemble the `workspace_api` description for one bridge from the static
+/// variants, pruning the doc lines of every feature disabled in
+/// `[agentFeatures]` (a method line and its indented continuation lines drop
+/// together; doubled blank lines left by a removed namespace paragraph
+/// collapse to one). With every toggle on — the default — this returns the
+/// static const unchanged, so the all-defaults description is byte-identical
+/// to today's by construction.
+pub fn workspace_api_description(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+) -> Cow<'static, str> {
+    let base = if is_chief {
+        WORKSPACE_API_DESCRIPTION_CHIEF
+    } else {
+        WORKSPACE_API_DESCRIPTION
+    };
+    let gated = gated_prefixes(features);
+    if gated.is_empty() {
+        return Cow::Borrowed(base);
+    }
+    // Method doc lines sit at exactly two spaces of indentation
+    // (`  ws.<ns>.<method>(...`); their wrapped continuation lines are
+    // indented deeper. Anything else (Rules/Parameters/Examples prose) never
+    // matches a gated `ws.` prefix at indent 2.
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 2 && trimmed.starts_with("ws.") {
+            skipping = gated.iter().any(|(prefix, _)| trimmed.starts_with(prefix));
+        } else if indent < 4 || trimmed.is_empty() {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = String::with_capacity(base.len());
+    let mut prev_blank = false;
+    for line in kept {
+        if line.is_empty() && prev_blank {
+            continue;
+        }
+        prev_blank = line.is_empty();
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF};
+    use super::{
+        denied_feature, workspace_api_description, AgentFeaturesSettings, Cow,
+        WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+    };
     use std::collections::HashSet;
 
     // Source of every `ws.<ns>.<method>` binding actually dispatched by
@@ -738,5 +843,220 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- [agentFeatures] segment-assembly tests ----------------------------
+
+    // A gated `ws.` doc prefix paired with the mutator that flips its
+    // `[agentFeatures]` toggle off.
+    type FeatureCase = (&'static str, fn(&mut AgentFeaturesSettings));
+
+    // Each toggle mapped to the `ws.` doc prefix it prunes and a mutator that
+    // flips it off. Iterated by the assembly tests below so a new toggle
+    // cannot ship without joining the sweep.
+    fn feature_cases() -> Vec<FeatureCase> {
+        vec![
+            ("ws.hook.", |f| f.background_hooks = false),
+            ("ws.host.", |f| f.host_exec = false),
+            ("ws.script.", |f| f.scripts = false),
+            ("ws.terminal.", |f| f.terminal_access = false),
+            ("ws.browser.", |f| f.browser_automation = false),
+            ("ws.app.question.", |f| f.structured_questions = false),
+        ]
+    }
+
+    // Hard requirement: with every toggle on (the default), the assembled
+    // description IS the static const — byte-identical, both variants.
+    #[test]
+    fn all_defaults_description_is_byte_identical() {
+        let features = AgentFeaturesSettings::default();
+        let base = workspace_api_description(false, &features);
+        assert!(
+            matches!(base, Cow::Borrowed(_)),
+            "all-on must not reassemble"
+        );
+        assert_eq!(&*base, WORKSPACE_API_DESCRIPTION);
+        let chief = workspace_api_description(true, &features);
+        assert!(
+            matches!(chief, Cow::Borrowed(_)),
+            "all-on must not reassemble"
+        );
+        assert_eq!(&*chief, WORKSPACE_API_DESCRIPTION_CHIEF);
+    }
+
+    // Disabling one feature removes exactly its own doc lines: no method of
+    // the gated namespace stays documented (a passing textual cross-reference
+    // in another namespace's doc line — e.g. `ws.script.*` inside the
+    // `ws.host.exec` entry — may remain), every other documented method
+    // survives, and the pruned text never leaves doubled blank lines or
+    // continuation orphans behind.
+    #[test]
+    fn disabling_one_feature_prunes_only_its_lines() {
+        for is_chief in [false, true] {
+            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
+            let full_methods = extract_ws_methods(&full);
+            for (prefix, disable) in feature_cases() {
+                let mut features = AgentFeaturesSettings::default();
+                disable(&mut features);
+                let pruned = workspace_api_description(is_chief, &features);
+                assert!(
+                    !pruned
+                        .lines()
+                        .any(|l| l.strip_prefix("  ").is_some_and(|t| t.starts_with(prefix))),
+                    "chief={is_chief}: a `{prefix}` doc line survived disabling its toggle"
+                );
+                let gated_ns = prefix.trim_start_matches("ws.").trim_end_matches('.');
+                let pruned_methods = extract_ws_methods(&pruned);
+                for (ns, method) in &full_methods {
+                    if ns == gated_ns {
+                        assert!(
+                            !pruned_methods.contains(&(ns.clone(), method.clone())),
+                            "chief={is_chief}: ws.{ns}.{method} still documented after \
+                             disabling `{prefix}`"
+                        );
+                    } else {
+                        assert!(
+                            pruned_methods.contains(&(ns.clone(), method.clone())),
+                            "chief={is_chief}: disabling `{prefix}` also dropped ws.{ns}.{method}"
+                        );
+                    }
+                }
+                assert!(
+                    !pruned.contains("\n\n\n"),
+                    "chief={is_chief}: pruning `{prefix}` left doubled blank lines"
+                );
+            }
+        }
+    }
+
+    // All toggles off at once: every gated prefix is gone, the un-gated
+    // surface (notes, tasks, git, files, crossWorkspace, ...) is intact.
+    #[test]
+    fn disabling_all_features_keeps_ungated_surface() {
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            host_exec: false,
+            scripts: false,
+            terminal_access: false,
+            browser_automation: false,
+            rich_chat_blocks: false,
+            structured_questions: false,
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features);
+            for (prefix, _) in feature_cases() {
+                assert!(
+                    !pruned.contains(prefix),
+                    "chief={is_chief}: `{prefix}` survived"
+                );
+            }
+            for kept in [
+                "ws.note.read(",
+                "ws.task.updateStatus(",
+                "ws.git.status(",
+                "ws.file.read(",
+                "ws.crossWorkspace.listSiblings(",
+                "ws.agent.create(",
+                "ws.event.subscribe(",
+                "ws.pr.status(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
+    // `richChatBlocks` is prompt-only: flipping it must not touch the tool
+    // description at all.
+    #[test]
+    fn rich_chat_blocks_does_not_affect_description() {
+        let features = AgentFeaturesSettings {
+            rich_chat_blocks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        assert_eq!(
+            &*workspace_api_description(false, &features),
+            WORKSPACE_API_DESCRIPTION
+        );
+        assert_eq!(
+            &*workspace_api_description(true, &features),
+            WORKSPACE_API_DESCRIPTION_CHIEF
+        );
+    }
+
+    // `structuredQuestions` is method-level: other `ws.app.*` docs in the
+    // chief variant must survive it.
+    #[test]
+    fn structured_questions_off_keeps_other_app_docs_in_chief() {
+        let features = AgentFeaturesSettings {
+            structured_questions: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let pruned = workspace_api_description(true, &features);
+        assert!(!pruned.contains("ws.app.question."));
+        for kept in [
+            "ws.app.agents.list(",
+            "ws.app.settings.list(",
+            "ws.app.ui.navigate(",
+        ] {
+            assert!(pruned.contains(kept), "`{kept}` was wrongly pruned");
+        }
+    }
+
+    // The dispatch-deny mapping: gated frame methods name their feature,
+    // un-gated methods and enabled toggles pass through.
+    #[test]
+    fn denied_feature_maps_gated_methods_only() {
+        let all_off = AgentFeaturesSettings {
+            background_hooks: false,
+            host_exec: false,
+            scripts: false,
+            terminal_access: false,
+            browser_automation: false,
+            rich_chat_blocks: false,
+            structured_questions: false,
+        };
+        assert_eq!(
+            denied_feature(&all_off, "hook.schedule"),
+            Some("agentFeatures.backgroundHooks")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "host.exec"),
+            Some("agentFeatures.hostExec")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "script.run"),
+            Some("agentFeatures.scripts")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "terminal.list"),
+            Some("agentFeatures.terminalAccess")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "browser.exec"),
+            Some("agentFeatures.browserAutomation")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "app.question.ask"),
+            Some("agentFeatures.structuredQuestions")
+        );
+        // Un-gated namespaces pass even with everything off.
+        assert_eq!(denied_feature(&all_off, "note.read"), None);
+        assert_eq!(
+            denied_feature(&all_off, "crossWorkspace.listSiblings"),
+            None
+        );
+        assert_eq!(denied_feature(&all_off, "app.settings.list"), None);
+        // Enabled toggles never deny.
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "host.exec"),
+            None
+        );
     }
 }
