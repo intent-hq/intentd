@@ -74,18 +74,23 @@ impl RpcProfileLayer {
     /// [`DURATION_THRESHOLD_ENV`] overrides (unparseable values fall back to
     /// the defaults).
     pub fn from_env() -> Self {
+        Self::from_env_with(|var| std::env::var(var).ok())
+    }
+
+    /// [`from_env`](Self::from_env) with an injectable variable lookup so
+    /// tests never mutate process-global env (which races under parallel
+    /// `cargo test`).
+    fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Self {
+        let parse = |var: &str, default: u64| {
+            get(var)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(default)
+        };
         Self::new(
-            env_u64(STATEMENT_THRESHOLD_ENV, DEFAULT_STATEMENT_WARN_THRESHOLD),
-            Duration::from_millis(env_u64(DURATION_THRESHOLD_ENV, DEFAULT_DURATION_WARN_MS)),
+            parse(STATEMENT_THRESHOLD_ENV, DEFAULT_STATEMENT_WARN_THRESHOLD),
+            Duration::from_millis(parse(DURATION_THRESHOLD_ENV, DEFAULT_DURATION_WARN_MS)),
         )
     }
-}
-
-fn env_u64(var: &str, default: u64) -> u64 {
-    std::env::var(var)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(default)
 }
 
 /// Span-extension state for one in-flight dispatch.
@@ -299,21 +304,31 @@ mod tests {
 
     #[test]
     fn from_env_overrides_defaults() {
-        std::env::set_var(STATEMENT_THRESHOLD_ENV, "3");
-        std::env::set_var(DURATION_THRESHOLD_ENV, "50");
-        let layer = RpcProfileLayer::from_env();
-        std::env::remove_var(STATEMENT_THRESHOLD_ENV);
-        std::env::remove_var(DURATION_THRESHOLD_ENV);
+        let layer = RpcProfileLayer::from_env_with(|var| match var {
+            STATEMENT_THRESHOLD_ENV => Some("3".to_string()),
+            DURATION_THRESHOLD_ENV => Some("50".to_string()),
+            _ => None,
+        });
         assert_eq!(layer.statement_threshold, 3);
         assert_eq!(layer.duration_threshold, Duration::from_millis(50));
 
-        let defaults = RpcProfileLayer::from_env();
+        let defaults = RpcProfileLayer::from_env_with(|_| None);
         assert_eq!(
             defaults.statement_threshold,
             DEFAULT_STATEMENT_WARN_THRESHOLD
         );
         assert_eq!(
             defaults.duration_threshold,
+            Duration::from_millis(DEFAULT_DURATION_WARN_MS)
+        );
+
+        let unparseable = RpcProfileLayer::from_env_with(|_| Some("nonsense".to_string()));
+        assert_eq!(
+            unparseable.statement_threshold,
+            DEFAULT_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            unparseable.duration_threshold,
             Duration::from_millis(DEFAULT_DURATION_WARN_MS)
         );
     }

@@ -192,7 +192,8 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     // Per-dispatch profiling span: carries the method name so the composition
     // root's profiling layer can count `sqlx::query` statement events scoped
     // to this dispatch and time the handler (see RPC_DISPATCH_SPAN_TARGET).
-    let span = tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, "rpc_dispatch", method);
+    let span =
+        tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, RPC_DISPATCH_SPAN_NAME, method);
     let result = dispatch(api, method, &params).instrument(span).await;
 
     // Notifications never get a response, even on error / unknown method (§3.4).
