@@ -6725,6 +6725,7 @@ mod wsapi6_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         pr_status_calls: Mutex<u32>,
+        pr_snapshot_calls: Mutex<Vec<u64>>,
         pr_merge_calls: Mutex<Vec<PrMergeCall>>,
         pr_update_branch_calls: Mutex<u32>,
         pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
@@ -6780,6 +6781,21 @@ mod wsapi6_bindings_tests {
                         "isClosed": false,
                         "summary": "✅ PR is mergeable with no conflicts.",
                     })
+                }))
+            })
+        }
+
+        fn pr_state(&self, _ws: WorkspaceId, pr_number: u64) -> BoxFuture<'_, Result<Value>> {
+            self.pr_snapshot_calls.lock().unwrap().push(pr_number);
+            Box::pin(async move {
+                Ok(json!({
+                    "prNumber": pr_number,
+                    "state": "open",
+                    "isMerged": false,
+                    "mergeBlockedReason": null,
+                    "checks": { "total": 0, "passed": 0, "failed": 0, "pending": 0, "failedNames": [] },
+                    "reviews": { "decision": "review_required", "approvals": 0, "changesRequested": 0 },
+                    "comments": { "conversationCount": 0, "reviewCommentCount": 0, "unresolvedThreadCount": 0, "totalCount": 0 },
                 }))
             })
         }
@@ -7099,6 +7115,39 @@ mod wsapi6_bindings_tests {
         let resp = call(&srv, "return await ws.pr.status();").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("No active PR"));
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_forwards_pr_number_and_returns_shape() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["prNumber"], json!(42));
+        assert_eq!(v["isMerged"], json!(false));
+        assert_eq!(v["mergeBlockedReason"], json!(null));
+        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![42u64]);
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_requires_numeric_pr_number() {
+        // Missing, negative, and non-numeric prNumber all surface the same
+        // validation error before the trait method is called — parity with
+        // the `replyToReviewComment` commentId pattern.
+        let (srv, api) = server();
+        for code in [
+            "return await ws.pr.snapshot();",
+            "return await ws.pr.snapshot(-1);",
+            "return await ws.pr.snapshot('abc');",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
+            assert!(
+                text(&resp).contains("prNumber is required and must be a number"),
+                "code: {code}"
+            );
+        }
+        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
         status: () => host({ method: 'pr.status', args: {} }),
+        snapshot: (prNumber) => host({ method: 'pr.snapshot', args: { prNumber } }),
         merge: (options) => host({ method: 'pr.merge', args: { ...(options || {}) } }),
         updateBranch: () => host({ method: 'pr.updateBranch', args: {} }),
         listReviewComments: (options) =>
@@ -40,6 +41,7 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "status" => status(api, ws).await,
+        "snapshot" => snapshot(api, ws, args).await,
         "merge" => merge(api, ws, args).await,
         "updateBranch" => update_branch(api, ws).await,
         "listReviewComments" => list_review_comments(api, ws, args).await,
@@ -53,6 +55,21 @@ pub(crate) async fn dispatch(
 
 async fn status(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
     api.pr_status(ws.clone()).await.map_err(map_err)
+}
+
+async fn snapshot(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let pr_number =
+        req_i64(args, "prNumber").map_err(|_| "prNumber is required and must be a number")?;
+    if pr_number < 0 {
+        return Err("prNumber is required and must be a number".to_string());
+    }
+    api.pr_state(ws.clone(), pr_number as u64)
+        .await
+        .map_err(map_err)
 }
 
 async fn merge(
