@@ -1493,10 +1493,13 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `rtk.enabled` is a global (non-workspace-scoped) setting;
-            // auto-commit resolves per-workspace (persisted override →
-            // global `git.autoCommit` fallback, spec Diagnosis §3b) so the
-            // prompt reflects what the commit gate will actually enforce.
+            // `rtk.enabled` and the `[agentFeatures]` toggles are global
+            // (non-workspace-scoped) settings, captured once here so the
+            // persisted prompt reflects the flags at session creation
+            // ("new sessions only"); auto-commit resolves per-workspace
+            // (persisted override → global `git.autoCommit` fallback, spec
+            // Diagnosis §3b) so the prompt reflects what the commit gate
+            // will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
@@ -1518,6 +1521,7 @@ impl AgentManager {
                 is_sub_agent,
                 auto_commit_enabled,
                 settings.rtk.enabled,
+                &settings.agent_features,
                 workspace.as_ref(),
                 Some(&session),
             )
