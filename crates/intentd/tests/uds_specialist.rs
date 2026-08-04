@@ -683,10 +683,12 @@ async fn specialist_resolution_preview() {
     // The retired tier does not resolve under codex either.
     let tiered = find_spec(&list, "tiered");
     assert!(tiered.get("resolvedModel").is_none());
+    assert!(tiered.get("resolvedProvider").is_none());
     // The auggie-claimed pin does not leak into a codex context; with no
     // settings chain the preview falls through to the CLI default (omitted).
     let auggie_pin = find_spec(&list, "auggie-pin");
     assert!(auggie_pin.get("resolvedModel").is_none());
+    assert!(auggie_pin.get("resolvedProvider").is_none());
     // The unclaimed pin still applies under codex.
     let pinner = find_spec(&list, "pinner");
     assert_eq!(pinner["resolvedModel"], "opus4.5");
