@@ -1390,11 +1390,30 @@ impl Services {
 
         let mut streams = Vec::with_capacity(busy.len());
         for (agent_id, workspace_id) in busy {
-            let updated_at = self.store.get_agent_session_updated_at(&agent_id).await?;
+            // A busy agent whose session row is gone (e.g. a concurrent
+            // `agent.delete` — an expected race elsewhere in the manager/store
+            // paths) is skipped rather than failing the whole response.
+            let updated_at = match self.store.get_agent_session_updated_at(&agent_id).await {
+                Ok(updated_at) => updated_at,
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        "agent.listActive: busy agent has no session row (likely \
+                         deleted mid-turn); skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             streams.push(json!({
                 "agentId": agent_id,
                 "sessionId": agent_id,
                 "workspaceId": workspace_id,
+                // `startTime` is derived from the session's `updated_at`:
+                // `try_begin` persists the Active status transition (touching
+                // `updated_at`) when the turn is claimed, so it approximates
+                // the turn start without a dedicated column. The wire name is
+                // part of the 4.1 contract (consumed by FE) — do not rename.
                 "startTime": iso_ms(&updated_at),
             }));
         }

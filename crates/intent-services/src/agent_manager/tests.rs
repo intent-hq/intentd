@@ -4581,6 +4581,45 @@ async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     );
 }
 
+/// A busy agent whose session row is missing (e.g. deleted mid-turn by a
+/// concurrent `agent.delete`) is skipped instead of failing the whole
+/// `agent.listActive` response (PR #881 review).
+#[tokio::test]
+async fn list_active_skips_busy_agent_with_missing_session_row() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-list-active-missing");
+    let other_ws = WorkspaceId::from("ws-list-active-missing-2");
+    let survivor = AgentId::from("agent-active-survivor");
+    let deleted = AgentId::from("agent-active-deleted");
+    seed_agent(&mgr, &ws, &survivor).await;
+    seed_agent(&mgr, &other_ws, &deleted).await;
+
+    assert!(mgr.try_begin(&survivor, &ws).await);
+    assert!(mgr.try_begin(&deleted, &other_ws).await);
+    // Simulate a concurrent agent.delete racing the busy snapshot: the row is
+    // gone but the manager still lists the agent as busy.
+    mgr.services
+        .store
+        .delete_agent_session(&other_ws, &deleted)
+        .await
+        .expect("delete session row");
+
+    let active = services.agent_list_active_op().await.unwrap();
+    let streams = active["streams"].as_array().expect("streams array");
+    assert_eq!(
+        streams.len(),
+        1,
+        "missing-row agent is skipped, not an endpoint error: {active}"
+    );
+    assert_eq!(streams[0]["agentId"], json!(survivor));
+}
+
 /// `try_begin` persists the runtime `Active` transition and publishes the
 /// self-sufficient `agent:status-changed` event so a hydrated client reflects
 /// the live runtime rather than the stored `Pending` placeholder.
