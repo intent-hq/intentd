@@ -12846,6 +12846,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12887,6 +12888,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12902,8 +12904,13 @@ mod rules {
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
         // No override and no `.intent/agent-rules/task-loop.md` → bundled built-in,
         // composed as common + workspace + specific (task-loop is a workspace agent).
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert!(rules.contains("# Task Loop Agent"), "bundled specific body");
         assert!(rules.contains("## Delegating Tasks"), "common layer");
         assert!(rules.contains("# Space"), "workspace layer");
@@ -12916,8 +12923,13 @@ mod rules {
         let dir = tree.0.join(".intent").join("agent-rules");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert_eq!(rules, "WORKSPACE_FILE_RULES");
     }
 
@@ -12932,8 +12944,13 @@ mod rules {
         svc.rules_update(ws, "task-loop".into(), "OVERRIDE_RULES".into(), None)
             .await
             .unwrap();
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert_eq!(rules, "OVERRIDE_RULES");
     }
 
@@ -12943,8 +12960,13 @@ mod rules {
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
         // The spawn default `interactive` is an unknown instruction id →
         // fallbackToWorkspace (common + workspace + workspace).
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "interactive").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "interactive",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert!(rules.contains("# Space"), "workspace body present");
         assert!(rules.contains("## Delegating Tasks"), "common prepended");
     }
@@ -12963,6 +12985,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13009,6 +13032,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13058,6 +13082,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13086,6 +13111,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13136,6 +13162,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13167,6 +13194,7 @@ mod rules {
             false,
             true,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13235,6 +13263,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -13356,6 +13385,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13490,6 +13520,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13614,6 +13645,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13734,6 +13766,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13854,6 +13887,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13978,6 +14012,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )

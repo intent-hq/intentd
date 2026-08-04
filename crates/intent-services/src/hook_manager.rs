@@ -7,9 +7,12 @@
 //! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
 //! Scripts evaluate in QuickJS via `intent_js::eval` with the exact same
-//! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs
-//! (including `ws.host.exec`), a 60 s wall-clock budget, and the hook's
-//! workspace/agent pinned as the caller. The script's return value is the
+//! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs —
+//! gated by the same `[agentFeatures]` toggles (e.g. no `ws.host.exec` when
+//! `agentFeatures.hostExec` is off; with all defaults on the environment is
+//! byte-identical to the ungated one) — a 60 s wall-clock budget, and the
+//! hook's workspace/agent pinned as the caller. The script's return value is
+//! the
 //! contract: `{ dispatch: true, message }` wakes the owning agent (queued
 //! behind an in-flight turn via the automatic-delivery `agent.sendMessage`
 //! path) and terminates the hook; `{ dispatch: false }` / `undefined` sleeps
@@ -29,6 +32,7 @@ use intent_core::events::{
     HOOK_CANCELLED, HOOK_DISPATCHED, HOOK_EVICTED, HOOK_EXPIRED, HOOK_RUN_COMPLETED,
     HOOK_RUN_STARTED, HOOK_SCHEDULED,
 };
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     now_iso, AgentId, AgentStatus, Error, Hook, HookId, HookState, Result, WorkspaceApi,
     WorkspaceId,
@@ -182,22 +186,30 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
     time_to_expiry(expires_at, skew_ms) == Some(Duration::ZERO)
 }
 
-/// Evaluate one hook script in QuickJS with the full `ws.*` environment and
-/// interpret its return value against the script contract. Never panics; every
-/// failure mode folds into [`RunOutcome::Failed`].
-async fn run_hook_script(api: Arc<dyn WorkspaceApi>, hook: &Hook, timeout: Duration) -> RunOutcome {
-    let host = intent_acp::make_workspace_host(
+/// Evaluate one hook script in QuickJS with the `ws.*` environment gated by
+/// the same `[agentFeatures]` toggles as the `workspace_api` tool (prelude
+/// pruning + dispatch deny; all-defaults is byte-identical to the ungated
+/// environment) and interpret its return value against the script contract.
+/// Never panics; every failure mode folds into [`RunOutcome::Failed`].
+async fn run_hook_script(
+    api: Arc<dyn WorkspaceApi>,
+    hook: &Hook,
+    timeout: Duration,
+    agent_features: &AgentFeaturesSettings,
+) -> RunOutcome {
+    let host = intent_acp::make_workspace_host_for(
         api,
         hook.workspace_id.clone(),
         Some(hook.agent_id.clone()),
         None,
+        agent_features.clone(),
     );
     // Same `{__k, __v}` envelope as the `workspace_api` dispatch so an
     // `undefined` return (no dispatch) survives the JSON bridge, extended
     // with a `console.*` shim whose capped line buffer rides back as
     // `__logs`. A user-code throw is caught in-envelope (`__k: 'e'`) so its
     // logs survive; only a timeout/engine failure loses them.
-    let prelude = intent_acp::bindings_prelude();
+    let prelude = intent_acp::bindings_prelude_for(agent_features);
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
@@ -404,12 +416,22 @@ impl Services {
     /// `hook.schedule`: validate, run the script once immediately (a real run
     /// — a dispatch wakes the owner and never persists a schedule; a failure
     /// rejects the call), then persist the hook and spawn its scheduler task.
+    /// Rejected outright when `agentFeatures.backgroundHooks` is off (services
+    /// layer defense in depth behind the MCP dispatch deny); already-active
+    /// hooks are unaffected by the toggle and run to their terminal state/TTL.
     pub(crate) async fn hook_schedule_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         params: &Value,
     ) -> Result<Value> {
+        let agent_features = self.effective_settings().agent_features;
+        if !agent_features.background_hooks {
+            return Err(Error::InvalidParams(
+                "hook.schedule: disabled in settings (agentFeatures.backgroundHooks = false)"
+                    .into(),
+            ));
+        }
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -482,7 +504,7 @@ impl Services {
         // lifecycle event fires — the error surfaces on the call itself); a
         // dispatch wakes the owner immediately and the hook never schedules.
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.clone());
-        let outcome = run_hook_script(api, &hook, self.hook_eval_timeout).await;
+        let outcome = run_hook_script(api, &hook, self.hook_eval_timeout, &agent_features).await;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
@@ -748,7 +770,10 @@ impl Services {
     /// daemon was down are expired (owner woken). `running` rows (daemon died
     /// mid-run) are reset to `scheduled`; every resumed hook starts a fresh
     /// `delayMs` countdown but keeps its ORIGINAL `expiresAt` (the TTL does
-    /// not reset on restart). Returns the number of resumed hooks.
+    /// not reset on restart). `agentFeatures.backgroundHooks = false` does
+    /// NOT cancel or skip active rows (decided semantics: the toggle only
+    /// rejects NEW schedules; existing hooks run to their terminal
+    /// state/TTL). Returns the number of resumed hooks.
     pub async fn rehydrate_hooks(&self) -> Result<usize> {
         let hooks = self.store.load_active_hooks().await?;
         let mut resumed = 0;
@@ -899,7 +924,11 @@ impl Services {
         hook.state = HookState::Running;
         self.emit_hook_event(HOOK_RUN_STARTED, hook, None).await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.clone());
-        let outcome = run_hook_script(api, hook, self.hook_eval_timeout).await;
+        // Feature flags are read fresh per run: a hook outlives sessions and
+        // daemon restarts, so the current effective `[agentFeatures]` gate is
+        // the same one a newly created session's bridge would capture.
+        let agent_features = self.effective_settings().agent_features;
+        let outcome = run_hook_script(api, hook, self.hook_eval_timeout, &agent_features).await;
         let last_run_at = now_iso();
         match outcome {
             RunOutcome::Continue { logs, state } => {
@@ -2448,6 +2477,108 @@ mod tests {
         // A null/missing hookState would throw on `.n` and evict instead.
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         wait_for_wake(&svc, &owner, "saw n=7").await;
+    }
+
+    /// Wire a settings registry with the given `agentFeatures.*` overrides
+    /// applied, so gates under test read them via `effective_settings()`.
+    fn features_registry(
+        overrides: &[(&str, bool)],
+    ) -> (tempfile::TempDir, Arc<crate::SettingsRegistry>) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry"),
+        );
+        let changes: Vec<(String, Value)> = overrides
+            .iter()
+            .map(|(key, on)| (format!("agentFeatures.{key}"), json!(on)))
+            .collect();
+        registry.apply(&changes).expect("apply overrides");
+        (dir, registry)
+    }
+
+    #[tokio::test]
+    async fn schedule_rejected_when_background_hooks_disabled() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let (_cfg, registry) = features_registry(&[("backgroundHooks", false)]);
+        let svc = svc.with_settings_registry(registry);
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "gated", "code": "return { dispatch: false };",
+                         "delayMs": 10_000 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disabled in settings (agentFeatures.backgroundHooks = false)"),
+            "{err}"
+        );
+        // Rejected before the validation run: nothing persisted.
+        assert!(svc.store().load_active_hooks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydration_resumes_active_hooks_when_background_hooks_disabled() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let (_cfg, registry) = features_registry(&[("backgroundHooks", false)]);
+        let svc = svc.with_settings_registry(registry);
+        // An active row from a previous daemon lifetime: the toggle only
+        // rejects NEW schedules, so boot must resume this hook and let it
+        // run to its terminal state.
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "survivor".to_string(),
+            code: "return { dispatch: true, message: 'ran while disabled' };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 1,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow still drives an already-active hook");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        wait_for_wake(&svc, &owner, "ran while disabled").await;
+    }
+
+    #[tokio::test]
+    async fn hook_runs_use_feature_gated_prelude_and_dispatch() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let (_cfg, registry) = features_registry(&[("hostExec", false)]);
+        let svc = svc.with_settings_registry(registry);
+        // The validation run executes with the gated environment: `ws.host`
+        // is pruned from the prelude and a raw `host({...})` frame is denied
+        // at dispatch. Both observations ride back on the dispatch message.
+        let code = "let denied = '';\n\
+                    try { await host({ method: 'host.exec', args: { command: 'echo' } }); }\n\
+                    catch (e) { denied = String(e); }\n\
+                    return { dispatch: true, message: typeof ws.host + '|' + denied };";
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "gated-env", "code": code, "delayMs": 10_000 }),
+            )
+            .await
+            .expect("validation run dispatches");
+        assert_eq!(out.get("dispatched"), Some(&json!(true)));
+        let wake = wait_for_wake(&svc, &owner, "undefined|").await;
+        assert!(
+            wake.contains("disabled in settings (agentFeatures.hostExec = false)"),
+            "{wake}"
+        );
     }
 
     #[test]

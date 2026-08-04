@@ -91,6 +91,14 @@ pub const KNOWN_PATHS: &[&str] = &[
     "events.streamRetentionHours",
     "workspaceApi.maxOutputChars",
     "workspaceApi.toonOutput",
+    "agentFeatures.backgroundHooks",
+    "agentFeatures.hostExec",
+    "agentFeatures.scripts",
+    "agentFeatures.terminalAccess",
+    "agentFeatures.browserAutomation",
+    "agentFeatures.richChatBlocks",
+    "agentFeatures.structuredQuestions",
+    "agentFeatures.attentionRequests",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).

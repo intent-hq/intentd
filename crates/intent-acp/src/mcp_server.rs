@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
@@ -20,6 +21,12 @@ mod dispatch;
 mod tools;
 
 pub use tools::ToolDef;
+
+// Static description const, exposed for the segment-assembly parity tests
+// in `crate::tests` (the assembled all-defaults description must be
+// byte-identical to it).
+#[cfg(test)]
+pub(crate) use tools::WORKSPACE_API_DESCRIPTION;
 
 // Canonical proposal helpers (§7.1): the collapsed-output proposal lift in
 // `intent-services::tool_block` reuses these so validation and resource-item
@@ -37,7 +44,8 @@ pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 // evaluates agent scripts with the same `ws.*` prelude + host dispatch the
 // `workspace_api` tool installs, so the two environments cannot drift.
 pub use bindings::prelude as bindings_prelude;
-pub use dispatch::make_workspace_host;
+pub use bindings::prelude_for as bindings_prelude_for;
+pub use dispatch::{make_workspace_host, make_workspace_host_for};
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -69,6 +77,11 @@ pub struct WorkspaceMcpServer {
     /// attaches it without depending on the provider's echo fidelity. `None`
     /// keeps the legacy echo-parse-only behavior (FE front door, tests).
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    /// `[agentFeatures]` toggles captured at bridge creation (new sessions
+    /// only — mid-session settings changes never affect a live bridge).
+    /// Disabled features are pruned from the tool description and JS prelude
+    /// and denied at dispatch. Defaults to all-on (FE front door, tests).
+    agent_features: AgentFeaturesSettings,
 }
 
 impl WorkspaceMcpServer {
@@ -85,6 +98,7 @@ impl WorkspaceMcpServer {
             is_chief,
             workspace_api_timeout: dispatch::default_workspace_api_timeout(),
             turn_attachments: None,
+            agent_features: AgentFeaturesSettings::default(),
         }
     }
 
@@ -127,6 +141,15 @@ impl WorkspaceMcpServer {
     /// set — the registry keys pending attachments by agent.
     pub fn with_turn_attachments(mut self, registry: Option<Arc<TurnAttachmentRegistry>>) -> Self {
         self.turn_attachments = registry;
+        self
+    }
+
+    /// Capture the `[agentFeatures]` toggles for this bridge (the spawn-time
+    /// wiring point — settings are read once at bridge creation so live
+    /// sessions keep their original surface). Disabled features are pruned
+    /// from the tool description and JS prelude and denied at dispatch.
+    pub fn with_agent_features(mut self, features: AgentFeaturesSettings) -> Self {
+        self.agent_features = features;
         self
     }
 
@@ -184,9 +207,19 @@ impl WorkspaceMcpServer {
             .available_tools()
             .iter()
             .map(|t| {
+                // `workspace_api` gets its description assembled per-bridge so
+                // `[agentFeatures]` toggles captured at creation prune the
+                // disabled surface; with all defaults on the assembled text is
+                // the static const unchanged.
+                let description = if t.name == "workspace_api" {
+                    tools::workspace_api_description(self.is_chief, &self.agent_features)
+                        .into_owned()
+                } else {
+                    t.description.to_string()
+                };
                 json!({
                     "name": t.name,
-                    "description": t.description,
+                    "description": description,
                     "inputSchema": t.schema(),
                 })
             })

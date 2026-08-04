@@ -229,10 +229,14 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 /// workspace` via the reference's `fallbackToWorkspace` path. The FE file-watch
 /// cache-invalidation around the workspace file is intentionally not ported — the
 /// daemon re-resolves per spawn, so the file is always read fresh.
+///
+/// `agent_features` gates feature-specific sections of the tier-3 bundled
+/// bodies only; tier 1/2 user-supplied content is never filtered.
 pub(crate) async fn get_specialization_rules(
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
 ) -> String {
     // 1. User-settings override (highest precedence — settings win over file/bundled).
     let overrides = read_overrides(store).await;
@@ -252,7 +256,7 @@ pub(crate) async fn get_specialization_rules(
         }
     }
     // 3. Bundled built-in (composed with common/workspace per the reference).
-    crate::instructions::get_instruction_with_common(agent_type)
+    crate::instructions::get_instruction_with_common(agent_type, agent_features)
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
@@ -405,6 +409,12 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
 /// block at the end of user-facing responses. The specialization slot is always
 /// populated (tier 3 always resolves), so this returns `None` only in the
 /// unreachable case where even the bundled specialization is empty.
+///
+/// `agent_features` (the `[agentFeatures]` toggles, read once at session
+/// creation like `rtk_enabled`) gates feature-specific prompt sections: the
+/// bundled specialization bodies via [`get_specialization_rules`], and the
+/// `## Asking the User Questions` footer block (`structuredQuestions`). With
+/// all defaults on the assembled prompt is byte-identical to the ungated one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -414,6 +424,7 @@ pub(crate) async fn assemble_system_prompt(
     is_sub_agent: bool,
     auto_commit_enabled: bool,
     rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
 ) -> Option<String> {
@@ -422,7 +433,8 @@ pub(crate) async fn assemble_system_prompt(
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
     }
-    let specialization = get_specialization_rules(store, workspace_path, agent_type).await;
+    let specialization =
+        get_specialization_rules(store, workspace_path, agent_type, agent_features).await;
     if !specialization.trim().is_empty() {
         parts.push(specialization);
     }
@@ -546,19 +558,22 @@ pub(crate) async fn assemble_system_prompt(
     // Asking the User Questions + Suggested Next Steps — top-level
     // interactive agents only. Sub-agents don't own a user-facing chat turn
     // (they report to a parent), so they skip both blocks, matching the
-    // reference gating.
+    // reference gating. The questions block is additionally gated by
+    // `agentFeatures.structuredQuestions` (spec audit row 8).
     if !is_sub_agent {
-        parts.push(
-            "## Asking the User Questions\n\n\
-             When requirements are ambiguous or a decision needs user input, ask \
-             structured clarifying questions with `ws.app.question.ask` via the \
-             `workspace_api` tool instead of burying questions in prose. Call it once \
-             per question with 2-4 options; do not add an \"Other\" option — a \
-             free-form answer is always offered automatically. Ask all your \
-             questions, then end the turn: questions are presented when your turn \
-             ends, and the answers arrive in the next user message."
-                .to_string(),
-        );
+        if agent_features.structured_questions {
+            parts.push(
+                "## Asking the User Questions\n\n\
+                 When requirements are ambiguous or a decision needs user input, ask \
+                 structured clarifying questions with `ws.app.question.ask` via the \
+                 `workspace_api` tool instead of burying questions in prose. Call it once \
+                 per question with 2-4 options; do not add an \"Other\" option — a \
+                 free-form answer is always offered automatically. Ask all your \
+                 questions, then end the turn: questions are presented when your turn \
+                 ends, and the answers arrive in the next user message."
+                    .to_string(),
+            );
+        }
         let example_second_line = if effective_auto_commit {
             "Check the changes in the diff view."
         } else {
@@ -704,6 +719,7 @@ impl<'a> RulesService<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use intent_core::settings_file::AgentFeaturesSettings;
     use intent_core::Workspace;
     use intent_store::Store;
     use std::path::PathBuf;
@@ -807,6 +823,7 @@ This is a test skill.
             false,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             Some(&workspace),
             None,
         )
@@ -864,6 +881,7 @@ This is a test skill.
             false,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             Some(&workspace),
             None,
         )
@@ -892,6 +910,7 @@ This is a test skill.
             false,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -920,6 +939,7 @@ This is a test skill.
             false,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -954,6 +974,7 @@ This is a test skill.
             true,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -984,6 +1005,7 @@ This is a test skill.
             false,
             true,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -1065,6 +1087,7 @@ This is a test skill.
             false,
             true,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             Some(&session),
         )
@@ -1100,6 +1123,7 @@ This is a test skill.
             true,
             false,
             false,
+            &AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -1122,5 +1146,117 @@ This is a test skill.
             !prompt.contains("committed automatically by the system"),
             "ON-state clause should be absent when auto-commit is off"
         );
+    }
+
+    #[tokio::test]
+    async fn test_structured_questions_off_removes_ask_questions_block_only() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let features = AgentFeaturesSettings {
+            structured_questions: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &features,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !prompt.contains("## Asking the User Questions"),
+            "Ask-questions block should be absent when structuredQuestions is off"
+        );
+        assert!(
+            !prompt.contains("ws.app.question.ask"),
+            "structured-questions binding should not be referenced when off"
+        );
+        assert!(
+            prompt.contains("## Suggested Next Steps"),
+            "Suggested Next Steps must survive structuredQuestions gating"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attention_requests_off_removes_raising_attention_section() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &features,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !prompt.contains("## Raising Attention"),
+            "Raising Attention section should be absent when attentionRequests is off"
+        );
+        assert!(
+            !prompt.contains("ws.agent.reportBlocker")
+                && !prompt.contains("ws.agent.requestDiscussion"),
+            "attention-request bindings should not be referenced when off"
+        );
+        assert!(
+            prompt.contains("## Waiting on External Conditions"),
+            "neighboring sections must survive attentionRequests gating"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_features_defaults_keep_all_gated_sections() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        // All defaults on: every gated section is present and the bundled
+        // specialization rides in untouched (byte-identity of the bundled
+        // bodies themselves is asserted in `instructions::tests`).
+        let with_defaults = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(with_defaults.contains("## Waiting on External Conditions"));
+        assert!(with_defaults.contains("## Rich Chat Rendering"));
+        assert!(with_defaults.contains("## Asking the User Questions"));
+        assert!(with_defaults.contains("## Raising Attention"));
+
+        // The bundled specialization slice is the untouched composition.
+        let expected_specialization = crate::instructions::get_instruction_with_common(
+            "workspace",
+            &AgentFeaturesSettings::default(),
+        );
+        assert!(with_defaults.contains(&expected_specialization));
     }
 }

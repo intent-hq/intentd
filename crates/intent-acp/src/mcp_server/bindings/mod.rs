@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
@@ -44,8 +45,19 @@ pub(crate) mod workspace;
 /// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
 /// scheduler in `intent-services` — install the exact same environment.
 pub fn prelude() -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+    prelude_for(&AgentFeaturesSettings::default())
+}
+
+/// Feature-aware variant of [`prelude`]: namespaces disabled in
+/// `[agentFeatures]` are omitted entirely, so agent code touching them fails
+/// with a clear `ws.<ns> is undefined` TypeError. With every toggle on — the
+/// default — the output is byte-identical to [`prelude`].
+///
+/// `pub` (re-exported as `intent_acp::bindings_prelude_for`) so the
+/// background hook scheduler in `intent-services` installs the same gated
+/// environment its owning session's `workspace_api` bridge would.
+pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
+    let mut fragments: Vec<&str> = vec![
         workspace::PRELUDE,
         note::PRELUDE,
         task::PRELUDE,
@@ -53,17 +65,30 @@ pub fn prelude() -> String {
         primitive::PRELUDE,
         cross_workspace::PRELUDE,
         pr::PRELUDE,
-        browser::PRELUDE,
-        agent::PRELUDE,
-        event::PRELUDE,
-        git::PRELUDE,
-        host::PRELUDE,
-        hook::PRELUDE,
-        script::PRELUDE,
-        terminal::PRELUDE,
-        file::PRELUDE,
-        app::prelude(),
-    )
+    ];
+    if features.browser_automation {
+        fragments.push(browser::PRELUDE);
+    }
+    let agent = agent::prelude_for(features);
+    fragments.extend([agent.as_ref(), event::PRELUDE, git::PRELUDE]);
+    if features.host_exec {
+        fragments.push(host::PRELUDE);
+    }
+    if features.background_hooks {
+        fragments.push(hook::PRELUDE);
+    }
+    if features.scripts {
+        fragments.push(script::PRELUDE);
+    }
+    if features.terminal_access {
+        fragments.push(terminal::PRELUDE);
+    }
+    fragments.push(file::PRELUDE);
+    let app = app::prelude_for(features);
+    fragments.push(&app);
+    let mut out = fragments.join("\n");
+    out.push('\n');
+    out
 }
 
 /// Dispatch one `host({ method, args })` frame to the matching per-namespace
@@ -247,4 +272,109 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
 /// message content the reference builders threw).
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod prelude_tests {
+    use super::*;
+
+    // Hard requirement: with all `[agentFeatures]` toggles on (the default),
+    // the feature-aware prelude is byte-identical to the legacy one the hook
+    // scheduler installs — the two environments cannot drift.
+    #[test]
+    fn all_defaults_prelude_is_byte_identical() {
+        assert_eq!(prelude_for(&AgentFeaturesSettings::default()), prelude());
+    }
+
+    // Each disabled toggle removes exactly its own `ws.<ns> = {` installer
+    // from the prelude, leaving every other namespace in place.
+    // A gated prelude installer marker paired with the mutator that flips
+    // its `[agentFeatures]` toggle off.
+    type PreludeCase = (&'static str, fn(&mut AgentFeaturesSettings));
+
+    #[test]
+    fn disabled_features_are_omitted_from_prelude() {
+        let cases: Vec<PreludeCase> = vec![
+            ("ws.hook = {", |f| f.background_hooks = false),
+            ("ws.host = {", |f| f.host_exec = false),
+            ("ws.script = {", |f| f.scripts = false),
+            ("ws.terminal = {", |f| f.terminal_access = false),
+            ("ws.browser = {", |f| f.browser_automation = false),
+            ("ws.app.question = {", |f| f.structured_questions = false),
+        ];
+        let markers: Vec<&str> = cases.iter().map(|(m, _)| *m).collect();
+        for (marker, disable) in &cases {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            let js = prelude_for(&features);
+            assert!(
+                !js.contains(marker),
+                "`{marker}` still installed when disabled"
+            );
+            for other in &markers {
+                if other != marker {
+                    assert!(
+                        js.contains(other),
+                        "disabling `{marker}` also dropped `{other}`"
+                    );
+                }
+            }
+            // Un-gated namespaces always survive.
+            for kept in [
+                "ws.note = {",
+                "ws.git = {",
+                "ws.file = {",
+                "ws.crossWorkspace = {",
+            ] {
+                assert!(
+                    js.contains(kept),
+                    "disabling `{marker}` dropped un-gated `{kept}`"
+                );
+            }
+        }
+    }
+
+    // `structuredQuestions` off removes only `ws.app.question`; the rest of
+    // the `ws.app.*` prelude (chief-gated server-side) stays installed.
+    #[test]
+    fn structured_questions_off_keeps_other_app_prelude() {
+        let features = AgentFeaturesSettings {
+            structured_questions: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let js = prelude_for(&features);
+        assert!(!js.contains("ws.app.question = {"));
+        for kept in [
+            "ws.app.workspaces = {",
+            "ws.app.settings = {",
+            "ws.app.ui = {",
+        ] {
+            assert!(js.contains(kept), "`{kept}` was wrongly dropped");
+        }
+    }
+
+    // Guard: the attention-request segment gated by `attentionRequests` still
+    // matches the `ws.agent` prelude verbatim, so the `replacen` scrub cannot
+    // silently become a no-op after a prelude edit.
+    #[test]
+    fn attention_prelude_segment_matches_agent_prelude() {
+        assert!(agent::PRELUDE.contains(agent::ATTENTION_PRELUDE_SEGMENT));
+    }
+
+    // `attentionRequests` off removes only the two attention-request
+    // installers from `ws.agent`; the namespace itself — `reportToParent`
+    // included — stays installed.
+    #[test]
+    fn attention_requests_off_keeps_rest_of_agent_prelude() {
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let js = prelude_for(&features);
+        assert!(!js.contains("requestDiscussion:"));
+        assert!(!js.contains("reportBlocker:"));
+        for kept in ["ws.agent = {", "reportToParent:", "wakeOrCreate:"] {
+            assert!(js.contains(kept), "`{kept}` was wrongly dropped");
+        }
+    }
 }
