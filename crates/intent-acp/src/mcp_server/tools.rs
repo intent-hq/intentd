@@ -531,7 +531,16 @@ pub(super) fn denied_feature(
         .find_map(|(prefix, feature)| {
             // Frame methods carry no `ws.` prefix.
             let ns = prefix.strip_prefix("ws.").unwrap_or(prefix);
-            method.starts_with(ns).then_some(feature)
+            // Namespace entries end with `.` and gate everything under them;
+            // method-level entries (the `attentionRequests` pair) name one
+            // full method and must match exactly, so a future
+            // `agent.requestDiscussionHistory` would not be over-denied.
+            let hit = if ns.ends_with('.') {
+                method.starts_with(ns)
+            } else {
+                method == ns
+            };
+            hit.then_some(feature)
         })
 }
 
@@ -1132,6 +1141,12 @@ mod tests {
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
+        // Method-level entries match exactly: a longer method sharing the
+        // gated method as a prefix is not over-denied.
+        assert_eq!(
+            denied_feature(&all_off, "agent.requestDiscussionHistory"),
+            None
+        );
         // Enabled toggles never deny.
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),
