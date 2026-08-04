@@ -56,3 +56,9 @@ gh release upload "$channel_tag" \
   --repo "$REPO" \
   --clobber
 echo "uploaded $MANIFEST to $channel_tag" >&2
+
+# Re-stamp published_at so the channel release reflects when its manifest was
+# last refreshed (GitHub only sets published_at on the draft->published
+# transition, never on asset uploads).
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+"$script_dir/refresh-release-published-at.sh" "$channel_tag" "$REPO"
