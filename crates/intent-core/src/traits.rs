@@ -1075,6 +1075,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listActive`: daemon-global mid-turn agent streams (PROTOCOL
+    /// §5.5). No workspace id is required because the result spans workspaces.
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_active not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.get`: one agent as [`AgentLite`]; `NotFound` falls back to disk
     /// then surfaces `-32602` (PROTOCOL §5.5).
     fn agent_get(

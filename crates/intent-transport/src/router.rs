@@ -961,6 +961,7 @@ async fn dispatch(
             let agents = api.agent_list(ws).await.map_err(domain_to_rpc)?;
             Ok(json!({ "agents": agents }))
         }
+        "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
