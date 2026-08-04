@@ -2,15 +2,15 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      seven `agentFeatures.*` paths (defaults on).
+//      eight `agentFeatures.*` paths (defaults on).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
 //   3. Flip `backgroundHooks` / `hostExec` / `terminalAccess` /
-//      `richChatBlocks` off via `settings.update`, create a NEW session:
-//      prompt sections absent, tool description pruned, dispatch denied with
-//      the explicit "disabled in settings (<path> = false)" error
-//      (`hook.schedule` included).
+//      `richChatBlocks` / `attentionRequests` off via `settings.update`,
+//      create a NEW session: prompt sections absent, tool description pruned,
+//      dispatch denied with the explicit "disabled in settings
+//      (<path> = false)" error (`hook.schedule` included).
 //   4. New-sessions-only: the EXISTING session's bridge — captured at agent
 //      creation — still advertises the full surface and still dispatches the
 //      gated methods after the flip.
@@ -43,8 +43,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The seven `agentFeatures.*` settings paths (all default on).
-const FEATURE_PATHS: [&str; 7] = [
+/// The eight `agentFeatures.*` settings paths (all default on).
+const FEATURE_PATHS: [&str; 8] = [
     "agentFeatures.backgroundHooks",
     "agentFeatures.hostExec",
     "agentFeatures.scripts",
@@ -52,6 +52,7 @@ const FEATURE_PATHS: [&str; 7] = [
     "agentFeatures.browserAutomation",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
+    "agentFeatures.attentionRequests",
 ];
 
 struct Daemon {
@@ -381,7 +382,7 @@ impl BridgeClient {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: settings round-trip for all seven agentFeatures.* paths over WSS.
+// Test 1: settings round-trip for all eight agentFeatures.* paths over WSS.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -558,6 +559,10 @@ async fn agent_features_gate_new_sessions_only() {
         prompt_a.contains("## Rich Chat Rendering"),
         "full prompt must contain the richChatBlocks section"
     );
+    assert!(
+        prompt_a.contains("## Raising Attention"),
+        "full prompt must contain the attentionRequests section"
+    );
 
     // A's bridge (from the generated per-agent MCP config) advertises the
     // full workspace_api surface and dispatches gated methods.
@@ -578,6 +583,8 @@ async fn agent_features_gate_new_sessions_only() {
         "ws.terminal.readOutput(",
         "ws.browser.exec(",
         "ws.script.run(",
+        "ws.agent.reportBlocker(",
+        "ws.agent.requestDiscussion(",
     ] {
         assert!(desc_a.contains(marker), "full description missing {marker}");
     }
@@ -593,6 +600,18 @@ async fn agent_features_gate_new_sessions_only() {
         .call_js("return await ws.host.exec({ command: '/bin/echo', args: ['ok'] })")
         .await;
     assert!(!err, "ws.host.exec on full session must succeed: {text}");
+    // The attention-request bindings are installed on the full session
+    // (typeof probe — invoking them would raise a real attention request).
+    let (err, text) = bridge_a
+        .call_js(
+            "return { rb: typeof ws.agent.reportBlocker, rd: typeof ws.agent.requestDiscussion }",
+        )
+        .await;
+    assert!(!err, "typeof probe on full session must succeed: {text}");
+    assert!(
+        text.contains("\"rb\": \"function\"") && text.contains("\"rd\": \"function\""),
+        "attention-request bindings must be installed on the full session: {text}"
+    );
 
     // ===== Flip the toggles off =====
     let flip = wss_rpc(
@@ -604,13 +623,14 @@ async fn agent_features_gate_new_sessions_only() {
             { "path": "agentFeatures.hostExec", "value": false },
             { "path": "agentFeatures.terminalAccess", "value": false },
             { "path": "agentFeatures.richChatBlocks", "value": false },
+            { "path": "agentFeatures.attentionRequests", "value": false },
         ] }),
     )
     .await;
     assert_eq!(
         flip["result"]["applied"].as_array().map(Vec::len),
-        Some(4),
-        "all four toggles applied: {flip}"
+        Some(5),
+        "all five toggles applied: {flip}"
     );
 
     // ===== Session B: created AFTER the flip =====
@@ -655,6 +675,10 @@ async fn agent_features_gate_new_sessions_only() {
         "gated prompt must NOT contain the richChatBlocks section"
     );
     assert!(
+        !prompt_b.contains("## Raising Attention"),
+        "gated prompt must NOT contain the attentionRequests section"
+    );
+    assert!(
         prompt_b.contains("## Response Organization"),
         "ungated common sections must survive pruning"
     );
@@ -674,19 +698,32 @@ async fn agent_features_gate_new_sessions_only() {
     let mut bridge_b = BridgeClient::connect(&addr_b).await;
 
     let desc_b = bridge_b.workspace_api_description().await;
-    for gated in ["ws.host.", "ws.hook.", "ws.terminal."] {
+    for gated in [
+        "ws.host.",
+        "ws.hook.",
+        "ws.terminal.",
+        "ws.agent.reportBlocker",
+        "ws.agent.requestDiscussion",
+    ] {
         assert!(
             !desc_b.contains(gated),
             "gated description must not mention {gated}"
         );
     }
-    for kept in ["ws.browser.exec(", "ws.script.run(", "ws.note.read("] {
+    for kept in [
+        "ws.browser.exec(",
+        "ws.script.run(",
+        "ws.note.read(",
+        "ws.agent.reportToParent(",
+    ] {
         assert!(desc_b.contains(kept), "gated description missing {kept}");
     }
 
-    // B's JS prelude: the gated `ws.*` namespaces are not even defined.
+    // B's JS prelude: the gated `ws.*` namespaces are not even defined, and
+    // the method-level attentionRequests gate leaves the rest of `ws.agent`
+    // installed while dropping the two attention-request bindings.
     let (err, text) = bridge_b
-        .call_js("return { hook: typeof ws.hook, host: typeof ws.host, terminal: typeof ws.terminal, browser: typeof ws.browser }")
+        .call_js("return { hook: typeof ws.hook, host: typeof ws.host, terminal: typeof ws.terminal, browser: typeof ws.browser, rb: typeof ws.agent.reportBlocker, rd: typeof ws.agent.requestDiscussion, rtp: typeof ws.agent.reportToParent }")
         .await;
     assert!(!err, "typeof probe must succeed: {text}");
     assert!(
@@ -696,8 +733,12 @@ async fn agent_features_gate_new_sessions_only() {
         "gated prelude namespaces must be undefined on B: {text}"
     );
     assert!(
-        text.contains("\"browser\": \"object\""),
-        "ungated prelude namespaces must survive on B: {text}"
+        text.contains("\"rb\": \"undefined\"") && text.contains("\"rd\": \"undefined\""),
+        "gated attention-request bindings must be undefined on B: {text}"
+    );
+    assert!(
+        text.contains("\"browser\": \"object\"") && text.contains("\"rtp\": \"function\""),
+        "ungated prelude surface must survive on B: {text}"
     );
 
     // B's dispatch (defense in depth): raw `host({...})` frames that bypass
@@ -732,10 +773,33 @@ async fn agent_features_gate_new_sessions_only() {
         ),
         "terminal.list denial must name the toggle: {text}"
     );
+    let (err, text) = bridge_b
+        .call_js("return await host({ method: 'agent.reportBlocker', args: { reason: 'r' } })")
+        .await;
+    assert!(err, "agent.reportBlocker must be denied: {text}");
+    assert!(
+        text.contains(
+            "host: method `agent.reportBlocker` is disabled in settings (agentFeatures.attentionRequests = false)"
+        ),
+        "agent.reportBlocker denial must name the toggle: {text}"
+    );
+    let (err, text) = bridge_b
+        .call_js("return await host({ method: 'agent.requestDiscussion', args: { reason: 'r' } })")
+        .await;
+    assert!(err, "agent.requestDiscussion must be denied: {text}");
+    assert!(
+        text.contains(
+            "host: method `agent.requestDiscussion` is disabled in settings (agentFeatures.attentionRequests = false)"
+        ),
+        "agent.requestDiscussion denial must name the toggle: {text}"
+    );
 
     // Control: an ungated namespace still dispatches on B.
     let (err, text) = bridge_b.call_js("return await ws.script.list()").await;
     assert!(!err, "ws.script.list must stay available on B: {text}");
+    // Control: sibling ws.agent.* methods still dispatch on B.
+    let (err, text) = bridge_b.call_js("return await ws.agent.list()").await;
+    assert!(!err, "ws.agent.list must stay available on B: {text}");
 
     // ===== New-sessions-only: session A is unaffected by the flip =====
     let mut bridge_a2 = BridgeClient::connect(&addr_a).await;
@@ -769,7 +833,8 @@ async fn agent_features_gate_new_sessions_only() {
         .expect("systemPrompt still populated for A");
     assert!(
         prompt_a2.contains("## Waiting on External Conditions")
-            && prompt_a2.contains("## Rich Chat Rendering"),
+            && prompt_a2.contains("## Rich Chat Rendering")
+            && prompt_a2.contains("## Raising Attention"),
         "A's persisted prompt must keep the gated sections after the flip"
     );
 }

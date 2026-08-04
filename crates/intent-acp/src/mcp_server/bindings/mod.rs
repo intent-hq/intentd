@@ -69,7 +69,8 @@ pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
     if features.browser_automation {
         fragments.push(browser::PRELUDE);
     }
-    fragments.extend([agent::PRELUDE, event::PRELUDE, git::PRELUDE]);
+    let agent = agent::prelude_for(features);
+    fragments.extend([agent.as_ref(), event::PRELUDE, git::PRELUDE]);
     if features.host_exec {
         fragments.push(host::PRELUDE);
     }
@@ -348,6 +349,31 @@ mod prelude_tests {
             "ws.app.settings = {",
             "ws.app.ui = {",
         ] {
+            assert!(js.contains(kept), "`{kept}` was wrongly dropped");
+        }
+    }
+
+    // Guard: the attention-request segment gated by `attentionRequests` still
+    // matches the `ws.agent` prelude verbatim, so the `replacen` scrub cannot
+    // silently become a no-op after a prelude edit.
+    #[test]
+    fn attention_prelude_segment_matches_agent_prelude() {
+        assert!(agent::PRELUDE.contains(agent::ATTENTION_PRELUDE_SEGMENT));
+    }
+
+    // `attentionRequests` off removes only the two attention-request
+    // installers from `ws.agent`; the namespace itself — `reportToParent`
+    // included — stays installed.
+    #[test]
+    fn attention_requests_off_keeps_rest_of_agent_prelude() {
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let js = prelude_for(&features);
+        assert!(!js.contains("requestDiscussion:"));
+        assert!(!js.contains("reportBlocker:"));
+        for kept in ["ws.agent = {", "reportToParent:", "wakeOrCreate:"] {
             assert!(js.contains(kept), "`{kept}` was wrongly dropped");
         }
     }

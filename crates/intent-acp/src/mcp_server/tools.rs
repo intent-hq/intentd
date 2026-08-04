@@ -476,9 +476,11 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
 }];
 
 /// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
-/// Shared by the description assembler below, the prelude assembler in
-/// [`super::bindings`], and the dispatch deny in [`super::bindings`] (via
-/// [`denied_feature`]), so the three layers cannot drift.
+/// Namespace-level prefixes end with `.`; method-level prefixes (the
+/// `attentionRequests` pair) name one full method each. Shared by the
+/// description assembler below, the prelude assembler in [`super::bindings`],
+/// and the dispatch deny in [`super::bindings`] (via [`denied_feature`]), so
+/// the three layers cannot drift.
 fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
     if !features.background_hooks {
@@ -499,8 +501,21 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
     if !features.structured_questions {
         out.push(("ws.app.question.", "agentFeatures.structuredQuestions"));
     }
+    if !features.attention_requests {
+        out.push((
+            "ws.agent.requestDiscussion",
+            "agentFeatures.attentionRequests",
+        ));
+        out.push(("ws.agent.reportBlocker", "agentFeatures.attentionRequests"));
+    }
     out
 }
+
+/// The `ws.agent.reportToParent` doc line's cross-reference to the two
+/// attention-request methods, scrubbed from the assembled description when
+/// `agentFeatures.attentionRequests` is off (a unit test guards that this
+/// clause still matches both description variants verbatim).
+const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
 
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
@@ -571,6 +586,12 @@ pub fn workspace_api_description(
     if !base.ends_with('\n') {
         out.pop();
     }
+    // Method-level scrub for `attentionRequests`: the surviving
+    // `ws.agent.reportToParent` doc line cross-references the two pruned
+    // methods, so drop that clause too.
+    if !features.attention_requests {
+        out = out.replacen(REPORT_TO_PARENT_ATTENTION_XREF, "", 1);
+    }
     Cow::Owned(out)
 }
 
@@ -578,7 +599,8 @@ pub fn workspace_api_description(
 mod tests {
     use super::{
         denied_feature, workspace_api_description, AgentFeaturesSettings, Cow,
-        WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
+        WORKSPACE_API_DESCRIPTION_CHIEF,
     };
     use std::collections::HashSet;
 
@@ -847,21 +869,27 @@ mod tests {
 
     // ---- [agentFeatures] segment-assembly tests ----------------------------
 
-    // A gated `ws.` doc prefix paired with the mutator that flips its
-    // `[agentFeatures]` toggle off.
-    type FeatureCase = (&'static str, fn(&mut AgentFeaturesSettings));
+    // The gated `ws.` doc prefixes paired with the mutator that flips their
+    // `[agentFeatures]` toggle off. Namespace-level toggles gate one
+    // `ws.<ns>.` prefix; method-level toggles (attentionRequests) gate one
+    // full method name per prefix.
+    type FeatureCase = (&'static [&'static str], fn(&mut AgentFeaturesSettings));
 
-    // Each toggle mapped to the `ws.` doc prefix it prunes and a mutator that
-    // flips it off. Iterated by the assembly tests below so a new toggle
+    // Each toggle mapped to the `ws.` doc prefixes it prunes and a mutator
+    // that flips it off. Iterated by the assembly tests below so a new toggle
     // cannot ship without joining the sweep.
     fn feature_cases() -> Vec<FeatureCase> {
         vec![
-            ("ws.hook.", |f| f.background_hooks = false),
-            ("ws.host.", |f| f.host_exec = false),
-            ("ws.script.", |f| f.scripts = false),
-            ("ws.terminal.", |f| f.terminal_access = false),
-            ("ws.browser.", |f| f.browser_automation = false),
-            ("ws.app.question.", |f| f.structured_questions = false),
+            (&["ws.hook."], |f| f.background_hooks = false),
+            (&["ws.host."], |f| f.host_exec = false),
+            (&["ws.script."], |f| f.scripts = false),
+            (&["ws.terminal."], |f| f.terminal_access = false),
+            (&["ws.browser."], |f| f.browser_automation = false),
+            (&["ws.app.question."], |f| f.structured_questions = false),
+            (
+                &["ws.agent.requestDiscussion", "ws.agent.reportBlocker"],
+                |f| f.attention_requests = false,
+            ),
         ]
     }
 
@@ -884,46 +912,48 @@ mod tests {
         assert_eq!(&*chief, WORKSPACE_API_DESCRIPTION_CHIEF);
     }
 
-    // Disabling one feature removes exactly its own doc lines: no method of
-    // the gated namespace stays documented (a passing textual cross-reference
-    // in another namespace's doc line — e.g. `ws.script.*` inside the
-    // `ws.host.exec` entry — may remain), every other documented method
-    // survives, and the pruned text never leaves doubled blank lines or
-    // continuation orphans behind.
+    // Disabling one feature removes exactly its own doc lines: no method
+    // matching a gated prefix stays documented (a passing textual
+    // cross-reference in another namespace's doc line — e.g. `ws.script.*`
+    // inside the `ws.host.exec` entry — may remain), every other documented
+    // method survives, and the pruned text never leaves doubled blank lines
+    // or continuation orphans behind.
     #[test]
     fn disabling_one_feature_prunes_only_its_lines() {
         for is_chief in [false, true] {
             let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
             let full_methods = extract_ws_methods(&full);
-            for (prefix, disable) in feature_cases() {
+            for (prefixes, disable) in feature_cases() {
                 let mut features = AgentFeaturesSettings::default();
                 disable(&mut features);
                 let pruned = workspace_api_description(is_chief, &features);
-                assert!(
-                    !pruned
-                        .lines()
-                        .any(|l| l.strip_prefix("  ").is_some_and(|t| t.starts_with(prefix))),
-                    "chief={is_chief}: a `{prefix}` doc line survived disabling its toggle"
-                );
-                let gated_ns = prefix.trim_start_matches("ws.").trim_end_matches('.');
+                for prefix in prefixes {
+                    assert!(
+                        !pruned
+                            .lines()
+                            .any(|l| l.strip_prefix("  ").is_some_and(|t| t.starts_with(prefix))),
+                        "chief={is_chief}: a `{prefix}` doc line survived disabling its toggle"
+                    );
+                }
                 let pruned_methods = extract_ws_methods(&pruned);
                 for (ns, method) in &full_methods {
-                    if ns == gated_ns {
+                    let full_name = format!("ws.{ns}.{method}");
+                    if prefixes.iter().any(|p| full_name.starts_with(p)) {
                         assert!(
                             !pruned_methods.contains(&(ns.clone(), method.clone())),
-                            "chief={is_chief}: ws.{ns}.{method} still documented after \
-                             disabling `{prefix}`"
+                            "chief={is_chief}: {full_name} still documented after \
+                             disabling `{prefixes:?}`"
                         );
                     } else {
                         assert!(
                             pruned_methods.contains(&(ns.clone(), method.clone())),
-                            "chief={is_chief}: disabling `{prefix}` also dropped ws.{ns}.{method}"
+                            "chief={is_chief}: disabling `{prefixes:?}` also dropped {full_name}"
                         );
                     }
                 }
                 assert!(
                     !pruned.contains("\n\n\n"),
-                    "chief={is_chief}: pruning `{prefix}` left doubled blank lines"
+                    "chief={is_chief}: pruning `{prefixes:?}` left doubled blank lines"
                 );
             }
         }
@@ -941,14 +971,17 @@ mod tests {
             browser_automation: false,
             rich_chat_blocks: false,
             structured_questions: false,
+            attention_requests: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
-            for (prefix, _) in feature_cases() {
-                assert!(
-                    !pruned.contains(prefix),
-                    "chief={is_chief}: `{prefix}` survived"
-                );
+            for (prefixes, _) in feature_cases() {
+                for prefix in prefixes {
+                    assert!(
+                        !pruned.contains(prefix),
+                        "chief={is_chief}: `{prefix}` survived"
+                    );
+                }
             }
             for kept in [
                 "ws.note.read(",
@@ -957,6 +990,7 @@ mod tests {
                 "ws.file.read(",
                 "ws.crossWorkspace.listSiblings(",
                 "ws.agent.create(",
+                "ws.agent.reportToParent(",
                 "ws.event.subscribe(",
                 "ws.pr.status(",
             ] {
@@ -1005,6 +1039,43 @@ mod tests {
         }
     }
 
+    // Guard: the reportToParent cross-reference clause scrubbed by the
+    // `attentionRequests` gate still matches both description variants
+    // verbatim, so the `replacen` scrub cannot silently become a no-op.
+    #[test]
+    fn attention_xref_clause_is_present_in_both_variants() {
+        assert!(WORKSPACE_API_DESCRIPTION.contains(REPORT_TO_PARENT_ATTENTION_XREF));
+        assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains(REPORT_TO_PARENT_ATTENTION_XREF));
+    }
+
+    // `attentionRequests` is method-level: other `ws.agent.*` docs — most
+    // importantly `reportToParent`, minus its cross-reference to the pruned
+    // pair — must survive it, and no textual mention of the pruned methods
+    // may remain anywhere in the description.
+    #[test]
+    fn attention_requests_off_keeps_other_agent_docs() {
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features);
+            assert!(!pruned.contains("ws.agent.requestDiscussion"));
+            assert!(!pruned.contains("ws.agent.reportBlocker"));
+            for kept in [
+                "ws.agent.reportToParent(",
+                "ws.agent.create(",
+                "ws.agent.delegate(",
+                "ws.agent.watch(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
     // The dispatch-deny mapping: gated frame methods name their feature,
     // un-gated methods and enabled toggles pass through.
     #[test]
@@ -1017,6 +1088,7 @@ mod tests {
             browser_automation: false,
             rich_chat_blocks: false,
             structured_questions: false,
+            attention_requests: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -1042,6 +1114,14 @@ mod tests {
             denied_feature(&all_off, "app.question.ask"),
             Some("agentFeatures.structuredQuestions")
         );
+        assert_eq!(
+            denied_feature(&all_off, "agent.requestDiscussion"),
+            Some("agentFeatures.attentionRequests")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "agent.reportBlocker"),
+            Some("agentFeatures.attentionRequests")
+        );
         // Un-gated namespaces pass even with everything off.
         assert_eq!(denied_feature(&all_off, "note.read"), None);
         assert_eq!(
@@ -1049,6 +1129,9 @@ mod tests {
             None
         );
         assert_eq!(denied_feature(&all_off, "app.settings.list"), None);
+        // Sibling `ws.agent.*` methods pass even with attentionRequests off.
+        assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
+        assert_eq!(denied_feature(&all_off, "agent.list"), None);
         // Enabled toggles never deny.
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),
@@ -1056,6 +1139,10 @@ mod tests {
         );
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "host.exec"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
             None
         );
     }

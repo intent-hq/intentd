@@ -5387,6 +5387,43 @@ mod workspace_api_tool_tests {
             "expected explicit disabled-in-settings denial, got: {text}"
         );
     }
+
+    #[tokio::test]
+    async fn attention_requests_off_denies_blocker_and_discussion() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                attention_requests: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: the two attention-request installers are not present on
+        // `ws.agent`, while the rest of the namespace survives.
+        let resp = call_workspace_api(
+            &srv,
+            "return { rb: typeof ws.agent.reportBlocker, rd: typeof ws.agent.requestDiscussion, rtp: typeof ws.agent.reportToParent };",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["rb"], json!("undefined"));
+        assert_eq!(body["rd"], json!("undefined"));
+        assert_eq!(body["rtp"], json!("function"));
+        // Dispatch: the raw frames are denied with the settings error.
+        for method in ["agent.reportBlocker", "agent.requestDiscussion"] {
+            let resp = call_workspace_api(
+                &srv,
+                &format!("return await host({{ method: '{method}', args: {{ reason: 'r' }} }});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            let text = tool_text(&resp);
+            assert!(
+                text.contains("disabled in settings")
+                    && text.contains("agentFeatures.attentionRequests"),
+                "expected explicit disabled-in-settings denial for {method}, got: {text}"
+            );
+        }
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,

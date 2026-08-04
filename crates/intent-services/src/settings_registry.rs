@@ -98,6 +98,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.browserAutomation",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
+    "agentFeatures.attentionRequests",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).

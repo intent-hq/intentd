@@ -528,6 +528,9 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.structuredQuestions` — expose structured questions
     /// (`ws.app.question.ask`) to agents.
     pub structured_questions: bool,
+    /// `agentFeatures.attentionRequests` — expose attention requests
+    /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
+    pub attention_requests: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -540,6 +543,7 @@ impl Default for AgentFeaturesSettings {
             browser_automation: true,
             rich_chat_blocks: true,
             structured_questions: true,
+            attention_requests: true,
         }
     }
 }
@@ -952,6 +956,9 @@ richChatBlocks = true
 # Structured questions -- expose structured questions (ws.app.question.ask)
 # to agents.
 structuredQuestions = true
+# Attention requests -- expose attention requests (ws.agent.reportBlocker /
+# ws.agent.requestDiscussion) to agents.
+attentionRequests = true
 "##;
 
 #[cfg(test)]
@@ -1043,6 +1050,7 @@ mod tests {
         assert!(d.agent_features.browser_automation);
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
+        assert!(d.agent_features.attention_requests);
     }
 
     #[test]
@@ -1068,6 +1076,7 @@ mod tests {
         assert!(parsed.agent_features.terminal_access);
         assert!(parsed.agent_features.browser_automation);
         assert!(parsed.agent_features.structured_questions);
+        assert!(parsed.agent_features.attention_requests);
     }
 
     #[test]

@@ -134,12 +134,16 @@ fn remove_section(text: &str, heading: &str) -> String {
     }
 }
 
-/// The `common` body with feature-gated sections omitted (spec audit rows 1
-/// and 7): `backgroundHooks` gates "Waiting on External Conditions",
-/// `richChatBlocks` gates "Rich Chat Rendering". With all defaults on this
-/// borrows the bundled body untouched (byte-identical prompts).
+/// The `common` body with feature-gated sections omitted (spec audit rows 1,
+/// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
+/// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
+/// "Raising Attention". With all defaults on this borrows the bundled body
+/// untouched (byte-identical prompts).
 fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     let mut body = Cow::Borrowed(COMMON);
+    if !features.attention_requests {
+        body = Cow::Owned(remove_section(&body, "Raising Attention"));
+    }
     if !features.background_hooks {
         body = Cow::Owned(remove_section(&body, "Waiting on External Conditions"));
     }
@@ -342,18 +346,36 @@ mod tests {
     }
 
     #[test]
-    fn both_common_gates_off_removes_both_sections() {
+    fn attention_requests_off_removes_only_raising_attention_section() {
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..defaults()
+        };
+        let out = get_instruction_with_common("task-loop", &features);
+        assert!(!out.contains("## Raising Attention"));
+        assert!(!out.contains("ws.agent.reportBlocker"));
+        assert!(!out.contains("ws.agent.requestDiscussion"));
+        // Neighboring sections survive intact, with clean separation.
+        assert!(out.contains("## Note Editing"));
+        assert!(out.contains("(which replaces everything).\n\n## Waiting on External Conditions"));
+        // The ungated reportToParent guidance elsewhere in common survives.
+        assert!(out.contains("ws.agent.reportToParent"));
+    }
+
+    #[test]
+    fn all_common_gates_off_removes_all_gated_sections() {
         let features = AgentFeaturesSettings {
             background_hooks: false,
             rich_chat_blocks: false,
+            attention_requests: false,
             ..defaults()
         };
         let common = gated_common(&features);
         assert!(!common.contains("## Waiting on External Conditions"));
         assert!(!common.contains("## Rich Chat Rendering"));
+        assert!(!common.contains("## Raising Attention"));
         assert!(common.contains("## Delegating Tasks"));
         assert!(common.contains("## Note Editing"));
-        assert!(common.contains("## Raising Attention"));
         assert!(common.contains("## Response Organization"));
     }
 

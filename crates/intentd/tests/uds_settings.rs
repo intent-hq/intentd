@@ -503,7 +503,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(reset["value"], json!(true));
     let _ = read_json(&mut sr).await; // drain the settings:changed event.
 
-    // `agentFeatures.*` — the seven agent feature toggles are plain non-secret
+    // `agentFeatures.*` — the eight agent feature toggles are plain non-secret
     // TOML-backed booleans defaulting to on: list/get expose the defaults,
     // update/reset round-trip, and mistyped values → -32602.
     let list = rpc(&mut w, &mut r, 26, "settings.list", json!({})).await;
@@ -515,6 +515,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
         "agentFeatures.browserAutomation",
         "agentFeatures.richChatBlocks",
         "agentFeatures.structuredQuestions",
+        "agentFeatures.attentionRequests",
     ] {
         let e = entry(&list, path);
         assert_eq!(e["type"], "boolean", "{path}");

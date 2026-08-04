@@ -1187,6 +1187,45 @@ This is a test skill.
     }
 
     #[tokio::test]
+    async fn test_attention_requests_off_removes_raising_attention_section() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &features,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !prompt.contains("## Raising Attention"),
+            "Raising Attention section should be absent when attentionRequests is off"
+        );
+        assert!(
+            !prompt.contains("ws.agent.reportBlocker")
+                && !prompt.contains("ws.agent.requestDiscussion"),
+            "attention-request bindings should not be referenced when off"
+        );
+        assert!(
+            prompt.contains("## Waiting on External Conditions"),
+            "neighboring sections must survive attentionRequests gating"
+        );
+    }
+
+    #[tokio::test]
     async fn test_agent_features_defaults_keep_all_gated_sections() {
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
@@ -1211,6 +1250,7 @@ This is a test skill.
         assert!(with_defaults.contains("## Waiting on External Conditions"));
         assert!(with_defaults.contains("## Rich Chat Rendering"));
         assert!(with_defaults.contains("## Asking the User Questions"));
+        assert!(with_defaults.contains("## Raising Attention"));
 
         // The bundled specialization slice is the untouched composition.
         let expected_specialization = crate::instructions::get_instruction_with_common(

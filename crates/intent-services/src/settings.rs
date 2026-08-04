@@ -1250,6 +1250,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.attentionRequests",
+            "Attention requests",
+            "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
     ]
 }
 
@@ -2217,7 +2224,7 @@ mod tests {
         }
     }
 
-    /// The seven `agentFeatures.*` toggles are TOML-backed booleans, all
+    /// The eight `agentFeatures.*` toggles are TOML-backed booleans, all
     /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
     /// category and a `KNOWN_PATHS` entry, and each round-trips through the
     /// registry-wired service (default origin → file override → reset).
@@ -2231,6 +2238,7 @@ mod tests {
             "agentFeatures.browserAutomation",
             "agentFeatures.richChatBlocks",
             "agentFeatures.structuredQuestions",
+            "agentFeatures.attentionRequests",
         ];
         for path in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
