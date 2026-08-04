@@ -3857,6 +3857,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `voice.transcribe`: speech-to-text over a pluggable provider
+    /// (ElevenLabs Scribe | OpenAI). `params` carries `audio` (required,
+    /// base64), optional `mimeType`, `language`, `provider` override, and
+    /// `context { prompt?, keyterms? }`; returns `{ text, provider,
+    /// durationMs? }`. Missing/oversized/invalid audio → `InvalidParams`
+    /// (-32602); a missing API key or provider failure → `Internal` (-32603).
+    /// The provider API keys never cross the wire.
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::voice_transcribe not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.getChanges`: the filtered tracked-change list
     /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
     fn file_tracking_get_changes(

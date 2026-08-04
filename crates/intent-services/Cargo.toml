@@ -14,6 +14,7 @@ intent-git = { path = "../intent-git", version = "0.4.1" }
 intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.4.1" }
 intent-linear = { path = "../intent-linear", version = "0.4.1" }
 intent-sentry = { path = "../intent-sentry", version = "0.4.1" }
+intent-voice = { path = "../intent-voice", version = "0.4.1" }
 intent-acp = { path = "../intent-acp", version = "0.4.1" }
 intent-js = { path = "../intent-js", version = "0.4.1" }
 intent-context = { path = "../intent-context", version = "0.4.1" }
