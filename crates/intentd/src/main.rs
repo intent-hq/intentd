@@ -968,17 +968,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
-    // Start the watcher registry (#611): seeds a filesystem watcher per active
-    // workspace (debounced `file:*` events), the skills watcher (`skills:changed`),
-    // and the specialists watcher (`specialists:changed`), then follows workspace
-    // lifecycle events so workspaces created/opened after boot gain watching and
-    // deleted/closed workspaces are torn down without a restart. The handle is
-    // held for the lifetime of `serve` and torn down on return.
-    let _watcher_registry = WatcherRegistry::start(bus.clone(), api.clone()).await;
     // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
     // file edits refresh the FE Changes panel without any in-app git action.
-    // Held for the lifetime of `serve` and torn down on return.
-    let _git_status_refresher = GitStatusRefresher::start(bus.clone(), api.clone());
+    // Arc'd so the watcher registry's `.git` metadata watches feed the same
+    // debounced trigger path. Held for the lifetime of `serve` and torn down
+    // on return.
+    let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
+    // Start the watcher registry (#611): seeds a filesystem watcher per active
+    // workspace (debounced `file:*` events), a narrow `.git` metadata watch per
+    // git workspace (external git operations → git-status refresh, monorepo#1397),
+    // the skills watcher (`skills:changed`), and the specialists watcher
+    // (`specialists:changed`), then follows workspace lifecycle events so
+    // workspaces created/opened after boot gain watching and deleted/closed
+    // workspaces are torn down without a restart. The handle is held for the
+    // lifetime of `serve` and torn down on return.
+    let _watcher_registry =
+        WatcherRegistry::start(bus.clone(), api.clone(), Arc::clone(&git_status_refresher)).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at

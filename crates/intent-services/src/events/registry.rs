@@ -22,11 +22,13 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
+use super::git_metadata_watcher::GitMetadataWatcher;
+use super::git_status_refresher::GitStatusRefresher;
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
 
-/// Coordinates the three watcher families against the live workspace set.
+/// Coordinates the watcher families against the live workspace set.
 /// Dropping the registry tears down the lifecycle task and every watcher it
 /// owns (clean shutdown, matching the previous boot-time handles).
 pub struct WatcherRegistry {
@@ -43,8 +45,13 @@ impl WatcherRegistry {
     /// Seed watchers for every current non-archived workspace with an existing
     /// on-disk root, then follow workspace lifecycle events on `bus`.
     /// `services` resolves paths for lifecycle events whose payload does not
-    /// carry the workspace row (e.g. `workspace:opened`).
-    pub async fn start(bus: EventBus, services: Arc<dyn WorkspaceApi>) -> Self {
+    /// carry the workspace row (e.g. `workspace:opened`). `refresher` receives
+    /// the `.git` metadata detections (external git operations, monorepo#1397).
+    pub async fn start(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        refresher: Arc<GitStatusRefresher>,
+    ) -> Self {
         // Subscribe BEFORE taking the workspace snapshot: subscription
         // delivery is live-only, so a lifecycle event published between the
         // snapshot and the subscribe would never be observed. A workspace
@@ -89,6 +96,14 @@ impl WatcherRegistry {
         }
         tracing::info!(count = file_watchers.len(), "file watchers started");
 
+        let mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher> = HashMap::new();
+        for (ws_id, path) in &initial {
+            if let Some(w) = start_git_metadata_watch(&refresher, ws_id.clone(), path.clone(), "") {
+                git_watchers.insert(ws_id.clone(), w);
+            }
+        }
+        tracing::info!(count = git_watchers.len(), "git metadata watchers started");
+
         let skills = SkillsWatcher::start(bus.clone(), initial.clone());
         tracing::info!("skills watcher started");
         let specialists = SpecialistsWatcher::start(bus.clone(), initial);
@@ -97,8 +112,10 @@ impl WatcherRegistry {
         let task = tokio::spawn(lifecycle_loop(
             bus,
             services,
+            refresher,
             sub,
             file_watchers,
+            git_watchers,
             skills,
             specialists,
         ));
@@ -106,12 +123,39 @@ impl WatcherRegistry {
     }
 }
 
+/// Start the `.git` metadata watch for one workspace, logging the outcome.
+/// `None` covers both the quiet non-git case and a start failure.
+fn start_git_metadata_watch(
+    refresher: &Arc<GitStatusRefresher>,
+    ws_id: WorkspaceId,
+    path: PathBuf,
+    suffix: &str,
+) -> Option<GitMetadataWatcher> {
+    match GitMetadataWatcher::start(Arc::clone(refresher), ws_id.clone(), path.clone()) {
+        Ok(Some(w)) => {
+            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
+            Some(w)
+        }
+        Ok(None) => {
+            tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "git metadata watcher start failed");
+            None
+        }
+    }
+}
+
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
+#[allow(clippy::too_many_arguments)]
 async fn lifecycle_loop(
     bus: EventBus,
     services: Arc<dyn WorkspaceApi>,
+    refresher: Arc<GitStatusRefresher>,
     mut sub: super::bus::Subscription,
     mut file_watchers: HashMap<WorkspaceId, FileWatcher>,
+    mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher>,
     skills: SkillsWatcher,
     specialists: SpecialistsWatcher,
 ) {
@@ -133,12 +177,23 @@ async fn lifecycle_loop(
                             tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "file watcher start failed")
                         }
                     }
+                    if let Some(w) = start_git_metadata_watch(
+                        &refresher,
+                        ws_id.clone(),
+                        path.clone(),
+                        " (runtime registration)",
+                    ) {
+                        git_watchers.insert(ws_id.clone(), w);
+                    }
                     skills.add_workspace(ws_id.clone(), path.clone());
                     specialists.add_workspace(ws_id, path);
                 }
                 WORKSPACE_DELETED | WORKSPACE_CLOSED => {
                     if file_watchers.remove(&ws_id).is_some() {
                         tracing::info!(workspace = %ws_id, "workspace file watcher stopped (runtime deregistration)");
+                    }
+                    if git_watchers.remove(&ws_id).is_some() {
+                        tracing::info!(workspace = %ws_id, "workspace git metadata watcher stopped (runtime deregistration)");
                     }
                     skills.remove_workspace(&ws_id);
                     specialists.remove_workspace(&ws_id);
@@ -334,6 +389,12 @@ mod tests {
         }
     }
 
+    /// Start a registry with its own refresher (the production wiring shape).
+    async fn start_registry(bus: &EventBus, api: Arc<dyn WorkspaceApi>) -> WatcherRegistry {
+        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
+        WatcherRegistry::start(bus.clone(), api, refresher).await
+    }
+
     #[tokio::test]
     async fn boot_time_workspace_is_watched() {
         let (_db, bus, mut sub) = bus_and_sub().await;
@@ -341,7 +402,7 @@ mod tests {
         let ws = test_workspace("ws-boot", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = WatcherRegistry::start(bus.clone(), api).await;
+        let _registry = start_registry(&bus, api).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
@@ -355,7 +416,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = WatcherRegistry::start(bus.clone(), api).await;
+        let _registry = start_registry(&bus, api).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Register a workspace at runtime via `workspace:created` (payload
@@ -398,7 +459,7 @@ mod tests {
         // only the id, so the registry must resolve the path via the api.
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = WatcherRegistry::start(bus.clone(), api).await;
+        let _registry = start_registry(&bus, api).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Simulate close → open: after close the watchers are gone, and the
@@ -419,5 +480,95 @@ mod tests {
             ev.is_some(),
             "reopened workspace must emit file events (path resolved via services)"
         );
+    }
+
+    #[tokio::test]
+    async fn git_workspace_created_after_start_gains_metadata_watch_and_deletion_stops_it() {
+        use git2::{Repository, Signature};
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let (_db, bus, _file_sub) = bus_and_sub().await;
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+        let fake = Arc::new(FakeApi::new(Vec::new()));
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+
+        let _registry = start_registry(&bus, api).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Real repo with a seed commit, registered at runtime. The refresher
+        // resolves the worktree via `get_workspace`, so the api must know the
+        // workspace before the lifecycle event lands.
+        let root = TempDir::new("git-dynamic");
+        let repo = Repository::init(&root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+
+        let mut ws = test_workspace("ws-git-dynamic", &root.path);
+        ws.worktree_path = ws.path.clone();
+        fake.workspaces.lock().unwrap().push(ws.clone());
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // External `git checkout`-style HEAD rewrite → debounced refresh.
+        repo.set_head("refs/heads/other").unwrap();
+        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(10)).await;
+        assert!(
+            ev.is_some(),
+            "git workspace registered after start must refresh git status on .git metadata changes"
+        );
+
+        // Deregister via `workspace:deleted`: the metadata watch stops.
+        bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
+            .await
+            .expect("publish deleted");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        repo.set_head("refs/heads/main").unwrap();
+        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(3)).await;
+        assert!(
+            ev.is_none(),
+            "deregistered workspace must stop refreshing git status, got {ev:?}"
+        );
+    }
+
+    /// Await the next `changes:git-status` event for `ws_id` within `overall`.
+    async fn next_status_event(
+        sub: &mut super::super::bus::Subscription,
+        ws_id: &WorkspaceId,
+        overall: Duration,
+    ) -> Option<intent_core::Event> {
+        let deadline = Instant::now() + overall;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match timeout(remaining, sub.recv()).await {
+                Ok(Some(batch)) => {
+                    if let Some(ev) = batch.into_iter().find(|ev| &ev.workspace_id == ws_id) {
+                        return Some(ev);
+                    }
+                }
+                _ => return None,
+            }
+        }
     }
 }
