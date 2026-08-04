@@ -15941,6 +15941,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_op(workspace_id).await })
     }
 
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_list_active_op().await })
+    }
+
     fn agent_get(
         &self,
         agent_id: AgentId,

@@ -1376,6 +1376,50 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
 }
 
 impl Services {
+    /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
+    /// the runtime manager's busy set. Only the small busy set reaches SQLite,
+    /// and each lookup selects `updated_at` alone.
+    pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
+        let Some(manager) = self.agent_manager() else {
+            return Ok(json!({ "streams": [] }));
+        };
+        let busy = manager.list_busy();
+        if busy.is_empty() {
+            return Ok(json!({ "streams": [] }));
+        }
+
+        let mut streams = Vec::with_capacity(busy.len());
+        for (agent_id, workspace_id) in busy {
+            // A busy agent whose session row is gone (e.g. a concurrent
+            // `agent.delete` — an expected race elsewhere in the manager/store
+            // paths) is skipped rather than failing the whole response.
+            let updated_at = match self.store.get_agent_session_updated_at(&agent_id).await {
+                Ok(updated_at) => updated_at,
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        "agent.listActive: busy agent has no session row (likely \
+                         deleted mid-turn); skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            streams.push(json!({
+                "agentId": agent_id,
+                "sessionId": agent_id,
+                "workspaceId": workspace_id,
+                // `startTime` is derived from the session's `updated_at`:
+                // `try_begin` persists the Active status transition (touching
+                // `updated_at`) when the turn is claimed, so it approximates
+                // the turn start without a dedicated column. The wire name is
+                // part of the 4.1 contract (consumed by FE) — do not rename.
+                "startTime": iso_ms(&updated_at),
+            }));
+        }
+        Ok(json!({ "streams": streams }))
+    }
+
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
     /// a fixed number of store queries regardless of session count, and no
@@ -3412,10 +3456,12 @@ impl Services {
             intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
             Value::String(message_id.clone()),
         );
-        session.metadata = Some(Value::Object(metadata));
-        session.updated_at = now_iso();
+        // Targeted metadata+updated_at write: the session above came from the
+        // summary projection (no `system_prompt`), so a full-row
+        // `update_agent_session` write-back would clear the stored prompt.
+        let metadata = Value::Object(metadata);
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,
