@@ -1,7 +1,8 @@
 //! WSS end-to-end for the `Workspace.diskUsage` aggregate (PROTOCOL §9.1):
 //! `workspace.list` / `workspace.get` responses carry the cached physical
-//! footprint of the daemon-managed workspace directory. The first read omits
-//! the field (the walk runs detached and backfills), a follow-up poll
+//! footprint of the daemon-managed workspace directory. A cold list omits the
+//! field without starting a walk; the first get also omits it while starting a
+//! detached backfill, and a follow-up poll
 //! observes the computed `{ bytes, fileCount, computedAt, breakdown }`
 //! shape, and rows without a daemon-managed directory (skip-isolation)
 //! never grow the field. Drives a real [`WsApiServer`] over TLS with
@@ -309,7 +310,17 @@ async fn disk_usage_appears_on_list_and_get_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
-    // First read: field omitted (walk kicked off in the background), and
+    // Cold workspace.list is cache-only and therefore omits diskUsage.
+    let cold_list = wss_rpc(&mut rpc, 0, "workspace.list", json!({})).await;
+    let cold_managed = cold_list["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(fx.ws_id.as_str()))
+        .expect("managed row listed");
+    assert!(cold_managed.get("diskUsage").is_none());
+
+    // First get: field omitted (walk kicked off in the background), and
     // omitted means absent — never null.
     let first = wss_rpc(
         &mut rpc,

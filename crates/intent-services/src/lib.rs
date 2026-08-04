@@ -466,10 +466,9 @@ pub struct Services {
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
     /// Per-workspace disk-usage cache backing `Workspace.diskUsage` on the
-    /// list/get emit path (§9.1): TTL'd stale-while-revalidate entries whose
-    /// walks run detached on the blocking pool, so serving the aggregate
-    /// never blocks a call (first compute omits and backfills). Shared
-    /// across clones.
+    /// list/get emit path (§9.1): list reads cached values only, while get uses
+    /// TTL'd stale-while-revalidate entries whose walks run detached on the
+    /// blocking pool (first compute omits and backfills). Shared across clones.
     disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
@@ -1099,6 +1098,20 @@ impl Services {
     /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
     /// every workspace re-read pinned the blocking pool.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+        self.enrich_workspace_aggregates_inner(ws, true).await;
+    }
+
+    /// List enrichment is cache-only for disk usage: a cold list must never
+    /// fan out full-tree walks across every returned workspace.
+    async fn enrich_workspace_aggregates_for_list(&self, ws: &mut Workspace) {
+        self.enrich_workspace_aggregates_inner(ws, false).await;
+    }
+
+    async fn enrich_workspace_aggregates_inner(
+        &self,
+        ws: &mut Workspace,
+        refresh_disk_usage: bool,
+    ) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
             Some(ws.updated_at.as_str()),
@@ -1131,11 +1144,13 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
-        // diskUsage: cached physical footprint of the daemon-managed
-        // workspace directory. Omitted until the first walk completes —
-        // serving the cache never waits on a walk (computes run detached and
-        // backfill), so it can never exceed the per-call aggregate budget.
-        ws.disk_usage = self.compute_disk_usage(ws).await;
+        // diskUsage: list reads are strictly cache-only; single-workspace get
+        // may schedule a detached refresh/backfill. Neither waits on a walk.
+        ws.disk_usage = if refresh_disk_usage {
+            self.compute_disk_usage(ws).await
+        } else {
+            self.cached_disk_usage(ws)
+        };
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1438,15 +1453,13 @@ impl Services {
             .await
     }
 
-    /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
-    /// directory from the shared [`disk_usage::DiskUsageCache`]. Only rows
-    /// with such a directory qualify: remote / skip-isolation rows and the
-    /// virtual chief workspace omit the field. The directory is the
-    /// provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
+    /// Resolve the daemon-managed directory eligible for `diskUsage`. Remote /
+    /// skip-isolation rows and the virtual chief workspace omit the field. The
+    /// directory is the provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
     /// `<parent>/<id>`, covering custom `workspace.worktreesLocation` roots)
     /// when it is named for the workspace id, else `<workspaces_root>/<id>`
     /// — a never-provisioned directory simply never yields a value.
-    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+    fn disk_usage_dir(&self, ws: &Workspace) -> Option<PathBuf> {
         if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
             return None;
         }
@@ -1465,7 +1478,18 @@ impl Services {
                     .unwrap_or_else(default_workspaces_root)
                     .join(ws.id.as_str())
             });
-        self.disk_usage.usage(dir).await
+        Some(dir)
+    }
+
+    /// Serve cached usage and schedule a refresh/backfill when stale or absent.
+    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+        self.disk_usage.usage(self.disk_usage_dir(ws)?).await
+    }
+
+    /// Serve cached usage without checking freshness or scheduling a walk.
+    fn cached_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+        let dir = self.disk_usage_dir(ws)?;
+        self.disk_usage.cached(&dir)
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -9329,7 +9353,7 @@ impl WorkspaceApi for Services {
                         .await
                         .expect("enrichment semaphore closed");
                     ws.activity = this.workspace_activity(&ws.id);
-                    this.enrich_workspace_aggregates(&mut ws).await;
+                    this.enrich_workspace_aggregates_for_list(&mut ws).await;
                     (idx, ws)
                 });
             }

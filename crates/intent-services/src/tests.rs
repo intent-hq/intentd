@@ -364,6 +364,67 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diffSummary").is_none());
 }
 
+/// A cold multi-workspace list is cache-only for disk usage: it neither
+/// backfills entries nor claims queued walk slots. A single-workspace get may
+/// still request one detached backfill, which later list calls can serve.
+#[tokio::test]
+async fn workspace_list_does_not_arm_disk_usage_walks() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let mut ids = Vec::new();
+
+    for _ in 0..4 {
+        let id = WorkspaceId::new();
+        store.insert_workspace(&workspace(&id)).await.expect("ws");
+        let dir = root.path().join(id.as_str());
+        std::fs::create_dir(&dir).expect("workspace dir");
+        std::fs::write(dir.join("data.bin"), vec![0xA5; 8192]).expect("workspace file");
+        ids.push(id);
+    }
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let listed = svc.list_workspaces(false).await.expect("cold list");
+    assert!(listed.iter().all(|ws| ws.disk_usage.is_none()));
+    assert_eq!(
+        svc.disk_usage.state_counts(),
+        (0, 0),
+        "cold list must not populate the cache or claim walk slots"
+    );
+
+    assert!(svc
+        .get_workspace(ids[0].clone())
+        .await
+        .expect("first get")
+        .disk_usage
+        .is_none());
+    for _ in 0..200 {
+        if svc
+            .get_workspace(ids[0].clone())
+            .await
+            .expect("poll get")
+            .disk_usage
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let listed = svc.list_workspaces(false).await.expect("warm list");
+    assert!(listed
+        .iter()
+        .find(|ws| ws.id == ids[0])
+        .expect("requested workspace")
+        .disk_usage
+        .is_some());
+    assert!(listed
+        .iter()
+        .filter(|ws| ws.id != ids[0])
+        .all(|ws| ws.disk_usage.is_none()));
+    assert_eq!(svc.disk_usage.state_counts().0, 1);
+}
+
 /// Parity: the cheap store-level `count_task_stats` query (no note-body
 /// hydration) must match the enriched `compute_task_stats` over hydrated
 /// notes for the same seeded data, across the spec-linked filter, the

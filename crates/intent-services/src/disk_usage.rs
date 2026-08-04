@@ -31,11 +31,12 @@
 //! Per-workspace-dir entries with a ~60s TTL. A fresh entry is returned
 //! as-is; an expired entry is returned immediately while a background
 //! recompute refreshes it (stale-while-revalidate); the first-ever
-//! computation returns `None` (field omitted on the wire) and backfills for
-//! the next poll. Refreshes are single-flight per directory and run the walk
-//! on the blocking pool, with walks across directories globally serialized;
-//! a failed walk keeps the last-good entry (retry on the next poll) and a
-//! missing directory simply never produces an entry.
+//! computation requested by `workspace.get` returns `None` (field omitted on
+//! the wire) and backfills for the next poll. `workspace.list` only reads this
+//! cache and never starts a walk. Refreshes are single-flight per directory and
+//! run the walk on the blocking pool, with walks across directories globally
+//! serialized; a failed walk keeps the last-good entry (retry on the next poll)
+//! and a missing directory simply never produces an entry.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
@@ -99,6 +100,24 @@ impl DiskUsageCache {
             walk_probe: Some(walk_probe),
             ..Self::with_ttl(ttl)
         }
+    }
+
+    /// Return the last computed value without checking freshness or scheduling
+    /// a walk. List-shaped reads use this to stay bounded on a cold cache.
+    pub(crate) fn cached(&self, workspace_dir: &Path) -> Option<WorkspaceDiskUsage> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(workspace_dir)
+            .map(|entry| entry.usage.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_counts(&self) -> (usize, usize) {
+        (
+            self.entries.lock().unwrap().len(),
+            self.in_flight.lock().unwrap().len(),
+        )
     }
 
     /// Serve the cached usage for `workspace_dir` under the module's cache
@@ -418,6 +437,24 @@ mod tests {
         let usage = poll_until_some(&cache, dir.path()).await;
         assert!(usage.bytes > 0);
         assert_eq!(usage.file_count, 1);
+    }
+
+    /// Cache-only reads never claim a single-flight slot or start a walk.
+    #[tokio::test]
+    async fn cached_cold_miss_does_not_start_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("f.bin"), 8192);
+        let probe = Arc::new(WalkProbe::new(Duration::from_millis(10)));
+        let cache = Arc::new(DiskUsageCache::with_probe(
+            Duration::from_secs(3600),
+            Arc::clone(&probe),
+        ));
+
+        assert!(cache.cached(dir.path()).is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(cache.state_counts(), (0, 0));
+        assert_eq!(probe.max.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// A fresh entry is served as-is: no recompute inside the TTL.
