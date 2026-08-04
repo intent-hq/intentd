@@ -271,6 +271,11 @@ async fn dispatch(
             let ws = api.unarchive_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "workspace.diskUsage" => {
+            let id = require_workspace_id(params)?;
+            let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
+            Ok(result)
+        }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
             let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;

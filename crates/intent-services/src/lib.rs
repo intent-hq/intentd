@@ -465,11 +465,11 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
-    /// Per-workspace disk-usage cache backing `Workspace.diskUsage` on the
-    /// list/get emit path (§9.1): TTL'd stale-while-revalidate entries whose
-    /// walks run detached on the blocking pool, so serving the aggregate
-    /// never blocks a call (first compute omits and backfills). Shared
-    /// across clones.
+    /// Per-workspace disk-usage cache backing the on-demand
+    /// `workspace.diskUsage` method (§5.1) — never the list/get emit path:
+    /// TTL'd stale-while-revalidate entries whose walks run detached on the
+    /// blocking pool, so serving the method never blocks a call (first
+    /// compute omits and backfills). Shared across clones.
     disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
@@ -1131,11 +1131,10 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
-        // diskUsage: cached physical footprint of the daemon-managed
-        // workspace directory. Omitted until the first walk completes —
-        // serving the cache never waits on a walk (computes run detached and
-        // backfill), so it can never exceed the per-call aggregate budget.
-        ws.disk_usage = self.compute_disk_usage(ws).await;
+        // diskUsage is deliberately NOT populated here: list/get/subscription
+        // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
+        // derived-field ladder). Clients fetch it on demand via the dedicated
+        // `workspace.diskUsage` method (monorepo#1396).
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1438,15 +1437,13 @@ impl Services {
             .await
     }
 
-    /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
-    /// directory from the shared [`disk_usage::DiskUsageCache`]. Only rows
-    /// with such a directory qualify: remote / skip-isolation rows and the
-    /// virtual chief workspace omit the field. The directory is the
-    /// provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
-    /// `<parent>/<id>`, covering custom `workspace.worktreesLocation` roots)
-    /// when it is named for the workspace id, else `<workspaces_root>/<id>`
-    /// — a never-provisioned directory simply never yields a value.
-    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+    /// The daemon-managed directory whose footprint `workspace.diskUsage`
+    /// reports, or `None` for rows without one (remote / skip-isolation rows
+    /// and the virtual chief workspace). The directory is the provisioned
+    /// checkout's parent (`<parent>/<id>/<repo-slug>` → `<parent>/<id>`,
+    /// covering custom `workspace.worktreesLocation` roots) when it is named
+    /// for the workspace id, else `<workspaces_root>/<id>`.
+    fn disk_usage_dir(&self, ws: &Workspace) -> Option<PathBuf> {
         if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
             return None;
         }
@@ -1465,7 +1462,43 @@ impl Services {
                     .unwrap_or_else(default_workspaces_root)
                     .join(ws.id.as_str())
             });
-        self.disk_usage.usage(dir).await
+        Some(dir)
+    }
+
+    /// `workspace.diskUsage` (§5.1): on-demand cached footprint of the
+    /// workspace's daemon-managed directory — `{ diskUsage?, refreshing }`
+    /// per the [`disk_usage::DiskUsageCache::poll`] semantics. Non-qualifying
+    /// rows (no daemon-managed directory, or one that was never provisioned)
+    /// answer `{ refreshing: false }` with the field omitted, without
+    /// touching the cache; an unknown id is `NotFound`.
+    pub(crate) async fn workspace_disk_usage_op(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        let ws = if id.is_chief() {
+            chief_workspace()
+        } else {
+            self.store.get_workspace(&id).await?
+        };
+        let Some(dir) = self.disk_usage_dir(&ws) else {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        };
+        // A never-provisioned directory can never yield a value, so don't
+        // arm a walk (it would fail and leave `refreshing` forever-true).
+        let is_dir = tokio::fs::metadata(&dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        }
+        let (usage, refreshing) = self.disk_usage.poll(dir).await;
+        let mut result = serde_json::json!({ "refreshing": refreshing });
+        if let Some(usage) = usage {
+            result["diskUsage"] = serde_json::to_value(usage)
+                .map_err(|e| Error::Internal(format!("serialize diskUsage: {e}")))?;
+        }
+        Ok(result)
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -9433,6 +9466,10 @@ impl WorkspaceApi for Services {
             this.enrich_workspace_aggregates(&mut ws).await;
             Ok(ws)
         })
+    }
+
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_disk_usage_op(id).await })
     }
 
     fn create_workspace(

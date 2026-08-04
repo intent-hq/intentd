@@ -75,6 +75,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.diskUsage`: on-demand cached physical footprint of the
+    /// workspace's daemon-managed directory (PROTOCOL §5.1) —
+    /// `{ diskUsage?, refreshing }`. A fresh cache entry returns the usage
+    /// with `refreshing: false`; a stale or absent entry arms a background
+    /// walk and returns `refreshing: true` (the stale value is served when
+    /// available). Non-qualifying workspaces (remote, skip-isolation, chief,
+    /// never-provisioned directory) return `refreshing: false` with the
+    /// field omitted; `NotFound` if the workspace is absent.
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_disk_usage not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is
