@@ -3062,6 +3062,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
+    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` in the
+    /// workspace's repo — state, mergeability + blocked reason, check-run
+    /// tally, review decision, and comment counts — for hook-based PR
+    /// monitoring. `pr_number` is REQUIRED; there is no active-PR fallback.
+    fn pr_state(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, pr_number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_state not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.merge`: merge the active PR with `merge_method` (default `merge`) and
     /// optional commit overrides. Requires an active PR (PROTOCOL §5.7).
     fn pr_merge(

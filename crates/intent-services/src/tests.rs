@@ -6449,6 +6449,13 @@ mod pr {
         /// contents payload: directory, non-base64/non-UTF-8), exercising the
         /// tolerant fold of `github.repoConfig.get`.
         file_content_decode_error: bool,
+        /// When set, `get_pr` returns `NotFound` for this PR number,
+        /// exercising the `pr_state` nonexistent-PR error path.
+        missing_pr: Option<u64>,
+        /// When true, `get_pr` reports the sample PR as unmergeable with
+        /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
+        /// exercising the `pr_state` `mergeBlockedReason` wiring.
+        dirty_pr: bool,
     }
 
     fn sample_pr() -> PullRequest {
@@ -6609,10 +6616,17 @@ mod pr {
                 updated_at: String::new(),
             })
         }
-        async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
+        async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            if self.missing_pr == Some(number) {
+                return Err(ScError::NotFound("no such PR".into()));
+            }
             let mut pr = sample_pr();
             if self.merged_linked {
                 pr.state = PrState::Merged;
+            }
+            if self.dirty_pr {
+                pr.mergeable = Some(false);
+                pr.mergeable_state = Some("dirty".into());
             }
             Ok(pr)
         }
@@ -7354,6 +7368,121 @@ mod pr {
     async fn no_active_pr_is_internal_error() {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
+
+    #[tokio::test]
+    async fn state_snapshot_shape_and_counts() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["title"], "Add thing");
+        assert_eq!(v["url"], "https://github.com/o/r/pull/42");
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["isDraft"], false);
+        assert_eq!(v["isMerged"], false);
+        assert_eq!(v["isClosed"], false);
+        assert_eq!(v["headSha"], "deadbeef");
+        assert_eq!(v["mergeable"], true);
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+        // Check tally + failing names from the head SHA's runs.
+        assert_eq!(v["checks"]["total"], 3);
+        assert_eq!(v["checks"]["passed"], 1);
+        assert_eq!(v["checks"]["failed"], 1);
+        assert_eq!(v["checks"]["pending"], 1);
+        assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        // Review decision from the aggregated actionable reviews.
+        assert_eq!(v["reviews"]["decision"], "approved");
+        assert_eq!(v["reviews"]["approvals"], 1);
+        assert_eq!(v["reviews"]["changesRequested"], 0);
+        // 1 conversation comment + 2 inline thread comments (RT1 + RT2; the
+        // resolved thread's comment still counts), 1 unresolved thread.
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_counts_via_rest_fallback() {
+        // GraphQL threads unavailable: inline comments are counted from the
+        // flat REST list (replies included); resolution is unavailable there,
+        // so every fallback thread counts as unresolved.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_threads: true,
+                review_comment_pages: 2,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_dirty_pr_reports_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["mergeable"], false);
+        assert_eq!(v["mergeableState"], "dirty");
+        assert_eq!(v["mergeBlockedReason"], "merge conflicts");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_merged_pr_has_no_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                merged_linked: true,
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["state"], "merged");
+        assert_eq!(v["isMerged"], true);
+        assert_eq!(v["isClosed"], false);
+        // A merged PR never reports a blocked reason, even when the forge
+        // still surfaces a dirty mergeable state.
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_missing_pr_is_clear_error() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                missing_pr: Some(999),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc.pr_state(ws, 999).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found")));
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_requires_workspace_repo() {
+        // No repository on the workspace: same "No active PR" guard as the
+        // other pr.* methods (the required prNumber does not bypass it).
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc.pr_state(ws, 42).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
