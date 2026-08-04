@@ -6710,6 +6710,43 @@ impl Services {
                 )
                 .await;
         };
+        // Archived-workspace gate (mirrors `try_drain_queue`'s): a wake must
+        // not start a turn while the workspace is archived — it parks in the
+        // queue until unarchive, whose drain kick delivers it (see
+        // `unarchive_workspace`). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not swallow a wake.
+        if !workspace_id.is_chief() {
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    let (queued, position) = self.enqueue_message(
+                        agent_id,
+                        content.to_string(),
+                        None,
+                        None,
+                        message_metadata.cloned(),
+                        None,
+                        false,
+                    );
+                    self.publish_queue_updated(agent_id).await;
+                    return Ok(json!({
+                        "success": true,
+                        "queued": true,
+                        "queuedMessage": queued.to_value(position),
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "wake delivery: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Runtime path (DELIV-1): two-step claim/persist/spawn so the
         // user-message row is on disk BEFORE the turn worker starts, and no
         // worker is ever spawned for a row that failed to persist:

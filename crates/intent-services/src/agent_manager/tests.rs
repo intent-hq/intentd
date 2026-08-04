@@ -4489,6 +4489,208 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
     assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
 }
 
+/// `workspace.archive` gracefully interrupts every in-flight turn in the
+/// workspace (the `agent.stop` keep-alive semantics of
+/// `AgentManager::interrupt`): the draining worker is aborted and the terminal
+/// `agent:stream:end` (`stopReason: "interrupted"`) is emitted — but NOTHING
+/// is deleted. The tracked handle (provider child), registry entry, and
+/// session row all survive so unarchive can resume the same session, and no
+/// `agent:deleted` fires; `workspace:updated` still carries the archive delta.
+#[tokio::test]
+async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive");
+    let id = AgentId::from("a-archive-busy");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // An `acpSessionId` is required for the keep-alive interrupt (otherwise
+    // `interrupt` falls back to the hard `stop` kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-archive")
+        .await
+        .unwrap();
+    // Simulate a mid-turn worker: claim the in-flight slot AND register a
+    // JoinHandle in the workers map (the interrupt must abort it).
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+    assert!(archived.archived, "workspace archived");
+
+    // Drain the published events within a bounded window.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap_or_else(|| panic!("archive interrupt emits terminal stream:end (got {types:?})"));
+    assert_eq!(
+        end.data["stopReason"], "interrupted",
+        "archive interrupt terminal carries stopReason (got {:?})",
+        end.data
+    );
+    assert!(
+        !types.contains(&"agent:deleted"),
+        "archive deletes nothing (got {types:?})"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "workspace:updated"
+                && e.data["changes"]["archived"] == json!(true)),
+        "workspace:updated carries the archive delta (got {types:?})"
+    );
+
+    // Keep-alive: the handle + registry entry survive (child stays alive for
+    // resume), the in-flight slot and worker are released, and the persisted
+    // session row is untouched.
+    assert!(mgr.contains(&id), "tracked handle survives archive");
+    assert!(
+        mgr.registry().is_registered(&id),
+        "process stays registered (idle, reapable)"
+    );
+    assert!(!mgr.is_busy(&id), "in-flight slot released");
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "turn worker aborted"
+    );
+    mgr.services
+        .store
+        .get_agent_session(&id)
+        .await
+        .expect("session row preserved");
+}
+
+/// Pending queued messages survive `workspace.archive` untouched and are NOT
+/// drained into a new turn while the workspace is archived (the archived gate
+/// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
+/// delivers the parked queue — no organic follow-up kick required.
+#[tokio::test]
+async fn archive_workspace_parks_queue_until_unarchive() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-queue");
+    let id = AgentId::from("a-archive-queued");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-archive-q")
+        .await
+        .unwrap();
+    // Busy agent with a pending queued message (the queue kick inside
+    // `agent_queue_message_op` is a no-op while the slot is held).
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .await
+        .expect("queue message");
+    assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+
+    // The interrupt released the slot but the queue is intact and undrained.
+    assert!(!mgr.is_busy(&id), "interrupt released the slot");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "queue survives archive"
+    );
+
+    // An explicit drain kick while archived parks (archived gate): no slot
+    // claim, no dequeue.
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&id), "no queue-drain respawn while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "queue stays parked while archived"
+    );
+
+    // Unarchive itself kicks the drain — the parked queue delivers without
+    // any organic follow-up kick.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick delivers the parked queue"
+    );
+}
+
+/// Wake deliveries (`deliver_wake_message` — hook wakes, completion-watch
+/// wakes, `agent.wakeOrCreate` context messages) must not start a turn while
+/// the workspace is archived: the archived gate parks them in the queue
+/// instead of claiming the slot, and unarchive's own drain kick delivers
+/// the parked wake.
+#[tokio::test]
+async fn archive_workspace_parks_wake_deliveries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-wake");
+    let id = AgentId::from("a-archive-wake");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+
+    // Idle agent + archived workspace: the wake queues instead of spawning
+    // a turn.
+    let out = services
+        .deliver_wake_message(&ws, &id, "[Background hook \"w\"] cancelled", None)
+        .await
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert!(!mgr.is_busy(&id), "no turn spawned while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "wake queued behind the archived gate"
+    );
+
+    // Unarchive itself kicks the drain and delivers the parked wake.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick delivers the parked wake"
+    );
+}
+
 /// `stop` drops any pending `recreated` flag so a stale resend bit cannot
 /// survive a teardown into a future spawn (parity with the `recreated` doc on
 /// `AgentManager`).
