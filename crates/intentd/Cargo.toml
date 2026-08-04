@@ -58,6 +58,9 @@ intent-linear = { path = "../intent-linear", version = "0.4.1" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
 intent-sentry = { path = "../intent-sentry", version = "0.4.1" }
+# `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
+# `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
+intent-voice = { path = "../intent-voice", version = "0.4.1" }
 async-trait = "0.1"
 tokio = { workspace = true }
 serde_json = { workspace = true }

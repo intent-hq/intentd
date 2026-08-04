@@ -2649,6 +2649,19 @@ async fn dispatch(
             let r = api.unsloth_stop().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "voice.transcribe" => {
+            // Daemon-owned and global: no `workspaceId`. `audio` (base64) is
+            // required; the service layer validates shape/size and selects
+            // the provider (per-call override else the `voice.provider`
+            // setting). Missing/oversized/invalid audio → -32602.
+            require_str_param(params, "audio")?;
+            let request = Value::Object(params.clone());
+            match api.voice_transcribe(request).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api

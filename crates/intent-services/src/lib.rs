@@ -101,6 +101,7 @@ mod shell;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
+mod voice_ops;
 mod workspace_aggregates;
 
 #[cfg(test)]
@@ -110,8 +111,8 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents, InMemorySecretStore,
-    SecretStore,
+    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
+    migrate_default_vocabulary, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -269,6 +270,12 @@ pub struct Services {
     /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
     /// "not configured" `Internal` error when no pair is available.
     sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
+    /// Active voice engine for `voice.transcribe`. `None` until wired by a
+    /// test; when unset, the handler builds the provider engine per call from
+    /// the `voice.provider` setting (key from the secrets store /
+    /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
+    /// "not configured" `Internal` error when no key is available.
+    voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -563,6 +570,7 @@ impl Services {
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
+            voice_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
@@ -1743,6 +1751,15 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Wire the active voice engine used by `voice.transcribe`. Tests inject
+    /// a stub so the handler never touches the network; production leaves it
+    /// unset and the handler builds the provider engine per call from the
+    /// `voice.provider` setting.
+    pub fn with_voice_engine(mut self, voice_engine: Arc<dyn intent_voice::VoiceEngine>) -> Self {
+        self.voice_engine = Some(voice_engine);
         self
     }
 
@@ -18734,6 +18751,61 @@ impl WorkspaceApi for Services {
                 .map_err(sentry_ops::map_sentry_err)?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    // ========================================================================
+    // voice.transcribe — daemon-side speech-to-text. Maps onto the
+    // `VoiceEngine` trait; the engine resolves the API key (secrets store /
+    // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
+    // provider. A missing/invalid key → `Internal` ("not configured",
+    // graceful). Validation/context-merging glue lives in `voice_ops`. The
+    // API keys are never logged or returned over the wire.
+    // ========================================================================
+
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.voice_engine.clone();
+        Box::pin(async move {
+            let parsed = voice_ops::parse_request(&params)?;
+            // Provider: per-call override, else the `voice.provider` setting.
+            let setting = self
+                .settings_service()
+                .get("voice.provider")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let provider = voice_ops::select_provider(setting.as_deref(), parsed.provider_override);
+            // Vocabulary: the `voice.vocabulary` setting (defaults from the
+            // catalog); a malformed stored value degrades to an empty list.
+            let vocabulary_value = self
+                .settings_service()
+                .get("voice.vocabulary")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").cloned());
+            let vocabulary = voice_ops::parse_vocabulary_setting(vocabulary_value.as_ref());
+            // OpenAI model: the `voice.openai.model` setting (catalog default
+            // applies when unset). Ignored by other providers.
+            let openai_model = self
+                .settings_service()
+                .get("voice.openai.model")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary);
+            let transcript = engine
+                .transcribe(request)
+                .await
+                .map_err(voice_ops::map_voice_err)?;
+            Ok(serde_json::json!({
+                "text": transcript.text,
+                "provider": engine.provider_name(),
+                "durationMs": transcript.duration_ms,
+            }))
         })
     }
 
