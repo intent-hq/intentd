@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-08-03
+
+### 🚀 Features
+
+- Hint renderable chat blocks in agent instructions ([#874](https://github.com/intent-hq/intentd/pull/874))
+- Hint nav-link blocks in agent instructions ([#877](https://github.com/intent-hq/intentd/pull/877))
+- Flush queued messages into one combined turn on idle ([#876](https://github.com/intent-hq/intentd/pull/876))
+
+### 🐛 Bug Fixes
+
+- Derive tool name from dot-separated codex MCP titles ([#869](https://github.com/intent-hq/intentd/pull/869))
+- Write per-agent config files under <data_dir>/agent-configs instead of the OS temp dir ([#871](https://github.com/intent-hq/intentd/pull/871))
+
+### 🧪 Testing
+
+- Eliminate remaining test temp residuals (RAII guards, sqlite sidecars, sockets, node caches) ([#872](https://github.com/intent-hq/intentd/pull/872))
+
+
 ## [0.4.0] - 2026-08-03
 
 ### 🚀 Features

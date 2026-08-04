@@ -65,6 +65,7 @@ pub struct SettingsFile {
     pub events: EventsSettings,
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
+    pub agent_features: AgentFeaturesSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -533,6 +534,10 @@ pub struct AgentsSettings {
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
+    /// `agents.flushQueuedMessages` — deliver the whole queued-message
+    /// backlog in one batched turn when an idle agent drains its queue
+    /// (off = one turn per queued message).
+    pub flush_queued_messages: bool,
 }
 
 impl Default for AgentsSettings {
@@ -540,6 +545,7 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
+            flush_queued_messages: true,
         }
     }
 }
@@ -596,6 +602,53 @@ impl Default for HooksSettings {
     fn default() -> Self {
         Self {
             max_per_agent: DEFAULT_HOOKS_MAX_PER_AGENT,
+        }
+    }
+}
+
+/// `[agentFeatures]` — per-feature toggles for what agents see and may call
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentFeaturesSettings {
+    /// `agentFeatures.backgroundHooks` — expose background hooks
+    /// (`ws.hook.*`) to agents.
+    pub background_hooks: bool,
+    /// `agentFeatures.hostExec` — expose one-shot host command execution
+    /// (`ws.host.exec`) to agents.
+    pub host_exec: bool,
+    /// `agentFeatures.scripts` — expose saved scripts (`ws.script.*`) to
+    /// agents.
+    pub scripts: bool,
+    /// `agentFeatures.terminalAccess` — expose terminal read access
+    /// (`ws.terminal.*`) to agents.
+    pub terminal_access: bool,
+    /// `agentFeatures.browserAutomation` — expose browser automation
+    /// (`ws.browser.*`) to agents.
+    pub browser_automation: bool,
+    /// `agentFeatures.richChatBlocks` — include rich chat block guidance
+    /// (mermaid, ws-block, nav-link) in agent prompts.
+    pub rich_chat_blocks: bool,
+    /// `agentFeatures.structuredQuestions` — expose structured questions
+    /// (`ws.app.question.ask`) to agents.
+    pub structured_questions: bool,
+    /// `agentFeatures.attentionRequests` — expose attention requests
+    /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
+    pub attention_requests: bool,
+}
+
+impl Default for AgentFeaturesSettings {
+    fn default() -> Self {
+        Self {
+            background_hooks: true,
+            host_exec: true,
+            scripts: true,
+            terminal_access: true,
+            browser_automation: true,
+            rich_chat_blocks: true,
+            structured_questions: true,
+            attention_requests: true,
         }
     }
 }
@@ -1008,6 +1061,9 @@ maxConcurrent = 0
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
+# Flush queued messages -- deliver the whole queued-message backlog in one
+# batched turn when an idle agent drains its queue.
+flushQueuedMessages = true
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
@@ -1027,6 +1083,29 @@ toonOutput = true
 # Max hooks per agent -- cap on concurrently active (scheduled/running)
 # background hooks per agent.
 maxPerAgent = 5
+
+[agentFeatures]
+# All toggles default to on; changes apply to new agent sessions only.
+# Background hooks -- expose background hooks (ws.hook.*) to agents.
+backgroundHooks = true
+# Host exec -- expose one-shot host command execution (ws.host.exec) to
+# agents.
+hostExec = true
+# Saved scripts -- expose saved scripts (ws.script.*) to agents.
+scripts = true
+# Terminal access -- expose terminal read access (ws.terminal.*) to agents.
+terminalAccess = true
+# Browser automation -- expose browser automation (ws.browser.*) to agents.
+browserAutomation = true
+# Rich chat blocks -- include rich chat block guidance (mermaid, ws-block,
+# nav-link) in agent prompts.
+richChatBlocks = true
+# Structured questions -- expose structured questions (ws.app.question.ask)
+# to agents.
+structuredQuestions = true
+# Attention requests -- expose attention requests (ws.agent.reportBlocker /
+# ws.agent.requestDiscussion) to agents.
+attentionRequests = true
 "##;
 
 #[cfg(test)]
@@ -1103,6 +1182,7 @@ mod tests {
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
+        assert!(d.agents.flush_queued_messages);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
@@ -1116,22 +1196,48 @@ mod tests {
             DEFAULT_WORKSPACE_API_TOON_OUTPUT
         );
         assert_eq!(d.hooks.max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
+        assert!(d.agent_features.background_hooks);
+        assert!(d.agent_features.host_exec);
+        assert!(d.agent_features.scripts);
+        assert!(d.agent_features.terminal_access);
+        assert!(d.agent_features.browser_automation);
+        assert!(d.agent_features.rich_chat_blocks);
+        assert!(d.agent_features.structured_questions);
+        assert!(d.agent_features.attention_requests);
     }
 
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
+        assert!(!parsed.agents.flush_queued_messages);
         assert_eq!(parsed.events.stream_retention_hours, 24);
         assert_eq!(parsed.workspace_api.max_output_chars, 5000);
         assert!(!parsed.workspace_api.toon_output);
         assert!(parsed.server.ws_api.enabled);
         assert_eq!(parsed.server.ws_api.port, 2000);
         assert_eq!(parsed.hooks.max_per_agent, 9);
+        assert!(!parsed.agent_features.background_hooks);
+        assert!(!parsed.agent_features.host_exec);
+        assert!(!parsed.agent_features.rich_chat_blocks);
+        // Keys absent from a partial [agentFeatures] table keep their default.
+        assert!(parsed.agent_features.scripts);
+        assert!(parsed.agent_features.terminal_access);
+        assert!(parsed.agent_features.browser_automation);
+        assert!(parsed.agent_features.structured_questions);
+        assert!(parsed.agent_features.attention_requests);
+    }
+
+    #[test]
+    fn agent_features_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[agentFeatures]\nhostExek = false\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agentFeatures"), "names the table: {msg}");
+        assert!(msg.contains("hostExek"), "names the bad key: {msg}");
     }
 
     #[test]

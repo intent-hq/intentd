@@ -14,7 +14,7 @@ use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
-    PermissionPolicy, Services, WatcherRegistry,
+    GitStatusRefresher, PermissionPolicy, Services, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -29,6 +29,7 @@ mod client;
 mod git_credential;
 mod import;
 mod legacy_import;
+mod rpc_profile;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -474,7 +475,9 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    };
 
     // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
     let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
@@ -515,18 +518,33 @@ fn init_tracing() {
         }
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // The env filter is applied per output layer (not globally) so the RPC
+    // profiling layer below can observe the DEBUG-level `sqlx::query`
+    // statement events that the default `info` filter would otherwise
+    // disable at the callsite.
+    let output_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(output_filter());
+
+    // Per-RPC statement-count / duration WARN profiling (expensive-RPC
+    // guardrail); its warns flow through the output layers above.
+    let profile_layer =
+        rpc_profile::RpcProfileLayer::from_env().with_filter(rpc_profile::profile_filter());
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
+        .with(profile_layer)
         .with(stderr_layer);
 
     if let Some(appender) = file_appender {
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(output_filter());
         match subscriber.with(file_layer).try_init() {
             Ok(_) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
@@ -980,13 +998,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
+    // file edits refresh the FE Changes panel without any in-app git action.
+    // Arc'd so the watcher registry's `.git` metadata watches feed the same
+    // debounced trigger path. Held for the lifetime of `serve` and torn down
+    // on return.
+    let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
     // Start the watcher registry (#611): seeds a filesystem watcher per active
-    // workspace (debounced `file:*` events), the skills watcher (`skills:changed`),
-    // and the specialists watcher (`specialists:changed`), then follows workspace
-    // lifecycle events so workspaces created/opened after boot gain watching and
-    // deleted/closed workspaces are torn down without a restart. The handle is
-    // held for the lifetime of `serve` and torn down on return.
-    let _watcher_registry = WatcherRegistry::start(bus.clone(), api.clone()).await;
+    // workspace (debounced `file:*` events), a narrow `.git` metadata watch per
+    // git workspace (external git operations → git-status refresh, monorepo#1397),
+    // the skills watcher (`skills:changed`), and the specialists watcher
+    // (`specialists:changed`), then follows workspace lifecycle events so
+    // workspaces created/opened after boot gain watching and deleted/closed
+    // workspaces are torn down without a restart. The handle is held for the
+    // lifetime of `serve` and torn down on return.
+    let _watcher_registry =
+        WatcherRegistry::start(bus.clone(), api.clone(), Arc::clone(&git_status_refresher)).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at

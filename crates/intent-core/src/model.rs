@@ -245,11 +245,12 @@ pub struct Workspace {
     pub execution_environment: Option<SandboxType>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
-    /// sandboxes, everything). Computed on the `workspace.list` /
-    /// `workspace.get` emit path (§9.1) from a cached background walk; never
-    /// persisted. Omitted (not `null`) until the first walk completes and for
-    /// rows without a daemon-managed directory (remote / skip-isolation /
-    /// chief).
+    /// sandboxes, everything). Never populated on `workspace.list` /
+    /// `workspace.get` rows (monorepo#1396) — clients fetch it on demand via
+    /// the dedicated `workspace.diskUsage` method (§5.1), which serves a
+    /// cached background walk; never persisted. Omitted (not `null`) until
+    /// the first walk completes and for rows without a daemon-managed
+    /// directory (remote / skip-isolation / chief).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<WorkspaceDiskUsage>,
 }

@@ -5298,6 +5298,159 @@ mod workspace_api_tool_tests {
             .unwrap()
             .contains("`summary` is required and must be a string"));
     }
+
+    // ---- [agentFeatures] surface gating (description / prelude / dispatch) --
+
+    fn no_hooks_features() -> intent_core::settings_file::AgentFeaturesSettings {
+        intent_core::settings_file::AgentFeaturesSettings {
+            background_hooks: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_description_prunes_disabled_feature() {
+        // Layer (a): a bridge created with `backgroundHooks = false` must not
+        // advertise `ws.hook.*` in its `workspace_api` description, while an
+        // all-defaults bridge advertises it verbatim.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("ws.hook."),
+            "pruned description still advertises ws.hook.*"
+        );
+        assert!(
+            desc.contains("ws.note.read("),
+            "un-gated surface must stay advertised"
+        );
+
+        let default_srv = server("amber-forest", None);
+        let resp = default_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            crate::mcp_server::WORKSPACE_API_DESCRIPTION,
+            "all-defaults tools/list description must be byte-identical to the static const"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_namespace_is_absent_from_prelude() {
+        // Layer (b): with the toggle off, `ws.hook` is not installed, so
+        // touching it fails with the clear namespace-missing TypeError.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.hook.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("undefined"),
+            "expected undefined-namespace error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_method_is_denied_at_dispatch() {
+        // Layer (c): a raw `host({...})` frame cannot bypass the pruned
+        // prelude — dispatch denies it with the explicit settings error.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'hook.list', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings") && text.contains("agentFeatures.backgroundHooks"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_features_dispatch_unaffected_by_other_toggles() {
+        // Disabling hooks must not disturb un-gated namespaces on the same
+        // bridge — `ws.workspace.info()` still round-trips.
+        let srv = server("amber-forest", Some("/tmp/amber-forest"))
+            .with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn structured_questions_off_denies_question_ask() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                structured_questions: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: ws.app.question is not installed.
+        let resp = call_workspace_api(
+            &srv,
+            "return await ws.app.question.ask({ question: 'q', header: 'h', options: [{label:'a'},{label:'b'}] });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        // Dispatch: the raw frame is denied with the settings error.
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'app.question.ask', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings")
+                && text.contains("agentFeatures.structuredQuestions"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attention_requests_off_denies_blocker_and_discussion() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                attention_requests: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: the two attention-request installers are not present on
+        // `ws.agent`, while the rest of the namespace survives.
+        let resp = call_workspace_api(
+            &srv,
+            "return { rb: typeof ws.agent.reportBlocker, rd: typeof ws.agent.requestDiscussion, rtp: typeof ws.agent.reportToParent };",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["rb"], json!("undefined"));
+        assert_eq!(body["rd"], json!("undefined"));
+        assert_eq!(body["rtp"], json!("function"));
+        // Dispatch: the raw frames are denied with the settings error.
+        for method in ["agent.reportBlocker", "agent.requestDiscussion"] {
+            let resp = call_workspace_api(
+                &srv,
+                &format!("return await host({{ method: '{method}', args: {{ reason: 'r' }} }});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            let text = tool_text(&resp);
+            assert!(
+                text.contains("disabled in settings")
+                    && text.contains("agentFeatures.attentionRequests"),
+                "expected explicit disabled-in-settings denial for {method}, got: {text}"
+            );
+        }
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,
@@ -6752,6 +6905,7 @@ mod wsapi6_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         pr_status_calls: Mutex<u32>,
+        pr_snapshot_calls: Mutex<Vec<u64>>,
         pr_merge_calls: Mutex<Vec<PrMergeCall>>,
         pr_update_branch_calls: Mutex<u32>,
         pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
@@ -6807,6 +6961,21 @@ mod wsapi6_bindings_tests {
                         "isClosed": false,
                         "summary": "✅ PR is mergeable with no conflicts.",
                     })
+                }))
+            })
+        }
+
+        fn pr_state(&self, _ws: WorkspaceId, pr_number: u64) -> BoxFuture<'_, Result<Value>> {
+            self.pr_snapshot_calls.lock().unwrap().push(pr_number);
+            Box::pin(async move {
+                Ok(json!({
+                    "prNumber": pr_number,
+                    "state": "open",
+                    "isMerged": false,
+                    "mergeBlockedReason": null,
+                    "checks": { "total": 0, "passed": 0, "failed": 0, "pending": 0, "failedNames": [] },
+                    "reviews": { "decision": "review_required", "approvals": 0, "changesRequested": 0 },
+                    "comments": { "conversationCount": 0, "reviewCommentCount": 0, "unresolvedThreadCount": 0, "totalCount": 0 },
                 }))
             })
         }
@@ -7126,6 +7295,40 @@ mod wsapi6_bindings_tests {
         let resp = call(&srv, "return await ws.pr.status();").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("No active PR"));
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_forwards_pr_number_and_returns_shape() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["prNumber"], json!(42));
+        assert_eq!(v["isMerged"], json!(false));
+        assert_eq!(v["mergeBlockedReason"], json!(null));
+        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![42u64]);
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_requires_numeric_pr_number() {
+        // Missing, non-positive, and non-numeric prNumber all surface the
+        // same validation error before the trait method is called — parity
+        // with the `replyToReviewComment` commentId pattern.
+        let (srv, api) = server();
+        for code in [
+            "return await ws.pr.snapshot();",
+            "return await ws.pr.snapshot(0);",
+            "return await ws.pr.snapshot(-1);",
+            "return await ws.pr.snapshot('abc');",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
+            assert!(
+                text(&resp).contains("prNumber is required and must be a number"),
+                "code: {code}"
+            );
+        }
+        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

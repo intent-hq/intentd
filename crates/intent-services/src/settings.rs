@@ -1221,6 +1221,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             30.0,
         ),
+        boolean(
+            "agents.flushQueuedMessages",
+            "Flush queued messages",
+            "Deliver the whole queued-message backlog in one batched turn when an idle agent drains its queue",
+            "agents",
+            true,
+        ),
         number(
             "events.streamRetentionHours",
             "Event stream retention hours",
@@ -1244,6 +1251,62 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "TOON output",
             "TOON-encode workspace_api tool results (token-efficient) instead of plain JSON",
             "workspaceApi",
+            true,
+        ),
+        boolean(
+            "agentFeatures.backgroundHooks",
+            "Background hooks",
+            "Expose background hooks (ws.hook.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.hostExec",
+            "Host exec",
+            "Expose one-shot host command execution (ws.host.exec) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.scripts",
+            "Saved scripts",
+            "Expose saved scripts (ws.script.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.terminalAccess",
+            "Terminal access",
+            "Expose terminal read access (ws.terminal.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.browserAutomation",
+            "Browser automation",
+            "Expose browser automation (ws.browser.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.richChatBlocks",
+            "Rich chat blocks",
+            "Include rich chat block guidance (mermaid, ws-block, nav-link) in agent prompts; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.structuredQuestions",
+            "Structured questions",
+            "Expose structured questions (ws.app.question.ask) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.attentionRequests",
+            "Attention requests",
+            "Expose attention requests (ws.agent.reportBlocker / ws.agent.requestDiscussion) to agents; applies to new sessions only",
+            "agentFeatures",
             true,
         ),
     ]
@@ -2279,6 +2342,152 @@ mod tests {
         assert_eq!(registry.get("sandbox.cow.enabled"), Some(json!(false)));
         assert_eq!(registry.get("sandbox.defaultType"), Some(json!("worktree")));
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// `agents.flushQueuedMessages` is a TOML-backed boolean defaulting to
+    /// `true`: the catalog entry and wire round-trip through the
+    /// registry-wired service (default origin → file override → reset).
+    #[tokio::test]
+    async fn agents_flush_queued_messages_round_trip_via_registry() {
+        let def = find_definition("agents.flushQueuedMessages")
+            .expect("agents.flushQueuedMessages missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(def.ty, SettingType::Boolean));
+        assert_eq!(def.default_value, Some(json!(true)));
+        assert!(KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default with `default` origin.
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+
+        // Update persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([
+            { "path": "agents.flushQueuedMessages", "value": false },
+        ]))
+        .await
+        .expect("update");
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("flushQueuedMessages"), "{text}");
+        assert_eq!(
+            store
+                .get_setting("agents.flushQueuedMessages")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Reset restores the default.
+        let reset = svc
+            .reset("agents.flushQueuedMessages")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(true));
+        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// The eight `agentFeatures.*` toggles are TOML-backed booleans, all
+    /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
+    /// category and a `KNOWN_PATHS` entry, and each round-trips through the
+    /// registry-wired service (default origin → file override → reset).
+    #[tokio::test]
+    async fn agent_features_toggles_round_trip_via_registry() {
+        let paths = [
+            "agentFeatures.backgroundHooks",
+            "agentFeatures.hostExec",
+            "agentFeatures.scripts",
+            "agentFeatures.terminalAccess",
+            "agentFeatures.browserAutomation",
+            "agentFeatures.richChatBlocks",
+            "agentFeatures.structuredQuestions",
+            "agentFeatures.attentionRequests",
+        ];
+        for path in paths {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert_eq!(def.category, "agentFeatures");
+            assert!(matches!(def.ty, SettingType::Boolean), "{path} boolean");
+            assert_eq!(def.default_value, Some(json!(true)), "{path} defaults on");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-agentfeat-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-agentfeat-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for path in paths {
+            // Default with `default` origin.
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(true), "{path} default");
+            assert_eq!(got["origin"], json!("default"), "{path} origin");
+
+            // Update persists to config.toml with `file` origin, never SQLite.
+            svc.update(&json!([{ "path": path, "value": false }]))
+                .await
+                .expect("update");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(false), "{path} updated");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+
+            // Reset restores the default.
+            let reset = svc.reset(path).await.expect("reset");
+            assert_eq!(reset["value"], json!(true), "{path} reset");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
+        }
+
+        // Mistyped values reject with -32602 semantics (InvalidParams).
+        let err = svc
+            .update(&json!([{ "path": "agentFeatures.hostExec", "value": "yes" }]))
+            .await
+            .expect_err("string value must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// Q1 regression: with the registry wired (production composition), a

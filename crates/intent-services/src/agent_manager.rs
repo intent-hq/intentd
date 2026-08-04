@@ -172,6 +172,22 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     }
 }
 
+/// Combined provider prompt for a batch flush (`agents.flushQueuedMessages`):
+/// a header naming the flushed count, then each entry's content under a
+/// `Message #N:` label in delivery order. Entry contents already carry their
+/// per-entry [`dequeue_wait_note`] (and any #576 stale-redrive note), so each
+/// section retains its own queuedAt time and wait duration. Wire-only — the
+/// transcript persists each entry as its own user row; this combined text is
+/// never persisted.
+fn flush_combined_prompt(entries: &[QueuedMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("{} queued messages while you were working", entries.len());
+    for (i, m) in entries.iter().enumerate() {
+        let _ = write!(out, "\n\nMessage #{}:\n{}", i + 1, m.content);
+    }
+    out
+}
+
 const GB: u64 = 1024 * 1024 * 1024;
 
 /// Whether a `session/cancel` error means the child's transport is already
@@ -334,6 +350,27 @@ fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
         intent_core::MessageOrigin::User
     } else {
         intent_core::MessageOrigin::Automatic
+    }
+}
+
+/// Rebuild the single-entry drain [`TurnOptions`] for one queue entry — the
+/// exact shape the non-flush drain arms construct inline. Used by the
+/// batch-flush persist-failure path so the failed entry is parked/requeued
+/// with the same options a single-entry drain would have used.
+fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
+    TurnOptions {
+        image_blocks: entry.image_blocks.clone(),
+        file_blocks: entry.file_blocks.clone(),
+        message_metadata: entry.message_metadata.clone(),
+        suppress_report_clear: stale,
+        queued_at: Some(entry.queued_at.clone()),
+        prepend_content: entry.prepend_content.clone(),
+        prepend_image_blocks: entry.prepend_image_blocks.clone(),
+        prepend_file_blocks: entry.prepend_file_blocks.clone(),
+        turn_id: Some(entry.turn_id.clone()),
+        interrupt_priority: entry.interrupt_priority,
+        origin: origin_from_user_flag(entry.user_origin),
+        ..TurnOptions::default()
     }
 }
 
@@ -1444,7 +1481,11 @@ impl AgentManager {
                 .with_caller_agent_id(Some(agent_id.clone()))
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
-                .with_turn_attachments(Some(self.services.turn_attachments())),
+                .with_turn_attachments(Some(self.services.turn_attachments()))
+                // `[agentFeatures]` toggles are captured here, at bridge
+                // creation, so they apply to new sessions only — a settings
+                // change never mutates a live agent's surface.
+                .with_agent_features(self.services.effective_settings().agent_features),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await
@@ -1529,10 +1570,13 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `rtk.enabled` is a global (non-workspace-scoped) setting;
-            // auto-commit resolves per-workspace (persisted override →
-            // global `git.autoCommit` fallback, spec Diagnosis §3b) so the
-            // prompt reflects what the commit gate will actually enforce.
+            // `rtk.enabled` and the `[agentFeatures]` toggles are global
+            // (non-workspace-scoped) settings, captured once here so the
+            // persisted prompt reflects the flags at session creation
+            // ("new sessions only"); auto-commit resolves per-workspace
+            // (persisted override → global `git.autoCommit` fallback, spec
+            // Diagnosis §3b) so the prompt reflects what the commit gate
+            // will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
@@ -1554,6 +1598,7 @@ impl AgentManager {
                 is_sub_agent,
                 auto_commit_enabled,
                 settings.rtk.enabled,
+                &settings.agent_features,
                 workspace.as_ref(),
                 Some(&session),
             )
@@ -3169,6 +3214,32 @@ impl AgentManager {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
+    /// Snapshot every agent with a turn currently in flight together with its
+    /// owning workspace. This is the daemon-global source for
+    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    ///
+    /// Lock-order invariant: `busy` is always acquired before `agent_ws`
+    /// (here and in every busy/agent_ws mutator — `try_begin`,
+    /// `release_in_flight_slot`, `end_turn`), and mutators update both maps
+    /// while holding the `busy` lock. That makes a claim/release visible
+    /// atomically from this snapshot's perspective: a busy agent always has
+    /// its `agent_ws` entry.
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let busy = self.busy.lock().unwrap();
+        let agent_ws = self.agent_ws.lock().unwrap();
+        let mut active = busy
+            .iter()
+            .filter_map(|agent_id| {
+                agent_ws
+                    .get(agent_id)
+                    .cloned()
+                    .map(|workspace_id| (agent_id.clone(), workspace_id))
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        active
+    }
+
     /// Atomically claim the in-flight slot for `agent_id` in `workspace_id`:
     /// `true` when the agent was idle (now marked busy), `false` when a turn is
     /// already running. On a successful claim the agent's workspace is recorded
@@ -3179,12 +3250,21 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
+        // Insert into `agent_ws` while still holding the `busy` lock
+        // (busy → agent_ws order, matching `list_busy`) so a concurrent
+        // `list_busy` never observes a busy agent without its workspace.
+        let claimed = {
+            let mut busy = self.busy.lock().unwrap();
+            let claimed = busy.insert(agent_id.clone());
+            if claimed {
+                self.agent_ws
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), workspace_id.clone());
+            }
+            claimed
+        };
         if claimed {
-            self.agent_ws
-                .lock()
-                .unwrap()
-                .insert(agent_id.clone(), workspace_id.clone());
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -3203,14 +3283,24 @@ impl AgentManager {
     /// terminal spawn failure already persisted Error status and we only need
     /// to release busy/agent_ws so a future message can restart the worker).
     async fn release_in_flight_slot(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
         }
+    }
+
+    /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
+    /// `list_busy` (both maps mutated under the `busy` lock, busy → agent_ws
+    /// order). Returns `None` when the agent was not busy, otherwise the
+    /// removed `agent_ws` entry.
+    fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
+        let mut busy = self.busy.lock().unwrap();
+        if !busy.remove(agent_id) {
+            return None;
+        }
+        Some(self.agent_ws.lock().unwrap().remove(agent_id))
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
@@ -3219,11 +3309,9 @@ impl AgentManager {
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
@@ -3853,6 +3941,29 @@ impl AgentManager {
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
+        }
+        // Batch flush (`agents.flushQueuedMessages`, default on): with the
+        // setting on and MORE THAN ONE ready-to-send entry waiting (under an
+        // active hold: user-origin entries only — the hold contract is
+        // unchanged), drain them all into ONE combined provider turn while
+        // persisting each entry as its own transcript row. A single ready
+        // entry (or the setting off) falls through to the existing
+        // single-entry path unchanged.
+        if self.services.flush_queued_messages_enabled() {
+            if let Some(batch) = self.services.dequeue_ready_batch(&agent_id, hold_drain, 2) {
+                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn { content, options } => {
+                        self.spawn_worker(agent_id, workspace_id, content, *options, true);
+                    }
+                    FlushPrep::Parked => {
+                        // Release the slot without overwriting the Error
+                        // status just persisted, so `agent.retry` (or a
+                        // future message) can redrive.
+                        self.release_in_flight_slot(&agent_id).await;
+                    }
+                }
+                return;
+            }
         }
         // Under an active hold only a user-origin entry may drain; the
         // normal path pops the queue head as before.
@@ -6544,7 +6655,34 @@ async fn run_message_worker(
         // between `has_user_origin_ready` returning false and the slot's
         // release would otherwise strand behind a gone worker with nothing to
         // kick `try_drain_queue`.
-        let drained = if mgr.services.question_hold_active(&agent_id).await {
+        let hold_active = mgr.services.question_hold_active(&agent_id).await;
+        // Batch flush (`agents.flushQueuedMessages`): same contract as the
+        // `try_drain_queue` flush arm — ≥2 ready entries (user-origin only
+        // under an active hold) drain into one combined provider turn;
+        // otherwise the single-entry arm below runs unchanged.
+        if mgr.services.flush_queued_messages_enabled() {
+            if let Some(batch) = mgr.services.dequeue_ready_batch(&agent_id, hold_active, 2) {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let drained = if hold_active {
             if mgr.services.has_user_origin_ready(&agent_id) {
                 mgr.services.dequeue_user_origin_message(&agent_id)
             } else {
@@ -6660,6 +6798,36 @@ async fn run_message_worker(
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
+            // Batch flush (`agents.flushQueuedMessages`): `next` was popped
+            // before the slot re-claim, so fold any FURTHER ready entries in
+            // behind it (min 1 more ⇒ ≥2 total, matching the other flush
+            // arms; user-origin only under an active hold) and run them as
+            // one combined turn. With no extra entry (or the setting off)
+            // the single-entry path below runs unchanged.
+            if mgr.services.flush_queued_messages_enabled() {
+                let hold = mgr.services.question_hold_active(&agent_id).await;
+                if let Some(mut batch) = mgr.services.dequeue_ready_batch(&agent_id, hold, 1) {
+                    batch.insert(0, next);
+                    match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                        FlushPrep::Turn {
+                            content: c,
+                            options: o,
+                        } => {
+                            content = c;
+                            options = *o;
+                            user_persisted = true;
+                            // New messages → fresh silent-redrive budget
+                            // (monorepo#764).
+                            silent_redrive_used = false;
+                            continue 'outer;
+                        }
+                        FlushPrep::Parked => {
+                            mgr.release_in_flight_slot(&agent_id).await;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -6737,6 +6905,162 @@ async fn run_message_worker(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    }
+}
+
+/// Outcome of [`prepare_flush_turn`]: either the combined turn is ready to
+/// run, or a persist failure parked the agent in `Error` (the caller must
+/// release the in-flight slot without starting a turn).
+enum FlushPrep {
+    Turn {
+        content: String,
+        options: Box<TurnOptions>,
+    },
+    Parked,
+}
+
+/// Prepare a batch-flushed turn (`agents.flushQueuedMessages`, default on):
+/// the caller has already claimed the in-flight slot and batch-dequeued ≥2
+/// ready-to-send entries in drain order. This mirrors the single-entry drain
+/// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
+/// then the transcript row append (`persist_user`; entries already persisted
+/// by a terminal-failure requeue are not re-appended) — while emitting ONE
+/// `agent:queue:updated` (the fully-shrunk queue) and ONE
+/// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
+/// turn's id). Each row persist emits its normal `agent:message`, so clients
+/// render N stacked user rows — and every row echo carries the COMBINED
+/// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
+/// correlate with the single `agent:queue:processing`/`agent:stream:*`
+/// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
+/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
+///
+/// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
+/// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
+/// `prepend_*` payloads from all entries in message order; head entry's
+/// `turn_id` / `queued_at` / `interrupt_priority` / `messageMetadata`;
+/// `origin` is User when ANY entry is user-origin (a user message is being
+/// delivered); the turn-begin report clear is suppressed only when EVERY
+/// entry is a stale redrive (any fresh entry means the clear should happen).
+///
+/// Fail closed (#547, never-lost): when an entry's row append exhausts the
+/// bounded retry, the agent parks in `Error` via
+/// [`handle_drain_persist_failure`] (which requeues the FAILED entry at the
+/// queue front, `persisted: false`) and the other flushed entries are
+/// requeued around it in original order — entries whose rows already
+/// persisted carry `persisted: true` so the retry drain never
+/// double-appends. Returns [`FlushPrep::Parked`].
+async fn prepare_flush_turn(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    mut entries: Vec<QueuedMessage>,
+) -> FlushPrep {
+    mgr.services
+        .publish_queue_updated_for(
+            agent_id,
+            workspace_id,
+            mgr.services.queue_snapshot(agent_id),
+        )
+        .await;
+    // Per-entry annotations, same order as the single-entry drain arms: the
+    // stale check before the wait note, both before the row persist so the
+    // persisted row and the provider prompt carry the same content.
+    let mut stale_flags = Vec::with_capacity(entries.len());
+    for entry in entries.iter_mut() {
+        let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
+        annotate_dequeue_wait(entry);
+        stale_flags.push(stale);
+    }
+    // Drain-start signal (monorepo#1022): one event for the combined turn,
+    // keyed on the head entry (its `turn_id` IS the turn's id below).
+    mgr.services
+        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .await;
+    // All rows persist under the combined turn's id — the provider turn runs
+    // once, under the head entry's `turn_id`, so a per-entry id on row #2+
+    // would never match any processing/stream event.
+    let combined_turn_id = entries[0].turn_id.clone();
+    for i in 0..entries.len() {
+        if entries[i].persisted {
+            continue;
+        }
+        if persist_user(
+            mgr,
+            agent_id,
+            workspace_id,
+            &entries[i].content,
+            entries[i].image_blocks.as_ref(),
+            entries[i].file_blocks.as_ref(),
+            entries[i].message_metadata.as_ref(),
+            Some(&combined_turn_id),
+        )
+        .await
+        {
+            // The row is durable: a later mid-flush failure requeues this
+            // entry with `persisted: true` so the retry drain skips the
+            // duplicate append (STAB-51).
+            entries[i].persisted = true;
+            continue;
+        }
+        // Fail closed: restore the queue in original order — tail first,
+        // then the failed entry (the handler's own front requeue), then the
+        // already-persisted head entries ahead of it.
+        let stale = stale_flags[i];
+        let failed = entries.remove(i);
+        let tail = entries.split_off(i);
+        let head = entries;
+        let options = turn_options_for_entry(&failed, stale);
+        mgr.services.requeue_front_batch(agent_id, tail);
+        handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options).await;
+        mgr.services.requeue_front_batch(agent_id, head);
+        // The handler's queue publish preceded the head requeue: re-publish
+        // so clients see the fully-restored queue.
+        mgr.services
+            .publish_queue_updated_for(
+                agent_id,
+                workspace_id,
+                mgr.services.queue_snapshot(agent_id),
+            )
+            .await;
+        return FlushPrep::Parked;
+    }
+    let content = flush_combined_prompt(&entries);
+    let mut image_blocks = None;
+    let mut file_blocks = None;
+    let mut prepend_content: Option<String> = None;
+    let mut prepend_image_blocks = None;
+    let mut prepend_file_blocks = None;
+    for entry in &entries {
+        image_blocks = merge_block_arrays(image_blocks, entry.image_blocks.clone());
+        file_blocks = merge_block_arrays(file_blocks, entry.file_blocks.clone());
+        if let Some(p) = entry.prepend_content.as_deref().filter(|p| !p.is_empty()) {
+            prepend_content = Some(match prepend_content.take() {
+                Some(existing) => format!("{existing}\n\n{p}"),
+                None => p.to_string(),
+            });
+        }
+        prepend_image_blocks =
+            merge_block_arrays(prepend_image_blocks, entry.prepend_image_blocks.clone());
+        prepend_file_blocks =
+            merge_block_arrays(prepend_file_blocks, entry.prepend_file_blocks.clone());
+    }
+    let options = TurnOptions {
+        image_blocks,
+        file_blocks,
+        message_metadata: entries[0].message_metadata.clone(),
+        suppress_report_clear: stale_flags.iter().all(|&s| s),
+        queued_at: Some(entries[0].queued_at.clone()),
+        prepend_content,
+        prepend_image_blocks,
+        prepend_file_blocks,
+        turn_id: Some(entries[0].turn_id.clone()),
+        interrupt_priority: entries[0].interrupt_priority,
+        origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
+        ..TurnOptions::default()
+    };
+    FlushPrep::Turn {
+        content,
+        options: Box::new(options),
     }
 }
 
@@ -7600,11 +7924,11 @@ mod role_reminder_tests {
     use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
     use intent_store::Store;
 
-    /// Seed a hermetic specialists dir under temp with one `<id>.md`.
-    fn write_specialist(id: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("intentd-spc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{id}.md")), content).unwrap();
+    /// Seed a hermetic specialists dir under temp with one `<id>.md`. Keep the
+    /// returned RAII guard alive for the test (dropping it removes the dir).
+    fn write_specialist(id: &str, content: &str) -> tempfile::TempDir {
+        let dir = crate::tests::test_tempdir("intentd-spc-");
+        std::fs::write(dir.path().join(format!("{id}.md")), content).unwrap();
         dir
     }
 
@@ -7700,12 +8024,15 @@ mod role_reminder_tests {
         }
     }
 
-    /// Build a manager over a temp store seeded with a workspace + agent session.
+    /// Build a manager over a temp store seeded with a workspace + agent
+    /// session. The returned RAII guard owns the db dir (db + `-wal`/`-shm`
+    /// sidecars); keep it alive for the duration of the test.
     pub(super) async fn manager_with(
         specialist: Option<&str>,
         specialists_dir: Option<PathBuf>,
-    ) -> (AgentManager, AgentId) {
-        let path = std::env::temp_dir().join(format!("intentd-rr-{}.db", uuid::Uuid::new_v4()));
+    ) -> (AgentManager, AgentId, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-rr-");
+        let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone())
@@ -7725,7 +8052,7 @@ mod role_reminder_tests {
             .await
             .unwrap();
         let sink = Arc::new(BusEventSink::new(bus));
-        (AgentManager::new(services, sink, 4), agent_id)
+        (AgentManager::new(services, sink, 4), agent_id, db_dir)
     }
 
     /// First text block's text from a built prompt.
@@ -7743,7 +8070,7 @@ mod role_reminder_tests {
     /// turn.
     #[tokio::test]
     async fn stop_preserves_force_recreate_but_clears_recreated() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         mgr.force_recreate.lock().unwrap().insert(agent_id.clone());
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         mgr.stop(&agent_id).await;
@@ -7763,7 +8090,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
             let prompt = mgr
@@ -7789,7 +8117,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         let prompt = mgr
@@ -7811,7 +8140,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn no_injection_without_specialist() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let prompt = mgr
             .build_turn_prompt(
                 &agent_id,
@@ -7828,7 +8157,7 @@ mod role_reminder_tests {
         // Reference-parity `acp-provider.ts` §5.5: `stdinContext` is prepended
         // to the outbound prompt as `Context:\n<ctx>\n\n---\n\n<body>` before
         // any role reminder. Applies to both plain and specialist agents.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some("hello ctx".to_string()),
             ..TurnOptions::default()
@@ -7849,7 +8178,7 @@ mod role_reminder_tests {
     async fn stdin_context_empty_string_is_not_prepended() {
         // An empty `stdinContext` is treated as absent so we do not emit a
         // stray `Context:` header with nothing under it.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some(String::new()),
             ..TurnOptions::default()
@@ -7868,7 +8197,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let opts = TurnOptions {
             stdin_context: Some("ctx".to_string()),
             ..TurnOptions::default()
@@ -7892,7 +8222,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nImplement the task.",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let inj = mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7911,7 +8242,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nFile body.",
         );
-        let (mgr, _first) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let agent_id = AgentId::from("agent-2");
         let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), Some("implementor"));
         s.metadata = Some(serde_json::json!({ "behaviorPrompt": "Custom override." }));
@@ -7932,7 +8264,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn specialist_injection_none_for_plain_agent() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         assert!(mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7962,7 +8294,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_fires_once_per_fresh_session() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "You are helpful.").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -7999,7 +8331,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_refires_after_recreate() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "SP body").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         // Fresh session → fires; consumed by the first turn.
@@ -8033,7 +8365,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_not_armed_for_native_mechanism_providers() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "native SP").await;
         // Native-mechanism providers (rules file / _meta / env) never arm the
         // fallback — no double injection.
@@ -8152,7 +8484,7 @@ mod role_reminder_tests {
     async fn first_turn_prepend_skipped_when_no_system_prompt() {
         // Armed but the session has no persisted system_prompt (or blank) —
         // no stray empty <system> block; the flag is still consumed.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
         let text = prompt_text(
@@ -8176,7 +8508,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         set_system_prompt(&mgr, &agent_id, "SP").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -8288,7 +8621,7 @@ mod dead_child_respawn_tests {
     async fn reuses_cached_session_when_child_alive() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-alive");
         seed_mock_session(&mgr, &agent_id, "acp-cached").await;
         let _ends = install_fake_handle(&mgr, &agent_id, None);
@@ -8311,7 +8644,7 @@ mod dead_child_respawn_tests {
     async fn respawns_when_cached_child_is_dead() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-dead");
         seed_mock_session(&mgr, &agent_id, "acp-stale").await;
 
@@ -9174,12 +9507,15 @@ mod agent_retry_tests {
         }
     }
 
+    /// The returned RAII guard owns the db dir (db + `-wal`/`-shm` sidecars);
+    /// keep it alive for the duration of the test.
     async fn manager_with_session(
         agent_id: &AgentId,
         ws: &WorkspaceId,
         status: AgentStatus,
-    ) -> Arc<AgentManager> {
-        let path = std::env::temp_dir().join(format!("intentd-retry-{}.db", uuid::Uuid::new_v4()));
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-retry-");
+        let path = db_dir.path().join("store.db");
         let db = Store::open(&path).await.expect("temp store");
         db.insert_workspace(&workspace(ws))
             .await
@@ -9190,14 +9526,14 @@ mod agent_retry_tests {
         let bus = EventBus::new(db.clone());
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
-        Arc::new(AgentManager::new(services, sink, 8))
+        (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
     #[tokio::test]
     async fn retry_from_error_status_with_empty_queue_clears_to_idle() {
         let agent_id = AgentId::from("agent-1");
         let ws = WorkspaceId::from("ws-1");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -9223,7 +9559,7 @@ mod agent_retry_tests {
     async fn retry_from_error_status_with_queued_message_redrives() {
         let agent_id = AgentId::from("agent-redrive");
         let ws = WorkspaceId::from("ws-redrive");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services.enqueue_message(
@@ -9263,7 +9599,7 @@ mod agent_retry_tests {
             let id = format!("agent-race-{yields}");
             let agent_id = AgentId::from(id.as_str());
             let ws = WorkspaceId::from("ws-race");
-            let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+            let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
             let retry_fut = mgr.agent_retry(agent_id.clone(), ws.clone());
             let enqueue_fut = async {
@@ -9310,7 +9646,7 @@ mod agent_retry_tests {
     async fn retry_from_pending_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-2");
         let ws = WorkspaceId::from("ws-2");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -9332,7 +9668,7 @@ mod agent_retry_tests {
     async fn retry_from_active_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-3");
         let ws = WorkspaceId::from("ws-3");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())

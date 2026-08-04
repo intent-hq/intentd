@@ -8,8 +8,10 @@
 //! threaded through the `caller_agent_id` argument that WSAPI-2 already
 //! carries on the MCP seam.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin,
     NoteId, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
@@ -64,6 +66,25 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'agent.reportBlocker', args: { reason } }),
     };
 "#;
+
+/// The `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` installer
+/// lines inside [`PRELUDE`], removed when `agentFeatures.attentionRequests`
+/// is off (a unit test guards that this segment still matches the prelude
+/// verbatim).
+pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
+
+/// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
+/// off the two attention-request installers are omitted, so agent code
+/// touching them fails with a clear `not a function` TypeError. Every other
+/// `ws.agent.*` method (including `reportToParent`) stays un-gated. With the
+/// toggle on — the default — this borrows [`PRELUDE`] byte-identically.
+pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
+    if features.attention_requests {
+        Cow::Borrowed(PRELUDE)
+    } else {
+        Cow::Owned(PRELUDE.replacen(ATTENTION_PRELUDE_SEGMENT, "", 1))
+    }
+}
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

@@ -13,6 +13,18 @@ use intent_core::{
     WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
+use tracing::Instrument;
+
+/// Target of the per-dispatch profiling span wrapped around [`dispatch`] in
+/// [`handle_message`]. Matched (together with [`RPC_DISPATCH_SPAN_NAME`]) by
+/// the statement-count / duration profiling layer installed by the `intentd`
+/// composition root, which attributes `sqlx::query` statement events and
+/// wall-clock duration to the active RPC and WARNs when either exceeds its
+/// budget. Logging only — no wire-contract impact.
+pub const RPC_DISPATCH_SPAN_TARGET: &str = "intent_transport::rpc_dispatch";
+/// Name of the per-dispatch profiling span (the literal passed to
+/// `info_span!` in [`handle_message`]).
+pub const RPC_DISPATCH_SPAN_NAME: &str = "rpc_dispatch";
 
 const PARSE_ERROR: i32 = -32700;
 const INVALID_REQUEST: i32 = -32600;
@@ -200,7 +212,12 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
     };
 
-    let result = dispatch(api, method, &params).await;
+    // Per-dispatch profiling span: carries the method name so the composition
+    // root's profiling layer can count `sqlx::query` statement events scoped
+    // to this dispatch and time the handler (see RPC_DISPATCH_SPAN_TARGET).
+    let span =
+        tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, RPC_DISPATCH_SPAN_NAME, method);
+    let result = dispatch(api, method, &params).instrument(span).await;
 
     // Notifications never get a response, even on error / unknown method (§3.4).
     if is_notification {
@@ -293,6 +310,11 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api.unarchive_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        "workspace.diskUsage" => {
+            let id = require_workspace_id(params)?;
+            let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
+            Ok(result)
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
@@ -984,6 +1006,7 @@ async fn dispatch(
             let agents = api.agent_list(ws).await.map_err(domain_to_rpc)?;
             Ok(json!({ "agents": agents }))
         }
+        "agent.listActive" => api.agent_list_active().await.map_err(domain_to_rpc),
         "agent.get" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);

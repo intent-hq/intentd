@@ -131,7 +131,10 @@ async fn settings_round_trip_redaction_validation_and_event() {
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );
-    let socket = std::env::temp_dir().join(format!("intentd-set-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-set-");
+    let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
@@ -495,6 +498,68 @@ async fn settings_round_trip_redaction_validation_and_event() {
         25,
         "settings.reset",
         json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(true));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+
+    // `agentFeatures.*` — the eight agent feature toggles are plain non-secret
+    // TOML-backed booleans defaulting to on: list/get expose the defaults,
+    // update/reset round-trip, and mistyped values → -32602.
+    let list = rpc(&mut w, &mut r, 26, "settings.list", json!({})).await;
+    for path in [
+        "agentFeatures.backgroundHooks",
+        "agentFeatures.hostExec",
+        "agentFeatures.scripts",
+        "agentFeatures.terminalAccess",
+        "agentFeatures.browserAutomation",
+        "agentFeatures.richChatBlocks",
+        "agentFeatures.structuredQuestions",
+        "agentFeatures.attentionRequests",
+    ] {
+        let e = entry(&list, path);
+        assert_eq!(e["type"], "boolean", "{path}");
+        assert_eq!(e["value"], json!(true), "{path}");
+        assert_eq!(e["category"], "agentFeatures", "{path}");
+        assert!(e.get("sensitive").is_none(), "{path}");
+    }
+    let resp = call(
+        &mut w,
+        &mut r,
+        27,
+        "settings.update",
+        json!({ "changes": [{ "path": "agentFeatures.hostExec", "value": "off" }] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        28,
+        "settings.update",
+        json!({ "changes": [{ "path": "agentFeatures.hostExec", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        applied["applied"][0],
+        json!({ "path": "agentFeatures.hostExec", "value": false })
+    );
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        29,
+        "settings.get",
+        json!({ "path": "agentFeatures.hostExec" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false));
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        30,
+        "settings.reset",
+        json!({ "path": "agentFeatures.hostExec" }),
     )
     .await;
     assert_eq!(reset["value"], json!(true));

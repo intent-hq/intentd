@@ -25,6 +25,16 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp";
 
+/// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
+/// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
+/// and loading it made `agent.list` scale with the stored prompt bytes.
+const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
+    name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
+    specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
+    attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
+    initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
+    sandbox_branch, stop_reason, stop_reason_timestamp";
+
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
 /// `message_contents` is non-empty only for sessions whose decoded snapshot
@@ -517,14 +527,14 @@ impl Store {
     /// checks — monorepo#958), skipping the full transcript hydration that
     /// `get_agent_session` performs.
     pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSession> {
-        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session summary failed: {e}")))?;
         match row {
-            Some(r) => map_session_row(&r),
+            Some(r) => map_session_summary_row(&r),
             None => Err(Error::NotFound(format!("agent session {id}"))),
         }
     }
@@ -542,6 +552,20 @@ impl Store {
             .map_err(|e| Error::Internal(format!("get agent session status failed: {e}")))?;
         match row {
             Some(r) => enum_from_db::<AgentStatus>(&r.get::<String, _>("status")),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
+    /// Lightweight timestamp-only lookup for daemon-global active-agent probes.
+    /// Selects no session metadata or transcript content.
+    pub async fn get_agent_session_updated_at(&self, id: &AgentId) -> Result<String> {
+        let row = sqlx::query("SELECT updated_at FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session updated_at failed: {e}")))?;
+        match row {
+            Some(r) => Ok(r.get("updated_at")),
             None => Err(Error::NotFound(format!("agent session {id}"))),
         }
     }
@@ -591,14 +615,14 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
         let sql = format!(
-            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
-        rows.iter().map(map_session_row).collect()
+        rows.iter().map(map_session_summary_row).collect()
     }
 
     /// Get message count and whether any assistant message exists for each session in
@@ -1393,6 +1417,37 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a metadata change: a narrow write of `metadata` and
+    /// `updated_at` only. Callers that load a session via the summary
+    /// projection (no `system_prompt` — see [`SESSION_SUMMARY_COLUMNS`]) must
+    /// use this instead of [`Store::update_agent_session`], whose full-row
+    /// write would clear every column absent from the summary. Scoped to
+    /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
+    /// or the workspace does not match.
+    pub async fn update_agent_session_metadata(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        metadata: Option<&serde_json::Value>,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET metadata=?, updated_at=? WHERE id=? AND workspace_id=?",
+        )
+        .bind(encode_metadata(metadata)?)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Persist the runtime `status` + `is_active` transition for `agent_session`
     /// without touching the write-once `acp_session_id` / immutable `provider`
     /// (the broader [`Store::update_agent_session`] enforces those invariants).
@@ -1810,6 +1865,17 @@ impl Store {
 }
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
+    map_session_row_with_system_prompt(row, col(row, "system_prompt")?)
+}
+
+fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
+    map_session_row_with_system_prompt(row, None)
+}
+
+fn map_session_row_with_system_prompt(
+    row: &SqliteRow,
+    system_prompt: Option<String>,
+) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
     let task_note: Option<String> = col(row, "task_note_id")?;
@@ -1835,7 +1901,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
         is_active: col::<i64>(row, "is_active")? != 0,
-        system_prompt: col(row, "system_prompt")?,
+        system_prompt,
         // Loaded separately by the caller; derived `stats` is never persisted.
         messages: Vec::new(),
         stats: None,
@@ -3992,6 +4058,7 @@ mod tests {
 
         // Insert agent session
         let agent_id = AgentId("agent-summary-test".to_string());
+        let system_prompt = "large system prompt".repeat(4096);
         let session = AgentSession {
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
@@ -4003,7 +4070,7 @@ mod tests {
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
-            system_prompt: None,
+            system_prompt: Some(system_prompt.clone()),
             created_at: ts.clone(),
             updated_at: ts.clone(),
             messages: vec![],
@@ -4053,6 +4120,11 @@ mod tests {
             .expect("list_agent_sessions");
         assert_eq!(full.len(), 1, "should have one session");
         assert_eq!(
+            full[0].system_prompt.as_deref(),
+            Some(system_prompt.as_str()),
+            "full session reads should retain system_prompt"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -4071,6 +4143,14 @@ mod tests {
         );
         assert_eq!(summaries[0].id, agent_id, "id should match");
         assert_eq!(summaries[0].name, "Test Agent", "name should match");
+        assert_eq!(
+            summaries[0].system_prompt, None,
+            "summary reads should not load system_prompt"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
+            "the summary SELECT must not mention system_prompt"
+        );
     }
 
     #[tokio::test]
@@ -4582,6 +4662,65 @@ mod tests {
         match store.get_agent_session_summary(&missing).await {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `update_agent_session_metadata` writes only `metadata` + `updated_at`:
+    /// columns absent from the summary projection (`system_prompt`) survive,
+    /// and the write is workspace-scoped (`NotFound` on mismatch or missing).
+    #[tokio::test]
+    async fn update_agent_session_metadata_targets_only_metadata() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-meta".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep this prompt".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let metadata = serde_json::json!({ "dismissedQuestionsMessageId": "msg-1" });
+        let later = now_iso();
+        store
+            .update_agent_session_metadata(&ws_id, &agent_id, Some(&metadata), &later)
+            .await
+            .expect("update metadata");
+
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(after.metadata, Some(metadata.clone()));
+        assert_eq!(after.updated_at, later);
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("keep this prompt"),
+            "targeted metadata write must not touch system_prompt"
+        );
+
+        // Workspace mismatch and unknown id both surface as NotFound.
+        let other_ws = WorkspaceId("ws-meta-other".to_string());
+        match store
+            .update_agent_session_metadata(&other_ws, &agent_id, Some(&metadata), &later)
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on workspace mismatch, got {other:?}"),
+        }
+        let missing = AgentId("agent-meta-missing".to_string());
+        match store
+            .update_agent_session_metadata(&ws_id, &missing, Some(&metadata), &later)
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on unknown id, got {other:?}"),
         }
     }
 

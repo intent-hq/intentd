@@ -191,6 +191,7 @@ async fn boot(
     tokio::task::JoinHandle<()>,
     EventBus,
     tempfile::TempDir,
+    tempfile::TempDir,
 ) {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -199,7 +200,10 @@ async fn boot(
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
-    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");
+    let socket = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let bus_clone = bus.clone();
     let socket_clone = socket.clone();
@@ -209,7 +213,7 @@ async fn boot(
         })
         .await;
     });
-    (socket, shutdown_tx, server, bus, ws_root)
+    (socket, shutdown_tx, server, bus, ws_root, sock_dir)
 }
 
 /// `git.commit` inside a workspace worktree publishes both `git:commit`
@@ -249,7 +253,7 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     let ws = workspace_row(&ws_id, repo, "main");
     store.insert_workspace(&ws).await.expect("insert workspace");
 
-    let (socket, shutdown, server, bus, _ws_root) = boot(store).await;
+    let (socket, shutdown, server, bus, _ws_root, _sock_dir) = boot(store).await;
 
     // Subscriber first (change events are point-in-time; no replay).
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();

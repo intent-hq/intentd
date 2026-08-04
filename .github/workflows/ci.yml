@@ -235,8 +235,17 @@ jobs:
   # the heavy jobs skip only when the output is exactly 'true' (script error,
   # missing output, or job failure falls back to full CI), push / merge_group
   # runs are never gated, and check / pr-title / conflict-markers /
-  # deb-packaging still run on every PR. Job names are unchanged, so skipped
-  # heavy jobs satisfy the required-check ruleset without edits.
+  # deb-packaging still run on every PR. Job names are unchanged, so the
+  # required-check ruleset needs no edits — but the gating mechanism differs
+  # by job shape. The non-matrix coverage jobs skip at job level (a skipped
+  # job still reports its required context). The build job CANNOT be skipped
+  # at job level: a job-level skip prevents the matrix from expanding, so
+  # GitHub reports a single skipped check named literally `matrix.name` and
+  # the required per-entry contexts (`build (aarch64-apple-darwin, macos-14)`
+  # etc.) are never reported, leaving release PRs blocked forever (intentd#868).
+  # Instead the build job always runs and every step is gated on
+  # fast_path != 'true', so on fast-path PRs each matrix entry completes as
+  # an all-steps-skipped success under its required name.
   release-fast-path:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
@@ -265,12 +274,18 @@ jobs:
           echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
 
   build:
-    # Skipped when the diff is release-PR-shaped (see release-fast-path).
-    # Runs unless the output is exactly 'true': on push / merge_group the
-    # fast-path job is skipped and the output is empty, and a fast-path
-    # failure leaves it empty too, so both fall back to running this job.
+    # Step-gated (NOT job-gated) when the diff is release-PR-shaped: every
+    # step below carries `needs.release-fast-path.outputs.fast_path != 'true'`
+    # so on fast-path PRs the matrix still expands and each entry reports its
+    # required check context as an all-steps-skipped success (see the
+    # release-fast-path comment for why a job-level skip breaks matrix
+    # required checks). Steps run unless the output is exactly 'true': on
+    # push / merge_group the fast-path job is skipped and the output is
+    # empty, and a fast-path failure leaves it empty too, so both fall back
+    # to running the full job. `!cancelled()` keeps the job from being
+    # auto-skipped when its `needs` dependency was skipped (push/merge_group).
     needs: release-fast-path
-    if: ${{ !cancelled() && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -283,8 +298,14 @@ jobs:
           # offline and PRs queued indefinitely behind it.
           - target: aarch64-apple-darwin
             os: macos-14
+            name: build (aarch64-apple-darwin, macos-14)
           - target: x86_64-pc-windows-msvc
             os: [self-hosted, Windows, X64]
+            name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
+    # Explicit per-entry names (instead of the default matrix-value join) so
+    # the required-check contexts in the main ruleset stay stable even when a
+    # matrix entry's runner labels change.
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Keeps the cargo-check steps free of debuginfo/incremental artifacts
@@ -297,12 +318,13 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+        if: needs.release-fast-path.outputs.fast_path != 'true'
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
       # runner's Windows-path step scripts. Prepend Git's bin dir so every
       # later `shell: bash` step resolves Git Bash instead.
       - name: Put Git Bash first on PATH (Windows)
-        if: runner.os == 'Windows'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       # Per-job persistent target dir outside the work dir, self-hosted
@@ -313,16 +335,18 @@ jobs:
       # $USERPROFILE carries the native C:\Users\... form, so prefer it when
       # set.
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
-        if: contains(matrix.os, 'self-hosted')
+        if: needs.release-fast-path.outputs.fast_path != 'true' && contains(matrix.os, 'self-hosted')
         shell: bash
         run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
+        if: needs.release-fast-path.outputs.fast_path != 'true'
         id: toolchain
         shell: bash
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
+        if: needs.release-fast-path.outputs.fast_path != 'true'
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
@@ -330,7 +354,7 @@ jobs:
       # use the GH cache there instead (mirrors the `check` job's
       # burst-runner caching; pure overhead on the self-hosted runners).
       - name: Rust cache (GitHub-hosted runner only)
-        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        if: ${{ needs.release-fast-path.outputs.fast_path != 'true' && !contains(matrix.os, 'self-hosted') }}
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
@@ -339,19 +363,21 @@ jobs:
       # push to main and in the merge queue. The "Warm PR check cache" step
       # keeps the persistent target dir warm for PR checks after main builds.
       - name: Check (PR compilation proof)
-        if: github.event_name == 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request'
         run: cargo check --workspace --target ${{ matrix.target }}
       - name: Build (release)
-        if: github.event_name != 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'pull_request'
         run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: Warm PR check cache
-        if: github.event_name == 'push'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    # Skipped when the diff is release-PR-shaped (see release-fast-path);
-    # fail-safe as in the build job. The route.result guard preserves the
-    # pre-existing behavior that a route failure skips this job.
+    # Skipped at job level when the diff is release-PR-shaped (safe for
+    # non-matrix jobs — a skipped job still reports its required context;
+    # see release-fast-path). Fail-safe: skips only when the output is
+    # exactly 'true'. The route.result guard preserves the pre-existing
+    # behavior that a route failure skips this job.
     needs: [route, release-fast-path]
     if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
@@ -497,9 +523,11 @@ jobs:
           retention-days: 3
 
   coverage-all:
-    # Skipped when the diff is release-PR-shaped (see release-fast-path);
-    # fail-safe as in the build job. The route.result guard preserves the
-    # pre-existing behavior that a route failure skips this job.
+    # Skipped at job level when the diff is release-PR-shaped (safe for
+    # non-matrix jobs — a skipped job still reports its required context;
+    # see release-fast-path). Fail-safe: skips only when the output is
+    # exactly 'true'. The route.result guard preserves the pre-existing
+    # behavior that a route failure skips this job.
     needs: [route, release-fast-path]
     if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
@@ -559,6 +587,15 @@ jobs:
             sudo -n apt-get update -qq
             sudo -n apt-get install -y -qq libssl-dev
           fi
+      # Raise the per-user inotify instance ceiling. The instrumented full
+      # suite starts many real notify watchers in parallel (file, .git
+      # metadata, skills, specialists) and up to 8 co-tenant runner slots
+      # share the same user on the tinybox, so the kernel default of 128
+      # instances can exhaust mid-run — watcher starts in unrelated tests
+      # then fail with EMFILE "Too many open files" (intentd PR #882).
+      # Relies on the runner user's passwordless sudo, like the step above.
+      - name: Raise inotify instance limit
+        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace

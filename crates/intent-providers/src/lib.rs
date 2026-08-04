@@ -11,6 +11,17 @@
 
 pub use intent_core::Result;
 
+/// Test-binary-wide guard: export `NODE_DISABLE_COMPILE_CACHE=1` before any
+/// test runs. `enhanced_path_dirs()` triggers `intent_core`'s login-shell PATH
+/// capture, whose rc files may run node CLIs (nvm/npm, ng completion); those
+/// inherit this and skip `module.enableCompileCache()`, which would otherwise
+/// leave a `node-compile-cache/` residue at the TMPDIR root.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 pub mod args;
 pub mod config;
 pub mod discover;

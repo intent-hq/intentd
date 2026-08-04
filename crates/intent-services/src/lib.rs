@@ -135,8 +135,8 @@ pub use agent_manager::{
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 pub use events::{
-    EventBus, FileWatcher, SkillsWatcher, SpecialistsWatcher, Subscription, SubscriptionFilter,
-    WatcherRegistry,
+    EventBus, FileWatcher, GitMetadataWatcher, GitStatusRefresher, SkillsWatcher,
+    SpecialistsWatcher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -467,11 +467,11 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
-    /// Per-workspace disk-usage cache backing `Workspace.diskUsage` on the
-    /// list/get emit path (§9.1): TTL'd stale-while-revalidate entries whose
-    /// walks run detached on the blocking pool, so serving the aggregate
-    /// never blocks a call (first compute omits and backfills). Shared
-    /// across clones.
+    /// Per-workspace disk-usage cache backing the on-demand
+    /// `workspace.diskUsage` method (§5.1) — never the list/get emit path:
+    /// TTL'd stale-while-revalidate entries whose walks run detached on the
+    /// blocking pool, so serving the method never blocks a call (first
+    /// compute omits and backfills). Shared across clones.
     disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
@@ -709,6 +709,13 @@ impl Services {
             .as_ref()
             .map(|r| r.snapshot().effective.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether queue drains should deliver the whole queued-message backlog
+    /// in one batched turn (`agents.flushQueuedMessages`, default on). Read
+    /// at drain time by the agent manager; cheap registry-snapshot read.
+    pub fn flush_queued_messages_enabled(&self) -> bool {
+        self.effective_settings().agents.flush_queued_messages
     }
 
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
@@ -1126,11 +1133,10 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
-        // diskUsage: cached physical footprint of the daemon-managed
-        // workspace directory. Omitted until the first walk completes —
-        // serving the cache never waits on a walk (computes run detached and
-        // backfill), so it can never exceed the per-call aggregate budget.
-        ws.disk_usage = self.compute_disk_usage(ws).await;
+        // diskUsage is deliberately NOT populated here: list/get/subscription
+        // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
+        // derived-field ladder). Clients fetch it on demand via the dedicated
+        // `workspace.diskUsage` method (monorepo#1396).
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1448,15 +1454,13 @@ impl Services {
         self.compute_cow_supported().await
     }
 
-    /// Serve the `diskUsage` aggregate for a workspace's daemon-managed
-    /// directory from the shared [`disk_usage::DiskUsageCache`]. Only rows
-    /// with such a directory qualify: remote / skip-isolation rows and the
-    /// virtual chief workspace omit the field. The directory is the
-    /// provisioned checkout's parent (`<parent>/<id>/<repo-slug>` →
-    /// `<parent>/<id>`, covering custom `workspace.worktreesLocation` roots)
-    /// when it is named for the workspace id, else `<workspaces_root>/<id>`
-    /// — a never-provisioned directory simply never yields a value.
-    async fn compute_disk_usage(&self, ws: &Workspace) -> Option<intent_core::WorkspaceDiskUsage> {
+    /// The daemon-managed directory whose footprint `workspace.diskUsage`
+    /// reports, or `None` for rows without one (remote / skip-isolation rows
+    /// and the virtual chief workspace). The directory is the provisioned
+    /// checkout's parent (`<parent>/<id>/<repo-slug>` → `<parent>/<id>`,
+    /// covering custom `workspace.worktreesLocation` roots) when it is named
+    /// for the workspace id, else `<workspaces_root>/<id>`.
+    fn disk_usage_dir(&self, ws: &Workspace) -> Option<PathBuf> {
         if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
             return None;
         }
@@ -1475,7 +1479,43 @@ impl Services {
                     .unwrap_or_else(default_workspaces_root)
                     .join(ws.id.as_str())
             });
-        self.disk_usage.usage(dir).await
+        Some(dir)
+    }
+
+    /// `workspace.diskUsage` (§5.1): on-demand cached footprint of the
+    /// workspace's daemon-managed directory — `{ diskUsage?, refreshing }`
+    /// per the [`disk_usage::DiskUsageCache::poll`] semantics. Non-qualifying
+    /// rows (no daemon-managed directory, or one that was never provisioned)
+    /// answer `{ refreshing: false }` with the field omitted, without
+    /// touching the cache; an unknown id is `NotFound`.
+    pub(crate) async fn workspace_disk_usage_op(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        let ws = if id.is_chief() {
+            chief_workspace()
+        } else {
+            self.store.get_workspace(&id).await?
+        };
+        let Some(dir) = self.disk_usage_dir(&ws) else {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        };
+        // A never-provisioned directory can never yield a value, so don't
+        // arm a walk (it would fail and leave `refreshing` forever-true).
+        let is_dir = tokio::fs::metadata(&dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        }
+        let (usage, refreshing) = self.disk_usage.poll(dir).await;
+        let mut result = serde_json::json!({ "refreshing": refreshing });
+        if let Some(usage) = usage {
+            result["diskUsage"] = serde_json::to_value(usage)
+                .map_err(|e| Error::Internal(format!("serialize diskUsage: {e}")))?;
+        }
+        Ok(result)
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -9688,6 +9728,10 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_disk_usage_op(id).await })
+    }
+
     fn create_workspace(
         &self,
         input: WorkspaceCreate,
@@ -16355,6 +16399,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_op(workspace_id).await })
     }
 
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_list_active_op().await })
+    }
+
     fn agent_get(
         &self,
         agent_id: AgentId,
@@ -17670,6 +17718,124 @@ impl WorkspaceApi for Services {
                 "failed": s.failed,
                 "pending": s.pending,
                 "runs": runs,
+            }))
+        })
+    }
+
+    fn pr_state(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
+                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+                    "PR #{pr_number} not found in the workspace repository"
+                )),
+                other => pr_ops::map_sc_err(other),
+            })?;
+            let state = pr_ops::derive_status_state(&pr);
+            let mergeable_state = pr
+                .mergeable_state
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let merge_blocked_reason =
+                pr_ops::merge_blocked_reason(state, pr.mergeable, &mergeable_state);
+
+            // Check runs on the PR head (SHA, else source branch). Providers
+            // without check-run support — or a PR whose head cannot be
+            // determined — report an empty tally rather than failing the
+            // whole snapshot.
+            let head_ref = pr
+                .head_sha
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
+            let (check_summary, failed_names) = match &head_ref {
+                Some(git_ref) if sc.capabilities().check_runs => {
+                    let runs = sc
+                        .check_runs(&repo_ref, git_ref)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                    (
+                        pr_ops::summarize_check_runs(&runs),
+                        pr_ops::failed_check_names(&runs),
+                    )
+                }
+                _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
+            };
+
+            let reviews = sc
+                .list_reviews(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let agg = pr_ops::aggregate_reviews(&reviews);
+            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+
+            let conversation = sc
+                .list_comments(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let conversation_count = conversation.len() as i64;
+            // Inline review comments: threads via GraphQL when available,
+            // falling back to the flat REST list grouped by reply parent (the
+            // same fallback as `pr.listReviewComments`; resolution state is
+            // unavailable there, so every fallback thread counts as
+            // unresolved).
+            let threads =
+                match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
+                    .await
+                {
+                    Ok((threads, _, _)) => threads,
+                    Err(_) => {
+                        let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
+                            sc.list_review_comments(&repo_ref, pr_number, p)
+                        })
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                        pr_ops::fallback_threads(comments)
+                    }
+                };
+            let (review_comment_count, unresolved_thread_count) =
+                pr_ops::count_thread_comments(&threads);
+
+            Ok(serde_json::json!({
+                "prNumber": pr_number,
+                "title": pr.title,
+                "url": pr.url,
+                "state": state,
+                "isDraft": state == "draft",
+                "isMerged": state == "merged",
+                "isClosed": state == "closed",
+                "headSha": pr.head_sha,
+                "updatedAt": pr.updated_at,
+                "mergeable": pr.mergeable,
+                "mergeableState": mergeable_state,
+                "mergeBlockedReason": merge_blocked_reason,
+                "checks": {
+                    "total": check_summary.total,
+                    "passed": check_summary.passed,
+                    "failed": check_summary.failed,
+                    "pending": check_summary.pending,
+                    "failedNames": failed_names,
+                },
+                "reviews": {
+                    "decision": decision,
+                    "approvals": agg.approval_count,
+                    "changesRequested": agg.changes_requested_count,
+                },
+                "comments": {
+                    "conversationCount": conversation_count,
+                    "reviewCommentCount": review_comment_count,
+                    "unresolvedThreadCount": unresolved_thread_count,
+                    "totalCount": conversation_count + review_comment_count,
+                },
             }))
         })
     }

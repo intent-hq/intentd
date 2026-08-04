@@ -146,7 +146,10 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );
-    let socket = std::env::temp_dir().join(format!("intentd-mcp-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-mcp-");
+    let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({

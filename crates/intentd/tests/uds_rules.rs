@@ -160,8 +160,10 @@ async fn rules_round_trip_overrides_files_and_event() {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
-    // Keep the socket name short — the macOS AF_UNIX path limit is ~104 bytes.
-    let socket = std::env::temp_dir().join(format!("ir-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "ir-");
+    let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
