@@ -90,6 +90,19 @@ fn ws_with(id: &WorkspaceId) -> Workspace {
 }
 
 impl WorkspaceApi for FakeApi {
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "streams": [{
+                    "agentId": "agent-active",
+                    "sessionId": "agent-active",
+                    "workspaceId": "ws-active",
+                    "startTime": 1_750_000_000_000_i64,
+                }],
+            }))
+        })
+    }
+
     fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async { Ok(vec![sample_ws()]) })
     }
@@ -99,6 +112,22 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(ws_with(&id))
+        })
+    }
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "diskUsage": {
+                    "bytes": 4096,
+                    "fileCount": 1,
+                    "computedAt": "2026-01-01T00:00:00Z",
+                    "breakdown": [],
+                },
+                "refreshing": true,
+            }))
         })
     }
     fn create_workspace(
@@ -2147,6 +2176,46 @@ async fn workspace_get_not_found_is_minus_32602_with_message() {
     );
 }
 
+/// `workspace.diskUsage` returns the service payload verbatim:
+/// `{ diskUsage?, refreshing }` with no extra envelope nesting.
+#[tokio::test]
+async fn workspace_disk_usage_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["refreshing"], serde_json::json!(true));
+    assert_eq!(v["result"]["diskUsage"]["bytes"], serde_json::json!(4096));
+    assert_eq!(v["result"]["diskUsage"]["fileCount"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
 #[tokio::test]
 async fn workspace_create_returns_workspace_object() {
     let v =
@@ -3147,6 +3216,22 @@ async fn agent_methods_are_routed_not_method_not_found() {
             .await
             .unwrap();
     assert_eq!(err_code(&v), -32603);
+
+    // agent.listActive is daemon-global and accepts an empty params object.
+    let v = call(r#"{"jsonrpc":"2.0","id":7,"method":"agent.listActive","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "streams": [{
+                "agentId": "agent-active",
+                "sessionId": "agent-active",
+                "workspaceId": "ws-active",
+                "startTime": 1_750_000_000_000_i64,
+            }],
+        })
+    );
 
     // agent.getModels takes no params and must route too.
     let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.getModels"}"#)

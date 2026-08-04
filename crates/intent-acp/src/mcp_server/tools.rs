@@ -232,6 +232,8 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
+  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
@@ -428,6 +430,8 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
+  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.

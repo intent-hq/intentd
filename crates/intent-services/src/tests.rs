@@ -362,6 +362,80 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
+    // diskUsage left the hot read path (monorepo#1396): list/get rows never
+    // carry it — clients fetch it via the on-demand `workspace.diskUsage`.
+    assert!(got.disk_usage.is_none());
+    assert!(v.get("diskUsage").is_none());
+}
+
+/// `workspace.diskUsage` cache-state → response mapping: a qualifying row
+/// with a provisioned directory answers `{ refreshing: true }` first (walk
+/// armed, field omitted), backfills to `{ diskUsage, refreshing: false }`
+/// once the walk settles, a skip-isolation row and a never-provisioned
+/// directory answer `{ refreshing: false }` without arming anything, and an
+/// unknown id is `NotFound`.
+#[tokio::test]
+async fn workspace_disk_usage_op_maps_cache_states() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    // Qualifying row with a provisioned daemon-managed directory.
+    let ws = WorkspaceId::new();
+    let mut managed = workspace(&ws);
+    let checkout = root.path().join(ws.as_str()).join("repo");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    std::fs::write(checkout.join("data.bin"), vec![0xCD; 8192]).expect("seed file");
+    managed.worktree_path = Some(checkout.to_string_lossy().into_owned());
+    store.insert_workspace(&managed).await.expect("ws");
+
+    // Skip-isolation row: no daemon-managed directory by construction.
+    let ws_skip = WorkspaceId::new();
+    let mut skip = workspace(&ws_skip);
+    skip.skip_worktree = true;
+    store.insert_workspace(&skip).await.expect("ws skip");
+
+    // Qualifying row whose directory was never provisioned on disk.
+    let ws_bare = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws_bare))
+        .await
+        .expect("ws bare");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    // First call arms the walk: refreshing true, field omitted (absent, not null).
+    let first = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+    assert_eq!(first["refreshing"], serde_json::json!(true));
+    assert!(first.get("diskUsage").is_none(), "{first}");
+
+    // Bounded poll until the backfill settles: diskUsage + refreshing false.
+    let mut settled = None;
+    for _ in 0..200 {
+        let got = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+        if got.get("diskUsage").is_some() && got["refreshing"] == serde_json::json!(false) {
+            settled = Some(got);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = settled.expect("diskUsage backfilled + settled");
+    assert!(got["diskUsage"]["bytes"].as_u64().unwrap() >= 8192);
+    assert_eq!(got["diskUsage"]["fileCount"], serde_json::json!(1));
+
+    // Skip-isolation and never-provisioned rows: nothing to walk or refresh.
+    for id in [&ws_skip, &ws_bare] {
+        let got = svc.workspace_disk_usage_op(id.clone()).await.expect("op");
+        assert_eq!(got["refreshing"], serde_json::json!(false), "{got}");
+        assert!(got.get("diskUsage").is_none(), "{got}");
+    }
+
+    // Unknown id: standard NotFound.
+    let err = svc
+        .workspace_disk_usage_op(WorkspaceId::from("ws_missing"))
+        .await
+        .expect_err("unknown id errors");
+    assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
 }
 
 /// Parity: the cheap store-level `count_task_stats` query (no note-body
@@ -6449,6 +6523,13 @@ mod pr {
         /// contents payload: directory, non-base64/non-UTF-8), exercising the
         /// tolerant fold of `github.repoConfig.get`.
         file_content_decode_error: bool,
+        /// When set, `get_pr` returns `NotFound` for this PR number,
+        /// exercising the `pr_state` nonexistent-PR error path.
+        missing_pr: Option<u64>,
+        /// When true, `get_pr` reports the sample PR as unmergeable with
+        /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
+        /// exercising the `pr_state` `mergeBlockedReason` wiring.
+        dirty_pr: bool,
     }
 
     fn sample_pr() -> PullRequest {
@@ -6609,10 +6690,17 @@ mod pr {
                 updated_at: String::new(),
             })
         }
-        async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
+        async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            if self.missing_pr == Some(number) {
+                return Err(ScError::NotFound("no such PR".into()));
+            }
             let mut pr = sample_pr();
             if self.merged_linked {
                 pr.state = PrState::Merged;
+            }
+            if self.dirty_pr {
+                pr.mergeable = Some(false);
+                pr.mergeable_state = Some("dirty".into());
             }
             Ok(pr)
         }
@@ -7354,6 +7442,121 @@ mod pr {
     async fn no_active_pr_is_internal_error() {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
+
+    #[tokio::test]
+    async fn state_snapshot_shape_and_counts() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["title"], "Add thing");
+        assert_eq!(v["url"], "https://github.com/o/r/pull/42");
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["isDraft"], false);
+        assert_eq!(v["isMerged"], false);
+        assert_eq!(v["isClosed"], false);
+        assert_eq!(v["headSha"], "deadbeef");
+        assert_eq!(v["mergeable"], true);
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+        // Check tally + failing names from the head SHA's runs.
+        assert_eq!(v["checks"]["total"], 3);
+        assert_eq!(v["checks"]["passed"], 1);
+        assert_eq!(v["checks"]["failed"], 1);
+        assert_eq!(v["checks"]["pending"], 1);
+        assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        // Review decision from the aggregated actionable reviews.
+        assert_eq!(v["reviews"]["decision"], "approved");
+        assert_eq!(v["reviews"]["approvals"], 1);
+        assert_eq!(v["reviews"]["changesRequested"], 0);
+        // 1 conversation comment + 2 inline thread comments (RT1 + RT2; the
+        // resolved thread's comment still counts), 1 unresolved thread.
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_counts_via_rest_fallback() {
+        // GraphQL threads unavailable: inline comments are counted from the
+        // flat REST list (replies included); resolution is unavailable there,
+        // so every fallback thread counts as unresolved.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_threads: true,
+                review_comment_pages: 2,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_dirty_pr_reports_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["mergeable"], false);
+        assert_eq!(v["mergeableState"], "dirty");
+        assert_eq!(v["mergeBlockedReason"], "merge conflicts");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_merged_pr_has_no_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                merged_linked: true,
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["state"], "merged");
+        assert_eq!(v["isMerged"], true);
+        assert_eq!(v["isClosed"], false);
+        // A merged PR never reports a blocked reason, even when the forge
+        // still surfaces a dirty mergeable state.
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_missing_pr_is_clear_error() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                missing_pr: Some(999),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc.pr_state(ws, 999).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found")));
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_requires_workspace_repo() {
+        // No repository on the workspace: same "No active PR" guard as the
+        // other pr.* methods (the required prNumber does not bypass it).
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc.pr_state(ws, 42).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 

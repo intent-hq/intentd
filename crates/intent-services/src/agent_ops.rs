@@ -141,16 +141,13 @@ fn resolve_default_model_from_settings(
 /// by the caller. Also reusable standalone (e.g. `specialist.get/list`
 /// `resolvedModel`) so previews match what a no-model create actually pins.
 ///
-/// Precedence (steps 2–5):
+/// Precedence (steps 2–4; the former `modelTier` step is retired — the key
+/// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
-/// 3. Specialist frontmatter `modelTier` — resolved strictly within the
-///    resolved provider's tier table; providers without a table (opencode,
-///    droid, grok) and claude-code's `"default"` smart-tier sentinel fall
-///    through. Never another provider's model.
-/// 4. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+/// 3. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
 ///    provider-guarded.
-/// 5. `None` → provider CLI default (`session.model` stays unset).
+/// 4. `None` → provider CLI default (`session.model` stays unset).
 ///
 /// The `specialist` id doubles as the `agent_type` for the settings chain's
 /// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
@@ -187,22 +184,9 @@ pub(crate) fn resolve_agent_default_model(
                 "specialist frontmatter model belongs to another provider; ignoring"
             );
         }
-
-        // Step 3: specialist frontmatter `modelTier` — strictly within the
-        // resolved provider's tier table (no cross-provider fallback).
-        // claude-code's smart tier is the literal "default" sentinel ("use
-        // the CLI default"), not a model id — it falls through too.
-        if let Some(tier) = specialists_svc.resolve_model_tier(spec_id, workspace_path) {
-            if let Some(m) = intent_providers::ModelTier::from_wire(&tier)
-                .and_then(|t| intent_providers::default_model_for_provider(effective_provider, t))
-                .filter(|m| *m != "default")
-            {
-                return Some(m.to_string());
-            }
-        }
     }
 
-    // Step 4: settings chain, provider-guarded — a configured default owned
+    // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
     let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
@@ -215,7 +199,7 @@ pub(crate) fn resolve_agent_default_model(
         "configured default model belongs to another provider; \
          falling back to the CLI default"
     );
-    // Step 5: None → provider CLI default.
+    // Step 4: None → provider CLI default.
     None
 }
 
@@ -1376,6 +1360,50 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
 }
 
 impl Services {
+    /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
+    /// the runtime manager's busy set. Only the small busy set reaches SQLite,
+    /// and each lookup selects `updated_at` alone.
+    pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
+        let Some(manager) = self.agent_manager() else {
+            return Ok(json!({ "streams": [] }));
+        };
+        let busy = manager.list_busy();
+        if busy.is_empty() {
+            return Ok(json!({ "streams": [] }));
+        }
+
+        let mut streams = Vec::with_capacity(busy.len());
+        for (agent_id, workspace_id) in busy {
+            // A busy agent whose session row is gone (e.g. a concurrent
+            // `agent.delete` — an expected race elsewhere in the manager/store
+            // paths) is skipped rather than failing the whole response.
+            let updated_at = match self.store.get_agent_session_updated_at(&agent_id).await {
+                Ok(updated_at) => updated_at,
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        "agent.listActive: busy agent has no session row (likely \
+                         deleted mid-turn); skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            streams.push(json!({
+                "agentId": agent_id,
+                "sessionId": agent_id,
+                "workspaceId": workspace_id,
+                // `startTime` is derived from the session's `updated_at`:
+                // `try_begin` persists the Active status transition (touching
+                // `updated_at`) when the turn is claimed, so it approximates
+                // the turn start without a dedicated column. The wire name is
+                // part of the 4.1 contract (consumed by FE) — do not rename.
+                "startTime": iso_ms(&updated_at),
+            }));
+        }
+        Ok(json!({ "streams": streams }))
+    }
+
     /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
     /// plus the bounded per-workspace message projections (monorepo#958):
     /// a fixed number of store queries regardless of session count, and no
@@ -3412,10 +3440,12 @@ impl Services {
             intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
             Value::String(message_id.clone()),
         );
-        session.metadata = Some(Value::Object(metadata));
-        session.updated_at = now_iso();
+        // Targeted metadata+updated_at write: the session above came from the
+        // summary projection (no `system_prompt`), so a full-row
+        // `update_agent_session` write-back would clear the stored prompt.
+        let metadata = Value::Object(metadata);
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,

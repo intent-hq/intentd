@@ -10,10 +10,14 @@
 //! `expired` state, and the `hook:expired` event — no method-catalog change.
 //! Version 4.0 changes the `terminal.list` response shape (breaking; §5.13,
 //! monorepo#1334): the bare terminals array is retired in favor of the
-//! `{ terminals, daemonBootId }` envelope — no method-catalog change.
+//! `{ terminals, daemonBootId }` envelope — no method-catalog change. Version
+//! 4.1 adds `agent.listActive` (additive; §5.5, monorepo#1395). Version 4.2
+//! adds `workspace.diskUsage` and stops populating `Workspace.diskUsage` on
+//! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
+//! was optional, so row shapes remain valid for existing clients.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.0";
+pub const PROTOCOL_VERSION: &str = "4.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

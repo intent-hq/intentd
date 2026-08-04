@@ -75,6 +75,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.diskUsage`: on-demand cached physical footprint of the
+    /// workspace's daemon-managed directory (PROTOCOL §5.1) —
+    /// `{ diskUsage?, refreshing }`. A fresh cache entry returns the usage
+    /// with `refreshing: false`; a stale or absent entry arms a background
+    /// walk and returns `refreshing: true` (the stale value is served when
+    /// available). Non-qualifying workspaces (remote, skip-isolation, chief,
+    /// never-provisioned directory) return `refreshing: false` with the
+    /// field omitted; `NotFound` if the workspace is absent.
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_disk_usage not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is
@@ -1071,6 +1088,16 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.listActive`: daemon-global mid-turn agent streams (PROTOCOL
+    /// §5.5). No workspace id is required because the result spans workspaces.
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_active not implemented".to_string(),
             ))
         })
     }
@@ -3048,6 +3075,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_list_check_runs not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
+    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` in the
+    /// workspace's repo — state, mergeability + blocked reason, check-run
+    /// tally, review decision, and comment counts — for hook-based PR
+    /// monitoring. `pr_number` is REQUIRED; there is no active-PR fallback.
+    fn pr_state(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, pr_number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_state not implemented".to_string(),
             ))
         })
     }

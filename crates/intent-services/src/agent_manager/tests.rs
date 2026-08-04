@@ -4522,6 +4522,104 @@ async fn is_busy_reflects_try_begin_and_end_turn() {
     assert!(!mgr.is_busy(&id), "release flips busy off");
 }
 
+#[tokio::test]
+async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-list-busy");
+    let id = AgentId::from("agent-list-busy");
+
+    assert!(
+        mgr.list_busy().is_empty(),
+        "fresh manager has no busy agents"
+    );
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(mgr.list_busy(), vec![(id.clone(), ws)]);
+
+    mgr.end_turn(&id).await;
+    assert!(
+        mgr.list_busy().is_empty(),
+        "released agent is no longer listed"
+    );
+}
+
+#[tokio::test]
+async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-list-active");
+    let id = AgentId::from("agent-list-active");
+    seed_agent(&mgr, &ws, &id).await;
+
+    assert_eq!(
+        services.agent_list_active_op().await.unwrap(),
+        json!({ "streams": [] }),
+        "idle agents are excluded"
+    );
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    let active = services.agent_list_active_op().await.unwrap();
+    let streams = active["streams"].as_array().expect("streams array");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0]["agentId"], json!(id));
+    assert_eq!(streams[0]["sessionId"], json!(id));
+    assert_eq!(streams[0]["workspaceId"], json!(ws));
+    assert!(
+        streams[0]["startTime"].as_i64().is_some_and(|ms| ms > 0),
+        "updatedAt is converted to epoch milliseconds: {active}"
+    );
+
+    mgr.end_turn(&id).await;
+    assert_eq!(
+        services.agent_list_active_op().await.unwrap(),
+        json!({ "streams": [] }),
+        "settled agents are excluded"
+    );
+}
+
+/// A busy agent whose session row is missing (e.g. deleted mid-turn by a
+/// concurrent `agent.delete`) is skipped instead of failing the whole
+/// `agent.listActive` response (PR #881 review).
+#[tokio::test]
+async fn list_active_skips_busy_agent_with_missing_session_row() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-list-active-missing");
+    let other_ws = WorkspaceId::from("ws-list-active-missing-2");
+    let survivor = AgentId::from("agent-active-survivor");
+    let deleted = AgentId::from("agent-active-deleted");
+    seed_agent(&mgr, &ws, &survivor).await;
+    seed_agent(&mgr, &other_ws, &deleted).await;
+
+    assert!(mgr.try_begin(&survivor, &ws).await);
+    assert!(mgr.try_begin(&deleted, &other_ws).await);
+    // Simulate a concurrent agent.delete racing the busy snapshot: the row is
+    // gone but the manager still lists the agent as busy.
+    mgr.services
+        .store
+        .delete_agent_session(&other_ws, &deleted)
+        .await
+        .expect("delete session row");
+
+    let active = services.agent_list_active_op().await.unwrap();
+    let streams = active["streams"].as_array().expect("streams array");
+    assert_eq!(
+        streams.len(),
+        1,
+        "missing-row agent is skipped, not an endpoint error: {active}"
+    );
+    assert_eq!(streams[0]["agentId"], json!(survivor));
+}
+
 /// `try_begin` persists the runtime `Active` transition and publishes the
 /// self-sufficient `agent:status-changed` event so a hydrated client reflects
 /// the live runtime rather than the stored `Pending` placeholder.
