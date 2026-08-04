@@ -14546,6 +14546,24 @@ mod worktree_provisioning {
             .unwrap()
     }
 
+    /// `INTENTD_WORKSPACES_DIR` mutation is process-global; tests that set it
+    /// serialize on this lock and restore via [`WsDirEnvGuard`].
+    static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores (or removes) `INTENTD_WORKSPACES_DIR` on drop so a panic
+    /// mid-test cannot leak the override into other in-process tests.
+    struct WsDirEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl Drop for WsDirEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
+                None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
+            }
+        }
+    }
+
     /// Init a git repo with one commit; returns (guard, head sha, head branch).
     fn seed_repo(prefix: &str) -> (TempDir, String, String) {
         let dir = unique_dir(prefix);
@@ -14881,20 +14899,6 @@ mod worktree_provisioning {
     /// process-global, hence the lock + drop-guard restore).
     #[tokio::test]
     async fn cow_supported_probes_default_root_when_none_injected() {
-        static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        /// Restores (or removes) `INTENTD_WORKSPACES_DIR` on drop so a panic
-        /// mid-test cannot leak the override into other in-process tests.
-        struct WsDirEnvGuard {
-            prior: Option<std::ffi::OsString>,
-        }
-        impl Drop for WsDirEnvGuard {
-            fn drop(&mut self) {
-                match self.prior.take() {
-                    Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
-                    None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
-                }
-            }
-        }
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-cowcap-root");
@@ -14912,6 +14916,84 @@ mod worktree_provisioning {
             result.is_some(),
             "capability reported (true or false) even without an injected root"
         );
+    }
+
+    /// Regression (microVM agent spawn): `Services::provision_sandbox` must
+    /// resolve the workspaces root like its sibling consumers — injected
+    /// root, else `default_workspaces_root()` — instead of hard-erroring
+    /// with "workspaces_root not configured". Production daemons never call
+    /// `.with_workspaces_root()` (only tests do), so the hard error failed
+    /// every microVM agent spawn, the first real-daemon path through this
+    /// method. Guarded by `INTENTD_WORKSPACES_DIR` (env-var mutation is
+    /// process-global, hence the lock + drop-guard restore).
+    #[tokio::test]
+    async fn provision_sandbox_falls_back_to_default_root_when_none_injected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _sha, _branch) = seed_repo("intentd-sbxroot-repo");
+        let root = unique_dir("intentd-sbxroot-root");
+
+        // Direct-mode workspace over the seeded repo (sandbox-eligible:
+        // repository_path set, no provisioned worktree).
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        ws.repository_name = Some("Sbx Repo".to_string());
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        let agent_id = AgentId::new();
+        let session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Sandbox Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        store.insert_agent_session(&session).await.expect("session");
+
+        let svc = Services::new(store); // no .with_workspaces_root()
+        let outcome = {
+            let _lock = ENV_WS_DIR_LOCK.lock().await;
+            let _env = WsDirEnvGuard {
+                prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
+            };
+            std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
+            svc.provision_sandbox(&ws_id, &agent_id).await
+        };
+        // Supported vs Unsupported depends on the temp filesystem's CoW
+        // capability; the regression is the hard error on a missing root.
+        outcome.expect("provision_sandbox resolves the default workspaces root");
     }
 
     /// `system.capabilities` (PROTOCOL §5.7): the trait method returns a plain

@@ -19491,6 +19491,12 @@ impl WorkspaceApi for Services {
 impl Services {
     /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
     /// Returns `ProvisionOutcome::Supported` if CoW is available, or `Unsupported` for fallback.
+    /// Resolves the workspaces root like every other consumer — the injected
+    /// `workspaces_root`, else [`default_workspaces_root`]
+    /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`). Production
+    /// daemons never call `.with_workspaces_root()` (only tests do), so a
+    /// hard error on `None` here failed every microVM agent spawn — the
+    /// first real-daemon path through this method.
     pub async fn provision_sandbox(
         &self,
         workspace_id: &WorkspaceId,
@@ -19500,7 +19506,7 @@ impl Services {
             workspaces_root: self
                 .workspaces_root
                 .clone()
-                .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?,
+                .unwrap_or_else(default_workspaces_root),
         };
         sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
     }
