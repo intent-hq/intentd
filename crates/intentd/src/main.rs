@@ -14,7 +14,7 @@ use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
-    PermissionPolicy, Services, WatcherRegistry,
+    GitStatusRefresher, PermissionPolicy, Services, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -975,6 +975,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // deleted/closed workspaces are torn down without a restart. The handle is
     // held for the lifetime of `serve` and torn down on return.
     let _watcher_registry = WatcherRegistry::start(bus.clone(), api.clone()).await;
+    // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
+    // file edits refresh the FE Changes panel without any in-app git action.
+    // Held for the lifetime of `serve` and torn down on return.
+    let _git_status_refresher = GitStatusRefresher::start(bus.clone(), api.clone());
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
