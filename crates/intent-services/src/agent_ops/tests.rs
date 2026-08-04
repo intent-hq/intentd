@@ -17750,6 +17750,249 @@ async fn dismiss_questions_fails_closed() {
     ));
 }
 
+/// An assistant content-block array carrying `n` question resource blocks.
+fn question_blocks_n(n: usize) -> serde_json::Value {
+    let mut blocks = vec![json!({ "type": "text", "text": "I have questions." })];
+    for i in 0..n {
+        blocks.push(json!({
+            "type": "resource",
+            "resource": {
+                "uri": format!("intent-question://q-{i}"),
+                "name": format!("Q{i}"),
+                "mimeType": "application/vnd.intent.question+json",
+                "text": "{\"question\":\"?\"}"
+            }
+        }));
+    }
+    json!(blocks)
+}
+
+/// The dismissal notice `messageMetadata` for a dismissed message id.
+fn dismissal_metadata(message_id: &str) -> serde_json::Value {
+    json!({
+        "type": "questions_dismissed",
+        "source": "system",
+        "dismissedQuestionsMessageId": message_id,
+    })
+}
+
+/// Idle agent, empty queue, hold released by the marker: the dismissal
+/// notice is delivered immediately — the transcript gains a user row with
+/// the singular "1 question" wording and the `questions_dismissed`
+/// metadata on both the block and the row.
+#[tokio::test]
+async fn dismiss_questions_notifies_agent_immediately_when_idle() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("non-empty transcript");
+    assert_eq!(
+        last.role, "user",
+        "notice delivered as a user row: {last:?}"
+    );
+    assert_eq!(
+        last.content[0]["text"],
+        json!(
+            "User dismissed your 1 question without answering. Do not re-ask; \
+             continue with your best judgment."
+        ),
+        "singular wording with the derived count"
+    );
+    assert_eq!(
+        last.content[0]["messageMetadata"],
+        dismissal_metadata(&asked.id),
+        "block carries the questions_dismissed metadata"
+    );
+    assert_eq!(
+        last.metadata,
+        Some(dismissal_metadata(&asked.id)),
+        "row-level metadata matches the block fold"
+    );
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "immediate delivery never queues"
+    );
+}
+
+/// Multiple question blocks on the dismissed message pluralize the count.
+#[tokio::test]
+async fn dismiss_questions_notice_pluralizes_count() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks_n(3), &now_iso())
+        .await
+        .expect("append questions");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("non-empty transcript");
+    assert!(
+        last.content[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your 3 questions without answering.")),
+        "plural wording with the derived count: {last:?}"
+    );
+}
+
+/// Underivable count (unknown message id) falls back to the countless
+/// wording — the notice still delivers.
+#[tokio::test]
+async fn dismiss_questions_notice_falls_back_without_count() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-unknown".to_string())
+        .await
+        .expect("dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let last = messages.last().expect("notice delivered");
+    assert_eq!(last.role, "user");
+    assert!(
+        last.content[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your questions without answering.")),
+        "fallback wording when the count cannot be derived: {last:?}"
+    );
+}
+
+/// Re-dismissing the same messageId re-persists the marker but never
+/// appends a duplicate notice.
+#[tokio::test]
+async fn dismiss_questions_repeat_dismissal_sends_no_duplicate_notice() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("re-dismiss");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let notices = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("User dismissed your"))
+        })
+        .count();
+    assert_eq!(notices, 1, "exactly one notice despite the re-dismiss");
+    assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
+}
+
+/// A NEWER pending question keeps holding automatic deliveries after an
+/// older message's dismissal — the notice parks instead of delivering, and
+/// is promoted to the FRONT of the queue (ahead of previously parked
+/// entries), exposing the metadata on the `agent.getQueue` wire shape.
+#[tokio::test]
+async fn dismiss_questions_notice_parks_front_of_queue_when_still_held() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked_old = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append older question");
+    svc.enqueue_message(
+        &id,
+        "parked wake".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    svc.store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append newer question");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "hold armed by the newer question"
+    );
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_old.id.clone())
+        .await
+        .expect("dismiss older");
+
+    // Still held (the marker names the OLDER message), so no user row landed.
+    assert!(
+        svc.question_hold_active(&id).await,
+        "newer question still holds"
+    );
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages.iter().all(|m| m.role != "user"),
+        "notice must not reach the transcript while held"
+    );
+
+    // The notice parked at the FRONT, ahead of the earlier entry, with the
+    // metadata (and the front-promotion marker) on the wire shape.
+    let queue = svc.queue_snapshot(&id);
+    assert_eq!(
+        queue.len(),
+        2,
+        "notice + previously parked entry: {queue:?}"
+    );
+    assert!(
+        queue[0]["content"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("User dismissed your 1 question")),
+        "notice drains first: {queue:?}"
+    );
+    assert_eq!(
+        queue[0]["messageMetadata"],
+        dismissal_metadata(&asked_old.id),
+        "queue entry exposes the questions_dismissed metadata: {queue:?}"
+    );
+    assert_eq!(queue[0]["interruptPriority"], json!(true));
+    assert_eq!(queue[1]["content"], json!("parked wake"));
+}
+
 // ---------------------------------------------------------------------------
 // Question hold: automatic deliveries and drains are gated (Task 2)
 // ---------------------------------------------------------------------------
