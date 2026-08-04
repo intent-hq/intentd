@@ -17920,6 +17920,59 @@ async fn dismiss_questions_repeat_dismissal_sends_no_duplicate_notice() {
     assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
 }
 
+/// Interleaved re-dismissal (A -> B -> A): the persisted marker is
+/// single-slot (B overwrote A), so only the in-memory notice registry stops
+/// the third call from re-delivering A's notice (PR #892 review). Each
+/// question is dismissed while it is the newest, so the first two notices
+/// deliver immediately rather than parking.
+#[tokio::test]
+async fn dismiss_questions_interleaved_redismissal_sends_no_duplicate_notice() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked_a = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question A");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_a.id.clone())
+        .await
+        .expect("dismiss A");
+
+    let asked_b = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question B");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_b.id.clone())
+        .await
+        .expect("dismiss B");
+
+    // Marker now names B; only the registry remembers A was already noticed.
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_a.id.clone())
+        .await
+        .expect("re-dismiss A");
+
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let notices = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("User dismissed your"))
+        })
+        .count();
+    assert_eq!(
+        notices, 2,
+        "one notice per distinct messageId; A's re-dismissal adds none"
+    );
+    assert!(svc.queue_snapshot(&id).is_empty(), "nothing queued either");
+}
+
 /// A NEWER pending question keeps holding automatic deliveries after an
 /// older message's dismissal — the notice parks instead of delivering, and
 /// is promoted to the FRONT of the queue (ahead of previously parked

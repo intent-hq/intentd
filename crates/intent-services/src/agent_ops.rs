@@ -3446,9 +3446,24 @@ impl Services {
         }
         // Idempotency for the notice below: a repeat dismissal of the same
         // messageId re-persists the marker (harmless) but must NOT deliver a
-        // duplicate dismissal notice.
-        let already_dismissed =
-            session.dismissed_questions_message_id() == Some(message_id.as_str());
+        // duplicate dismissal notice. The claim is atomic — a check-and-insert
+        // into the per-agent notice registry under one lock acquisition — so
+        // concurrent dismissals of the same id race to a single winner, and
+        // the registry remembers OLDER ids the single-slot persisted marker
+        // has since been overwritten by (A -> B -> A). The persisted marker
+        // still short-circuits ids dismissed before a daemon restart.
+        let already_dismissed = {
+            let persisted = session.dismissed_questions_message_id() == Some(message_id.as_str());
+            let mut guard = self
+                .dismissal_notices_sent
+                .lock()
+                .expect("dismissal notice registry poisoned");
+            let claimed = !guard
+                .entry(agent_id.clone())
+                .or_default()
+                .insert(message_id.clone());
+            persisted || claimed
+        };
         // Preserve non-object metadata verbatim under a side key rather than
         // discarding it: the column is documented/typed as a free-form
         // object today, but silently replacing a non-object value (should
@@ -3476,9 +3491,24 @@ impl Services {
         // summary projection (no `system_prompt`), so a full-row
         // `update_agent_session` write-back would clear the stored prompt.
         let metadata = Value::Object(metadata);
-        self.store
+        if let Err(e) = self
+            .store
             .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
-            .await?;
+            .await
+        {
+            // Release the notice claim so a retried dismissal (after this
+            // store failure) still delivers the notice.
+            if !already_dismissed {
+                let mut guard = self
+                    .dismissal_notices_sent
+                    .lock()
+                    .expect("dismissal notice registry poisoned");
+                if let Some(sent) = guard.get_mut(&agent_id) {
+                    sent.remove(&message_id);
+                }
+            }
+            return Err(e);
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -3544,9 +3574,14 @@ impl Services {
     /// the queue instead (busy turn, store-append fallback, or a NEWER pending
     /// question re-holding automatic deliveries) the entry is promoted to the
     /// FRONT of the queue so the notice is the next delivery, ahead of parked
-    /// interrupts and held wakes. Fail-soft: delivery problems are logged,
-    /// never surfaced to the RPC — the durable dismissal marker is the source
-    /// of truth.
+    /// interrupts and held wakes. The promotion is a separate queue-lock
+    /// acquisition from the enqueue, so a concurrent drain can pop a
+    /// previously parked entry (or the notice itself) in the window between
+    /// them — benign: the notice still delivers, just not strictly first, and
+    /// [`Services::move_queued_message_front`] returns `false` when the entry
+    /// is already gone. Fail-soft: delivery problems are logged, never
+    /// surfaced to the RPC — the durable dismissal marker is the source of
+    /// truth.
     async fn notify_questions_dismissed(
         &self,
         workspace_id: &WorkspaceId,
@@ -7064,10 +7099,15 @@ impl Services {
     }
 
     /// Move an already-enqueued entry to position 0 (the head of the queue,
-    /// ahead of every other entry — including leading interrupts) so it is
-    /// the next delivery, and mark it `interrupt_priority` so a later
-    /// interrupt enqueue (which inserts after the leading interrupt run)
-    /// cannot slot ahead of it. Used by the questions-dismissed notice
+    /// ahead of every other entry — including leading interrupts, even
+    /// user-origin ones: the dismissal context must precede whatever drains
+    /// next) so it is the next delivery, and mark it `interrupt_priority` so
+    /// a later interrupt enqueue (which inserts after the leading interrupt
+    /// run) cannot slot ahead of it. That flag surfaces as
+    /// `interruptPriority: true` on the `agent.getQueue` wire shape even for
+    /// a solitary promoted entry that never was an interrupt enqueue —
+    /// deliberate: it encodes drain precedence, not enqueue provenance. Used
+    /// by the questions-dismissed notice
     /// ([`Services::notify_questions_dismissed`]) when the notice falls back
     /// to the queue: the dismissal context must reach the agent before any
     /// previously parked entry. Returns `true` iff the entry was found and

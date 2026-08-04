@@ -248,6 +248,16 @@ pub struct Services {
     /// wake. Cleared by any non-interim completion delivery. In-memory only,
     /// like the other live delivery state.
     interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
+    /// Message ids whose questions-dismissed notice has already been claimed
+    /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
+    /// dismissal marker is single-slot (most recent id only), so this set is
+    /// what makes the no-duplicate-notice guarantee hold across concurrent
+    /// dismissals of the same id (both read the marker before either writes)
+    /// and interleaved dismissals (A → B → A). In-memory only: after a
+    /// daemon restart only the single-slot marker guards, so a re-dismissal
+    /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
+    /// notice at worst.
+    dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -566,6 +576,7 @@ impl Services {
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
