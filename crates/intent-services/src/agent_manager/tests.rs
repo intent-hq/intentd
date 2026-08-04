@@ -10390,7 +10390,7 @@ mod flush_queued_messages_tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("agents.flushQueuedMessages".to_string(), json!(false))])
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
             .expect("disable flush");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
@@ -10449,6 +10449,169 @@ mod flush_queued_messages_tests {
                 .iter()
                 .all(|t| !t.contains("queued messages while you were working")),
             "no combined header on the single-entry path: {prompts:?}"
+        );
+    }
+
+    /// `systemOnly` mode: with ≥2 ready system-origin entries interleaved
+    /// with a user-origin entry, the system entries batch into ONE combined
+    /// turn while the user-origin entry stays queued and drains solo
+    /// afterward (its own single-entry FIFO turn).
+    #[tokio::test]
+    async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
+        let script = mock_agent_script();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-flush-systemonly-{}.log", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        // A manager whose settings registry has the flush setting `systemOnly`.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "agents.flushQueuedMessages".to_string(),
+                json!("systemOnly"),
+            )])
+            .expect("set flush mode to systemOnly");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-systemonly"),
+            AgentId::from("a-flush-systemonly"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services
+            .enqueue_message(&id, "sys-1".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "user-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        mgr.services
+            .enqueue_message(&id, "sys-2".to_string(), None, None, None, None, false);
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both the combined system turn and the solo user turn complete");
+
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(
+            prompts.len(),
+            2,
+            "one combined system turn + one solo user turn: {prompts:?}"
+        );
+        let combined = &prompts[0];
+        assert!(
+            combined.contains("2 queued messages while you were working"),
+            "first turn combines the two system entries: {combined}"
+        );
+        let s1 = combined.find("sys-1").expect("sys-1 in combined turn");
+        let s2 = combined.find("sys-2").expect("sys-2 in combined turn");
+        assert!(s1 < s2, "system entries in relative order: {combined}");
+        assert!(
+            !combined.contains("user-1"),
+            "user entry excluded from the system-only batch: {combined}"
+        );
+        let solo = &prompts[1];
+        assert!(
+            solo.contains("user-1") && !solo.contains("queued messages while you were working"),
+            "second turn is the solo FIFO drain of the user entry: {solo}"
+        );
+    }
+
+    /// `systemOnly` mode with only ONE ready system entry (no batching
+    /// partner) drains it solo via the single-entry FIFO path — no combined
+    /// header.
+    #[tokio::test]
+    async fn system_only_single_system_entry_drains_solo() {
+        let script = mock_agent_script();
+        let prompt_log = std::env::temp_dir().join(format!(
+            "itd-flush-systemonly-solo-{}.log",
+            uuid::Uuid::new_v4()
+        ));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "agents.flushQueuedMessages".to_string(),
+                json!("systemOnly"),
+            )])
+            .expect("set flush mode to systemOnly");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-systemonly-solo"),
+            AgentId::from("a-flush-systemonly-solo"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services
+            .enqueue_message(&id, "sys-only".to_string(), None, None, None, None, false);
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("solo turn completes");
+
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(prompts.len(), 1, "single solo turn: {prompts:?}");
+        assert!(
+            !prompts[0].contains("queued messages while you were working"),
+            "no combined header for a lone system entry: {prompts:?}"
         );
     }
 

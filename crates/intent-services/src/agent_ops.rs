@@ -7021,6 +7021,72 @@ impl Services {
         Some(drained)
     }
 
+    /// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
+    /// scan the WHOLE queue — regardless of interleaving with user-origin
+    /// entries — for ready-to-send (`!editing`) SYSTEM-origin entries
+    /// (`user_origin == false`) and, when at least `min_ready` are found,
+    /// remove ALL of them, preserving their relative order; user-origin
+    /// entries are left untouched in their original queue positions. System
+    /// entries may thus be delivered ahead of earlier-queued, interleaved
+    /// user entries. Returns `None` — leaving the queue untouched — when
+    /// fewer than `min_ready` system entries are ready, so the caller falls
+    /// through to the single-entry drain path.
+    pub(crate) fn dequeue_system_only_batch(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+    ) -> Option<Vec<QueuedMessage>> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let eligible = |m: &QueuedMessage| !m.editing && !m.user_origin;
+        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
+            return None;
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            if eligible(&queue[i]) {
+                drained.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        Some(drained)
+    }
+
+    /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
+    /// defers to [`Services::dequeue_ready_batch`] (every ready entry,
+    /// `user_origin_only` under an active hold); `SystemOnly` defers to
+    /// [`Services::dequeue_system_only_batch`] (system-origin entries
+    /// anywhere in the queue) but NEVER batches while a hold is active
+    /// (`user_origin_only`) — the hold's release is a user-origin entry,
+    /// which `SystemOnly` by definition excludes; `Off` always returns `None`
+    /// so every caller falls through to the single-entry FIFO path.
+    pub(crate) fn dequeue_flush_batch(
+        &self,
+        agent_id: &AgentId,
+        mode: intent_core::FlushQueuedMessagesMode,
+        user_origin_only: bool,
+        min_ready: usize,
+    ) -> Option<Vec<QueuedMessage>> {
+        match mode {
+            intent_core::FlushQueuedMessagesMode::All => {
+                self.dequeue_ready_batch(agent_id, user_origin_only, min_ready)
+            }
+            intent_core::FlushQueuedMessagesMode::SystemOnly => {
+                if user_origin_only {
+                    None
+                } else {
+                    self.dequeue_system_only_batch(agent_id, min_ready)
+                }
+            }
+            intent_core::FlushQueuedMessagesMode::Off => None,
+        }
+    }
+
     /// Re-insert a batch of messages at the front of an agent's queue,
     /// preserving their order (`messages[0]` becomes the queue head). Used by
     /// the batch-flush persist-failure path to hand back the undelivered
