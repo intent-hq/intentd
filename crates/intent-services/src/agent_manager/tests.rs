@@ -4643,6 +4643,55 @@ async fn archive_workspace_parks_queue_until_unarchive() {
     );
 }
 
+/// Wake deliveries (`deliver_wake_message` — hook wakes, completion-watch
+/// wakes, `agent.wakeOrCreate` context messages) must not start a turn while
+/// the workspace is archived: the archived gate parks them in the queue
+/// instead of claiming the slot, and the queue drains on the next kick after
+/// unarchive.
+#[tokio::test]
+async fn archive_workspace_parks_wake_deliveries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-wake");
+    let id = AgentId::from("a-archive-wake");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+
+    // Idle agent + archived workspace: the wake queues instead of spawning
+    // a turn.
+    let out = services
+        .deliver_wake_message(&ws, &id, "[Background hook \"w\"] cancelled", None)
+        .await
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert!(!mgr.is_busy(&id), "no turn spawned while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "wake queued behind the archived gate"
+    );
+
+    // Unarchive → the next drain kick delivers the parked wake.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "parked wake drains after unarchive"
+    );
+}
+
 /// `stop` drops any pending `recreated` flag so a stale resend bit cannot
 /// survive a teardown into a future spawn (parity with the `recreated` doc on
 /// `AgentManager`).

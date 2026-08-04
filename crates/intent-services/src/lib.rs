@@ -10958,6 +10958,10 @@ impl WorkspaceApi for Services {
             // emits no further events) and the row is pruned by the next
             // startup heal's workspace-existence check.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree
@@ -11221,6 +11225,16 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
+            // Cancel every active background hook in the workspace: task
+            // aborted, state persisted to `cancelled`, `hook:cancelled`
+            // emitted, owner woken with a notice. Unarchive does NOT
+            // resurrect cancelled hooks — the notice tells the owner to
+            // reschedule if the condition still matters. Runs AFTER the
+            // archived row is persisted so the cancel wakes park behind the
+            // archived gate in `deliver_wake_message` (queued at most, no
+            // turn spawned) — the same reason the interrupt sweep above
+            // runs post-persist.
+            this.cancel_workspace_hooks(&id).await;
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
