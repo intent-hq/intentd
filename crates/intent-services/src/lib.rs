@@ -101,6 +101,7 @@ mod shell;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
+mod voice_ops;
 mod workspace_aggregates;
 
 #[cfg(test)]
@@ -110,8 +111,8 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents, InMemorySecretStore,
-    SecretStore,
+    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
+    migrate_default_vocabulary, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -247,6 +248,16 @@ pub struct Services {
     /// wake. Cleared by any non-interim completion delivery. In-memory only,
     /// like the other live delivery state.
     interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
+    /// Message ids whose questions-dismissed notice has already been claimed
+    /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
+    /// dismissal marker is single-slot (most recent id only), so this set is
+    /// what makes the no-duplicate-notice guarantee hold across concurrent
+    /// dismissals of the same id (both read the marker before either writes)
+    /// and interleaved dismissals (A → B → A). In-memory only: after a
+    /// daemon restart only the single-slot marker guards, so a re-dismissal
+    /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
+    /// notice at worst.
+    dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -269,6 +280,12 @@ pub struct Services {
     /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
     /// "not configured" `Internal` error when no pair is available.
     sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
+    /// Active voice engine for `voice.transcribe`. `None` until wired by a
+    /// test; when unset, the handler builds the provider engine per call from
+    /// the `voice.provider` setting (key from the secrets store /
+    /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
+    /// "not configured" `Internal` error when no key is available.
+    voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -559,10 +576,12 @@ impl Services {
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
+            voice_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
@@ -1742,6 +1761,15 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Wire the active voice engine used by `voice.transcribe`. Tests inject
+    /// a stub so the handler never touches the network; production leaves it
+    /// unset and the handler builds the provider engine per call from the
+    /// `voice.provider` setting.
+    pub fn with_voice_engine(mut self, voice_engine: Arc<dyn intent_voice::VoiceEngine>) -> Self {
+        self.voice_engine = Some(voice_engine);
         self
     }
 
@@ -18733,6 +18761,61 @@ impl WorkspaceApi for Services {
                 .map_err(sentry_ops::map_sentry_err)?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    // ========================================================================
+    // voice.transcribe — daemon-side speech-to-text. Maps onto the
+    // `VoiceEngine` trait; the engine resolves the API key (secrets store /
+    // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
+    // provider. A missing/invalid key → `Internal` ("not configured",
+    // graceful). Validation/context-merging glue lives in `voice_ops`. The
+    // API keys are never logged or returned over the wire.
+    // ========================================================================
+
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.voice_engine.clone();
+        Box::pin(async move {
+            let parsed = voice_ops::parse_request(&params)?;
+            // Provider: per-call override, else the `voice.provider` setting.
+            let setting = self
+                .settings_service()
+                .get("voice.provider")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let provider = voice_ops::select_provider(setting.as_deref(), parsed.provider_override);
+            // Vocabulary: the `voice.vocabulary` setting (defaults from the
+            // catalog); a malformed stored value degrades to an empty list.
+            let vocabulary_value = self
+                .settings_service()
+                .get("voice.vocabulary")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").cloned());
+            let vocabulary = voice_ops::parse_vocabulary_setting(vocabulary_value.as_ref());
+            // OpenAI model: the `voice.openai.model` setting (catalog default
+            // applies when unset). Ignored by other providers.
+            let openai_model = self
+                .settings_service()
+                .get("voice.openai.model")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary);
+            let transcript = engine
+                .transcribe(request)
+                .await
+                .map_err(voice_ops::map_voice_err)?;
+            Ok(serde_json::json!({
+                "text": transcript.text,
+                "provider": engine.provider_name(),
+                "durationMs": transcript.duration_ms,
+            }))
         })
     }
 

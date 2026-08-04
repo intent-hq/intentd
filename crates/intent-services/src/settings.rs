@@ -49,6 +49,9 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// boot.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
+/// Settings path of the user-editable transcription vocabulary (§5.12).
+pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
+
 /// Abstraction over secret persistence (the sensitive-setting analog of the
 /// transport's `TokenStore`). Production uses the file-backed
 /// [`intent_core::FileSecretStore`]; tests inject [`InMemorySecretStore`] so
@@ -1037,6 +1040,42 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "accounts",
             None,
         ),
+        // --- Group A: voice (speech-to-text) -----------------------------------
+        enumerated(
+            "voice.provider",
+            "Voice provider",
+            "Active speech-to-text provider for voice.transcribe",
+            "voice",
+            &["elevenlabs", "openai"],
+            "elevenlabs",
+        ),
+        secret(
+            "voice.elevenlabs.apiKey",
+            "ElevenLabs API key",
+            "API key used by the ElevenLabs Scribe transcription provider",
+            "voice",
+        ),
+        secret(
+            "voice.openai.apiKey",
+            "OpenAI API key",
+            "API key used by the OpenAI transcription provider",
+            "voice",
+        ),
+        enumerated(
+            "voice.openai.model",
+            "OpenAI voice model",
+            "Transcription model used by the OpenAI provider",
+            "voice",
+            &["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
+            "gpt-4o-transcribe",
+        ),
+        object(
+            "voice.vocabulary",
+            "Voice vocabulary",
+            "Vocabulary terms (string array) biased into every voice.transcribe call",
+            "voice",
+            Some(json!(crate::voice_ops::DEFAULT_VOCABULARY)),
+        ),
         // --- Group A: persisted permission rules ------------------------------
         // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
         // of command allow/deny/ask entries with optional expiries. Structure is
@@ -1358,6 +1397,27 @@ pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
         tracing::info!(
             path = RETIRED_WORKSPACE_OVERRIDES_PATH,
             "deleted stale settings row for retired setting"
+        );
+    }
+    Ok(())
+}
+
+/// One-time boot migration for the `voice.vocabulary` default trim: a stored
+/// row that exactly matches the retired 17-term seed default (order-sensitive)
+/// only ever persisted the old default, so it is deleted and the catalog
+/// default (`["Intent"]`) applies again. Any other stored value — a
+/// user-modified list, or even a malformed blob — is never touched.
+/// Idempotent — an absent or non-matching row is a no-op.
+pub async fn migrate_default_vocabulary(store: &Store) -> Result<()> {
+    let Some(raw) = store.get_setting(VOICE_VOCABULARY_PATH).await? else {
+        return Ok(());
+    };
+    let legacy = json!(crate::voice_ops::LEGACY_DEFAULT_VOCABULARY);
+    if matches!(serde_json::from_str::<Value>(&raw), Ok(value) if value == legacy) {
+        store.delete_setting(VOICE_VOCABULARY_PATH).await?;
+        tracing::info!(
+            path = VOICE_VOCABULARY_PATH,
+            "deleted stored voice.vocabulary matching the retired 17-term default; the new default applies"
         );
     }
     Ok(())
@@ -1741,6 +1801,20 @@ mod tests {
         assert!(!def.read_only, "{path} must not be read-only");
         assert!(matches!(def.ty, SettingType::String));
         assert!(def.default_value.is_none(), "{path} default is null");
+    }
+
+    /// `voice.vocabulary` is a non-secret string-array (Object) entry whose
+    /// default is the minimal `["Intent"]` seed — users add their own terms.
+    #[test]
+    fn voice_vocabulary_is_a_string_array_with_the_default_terms() {
+        let def = find_definition("voice.vocabulary").expect("voice.vocabulary missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "voice");
+        assert!(matches!(def.ty, SettingType::Object));
+        let default = def.default_value.expect("voice.vocabulary default");
+        assert_eq!(default, json!(crate::voice_ops::DEFAULT_VOCABULARY));
+        assert_eq!(default, json!(["Intent"]));
     }
 
     /// `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
@@ -2457,6 +2531,76 @@ mod tests {
         }
     }
 
+    /// `voice.openai.model` is a TOML-backed enum with the three supported
+    /// OpenAI transcription models and the gpt-4o-transcribe default; it
+    /// persists through `settings.update` to config.toml (never SQLite).
+    #[tokio::test]
+    async fn voice_openai_model_is_a_toml_backed_enum() {
+        let path = "voice.openai.model";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(
+            def.ty,
+            SettingType::Enum(&["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"])
+        ));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "voice");
+        assert_eq!(def.default_value, Some(json!("gpt-4o-transcribe")));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-voicemodel-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-voicemodel-{tag}.toml"));
+        // Start from an empty file (not the commented default template) so
+        // origins read `default` until the key is explicitly written.
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], json!("gpt-4o-transcribe"));
+        assert_eq!(got["origin"], json!("default"));
+
+        // A picked model persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": "whisper-1" }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!("whisper-1"));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("whisper-1"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Values outside the enum are rejected.
+        svc.update(&json!([{ "path": path, "value": "gpt-5-transcribe" }]))
+            .await
+            .expect_err("out-of-enum value must be rejected");
+
+        // Reset restores the default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], json!("gpt-4o-transcribe"));
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], json!("gpt-4o-transcribe"));
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// `model.workspaceOverrides` is retired (monorepo#1000) but old clients
     /// still write it on every workspace-scoped model pick: `settings.update`
     /// tolerates-and-ignores the entry (nothing persisted, nothing echoed in
@@ -2554,6 +2698,88 @@ mod tests {
         );
         // Second run: nothing to delete, still Ok.
         cleanup_retired_settings(&store).await.expect("idempotent");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// [`migrate_default_vocabulary`] deletes a stored `voice.vocabulary`
+    /// row that exactly matches the retired 17-term default (so the new
+    /// `["Intent"]` default applies), and is an idempotent no-op afterwards.
+    #[tokio::test]
+    async fn migrate_default_vocabulary_deletes_untouched_old_default() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-vocab-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+
+        let legacy = serde_json::to_string(&json!(crate::voice_ops::LEGACY_DEFAULT_VOCABULARY))
+            .expect("encode legacy default");
+        store
+            .set_setting(VOICE_VOCABULARY_PATH, &legacy)
+            .await
+            .expect("seed old default row");
+        migrate_default_vocabulary(&store).await.expect("migrate");
+        assert_eq!(
+            store
+                .get_setting(VOICE_VOCABULARY_PATH)
+                .await
+                .expect("read settings table"),
+            None,
+            "untouched old default must be deleted"
+        );
+        // Second run: no row, still Ok.
+        migrate_default_vocabulary(&store)
+            .await
+            .expect("idempotent");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// [`migrate_default_vocabulary`] never touches a user-modified list —
+    /// including reorderings, subsets, and supersets of the old default —
+    /// or a malformed stored blob.
+    #[tokio::test]
+    async fn migrate_default_vocabulary_preserves_user_modified_lists() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-vocab-user-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+
+        let mut reordered: Vec<&str> = crate::voice_ops::LEGACY_DEFAULT_VOCABULARY.to_vec();
+        reordered.reverse();
+        let mut extended: Vec<&str> = crate::voice_ops::LEGACY_DEFAULT_VOCABULARY.to_vec();
+        extended.push("Endara");
+        let cases = [
+            serde_json::to_string(&json!(["Endara", "TOON"])).unwrap(),
+            serde_json::to_string(&json!(reordered)).unwrap(),
+            serde_json::to_string(&json!(extended)).unwrap(),
+            serde_json::to_string(&json!(crate::voice_ops::LEGACY_DEFAULT_VOCABULARY[..16]))
+                .unwrap(),
+            "not-json".to_string(),
+        ];
+        for stored in cases {
+            store
+                .set_setting(VOICE_VOCABULARY_PATH, &stored)
+                .await
+                .expect("seed row");
+            migrate_default_vocabulary(&store).await.expect("migrate");
+            assert_eq!(
+                store
+                    .get_setting(VOICE_VOCABULARY_PATH)
+                    .await
+                    .expect("read settings table"),
+                Some(stored.clone()),
+                "user-modified value must be preserved"
+            );
+        }
 
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(

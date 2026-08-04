@@ -79,6 +79,8 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.oauthClientId",
     "sourceControl.github.exposeGitCredentialToChildren",
     "accounts.sentry.organization",
+    "voice.provider",
+    "voice.openai.model",
     "context.enabled",
     "context.auggiePath",
     "context.allowIndexing",
