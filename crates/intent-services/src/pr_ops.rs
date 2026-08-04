@@ -534,8 +534,10 @@ pub(crate) fn count_thread_comments(threads: &[ReviewThread]) -> (i64, i64) {
 /// The `ws.pr.snapshot` `mergeBlockedReason` derivation: a human-readable
 /// reason merging is blocked, non-`None` exactly when the PR is open (incl.
 /// draft) and cannot be merged, from the [`derive_status_state`] `state`,
-/// `mergeable`, and raw `mergeable_state`. Merged/closed PRs and
-/// still-computing mergeability (`unknown`) yield `None`.
+/// `mergeable`, and raw `mergeable_state`. Merged/closed PRs yield `None`;
+/// for any other `mergeable_state` (e.g. still-computing `unknown`) a draft
+/// PR or an explicit `mergeable == Some(false)` still produces a reason
+/// before falling back to `None`.
 pub(crate) fn merge_blocked_reason(
     state: &str,
     mergeable: Option<bool>,

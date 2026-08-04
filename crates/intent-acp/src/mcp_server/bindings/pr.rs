@@ -64,7 +64,7 @@ async fn snapshot(
 ) -> Result<Value, String> {
     let pr_number =
         req_i64(args, "prNumber").map_err(|_| "prNumber is required and must be a number")?;
-    if pr_number < 0 {
+    if pr_number <= 0 {
         return Err("prNumber is required and must be a number".to_string());
     }
     api.pr_state(ws.clone(), pr_number as u64)

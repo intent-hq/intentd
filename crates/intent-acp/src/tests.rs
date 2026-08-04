@@ -7131,12 +7131,13 @@ mod wsapi6_bindings_tests {
 
     #[tokio::test]
     async fn pr_snapshot_requires_numeric_pr_number() {
-        // Missing, negative, and non-numeric prNumber all surface the same
-        // validation error before the trait method is called — parity with
-        // the `replyToReviewComment` commentId pattern.
+        // Missing, non-positive, and non-numeric prNumber all surface the
+        // same validation error before the trait method is called — parity
+        // with the `replyToReviewComment` commentId pattern.
         let (srv, api) = server();
         for code in [
             "return await ws.pr.snapshot();",
+            "return await ws.pr.snapshot(0);",
             "return await ws.pr.snapshot(-1);",
             "return await ws.pr.snapshot('abc');",
         ] {
