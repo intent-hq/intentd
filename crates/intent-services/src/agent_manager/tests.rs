@@ -4580,8 +4580,8 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 
 /// Pending queued messages survive `workspace.archive` untouched and are NOT
 /// drained into a new turn while the workspace is archived (the archived gate
-/// in `try_drain_queue`); after `workspace.unarchive` the next drain kick
-/// re-engages and delivers the parked queue.
+/// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
+/// delivers the parked queue — no organic follow-up kick required.
 #[tokio::test]
 async fn archive_workspace_parks_queue_until_unarchive() {
     let tmp = TempDb::new();
@@ -4632,22 +4632,22 @@ async fn archive_workspace_parks_queue_until_unarchive() {
         "queue stays parked while archived"
     );
 
-    // Unarchive → the next drain kick re-engages and delivers the queue.
+    // Unarchive itself kicks the drain — the parked queue delivers without
+    // any organic follow-up kick.
     <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
         .await
         .expect("unarchive workspace");
-    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
     assert!(
         services.queue_snapshot(&id).is_empty(),
-        "queue drains on the agent's next run after unarchive"
+        "unarchive's drain kick delivers the parked queue"
     );
 }
 
 /// Wake deliveries (`deliver_wake_message` — hook wakes, completion-watch
 /// wakes, `agent.wakeOrCreate` context messages) must not start a turn while
 /// the workspace is archived: the archived gate parks them in the queue
-/// instead of claiming the slot, and the queue drains on the next kick after
-/// unarchive.
+/// instead of claiming the slot, and unarchive's own drain kick delivers
+/// the parked wake.
 #[tokio::test]
 async fn archive_workspace_parks_wake_deliveries() {
     let tmp = TempDb::new();
@@ -4681,14 +4681,13 @@ async fn archive_workspace_parks_wake_deliveries() {
         "wake queued behind the archived gate"
     );
 
-    // Unarchive → the next drain kick delivers the parked wake.
+    // Unarchive itself kicks the drain and delivers the parked wake.
     <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
         .await
         .expect("unarchive workspace");
-    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
     assert!(
         services.queue_snapshot(&id).is_empty(),
-        "parked wake drains after unarchive"
+        "unarchive's drain kick delivers the parked wake"
     );
 }
 

@@ -6541,10 +6541,11 @@ impl Services {
         };
         // Archived-workspace gate (mirrors `try_drain_queue`'s): a wake must
         // not start a turn while the workspace is archived — it parks in the
-        // queue until unarchive, when the next drain kick delivers it. Chief
-        // is virtual and never archived, so skip the row read. Fail open on
-        // a lookup error: the gate only parks affirmatively-archived
-        // workspaces; a transient store error must not swallow a wake.
+        // queue until unarchive, whose drain kick delivers it (see
+        // `unarchive_workspace`). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not swallow a wake.
         if !workspace_id.is_chief() {
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {
