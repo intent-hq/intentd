@@ -17301,6 +17301,124 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_state(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
+                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+                    "PR #{pr_number} not found in the workspace repository"
+                )),
+                other => pr_ops::map_sc_err(other),
+            })?;
+            let state = pr_ops::derive_status_state(&pr);
+            let mergeable_state = pr
+                .mergeable_state
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let merge_blocked_reason =
+                pr_ops::merge_blocked_reason(state, pr.mergeable, &mergeable_state);
+
+            // Check runs on the PR head (SHA, else source branch). Providers
+            // without check-run support — or a PR whose head cannot be
+            // determined — report an empty tally rather than failing the
+            // whole snapshot.
+            let head_ref = pr
+                .head_sha
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
+            let (check_summary, failed_names) = match &head_ref {
+                Some(git_ref) if sc.capabilities().check_runs => {
+                    let runs = sc
+                        .check_runs(&repo_ref, git_ref)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                    (
+                        pr_ops::summarize_check_runs(&runs),
+                        pr_ops::failed_check_names(&runs),
+                    )
+                }
+                _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
+            };
+
+            let reviews = sc
+                .list_reviews(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let agg = pr_ops::aggregate_reviews(&reviews);
+            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+
+            let conversation = sc
+                .list_comments(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let conversation_count = conversation.len() as i64;
+            // Inline review comments: threads via GraphQL when available,
+            // falling back to the flat REST list grouped by reply parent (the
+            // same fallback as `pr.listReviewComments`; resolution state is
+            // unavailable there, so every fallback thread counts as
+            // unresolved).
+            let threads =
+                match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
+                    .await
+                {
+                    Ok((threads, _, _)) => threads,
+                    Err(_) => {
+                        let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
+                            sc.list_review_comments(&repo_ref, pr_number, p)
+                        })
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                        pr_ops::fallback_threads(comments)
+                    }
+                };
+            let (review_comment_count, unresolved_thread_count) =
+                pr_ops::count_thread_comments(&threads);
+
+            Ok(serde_json::json!({
+                "prNumber": pr_number,
+                "title": pr.title,
+                "url": pr.url,
+                "state": state,
+                "isDraft": state == "draft",
+                "isMerged": state == "merged",
+                "isClosed": state == "closed",
+                "headSha": pr.head_sha,
+                "updatedAt": pr.updated_at,
+                "mergeable": pr.mergeable,
+                "mergeableState": mergeable_state,
+                "mergeBlockedReason": merge_blocked_reason,
+                "checks": {
+                    "total": check_summary.total,
+                    "passed": check_summary.passed,
+                    "failed": check_summary.failed,
+                    "pending": check_summary.pending,
+                    "failedNames": failed_names,
+                },
+                "reviews": {
+                    "decision": decision,
+                    "approvals": agg.approval_count,
+                    "changesRequested": agg.changes_requested_count,
+                },
+                "comments": {
+                    "conversationCount": conversation_count,
+                    "reviewCommentCount": review_comment_count,
+                    "unresolvedThreadCount": unresolved_thread_count,
+                    "totalCount": conversation_count + review_comment_count,
+                },
+            }))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // pr.* write/action surface (PROTOCOL §5.7). Same active-PR enforcement as
     // the read methods; validation/poll glue lives in `pr_ops`.

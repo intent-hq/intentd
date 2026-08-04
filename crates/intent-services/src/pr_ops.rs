@@ -513,6 +513,71 @@ pub(crate) fn summarize_check_runs(runs: &[CheckRun]) -> CheckRunSummary {
     summary
 }
 
+/// Names of failing check runs (failure / cancelled) for the `ws.pr.snapshot`
+/// `checks.failedNames` list, in run order.
+pub(crate) fn failed_check_names(runs: &[CheckRun]) -> Vec<String> {
+    runs.iter()
+        .filter(|r| matches!(r.state, CheckState::Failure | CheckState::Cancelled))
+        .map(|r| r.name.clone())
+        .collect()
+}
+
+/// Comment tallies for the `ws.pr.snapshot` `comments` block: the total number
+/// of inline review comments across `threads` (EVERY thread comment counts,
+/// including replies inside a thread) and the number of unresolved threads.
+pub(crate) fn count_thread_comments(threads: &[ReviewThread]) -> (i64, i64) {
+    let review_comment_count = threads.iter().map(|t| t.comments.len() as i64).sum();
+    let unresolved = threads.iter().filter(|t| !t.is_resolved).count() as i64;
+    (review_comment_count, unresolved)
+}
+
+/// The `ws.pr.snapshot` `mergeBlockedReason` derivation: a human-readable
+/// reason merging is blocked, non-`None` exactly when the PR is open (incl.
+/// draft) and cannot be merged, from the [`derive_status_state`] `state`,
+/// `mergeable`, and raw `mergeable_state`. Merged/closed PRs yield `None`;
+/// for any other `mergeable_state` (e.g. still-computing `unknown`) a draft
+/// PR or an explicit `mergeable == Some(false)` still produces a reason
+/// before falling back to `None`.
+pub(crate) fn merge_blocked_reason(
+    state: &str,
+    mergeable: Option<bool>,
+    mergeable_state: &str,
+) -> Option<String> {
+    if state == "merged" || state == "closed" {
+        return None;
+    }
+    let reason = match mergeable_state {
+        "dirty" => Some("merge conflicts"),
+        "blocked" => Some("blocked by required checks or reviews"),
+        "behind" => Some("branch behind base"),
+        _ if state == "draft" => Some("draft PRs cannot be merged"),
+        _ if mergeable == Some(false) => Some("not mergeable"),
+        _ => None,
+    };
+    reason.map(str::to_string)
+}
+
+/// The `ws.pr.snapshot` `reviews.decision` derivation: `changes_requested` /
+/// `approved` from the aggregated actionable reviews; `review_required` when
+/// an open (incl. draft) PR has no actionable reviews but the forge reports
+/// the merge as `blocked` (required reviews / branch protection unmet); else
+/// `none`.
+pub(crate) fn snapshot_review_decision(
+    agg: &ReviewAggregate,
+    state: &str,
+    mergeable_state: &str,
+) -> &'static str {
+    if agg.changes_requested_count > 0 {
+        "changes_requested"
+    } else if agg.approval_count > 0 {
+        "approved"
+    } else if (state == "open" || state == "draft") && mergeable_state == "blocked" {
+        "review_required"
+    } else {
+        "none"
+    }
+}
+
 /// Validate `pr.listReviewComments` `status` (default `unresolved`); an invalid
 /// value throws in the TS builder → `-32603` here.
 pub(crate) fn validate_review_comment_status(status: Option<String>) -> Result<String> {
@@ -1015,6 +1080,127 @@ mod tests {
         ];
         let s = summarize_check_runs(&runs);
         assert_eq!((s.total, s.passed, s.failed, s.pending), (5, 2, 2, 1));
+    }
+
+    #[test]
+    fn failed_check_names_lists_failure_and_cancelled_in_order() {
+        let mk = |name: &str, state: CheckState| CheckRun {
+            name: name.into(),
+            state,
+            url: None,
+        };
+        let runs = vec![
+            mk("build", CheckState::Success),
+            mk("test", CheckState::Failure),
+            mk("lint", CheckState::Pending),
+            mk("e2e", CheckState::Cancelled),
+            mk("docs", CheckState::Neutral),
+        ];
+        assert_eq!(
+            failed_check_names(&runs),
+            vec!["test".to_string(), "e2e".to_string()]
+        );
+        assert!(failed_check_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn thread_comment_count_includes_replies() {
+        let comment = |id: &str| ReviewThreadComment {
+            id: id.into(),
+            body: "b".into(),
+            author: "a".into(),
+            path: "x.rs".into(),
+            line: Some(1),
+            created_at: String::new(),
+        };
+        let threads = vec![
+            ReviewThread {
+                id: "RT1".into(),
+                is_resolved: false,
+                // Root comment + two replies: all three count.
+                comments: vec![comment("c1"), comment("c2"), comment("c3")],
+            },
+            ReviewThread {
+                id: "RT2".into(),
+                is_resolved: true,
+                comments: vec![comment("c4")],
+            },
+        ];
+        assert_eq!(count_thread_comments(&threads), (4, 1));
+        assert_eq!(count_thread_comments(&[]), (0, 0));
+    }
+
+    #[test]
+    fn merge_blocked_reason_matches_open_and_not_mergeable() {
+        // Blocked states on an open PR derive a human-readable reason.
+        assert_eq!(
+            merge_blocked_reason("open", Some(false), "dirty").as_deref(),
+            Some("merge conflicts")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(true), "blocked").as_deref(),
+            Some("blocked by required checks or reviews")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(true), "behind").as_deref(),
+            Some("branch behind base")
+        );
+        assert_eq!(
+            merge_blocked_reason("draft", Some(true), "clean").as_deref(),
+            Some("draft PRs cannot be merged")
+        );
+        // A blocked-state reason wins over the draft fallback.
+        assert_eq!(
+            merge_blocked_reason("draft", Some(false), "dirty").as_deref(),
+            Some("merge conflicts")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(false), "weird").as_deref(),
+            Some("not mergeable")
+        );
+        // Not blocked: mergeable/clean, unstable (non-required checks), and
+        // still-computing mergeability.
+        assert!(merge_blocked_reason("open", Some(true), "clean").is_none());
+        assert!(merge_blocked_reason("open", Some(true), "unstable").is_none());
+        assert!(merge_blocked_reason("open", None, "unknown").is_none());
+        // Merged/closed PRs never report a blocked reason.
+        assert!(merge_blocked_reason("merged", Some(false), "dirty").is_none());
+        assert!(merge_blocked_reason("closed", Some(false), "blocked").is_none());
+    }
+
+    #[test]
+    fn snapshot_decision_orders_changes_requested_approved_required_none() {
+        let agg = |approvals: i64, changes: i64| ReviewAggregate {
+            review_decision: None,
+            approval_count: approvals,
+            changes_requested_count: changes,
+            approved_by: Vec::new(),
+        };
+        assert_eq!(
+            snapshot_review_decision(&agg(1, 1), "open", "clean"),
+            "changes_requested"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(2, 0), "open", "blocked"),
+            "approved"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "open", "blocked"),
+            "review_required"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "draft", "blocked"),
+            "review_required"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "open", "clean"),
+            "none"
+        );
+        // Merged/closed PRs never derive `review_required` from `blocked`.
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "merged", "blocked"),
+            "none"
+        );
     }
 
     #[test]
