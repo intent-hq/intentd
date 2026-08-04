@@ -253,7 +253,8 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     assert_eq!(got["specialist"]["source"], "bundled");
     assert_eq!(got["specialist"]["prompt"], "You verify.");
 
-    // create — user scope (default) authors a new specialist file.
+    // create — user scope (default) authors a new specialist file. A retired
+    // `modelTier` in the spec is tolerated-and-ignored (never echoed).
     let created = ok(
         &mut w,
         &mut r,
@@ -266,7 +267,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     )
     .await;
     assert_eq!(created["specialist"]["source"], "user");
-    assert_eq!(created["specialist"]["modelTier"], "high");
+    assert!(created["specialist"].get("modelTier").is_none());
     assert!(h.user_dir.join("reviewer.md").exists());
 
     // 3-tier: user file with the same id as bundled wins over bundled.
@@ -355,7 +356,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
 async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
-    // plus the optional `hidden` boolean.
+    // plus the optional `hidden` boolean and a retired `modelTier` line.
     let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\nhidden: true\n---\n\nYou loop.";
     std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
 
@@ -374,7 +375,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     let s = &got["specialist"];
     assert_eq!(s["codingAgent"], "claude");
     assert_eq!(s["model"], "opus4.5");
-    assert_eq!(s["modelTier"], "smart");
+    assert!(
+        s.get("modelTier").is_none(),
+        "retired modelTier is never echoed"
+    );
     assert_eq!(s["roleReminder"], "Never stop early");
     assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "You loop.");
@@ -394,8 +398,9 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(ralph["isCustomized"], false);
     assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
 
-    // create→get round-trip: a user specialist persists every field losslessly,
-    // and the body may be supplied via the `behaviorPrompt` alias.
+    // create→get round-trip: a user specialist persists every live field
+    // losslessly (the retired `modelTier` is dropped), and the body may be
+    // supplied via the `behaviorPrompt` alias.
     let created = ok(
         &mut w,
         &mut r,
@@ -428,7 +433,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(s["source"], "user");
     assert_eq!(s["codingAgent"], "claude");
     assert_eq!(s["model"], "opus4.5");
-    assert_eq!(s["modelTier"], "smart");
+    assert!(
+        s.get("modelTier").is_none(),
+        "retired modelTier is dropped on create"
+    );
     assert_eq!(s["roleReminder"], "Keep going");
     assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "Loop body.");
@@ -611,8 +619,8 @@ async fn specialist_bundled_read_only_and_invalid_params() {
     h.shutdown().await;
 }
 
-/// Write a specialist file with extra frontmatter lines (e.g. `model`,
-/// `modelTier`) for the resolution-preview tests.
+/// Write a specialist file with extra frontmatter lines (e.g. `model`) for
+/// the resolution-preview tests.
 fn write_specialist_frontmatter(dir: &Path, id: &str, extra_frontmatter: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let body =
@@ -635,7 +643,7 @@ async fn specialist_resolution_preview() {
     let h = start().await;
     // Pinned frontmatter model (unclaimed by any tier table → provider-agnostic).
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
-    // Opt-in tier resolution.
+    // Retired tier opt-in: tolerated in the file, ignored by resolution.
     write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
     // Pin claimed by auggie's tier table → guarded away from other providers.
     write_specialist_frontmatter(&h.user_dir, "auggie-pin", "model: \"opus4.7\"");
@@ -650,9 +658,12 @@ async fn specialist_resolution_preview() {
     let pinner = find_spec(&list, "pinner");
     assert_eq!(pinner["resolvedModel"], "opus4.5");
     assert_eq!(pinner["resolvedProvider"], "auggie");
+    // Retired modelTier: never echoed, never resolved — with no settings
+    // chain the preview falls through to the CLI default (omitted).
     let tiered = find_spec(&list, "tiered");
-    assert_eq!(tiered["resolvedModel"], "opus4.7"); // auggie smart tier
-    assert_eq!(tiered["resolvedProvider"], "auggie");
+    assert!(tiered.get("modelTier").is_none());
+    assert!(tiered.get("resolvedModel").is_none());
+    assert!(tiered.get("resolvedProvider").is_none());
     let auggie_pin = find_spec(&list, "auggie-pin");
     assert_eq!(auggie_pin["resolvedModel"], "opus4.7");
     // No settings chain → CLI default → both preview fields omitted.
@@ -669,9 +680,9 @@ async fn specialist_resolution_preview() {
         json!({ "provider": "codex" }),
     )
     .await;
+    // The retired tier does not resolve under codex either.
     let tiered = find_spec(&list, "tiered");
-    assert_eq!(tiered["resolvedModel"], "gpt-5.3-codex/xhigh");
-    assert_eq!(tiered["resolvedProvider"], "codex");
+    assert!(tiered.get("resolvedModel").is_none());
     // The auggie-claimed pin does not leak into a codex context; with no
     // settings chain the preview falls through to the CLI default (omitted).
     let auggie_pin = find_spec(&list, "auggie-pin");
@@ -681,8 +692,7 @@ async fn specialist_resolution_preview() {
     assert_eq!(pinner["resolvedModel"], "opus4.5");
     assert_eq!(pinner["resolvedProvider"], "codex");
 
-    // claude-code's smart tier is the literal "default" sentinel → never a
-    // resolved model; falls through (no settings) → omitted.
+    // specialist.get mirrors the omission for the retired tier.
     let got = ok(
         &mut w,
         &mut r,
@@ -693,8 +703,6 @@ async fn specialist_resolution_preview() {
     .await;
     assert!(got["specialist"].get("resolvedModel").is_none());
 
-    // Tierless provider (grok: dynamic model list) → tier opt-in falls
-    // through → omitted.
     let got = ok(
         &mut w,
         &mut r,
@@ -801,6 +809,22 @@ async fn specialist_resolution_preview_inherits_settings() {
     )
     .await;
     assert_eq!(got["specialist"]["resolvedModel"], "opus4.5");
+
+    // Retirement regression: a lingering `modelTier: "smart"` file resolves
+    // via the settings chain (model.default), not the old tier table
+    // (auggie smart would have been "opus4.7").
+    write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
+    let got = ok(
+        &mut w,
+        &mut r,
+        5,
+        "specialist.get",
+        json!({ "id": "tiered" }),
+    )
+    .await;
+    assert!(got["specialist"].get("modelTier").is_none());
+    assert_eq!(got["specialist"]["resolvedModel"], "sonnet4.5");
+    assert_eq!(got["specialist"]["resolvedProvider"], "auggie");
 
     h.shutdown().await;
 }

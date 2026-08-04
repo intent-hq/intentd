@@ -141,16 +141,13 @@ fn resolve_default_model_from_settings(
 /// by the caller. Also reusable standalone (e.g. `specialist.get/list`
 /// `resolvedModel`) so previews match what a no-model create actually pins.
 ///
-/// Precedence (steps 2–5):
+/// Precedence (steps 2–4; the former `modelTier` step is retired — the key
+/// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
-/// 3. Specialist frontmatter `modelTier` — resolved strictly within the
-///    resolved provider's tier table; providers without a table (opencode,
-///    droid, grok) and claude-code's `"default"` smart-tier sentinel fall
-///    through. Never another provider's model.
-/// 4. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+/// 3. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
 ///    provider-guarded.
-/// 5. `None` → provider CLI default (`session.model` stays unset).
+/// 4. `None` → provider CLI default (`session.model` stays unset).
 ///
 /// The `specialist` id doubles as the `agent_type` for the settings chain's
 /// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
@@ -187,22 +184,9 @@ pub(crate) fn resolve_agent_default_model(
                 "specialist frontmatter model belongs to another provider; ignoring"
             );
         }
-
-        // Step 3: specialist frontmatter `modelTier` — strictly within the
-        // resolved provider's tier table (no cross-provider fallback).
-        // claude-code's smart tier is the literal "default" sentinel ("use
-        // the CLI default"), not a model id — it falls through too.
-        if let Some(tier) = specialists_svc.resolve_model_tier(spec_id, workspace_path) {
-            if let Some(m) = intent_providers::ModelTier::from_wire(&tier)
-                .and_then(|t| intent_providers::default_model_for_provider(effective_provider, t))
-                .filter(|m| *m != "default")
-            {
-                return Some(m.to_string());
-            }
-        }
     }
 
-    // Step 4: settings chain, provider-guarded — a configured default owned
+    // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
     let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
@@ -215,7 +199,7 @@ pub(crate) fn resolve_agent_default_model(
         "configured default model belongs to another provider; \
          falling back to the CLI default"
     );
-    // Step 5: None → provider CLI default.
+    // Step 4: None → provider CLI default.
     None
 }
 

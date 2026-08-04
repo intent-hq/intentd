@@ -182,7 +182,7 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
             continue;
         };
         let key = line[..colon].trim();
-        if key.is_empty() {
+        if key.is_empty() || RETIRED_FRONTMATTER_KEYS.contains(&key) {
             continue;
         }
         let mut value = line[colon + 1..].trim().to_string();
@@ -204,9 +204,9 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// Optional frontmatter scalar keys carried through `build_def`/`render_file`
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
-/// `modelTier`, `roleReminder`, `agentType`).
+/// `roleReminder`, `agentType`).
 ///
-/// NOTE: the config scalars `codingAgent`/`model`/`modelTier`/`agentType`
+/// NOTE: the config scalars `codingAgent`/`model`/`agentType`
 /// ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit semantics across
 /// tiers, like `hidden` (PROTOCOL §5.11, intent-hq/monorepo#718): an omitted
 /// key keeps the lower tiers' effective value, an explicit empty value
@@ -215,17 +215,20 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
 /// stale summary of a body that no longer exists).
-const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
-    "codingAgent",
-    "model",
-    "modelTier",
-    "roleReminder",
-    "agentType",
-];
+const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &["codingAgent", "model", "roleReminder", "agentType"];
 
 /// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
 /// across tiers; each key inherits independently.
-const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "modelTier", "agentType"];
+const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "agentType"];
+
+/// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
+/// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
+/// old-client `specialist.create`/`edit` specs may still carry them, but they
+/// are stripped on parse (never echoed by `get`/`list`), silently skipped by
+/// `render_file` (never rejected with `-32602`), and dropped from the file on
+/// its next rewrite. `modelTier` is retired: a specialist's model is either an
+/// explicit `model:` pin or inherited via the settings chain (§5.5).
+const RETIRED_FRONTMATTER_KEYS: &[&str] = &["modelTier"];
 
 /// Tri-state read of a frontmatter/spec `hidden` value: `Some(true)`/`Some(false)`
 /// when explicitly set, `None` when absent — an absent key **inherits** the
@@ -602,24 +605,6 @@ impl SpecialistsService {
         })
     }
 
-    /// Resolve a specialist's `modelTier` frontmatter scalar through the
-    /// 3-tier order (project > user > bundled), used at spawn time when the
-    /// specialist declares no usable `model`. Returns `None` when the
-    /// specialist is unknown or declares no `modelTier`, allowing the caller
-    /// to fall through to the settings chain.
-    pub(crate) fn resolve_model_tier(
-        &self,
-        id: &str,
-        workspace_path: Option<&Path>,
-    ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("modelTier")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
-    }
-
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
     /// keyed by id (later tiers overwrite earlier — the precedence merge).
     /// `hidden` and the config scalars ([`INHERITED_CONFIG_KEYS`]) inherit
@@ -881,7 +866,8 @@ mod tests {
         let (fm, body) = parse_frontmatter(content);
         assert_eq!(fm.get("codingAgent").unwrap(), "claude");
         assert_eq!(fm.get("model").unwrap(), "opus4.5");
-        assert_eq!(fm.get("modelTier").unwrap(), "smart");
+        // Retired keys are stripped on parse (RETIRED_FRONTMATTER_KEYS).
+        assert!(fm.get("modelTier").is_none());
         assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
         assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
         assert_eq!(body, "You loop.");
@@ -896,7 +882,8 @@ mod tests {
         assert_eq!(def["description"], "Loops");
         assert_eq!(def["codingAgent"], "claude");
         assert_eq!(def["model"], "opus4.5");
-        assert_eq!(def["modelTier"], "smart");
+        // A retired `modelTier:` frontmatter line is never echoed on the wire.
+        assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
         assert_eq!(def["agentType"], "ralph-loop");
         assert_eq!(def["prompt"], "You loop.");
@@ -931,10 +918,12 @@ mod tests {
             "prompt": "You loop.\nForever."
         });
         let rendered = render_file("ralph", &spec);
+        // A retired `modelTier` in the wire spec is dropped, never written.
+        assert!(!rendered.contains("modelTier"));
         let def = build_def("ralph", &rendered, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["codingAgent"], "claude");
         assert_eq!(def["model"], "opus4.5");
-        assert_eq!(def["modelTier"], "smart");
+        assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
         assert_eq!(def["agentType"], "ralph-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
@@ -1429,8 +1418,9 @@ mod tests {
     #[test]
     fn user_override_omitting_scalars_inherits_bundled_values() {
         // A user override that omits the config scalars (codingAgent, model,
-        // modelTier, agentType) inherits the bundled tier's effective values
-        // on get, list, and the spawn-time resolvers.
+        // agentType) inherits the bundled tier's effective values on get,
+        // list, and the spawn-time resolvers. A retired `modelTier:` line in
+        // the bundled file is ignored and never surfaces.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         bundled.write(
@@ -1447,7 +1437,7 @@ mod tests {
         assert_eq!(def["source"], "user");
         assert_eq!(def["codingAgent"], "claude", "codingAgent inherited on get");
         assert_eq!(def["model"], "opus4.5", "model inherited on get");
-        assert_eq!(def["modelTier"], "smart", "modelTier inherited on get");
+        assert!(def.get("modelTier").is_none(), "retired modelTier ignored");
         assert_eq!(def["agentType"], "zeta-type", "agentType inherited on get");
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
@@ -1457,7 +1447,10 @@ mod tests {
             "codingAgent inherited in list"
         );
         assert_eq!(zeta["model"], "opus4.5", "model inherited in list");
-        assert_eq!(zeta["modelTier"], "smart", "modelTier inherited in list");
+        assert!(
+            zeta.get("modelTier").is_none(),
+            "retired modelTier ignored in list"
+        );
         assert_eq!(
             zeta["agentType"], "zeta-type",
             "agentType inherited in list"
@@ -1472,9 +1465,7 @@ mod tests {
     #[test]
     fn user_override_of_embedded_inherits_scalars_at_spawn() {
         // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType keeps the embedded value at spawn time. Bundled
-        // specialists no longer declare modelTier (they inherit the user's
-        // default model), so no tier surfaces from the floor either.
+        // omits agentType keeps the embedded value at spawn time.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
@@ -1491,9 +1482,83 @@ mod tests {
         assert_eq!(got["specialist"]["source"], "user");
         assert!(
             got["specialist"].get("modelTier").is_none(),
-            "bundled specialists declare no modelTier"
+            "modelTier is retired and never emitted"
         );
-        assert_eq!(svc.resolve_model_tier("ralph", None), None);
+    }
+
+    #[test]
+    fn create_and_edit_tolerate_and_drop_retired_model_tier() {
+        // Retirement regression (PROTOCOL §5.11): a `modelTier` in
+        // `specialist.create`/`edit` params succeeds (no -32602), is never
+        // echoed, and is never written to the file.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let created = svc
+            .create(
+                "tiered",
+                &json!({
+                    "id": "tiered", "name": "Tiered", "description": "d",
+                    "modelTier": "smart", "prompt": "body"
+                }),
+                None,
+                None,
+            )
+            .expect("create with retired modelTier succeeds");
+        assert!(created["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("tiered.md")).unwrap();
+        assert!(!content.contains("modelTier"), "never written: {content}");
+
+        let edited = svc
+            .edit(
+                "tiered",
+                &json!({
+                    "id": "tiered", "name": "Tiered", "description": "d",
+                    "modelTier": "fast", "prompt": "body v2"
+                }),
+                "user",
+                None,
+            )
+            .expect("edit with retired modelTier succeeds");
+        assert!(edited["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("tiered.md")).unwrap();
+        assert!(!content.contains("modelTier"), "never written: {content}");
+    }
+
+    #[test]
+    fn edit_rewrite_drops_preexisting_model_tier_line() {
+        // Retirement regression (PROTOCOL §5.11): a pre-existing `modelTier:`
+        // frontmatter line is ignored on parse (never echoed) and dropped from
+        // the file on the next `specialist.edit` rewrite.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "legacy",
+            "---\nname: \"Legacy\"\ndescription: \"d\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("legacy", None).unwrap();
+        assert!(got["specialist"].get("modelTier").is_none());
+        assert_eq!(got["specialist"]["model"], "opus4.5");
+
+        let edited = svc
+            .edit(
+                "legacy",
+                &json!({
+                    "id": "legacy", "name": "Legacy", "description": "d",
+                    "model": "opus4.5", "prompt": "body v2"
+                }),
+                "user",
+                None,
+            )
+            .expect("edit succeeds");
+        assert!(edited["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("legacy.md")).unwrap();
+        assert!(
+            !content.contains("modelTier"),
+            "rewrite drops the retired key: {content}"
+        );
+        assert!(content.contains("model: \"opus4.5\""), "model kept");
     }
 
     #[test]
