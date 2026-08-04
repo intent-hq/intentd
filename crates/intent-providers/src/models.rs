@@ -36,8 +36,13 @@ impl ModelTier {
     /// All tiers in resolution order (`fast`, `balanced`, `smart`).
     pub const ALL: [ModelTier; 3] = [ModelTier::Fast, ModelTier::Balanced, ModelTier::Smart];
 
-    /// Parse the wire tier name (`"fast" | "balanced" | "smart"`). `None` for
+    /// Parse a tier name (`"fast" | "balanced" | "smart"`). `None` for
     /// anything else.
+    ///
+    /// No wire surface supplies tier names anymore (the frontmatter
+    /// `modelTier` step is retired), so this is currently unused outside
+    /// tests. Retained while the catalog `modelTiers` table still uses
+    /// [`ModelTier`]; removing both together is a stated follow-up.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "fast" => Some(ModelTier::Fast),

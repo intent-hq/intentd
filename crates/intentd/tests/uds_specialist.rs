@@ -703,6 +703,7 @@ async fn specialist_resolution_preview() {
     .await;
     assert!(got["specialist"].get("resolvedModel").is_none());
 
+    // Same probe under grok — a tierless provider (dynamic model list).
     let got = ok(
         &mut w,
         &mut r,
