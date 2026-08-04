@@ -51,6 +51,4 @@ ctor = "1.0.10"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
-
-[target."cfg(target_os = \"macos\")".dependencies]
 libc = "0.2"

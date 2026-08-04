@@ -74,11 +74,13 @@ pub struct MicrovmSpawnSpec {
 
 /// A booted per-agent VM: the helper child *is* the VM.
 pub struct MicrovmVm {
-    /// Per-VM state dir (rootfs clone, exec socket, console log).
+    /// Per-VM state dir (rootfs clone, console log).
     pub vm_dir: PathBuf,
     /// The per-VM rootfs tree (CoW clone of the extracted image).
     pub rootfs: PathBuf,
     /// Host unix socket forwarded to the guest exec agent's vsock port.
+    /// Lives in the system temp dir, not `vm_dir` — see
+    /// [`super::exec_sock_path`] (SUN_LEN).
     pub exec_sock: PathBuf,
     /// The helper process; killed (whole group) to tear the VM down. Taken
     /// by the caller for handle ownership.
@@ -165,8 +167,22 @@ impl MicrovmVm {
             .map_err(|e| MicrovmError::Io(format!("create /intent dir: {e}")))?;
 
         // 3. Spawn the helper. The guest command is the image's init
-        // entrypoint; everything else rides the exec protocol later.
-        let exec_sock = spec.vm_dir.join("exec.sock");
+        // entrypoint; everything else rides the exec protocol later. The exec
+        // socket uses a short temp-dir path keyed on the agent id (the vm_dir
+        // file name) — libkrun binds it, so scrub any stale file from a
+        // crashed prior VM first.
+        let agent_id = spec
+            .vm_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                MicrovmError::Boot(format!(
+                    "vm dir has no agent-id component: {}",
+                    spec.vm_dir.display()
+                ))
+            })?;
+        let exec_sock = super::exec_sock_path(agent_id)?;
+        scrub_stale_exec_sock(&exec_sock)?;
         let console_log = spec.vm_dir.join("console.log");
         let mut cmd = Command::new(&spec.helper_exe);
         cmd.arg("--root-fs")
@@ -220,6 +236,7 @@ impl MicrovmVm {
         if let Err(e) = ready {
             let _ = child.start_kill();
             let _ = child.wait().await;
+            let _ = tokio::fs::remove_file(&exec_sock).await;
             return Err(e);
         }
         let boot_ms = started.elapsed().as_millis() as u64;
@@ -349,16 +366,23 @@ impl MicrovmVm {
 
 /// Dropping the VM scrubs its state: the rotation watcher stops (own Drop),
 /// any still-owned helper child dies via `kill_on_drop`, and the per-VM
-/// directory — rootfs clone with every staged credential inside it, exec
-/// socket, console log — is removed on a detached thread (Drop cannot be
-/// async, and the tree can be large). Every handle-teardown path drops the
-/// VM after killing the helper's process group, so the scrub is universal;
-/// a daemon crash instead scrubs lazily at the next boot for the same agent
-/// (`MicrovmVm::boot` removes a stale vm dir first).
+/// directory — rootfs clone with every staged credential inside it, console
+/// log — plus the temp-dir exec socket are removed on a detached thread
+/// (Drop cannot be async, and the tree can be large). Every handle-teardown
+/// path drops the VM after killing the helper's process group, so the scrub
+/// is universal; a daemon crash instead scrubs lazily at the next boot for
+/// the same agent (`MicrovmVm::boot` removes a stale vm dir and exec socket
+/// first).
 impl Drop for MicrovmVm {
     fn drop(&mut self) {
         let dir = self.vm_dir.clone();
+        let sock = self.exec_sock.clone();
         std::thread::spawn(move || {
+            if let Err(e) = std::fs::remove_file(&sock) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(sock = %sock.display(), error = %e, "exec socket scrub failed");
+                }
+            }
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(dir = %dir.display(), error = %e, "microVM scrub failed");
@@ -393,6 +417,32 @@ impl Drop for MicrovmVm {
     }
 }
 
+/// Remove a stale exec socket left by a crashed prior VM — but ONLY when the
+/// path really is a socket owned by the current uid. Anything else sitting at
+/// the rendezvous path is refused with a clear error (squat protection: the
+/// socket grants guest command execution, so it must never be silently
+/// replaced or followed).
+fn scrub_stale_exec_sock(path: &Path) -> Result<(), MicrovmError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(MicrovmError::Io(format!("stat stale exec socket: {e}"))),
+    };
+    let uid = unsafe { libc::getuid() };
+    if !meta.file_type().is_socket() || meta.uid() != uid {
+        return Err(MicrovmError::Boot(format!(
+            "refusing to scrub {}: expected a socket owned by uid {uid}, found {:?} \
+             owned by uid {}; remove it and retry",
+            path.display(),
+            meta.file_type(),
+            meta.uid()
+        )));
+    }
+    std::fs::remove_file(path)
+        .map_err(|e| MicrovmError::Io(format!("scrub stale exec socket: {e}")))
+}
+
 /// Poll the exec socket with a trivial command until the guest agent answers,
 /// failing fast when the helper process exits first.
 async fn wait_for_exec_agent(sock: &Path, child: &mut Child) -> Result<(), MicrovmError> {
@@ -403,11 +453,23 @@ async fn wait_for_exec_agent(sock: &Path, child: &mut Child) -> Result<(), Micro
         cwd: "/".into(),
         merge_stderr: false,
     };
+    let mut sock_tightened = false;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(MicrovmError::Boot(format!(
                 "microVM helper exited during boot ({status}); see console.log in the VM dir"
             )));
+        }
+        // Defense-in-depth: chmod the socket to 0600 as soon as libkrun's
+        // bind materializes it. The bind happens inside krun_start_enter,
+        // which never returns in the helper, so the daemon side is the only
+        // practical place; the brief pre-chmod window is covered by the
+        // 0700 parent dir.
+        if !sock_tightened {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600)).is_ok() {
+                sock_tightened = true;
+            }
         }
         match exec::run_to_completion(sock, &probe, BOOT_READY_POLL * 4).await {
             Ok(_) => return Ok(()),
@@ -478,5 +540,23 @@ mod tests {
         let err = resolve_helper_exe().unwrap_err();
         std::env::remove_var(HELPER_EXE_ENV);
         assert!(matches!(err, MicrovmError::HelperMissing(_)));
+    }
+
+    #[test]
+    fn scrub_stale_exec_sock_removes_own_socket_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing path is fine.
+        scrub_stale_exec_sock(&tmp.path().join("absent.sock")).unwrap();
+        // A real socket owned by us is removed.
+        let sock = tmp.path().join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        scrub_stale_exec_sock(&sock).unwrap();
+        assert!(!sock.exists());
+        // Anything else at the path is refused.
+        let file = tmp.path().join("squat.sock");
+        std::fs::write(&file, b"x").unwrap();
+        let err = scrub_stale_exec_sock(&file).unwrap_err();
+        assert!(err.to_string().contains("refusing to scrub"));
+        assert!(file.exists());
     }
 }

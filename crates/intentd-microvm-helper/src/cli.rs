@@ -29,6 +29,11 @@ pub const MAX_VCPUS: u8 = 16;
 /// Minimum guest RAM in MiB.
 pub const MIN_MEM_MIB: u32 = 128;
 
+/// Unix socket paths must fit `sockaddr_un.sun_path`: 104 bytes on macOS
+/// (SUN_LEN), 108 on Linux. Reject over-long vsock socket paths during
+/// validation (exit 64) instead of failing deep in a libkrun API call.
+pub const MAX_SOCKET_PATH_BYTES: usize = 103;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "intentd-microvm-helper",
@@ -321,6 +326,13 @@ fn parse_vsock_spec(spec: &str, host_initiated: bool) -> Result<VsockPort, Strin
     if socket.is_empty() {
         return Err(format!("{flag}: socket path is empty"));
     }
+    if socket.len() > MAX_SOCKET_PATH_BYTES {
+        return Err(format!(
+            "{flag}: socket path is {} bytes; unix socket paths must be at most \
+             {MAX_SOCKET_PATH_BYTES} bytes (SUN_LEN): {socket}",
+            socket.len()
+        ));
+    }
     Ok(VsockPort {
         port,
         socket: PathBuf::from(socket),
@@ -447,6 +459,9 @@ mod tests {
         assert!(plan_with(root.path(), &["--vsock-connect", "0=/tmp/a.sock"]).is_err());
         assert!(plan_with(root.path(), &["--vsock-connect", "abc=/tmp/a.sock"]).is_err());
         assert!(plan_with(root.path(), &["--vsock-connect", "1024="]).is_err());
+        let long_sock = format!("1026=/tmp/{}.sock", "x".repeat(MAX_SOCKET_PATH_BYTES));
+        let err = plan_with(root.path(), &["--vsock-listen", &long_sock]).unwrap_err();
+        assert!(err.contains("SUN_LEN"));
         let err = plan_with(
             root.path(),
             &[
