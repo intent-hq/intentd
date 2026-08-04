@@ -29,6 +29,7 @@ mod client;
 mod git_credential;
 mod import;
 mod legacy_import;
+mod rpc_profile;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -474,7 +475,9 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    };
 
     // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
     let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
@@ -515,18 +518,33 @@ fn init_tracing() {
         }
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // The env filter is applied per output layer (not globally) so the RPC
+    // profiling layer below can observe the DEBUG-level `sqlx::query`
+    // statement events that the default `info` filter would otherwise
+    // disable at the callsite.
+    let output_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(output_filter());
+
+    // Per-RPC statement-count / duration WARN profiling (expensive-RPC
+    // guardrail); its warns flow through the output layers above.
+    let profile_layer =
+        rpc_profile::RpcProfileLayer::from_env().with_filter(rpc_profile::profile_filter());
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
+        .with(profile_layer)
         .with(stderr_layer);
 
     if let Some(appender) = file_appender {
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(output_filter());
         match subscriber.with(file_layer).try_init() {
             Ok(_) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
