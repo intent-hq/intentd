@@ -17560,6 +17560,38 @@ async fn dismiss_questions_preserves_existing_session_metadata() {
     assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-1"));
 }
 
+/// Regression (PR #881 review): the dismiss path reads the session via the
+/// summary projection, which omits `system_prompt`. Writing that summary row
+/// back with the full-row `update_agent_session` cleared the stored prompt;
+/// the targeted metadata write must leave it intact.
+#[tokio::test]
+async fn dismiss_questions_preserves_system_prompt() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.system_prompt = Some("You are a careful reviewer.".to_string());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("seed system prompt");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("dismiss");
+
+    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    assert_eq!(
+        after.dismissed_questions_message_id(),
+        Some("msg-1"),
+        "dismissal marker persisted"
+    );
+    assert_eq!(
+        after.system_prompt.as_deref(),
+        Some("You are a careful reviewer."),
+        "dismissQuestions must never clear the stored system_prompt"
+    );
+}
+
 #[tokio::test]
 async fn dismiss_questions_fails_closed() {
     let (_t, svc, ws) = setup().await;

@@ -3437,10 +3437,12 @@ impl Services {
             intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
             Value::String(message_id.clone()),
         );
-        session.metadata = Some(Value::Object(metadata));
-        session.updated_at = now_iso();
+        // Targeted metadata+updated_at write: the session above came from the
+        // summary projection (no `system_prompt`), so a full-row
+        // `update_agent_session` write-back would clear the stored prompt.
+        let metadata = Value::Object(metadata);
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,

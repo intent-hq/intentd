@@ -1417,6 +1417,37 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a metadata change: a narrow write of `metadata` and
+    /// `updated_at` only. Callers that load a session via the summary
+    /// projection (no `system_prompt` — see [`SESSION_SUMMARY_COLUMNS`]) must
+    /// use this instead of [`Store::update_agent_session`], whose full-row
+    /// write would clear every column absent from the summary. Scoped to
+    /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
+    /// or the workspace does not match.
+    pub async fn update_agent_session_metadata(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        metadata: Option<&serde_json::Value>,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET metadata=?, updated_at=? WHERE id=? AND workspace_id=?",
+        )
+        .bind(encode_metadata(metadata)?)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Persist the runtime `status` + `is_active` transition for `agent_session`
     /// without touching the write-once `acp_session_id` / immutable `provider`
     /// (the broader [`Store::update_agent_session`] enforces those invariants).
@@ -4623,6 +4654,65 @@ mod tests {
         match store.get_agent_session_summary(&missing).await {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `update_agent_session_metadata` writes only `metadata` + `updated_at`:
+    /// columns absent from the summary projection (`system_prompt`) survive,
+    /// and the write is workspace-scoped (`NotFound` on mismatch or missing).
+    #[tokio::test]
+    async fn update_agent_session_metadata_targets_only_metadata() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-meta".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep this prompt".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let metadata = serde_json::json!({ "dismissedQuestionsMessageId": "msg-1" });
+        let later = now_iso();
+        store
+            .update_agent_session_metadata(&ws_id, &agent_id, Some(&metadata), &later)
+            .await
+            .expect("update metadata");
+
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(after.metadata, Some(metadata.clone()));
+        assert_eq!(after.updated_at, later);
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("keep this prompt"),
+            "targeted metadata write must not touch system_prompt"
+        );
+
+        // Workspace mismatch and unknown id both surface as NotFound.
+        let other_ws = WorkspaceId("ws-meta-other".to_string());
+        match store
+            .update_agent_session_metadata(&other_ws, &agent_id, Some(&metadata), &later)
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on workspace mismatch, got {other:?}"),
+        }
+        let missing = AgentId("agent-meta-missing".to_string());
+        match store
+            .update_agent_session_metadata(&ws_id, &missing, Some(&metadata), &later)
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on unknown id, got {other:?}"),
         }
     }
 
