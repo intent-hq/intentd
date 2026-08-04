@@ -1,12 +1,14 @@
-//! WSS end-to-end for the `Workspace.diskUsage` aggregate (PROTOCOL §9.1):
-//! `workspace.list` / `workspace.get` responses carry the cached physical
-//! footprint of the daemon-managed workspace directory. The first read omits
-//! the field (the walk runs detached and backfills), a follow-up poll
-//! observes the computed `{ bytes, fileCount, computedAt, breakdown }`
-//! shape, and rows without a daemon-managed directory (skip-isolation)
-//! never grow the field. Drives a real [`WsApiServer`] over TLS with
-//! bearer-token auth and a pinned self-signed fingerprint (the production
-//! transport path).
+//! WSS end-to-end for the on-demand `workspace.diskUsage` method (PROTOCOL
+//! §5.1, monorepo#1396): the first call answers `{ refreshing: true }` with
+//! `diskUsage` omitted (the walk runs detached and backfills), a follow-up
+//! poll observes the computed `{ bytes, fileCount, computedAt, breakdown }`
+//! payload and a settled fresh entry reads `refreshing: false`; rows without
+//! a daemon-managed directory (skip-isolation) answer `{ refreshing: false }`
+//! without the field; an unknown id is the standard not-found error; and
+//! `workspace.list` / `workspace.get` rows never carry `diskUsage` (the
+//! aggregate left the hot read path). Drives a real [`WsApiServer`] over TLS
+//! with bearer-token auth and a pinned self-signed fingerprint (the
+//! production transport path).
 
 #![cfg(unix)]
 
@@ -257,7 +259,9 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+/// Send one JSON-RPC request and return the full response envelope
+/// (`id` / `jsonrpc` / `result` or `error`).
+async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.unwrap();
     timeout(common::rpc_read_timeout(), async {
@@ -266,8 +270,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
                 Message::Text(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap();
                     if v.get("id") == Some(&json!(id)) {
-                        assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                        return v["result"].clone();
+                        return v;
                     }
                 }
                 Message::Ping(p) => {
@@ -282,7 +285,13 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
     .expect("response timeout")
 }
 
-/// Assert the §9.1 `diskUsage` payload shape: physical bytes cover the seeded
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
+/// Assert the `diskUsage` payload shape: physical bytes cover the seeded
 /// 8 KiB file, `fileCount` counts it, `computedAt` is present, and the
 /// breakdown names the `repo` top-level directory.
 fn assert_disk_usage_shape(du: &Value) {
@@ -300,65 +309,124 @@ fn assert_disk_usage_shape(du: &Value) {
     assert_eq!(breakdown[0]["fileCount"], json!(1));
 }
 
-/// `workspace.get` / `workspace.list` carry `diskUsage` for the managed row
-/// once the detached walk backfills the cache: the very first read omits the
-/// field (never `null`), a bounded poll then observes the computed §9.1
-/// payload on both methods, and the direct-mode row never grows the field.
+/// `workspace.diskUsage` serves the managed row on demand: the first call
+/// answers `{ refreshing: true }` with `diskUsage` omitted (never `null`), a
+/// bounded poll then observes the computed payload, and a settled fresh
+/// entry reads `refreshing: false`. The direct-mode row answers
+/// `{ refreshing: false }` without the field, and an unknown id is the
+/// standard not-found error envelope.
 #[tokio::test]
-async fn disk_usage_appears_on_list_and_get_over_wss() {
+async fn disk_usage_method_serves_on_demand_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
-    // First read: field omitted (walk kicked off in the background), and
-    // omitted means absent — never null.
+    // First call: walk armed in the background, field omitted — never null.
     let first = wss_rpc(
         &mut rpc,
         1,
+        "workspace.diskUsage",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(first["refreshing"], json!(true), "first call arms: {first}");
+    assert!(
+        first.get("diskUsage").is_none(),
+        "first call omits diskUsage: {first}"
+    );
+
+    // Poll until the backfill lands with a settled `refreshing: false`
+    // (bounded). The walk is fast; the fresh TTL (~60s) far exceeds the
+    // poll budget, so a computed entry must eventually read settled.
+    let mut settled = None;
+    for attempt in 0..100i64 {
+        let got = wss_rpc(
+            &mut rpc,
+            10 + attempt,
+            "workspace.diskUsage",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        if got.get("diskUsage").is_some() && got["refreshing"] == json!(false) {
+            settled = Some(got);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let got = settled.expect("diskUsage backfilled + settled within the poll budget");
+    assert_disk_usage_shape(&got["diskUsage"]);
+
+    // Direct-mode row (no daemon-managed dir): no walk, nothing to refresh.
+    let skip = wss_rpc(
+        &mut rpc,
+        200,
+        "workspace.diskUsage",
+        json!({ "workspaceId": fx.skip_ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(skip["refreshing"], json!(false), "direct-mode row: {skip}");
+    assert!(
+        skip.get("diskUsage").is_none(),
+        "direct-mode row never grows diskUsage: {skip}"
+    );
+
+    // Unknown workspaceId: standard not-found error envelope.
+    let missing = wss_rpc_envelope(
+        &mut rpc,
+        300,
+        "workspace.diskUsage",
+        json!({ "workspaceId": "ws_does_not_exist" }),
+    )
+    .await;
+    assert_eq!(missing["jsonrpc"], json!("2.0"));
+    assert_eq!(missing["error"]["code"], json!(-32602), "{missing}");
+    assert_eq!(missing["error"]["message"], json!("Workspace not found"));
+}
+
+/// The aggregate left the hot read path: `workspace.get` and `workspace.list`
+/// rows never carry `diskUsage`, even after an on-demand call populated the
+/// cache for the same workspace.
+#[tokio::test]
+async fn disk_usage_never_appears_on_list_or_get_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    // Populate the cache via the on-demand method (bounded poll).
+    let mut populated = false;
+    for attempt in 0..100i64 {
+        let got = wss_rpc(
+            &mut rpc,
+            1 + attempt,
+            "workspace.diskUsage",
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        if got.get("diskUsage").is_some() {
+            populated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(populated, "cache populated within the poll budget");
+
+    // Even with a warm cache the list/get rows omit the field.
+    let got = wss_rpc(
+        &mut rpc,
+        200,
         "workspace.get",
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
     assert!(
-        first["workspace"].get("diskUsage").is_none(),
-        "first read omits diskUsage: {first}"
+        got["workspace"].get("diskUsage").is_none(),
+        "workspace.get row omits diskUsage: {got}"
     );
 
-    // Poll workspace.get until the backfill lands (bounded).
-    let mut got_usage = None;
-    for attempt in 0..100i64 {
-        let got = wss_rpc(
-            &mut rpc,
-            10 + attempt,
-            "workspace.get",
-            json!({ "workspaceId": fx.ws_id.as_str() }),
-        )
-        .await;
-        match got["workspace"].get("diskUsage") {
-            Some(du) => {
-                got_usage = Some(du.clone());
-                break;
-            }
-            None => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
-    let du = got_usage.expect("diskUsage backfilled within the poll budget");
-    assert_disk_usage_shape(&du);
-
-    // workspace.list carries the same aggregate for the managed row; the
-    // direct-mode row (no daemon-managed dir) still omits the field.
-    let listed = wss_rpc(&mut rpc, 200, "workspace.list", json!({})).await;
+    let listed = wss_rpc(&mut rpc, 201, "workspace.list", json!({})).await;
     let rows = listed["workspaces"].as_array().expect("workspaces array");
-    let managed = rows
-        .iter()
-        .find(|w| w["id"] == json!(fx.ws_id.as_str()))
-        .expect("managed row listed");
-    assert_disk_usage_shape(&managed["diskUsage"]);
-    let skip = rows
-        .iter()
-        .find(|w| w["id"] == json!(fx.skip_ws_id.as_str()))
-        .expect("direct-mode row listed");
-    assert!(
-        skip.get("diskUsage").is_none(),
-        "direct-mode row never grows diskUsage: {skip}"
-    );
+    for row in rows {
+        assert!(
+            row.get("diskUsage").is_none(),
+            "workspace.list row omits diskUsage: {row}"
+        );
+    }
 }

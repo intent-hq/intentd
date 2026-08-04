@@ -114,6 +114,22 @@ impl WorkspaceApi for FakeApi {
             Ok(ws_with(&id))
         })
     }
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "diskUsage": {
+                    "bytes": 4096,
+                    "fileCount": 1,
+                    "computedAt": "2026-01-01T00:00:00Z",
+                    "breakdown": [],
+                },
+                "refreshing": true,
+            }))
+        })
+    }
     fn create_workspace(
         &self,
         input: WorkspaceCreate,
@@ -2150,6 +2166,46 @@ async fn workspace_get_missing_id_is_minus_32602_with_message() {
 async fn workspace_get_not_found_is_minus_32602_with_message() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.get","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.diskUsage` returns the service payload verbatim:
+/// `{ diskUsage?, refreshing }` with no extra envelope nesting.
+#[tokio::test]
+async fn workspace_disk_usage_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["refreshing"], serde_json::json!(true));
+    assert_eq!(v["result"]["diskUsage"]["bytes"], serde_json::json!(4096));
+    assert_eq!(v["result"]["diskUsage"]["fileCount"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();

@@ -362,6 +362,80 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
+    // diskUsage left the hot read path (monorepo#1396): list/get rows never
+    // carry it — clients fetch it via the on-demand `workspace.diskUsage`.
+    assert!(got.disk_usage.is_none());
+    assert!(v.get("diskUsage").is_none());
+}
+
+/// `workspace.diskUsage` cache-state → response mapping: a qualifying row
+/// with a provisioned directory answers `{ refreshing: true }` first (walk
+/// armed, field omitted), backfills to `{ diskUsage, refreshing: false }`
+/// once the walk settles, a skip-isolation row and a never-provisioned
+/// directory answer `{ refreshing: false }` without arming anything, and an
+/// unknown id is `NotFound`.
+#[tokio::test]
+async fn workspace_disk_usage_op_maps_cache_states() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    // Qualifying row with a provisioned daemon-managed directory.
+    let ws = WorkspaceId::new();
+    let mut managed = workspace(&ws);
+    let checkout = root.path().join(ws.as_str()).join("repo");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    std::fs::write(checkout.join("data.bin"), vec![0xCD; 8192]).expect("seed file");
+    managed.worktree_path = Some(checkout.to_string_lossy().into_owned());
+    store.insert_workspace(&managed).await.expect("ws");
+
+    // Skip-isolation row: no daemon-managed directory by construction.
+    let ws_skip = WorkspaceId::new();
+    let mut skip = workspace(&ws_skip);
+    skip.skip_worktree = true;
+    store.insert_workspace(&skip).await.expect("ws skip");
+
+    // Qualifying row whose directory was never provisioned on disk.
+    let ws_bare = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws_bare))
+        .await
+        .expect("ws bare");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    // First call arms the walk: refreshing true, field omitted (absent, not null).
+    let first = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+    assert_eq!(first["refreshing"], serde_json::json!(true));
+    assert!(first.get("diskUsage").is_none(), "{first}");
+
+    // Bounded poll until the backfill settles: diskUsage + refreshing false.
+    let mut settled = None;
+    for _ in 0..200 {
+        let got = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+        if got.get("diskUsage").is_some() && got["refreshing"] == serde_json::json!(false) {
+            settled = Some(got);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = settled.expect("diskUsage backfilled + settled");
+    assert!(got["diskUsage"]["bytes"].as_u64().unwrap() >= 8192);
+    assert_eq!(got["diskUsage"]["fileCount"], serde_json::json!(1));
+
+    // Skip-isolation and never-provisioned rows: nothing to walk or refresh.
+    for id in [&ws_skip, &ws_bare] {
+        let got = svc.workspace_disk_usage_op(id.clone()).await.expect("op");
+        assert_eq!(got["refreshing"], serde_json::json!(false), "{got}");
+        assert!(got.get("diskUsage").is_none(), "{got}");
+    }
+
+    // Unknown id: standard NotFound.
+    let err = svc
+        .workspace_disk_usage_op(WorkspaceId::from("ws_missing"))
+        .await
+        .expect_err("unknown id errors");
+    assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
 }
 
 /// Parity: the cheap store-level `count_task_stats` query (no note-body
