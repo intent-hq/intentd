@@ -44,6 +44,7 @@ pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 // evaluates agent scripts with the same `ws.*` prelude + host dispatch the
 // `workspace_api` tool installs, so the two environments cannot drift.
 pub use bindings::prelude as bindings_prelude;
+pub use bindings::prelude_for as bindings_prelude_for;
 pub use dispatch::{make_workspace_host, make_workspace_host_for};
 
 /// Protocol version advertised on `initialize` (matches the TS server).

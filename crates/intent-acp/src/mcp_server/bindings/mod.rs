@@ -52,7 +52,11 @@ pub fn prelude() -> String {
 /// `[agentFeatures]` are omitted entirely, so agent code touching them fails
 /// with a clear `ws.<ns> is undefined` TypeError. With every toggle on — the
 /// default — the output is byte-identical to [`prelude`].
-pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
+///
+/// `pub` (re-exported as `intent_acp::bindings_prelude_for`) so the
+/// background hook scheduler in `intent-services` installs the same gated
+/// environment its owning session's `workspace_api` bridge would.
+pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
     let mut fragments: Vec<&str> = vec![
         workspace::PRELUDE,
         note::PRELUDE,
