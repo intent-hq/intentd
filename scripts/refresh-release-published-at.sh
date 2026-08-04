@@ -11,11 +11,15 @@
 #
 # The un-draft re-applies the release's prior `prerelease` flag and always
 # sends make_latest:false — every rolling release is created with
-# --latest=false and must never shadow real releases. The un-draft is retried
-# (5 attempts with backoff) and the script exits non-zero if the release is
-# left drafted, since a drafted release is invisible to consumers. [repo]
-# defaults to GITHUB_REPOSITORY; pass it explicitly to refresh a release on
-# another repo (e.g. the public intent-hq/intentd-releases mirror).
+# --latest=false and must never shadow real releases. The refresh is cosmetic,
+# so any failure BEFORE the release is drafted (missing release, transient API
+# error on the GET or the draft:true PATCH) is fail-soft: warn and exit 0, so
+# a hiccup here can never block a release pipeline. Once the release IS
+# drafted, re-publish is mandatory: the un-draft is retried (5 attempts with
+# backoff) and the script exits non-zero if the release is left drafted, since
+# a drafted release is invisible to consumers. [repo] defaults to
+# GITHUB_REPOSITORY; pass it explicitly to refresh a release on another repo
+# (e.g. the public intent-hq/intentd-releases mirror).
 # Requires: gh (authenticated via GH_TOKEN) and jq.
 set -euo pipefail
 
@@ -24,16 +28,27 @@ TAG="${1:?$usage}"
 REPO="${2:-${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set (or pass [repo])}}"
 
 # releases/tags/<tag> resolves only published releases, which is exactly what
-# a refresh needs (a draft has no published_at to refresh).
+# a refresh needs (a draft has no published_at to refresh). Fail-soft: the
+# release is still published, so skipping the cosmetic refresh must not fail
+# the caller.
 if ! release_json=$(gh api "repos/$REPO/releases/tags/$TAG"); then
-  echo "error: no published release for tag $TAG on $REPO" >&2
-  exit 1
+  echo "warning: no published release for tag $TAG on $REPO (or API error); skipping published_at refresh" >&2
+  exit 0
 fi
-release_id=$(jq -r '.id' <<<"$release_json")
+release_id=$(jq -r '.id // empty' <<<"$release_json")
 prerelease=$(jq -r '.prerelease' <<<"$release_json")
+if [[ -z "$release_id" ]]; then
+  echo "warning: could not resolve release id for tag $TAG on $REPO; skipping published_at refresh" >&2
+  exit 0
+fi
 
-gh api --method PATCH "repos/$REPO/releases/$release_id" \
-  -F draft=true --silent
+# Fail-soft too: a failed draft:true PATCH leaves the release published, so
+# there is nothing to repair — skip the refresh instead of failing the caller.
+if ! gh api --method PATCH "repos/$REPO/releases/$release_id" \
+  -F draft=true --silent; then
+  echo "warning: failed to draft release $TAG on $REPO; skipping published_at refresh" >&2
+  exit 0
+fi
 
 # From here the release is drafted; every failure path below must end in the
 # loud non-zero exit so a release can never silently stay in draft.
