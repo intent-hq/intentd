@@ -11186,6 +11186,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the sweep and still archives.
+        let manager = self.agent_manager();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -11200,6 +11204,23 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // Gracefully interrupt every in-flight turn in the workspace —
+            // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+            // turn cancelled over the wire, draining worker aborted, terminal
+            // `agent:stream:end` emitted, provider child + ACP session kept
+            // alive. Unlike `delete_workspace` nothing is deleted: session
+            // rows, transcripts, completion watches, and pending message
+            // queues all survive so unarchive can resume work. Runs AFTER the
+            // archived row is persisted so any concurrent queue-drain kick
+            // observes the archived flag and parks instead of respawning a
+            // turn (see the archived gate in `try_drain_queue`).
+            if let Some(manager) = manager {
+                for (agent_id, agent_ws) in manager.list_busy() {
+                    if agent_ws == id {
+                        manager.interrupt(&agent_id).await;
+                    }
+                }
+            }
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;

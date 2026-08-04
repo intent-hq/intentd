@@ -3525,6 +3525,34 @@ impl AgentManager {
         if !self.services.has_ready_to_send(&agent_id) {
             return;
         }
+        // Archived-workspace gate: the archive sweep interrupts in-flight
+        // turns but KEEPS pending queues persisted, so the automatic drain
+        // must not respawn a turn while the workspace is archived — messages
+        // park until unarchive, when the next drain kick delivers them. Chief
+        // is virtual and never archived, so skip the row read. Fail open on a
+        // lookup error: the gate only parks affirmatively-archived
+        // workspaces; a transient store error must not strand the queue.
+        if !workspace_id.is_chief() {
+            match self.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "skipping queue drain: workspace is archived"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "queue drain: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
         // parked while the agent's last assistant message carries
         // un-dismissed question blocks — draining one would append a user
