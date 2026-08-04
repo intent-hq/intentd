@@ -1153,7 +1153,8 @@ impl Services {
             let display_status = compute_display_status(
                 self.workspace_needs_attention(&ws.id).await,
                 ws.activity == WorkspaceActivity::AgentRunning
-                    || self.workspace_has_active_hooks(&ws.id).await,
+                    || self.workspace_has_active_hooks(&ws.id).await
+                    || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1206,7 +1207,10 @@ impl Services {
         let status = compute_display_status(
             needs_attention,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(workspace_id).await,
+                || self.workspace_has_active_hooks(workspace_id).await
+                || self
+                    .workspace_has_waiting_agent_subscriptions(workspace_id)
+                    .await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -9425,7 +9429,8 @@ impl WorkspaceApi for Services {
                     let display_status = compute_display_status(
                         this.workspace_needs_attention(&ws.id).await,
                         ws.activity == WorkspaceActivity::AgentRunning
-                            || this.workspace_has_active_hooks(&ws.id).await,
+                            || this.workspace_has_active_hooks(&ws.id).await
+                            || this.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
                         ws.pr_status,
