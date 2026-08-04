@@ -1800,6 +1800,14 @@ impl Services {
     /// polling (PROTOCOL §6.5). Emitted when watches are added (delegate /
     /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
+    ///
+    /// The watch set is also a `displayStatus` in-progress promotion input
+    /// (an idle parent still waiting on delegated children reads as active
+    /// work), so every publish recomputes the anchor workspace's derived
+    /// status — transition-only and best-effort
+    /// ([`Services::maybe_emit_display_status_changed`] dedupes against the
+    /// last observation and swallows errors), so a no-op recompute stays
+    /// silent and can never break the watch lifecycle.
     pub(crate) async fn publish_subscriptions_changed(
         &self,
         workspace_id: &WorkspaceId,
@@ -1823,6 +1831,7 @@ impl Services {
             }),
         )
         .await;
+        self.maybe_emit_display_status_changed(workspace_id).await;
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
@@ -5296,9 +5305,27 @@ impl Services {
         group_id: Option<String>,
     ) -> Result<Value> {
         if subscription_id.is_none() && group_id.is_none() {
+            // Snapshot the anchor workspaces BEFORE the sweep: dropping the
+            // caller's last watch/group can demote its home workspace's
+            // displayStatus, so recompute each distinct anchor afterwards
+            // (transition-only, best-effort — a no-op recompute stays silent).
+            let mut anchors: Vec<WorkspaceId> = Vec::new();
+            for w in self.list_watches_for_parent(&agent_id) {
+                if !anchors.contains(&w.parent_workspace_id) {
+                    anchors.push(w.parent_workspace_id);
+                }
+            }
+            for g in self.list_groups_for_parent(&agent_id) {
+                if !anchors.contains(&g.workspace_id) {
+                    anchors.push(g.workspace_id);
+                }
+            }
             self.remove_all_for_parent(&agent_id);
             self.remove_groups_for_parent(&agent_id);
             self.remove_event_subscriptions_for_agent(&agent_id).await;
+            for anchor in &anchors {
+                self.maybe_emit_display_status_changed(anchor).await;
+            }
             return Ok(json!({ "success": true }));
         }
 
