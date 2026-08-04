@@ -587,6 +587,15 @@ jobs:
             sudo -n apt-get update -qq
             sudo -n apt-get install -y -qq libssl-dev
           fi
+      # Raise the per-user inotify instance ceiling. The instrumented full
+      # suite starts many real notify watchers in parallel (file, .git
+      # metadata, skills, specialists) and up to 8 co-tenant runner slots
+      # share the same user on the tinybox, so the kernel default of 128
+      # instances can exhaust mid-run — watcher starts in unrelated tests
+      # then fail with EMFILE "Too many open files" (intentd PR #882).
+      # Relies on the runner user's passwordless sudo, like the step above.
+      - name: Raise inotify instance limit
+        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
