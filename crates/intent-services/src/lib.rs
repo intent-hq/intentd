@@ -5682,9 +5682,10 @@ fn sandbox_profiles_json(
 
 /// Whether the host **platform** can run microVM agent sandboxes, plus a
 /// structured reason when it cannot. macOS: Apple Silicon only (libkrun via
-/// Hypervisor.framework is arm64-only upstream); Linux: `/dev/kvm` must be
-/// present; every other OS is unsupported. Purely the platform half of
-/// `microvmSupported` — the CoW requirement is ANDed in by the caller.
+/// Hypervisor.framework is arm64-only upstream); every other OS — including
+/// Linux, whose KVM path is temporarily locked out to reduce surface area —
+/// is unsupported. Purely the platform half of `microvmSupported` — the CoW
+/// requirement is ANDed in by the caller.
 fn microvm_platform_supported() -> (bool, Option<&'static str>) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -5699,14 +5700,12 @@ fn microvm_platform_supported() -> (bool, Option<&'static str>) {
     }
     #[cfg(target_os = "linux")]
     {
-        if std::path::Path::new("/dev/kvm").exists() {
-            (true, None)
-        } else {
-            (
-                false,
-                Some("microVM sandboxes require KVM (/dev/kvm) on Linux"),
-            )
-        }
+        // Temporarily locked to macOS (the Linux/KVM arm used to gate on
+        // /dev/kvm here).
+        (
+            false,
+            Some("microVM sandboxes are temporarily locked to macOS"),
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -8917,6 +8916,12 @@ impl WorkspaceApi for Services {
             let cow_supported = self.compute_cow_supported().await;
             let cow_reason = match cow_supported {
                 Some(true) => None,
+                // Temporarily locked to macOS: on other OSes the choke point
+                // reports Some(false) without probing, so name the lock
+                // instead of blaming the filesystem.
+                Some(false) if cfg!(not(target_os = "macos")) => {
+                    Some("CoW sandboxes are temporarily locked to macOS".to_string())
+                }
                 Some(false) => Some(
                     "the workspaces root filesystem does not support copy-on-write clones"
                         .to_string(),
@@ -10286,11 +10291,19 @@ impl WorkspaceApi for Services {
                 match env {
                     intent_core::SandboxType::Cow => {
                         if services.compute_cow_supported().await != Some(true) {
+                            // Temporarily locked to macOS: name the platform
+                            // lock on other OSes instead of blaming the
+                            // filesystem (the choke point never probed).
+                            let reason = if cfg!(not(target_os = "macos")) {
+                                "CoW sandboxes are temporarily locked to macOS".to_string()
+                            } else {
+                                "the workspaces root filesystem does not support \
+                                 copy-on-write clones"
+                                    .to_string()
+                            };
                             return Err(Error::ExecutionEnvironmentUnavailable {
                                 environment: env.as_str().to_string(),
-                                reason: "the workspaces root filesystem does not support \
-                                         copy-on-write clones"
-                                    .to_string(),
+                                reason,
                             });
                         }
                     }
@@ -10806,15 +10819,23 @@ impl WorkspaceApi for Services {
                                     })?;
                                     let probe_repo = repo_dir.clone();
                                     let probe_dst = ws_dir.clone();
-                                    let support = tokio::task::spawn_blocking(move || {
-                                        intent_git::cow_probe(&probe_repo, &probe_dst)
-                                    })
-                                    .await
-                                    .map_err(|e| {
-                                        Error::Internal(format!(
-                                            "CoW probe task failed: {e}"
-                                        ))
-                                    })?;
+                                    // Temporarily locked to macOS: skip the
+                                    // live probe elsewhere (same gate as the
+                                    // workspace_aggregates choke point) and
+                                    // take the Unsupported arm below.
+                                    let support = if cfg!(not(target_os = "macos")) {
+                                        Ok(intent_git::CowSupport::Unsupported)
+                                    } else {
+                                        tokio::task::spawn_blocking(move || {
+                                            intent_git::cow_probe(&probe_repo, &probe_dst)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            Error::Internal(format!(
+                                                "CoW probe task failed: {e}"
+                                            ))
+                                        })?
+                                    };
                                     match support {
                                         Ok(intent_git::CowSupport::Supported) => {
                                             intent_core::CheckoutMode::Cow
@@ -12430,11 +12451,18 @@ impl WorkspaceApi for Services {
                         })?;
                         let probe_repo = repo_dir.clone();
                         let probe_dst = ws_dir.clone();
-                        let support = tokio::task::spawn_blocking(move || {
-                            intent_git::cow_probe(&probe_repo, &probe_dst)
-                        })
-                        .await
-                        .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?;
+                        // Temporarily locked to macOS: skip the live probe
+                        // elsewhere (same gate as the workspace_aggregates
+                        // choke point) and take the Unsupported arm below.
+                        let support = if cfg!(not(target_os = "macos")) {
+                            Ok(intent_git::CowSupport::Unsupported)
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                intent_git::cow_probe(&probe_repo, &probe_dst)
+                            })
+                            .await
+                            .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?
+                        };
                         match support {
                             Ok(intent_git::CowSupport::Supported) => intent_core::CheckoutMode::Cow,
                             Ok(intent_git::CowSupport::Unsupported) => {

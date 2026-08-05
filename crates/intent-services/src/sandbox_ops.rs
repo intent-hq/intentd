@@ -298,6 +298,12 @@ fn provision_sandbox_blocking(
         return Ok(ProvisionOutcome::Unsupported);
     }
 
+    // CoW sandboxes are temporarily locked to macOS — mirror the
+    // workspace_aggregates choke point (report unsupported without probing).
+    if cfg!(not(target_os = "macos")) {
+        return Ok(ProvisionOutcome::Unsupported);
+    }
+
     // Ensure sandbox parent exists (needed for cow_probe)
     std::fs::create_dir_all(&sandbox_parent)
         .map_err(|e| Error::Internal(format!("create sandbox parent dir failed: {e}")))?;
@@ -1428,7 +1434,8 @@ mod tests {
         // Early probe check - skip test if CoW not available (e.g., non-CoW filesystem)
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
@@ -1573,7 +1580,8 @@ mod tests {
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
@@ -1734,7 +1742,8 @@ mod tests {
         // Early probe check - skip test if CoW not available
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "Skipping test: CoW not supported between {:?} and {:?}",
                 repo_path, workspaces_root
@@ -2162,7 +2171,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2203,7 +2213,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2298,7 +2309,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2392,7 +2404,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&canonical_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2519,7 +2532,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2661,7 +2675,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2774,7 +2789,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2868,7 +2884,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -3050,7 +3067,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&source_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -3127,7 +3145,8 @@ mod tests {
 
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&source_path, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!("Skipping test: CoW not supported");
             let _ = fs::remove_dir_all(&test_root);
             return;

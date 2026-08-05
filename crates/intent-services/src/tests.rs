@@ -15579,8 +15579,9 @@ mod worktree_provisioning {
         let obj = caps.as_object().expect("result is an object");
         let cow = obj.get("cowSupported").and_then(|v| v.as_bool());
         let microvm = obj.get("microvmSupported").and_then(|v| v.as_bool());
-        let platform_capable = (cfg!(all(target_os = "macos", target_arch = "aarch64")))
-            || (cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+        // microVM is temporarily locked to macOS (Apple Silicon only); the
+        // Linux/KVM arm is disabled.
+        let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         if platform_capable {
             assert_eq!(microvm, cow, "capable platform mirrors cowSupported");
         } else {
@@ -15740,8 +15741,9 @@ mod worktree_provisioning {
             Some(cow_supported == Some(true))
         );
         // microvm is available only on a capable platform with CoW.
-        let platform_capable = (cfg!(all(target_os = "macos", target_arch = "aarch64")))
-            || (cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+        // microVM is temporarily locked to macOS (Apple Silicon only); the
+        // Linux/KVM arm is disabled.
+        let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         assert_eq!(
             options[3]["available"].as_bool(),
             Some(platform_capable && cow_supported == Some(true))
@@ -15789,9 +15791,11 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -16210,9 +16214,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-eecow-repo");
         let root = unique_dir("intentd-eecow-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -16349,9 +16355,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -16461,9 +16469,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -16513,9 +16523,11 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
+        // CoW is temporarily locked to macOS; skip everywhere else.
+        if cfg!(not(target_os = "macos"))
+            || intent_git::cow_probe(&repo_dir.0, &root.0)
+                .unwrap_or(intent_git::CowSupport::Unsupported)
+                != intent_git::CowSupport::Supported
         {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
@@ -17448,10 +17460,11 @@ mod file_ops_service {
         repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
             .unwrap();
 
-        // Early probe check - skip test if CoW not available
+        // Early probe check - skip test if CoW not available (temporarily
+        // locked to macOS).
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        if probe == CowSupport::Unsupported {
+        if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
                 "SKIP test (CoW not supported): {:?} → {:?}",
                 user_dir, workspaces_root
@@ -17623,7 +17636,9 @@ mod file_ops_service {
         // session's sandbox fields; the delegate result itself is "pending").
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        let expect_sandbox = matches!(probe, CowSupport::Supported);
+        // CoW is temporarily locked to macOS, so the settled outcome is the
+        // shared-mode fallback everywhere else regardless of the probe.
+        let expect_sandbox = cfg!(target_os = "macos") && matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
         let mut svc = Services::new(store.clone());

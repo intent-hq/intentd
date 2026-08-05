@@ -293,7 +293,12 @@ fn git_gate(test: &str) -> bool {
 
 /// Whether the filesystem hosting `/tmp` scratch dirs can CoW-clone
 /// (`intent_git::cow_probe` — the same capability check the daemon runs).
+/// CoW is temporarily locked to macOS, so every other OS reports false
+/// (mirroring the daemon's choke point).
 fn cow_supported() -> bool {
+    if cfg!(not(target_os = "macos")) {
+        return false;
+    }
     let probe = scratch_dir("probe");
     let src = probe.join("src");
     let dst = probe.join("dst");

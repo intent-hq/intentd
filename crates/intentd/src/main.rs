@@ -2815,6 +2815,11 @@ fn report_host_capabilities() {
 /// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
 /// failures are silent (the probe will be retried on demand if needed).
 fn probe_cow_at_startup(config: &Config) {
+    // CoW sandboxes are temporarily locked to macOS (the service layer's
+    // choke point reports unsupported without probing) — nothing to warm.
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
     let workspaces_root = config.data_dir.join("workspaces");
     if std::fs::create_dir_all(&workspaces_root).is_ok() {
         // Probe and cache; ignore errors (doctor will report them if persistent)
@@ -2826,6 +2831,12 @@ fn probe_cow_at_startup(config: &Config) {
 /// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
 /// Uses the cached result if available (populated by probe_cow_at_startup).
 fn report_cow_support(config: &Config) {
+    // Temporarily locked to macOS — mirror the service layer's choke point
+    // (which reports unsupported on other OSes without probing).
+    if cfg!(not(target_os = "macos")) {
+        println!("[--] CoW isolation: temporarily locked to macOS");
+        return;
+    }
     let workspaces_root = config.data_dir.join("workspaces");
     // Create workspaces dir if it doesn't exist (probe needs it)
     if !workspaces_root.exists() {
