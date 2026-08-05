@@ -6,11 +6,19 @@
 //! missing, an existing `gh` login (never clobbered), or a login failure all
 //! leave the device-flow outcome untouched — callers get no error, only logs.
 //!
+//! The revoke side mirrors this ([`logout_gh_after_revoke`]): when the daemon
+//! token is revoked, `gh` is logged out of github.com — but **only** when its
+//! active token is exactly the one being revoked (i.e. the login this sync
+//! created). A login we did not create is never touched, and every failure
+//! mode leaves the revoke outcome unaffected.
+//!
 //! 🔒 The token is loaded back from the secret store
 //! (`sourceControl.github.token`) here — it is never plumbed out of the
 //! device-flow engine — and reaches `gh auth login --with-token` via **stdin
 //! only**: never argv (process listings), never logs, and child output is
-//! never echoed (`gh auth status` can print masked token material).
+//! never echoed (`gh auth status` can print masked token material). The
+//! revoke-side match compares tokens **in memory only** — neither side ever
+//! reaches logs, errors, or argv.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,9 +55,28 @@ pub enum GhSyncOutcome {
     LoginFailed,
 }
 
-/// Injected command seam: the decision logic ([`sync_with`]) is unit-tested
-/// against a mock, so tests never spawn a real `gh` (and can never touch a
-/// developer's actual `gh` login).
+/// Terminal outcome of one revoke-side logout attempt (log/test surface only
+/// — never wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhLogoutOutcome {
+    /// `gh auth logout` succeeded — gh held exactly the revoked token.
+    LoggedOut,
+    /// No revoked token was captured (nothing was stored) — nothing to match.
+    NoToken,
+    /// `gh` is not on `PATH` — nothing to do.
+    GhNotInstalled,
+    /// `gh auth token` reports no github.com login — nothing to log out.
+    NotLoggedIn,
+    /// gh's active token differs from the revoked one — a login we did not
+    /// create is never logged out.
+    TokenMismatch,
+    /// The logout subprocess failed (spawn error / non-zero exit).
+    LogoutFailed,
+}
+
+/// Injected command seam: the decision logic ([`sync_with`] /
+/// [`logout_with`]) is unit-tested against a mock, so tests never spawn a
+/// real `gh` (and can never touch a developer's actual `gh` login).
 pub trait GhCli: Send + Sync {
     /// Locate the `gh` binary on `PATH`, or `None` when not installed.
     fn locate(&self) -> Option<PathBuf>;
@@ -58,6 +85,12 @@ pub trait GhCli: Send + Sync {
     /// Run `gh auth login --with-token --hostname github.com`, piping the
     /// token via stdin. True on success.
     fn login_with_token(&self, gh: &Path, token: &SecretString) -> bool;
+    /// The token `gh auth token --hostname github.com` resolves, or `None`
+    /// when gh has no github.com login. 🔒 Held in memory only — must never
+    /// reach logs, errors, or argv.
+    fn active_token(&self, gh: &Path) -> Option<SecretString>;
+    /// Run `gh auth logout --hostname github.com`. True on success.
+    fn logout(&self, gh: &Path) -> bool;
 }
 
 /// The sync decision ladder: no token → gh missing → existing login →
@@ -76,6 +109,31 @@ fn sync_with(cli: &dyn GhCli, token: Option<SecretString>) -> GhSyncOutcome {
         GhSyncOutcome::Synced
     } else {
         GhSyncOutcome::LoginFailed
+    }
+}
+
+/// The logout decision ladder: no revoked token → gh missing → gh not logged
+/// in → token mismatch → attempt. The mismatch arm is the guardrail: a gh
+/// login whose active token is not exactly the revoked one was not created by
+/// [`sync_with`], so it is never logged out. Pure over the [`GhCli`] seam so
+/// every arm is unit-testable. 🔒 The compare happens in memory only.
+fn logout_with(cli: &dyn GhCli, revoked: Option<SecretString>) -> GhLogoutOutcome {
+    let Some(revoked) = revoked else {
+        return GhLogoutOutcome::NoToken;
+    };
+    let Some(gh) = cli.locate() else {
+        return GhLogoutOutcome::GhNotInstalled;
+    };
+    let Some(active) = cli.active_token(&gh) else {
+        return GhLogoutOutcome::NotLoggedIn;
+    };
+    if active.expose_secret() != revoked.expose_secret() {
+        return GhLogoutOutcome::TokenMismatch;
+    }
+    if cli.logout(&gh) {
+        GhLogoutOutcome::LoggedOut
+    } else {
+        GhLogoutOutcome::LogoutFailed
     }
 }
 
@@ -127,6 +185,43 @@ pub async fn sync_token_to_gh(store: FileSecretStore) {
     }
 }
 
+/// Best-effort logout of the `gh` CLI after `github.revoke`. `revoked` is the
+/// daemon token captured **before** it was deleted from the secret store; gh
+/// is logged out of github.com only when its active token matches it exactly
+/// (see [`logout_with`]). Never returns an error: every failure mode is
+/// logged (never with token material) and the caller's revoke proceeds
+/// unaffected. Runs the blocking work (subprocesses) on the blocking pool,
+/// bounded by [`GH_SYNC_TIMEOUT`].
+pub async fn logout_gh_after_revoke(revoked: Option<String>) {
+    let revoked = revoked
+        .filter(|t| !t.trim().is_empty())
+        .map(SecretString::from);
+    let handle = tokio::task::spawn_blocking(move || logout_with(&SystemGhCli, revoked));
+    match timeout(GH_SYNC_TIMEOUT, handle).await {
+        Ok(Ok(GhLogoutOutcome::LoggedOut)) => {
+            tracing::info!("logged the gh CLI out of github.com after token revoke");
+        }
+        Ok(Ok(GhLogoutOutcome::LogoutFailed)) => {
+            tracing::warn!("gh CLI logout failed (gh auth logout); revoke unaffected");
+        }
+        Ok(Ok(outcome)) => {
+            tracing::debug!(?outcome, "skipped gh CLI logout after revoke");
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "gh CLI logout task failed");
+        }
+        Err(_) => {
+            // Only the wait is abandoned (see [`GH_SYNC_TIMEOUT`]): the
+            // blocking closure keeps running and the logout may still
+            // complete after this line is logged.
+            tracing::warn!(
+                "gh CLI logout still running after 10s; no longer waiting (it may still \
+                 complete in the background)"
+            );
+        }
+    }
+}
+
 /// Production [`GhCli`]: real `PATH` lookup + real `gh` subprocesses.
 struct SystemGhCli;
 
@@ -169,6 +264,36 @@ impl GhCli for SystemGhCli {
             // Dropping the handle closes stdin so `gh` sees EOF.
         }
         child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    fn active_token(&self, gh: &Path) -> Option<SecretString> {
+        // 🔒 stdout IS the token: captured in memory only, wrapped in a
+        // `SecretString` immediately, never logged. stderr is discarded.
+        let out = Command::new(gh)
+            .args(["auth", "token", "--hostname", "github.com"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let token = String::from_utf8(out.stdout).ok()?;
+        let trimmed = token.trim();
+        (!trimmed.is_empty()).then(|| SecretString::from(trimmed.to_string()))
+    }
+
+    fn logout(&self, gh: &Path) -> bool {
+        // Output is discarded: only the exit code matters, so no error path
+        // can echo credential material.
+        Command::new(gh)
+            .args(["auth", "logout", "--hostname", "github.com"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
@@ -215,13 +340,16 @@ mod tests {
 
     use super::*;
 
-    /// Scripted [`GhCli`] that records whether a login was attempted — no
-    /// real `gh` is ever spawned from tests.
+    /// Scripted [`GhCli`] that records whether a login/logout was attempted —
+    /// no real `gh` is ever spawned from tests.
     struct MockGhCli {
         installed: bool,
         authenticated: bool,
         login_succeeds: bool,
         login_attempted: AtomicBool,
+        active_token: Option<&'static str>,
+        logout_succeeds: bool,
+        logout_attempted: AtomicBool,
     }
 
     impl MockGhCli {
@@ -231,6 +359,25 @@ mod tests {
                 authenticated,
                 login_succeeds,
                 login_attempted: AtomicBool::new(false),
+                active_token: None,
+                logout_succeeds: false,
+                logout_attempted: AtomicBool::new(false),
+            }
+        }
+
+        fn for_logout(
+            installed: bool,
+            active_token: Option<&'static str>,
+            logout_succeeds: bool,
+        ) -> Self {
+            Self {
+                installed,
+                authenticated: active_token.is_some(),
+                login_succeeds: false,
+                login_attempted: AtomicBool::new(false),
+                active_token,
+                logout_succeeds,
+                logout_attempted: AtomicBool::new(false),
             }
         }
     }
@@ -247,6 +394,15 @@ mod tests {
         fn login_with_token(&self, _gh: &Path, _token: &SecretString) -> bool {
             self.login_attempted.store(true, Ordering::SeqCst);
             self.login_succeeds
+        }
+
+        fn active_token(&self, _gh: &Path) -> Option<SecretString> {
+            self.active_token.map(SecretString::from)
+        }
+
+        fn logout(&self, _gh: &Path) -> bool {
+            self.logout_attempted.store(true, Ordering::SeqCst);
+            self.logout_succeeds
         }
     }
 
@@ -314,5 +470,79 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
         sync_token_to_gh(store).await;
+    }
+
+    fn revoked() -> Option<SecretString> {
+        Some(SecretString::from("gho_test_revoked"))
+    }
+
+    #[test]
+    fn logs_out_when_gh_holds_the_revoked_token() {
+        let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), true);
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::LoggedOut);
+        assert!(cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn never_logs_out_a_login_we_did_not_create() {
+        let cli = MockGhCli::for_logout(true, Some("gho_someone_elses"), true);
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::TokenMismatch);
+        assert!(!cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_skips_without_a_revoked_token() {
+        let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), true);
+        assert_eq!(logout_with(&cli, None), GhLogoutOutcome::NoToken);
+        assert!(!cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_skips_when_gh_is_not_installed() {
+        let cli = MockGhCli::for_logout(false, Some("gho_test_revoked"), true);
+        assert_eq!(
+            logout_with(&cli, revoked()),
+            GhLogoutOutcome::GhNotInstalled
+        );
+        assert!(!cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_skips_when_gh_is_not_logged_in() {
+        let cli = MockGhCli::for_logout(true, None, true);
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::NotLoggedIn);
+        assert!(!cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_failure_is_reported_not_raised() {
+        let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), false);
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::LogoutFailed);
+        assert!(cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_outcome_debug_never_carries_a_token() {
+        // The outcome enum is the only logout surface that reaches logs.
+        for outcome in [
+            GhLogoutOutcome::LoggedOut,
+            GhLogoutOutcome::NoToken,
+            GhLogoutOutcome::GhNotInstalled,
+            GhLogoutOutcome::NotLoggedIn,
+            GhLogoutOutcome::TokenMismatch,
+            GhLogoutOutcome::LogoutFailed,
+        ] {
+            assert!(!format!("{outcome:?}").contains("gho_"));
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_entry_is_fail_soft_without_a_revoked_token() {
+        // No captured token → the decision ladder exits at `NoToken` before
+        // any PATH lookup, so this never spawns `gh` on the host. Completing
+        // at all (no panic, no error) is the fail-soft contract. Blank
+        // captures fold to `NoToken` too.
+        logout_gh_after_revoke(None).await;
+        logout_gh_after_revoke(Some("   ".to_string())).await;
     }
 }

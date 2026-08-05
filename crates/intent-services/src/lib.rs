@@ -18636,13 +18636,9 @@ impl WorkspaceApi for Services {
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
-            // gh CLI sync only makes sense against the production login host:
-            // a mock-host flow (test seam) stores a token gh cannot use, and
-            // syncing it would touch the host's real `gh` state from tests.
-            // Trailing slashes are insignificant ("https://github.com/" is the
-            // same host), so normalize before comparing.
-            let sync_gh = base_uri.trim_end_matches('/')
-                == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/');
+            // gh CLI sync only makes sense against the production login host
+            // (see `github_auth_ops::is_production_login_host`).
+            let sync_gh = github_auth_ops::is_production_login_host(&base_uri);
             tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
@@ -18693,17 +18689,49 @@ impl WorkspaceApi for Services {
         // the resolution chain) and orphan any in-flight flow (its poll task
         // exits cooperatively and reconciles a raced authorize by deleting
         // the just-persisted token). Env / `gh` CLI fallbacks are untouched —
-        // authStatus reflects them on next probe.
+        // authStatus reflects them on next probe. When gh's active login IS
+        // the token being revoked (the login the authorize-side sync
+        // created), gh is best-effort logged out too — same production-host
+        // gate as the login sync, so mock-host tests never touch a real `gh`.
         let state = self.github_auth_flow.clone();
         let secrets = self.secrets.clone();
         let bus = self.event_bus.clone();
+        let logout_gh = github_auth_ops::is_production_login_host(
+            &github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref()),
+        );
         Box::pin(async move {
+            // Capture the stored token BEFORE it is deleted so the detached
+            // logout can match it against gh's active login. Fail-soft: a
+            // load failure only skips the logout, never the revoke. 🔒 The
+            // token stays in memory — never logged or embedded in errors.
+            let revoked_token = if logout_gh {
+                secrets
+                    .load(github_auth_ops::SECRET_ACCOUNT)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(
+                            error = %e,
+                            "could not read stored github token before revoke; \
+                             skipping gh CLI logout"
+                        );
+                        None
+                    })
+            } else {
+                None
+            };
             {
                 let mut slot = state.lock().await;
                 *slot = None;
             }
             github_auth_ops::delete_stored_token(&secrets).await?;
             publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
+            if logout_gh {
+                // Detached + fail-soft (same pattern as the login sync): a
+                // logout failure can never fail or delay the revoke.
+                tokio::spawn(intent_sourcecontrol::gh_sync::logout_gh_after_revoke(
+                    revoked_token,
+                ));
+            }
             Ok(serde_json::json!({ "ok": true }))
         })
     }
