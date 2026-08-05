@@ -12,6 +12,7 @@
 
 pub mod device_flow;
 pub mod error;
+pub mod gh_sync;
 pub mod github;
 pub mod model;
 pub mod registry;

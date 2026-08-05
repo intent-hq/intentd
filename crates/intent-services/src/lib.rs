@@ -18636,6 +18636,13 @@ impl WorkspaceApi for Services {
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+            // gh CLI sync only makes sense against the production login host:
+            // a mock-host flow (test seam) stores a token gh cannot use, and
+            // syncing it would touch the host's real `gh` state from tests.
+            // Trailing slashes are insignificant ("https://github.com/" is the
+            // same host), so normalize before comparing.
+            let sync_gh = base_uri.trim_end_matches('/')
+                == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/');
             tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
@@ -18643,6 +18650,7 @@ impl WorkspaceApi for Services {
                 flow_id,
                 flow,
                 deadline,
+                sync_gh,
             ));
             let new_slot = github_auth_ops::FlowSlot {
                 flow_id,
