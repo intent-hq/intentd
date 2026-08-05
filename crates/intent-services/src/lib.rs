@@ -18584,7 +18584,10 @@ impl WorkspaceApi for Services {
             // gh CLI sync only makes sense against the production login host:
             // a mock-host flow (test seam) stores a token gh cannot use, and
             // syncing it would touch the host's real `gh` state from tests.
-            let sync_gh = base_uri == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI;
+            // Trailing slashes are insignificant ("https://github.com/" is the
+            // same host), so normalize before comparing.
+            let sync_gh = base_uri.trim_end_matches('/')
+                == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/');
             tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,

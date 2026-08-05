@@ -25,8 +25,11 @@ use crate::token::SECRET_ACCOUNT;
 
 /// Bounded budget for the whole sync (lookup + status probe + login) so a
 /// wedged `gh` or filesystem never holds the spawned sync task hostage. The
-/// blocking closure itself cannot be cancelled — on timeout it is abandoned,
-/// mirroring the secret-store patterns in [`crate::device_flow`].
+/// blocking closure itself cannot be cancelled — on timeout only the *wait*
+/// is abandoned: the closure (and any in-flight `gh` subprocess) keeps
+/// running to completion on the blocking pool, so a late sync may still
+/// succeed after the timeout is logged. This mirrors the secret-store
+/// patterns in [`crate::device_flow`].
 const GH_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Terminal outcome of one sync attempt (log/test surface only — never wire).
@@ -85,8 +88,16 @@ pub async fn sync_token_to_gh(store: FileSecretStore) {
     let handle = tokio::task::spawn_blocking(move || {
         let token = store
             .load(SECRET_ACCOUNT)
-            .ok()
-            .flatten()
+            .unwrap_or_else(|e| {
+                // Corrupt/unreadable secrets file: warn (mirrors
+                // `token::file_store_token`) but keep the fail-soft skip.
+                tracing::warn!(
+                    account = %SECRET_ACCOUNT,
+                    error = %e,
+                    "secrets-store load failed for gh CLI token sync (corrupt/unreadable file)"
+                );
+                None
+            })
             .filter(|t| !t.trim().is_empty())
             .map(SecretString::from);
         sync_with(&SystemGhCli, token)
@@ -105,7 +116,13 @@ pub async fn sync_token_to_gh(store: FileSecretStore) {
             tracing::warn!(error = %join_err, "gh CLI token sync task failed");
         }
         Err(_) => {
-            tracing::warn!("gh CLI token sync timed out");
+            // Only the wait is abandoned (see [`GH_SYNC_TIMEOUT`]): the
+            // blocking closure keeps running and the sync may still complete
+            // after this line is logged.
+            tracing::warn!(
+                "gh CLI token sync still running after 10s; no longer waiting (it may still \
+                 complete in the background)"
+            );
         }
     }
 }
