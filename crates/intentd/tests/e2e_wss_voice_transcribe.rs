@@ -327,6 +327,71 @@ async fn invalid_audio_rejects_with_invalid_params() {
     );
 }
 
+/// Language resolution order (PROTOCOL §5.41): per-call `language` >
+/// `voice.language` setting > none (provider auto-detection). Drives
+/// `settings.update` over the same WSS connection to set the fallback and
+/// asserts what actually lands on the engine at each step.
+#[tokio::test]
+async fn language_falls_back_to_voice_language_setting() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    // 1. No per-call language, no setting → auto-detect (None).
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.transcribe",
+        json!({ "audio": b64(b"a") }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+
+    // 2. Set voice.language = "de" → the setting fills the gap.
+    let upd = wss_rpc_raw(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "voice.language", "value": "de" }] }),
+    )
+    .await;
+    assert!(upd.get("error").is_none(), "unexpected error: {upd}");
+    let resp = wss_rpc_raw(
+        &mut ws,
+        3,
+        "voice.transcribe",
+        json!({ "audio": b64(b"b") }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+
+    // 3. Per-call language wins over the setting.
+    let resp = wss_rpc_raw(
+        &mut ws,
+        4,
+        "voice.transcribe",
+        json!({ "audio": b64(b"c"), "language": "en" }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+
+    let calls = fx.engine.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[0].language, None,
+        "no language anywhere → auto-detect"
+    );
+    assert_eq!(
+        calls[1].language.as_deref(),
+        Some("de"),
+        "voice.language setting fills a missing per-call language"
+    );
+    assert_eq!(
+        calls[2].language.as_deref(),
+        Some("en"),
+        "per-call language wins over the setting"
+    );
+}
+
 /// The injected engine is used regardless of the `provider` override (the
 /// injected handle wins, mirroring the linear/sentry test wiring), and the
 /// response `provider` reflects the engine that ran.
