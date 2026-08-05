@@ -2938,20 +2938,78 @@ impl Services {
     /// still defers.
     ///
     /// The waiting classification is exposed as a reusable predicate so the
-    /// reconciliation paths (task 2) can share it with the live delivery path.
+    /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
-        let outgoing = self.list_watches_for_parent(agent_id);
+        let outgoing: Vec<AgentId> = self
+            .list_watches_for_parent(agent_id)
+            .into_iter()
+            .map(|w| w.child_agent_id)
+            .collect();
+        let incoming: Vec<AgentId> = self
+            .find_watches_for_child(agent_id)
+            .into_iter()
+            .map(|w| w.parent_agent_id)
+            .collect();
+        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+    }
+
+    /// Durable variant of [`Services::agent_is_waiting_on_agents`]: falls
+    /// back to the persisted `completion_watch` rows when the in-memory
+    /// registry has no outgoing watches for the agent. Group rehydration
+    /// needs this — `heal_delegation_groups_on_startup` runs BEFORE
+    /// `heal_completion_watches_on_startup`, so at group-reconciliation time
+    /// a child's outgoing watches may only exist as persisted rows. A store
+    /// error fails open (not waiting): a missed deferral only yields the
+    /// pre-deferral early wake.
+    pub(crate) async fn agent_is_waiting_on_agents_durable(&self, agent_id: &AgentId) -> bool {
+        if self.agent_is_waiting_on_agents(agent_id) {
+            return true;
+        }
+        let rows = match self.store.list_completion_watches().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "agent-waiting classification: persisted watch lookup failed; treating as not waiting"
+                );
+                return false;
+            }
+        };
+        let outgoing: Vec<AgentId> = rows
+            .iter()
+            .filter(|r| &r.parent_agent_id == agent_id)
+            .map(|r| r.child_agent_id.clone())
+            .collect();
         if outgoing.is_empty() {
             return false;
         }
-        let incoming = self.find_watches_for_child(agent_id);
-        outgoing.iter().any(|w| {
-            let target = &w.child_agent_id;
+        let incoming: Vec<AgentId> = rows
+            .iter()
+            .filter(|r| &r.child_agent_id == agent_id)
+            .map(|r| r.parent_agent_id.clone())
+            .collect();
+        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+    }
+
+    /// Core of the agent-waiting classification, shared between the live
+    /// in-memory predicate above and the persisted-row fallback used by group
+    /// rehydration (which runs before the watch registry is loaded at
+    /// startup). `outgoing` is the agent's outgoing watch targets and
+    /// `incoming` the parents watching it; busy/queue state is probed live in
+    /// both cases (the 2-cycle guard).
+    pub(crate) fn classify_agent_waiting(
+        &self,
+        agent_id: &AgentId,
+        outgoing: &[AgentId],
+        incoming: &[AgentId],
+    ) -> bool {
+        outgoing.iter().any(|target| {
             if target == agent_id {
                 // Defensive: a self-watch is never a waiting reason.
                 return false;
             }
-            let mutual_idle = incoming.iter().any(|iw| &iw.parent_agent_id == target)
+            let mutual_idle = incoming.contains(target)
                 && !self.agent_is_busy(target.clone())
                 && !self.has_ready_to_send(target);
             // Count this edge as a waiting reason unless it is a deadlocked
