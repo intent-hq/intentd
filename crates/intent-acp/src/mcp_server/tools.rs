@@ -715,9 +715,10 @@ pub(super) fn help_index(is_chief: bool, features: &AgentFeaturesSettings) -> St
 /// `ws.help("<namespace>")` — one namespace's full doc lines, cut verbatim
 /// from the assembled description (every indent-2 `ws.<ns>.` method line plus
 /// its indented continuation lines). Accepts forgiving spellings: `"pr"`,
-/// `"ws.pr"`, `"pr.*"`, and nested names like `"app.question"`. Errors name
-/// the disabling `[agentFeatures]` toggle for gated-off namespaces and list
-/// the available namespaces for unknown ones.
+/// `"ws.pr"`, `"pr.*"`, and nested names like `"app.question"`; `"help"`
+/// resolves to the `ws.help(...)` entry itself. Errors name the disabling
+/// `[agentFeatures]` toggle for gated-off namespaces and list the available
+/// namespaces for unknown ones.
 pub(super) fn help_namespace(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -730,14 +731,17 @@ pub(super) fn help_namespace(
         .trim_end_matches('.');
     let desc = workspace_api_description(is_chief, features);
     if !ns.is_empty() {
-        let prefix = format!("ws.{ns}.");
+        // Direct calls like `ws.help(...)` are documented without a trailing
+        // dot, so match both the `ws.<ns>.` and `ws.<ns>(` spellings.
+        let dot_prefix = format!("ws.{ns}.");
+        let call_prefix = format!("ws.{ns}(");
         let mut lines: Vec<&str> = Vec::new();
         let mut in_segment = false;
         for line in desc.lines().skip_while(|l| !l.starts_with("API:")) {
             let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
             if indent == 2 && trimmed.starts_with("ws.") {
-                in_segment = trimmed.starts_with(&prefix);
+                in_segment = trimmed.starts_with(&dot_prefix) || trimmed.starts_with(&call_prefix);
             } else if indent < 4 || trimmed.is_empty() {
                 in_segment = false;
             }
@@ -764,10 +768,13 @@ pub(super) fn help_namespace(
         .skip(1)
         .take_while(|l| !l.trim().is_empty())
         .filter_map(|l| {
-            l.trim_start()
-                .strip_prefix("ws.")
-                .and_then(|rest| rest.split_once(".*"))
-                .map(|(name, _)| name.to_string())
+            let rest = l.trim_start().strip_prefix("ws.")?;
+            if let Some((name, _)) = rest.split_once(".*") {
+                Some(name.to_string())
+            } else {
+                // The index's `ws.help(namespace?)` entry has no `.*`.
+                rest.starts_with("help(").then(|| "help".to_string())
+            }
         })
         .collect();
     Err(format!(
@@ -1330,6 +1337,13 @@ mod tests {
         for alias in ["ws.pr", "pr.*", " pr. "] {
             assert_eq!(help_namespace(false, &features, alias).unwrap(), plain);
         }
+        // `help` resolves to the ws.help entry itself (documented as a call,
+        // not a dotted namespace).
+        let help_docs = help_namespace(false, &features, "help").unwrap();
+        assert!(
+            help_docs.trim_start().starts_with("ws.help(namespace?)"),
+            "help(help) should return the ws.help entry, got: {help_docs}"
+        );
     }
 
     // Gated-off namespaces error naming the disabling toggle; unknown
@@ -1350,6 +1364,10 @@ mod tests {
         assert!(
             err.contains("note"),
             "unknown error lists namespaces: {err}"
+        );
+        assert!(
+            err.contains("help"),
+            "unknown error lists `help` as available: {err}"
         );
         // Chief-only namespaces are unknown to base workspaces.
         assert!(

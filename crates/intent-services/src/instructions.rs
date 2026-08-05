@@ -134,20 +134,21 @@ fn remove_section(text: &str, heading: &str) -> String {
     }
 }
 
-/// The "Cross-repo PRs" bullet in common.md's "Waiting on External
-/// Conditions" section: its `ws.host.exec` recipe only works when
-/// `agentFeatures.hostExec` is on, so it is scrubbed when the toggle is off
-/// (a unit test guards that this line still matches the bundled body
-/// verbatim).
-const WAITING_HOST_EXEC_BULLET: &str = "- **Cross-repo PRs**: `ws.pr.*` is scoped to the workspace's own repo. For a PR in a different repo (e.g. a submodule PR), have the hook run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` and diff the fields you care about against `hookState`.\n";
+/// The `ws.host.exec` fallback sentence of the "Cross-repo PRs" bullet in
+/// common.md's "Waiting on External Conditions" section: its `gh api` recipe
+/// only works when `agentFeatures.hostExec` is on, so it is scrubbed when the
+/// toggle is off — the bullet itself survives, since its primary
+/// `ws.pr.snapshot({ repo })` path needs no host exec (a unit test guards
+/// that this text still matches the bundled body verbatim).
+const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
 
 /// The `common` body with feature-gated sections omitted (spec audit rows 1,
 /// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
 /// "Raising Attention". When `hostExec` is off but the Waiting section
-/// survives, its `ws.host.exec` cross-reference bullet is scrubbed. With all
-/// defaults on this borrows the bundled body untouched (byte-identical
-/// prompts).
+/// survives, the `ws.host.exec` fallback sentence of its "Cross-repo PRs"
+/// bullet is scrubbed. With all defaults on this borrows the bundled body
+/// untouched (byte-identical prompts).
 fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     let mut body = Cow::Borrowed(COMMON);
     if !features.attention_requests {
@@ -156,7 +157,7 @@ fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     if !features.background_hooks {
         body = Cow::Owned(remove_section(&body, "Waiting on External Conditions"));
     } else if !features.host_exec {
-        body = Cow::Owned(body.replacen(WAITING_HOST_EXEC_BULLET, "", 1));
+        body = Cow::Owned(body.replacen(WAITING_HOST_EXEC_SENTENCE, "", 1));
     }
     if !features.rich_chat_blocks {
         body = Cow::Owned(remove_section(&body, "Rich Chat Rendering"));
@@ -340,9 +341,9 @@ mod tests {
     }
 
     #[test]
-    fn host_exec_off_scrubs_cross_repo_bullet_from_waiting_section() {
-        // Guard: the gated bullet text still matches the bundled body.
-        assert!(COMMON.contains(WAITING_HOST_EXEC_BULLET));
+    fn host_exec_off_scrubs_gh_fallback_from_waiting_section() {
+        // Guard: the gated sentence text still matches the bundled body.
+        assert!(COMMON.contains(WAITING_HOST_EXEC_SENTENCE));
         let features = AgentFeaturesSettings {
             host_exec: false,
             ..defaults()
@@ -350,12 +351,11 @@ mod tests {
         let common = gated_common(&features);
         assert!(common.contains("## Waiting on External Conditions"));
         assert!(!common.contains("ws.host.exec"));
-        assert!(!common.contains("**Cross-repo PRs**"));
-        // Neighboring bullets survive intact, with clean list separation.
-        assert!(common.contains("ws.pr.snapshot(prNumber)"));
-        assert!(common.contains(
-            "against `hookState`, and dispatches only on meaningful change.\n- **Hygiene**"
-        ));
+        // The bullet survives, still leading with the snapshot override…
+        assert!(common.contains("**Cross-repo PRs**"));
+        assert!(common.contains("ws.pr.snapshot(prNumber, { repo: \"owner/name\" })"));
+        // …and the scrub leaves a clean sentence boundary before the next bullet.
+        assert!(common.contains("diff that snapshot against `hookState`.\n- **Hygiene**"));
     }
 
     #[test]

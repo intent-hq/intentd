@@ -7343,6 +7343,22 @@ mod wsapi6_bindings_tests {
     }
 
     #[tokio::test]
+    async fn pr_snapshot_rejects_non_string_repo() {
+        // A present-but-non-string `repo` fails fast instead of silently
+        // falling back to the workspace repo.
+        let (srv, api) = server();
+        for code in [
+            "return await ws.pr.snapshot(7, { repo: 123 });",
+            "return await ws.pr.snapshot(7, { repo: { owner: 'a', name: 'b' } });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
+            assert!(text(&resp).contains("repo must be an \"owner/name\" string"));
+        }
+        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn pr_snapshot_requires_numeric_pr_number() {
         // Missing, non-positive, and non-numeric prNumber all surface the
         // same validation error before the trait method is called — parity

@@ -68,8 +68,14 @@ async fn snapshot(
     if pr_number <= 0 {
         return Err("prNumber is required and must be a number".to_string());
     }
-    // Optional cross-repo override; slug validation lives in the engine.
-    let repo = opt_str(args, "repo");
+    // Optional cross-repo override; slug validation lives in the engine, but
+    // a present-yet-non-string value fails fast rather than silently falling
+    // back to the workspace repo.
+    let repo = match args.get("repo") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("repo must be an \"owner/name\" string".to_string()),
+    };
     api.pr_state(ws.clone(), pr_number as u64, repo)
         .await
         .map_err(map_err)
