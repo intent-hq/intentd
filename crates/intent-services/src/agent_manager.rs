@@ -2265,7 +2265,7 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let (conn, session_mcp_servers, wake_gate) = {
+        let (conn, session_mcp_servers, wake_gate, is_microvm) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -2274,7 +2274,22 @@ impl AgentManager {
                 handle.connection.clone(),
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
+                handle._vm.is_some(),
             )
+        };
+        // microVM agents (monorepo#1120, EE-5): the provider runs INSIDE the
+        // guest, where the CoW sandbox is virtio-fs-mounted at
+        // GUEST_WORKSPACE_DIR — the host sandbox path does not exist there, so
+        // providers that validate the session cwd (auggie's workspace root)
+        // die before producing any output. Every session-open branch below
+        // (`session/load` resume, recreate `session/new`, first `session/new`)
+        // must carry the guest path. Host-side consumers keep the host cwd:
+        // the handle's FileService aliases the guest prefix back onto the
+        // host clone (see `create_agent`).
+        let cwd = if is_microvm {
+            PathBuf::from(GUEST_WORKSPACE_DIR)
+        } else {
+            cwd
         };
         // Pause the idle wake listener for the whole session-open (monorepo#855):
         // a `session/load` replay burst must be drained by the resume path

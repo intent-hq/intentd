@@ -28,6 +28,7 @@ use super::{
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
+use crate::microvm::{MicrovmVm, GUEST_WORKSPACE_DIR};
 use crate::Services;
 
 /// SQLite db inside an RAII temp dir: the dir sweep (on drop, including on
@@ -1724,6 +1725,109 @@ async fn start_session_carries_session_mcp_servers_on_session_load() {
     let servers = params["mcpServers"].as_array().expect("mcpServers array");
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0]["name"], json!("workspace-mcp"));
+}
+
+/// Mark an already-tracked handle as a microVM agent by stashing a stub
+/// [`crate::microvm::MicrovmVm`] on it (no helper child, nonexistent state
+/// paths — the Drop scrub tolerates missing paths). `start_session` keys the
+/// guest-cwd translation on `_vm.is_some()`, which is all these tests need.
+fn mark_handle_microvm(mgr: &AgentManager, id: &AgentId) {
+    let stub_root =
+        std::env::temp_dir().join(format!("intentd-test-vmstub-{}", uuid::Uuid::new_v4()));
+    let vm = MicrovmVm {
+        vm_dir: stub_root.join("vm"),
+        rootfs: stub_root.join("vm/rootfs"),
+        exec_sock: stub_root.join("exec.sock"),
+        child: None,
+        rotation_watcher: None,
+        boot_ms: 0,
+        stop_event: None,
+    };
+    mgr.handles.lock().unwrap().get_mut(id).unwrap()._vm = Some(vm);
+}
+
+/// microVM agents run the provider INSIDE the guest, where the CoW sandbox is
+/// virtio-fs-mounted at [`GUEST_WORKSPACE_DIR`] — the host sandbox path does
+/// not exist there, and providers that validate the session cwd (auggie's
+/// workspace root) die before producing any output. `session/new` must carry
+/// the guest path, never the host sandbox path.
+#[tokio::test]
+async fn microvm_start_session_carries_guest_cwd_on_session_new() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-vm-new"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mark_handle_microvm(&mgr, &id);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    assert_eq!(
+        params["cwd"],
+        json!(GUEST_WORKSPACE_DIR),
+        "microVM session/new must carry the guest workspace path"
+    );
+}
+
+/// The same guest-cwd translation applies to the `session/load` resume path.
+#[tokio::test]
+async fn microvm_start_session_carries_guest_cwd_on_session_load() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-vm-load"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, true);
+    mark_handle_microvm(&mgr, &id);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("resume");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/load")
+        .expect("session/load sent");
+    assert_eq!(
+        params["cwd"],
+        json!(GUEST_WORKSPACE_DIR),
+        "microVM session/load must carry the guest workspace path"
+    );
+}
+
+/// Host-exec agents (no VM on the handle) are untouched by the translation:
+/// their session params keep the host cwd.
+#[tokio::test]
+async fn host_start_session_keeps_host_cwd() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-host-cwd"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+
+    mgr.start_session(&id, PathBuf::from("/tmp/host-sandbox"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    assert_eq!(
+        params["cwd"],
+        json!("/tmp/host-sandbox"),
+        "host agents keep the host cwd in session params"
+    );
 }
 
 /// Under the shipped `AllowAll` default, `start_session` best-effort asks the
