@@ -56,6 +56,72 @@ fn default_shell_for(
     }
 }
 
+
+/// Build argv for running `command` under `shell` (platform-aware `-c` /
+/// PowerShell `-Command` / `cmd /c`). Shared by saved-script runs and ACP
+/// `terminal/create` when a provider sets `terminal_requires_shell`.
+pub(crate) fn shell_args(shell: &str, command: &str) -> Vec<String> {
+    shell_args_for(shell, command, cfg!(windows))
+}
+
+/// Platform-parametrized [`shell_args`] (test seam: the Windows arms are
+/// unit-tested on any host).
+pub(crate) fn shell_args_for(shell: &str, command: &str, is_windows: bool) -> Vec<String> {
+    let file = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+        .to_lowercase();
+    // On a real Windows host `Path::file_name` already splits on `\`; this
+    // extra split only matters when the Windows arm runs under a POSIX test.
+    let file = if is_windows {
+        file.rsplit(|c| c == '\\' || c == '/')
+            .next()
+            .unwrap_or(&file)
+            .to_string()
+    } else {
+        file
+    };
+    let base = file.strip_suffix(".exe").unwrap_or(&file);
+    if is_windows {
+        if base == "powershell" || base == "pwsh" {
+            return vec![
+                "-NoProfile".to_string(),
+                "-NoLogo".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ];
+        }
+        return vec!["/c".to_string(), command.to_string()];
+    }
+    // `/bin/sh` is not a login shell and does not need `-l`. Login shells
+    // (bash/zsh/fish) get `-l` so nvm/fnm PATH setup still runs.
+    if base == "sh" || base == "dash" {
+        return vec!["-c".to_string(), command.to_string()];
+    }
+    vec!["-l".to_string(), "-c".to_string(), command.to_string()]
+}
+
+/// Node-style `shell: true` packaging for an ACP terminal request: join the
+/// program and args into one command line, then wrap with [`shell_args`].
+/// Returns `(shell_program, shell_args)`.
+pub(crate) fn shell_true_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
+    let shell = default_shell();
+    let line = if args.is_empty() {
+        command.to_string()
+    } else {
+        // Match Node child_process shell:true: space-join program + args
+        // without re-quoting (Grok sends the full line in `command` alone).
+        let mut parts = Vec::with_capacity(1 + args.len());
+        parts.push(command);
+        parts.extend(args.iter().map(String::as_str));
+        parts.join(" ")
+    };
+    let shell_argv = shell_args(&shell, &line);
+    (shell, shell_argv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +180,38 @@ mod tests {
         assert!(
             scrubbed_env_vars_except(&overlay).is_empty(),
             "an explicit overlay value must win"
+        );
+    }
+
+    #[test]
+    fn shell_args_posix_sh_uses_c_only() {
+        assert_eq!(
+            shell_args_for("/bin/sh", "echo hi", false),
+            vec!["-c", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn shell_args_posix_bash_uses_login_c() {
+        assert_eq!(
+            shell_args_for("/bin/bash", "echo hi", false),
+            vec!["-l", "-c", "echo hi"]
+        );
+    }
+
+    #[test]
+    fn shell_args_windows_powershell_and_cmd() {
+        let ps = ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command", "x"];
+        assert_eq!(shell_args_for("powershell.exe", "x", true), ps);
+        assert_eq!(shell_args_for("cmd.exe", "x", true), vec!["/c", "x"]);
+    }
+
+    #[test]
+    fn shell_true_invocation_preserves_packed_command_line() {
+        let (_shell, args) = shell_true_invocation("/bin/bash -lc 'echo hi'", &[]);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/bin/bash -lc 'echo hi'")
         );
     }
 }

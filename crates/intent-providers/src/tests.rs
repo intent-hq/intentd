@@ -135,6 +135,7 @@ fn registry_field_parity() {
     assert_eq!(grok.display_name, "Grok Build");
     assert_eq!(grok.command, "grok");
     assert_eq!(grok.base_args, &["agent", "stdio"]);
+    assert!(grok.terminal_requires_shell);
     // Grok selects models after session creation via session/set_model — no
     // CLI model flag.
     assert!(grok.model_flag.is_none() && grok.supports_set_model);
@@ -1506,5 +1507,20 @@ fn non_env_config_providers_ignore_mcp_json() {
             !env.contains_key("OPENCODE_CONFIG_CONTENT"),
             "{id} unexpectedly emitted OPENCODE_CONFIG_CONTENT"
         );
+    }
+}
+
+#[test]
+fn only_grok_requires_terminal_shell_by_default() {
+    for p in crate::ACP_PROVIDERS {
+        if p.id == "grok" {
+            assert!(p.terminal_requires_shell, "grok must shell-wrap ACP terminals");
+        } else {
+            assert!(
+                !p.terminal_requires_shell,
+                "{} should not require terminal shell wrap",
+                p.id
+            );
+        }
     }
 }
