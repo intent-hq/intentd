@@ -4,7 +4,7 @@
 //! `file:changed`) whose payload matches the TS `FileChangedEvent` shape.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use intent_core::{ActorType, Event, WorkspaceId};
@@ -613,4 +613,323 @@ async fn dedupe_within_window_emits_one_event_per_path() {
         count, 1,
         "Expected 1 coalesced event, got {count} for rapid writes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Gitignore suppression (intent-hq/monorepo#1457): ignored paths must never
+// surface as `file:*` events. Each test writes the suppressed path(s) first
+// and then a non-ignored *control* file: the control event arriving proves the
+// watcher processed the batch (and that non-ignored untracked files still
+// emit), while any event for a suppressed path fails the assertion.
+// ---------------------------------------------------------------------------
+
+/// `git init` the temp dir (plus user config) so the watcher sees a real repo.
+fn git_init(root: &Path) {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "watcher-test@example.com"]);
+    run(&["config", "user.name", "Watcher Test"]);
+}
+
+/// Wait until the control path's event arrives (up to 10s), asserting no
+/// `file:*` event for any suppressed path shows up — then keep draining until
+/// an 800 ms quiet window passes to catch stragglers flushed after the
+/// control.
+async fn expect_suppressed(sub: &mut super::bus::Subscription, suppressed: &[&str], control: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_control = false;
+    loop {
+        let wait = if seen_control {
+            Duration::from_millis(800)
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "control event for {control} never arrived"
+            );
+            remaining
+        };
+        match timeout(wait, sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if !ev.event_type.starts_with("file:") {
+                        continue;
+                    }
+                    let rel = ev.data["relativePath"].as_str().unwrap_or_default();
+                    assert!(
+                        !suppressed.contains(&rel),
+                        "suppressed path {rel} emitted an event: {:?}",
+                        ev.data
+                    );
+                    if rel == control {
+                        seen_control = true;
+                    }
+                }
+            }
+            Ok(None) => panic!("subscription closed before control event for {control}"),
+            Err(_) => {
+                assert!(seen_control, "control event for {control} never arrived");
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gitignored_generated_dir_is_suppressed() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-gen");
+    git_init(&dir.path);
+    std::fs::write(dir.path.join(".gitignore"), ".svelte-kit/\n").expect("write .gitignore");
+    std::fs::create_dir_all(dir.path.join(".svelte-kit/output")).expect("mk .svelte-kit");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join(".svelte-kit/output/x.d.ts"), b"x").expect("write ignored");
+    std::fs::write(dir.path.join(".svelte-kit/output/x.d.ts"), b"xy").expect("modify ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("control-gen.txt"), b"c").expect("write control");
+
+    expect_suppressed(
+        &mut sub,
+        &[
+            ".svelte-kit",
+            ".svelte-kit/output",
+            ".svelte-kit/output/x.d.ts",
+        ],
+        "control-gen.txt",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn user_ignored_path_suppressed_across_create_modify_delete() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-user");
+    git_init(&dir.path);
+    std::fs::write(dir.path.join(".gitignore"), "scratch.txt\n").expect("write .gitignore");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let scratch = dir.path.join("scratch.txt");
+    std::fs::write(&scratch, b"v1").expect("create ignored");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    std::fs::write(&scratch, b"v2 longer").expect("modify ignored");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    std::fs::remove_file(&scratch).expect("delete ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("untracked-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["scratch.txt"], "untracked-control.txt").await;
+}
+
+#[tokio::test]
+async fn nested_gitignore_applies_only_under_its_directory() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-nested");
+    git_init(&dir.path);
+    std::fs::create_dir_all(dir.path.join("sub")).expect("mk sub");
+    std::fs::write(dir.path.join("sub/.gitignore"), "*.secret\n").expect("write nested");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join("sub/data.secret"), b"x").expect("write ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The control matches the nested pattern but sits *outside* `sub/`, so it
+    // must still emit — proving the nested file is scoped to its directory.
+    std::fs::write(dir.path.join("top.secret"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["sub/data.secret"], "top.secret").await;
+}
+
+#[tokio::test]
+async fn git_info_exclude_is_honored() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-excl");
+    git_init(&dir.path);
+    std::fs::create_dir_all(dir.path.join(".git/info")).expect("mk info");
+    std::fs::write(dir.path.join(".git/info/exclude"), "excluded-local.txt\n")
+        .expect("write exclude");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join("excluded-local.txt"), b"x").expect("write ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("exclude-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["excluded-local.txt"], "exclude-control.txt").await;
+}
+
+#[tokio::test]
+async fn negation_reincludes_file_in_ignored_dir() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-neg");
+    git_init(&dir.path);
+    std::fs::write(dir.path.join(".gitignore"), "dist2/\n!dist2/keep.txt\n")
+        .expect("write .gitignore");
+    std::fs::create_dir_all(dir.path.join("dist2")).expect("mk dist2");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join("dist2/other.txt"), b"x").expect("write ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The negated path is itself the control: it must emit despite `dist2/`.
+    std::fs::write(dir.path.join("dist2/keep.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["dist2/other.txt", "dist2"], "dist2/keep.txt").await;
+}
+
+#[tokio::test]
+async fn gitignore_edit_takes_effect_without_restart() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-edit");
+    git_init(&dir.path);
+    std::fs::write(dir.path.join(".gitignore"), "initial-ignored.txt\n").expect("write .gitignore");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Not ignored yet: must emit.
+    std::fs::write(dir.path.join("runtime-ignored.txt"), b"v1").expect("write pre-rule");
+    next_for(
+        &mut sub,
+        "runtime-ignored.txt",
+        None,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("event before the ignore rule exists");
+
+    // Add the rule at runtime; the `.gitignore` event itself marks the matcher
+    // dirty and it rebuilds on next use — no daemon restart.
+    std::fs::write(
+        dir.path.join(".gitignore"),
+        "initial-ignored.txt\nruntime-ignored.txt\n",
+    )
+    .expect("edit .gitignore");
+    next_for(&mut sub, ".gitignore", None, Duration::from_secs(5))
+        .await
+        .expect("event for the .gitignore edit");
+
+    std::fs::write(dir.path.join("runtime-ignored.txt"), b"v2 longer").expect("write ignored");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("after-edit-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["runtime-ignored.txt"], "after-edit-control.txt").await;
+}
+
+#[tokio::test]
+async fn default_patterns_apply_without_gitignore_rule() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-def");
+    git_init(&dir.path);
+    // The repo's .gitignore does NOT mention *.log or .env — the TS-parity
+    // defaults must suppress them on their own.
+    std::fs::write(dir.path.join(".gitignore"), "unrelated.txt\n").expect("write .gitignore");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join("app.log"), b"x").expect("write log");
+    std::fs::write(dir.path.join(".env"), b"SECRET=1").expect("write env");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("default-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["app.log", ".env"], "default-control.txt").await;
+}
+
+#[tokio::test]
+async fn user_negation_overrides_default_pattern() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-override");
+    git_init(&dir.path);
+    // `dist` is both a default pattern and an IGNORED_DIRS entry; a user
+    // negation must win over both.
+    std::fs::write(dir.path.join(".gitignore"), "!dist\n").expect("write .gitignore");
+    std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
+    let ev = next_for(&mut sub, "dist/bundle.js", None, Duration::from_secs(5))
+        .await
+        .expect("negated default must emit");
+    assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+}
+
+#[tokio::test]
+async fn non_git_root_still_applies_default_patterns() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    // No git init: defaults must still suppress, non-default files still emit.
+    let dir = TempDir::new("gi-nongit");
+    std::fs::create_dir_all(dir.path.join(".svelte-kit")).expect("mk .svelte-kit");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(dir.path.join(".svelte-kit/x.js"), b"x").expect("write ignored");
+    std::fs::write(dir.path.join("noise.log"), b"x").expect("write log");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(dir.path.join("non-git-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(
+        &mut sub,
+        &[".svelte-kit", ".svelte-kit/x.js", "noise.log"],
+        "non-git-control.txt",
+    )
+    .await;
 }

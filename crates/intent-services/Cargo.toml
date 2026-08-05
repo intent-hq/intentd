@@ -23,6 +23,7 @@ intent-pty = { path = "../intent-pty", version = "0.4.2" }
 intent-search = { path = "../intent-search", version = "0.4.2" }
 base64 = { workspace = true }
 git2 = { workspace = true }
+ignore = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
