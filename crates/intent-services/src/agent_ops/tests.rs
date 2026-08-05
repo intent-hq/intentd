@@ -10837,6 +10837,75 @@ async fn cancel_subscriptions_settles_deferred_watcher() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// Classify→mark race regression: an `agent.unwatch` that removes B's last
+/// outgoing watch INSIDE the window between the delivery's `agent_waiting`
+/// probe and the `mark_interim_skipped_idle` write finds no marker, so its
+/// backstop redelivery no-ops. Without the tail re-probe the delivery would
+/// then defer on the stale snapshot with no future trigger, stranding A's
+/// watch. The park seam holds the delivery in exactly that window.
+#[tokio::test]
+async fn unwatch_in_classify_mark_window_still_settles_watcher() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let park = Arc::new(crate::CompletionClassifyPark::default());
+    let svc = Services::new(store).with_completion_classify_park(park.clone());
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    // B's idle delivery parks in the classify→mark window (agent_waiting
+    // already probed true; marker not yet written).
+    let delivery = tokio::spawn({
+        let svc = svc.clone();
+        let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
+        async move { svc.handle_completion_event(&event).await }
+    });
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("delivery parked in the classify→mark window");
+
+    // Concurrent unwatch inside the window: removes B's last outgoing watch;
+    // its backstop redelivery no-ops (no marker exists yet).
+    svc.agent_unwatch_op(ws.clone(), b.clone(), None, Some(c.clone()))
+        .await
+        .expect("unwatch C");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "backstop no-ops before the marker exists"
+    );
+
+    // Release the delivery: it marks the interim skip, defers on the stale
+    // snapshot, then the tail re-probe observes the emptied watch set and
+    // hands off to the redelivery — whose synthetic pass parks once more.
+    park.release.notify_one();
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("synthetic redelivery pass parked");
+    park.release.notify_one();
+    timeout(Duration::from_secs(5), delivery)
+        .await
+        .expect("delivery completes")
+        .expect("delivery task");
+
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "tail re-probe settles A's watch despite the in-window unwatch"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at the synthesized completion"
+    );
+}
+
 /// 2-cycle deadlock guard: A⇄B watch each other and both are idle. B's idle
 /// must NOT defer (the mutual-idle pair would deadlock otherwise) — A's watch
 /// on B fires as before.
