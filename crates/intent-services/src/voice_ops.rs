@@ -186,18 +186,22 @@ pub(crate) fn select_provider(
 }
 
 /// Resolve the transcription language: the per-call `language` wins, else
-/// the `voice.language` setting (trimmed; blank degrades to unset), else
-/// `None` (provider auto-detection).
+/// the `voice.language` setting, else `None` (provider auto-detection). Both
+/// inputs are trimmed and blank degrades to unset.
 pub(crate) fn resolve_language(
     per_call: Option<&str>,
     setting_value: Option<&str>,
 ) -> Option<String> {
-    per_call.map(str::to_string).or_else(|| {
-        setting_value
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
+    per_call
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            setting_value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// Parse the stored `voice.vocabulary` setting value into a term list: a JSON
@@ -416,6 +420,16 @@ mod tests {
             resolve_language(None, Some("  fr  ")),
             Some("fr".to_string()),
             "stored value is trimmed"
+        );
+        assert_eq!(
+            resolve_language(Some("  fr  "), None),
+            Some("fr".to_string()),
+            "per-call value is trimmed"
+        );
+        assert_eq!(
+            resolve_language(Some("   "), Some("de")),
+            Some("de".to_string()),
+            "blank per-call value falls back to the setting"
         );
         assert_eq!(resolve_language(None, Some("")), None, "blank means unset");
         assert_eq!(resolve_language(None, Some("   ")), None);
