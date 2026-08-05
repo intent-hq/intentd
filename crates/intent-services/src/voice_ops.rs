@@ -69,11 +69,20 @@ pub(crate) struct ParsedRequest {
     pub keyterms: Vec<String>,
 }
 
-/// Map a voice engine/registry error onto the domain `Internal` error
-/// (→ `-32603`): a missing key (`NotConfigured`) and any other provider
-/// failure both surface as `Internal` with a descriptive message (§9).
+/// Map a voice engine/registry error onto a domain error (→ `-32603`): a
+/// missing key (`NotConfigured` — exclusively the registry's no-key case;
+/// provider failures such as OpenAI model-unavailable use distinct variants)
+/// surfaces as `VoiceNotConfigured` so the wire carries
+/// `error.data.code = "voice-no-api-key"` (monorepo#1448); any other
+/// provider failure surfaces as `Internal` with a descriptive message (§9).
+/// The descriptive text is identical in both shapes.
 pub(crate) fn map_voice_err(e: intent_voice::Error) -> Error {
-    Error::Internal(e.to_string())
+    match e {
+        intent_voice::Error::NotConfigured(_) => Error::VoiceNotConfigured {
+            detail: e.to_string(),
+        },
+        other => Error::Internal(other.to_string()),
+    }
 }
 
 /// Parse/validate the wire params: `audio` (required, base64), optional
@@ -176,6 +185,25 @@ pub(crate) fn select_provider(
         .unwrap_or_default()
 }
 
+/// Resolve the transcription language: the per-call `language` wins, else
+/// the `voice.language` setting, else `None` (provider auto-detection). Both
+/// inputs are trimmed and blank degrades to unset.
+pub(crate) fn resolve_language(
+    per_call: Option<&str>,
+    setting_value: Option<&str>,
+) -> Option<String> {
+    per_call
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            setting_value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Parse the stored `voice.vocabulary` setting value into a term list: a JSON
 /// array yields its string elements; anything else (absent, `null`, wrong
 /// type, non-string elements) degrades to an empty list — never an error.
@@ -192,17 +220,20 @@ pub(crate) fn parse_vocabulary_setting(value: Option<&serde_json::Value>) -> Vec
 /// Build the provider [`TranscribeRequest`]: merge the configured
 /// `voice.vocabulary` terms with the request keyterms and compose the OpenAI
 /// prompt (see [`intent_voice::context`]). Both fields are always populated;
-/// each engine consumes the one it supports.
+/// each engine consumes the one it supports. `language` is the resolved
+/// value from [`resolve_language`] (per-call > `voice.language` setting >
+/// auto-detect).
 pub(crate) fn build_engine_request(
     parsed: &ParsedRequest,
     vocabulary: &[String],
+    language: Option<String>,
 ) -> TranscribeRequest {
     let keyterms = context::merge_keyterms(vocabulary, &parsed.keyterms);
     let prompt = context::compose_prompt(&keyterms, parsed.prompt.as_deref());
     TranscribeRequest {
         audio: parsed.audio.clone(),
         mime_type: parsed.mime_type.clone(),
-        language: parsed.language.clone(),
+        language,
         keyterms,
         prompt: Some(prompt),
     }
@@ -211,7 +242,7 @@ pub(crate) fn build_engine_request(
 /// Resolve the active [`VoiceEngine`] for `provider`: the injected handle
 /// (tests / explicit wiring) else the registry-built engine (key from the
 /// secrets store / `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`). A missing key
-/// yields `Internal` (graceful "not configured"), never a panic. Async
+/// yields `VoiceNotConfigured` (graceful "not configured"), never a panic. Async
 /// because the secrets lookup runs on the blocking pool with a bounded
 /// timeout so a wedged backing store never blocks the async runtime.
 pub(crate) async fn resolve_engine(
@@ -340,7 +371,7 @@ mod tests {
         }))
         .unwrap();
         let vocabulary = vec!["intentd".to_string(), "clippy".to_string()];
-        let req = build_engine_request(&parsed, &vocabulary);
+        let req = build_engine_request(&parsed, &vocabulary, parsed.language.clone());
         assert!(
             req.keyterms.contains(&"intentd".to_string()),
             "configured vocabulary merged in"
@@ -358,7 +389,7 @@ mod tests {
     fn engine_request_honors_custom_vocabulary() {
         let parsed = parse_request(&json!({ "audio": b64(b"x") })).unwrap();
         let vocabulary = vec!["Endara".to_string(), "TOON".to_string()];
-        let req = build_engine_request(&parsed, &vocabulary);
+        let req = build_engine_request(&parsed, &vocabulary, parsed.language.clone());
         assert_eq!(req.keyterms, vec!["Endara".to_string(), "TOON".to_string()]);
         assert!(
             !req.keyterms.contains(&"intentd".to_string()),
@@ -373,8 +404,36 @@ mod tests {
             "context": { "keyterms": ["Endara"] },
         }))
         .unwrap();
-        let req = build_engine_request(&parsed, &[]);
+        let req = build_engine_request(&parsed, &[], parsed.language.clone());
         assert_eq!(req.keyterms, vec!["Endara".to_string()]);
+    }
+
+    #[test]
+    fn resolves_language_per_call_then_setting_then_none() {
+        assert_eq!(
+            resolve_language(Some("en"), Some("de")),
+            Some("en".to_string()),
+            "per-call language wins over the setting"
+        );
+        assert_eq!(resolve_language(None, Some("de")), Some("de".to_string()));
+        assert_eq!(
+            resolve_language(None, Some("  fr  ")),
+            Some("fr".to_string()),
+            "stored value is trimmed"
+        );
+        assert_eq!(
+            resolve_language(Some("  fr  "), None),
+            Some("fr".to_string()),
+            "per-call value is trimmed"
+        );
+        assert_eq!(
+            resolve_language(Some("   "), Some("de")),
+            Some("de".to_string()),
+            "blank per-call value falls back to the setting"
+        );
+        assert_eq!(resolve_language(None, Some("")), None, "blank means unset");
+        assert_eq!(resolve_language(None, Some("   ")), None);
+        assert_eq!(resolve_language(None, None), None, "auto-detect");
     }
 
     #[test]
@@ -441,8 +500,32 @@ mod tests {
     }
 
     #[test]
-    fn maps_not_configured_to_internal() {
+    fn maps_not_configured_to_voice_not_configured() {
         let mapped = map_voice_err(intent_voice::Error::NotConfigured("no key".into()));
-        assert!(matches!(mapped, Error::Internal(_)));
+        match mapped {
+            Error::VoiceNotConfigured { detail } => {
+                assert_eq!(
+                    detail, "voice not configured: no key",
+                    "detail carries the descriptive text unchanged"
+                );
+            }
+            other => panic!("expected VoiceNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_other_voice_errors_to_internal() {
+        for e in [
+            intent_voice::Error::Auth("401 Unauthorized".into()),
+            intent_voice::Error::Api("500: Internal Server Error".into()),
+            intent_voice::Error::ModelUnavailable("openai returned 404: model not found".into()),
+        ] {
+            let expected = e.to_string();
+            let mapped = map_voice_err(e);
+            assert!(
+                matches!(mapped, Error::Internal(m) if m == expected),
+                "non-NotConfigured errors keep mapping to Internal"
+            );
+        }
     }
 }

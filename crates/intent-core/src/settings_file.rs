@@ -370,6 +370,10 @@ pub struct SentrySettings {
 pub struct VoiceSettings {
     /// `voice.provider` — active speech-to-text provider.
     pub provider: VoiceProvider,
+    /// `voice.language` — default transcription language hint (ISO-639-1
+    /// code, e.g. `"en"`) applied when a `voice.transcribe` call carries no
+    /// per-call `language`. Unset/empty → provider auto-detection.
+    pub language: Option<String>,
     /// `[voice.openai]` — OpenAI provider tuning.
     pub openai: VoiceOpenAiSettings,
 }
@@ -979,6 +983,10 @@ exposeGitCredentialToChildren = true
 # The API keys are secrets and live in secrets.json (voice.elevenlabs.apiKey /
 # voice.openai.apiKey).
 provider = "elevenlabs"
+# Voice language -- default transcription language hint (ISO-639-1 code)
+# used when a voice.transcribe call has no per-call language. Unset means
+# provider auto-detection.
+# language = "en"
 
 [voice.openai]
 # OpenAI voice model -- transcription model: "gpt-4o-transcribe",
@@ -1124,6 +1132,7 @@ mod tests {
         assert!(d.source_control.github.expose_git_credential_to_children);
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
+        assert_eq!(d.voice.language, None);
         assert_eq!(d.voice.openai.model, VoiceOpenAiModel::Gpt4oTranscribe);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);

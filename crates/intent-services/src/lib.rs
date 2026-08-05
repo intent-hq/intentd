@@ -18844,9 +18844,9 @@ impl WorkspaceApi for Services {
     // voice.transcribe — daemon-side speech-to-text. Maps onto the
     // `VoiceEngine` trait; the engine resolves the API key (secrets store /
     // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
-    // provider. A missing/invalid key → `Internal` ("not configured",
-    // graceful). Validation/context-merging glue lives in `voice_ops`. The
-    // API keys are never logged or returned over the wire.
+    // provider. A missing/invalid key → `VoiceNotConfigured` ("not
+    // configured", graceful). Validation/context-merging glue lives in
+    // `voice_ops`. The API keys are never logged or returned over the wire.
     // ========================================================================
 
     fn voice_transcribe(
@@ -18881,8 +18881,20 @@ impl WorkspaceApi for Services {
                 .await
                 .ok()
                 .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            // Language: per-call hint, else the `voice.language` setting,
+            // else none (provider auto-detection).
+            let language_setting = self
+                .settings_service()
+                .get("voice.language")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let language = voice_ops::resolve_language(
+                parsed.language.as_deref(),
+                language_setting.as_deref(),
+            );
             let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
-            let request = voice_ops::build_engine_request(&parsed, &vocabulary);
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
             let transcript = engine
                 .transcribe(request)
                 .await
