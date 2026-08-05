@@ -12014,21 +12014,22 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
-            let changed = ws.attention != WorkspaceAttention::None;
-            ws.attention = WorkspaceAttention::None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
+            // Dismissing attention merely acknowledges it — not "activity" —
+            // so never touch `updated_at` (which feeds the derived
+            // `lastActivity`), and skip the row write entirely when attention
+            // is already clear (intent-hq/monorepo#1466).
+            if ws.attention != WorkspaceAttention::None {
+                ws.attention = WorkspaceAttention::None;
+                store.update_workspace(&ws).await?;
+                // Self-sufficient `workspace:attention-changed` so every client
+                // clears the blue dot together (PROTOCOL §6.5); emit only on an
+                // actual change.
+                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
-            // Self-sufficient `workspace:attention-changed` so every client clears
-            // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
-            if changed {
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
-            }
             Ok(ws)
         })
     }
@@ -12043,13 +12044,13 @@ impl WorkspaceApi for Services {
             }
             let mut ws = store.get_workspace(&id).await?;
             // "Seen" clears the unread flag; review-required attention persists.
+            // Merely looking at a workspace is not "activity", so `updated_at`
+            // (which feeds the derived `lastActivity`) stays untouched
+            // (intent-hq/monorepo#1466).
             if ws.attention == WorkspaceAttention::Unread {
                 ws.attention = WorkspaceAttention::None;
-                ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
             }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
