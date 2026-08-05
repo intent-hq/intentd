@@ -389,7 +389,9 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// error) so tests can assert either arm.
 async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
     timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {

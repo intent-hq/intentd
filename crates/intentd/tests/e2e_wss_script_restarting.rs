@@ -158,7 +158,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// (`jsonrpc: "2.0"`, `result` present, no `error`), return `result`.
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
