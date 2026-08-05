@@ -432,7 +432,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn tier_directory_deletion_emits_event() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("rmdir-user");
         let ws = TempDir::new("rmdir-ws");
@@ -467,7 +471,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn missing_root_promotes_on_creation_and_detects_changes() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("late-user");
         let ws = TempDir::new("late-ws");
@@ -480,14 +488,24 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Warm-up widened 250ms -> 750ms: the missing-root promotion path must
+        // establish its parent watch before the tier dir is created below, and
+        // under nextest's oversubscribed parallelism a 250ms warm-up can lose
+        // that race, so the creation is never observed and the drain returns
+        // empty. The drains' first-event budget is `quiet` (the second arg),
+        // not the total deadline — the loop breaks after one `quiet` window of
+        // silence — so `quiet` is widened 2s -> 8s here (and the total deadline
+        // to match) to tolerate fsevents detection + forward-task latency under
+        // load. Behavior under test is unchanged; only the headroom before the
+        // "no event" verdict.
+        tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
         std::fs::write(proj.join("late.md"), specialist_md("Late", "body"))
             .expect("write specialist");
 
         let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(15))
+            drain_specialists_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20))
                 .await;
         assert!(
             !events.is_empty(),
@@ -499,7 +517,7 @@ mod tests {
         std::fs::write(proj.join("late.md"), specialist_md("Late", "new body"))
             .expect("modify specialist");
         let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+            drain_specialists_events(&mut sub, Duration::from_secs(6), Duration::from_secs(15))
                 .await;
         assert!(
             !events.is_empty(),
@@ -508,7 +526,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn project_tier_burst_debounces_to_one_event() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("debounce-user");
         let ws = TempDir::new("debounce-ws");
@@ -548,7 +570,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn user_tier_change_fans_out_to_all_workspaces() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("fanout-user");
         let ws1 = TempDir::new("fanout-ws1");
@@ -585,7 +611,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn unchanged_set_emits_nothing() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("noop-user");
         let ws = TempDir::new("noop-ws");
@@ -635,7 +665,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("dyn-user");
         let ws = TempDir::new("dyn-ws");

@@ -34,6 +34,22 @@ const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
 /// the child — which doubles as an env-inheritance check).
 const FAKE_DAEMON_LOG: &str = "FAKE_DAEMON_LOG";
 
+/// Serializes the load-sensitive serve-loop tests against one another. These
+/// drive a real long-running sitter supervisor that respawns/updates its child
+/// on wall-clock timers (backoff windows, periodic checks) and assert on the
+/// resulting spawn counts. `cargo test` runs the tests within this binary in
+/// parallel, so several live supervisors spawning children in tight loops
+/// otherwise starve one another off-CPU — flaking the timing assertions (most
+/// sharply `crash_respawn_backs_off_exponentially`, whose backed-off child can
+/// miss its spawn budget under load). Holding this guard for each such test's
+/// duration keeps only one live supervisor loop running at a time. Mirrors the
+/// `CHILD_SPAWN_SERIAL` (provider_models) and `WATCHER_TEST_SERIAL`
+/// (events/mod.rs) precedents. The brief one-shot tests (`doctor`, `restart`
+/// without a live sitter, single-shot `serve`) spawn once and finish, so they
+/// stay parallel. `unwrap_or_else(into_inner)` recovers from a poisoned lock so
+/// one panicking test does not cascade into the rest.
+static SERVE_LOOP_SERIAL: Mutex<()> = Mutex::new(());
+
 type Routes = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 type RequestLog = Arc<Mutex<Vec<String>>>;
 
@@ -363,6 +379,7 @@ fn no_network_and_nothing_installed_exits_nonzero() {
 
 #[test]
 fn update_mid_run_swaps_binary_and_preserves_args() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -423,6 +440,7 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
 
 #[test]
 fn config_channel_switch_applies_at_next_periodic_check() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -488,6 +506,7 @@ fn config_channel_switch_applies_at_next_periodic_check() {
 
 #[test]
 fn flag_pinned_channel_ignores_config_switch_mid_run() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -553,6 +572,7 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
 
 #[test]
 fn crash_respawn_backs_off_exponentially() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(7));
@@ -564,7 +584,7 @@ fn crash_respawn_backs_off_exponentially() {
         .arg("serve")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(1300));
+    thread::sleep(Duration::from_millis(5000));
     send_signal(&sitter, "TERM");
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
     assert_ne!(
@@ -573,14 +593,21 @@ fn crash_respawn_backs_off_exponentially() {
         "crash-looping sitter must not exit 0"
     );
 
-    // Doubling from 50ms (spawns at ~0/50/150/350/750/1150ms) gives ~6 runs
-    // in 1.3s; a constant 50ms delay would give ~26. Bound both sides.
+    // Doubling from 50ms, capped at 400ms (spawns at ~0/50/150/350/750/1150/
+    // 1550/1950/2350ms, then every ~400ms), gives ~15 runs in 5s; a constant
+    // 50ms delay would give ~100. Bound both sides to keep proving "backoff,
+    // not a constant-delay flood" while leaving the floor low. The window is
+    // deliberately generous (widened 2.4s -> 5s): `SERVE_LOOP_SERIAL` is inert
+    // under nextest (each test is its own process), so the backed-off child
+    // races the whole oversubscribed suite and can be starved to zero spawns
+    // through the first several seconds — the longer window lets it accumulate
+    // a safe margin of runs once that transient load clears.
     let runs = read_or_empty(&daemon_log_path(dir.path()))
         .lines()
         .filter(|line| *line == "run")
         .count();
     assert!(
-        (3..=9).contains(&runs),
+        (3..=30).contains(&runs),
         "expected backed-off respawns, got {runs} runs"
     );
     let stderr = read_or_empty(&stderr_path(dir.path()));
@@ -593,6 +620,7 @@ fn crash_respawn_backs_off_exponentially() {
 
 #[test]
 fn sighup_during_crash_backoff_respawns_the_state_json_version() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
@@ -864,6 +892,7 @@ fn run_one_shot(data_dir: &Path, base_url: &str, args: &[&str]) -> std::process:
 
 #[test]
 fn restart_command_respawns_state_version_without_exiting_sitter() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -1019,6 +1048,7 @@ fn double_dash_restart_forwards_verbatim_to_the_daemon() {
 
 #[test]
 fn sitter_initiated_stop_does_not_respawn() {
+    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));

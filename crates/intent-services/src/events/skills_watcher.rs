@@ -388,17 +388,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("dyn-ws");
         let ws_id = WorkspaceId::from("ws-skills-dyn");
 
-        // Start with NO workspaces; register at runtime (#611).
+        // Start with NO workspaces; register at runtime (#611). Warm-ups widened
+        // 250ms -> 500ms so the runtime registration + its OS watch establish
+        // before the SKILL.md is created, which under nextest's oversubscribed
+        // parallelism a 250ms warm-up can lose.
         let watcher = SkillsWatcher::start(bus.clone(), vec![]);
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // A project-tier SKILL.md created after registration emits for the
         // new workspace.
@@ -406,8 +413,12 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
         std::fs::write(skill_dir.join("SKILL.md"), skill_md("dyn-skill")).expect("write skill");
 
+        // First-event budget is `quiet` (the loop breaks after one quiet window
+        // of silence), widened 2s -> 8s (with the total deadline to match) to
+        // absorb fsevents detection + forward-task latency under load. The
+        // negative-assertion drain below stays tight — it asserts absence.
         let events =
-            drain_skills_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10)).await;
+            drain_skills_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20)).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),
             "change after runtime registration must emit for the workspace, got {events:?}"
