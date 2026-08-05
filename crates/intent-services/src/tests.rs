@@ -3989,15 +3989,27 @@ mod change_event_parity {
     }
 
     async fn harness() -> Harness {
+        harness_with_attention_park(None).await
+    }
+
+    /// Harness variant with the monorepo#1481 attention-write park seam
+    /// armed, so race tests can hold an attention path inside its
+    /// read→write window.
+    async fn harness_with_attention_park(
+        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let mut services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
+        if let Some(park) = park {
+            services = services.with_attention_write_park(park);
+        }
         Harness {
             _tmp: tmp,
             _ws_root: ws_root,
@@ -5103,6 +5115,143 @@ mod change_event_parity {
             reloaded.last_activity.as_deref(),
             Some("2020-01-03T00:00:00Z"),
             "derived lastActivity must not move on dismissAttention"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): the attention paths must scope
+    /// their write to the attention column (plus `updated_at` where intended)
+    /// — never a full-row replace — so a concurrent row mutation landing
+    /// between the path's workspace read and its write survives. Parks
+    /// `mark_seen` inside that window, mutates `title`/`updated_at`
+    /// concurrently, and asserts the mutation is not clobbered.
+    #[tokio::test]
+    async fn mark_seen_race_preserves_concurrent_row_mutation() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+        // Seed attention via the store (the armed park would hold the
+        // service-path raise too).
+        let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
+        seeded.attention = WorkspaceAttention::Unread;
+        seeded.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store.update_workspace(&seeded).await.expect("seed");
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move { services.mark_seen(ws_id).await });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("mark_seen reaches the attention write window");
+
+        // Concurrent mutation while mark_seen sits between read and write.
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-06-01T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        let seen = task.await.expect("join").expect("mark_seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive markSeen"
+        );
+        assert_eq!(
+            reloaded.updated_at, "2020-06-01T00:00:00Z",
+            "concurrent updated_at change must survive markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): same race window as above, for
+    /// `dismissAttention`.
+    #[tokio::test]
+    async fn dismiss_attention_race_preserves_concurrent_row_mutation() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+        let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
+        seeded.attention = WorkspaceAttention::ReviewRequired;
+        seeded.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store.update_workspace(&seeded).await.expect("seed");
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move { services.dismiss_attention(ws_id).await });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("dismiss_attention reaches the attention write window");
+
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-06-01T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        let dismissed = task.await.expect("join").expect("dismiss");
+        assert_eq!(dismissed.attention, WorkspaceAttention::None);
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive dismissAttention"
+        );
+        assert_eq!(
+            reloaded.updated_at, "2020-06-01T00:00:00Z",
+            "concurrent updated_at change must survive dismissAttention"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): same race window as above, for
+    /// `raise_attention`. Raising IS activity — `updated_at` moves — but the
+    /// write must still be scoped to attention + updated_at, so a concurrent
+    /// title change survives.
+    #[tokio::test]
+    async fn raise_attention_race_preserves_concurrent_title_change() {
+        use intent_core::WorkspaceAttention;
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move {
+            services
+                .raise_attention(&ws_id, WorkspaceAttention::Unread)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("raise_attention reaches the attention write window");
+
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        task.await.expect("join").expect("raise");
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::Unread);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive raiseAttention"
+        );
+        assert_ne!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "raiseAttention intentionally bumps updated_at"
         );
     }
 
