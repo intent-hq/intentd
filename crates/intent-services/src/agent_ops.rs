@@ -6710,6 +6710,43 @@ impl Services {
                 )
                 .await;
         };
+        // Archived-workspace gate (mirrors `try_drain_queue`'s): a wake must
+        // not start a turn while the workspace is archived — it parks in the
+        // queue until unarchive, whose drain kick delivers it (see
+        // `unarchive_workspace`). Chief is virtual and never archived, so
+        // skip the row read. Fail open on a lookup error: the gate only
+        // parks affirmatively-archived workspaces; a transient store error
+        // must not swallow a wake.
+        if !workspace_id.is_chief() {
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    let (queued, position) = self.enqueue_message(
+                        agent_id,
+                        content.to_string(),
+                        None,
+                        None,
+                        message_metadata.cloned(),
+                        None,
+                        false,
+                    );
+                    self.publish_queue_updated(agent_id).await;
+                    return Ok(json!({
+                        "success": true,
+                        "queued": true,
+                        "queuedMessage": queued.to_value(position),
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "wake delivery: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Runtime path (DELIV-1): two-step claim/persist/spawn so the
         // user-message row is on disk BEFORE the turn worker starts, and no
         // worker is ever spawned for a row that failed to persist:
@@ -7197,6 +7234,72 @@ impl Services {
             }
         }
         Some(drained)
+    }
+
+    /// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
+    /// scan the WHOLE queue — regardless of interleaving with user-origin
+    /// entries — for ready-to-send (`!editing`) SYSTEM-origin entries
+    /// (`user_origin == false`) and, when at least `min_ready` are found,
+    /// remove ALL of them, preserving their relative order; user-origin
+    /// entries are left untouched in their original queue positions. System
+    /// entries may thus be delivered ahead of earlier-queued, interleaved
+    /// user entries. Returns `None` — leaving the queue untouched — when
+    /// fewer than `min_ready` system entries are ready, so the caller falls
+    /// through to the single-entry drain path.
+    pub(crate) fn dequeue_system_only_batch(
+        &self,
+        agent_id: &AgentId,
+        min_ready: usize,
+    ) -> Option<Vec<QueuedMessage>> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let eligible = |m: &QueuedMessage| !m.editing && !m.user_origin;
+        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
+            return None;
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            if eligible(&queue[i]) {
+                drained.push(queue.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        Some(drained)
+    }
+
+    /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
+    /// defers to [`Services::dequeue_ready_batch`] (every ready entry,
+    /// `user_origin_only` under an active hold); `SystemOnly` defers to
+    /// [`Services::dequeue_system_only_batch`] (system-origin entries
+    /// anywhere in the queue) but NEVER batches while a hold is active
+    /// (`user_origin_only`) — the hold's release is a user-origin entry,
+    /// which `SystemOnly` by definition excludes; `Off` always returns `None`
+    /// so every caller falls through to the single-entry FIFO path.
+    pub(crate) fn dequeue_flush_batch(
+        &self,
+        agent_id: &AgentId,
+        mode: intent_core::FlushQueuedMessagesMode,
+        user_origin_only: bool,
+        min_ready: usize,
+    ) -> Option<Vec<QueuedMessage>> {
+        match mode {
+            intent_core::FlushQueuedMessagesMode::All => {
+                self.dequeue_ready_batch(agent_id, user_origin_only, min_ready)
+            }
+            intent_core::FlushQueuedMessagesMode::SystemOnly => {
+                if user_origin_only {
+                    None
+                } else {
+                    self.dequeue_system_only_batch(agent_id, min_ready)
+                }
+            }
+            intent_core::FlushQueuedMessagesMode::Off => None,
+        }
     }
 
     /// Re-insert a batch of messages at the front of an agent's queue,

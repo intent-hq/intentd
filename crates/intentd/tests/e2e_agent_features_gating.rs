@@ -192,7 +192,9 @@ async fn wss_connect(port: u16, cfg: Arc<ClientConfig>) -> Ws {
 
 async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     loop {
         let msg = timeout(Duration::from_secs(10), ws.next())
             .await

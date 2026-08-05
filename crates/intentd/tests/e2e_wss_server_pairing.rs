@@ -191,7 +191,7 @@ async fn connect_ws(
 
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     let mut ws = connect_ws(port, cfg).await;
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send");
     loop {
@@ -440,7 +440,9 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     // response frame within a bounded window (non-text frames tolerated).
     let notification = json!({ "jsonrpc": "2.0", "method": "system.shutdown" }).to_string();
     let mut ws = connect_ws(port, cfg.clone()).await;
-    ws.send(Message::Text(notification)).await.expect("send");
+    ws.send(Message::Text(notification.into()))
+        .await
+        .expect("send");
     let unexpected = timeout(Duration::from_secs(2), async {
         loop {
             match ws.next().await {
@@ -461,7 +463,9 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     // (id 2) also proves the notification produced no earlier response.
     let status_frame =
         json!({ "jsonrpc": "2.0", "id": 2, "method": "system.status", "params": {} }).to_string();
-    ws.send(Message::Text(status_frame)).await.expect("send");
+    ws.send(Message::Text(status_frame.into()))
+        .await
+        .expect("send");
     let status: Value = loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).expect("json"),

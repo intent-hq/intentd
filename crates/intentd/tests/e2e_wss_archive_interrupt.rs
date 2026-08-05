@@ -1,13 +1,20 @@
-//! WSS end-to-end turn correlation id (monorepo#1022): a terminal mid-turn
-//! failure's `agent:failed` carries the send's `turnId`; the requeued entry
-//! in `agent:queue:updated` gets a NEW `id` but keeps the SAME `turnId`; and
-//! the `agent.retry` redrive — its RPC response and the drain-start
-//! `agent:queue:processing` signal — carries that same original `turnId`.
+//! WSS end-to-end: `workspace.archive` stops an in-flight agent turn
+//! (graceful interrupt — keep-alive `agent.stop` semantics) while preserving
+//! the session for a later unarchive + resume.
 //!
-//! This is the regression lock for turn_id preservation in
-//! `persist_error_and_requeue`: if the requeue stops threading the failed
-//! turn's original `turn_id` onto the fresh queue entry, the SAME-`turnId`
-//! assertions below fail.
+//! Drives: create workspace → start an agent turn that parks mid-flight (mock
+//! ACP provider, `blockUntilCancel`) → `workspace.archive` → asserts:
+//! - the §5.1 archive response (refreshed record: `archived: true`,
+//!   `status: "Archived"`, `archivedAt` set),
+//! - the `workspace:updated` archive delta shape per docs/PROTOCOL.md §6.5
+//!   (`changes: { archived: true, status: "Archived", archivedAt: <ts> }`),
+//! - the terminal `agent:stream:end` carrying `stopReason: "interrupted"`
+//!   over `events.subscribe` (the turn was stopped, not completed),
+//! - `agent.list` shows the session preserved (not deleted) and no longer
+//!   responding,
+//! - after `workspace.unarchive`, a follow-up message resumes the SAME
+//!   provider child (the mock's per-process turn counter reports `turn=2`),
+//!   proving interrupt-not-kill keep-alive semantics across the archive.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -27,7 +34,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -35,6 +42,8 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+/// Live `intentd serve` process; killed (whole process group) and its data
+/// dir removed on drop, with the daemon log echoed for post-mortems.
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -42,7 +51,13 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            let pid = Pid::from_raw(self.child.id() as i32);
+            let _ = signal::killpg(pid, Signal::SIGKILL);
+        }
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -54,18 +69,16 @@ impl Drop for Daemon {
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-turnid-{}", &id[..8]));
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-archv-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir data dir");
     dir
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    if listen != "uds" {
-        common::enable_ws_api(data_dir);
-    }
+    common::enable_ws_api(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
@@ -73,6 +86,12 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // Group leader so Daemon::drop can killpg the daemon + ACP children.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -92,6 +111,7 @@ async fn await_uds(socket: &Path) -> bool {
     .is_ok()
 }
 
+/// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -165,14 +185,14 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn connect_ws(
-    port: u16,
-    cfg: Arc<ClientConfig>,
-) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
+/// Open an authenticated WSS connection (token in the query string).
+async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> common::TlsWs {
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
+/// Send one JSON-RPC frame and return the result whose id matches; any
+/// out-of-band notifications (`events.event`) are ignored.
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -202,6 +222,7 @@ where
     }
 }
 
+/// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -226,6 +247,7 @@ where
     }
 }
 
+/// Mock-agent gate (parity with the other WSS E2E suites).
 fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -262,7 +284,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
-        title: "WSS-TURNID-E2E".to_string(),
+        title: "WSS-ARCHIVE-E2E".to_string(),
         branch: "main".to_string(),
         base_ref: None,
         base_commit_sha: None,
@@ -303,47 +325,33 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-/// TURNID-1 (monorepo#1022): the turn correlation id survives a terminal
-/// mid-turn failure and its `agent.retry` redrive.
+/// `workspace.archive` stops an in-flight agent turn — graceful interrupt
+/// (keep-alive `agent.stop` semantics), NOT a hard kill — and preserves the
+/// session for a later unarchive + resume.
 ///
-/// The mock spawns and handshakes normally, then `process.exit(1)`s inside
-/// `session/prompt` on the first TWO attempts: the first pre-output death is
-/// consumed by the one-shot silent redrive (monorepo#764), the second is a
-/// terminal mid-turn failure that parks the agent in Error and requeues the
-/// message. The chain under test:
-///
-/// 1. `agent.sendMessage` (direct arm) responds with the minted `turnId`.
-/// 2. `agent:failed` + terminal `agent:stream:end` carry that `turnId`.
-/// 3. The requeued entry in `agent:queue:updated` (and `agent.getQueue`) has
-///    a NEW `id` but the SAME `turnId` — the `persist_error_and_requeue`
-///    preservation this test locks down.
-/// 4. `agent.retry` responds with the same `turnId`, and the redrive's
-///    drain-start `agent:queue:processing` names the requeued entry's new
-///    `id` as `messageId` with the original `turnId`.
+/// The mock's first turn streams "streaming-before-cancel" and parks at
+/// `session/cancel` (`blockUntilCancel`); `workspace.archive` must resolve it
+/// with a terminal `agent:stream:end` carrying `stopReason: "interrupted"`,
+/// emit the §6.5 `workspace:updated` archive delta, and leave the session
+/// listed (not deleted) with no turn in flight. After `workspace.unarchive`,
+/// a follow-up message resumes the SAME provider child (the mock's
+/// per-process counter reports `turn=2`).
 #[tokio::test]
-async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
-    let Some(script) = gate("WSS turn-correlation E2E") else {
+async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
+    let Some(script) = gate("WSS archive-interrupt E2E") else {
         return;
     };
+
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let attempt_file = data_dir.join("attempts.txt");
-    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
-    let behavior = json!({
-        "exitDuringPromptAttempts": 2,
-        "response": "turn-correlation-recovered-1022",
-    })
-    .to_string();
-    let env: [(&str, &str); 7] = [
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
-        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
-        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -358,12 +366,16 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event can be missed.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+        json!({
+            "eventTypes": ["agent:*", "chat:stream:delta", "workspace:updated"],
+            "workspaceId": ws_id,
+        }),
     )
     .await;
     assert!(
@@ -376,7 +388,7 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "WSS-TURNID", "model": "mock:default" }),
+        json!({ "workspaceId": ws_id, "name": "WSS-ARCHIVE", "model": "mock:default" }),
     )
     .await;
     let agent_id = created["agent"]["id"]
@@ -384,192 +396,206 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
         .expect("agent id")
         .to_string();
 
-    // (1) The direct-send RPC response mints and names the turn's
-    // correlation id — the anchor every later assertion compares against.
     let sent = wss_rpc(
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "dies mid-turn" }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    assert_eq!(sent["queued"], false, "direct send (not queued): {sent}");
-    let turn_id = sent["turnId"]
-        .as_str()
-        .expect("direct sendMessage response carries turnId (monorepo#1022)")
-        .to_string();
-    assert!(!turn_id.is_empty(), "turnId is non-empty");
 
-    // (2) + (3) Terminal failure surface: `agent:failed` and the terminal
-    // `agent:stream:end` carry the send's turnId, and the requeued entry in
-    // `agent:queue:updated` has a NEW id with the SAME turnId. The
-    // status-changed(error) event is emitted after the status persist, so
-    // seeing it guarantees the Error park landed.
-    let mut saw_failed = false;
-    let mut saw_terminal_end = false;
-    let mut saw_status_error = false;
-    let mut requeued_entry: Option<Value> = None;
-    for _ in 0..300 {
+    // First turn streams a chunk and parks at session/cancel — the archive
+    // lands mid-turn by construction.
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
-        let event = &frame["params"]["event"];
-        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
-            continue;
-        }
-        match event["type"].as_str() {
-            Some("agent:failed") => {
-                assert_eq!(
-                    event["data"]["turnId"].as_str(),
-                    Some(turn_id.as_str()),
-                    "agent:failed carries the send's turnId: {frame}"
-                );
-                saw_failed = true;
-            }
-            Some("agent:stream:end") => {
-                assert_eq!(
-                    event["data"]["turnId"].as_str(),
-                    Some(turn_id.as_str()),
-                    "terminal agent:stream:end carries the send's turnId: {frame}"
-                );
-                saw_terminal_end = true;
-            }
-            Some("agent:message") if event["data"]["role"] == "user" => {
-                // The user-row echo of the direct send carries the same id.
-                // (System rows — e.g. the turn-failure transcript notice —
-                // carry no turnId and are skipped by the role guard.)
-                assert_eq!(
-                    event["data"]["turnId"].as_str(),
-                    Some(turn_id.as_str()),
-                    "user-row agent:message echo carries the send's turnId: {frame}"
-                );
-            }
-            Some("agent:queue:updated") => {
-                let queue = event["data"]["queue"].as_array().expect("queue array");
-                if !queue.is_empty() {
-                    requeued_entry = Some(queue[0].clone());
-                }
-            }
-            Some("agent:status-changed") if event["data"]["status"] == "error" => {
-                saw_status_error = true;
-            }
-            _ => {}
-        }
-        if saw_failed && saw_terminal_end && saw_status_error && requeued_entry.is_some() {
+        if frame["params"]["event"]["type"] == "chat:stream:delta"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
             break;
         }
     }
-    assert!(saw_failed, "terminal agent:failed emitted");
-    assert!(saw_terminal_end, "terminal agent:stream:end emitted");
-    assert!(saw_status_error, "agent parked in error");
-    let requeued = requeued_entry.expect("agent:queue:updated carried the requeued entry");
-    assert_eq!(
-        requeued["turnId"].as_str(),
-        Some(turn_id.as_str()),
-        "requeued entry keeps the failed turn's ORIGINAL turnId (persist_error_and_requeue preservation): {requeued}"
-    );
-    let requeued_id = requeued["id"].as_str().expect("requeued entry id");
-    assert_ne!(
-        requeued_id, turn_id,
-        "requeued entry got a NEW id distinct from the preserved turnId: {requeued}"
-    );
-    assert_eq!(
-        requeued["requeuedAfterFailure"], true,
-        "requeued entry flagged requeuedAfterFailure: {requeued}"
-    );
-    let requeued_id = requeued_id.to_string();
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
 
-    // The same NEW-id / SAME-turnId contract over the RPC read surface.
-    let queue = wss_rpc(
+    // Archive mid-turn. §5.1 return shape: the refreshed workspace record.
+    let archived = wss_rpc(
         &mut rpc,
         12,
-        "agent.getQueue",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        "workspace.archive",
+        json!({ "workspaceId": ws_id }),
     )
     .await;
-    let messages = queue["queue"].as_array().expect("queue array");
-    assert_eq!(messages.len(), 1, "failed message requeued: {queue}");
-    assert_eq!(
-        messages[0]["id"].as_str(),
-        Some(requeued_id.as_str()),
-        "agent.getQueue names the same requeued entry: {queue}"
+    assert_eq!(archived["workspace"]["id"], ws_id.as_str());
+    assert_eq!(archived["workspace"]["archived"], json!(true));
+    assert_eq!(archived["workspace"]["status"], json!("Archived"));
+    assert!(
+        archived["workspace"]["archivedAt"].is_string(),
+        "archive response carries the persisted archivedAt: {archived}"
     );
-    assert_eq!(
-        messages[0]["turnId"].as_str(),
-        Some(turn_id.as_str()),
-        "agent.getQueue entry keeps the original turnId: {queue}"
-    );
+    let archived_at = archived["workspace"]["archivedAt"].clone();
 
-    // (4) agent.retry names the redriven turn in its response…
-    let retry_result = wss_rpc(
-        &mut rpc,
-        13,
-        "agent.retry",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(retry_result["ok"], true, "agent.retry ok on error status");
-    assert_eq!(
-        retry_result["redriven"], true,
-        "agent.retry redrives the requeued message: {retry_result}"
-    );
-    assert_eq!(
-        retry_result["turnId"].as_str(),
-        Some(turn_id.as_str()),
-        "agent.retry response carries the ORIGINAL turnId: {retry_result}"
-    );
-
-    // …and the redrive's drain-start `agent:queue:processing` signal pairs
-    // the requeued entry's NEW messageId with the ORIGINAL turnId, then the
-    // turn completes (the mock's attempt counter is past the failure window).
-    let mut saw_processing = false;
-    let mut saw_chunk = false;
-    let mut saw_retry_end = false;
-    for _ in 0..300 {
+    // The archive both emits the §6.5 workspace:updated delta AND interrupts
+    // the parked turn (terminal agent:stream:end with stopReason
+    // "interrupted" — the keep-alive interrupt signature, distinguishable
+    // from a normal turn end which carries no stopReason). Relative order of
+    // the two events is unspecified; collect both.
+    let mut archive_delta = None;
+    let mut interrupt_end = None;
+    for _ in 0..50 {
+        if archive_delta.is_some() && interrupt_end.is_some() {
+            break;
+        }
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
-        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
-            continue;
-        }
         match event["type"].as_str() {
-            Some("agent:queue:processing") => {
-                assert_eq!(
-                    event["data"]["messageId"].as_str(),
-                    Some(requeued_id.as_str()),
-                    "agent:queue:processing names the requeued entry's NEW id: {frame}"
-                );
-                assert_eq!(
-                    event["data"]["turnId"].as_str(),
-                    Some(turn_id.as_str()),
-                    "agent:queue:processing carries the ORIGINAL turnId: {frame}"
-                );
-                saw_processing = true;
+            Some("workspace:updated") => {
+                archive_delta = Some(event["data"].clone());
             }
+            Some("agent:stream:end") => {
+                interrupt_end = Some(event["data"].clone());
+            }
+            _ => {}
+        }
+    }
+
+    // §6.5 archive delta: the full applied WorkspaceUpdate, `<ts>` equal to
+    // the persisted archivedAt from the RPC response.
+    let archive_delta = archive_delta.expect("workspace.archive published workspace:updated");
+    assert_eq!(
+        archive_delta,
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": true,
+                "status": "Archived",
+                "archivedAt": archived_at,
+            }
+        }),
+        "archive delta shape per PROTOCOL.md §6.5"
+    );
+
+    let interrupt_end = interrupt_end.expect("archive interrupted the in-flight turn");
+    assert_eq!(
+        interrupt_end["agentId"].as_str().unwrap_or_default(),
+        agent_id,
+        "terminal stream:end names the interrupted agent: {interrupt_end}"
+    );
+    assert_eq!(
+        interrupt_end["stopReason"], "interrupted",
+        "archive interrupts (keep-alive), so stream:end carries stopReason: {interrupt_end}"
+    );
+
+    // Session preserved: agent.list still serves the session (not deleted)
+    // and it is no longer responding. Poll briefly — the worker releases the
+    // busy slot just after the terminal stream:end.
+    let mut settled = false;
+    for i in 0..40 {
+        let listed = wss_rpc(
+            &mut rpc,
+            20 + i,
+            "agent.list",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let agents = listed["agents"].as_array().expect("agents array");
+        let row = agents
+            .iter()
+            .find(|a| a["id"] == agent_id.as_str())
+            .unwrap_or_else(|| panic!("archived workspace keeps the session listed: {listed}"));
+        if row["isResponding"] == false && row["turnInFlight"] == false {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        settled,
+        "no responding agents after archive (session preserved, turn stopped)"
+    );
+
+    // Unarchive: §6.5 delta clears archivedAt with an explicit null.
+    let unarchived = wss_rpc(
+        &mut rpc,
+        70,
+        "workspace.unarchive",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(unarchived["workspace"]["archived"], json!(false));
+    assert_eq!(unarchived["workspace"]["status"], json!("Active"));
+    assert!(unarchived["workspace"].get("archivedAt").is_none());
+
+    let mut unarchive_delta = None;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "workspace:updated" {
+            unarchive_delta = Some(event["data"].clone());
+            break;
+        }
+    }
+    assert_eq!(
+        unarchive_delta.expect("workspace.unarchive published workspace:updated"),
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": false,
+                "status": "Active",
+                "archivedAt": null,
+            }
+        }),
+        "unarchive delta shape per PROTOCOL.md §6.5"
+    );
+
+    // Keep-alive across the archive: the follow-up resumes the SAME provider
+    // child — the mock's per-process turn counter reports turn=2. A hard
+    // kill would have respawned the child (fresh counter, turn=1).
+    let resumed = wss_rpc(
+        &mut rpc,
+        71,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+
+    let mut saw_resume_chunk = false;
+    let mut saw_resume_end = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        match event["type"].as_str() {
             Some("chat:stream:delta") => {
                 if event["data"]["content"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("turn-correlation-recovered-1022")
+                    .contains("turn=2")
                 {
-                    saw_chunk = true;
+                    saw_resume_chunk = true;
                 }
             }
             Some("agent:stream:end") => {
-                saw_retry_end = true;
+                assert!(
+                    event["data"].get("stopReason").is_none(),
+                    "normal stream:end carries no stopReason: {event}"
+                );
+                saw_resume_end = true;
                 break;
-            }
-            Some("agent:failed") => {
-                panic!("agent:failed emitted AGAIN after retry: {frame}");
             }
             _ => {}
         }
     }
     assert!(
-        saw_processing,
-        "agent:queue:processing emitted for the retry redrive"
+        saw_resume_chunk,
+        "post-unarchive turn resumed the SAME process (mock reported turn=2)"
     );
-    assert!(saw_chunk, "redriven turn streamed the mock response");
     assert!(
-        saw_retry_end,
-        "agent:stream:end emitted after retry redrive"
+        saw_resume_end,
+        "resumed turn emits its own terminal stream:end"
     );
 }

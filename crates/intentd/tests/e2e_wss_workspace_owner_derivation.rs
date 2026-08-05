@@ -202,7 +202,7 @@ async fn wss_rpc(
         "method": method,
         "params": params
     });
-    ws.send(Message::Text(msg.to_string()))
+    ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send rpc");
     let resp = timeout(Duration::from_secs(10), ws.next())

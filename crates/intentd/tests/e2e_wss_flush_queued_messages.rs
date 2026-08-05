@@ -1,9 +1,9 @@
 //! WSS end-to-end coverage for the queued-message batch flush
-//! (`agents.flushQueuedMessages`, default on): messages queued while an
+//! (`agents.flushQueuedMessages`, default `"all"`): messages queued while an
 //! agent is busy are delivered as ONE combined turn when the busy turn ends.
 //!
-//! Case 1 (default on): start a slow turn, queue 2 messages behind it, let
-//! the turn end. The provider-received prompt (via the mock fixture's
+//! Case 1 (default `"all"`): start a slow turn, queue 2 messages behind it,
+//! let the turn end. The provider-received prompt (via the mock fixture's
 //! `MOCK_AGENT_PROMPT_LOG` seam) is a single message starting with
 //! `2 queued messages while you were working` carrying `Message #1:` /
 //! `Message #2:` plus each entry's dequeue-wait `[SYSTEM NOTE]`; the
@@ -11,9 +11,14 @@
 //! one snapshot (2 → 0, never through 1) and exactly ONE
 //! `agent:queue:processing` fires.
 //!
-//! Case 2 (`flushQueuedMessages = false` in `config.toml`): the same setup
+//! Case 2 (`flushQueuedMessages = "off"` in `config.toml`): the same setup
 //! drains legacy one-at-a-time — one turn per queued message, no combined
 //! header, and the queue shrinks 2 → 1 → 0.
+//!
+//! Case 3 (`flushQueuedMessages = "systemOnly"`): two SYSTEM-origin messages
+//! queued behind a busy turn (via `agent.queueMessage`'s system-origin path,
+//! which parks as `user_origin: false`) are delivered as ONE combined turn,
+//! same contract as case 1.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -185,7 +190,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -310,18 +315,21 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-/// Seed `agents.flushQueuedMessages = false` into the data dir's
+/// Seed `agents.flushQueuedMessages = <mode>` into the data dir's
 /// `config.toml` BEFORE boot (must run before `enable_ws_api` appends the
 /// `[server.wsApi]` table, and the two tables must not collide).
-fn disable_flush_setting(data_dir: &Path) {
+fn seed_flush_mode(data_dir: &Path, mode: &str) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
     assert!(
         !path.exists(),
-        "disable_flush_setting must run before other config seeding"
+        "seed_flush_mode must run before other config seeding"
     );
-    std::fs::write(&path, "[agents]\nflushQueuedMessages = false\n")
-        .expect("seed config.toml with flushQueuedMessages = false");
+    std::fs::write(
+        &path,
+        format!("[agents]\nflushQueuedMessages = \"{mode}\"\n"),
+    )
+    .expect("seed config.toml with flushQueuedMessages mode");
 }
 
 /// Boot a daemon with the slow-first-turn mock, create an agent, start the
@@ -713,7 +721,7 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     );
 }
 
-/// FLUSH-2 (`agents.flushQueuedMessages = false` in `config.toml`): the same
+/// FLUSH-2 (`agents.flushQueuedMessages = "off"` in `config.toml`): the same
 /// two-queued setup drains legacy one-at-a-time — one turn per queued
 /// message (three prompts total, none with the batch header), TWO
 /// `agent:queue:processing` signals, and the queue shrinking through 1.
@@ -723,7 +731,7 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
         return;
     };
     let data_dir = temp_data_dir();
-    disable_flush_setting(&data_dir);
+    seed_flush_mode(&data_dir, "off");
     let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
 
     // Three terminal stream:ends: kick-off + one turn PER queued message.
@@ -802,5 +810,69 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
         1,
         "per-message dequeue-wait note: {}",
         prompts[2]
+    );
+}
+
+/// FLUSH-3 (`agents.flushQueuedMessages = "systemOnly"` in `config.toml`):
+/// `agent.queueMessage` enqueues with `user_origin: false` (system-origin),
+/// so two messages queued behind a busy turn via that RPC batch into ONE
+/// combined turn under `systemOnly` — the same wire contract as the default
+/// `"all"` case (FLUSH-1).
+#[tokio::test]
+async fn flush_system_only_combines_queued_messages_into_one_turn_over_wss() {
+    let Some(script) = gate("WSS queued-message flush systemOnly E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    seed_flush_mode(&data_dir, "systemOnly");
+    let mut setup = setup_busy_agent_with_two_queued(&data_dir, &script).await;
+
+    // Two terminal stream:ends: the kick-off turn, then the ONE combined
+    // flush turn (a third would mean the drain split the batch).
+    let obs = observe_drain(&mut setup.sub, &setup.agent_id, 2).await;
+
+    let shrink = shrink_lengths(&obs.queue_lengths);
+    assert!(
+        !shrink.contains(&1),
+        "queue must empty in one snapshot (2 → 0), never through 1: {:?}",
+        obs.queue_lengths
+    );
+    assert!(
+        shrink.ends_with(&[0]),
+        "final queue snapshot is empty: {:?}",
+        obs.queue_lengths
+    );
+    assert_eq!(
+        obs.processing_turn_ids.len(),
+        1,
+        "exactly ONE agent:queue:processing for the combined turn: {:?}",
+        obs.processing_turn_ids
+    );
+
+    let prompts = await_prompts(&setup.prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "kick-off + ONE flush turn: {prompts:?}");
+    let flush = &prompts[1];
+    assert!(
+        flush.starts_with(FLUSH_HEADER),
+        "systemOnly flush prompt starts with the batch header: {flush}"
+    );
+    let i_one = flush
+        .find(QUEUED_ONE)
+        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_ONE:?}: {flush}"));
+    let i_two = flush
+        .find(QUEUED_TWO)
+        .unwrap_or_else(|| panic!("flush prompt carries {QUEUED_TWO:?}: {flush}"));
+    assert!(i_one < i_two, "messages appear in queue order: {flush}");
+
+    let queue = wss_rpc(
+        &mut setup.rpc,
+        21,
+        "agent.getQueue",
+        json!({ "agentId": setup.agent_id }),
+    )
+    .await;
+    assert!(
+        queue["queue"].as_array().expect("queue array").is_empty(),
+        "queue empty after flush: {queue}"
     );
 }

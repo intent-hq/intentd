@@ -291,7 +291,7 @@ async fn connect_ws(
 /// text response parsed as JSON.
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     let mut ws = connect_ws(port, cfg).await;
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send");
     loop {
@@ -309,7 +309,7 @@ async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> 
     let mut ws = connect_ws(port, cfg).await;
     let mut out = Vec::new();
     for frame in frames {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -435,7 +435,7 @@ async fn wss_workspace_auto_commit_round_trip() {
         frame: String,
         id: i64,
     ) -> Value {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -686,7 +686,7 @@ async fn wss_oversized_message_terminates_connection() {
     // only termination is asserted here.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
-    let _ = ws.send(Message::Text(oversized)).await;
+    let _ = ws.send(Message::Text(oversized.into())).await;
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match ws.next().await {
@@ -2953,7 +2953,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
         .await
         .expect("plain ws handshake");
     sock.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.into(),
     ))
     .await
     .expect("send");
@@ -3313,7 +3313,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         frame: String,
         id: i64,
     ) -> Value {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -4797,7 +4797,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
 
     let call = r#"{"jsonrpc":"2.0","id":1,"method":"host.openInEditor","params":{"editorId":"vscode","path":"/repo/src/main.rs","line":12,"column":3}}"#;
-    ws.send(Message::Text(call.to_string()))
+    ws.send(Message::Text(call.to_string().into()))
         .await
         .expect("send");
 
@@ -4817,7 +4817,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
                     let reply = serde_json::json!({
                         "jsonrpc": "2.0", "id": id, "result": { "ok": true }
                     });
-                    ws.send(Message::Text(reply.to_string()))
+                    ws.send(Message::Text(reply.to_string().into()))
                         .await
                         .expect("send reverse reply");
                 } else if v["id"] == 1 {
@@ -5382,9 +5382,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
     // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
-    sub.send(Message::Text(format!(
-        r#"{{"jsonrpc":"2.0","id":21,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
-    )))
+    sub.send(Message::Text(
+        format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+        )
+        .into(),
+    ))
     .await
     .expect("send subscribe");
     let mut sub_resp: Option<Value> = None;

@@ -148,7 +148,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -572,7 +572,9 @@ async fn resolve_interrupted_invalid_params_validation() {
         "method": "agent.resolveInterrupted",
         "params": { "resume": "not-an-array" }
     });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
@@ -603,7 +605,9 @@ async fn resolve_interrupted_invalid_params_validation() {
         "method": "agent.resolveInterrupted",
         "params": { "abandon": 123 }
     });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
@@ -634,7 +638,9 @@ async fn resolve_interrupted_invalid_params_validation() {
         "method": "agent.resolveInterrupted",
         "params": { "resume": ["valid-id", 123, "another-id"] }
     });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
@@ -665,7 +671,9 @@ async fn resolve_interrupted_invalid_params_validation() {
         "method": "agent.resolveInterrupted",
         "params": { "resume": ["agent-1", "agent-2"], "abandon": ["agent-3"] }
     });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
