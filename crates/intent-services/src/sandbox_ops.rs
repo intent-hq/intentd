@@ -164,7 +164,13 @@ pub async fn provision_sandbox(
         // strand the just-cloned directory when the record insert fails.
         // Best-effort, but log failures so a leaked clone is observable.
         let cleanup_path = sandbox_path.clone();
-        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_path)).await {
+        match tokio::task::spawn_blocking(move || {
+            std::fs::remove_dir_all(&cleanup_path)?;
+            remove_empty_sandbox_parents(&cleanup_path);
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(remove_err)) => tracing::warn!(
                 sandbox_path = %sandbox_path.display(),
@@ -236,8 +242,12 @@ fn provision_sandbox_blocking(
     // itself is still unsupported (e.g. a nested cross-volume mount inside the
     // tree); degrade to shared mode instead of failing the agent start.
     if let Err(e) = cow_clone(&user_dir, &sandbox_path) {
-        if let Err(remove_err) = std::fs::remove_dir_all(&sandbox_path) {
-            if remove_err.kind() != std::io::ErrorKind::NotFound {
+        match std::fs::remove_dir_all(&sandbox_path) {
+            Ok(()) => remove_empty_sandbox_parents(&sandbox_path),
+            Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                remove_empty_sandbox_parents(&sandbox_path);
+            }
+            Err(remove_err) => {
                 tracing::warn!(
                     sandbox_path = %sandbox_path.display(),
                     error = %remove_err,
@@ -308,7 +318,29 @@ fn provision_sandbox_blocking(
     })
 }
 
-/// Discard a sandbox: remove the directory and the database record.
+/// Best-effort removal of the now-empty per-agent parent directories after a
+/// sandbox removal: `…/sandboxes/<agentId>/` and, when it too becomes empty,
+/// `…/sandboxes/`. `std::fs::remove_dir` only deletes EMPTY directories, so a
+/// sibling sandbox (or any unrelated entry) makes this a silent no-op; the
+/// walk never climbs past those two levels, so the workspace directory itself
+/// is untouched.
+fn remove_empty_sandbox_parents(sandbox_path: &std::path::Path) {
+    let mut dir = sandbox_path.parent();
+    for _ in 0..2 {
+        let Some(d) = dir else { break };
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// Discard a sandbox: remove the directory (plus any now-empty parent
+/// directories), the database record, and the agent session's sandbox
+/// linkage (`sandbox_id`/`sandbox_path`/`sandbox_branch`) — a discarded
+/// sandbox must never be observable through a stale session pointer
+/// (a respawned microVM agent would otherwise skip re-provisioning and
+/// fall back to mounting the canonical directory).
 pub async fn discard_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -323,10 +355,24 @@ pub async fn discard_sandbox(
             std::fs::remove_dir_all(&path)
                 .map_err(|e| Error::Internal(format!("remove sandbox directory failed: {e}")))?;
         }
+        remove_empty_sandbox_parents(&path);
     }
 
     // Delete the record (whether or not the directory existed)
     store.delete_sandbox(workspace_id, agent_id).await?;
+
+    // Clear the session's sandbox fields so no later spawn reuses the deleted
+    // path. Best-effort: the session row may already be gone (agent.delete).
+    if let Err(e) = store
+        .clear_agent_session_sandbox(workspace_id, agent_id)
+        .await
+    {
+        tracing::warn!(
+            agent = %agent_id.0,
+            error = %e,
+            "failed to clear agent session sandbox fields after discard"
+        );
+    }
 
     Ok(())
 }
@@ -356,10 +402,16 @@ pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
             if path.exists() {
                 let _ = std::fs::remove_dir_all(&path);
             }
+            remove_empty_sandbox_parents(&path);
             // Delete the record
             store
                 .delete_sandbox(&sandbox.workspace_id, &sandbox.agent_id)
                 .await?;
+            // Best-effort: the agent session (when it still exists — the
+            // dir-missing arm) must not keep pointing at the removed sandbox.
+            let _ = store
+                .clear_agent_session_sandbox(&sandbox.workspace_id, &sandbox.agent_id)
+                .await;
         }
     }
 
@@ -1641,8 +1693,83 @@ mod tests {
             "Sandbox record must be deleted from DB after discard"
         );
 
+        // Verify the now-empty <agentId>/ parent (and sandboxes/) were removed
+        let agent_parent = path.parent().unwrap();
+        assert!(
+            !agent_parent.exists(),
+            "Empty <agentId>/ parent must be removed after discard"
+        );
+        assert!(
+            !agent_parent.parent().unwrap().exists(),
+            "Empty sandboxes/ dir must be removed after discard"
+        );
+
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn discard_sandbox_clears_session_fields_and_keeps_sibling_parents() {
+        // No CoW required: insert the sandbox record by hand over a plain
+        // directory tree. Covers (a) session sandbox fields cleared on
+        // discard, (b) empty parent cleanup stops at a non-empty sandboxes/
+        // dir (sibling agent's sandbox survives).
+        let (store, _db) = temp_store().await;
+        let root = tempfile::TempDir::new().unwrap();
+
+        let ws = workspace_for_repo(&root.path().join("fake-repo"));
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let sandboxes_dir = root.path().join(ws.id.0.as_str()).join("sandboxes");
+        let sandbox_path = sandboxes_dir.join(agent_id.0.as_str()).join("repo");
+        fs::create_dir_all(&sandbox_path).unwrap();
+        let sibling = sandboxes_dir.join("agent-other").join("repo");
+        fs::create_dir_all(&sibling).unwrap();
+
+        let sandbox = intent_store::Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: format!("sb/{}", agent_id.0),
+            base_commit_sha: "abc123".to_string(),
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        // Point the session at the sandbox (as the delegate/microVM paths do)
+        let mut session = store.get_agent_session(&agent_id).await.unwrap();
+        session.sandbox_id = Some(sandbox.id.clone());
+        session.sandbox_path = Some(sandbox.path.clone());
+        session.sandbox_branch = Some(sandbox.branch.clone());
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        discard_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+
+        assert!(!sandbox_path.exists(), "sandbox dir removed");
+        assert!(
+            !sandboxes_dir.join(agent_id.0.as_str()).exists(),
+            "empty <agentId>/ parent removed"
+        );
+        assert!(
+            sandboxes_dir.exists() && sibling.exists(),
+            "non-empty sandboxes/ dir and sibling sandbox must survive"
+        );
+
+        let session = store.get_agent_session(&agent_id).await.unwrap();
+        assert!(
+            session.sandbox_id.is_none()
+                && session.sandbox_path.is_none()
+                && session.sandbox_branch.is_none(),
+            "session sandbox fields must be cleared after discard"
+        );
     }
 
     #[tokio::test]

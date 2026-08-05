@@ -334,6 +334,14 @@ mod tests {
         let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap();
         assert!(sandbox.is_none(), "Sandbox should be discarded after merge");
 
+        // Assert: session sandbox linkage cleared with the discard — a later
+        // spawn must re-provision instead of reusing the deleted path.
+        let session = store.get_agent_session(&child_id).await.unwrap();
+        assert!(
+            session.sandbox_path.is_none() && session.sandbox_branch.is_none(),
+            "Session sandbox fields must be cleared after merge+discard"
+        );
+
         // Assert: agent commits are in canonical
         let _canonical_repo = Repository::open(&repo_path).unwrap();
         assert!(
