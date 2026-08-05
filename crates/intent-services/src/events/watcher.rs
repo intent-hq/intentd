@@ -268,8 +268,11 @@ struct GitignoreMatcher {
     root: PathBuf,
     /// Resolved `<gitdir>/info/exclude` (worktree-aware), watched for edits.
     /// Detected on the absolute path before the [`IGNORED_DIRS`] prefilter,
-    /// which would otherwise drop everything under `.git`.
-    exclude_path: Option<PathBuf>,
+    /// which would otherwise drop everything under `.git`. Both the resolved
+    /// and canonicalized forms are kept (deduped): `notify` may report either
+    /// shape (symlinked roots, `..` segments from a worktree `commondir`), so
+    /// comparing against both keeps invalidation robust.
+    exclude_paths: Vec<PathBuf>,
     /// `.gitignore` matchers paired with their containing directory, ordered
     /// deepest-first so nested files take precedence per Git.
     gitignores: Vec<(PathBuf, Gitignore)>,
@@ -287,7 +290,7 @@ impl GitignoreMatcher {
     fn new(root: PathBuf) -> Self {
         let mut matcher = Self {
             root,
-            exclude_path: None,
+            exclude_paths: Vec::new(),
             gitignores: Vec::new(),
             exclude: None,
             global: None,
@@ -307,12 +310,22 @@ impl GitignoreMatcher {
     /// written by cargo, or files shipped inside `vendor/`) are skipped by the
     /// discovery walk in [`Self::rebuild`], so a rebuild for them would be a
     /// no-op — don't mark dirty for those (checked via `rel`, the
-    /// workspace-relative path). The `exclude_path` comparison stays on the
-    /// absolute path: `info/exclude` intentionally lives under `.git`.
+    /// workspace-relative path). The `exclude_paths` comparison stays on the
+    /// absolute path: `info/exclude` intentionally lives under `.git`. The
+    /// incoming path is canonicalized only on the cheap file-name match, and
+    /// both it and its canonical form are compared against both stored forms,
+    /// since `notify` and `resolve_exclude_file` may disagree on symlinks.
     fn note_raw_change(&mut self, abs: &Path, rel: Option<&str>) {
-        if self.exclude_path.as_deref() == Some(abs) {
-            self.dirty = true;
-            return;
+        if !self.exclude_paths.is_empty() && abs.file_name().is_some_and(|n| n == "exclude") {
+            let canon = std::fs::canonicalize(abs).ok();
+            if self
+                .exclude_paths
+                .iter()
+                .any(|p| p == abs || Some(p) == canon.as_ref())
+            {
+                self.dirty = true;
+                return;
+            }
         }
         if abs.file_name().is_some_and(|n| n == ".gitignore")
             && rel.is_some_and(|r| !should_ignore(Path::new(r)))
@@ -321,7 +334,14 @@ impl GitignoreMatcher {
         }
     }
 
-    fn has_whitelists(&self) -> bool {
+    /// Whether any source carries a `!` negation. Rebuilds first when the
+    /// matcher is dirty so the ingest fast-path never consults a stale
+    /// answer: a stale `false` would let the [`IGNORED_DIRS`] prefilter drop
+    /// a path that a freshly added negation rescues.
+    fn has_whitelists(&mut self) -> bool {
+        if self.dirty {
+            self.rebuild();
+        }
         self.has_whitelists
     }
 
@@ -372,7 +392,7 @@ impl GitignoreMatcher {
         self.gitignores.clear();
         self.exclude = None;
         self.global = None;
-        self.exclude_path = None;
+        self.exclude_paths.clear();
 
         let mut defaults = GitignoreBuilder::new(&self.root);
         for pattern in DEFAULT_IGNORE_PATTERNS {
@@ -411,7 +431,12 @@ impl GitignoreMatcher {
                     }
                 }
             }
-            self.exclude_path = Some(std::fs::canonicalize(&exclude_path).unwrap_or(exclude_path));
+            if let Ok(canon) = std::fs::canonicalize(&exclude_path) {
+                if canon != exclude_path {
+                    self.exclude_paths.push(canon);
+                }
+            }
+            self.exclude_paths.push(exclude_path);
 
             let mut files: Vec<PathBuf> = Vec::new();
             // Keep discovery deterministic for a given tree: don't consult

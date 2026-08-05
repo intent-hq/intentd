@@ -894,6 +894,41 @@ async fn default_patterns_apply_without_gitignore_rule() {
     expect_suppressed(&mut sub, &["app.log", ".env"], "default-control.txt").await;
 }
 
+/// PR 903 review regression: a runtime `info/exclude` edit lands as a raw
+/// event whose path is prefiltered (it lives under `.git`), so nothing else
+/// forces a rebuild. The ingest fast-path must not consult a stale
+/// `has_whitelists` — a freshly added `!dist` negation has to rescue
+/// `dist/…` (an [`IGNORED_DIRS`] entry) on the very next event, and the
+/// exclude-path comparison must hold whether notify reports the canonical or
+/// the resolved form of the path.
+#[tokio::test]
+async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("gi-excl-edit");
+    git_init(&dir.path);
+    std::fs::create_dir_all(dir.path.join(".git/info")).expect("mk info");
+    std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
+    let _watcher = FileWatcher::start(bus.clone(), WorkspaceId::from("ws-gi"), dir.path.clone())
+        .expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Edit info/exclude at runtime: the raw event for this path is the ONLY
+    // dirty trigger — it is prefiltered, so a stale fast-path would skip the
+    // rebuild and keep dropping `dist/…` below.
+    std::fs::write(dir.path.join(".git/info/exclude"), "!dist\n").expect("write exclude");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
+    let ev = next_for(&mut sub, "dist/bundle.js", None, Duration::from_secs(5))
+        .await
+        .expect("runtime exclude negation must rescue the prefiltered path");
+    assert_eq!(ev.data["relativePath"], "dist/bundle.js");
+}
+
 #[tokio::test]
 async fn user_negation_overrides_default_pattern() {
     let db = TempDb::new();
