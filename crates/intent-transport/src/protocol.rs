@@ -23,10 +23,17 @@
 //! Version 4.5 adds `agent.markSeen` (additive; §5.5): the per-conversation
 //! seen marker (`lastSeenMessageId` in session metadata, monotonic advance,
 //! `agent:updated` emit, served on the `AgentLite` metadata projection) —
-//! 279 router methods, 316 total.
+//! 279 router methods, 316 total. Version 5.0 removes the 11 caller-less
+//! `pr.*` router methods (breaking; §5.7, monorepo#1506) — `pr.capabilities`,
+//! `pr.listComments`, `pr.listReviewComments`, `pr.getReviews`,
+//! `pr.listCheckRuns`, `pr.merge`, `pr.updateBranch`, `pr.postComment`,
+//! `pr.replyToReviewComment`, `pr.resolveThread`, `pr.createReview` — keeping
+//! only `pr.status` and `pr.refresh`; the `github.*` explicit-addressing
+//! surface (§5.27) and the MCP-only `ws.pr.snapshot` engine are unchanged —
+//! 268 router methods, 305 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.5";
+pub const PROTOCOL_VERSION: &str = "5.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
