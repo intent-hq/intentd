@@ -5342,6 +5342,15 @@ impl Services {
         if removed {
             self.publish_subscriptions_changed(&watch.parent_workspace_id, &caller_agent_id)
                 .await;
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // the caller's own `agent:idle` may have been deferred (not fired,
+            // watch armed) because it held this outgoing watch. Removing it
+            // here is outside the wake path, so re-run the mutation-path
+            // redelivery — a no-op unless the caller is idle with no remaining
+            // waiting reason, in which case it synthesizes the caller's real
+            // completion and settles its own deferred watchers.
+            self.redeliver_completion_after_queue_mutation(&caller_agent_id)
+                .await;
         }
         Ok(json!({ "ok": true, "removed": removed }))
     }
@@ -5696,6 +5705,12 @@ impl Services {
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
             }
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // dropping every outgoing watch may remove the caller's last
+            // waiting reason, so re-run the mutation-path redelivery to settle
+            // any watch on the caller whose `agent:idle` was deferred.
+            self.redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
             return Ok(json!({ "success": true }));
         }
 
@@ -5762,6 +5777,12 @@ impl Services {
         for anchor in &anchors {
             self.publish_subscriptions_changed(anchor, &agent_id).await;
         }
+        // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+        // cancelling a scoped outgoing watch may remove the caller's last
+        // waiting reason, so re-run the mutation-path redelivery to settle any
+        // watch on the caller whose `agent:idle` was deferred.
+        self.redeliver_completion_after_queue_mutation(&agent_id)
+            .await;
         Ok(json!({ "success": true }))
     }
 
