@@ -556,16 +556,35 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 
 /// Resolve the effective provider id for an agent session using the same precedence
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
-/// yields a non-empty provider) → `provider` field → default provider. Malformed
-/// compound ids like `:sonnet` yield an empty prefix and fall through to the provider
-/// field / default. This ensures `_meta` injection, spawn args, and all provider-keyed
-/// logic use a consistent provider id.
-pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
+/// yields a non-empty provider) → `provider` field → `configured_default` (the
+/// daemon settings `providers.active`, when the caller has one to offer) → the
+/// hardcoded default provider. Malformed compound ids like `:sonnet` yield an
+/// empty prefix and fall through to the provider field / configured
+/// default / default. This ensures `_meta` injection, spawn args, and all
+/// provider-keyed logic use a consistent provider id.
+///
+/// `configured_default` deliberately sits ABOVE the hardcoded
+/// [`intent_providers::default_provider_id`] (Auggie) in this precedence
+/// (spec Decision D2): a session with no persisted `provider` (e.g. an older
+/// row, or a creation path that never resolved one) should still prefer the
+/// user's actual configured default over the hardcoded one. Callers without
+/// settings access (e.g. usage-stats attribution) pass `None`, preserving
+/// the previous hardcoded-default behavior for that narrower use.
+pub(crate) fn resolve_provider_id(
+    model: Option<&str>,
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> String {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
         .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            configured_default
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+        })
         .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
 }
 
@@ -1060,8 +1079,13 @@ impl Services {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → default), then build provider-specific _meta.
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        // prefix → provider field → configured default → default), then build
+        // provider-specific _meta.
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1119,7 +1143,11 @@ impl Services {
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection (recreate path sends
         // the same prompt as new/load).
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1183,7 +1211,11 @@ impl Services {
         }
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection.
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -1923,8 +1955,11 @@ impl Services {
         let now = time::OffsetDateTime::now_utc();
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
+        // Stats attribution only: no configured-default upgrade here (unlike
+        // the spawn-adjacent call sites above), matching the pre-existing
+        // `usage_stats.rs` helpers this mirrors — out of scope for D2.
         let provider_id =
-            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref()));
+            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None));
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),

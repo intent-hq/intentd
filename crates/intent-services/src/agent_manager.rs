@@ -2369,8 +2369,12 @@ impl AgentManager {
         }
         // Spell the rename tool the way this session's provider surfaces it;
         // a failed session lookup falls back to the generic phrasing.
+        let configured_default = self.services.effective_settings().providers.active;
         let tool_ref = match self.services.store.get_agent_session(agent_id).await {
-            Ok(s) => workspace_naming_tool_reference(&session_provider_id(&s)),
+            Ok(s) => workspace_naming_tool_reference(&session_provider_id(
+                &s,
+                configured_default.as_deref(),
+            )),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -5639,12 +5643,17 @@ fn derive_agent_type(
 /// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
 /// prefix wins over `session.provider`, because a cross-provider model switch
 /// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then the default provider. Delegates to
-/// [`crate::agent_session::resolve_provider_id`], which also guards against
-/// malformed compound ids like `:sonnet` (empty prefixes fall through to the
-/// provider field / default).
-fn session_provider_id(session: &AgentSession) -> String {
-    crate::agent_session::resolve_provider_id(session.model.as_deref(), session.provider.as_deref())
+/// a fallback for bare model ids, then `configured_default` (the daemon
+/// settings `providers.active`), then the hardcoded default provider.
+/// Delegates to [`crate::agent_session::resolve_provider_id`], which also
+/// guards against malformed compound ids like `:sonnet` (empty prefixes fall
+/// through to the provider field / configured default / default).
+fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> String {
+    crate::agent_session::resolve_provider_id(
+        session.model.as_deref(),
+        session.provider.as_deref(),
+        configured_default,
+    )
 }
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
@@ -5685,7 +5694,7 @@ fn resolve_spawn(
     settings: &intent_core::settings_file::SettingsFile,
     chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
-    let provider_id = session_provider_id(session);
+    let provider_id = session_provider_id(session, settings.providers.active.as_deref());
     // Whitespace-bearing bare ids are persisted effective-model display names
     // (D13, e.g. `claude-code:Opus 4.8`) — stats/attribution values, not
     // spawnable model ids. They must not reach `SpawnOptions.model` (CLI

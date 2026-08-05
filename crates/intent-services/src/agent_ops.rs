@@ -76,6 +76,9 @@ mod tests_stab115;
 #[cfg(test)]
 mod tests_specialist_frontmatter;
 
+#[cfg(test)]
+mod tests_delegate_provider_resolution;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000):
@@ -307,6 +310,97 @@ fn ensure_bare_model_matches_provider(
             "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
             owners.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the provider `agent.delegate` should spawn on when the caller
+/// supplies no explicit `model` (spec Decision D2). The wire has no
+/// `provider` param, so the daemon must derive one itself instead of leaving
+/// `AgentCreateExtra.provider` unset — which previously fell through to
+/// [`intent_providers::default_provider_id`] (Auggie) at spawn time
+/// regardless of the user's actual configured default.
+///
+/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
+///    when that is unset — the provider prefix of its compound `model`
+///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
+///    or the delegate fails with a clear error (never silently substituted).
+/// 2. The configured default (`providers.active`), with the same
+///    known/available requirement.
+/// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
+///    session's `provider` stays unset, exactly like the pre-existing model
+///    resolution's "no configured default" case. `resolve_provider_id`
+///    (`agent_session.rs`) applies the same configured-default-over-
+///    hardcoded-Auggie precedence at spawn time, but with no configured
+///    default to offer either, that precedence itself bottoms out at the
+///    spawn path's hardcoded [`intent_providers::default_provider_id`]
+///    (Auggie) — this residual, no-config case is the one scenario where
+///    the hardcoded default still applies.
+fn resolve_delegate_provider(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let settings = services.effective_settings();
+
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            ensure_known_provider("agent.delegate", &provider_id)?;
+            ensure_provider_available("agent.delegate", &provider_id, &settings.providers.paths)?;
+            return Ok(Some(provider_id));
+        }
+    }
+
+    match settings
+        .providers
+        .active
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        Some(active) => {
+            ensure_known_provider("agent.delegate", active)?;
+            ensure_provider_available("agent.delegate", active, &settings.providers.paths)?;
+            Ok(Some(active.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Reject a known provider id that the daemon's own provider discovery
+/// reports as unavailable (not installed, or gated off by a missing env
+/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
+/// can toast it — instead of letting the delegate succeed and the spawn fail
+/// later with a raw "No such file or directory" (spec Decision D2 step 3).
+/// Mirrors `resolve_spawn`'s override-aware resolution (monorepo#1065) via
+/// [`intent_providers::discover_providers_with_overrides`], keyed by the
+/// same `providers.paths` settings.
+fn ensure_provider_available(
+    method: &str,
+    provider_id: &str,
+    provider_paths: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let available = intent_providers::discover_providers_with_overrides(&|key| {
+        provider_paths.get(key).cloned()
+    })
+    .into_iter()
+    .find(|p| p.id == provider_id)
+    .is_some_and(|p| p.installed);
+    if !available {
+        let display = intent_providers::provider_config(provider_id).display_name;
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — it is not \
+             installed, or is disabled. Choose an available provider in Settings > Agents, or \
+             install {display}."
         )));
     }
     Ok(())
@@ -4557,6 +4651,28 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
+        // D2: resolve the provider up front when the caller gave no explicit
+        // `model` — the wire has no `provider` param on `agent.delegate`, so
+        // without this the created session's `provider` stays `None` and the
+        // spawn path falls through to the hardcoded default (Auggie),
+        // regardless of the user's actual configured default. A compound
+        // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
+        // provider via `agent_create_op`'s existing derivation, so D2 is
+        // skipped in that case.
+        let delegate_provider = if input.model.is_none() {
+            // SECURITY: derive workspace_path from the stored workspace
+            // record, never a client-supplied value (same rationale as
+            // `agent_create_op`'s model resolution).
+            let wp = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w));
+            resolve_delegate_provider(self, input.specialist.as_deref(), wp.as_deref())?
+        } else {
+            None
+        };
         let mut extra_metadata = serde_json::Map::new();
         if let Some(depth) = delegation_depth {
             extra_metadata.insert("delegationDepth".to_string(), json!(depth));
@@ -4568,6 +4684,7 @@ impl Services {
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
+            provider: delegate_provider,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable
             // by the child's opening-turn `ws.workspace.setAgentName`

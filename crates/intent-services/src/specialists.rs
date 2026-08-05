@@ -721,6 +721,26 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's `codingAgent` frontmatter scalar through the
+    /// same 3-tier order (project > user > bundled) as [`Self::resolve_model`],
+    /// used by the delegate/spawn provider resolution (D2 step 1) so a
+    /// specialist that pins a provider always runs on it instead of the
+    /// caller's configured default. Returns `None` when the specialist is
+    /// unknown or declares no `codingAgent`, letting the caller fall through
+    /// to the settings chain.
+    pub(crate) fn resolve_coding_agent(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("codingAgent")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
     /// keyed by id (later tiers overwrite earlier — the precedence merge).
     /// `hidden` and the config scalars ([`INHERITED_CONFIG_KEYS`]) inherit
