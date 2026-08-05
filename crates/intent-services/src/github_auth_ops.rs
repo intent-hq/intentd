@@ -136,6 +136,13 @@ async fn is_resident(state: &FlowState, flow_id: u64) -> bool {
 /// `github.authStatus` reflects the configured token from then on. If the
 /// flow was orphaned while the authorizing poll was in flight, the persisted
 /// token is deleted again (see [`FlowSlot`] on cooperative cancellation).
+///
+/// `sync_gh` opts the authorized transition into the best-effort gh CLI token
+/// sync ([`intent_sourcecontrol::gh_sync`]); `github.connect` sets it only
+/// when the flow targets the production login host, so mock-host tests never
+/// spawn a real `gh` (or feed it a mock token). The sync runs as a detached
+/// task after the slot update + event emit — fail-soft, it can never fail or
+/// delay the device flow.
 pub(crate) async fn run_poll_loop(
     state: FlowState,
     bus: Option<EventBus>,
@@ -143,6 +150,7 @@ pub(crate) async fn run_poll_loop(
     flow_id: u64,
     mut flow: DeviceFlow,
     deadline: Instant,
+    sync_gh: bool,
 ) {
     let mut consecutive_errors: u32 = 0;
     // `None` = authorized (slot cleared); `Some(phase)` = terminal failure.
@@ -209,6 +217,13 @@ pub(crate) async fn run_poll_loop(
     let status = outcome.map_or("authorized", FlowPhase::as_wire);
     tracing::info!(status, "github device flow finished");
     publish_event(&bus, auth_changed_event(status)).await;
+    if outcome.is_none() && sync_gh {
+        // Best-effort gh CLI sync: loads the token back from the secret store
+        // (it never leaves the engine) and pipes it to `gh` via stdin only.
+        tokio::spawn(intent_sourcecontrol::gh_sync::sync_token_to_gh(
+            intent_core::FileSecretStore::new(),
+        ));
+    }
 }
 
 /// Delete the stored `sourceControl.github.token` through the services
@@ -245,6 +260,17 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
             }
         })
         .unwrap_or_else(|| intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.to_string())
+}
+
+/// True iff `base_uri` is the production github.com login host — the shared
+/// gate for gh CLI side effects (login sync on authorize, logout on revoke):
+/// a mock-host flow (test seam) stores a token gh cannot use, and touching
+/// `gh` from it would reach the host's real login state from tests. Trailing
+/// slashes are insignificant ("https://github.com/" is the same host), so
+/// normalize before comparing.
+pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
+    base_uri.trim_end_matches('/')
+        == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/')
 }
 
 /// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
