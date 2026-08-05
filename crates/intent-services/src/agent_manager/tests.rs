@@ -4177,6 +4177,46 @@ async fn derive_agent_type_falls_back_to_default_without_agent_type() {
     assert!(get_tool_denylist_for_agent_type(DEFAULT_AGENT_TYPE).is_empty());
 }
 
+#[tokio::test]
+async fn specialist_model_options_lists_only_visible_specialists_with_options() {
+    let dir = TempSpecialistsDir::new();
+    // Carries options (with and without hints) → listed in order.
+    dir.write(
+        "chooser",
+        "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
+    );
+    // No options → omitted.
+    dir.write(
+        "plain",
+        "---\nname: \"Plain\"\ndescription: \"No options\"\n---\n\nbody",
+    );
+    // Hidden → omitted even though it carries options.
+    dir.write(
+        "ghost",
+        "---\nname: \"Ghost\"\ndescription: \"Hidden\"\nhidden: true\nmodelOptions: [{\"model\":\"grok:grok-5\",\"hint\":\"fast\"}]\n---\n\nbody",
+    );
+    let (_tmp, services) = services_with_specialists(&dir).await;
+
+    let listed = services.specialist_model_options(None);
+    let chooser = listed
+        .iter()
+        .find(|s| s.specialist == "chooser")
+        .expect("chooser listed");
+    assert_eq!(chooser.options.len(), 2);
+    assert_eq!(chooser.options[0].model, "opencode:kimi-k3");
+    assert_eq!(chooser.options[0].hint, "cheap");
+    assert_eq!(chooser.options[1].model, "auggie:opus");
+    assert_eq!(chooser.options[1].hint, "");
+    assert!(
+        !listed.iter().any(|s| s.specialist == "plain"),
+        "specialists without options are omitted"
+    );
+    assert!(
+        !listed.iter().any(|s| s.specialist == "ghost"),
+        "hidden specialists are omitted"
+    );
+}
+
 /// Build a normalized prompt for `session_id` keyed by `request_id`.
 fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
     PermissionRequestData {
