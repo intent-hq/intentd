@@ -2917,6 +2917,49 @@ impl Services {
             .remove(child_id)
     }
 
+    /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it
+    /// holds at least one outgoing completion watch whose target has not yet
+    /// settled. Mirrors the hook-waiting classification — such an agent will
+    /// run again when a watched target completes (which retires that outgoing
+    /// watch), so an `agent:idle` emitted while it waits is not its real
+    /// completion and must not fire the agent's own watchers (issue
+    /// intent-hq/monorepo#1468: an implementor idling while it waits on its PR
+    /// reviewer must not wake its coordinator into a no-progress loop). Grouped
+    /// (after_all) watches count too: a coordinator idling while its delegation
+    /// group is open is genuinely waiting on its children.
+    ///
+    /// 2-cycle deadlock guard: a mutual watch pair (A⇄B) in which BOTH sides
+    /// are idle would defer forever — each waits on the other, neither ever
+    /// fires. An outgoing watch on a target that watches this agent back AND is
+    /// itself idle (not busy, empty ready-to-send queue) is therefore NOT
+    /// counted as a waiting reason, so the deadlocked pair delivers as before
+    /// (both watchers fire). A mutual pair whose counterpart is still busy is a
+    /// genuine wait (the busy side will complete and wake this one), so it
+    /// still defers.
+    ///
+    /// The waiting classification is exposed as a reusable predicate so the
+    /// reconciliation paths (task 2) can share it with the live delivery path.
+    pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
+        let outgoing = self.list_watches_for_parent(agent_id);
+        if outgoing.is_empty() {
+            return false;
+        }
+        let incoming = self.find_watches_for_child(agent_id);
+        outgoing.iter().any(|w| {
+            let target = &w.child_agent_id;
+            if target == agent_id {
+                // Defensive: a self-watch is never a waiting reason.
+                return false;
+            }
+            let mutual_idle = incoming.iter().any(|iw| &iw.parent_agent_id == target)
+                && !self.agent_is_busy(target.clone())
+                && !self.has_ready_to_send(target);
+            // Count this edge as a waiting reason unless it is a deadlocked
+            // mutual-idle 2-cycle.
+            !mutual_idle
+        })
+    }
+
     /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
     /// queue mutation (retraction or an editing flip to under-edit) left an
     /// idle agent with an empty ready-to-send queue. Without this, a watch
@@ -3081,9 +3124,28 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     ///
-    /// Returns whether the event was classified as an interim idle, so the
-    /// caller's group-seal decision (`handle_completion_event`) shares this
-    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    /// Idle-visibility deferral (issue intent-hq/monorepo#1468): an
+    /// `agent:idle` for a child that itself holds live outgoing completion
+    /// watches on other, unsettled agents is also not its real completion —
+    /// the child will run again when a watched target completes. Such an
+    /// agent-waiting idle defers WATCH delivery exactly like a hook-waiting
+    /// one (ungrouped watches neither deliver nor retire; grouped memberships
+    /// skip the settlement record), classified LIVE at delivery time via
+    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the 2-cycle
+    /// deadlock guard). Unlike the hook/queue cases, agent-waiting does NOT
+    /// defer the child's OWN after_all group seal — an after_all coordinator
+    /// always holds grouped outgoing watches on its own children, so gating
+    /// the seal on agent-waiting would deadlock the group. The interim-skip
+    /// marker is reused, and the backstop paths (`agent.unwatch`,
+    /// `agent.cancelSubscriptions`, group settlement) re-run
+    /// [`Services::redeliver_completion_after_queue_mutation`] so a deferred
+    /// watch settles when the child's last outgoing watch disappears without
+    /// a wake.
+    ///
+    /// Returns whether the event was classified as a SEAL-interim idle
+    /// (queue/busy/hook — NOT agent-waiting), so the caller's group-seal
+    /// decision (`handle_completion_event`) shares this pass's snapshot
+    /// instead of re-probing the queue (monorepo#1281).
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
@@ -3114,14 +3176,36 @@ impl Services {
         // for groups; a hook-waiting one must not).
         let hook_waiting = event.event_type == AGENT_IDLE
             && !self.active_hooks_for_agent(child_id).await.is_empty();
-        let interim_idle = queue_interim || hook_waiting;
+        // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
+        // `agent:idle` for a child that itself holds live outgoing completion
+        // watches on other, unsettled agents is not its real completion — it
+        // will run again when a watched target completes. Classified LIVE at
+        // delivery time (like the hook probe) and with the 2-cycle deadlock
+        // guard baked into the predicate. This defers WATCH delivery only; it
+        // must NOT defer the child's own after_all group seal (see the
+        // `watch_interim` vs. `seal_interim` split below): a coordinator that
+        // delegated with `after_all` always holds grouped outgoing watches on
+        // its own children, so gating the seal on agent-waiting would deadlock
+        // the group (the seal is what ends the coordinator's delegating turn).
+        let agent_waiting =
+            event.event_type == AGENT_IDLE && self.agent_is_waiting_on_agents(child_id);
+        // Two interim notions:
+        // - `seal_interim` (queue/busy/hook): the child may run ANOTHER turn
+        //   that delegates more children, so its open after_all group is not
+        //   final — the caller must not seal. Agent-waiting is excluded: the
+        //   post-wait turn reopens a FRESH group, so the current one seals now.
+        // - `watch_interim`: seal-interim OR agent-waiting — the child has not
+        //   settled, so its ungrouped watchers neither deliver nor retire and
+        //   its grouped memberships skip the settlement record.
+        let seal_interim = queue_interim || hook_waiting;
+        let interim_idle = seal_interim || agent_waiting;
         // monorepo#1280/#1281: record the interim skip up front — even when
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle (or, for a
-        // hook-deferred idle, the last active hook's terminal transition)
-        // can synthesize the real completion (redelivering any skipped
-        // watches AND sealing a watchless coordinator's open after_all
-        // group).
+        // hook- or agent-deferred idle, the last active hook's terminal
+        // transition or the last outgoing watch's removal) can synthesize the
+        // real completion (redelivering any skipped watches AND sealing a
+        // watchless coordinator's open after_all group).
         if interim_idle {
             self.mark_interim_skipped_idle(child_id);
         }
@@ -3171,22 +3255,28 @@ impl Services {
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
-                // Idle-visibility deferral: a hook-waiting idle is NOT
-                // settlement — the child will run again when a hook
-                // dispatches, fails, or expires, so recording it now would
-                // let the group fire while the child still works. Skip the
-                // record and leave the grouped watch armed; the child's
-                // genuine completion (post-hook idle, failure, deletion, or
-                // the external-cancel redelivery) records normally. Unlike
-                // the queue-interim case below, grouped watches DO defer
-                // here: a hook-waiting child is bounded by the hook TTL
-                // (§5.40), so the group cannot hang forever.
-                if hook_waiting && event.event_type == AGENT_IDLE {
+                // Idle-visibility deferral: a hook-waiting OR agent-waiting
+                // idle is NOT settlement — the child will run again when a
+                // hook dispatches / fails / expires, or when a watched target
+                // completes, so recording it now would let the group fire
+                // while the child still works. Skip the record and leave the
+                // grouped watch armed; the child's genuine completion
+                // (post-hook / post-wait idle, failure, deletion, or the
+                // last-outgoing-watch-removal redelivery) records normally.
+                // Unlike the queue-interim case below, grouped watches DO
+                // defer here: a hook-waiting child is bounded by the hook TTL
+                // (§5.40) and an agent-waiting child is bounded by its watched
+                // target's completion (plus the 2-cycle guard), so the group
+                // cannot hang forever. NB this defers this child's record in
+                // ITS parent's group; the child's OWN after_all group seal is
+                // gated separately on `seal_interim` (which excludes
+                // agent-waiting) so an after_all coordinator never deadlocks.
+                if (hook_waiting || agent_waiting) && event.event_type == AGENT_IDLE {
                     tracing::debug!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         group = %gid,
-                        "deferring grouped agent:idle settlement — child owns active background hooks"
+                        "deferring grouped agent:idle settlement — child owns active background hooks or outgoing agent watches"
                     );
                     continue;
                 }
@@ -3259,19 +3349,20 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-/busy-/hook-aware completion): the child
-            // still has ready-to-send queued messages, a turn already in
-            // flight, or active background hooks it is waiting on, so this
-            // idle is not its real completion — deliver nothing and leave
-            // the watch (including a report_delivered one, which retires at
-            // the real completion) armed for the settlement that follows
-            // the queue drain / running turn / hook resolution. The
+            // Interim idle (queue-/busy-/hook-/agent-waiting completion): the
+            // child still has ready-to-send queued messages, a turn already
+            // in flight, active background hooks, or outgoing watches on
+            // unsettled agents it is waiting on, so this idle is not its real
+            // completion — deliver nothing and leave the watch (including a
+            // report_delivered one, which retires at the real completion)
+            // armed for the settlement that follows the queue drain / running
+            // turn / hook resolution / watched-target completion. The
             // interim-skip marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, or active background hooks (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, active background hooks, or outgoing agent watches (interim idle)"
                 );
                 continue;
             }
@@ -3351,14 +3442,19 @@ impl Services {
             self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                 .await;
         }
-        // monorepo#1280: `interim_idle` was snapshotted at entry; a
+        // monorepo#1280: `seal_interim` was snapshotted at entry; a
         // retraction that emptied the queue in the window between that
         // snapshot and the marker landing found no marker and no-op'd —
         // re-check now and hand off to the mutation-path redelivery (its
         // guards make this a no-op unless the queue really emptied and the
         // agent is idle). The indirect async recursion is depth-1: the
         // synthetic redelivery's event is non-interim by construction
-        // (queue empty), so its own pass never re-enters here.
+        // (queue empty), so its own pass never re-enters here. An
+        // agent-waiting-only idle (issue intent-hq/monorepo#1468) is
+        // deliberately excluded here — it has no queue-race to heal and its
+        // synthetic pass would re-classify as agent-waiting (a loop); its
+        // deferred watches settle via the backstop paths that re-run
+        // redelivery when the last outgoing watch is removed.
         //
         // monorepo#1297: a BUSY-classified interim skip reaches this re-check
         // on every pass (its queue is empty by definition). While the turn is
@@ -3369,10 +3465,16 @@ impl Services {
         // empty raced-drain arm) together heal it — whichever runs after the
         // slot release observes marker + empty queue + not busy and
         // synthesizes the real completion.
-        if interim_idle && !self.has_ready_to_send(child_id) {
+        if seal_interim && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
-        interim_idle
+        // Return the SEAL-interim classification (queue/busy/hook), NOT
+        // agent-waiting: the caller's after_all group-seal decision must NOT
+        // be blocked by agent-waiting (an after_all coordinator always holds
+        // grouped outgoing watches on its own children, so gating the seal on
+        // agent-waiting would deadlock the group — the seal is what ends the
+        // coordinator's delegating turn).
+        seal_interim
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
@@ -3425,6 +3527,16 @@ impl Services {
         }
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
             .await;
+        // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+        // settlement dropped the parent's grouped outgoing watches, which may
+        // have been its last waiting reason. Re-run the mutation-path
+        // redelivery so a watch on the parent whose `agent:idle` was deferred
+        // now settles. Normally a no-op — the aggregated wake above enqueued a
+        // message to the parent, so `has_ready_to_send` short-circuits — but
+        // it settles the deferred watch if that delivery failed. Box::pin
+        // breaks the try_fire_group → redeliver → deliver → try_fire_group
+        // async-recursion cycle this edge closes.
+        Box::pin(self.redeliver_completion_after_queue_mutation(&group.parent_agent_id)).await;
     }
 
     /// Handle sandbox merge-back on agent completion.
