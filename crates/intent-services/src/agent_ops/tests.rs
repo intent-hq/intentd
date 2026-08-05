@@ -10690,6 +10690,301 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     );
 }
 
+// ===========================================================================
+// Agent-waiting deferral in live completion-watch delivery
+// (issue intent-hq/monorepo#1468)
+// ===========================================================================
+
+/// Agent-waiting deferral: a watched child (B) that goes idle while itself
+/// holding a live outgoing watch on a third agent (C) delivers NO wake and its
+/// watcher (A) STAYS ARMED — B is waiting on C, so its idle is not its real
+/// completion. When C later completes and B's next idle is hookless and
+/// watchless, A's watch fires exactly once.
+#[tokio::test]
+async fn agent_waiting_idle_defers_watch_until_target_settles() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    // A watches B; B watches C (a chain A→B→C).
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    // B idles while it still watches C: deferred — no wake, A's watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "no wake while B waits on C"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "A's watch stays armed through B's deferred idle"
+    );
+
+    // C completes: B's watch on C fires and retires (C's watchers cleared).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert!(
+        svc.find_watches_for_child(&c).is_empty(),
+        "B's watch on C retires at C's completion"
+    );
+
+    // B idles again — now watchless — its real completion fires A's watch once.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0, "lastResponseSummary": "reviewer done, wrapped up" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1);
+    let text = parent_messages_text(&svc, &a).await;
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at B's real completion"
+    );
+}
+
+/// Agent-waiting deferral backstop via `agent.unwatch`: after B's idle is
+/// deferred (it watches C), removing B's outgoing watch on C outside the wake
+/// path settles A's deferred watch — B's last waiting reason is gone.
+#[tokio::test]
+async fn agent_unwatch_settles_deferred_watcher() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+    assert_eq!(svc.find_watches_for_child(&b).len(), 1);
+
+    // B unwatches C: the backstop redelivery synthesizes B's real completion.
+    svc.agent_unwatch_op(ws.clone(), b.clone(), None, Some(c.clone()))
+        .await
+        .expect("unwatch C");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "removing B's last outgoing watch settles A's deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at the backstop completion"
+    );
+}
+
+/// Agent-waiting deferral backstop via `agent.cancelSubscriptions` (sweep-all):
+/// after B's idle is deferred, cancelling all of B's subscriptions settles A's
+/// deferred watch.
+#[tokio::test]
+async fn cancel_subscriptions_settles_deferred_watcher() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+
+    svc.agent_cancel_subscriptions_op(ws.clone(), b.clone(), None, None)
+        .await
+        .expect("cancel all");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "cancelling B's subscriptions settles A's deferred watch"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// 2-cycle deadlock guard: A⇄B watch each other and both are idle. B's idle
+/// must NOT defer (the mutual-idle pair would deadlock otherwise) — A's watch
+/// on B fires as before.
+#[tokio::test]
+async fn mutual_idle_two_cycle_does_not_defer() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), a.clone(), None)
+        .expect("B watches A");
+
+    // The predicate itself: neither side counts the mutual-idle edge.
+    assert!(
+        !svc.agent_is_waiting_on_agents(&b),
+        "mutual-idle 2-cycle is not a waiting reason"
+    );
+
+    // B idles: not deferred — A's watch on B fires immediately.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "mutual-idle 2-cycle delivers as before (no deadlock)"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Agent-waiting deferral (grouped): a parent P delegates child B in an
+/// after_all group, and B itself watches C. B idling while it watches C does
+/// NOT record in P's group — the sealed group stays open. When C completes and
+/// B idles again (watchless), the group settles with one aggregated wake.
+#[tokio::test]
+async fn after_all_group_waits_for_agent_waiting_child() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch P→B");
+    // B watches C (ungrouped) — its own waiting reason.
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    // B idles while watching C: NOT recorded as settled in P's group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    // P idles: the group seals but stays open — B is unsettled.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &p,
+        json!({ "agentId": p.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &p).await,
+        0,
+        "sealed group waits for the agent-waiting child"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "grouped watch survives B's deferred idle"
+    );
+
+    // C completes (retires B's watch on C), then B idles watchless: the group
+    // records the real completion and fires exactly one aggregated wake.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &p).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    let text = parent_messages_text(&svc, &p).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Terminal signals are never agent-waiting-deferred: a watched child that
+/// FAILS while holding an outgoing watch still wakes its watcher immediately.
+#[tokio::test]
+async fn agent_failed_wakes_immediately_despite_outgoing_watch() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &b,
+        json!({ "agentId": b.0, "error": "turn exploded" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "failure wake is immediate regardless of outgoing watches"
+    );
+    let text = parent_messages_text(&svc, &a).await;
+    assert!(text.contains("failed"), "{text}");
+}
+
 /// Idle-visibility on the read surfaces: `agent.get`/`agent.list` overlay
 /// `waitingOnHooks` for hook-owning agents (omitted when empty) and
 /// `agent.diagnostics` agent rows carry the same list.
