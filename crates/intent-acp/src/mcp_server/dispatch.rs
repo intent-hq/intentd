@@ -441,6 +441,7 @@ async fn workspace_host_dispatch(
         &workspace_id,
         &caller_agent_id,
         turn_attachments.as_ref(),
+        agent_features,
         method,
         &args,
     )
