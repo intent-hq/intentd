@@ -697,77 +697,43 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
     .expect("response timeout")
 }
 
-/// `pr.capabilities` over the wire (PROTOCOL §5.7 extension): returns the
-/// provider id plus the camelCase capability flags, and requires only a
-/// resolvable provider — the seeded workspace is linked, but the flags do not
-/// depend on any PR state.
+/// Protocol v5.0 regression (monorepo#1506): the 11 removed `pr.*` methods
+/// fall through the router match to the normal unknown-method path — `-32601
+/// Method not found` over the wire — while `pr.status` / `pr.refresh` stay
+/// recognized (asserted by the other tests in this file).
 #[tokio::test]
-async fn pr_capabilities_returns_provider_flags_over_wss() {
+async fn removed_pr_methods_return_method_not_found_over_wss() {
     let fx = boot(StubForge::default()).await;
 
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let result = wss_rpc(
-        &mut rpc,
-        1,
+    for (id, method) in [
         "pr.capabilities",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(result["provider"], "stub");
-    let caps = &result["capabilities"];
-    assert_eq!(caps["draftPrs"], true);
-    assert_eq!(caps["squashMerge"], true);
-    assert_eq!(caps["rebaseMerge"], true);
-    assert_eq!(caps["reviewRequiredChanges"], true);
-    assert_eq!(caps["checkRuns"], true);
-    assert_eq!(caps["issues"], true);
-}
-
-/// Runtime capability gating over the wire (§7.2/§7.4): a provider without
-/// `squashMerge` rejects `pr.merge {mergeMethod:"squash"}` with `-32603` and
-/// the stable `unsupported by provider:` message prefix; `pr.capabilities`
-/// reflects the same disabled flags.
-#[tokio::test]
-async fn pr_merge_squash_gated_by_capabilities_over_wss() {
-    let fx = boot(StubForge {
-        caps: Some(ScCapabilities {
-            draft_prs: false,
-            squash_merge: false,
-            rebase_merge: false,
-            review_required_changes: false,
-            check_runs: false,
-            issues: false,
-        }),
-        ..Default::default()
-    })
-    .await;
-
-    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let caps = wss_rpc(
-        &mut rpc,
-        1,
-        "pr.capabilities",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(caps["capabilities"]["squashMerge"], false);
-
-    let resp = wss_rpc_raw(
-        &mut rpc,
-        2,
+        "pr.listComments",
+        "pr.listReviewComments",
+        "pr.getReviews",
+        "pr.listCheckRuns",
         "pr.merge",
-        json!({ "workspaceId": fx.ws_id.as_str(), "mergeMethod": "squash" }),
-    )
-    .await;
-    let err = &resp["error"];
-    assert_eq!(err["code"], -32603, "error envelope: {resp}");
-    assert_eq!(err["message"], "Internal error", "error envelope: {resp}");
-    // The stable detail rides in `error.data` (PROTOCOL §9 envelope).
-    assert!(
-        err["data"]
-            .as_str()
-            .unwrap()
-            .starts_with("unsupported by provider:"),
-        "error envelope: {resp}"
-    );
+        "pr.updateBranch",
+        "pr.postComment",
+        "pr.replyToReviewComment",
+        "pr.resolveThread",
+        "pr.createReview",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = wss_rpc_raw(
+            &mut rpc,
+            id as i64 + 1,
+            method,
+            json!({ "workspaceId": fx.ws_id.as_str() }),
+        )
+        .await;
+        let err = &resp["error"];
+        assert_eq!(err["code"], -32601, "{method} error envelope: {resp}");
+        assert_eq!(
+            err["message"], "Method not found",
+            "{method} error envelope: {resp}"
+        );
+    }
 }
