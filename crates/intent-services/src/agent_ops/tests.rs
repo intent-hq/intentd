@@ -10985,6 +10985,301 @@ async fn agent_failed_wakes_immediately_despite_outgoing_watch() {
     assert!(text.contains("failed"), "{text}");
 }
 
+/// Agent-waiting deferral at registration-time reconciliation: re-arming
+/// `agent.watch` on a child that is RuntimeIdle WITH a completion report (the
+/// STAB-108 "genuinely complete" shape) but still holding an outgoing watch on
+/// a third agent does NOT fire synthetically — the watch stays armed, and the
+/// `agent.unwatch` backstop settles it when the waiting reason disappears.
+#[tokio::test]
+async fn rearm_watch_on_agent_waiting_idle_child_stays_armed() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    // B looks genuinely complete by the STAB-108 predicate (RuntimeIdle +
+    // report, no interrupted row) — only its outgoing watch on C defers.
+    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("waiting on my reviewer".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark B");
+
+    svc.agent_watch_op(ws.clone(), a.clone(), b.clone())
+        .await
+        .expect("A re-arms watch on B");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        0,
+        "no synthetic fire while B waits on C"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&b).len(),
+        1,
+        "A's watch stays armed"
+    );
+
+    // Backstop: B unwatching C removes its last waiting reason — the
+    // deferred reconciliation (marker recorded) settles A's watch.
+    svc.agent_unwatch_op(ws.clone(), b.clone(), None, Some(c.clone()))
+        .await
+        .expect("unwatch C");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "removing B's last outgoing watch settles A's deferred watch"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Registration-time reconciliation still fires immediately on a FAILED child
+/// regardless of its outgoing watches (terminal signals are never
+/// agent-waiting-deferred).
+#[tokio::test]
+async fn rearm_watch_on_failed_child_with_outgoing_watch_fires_immediately() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    s.status = intent_core::AgentStatus::Error;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark B failed");
+
+    svc.agent_watch_op(ws.clone(), a.clone(), b.clone())
+        .await
+        .expect("A watches failed B");
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "failed child reconciles immediately despite its outgoing watch"
+    );
+    let text = parent_messages_text(&svc, &a).await;
+    assert!(text.contains("failed"), "{text}");
+}
+
+/// Agent-waiting deferral across a restart: a rehydrated watch on a child
+/// that is RuntimeIdle + report but itself watches a third agent must not
+/// refire at boot. Also verifies the heal ordering — ALL persisted rows load
+/// into the registry before any child reconciliation runs, so B's outgoing
+/// watch on C is visible to the waiting classification.
+#[tokio::test]
+async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (a, b, c) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let a = create_agent(&svc, &ws, "A").await;
+        let b = create_agent(&svc, &ws, "B").await;
+        let c = create_agent(&svc, &ws, "C").await;
+        svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+            .expect("A watches B");
+        svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+            .expect("B watches C");
+        wait_for_persisted_watches(&svc, 2).await;
+        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("waiting on my reviewer".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark B");
+        (a, b, c)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 2, "both watches rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &a).await,
+        0,
+        "no synthetic wake at boot while B holds an outgoing watch on C"
+    );
+    assert_eq!(
+        restarted.find_watches_for_child(&b).len(),
+        1,
+        "A's rehydrated watch stays armed"
+    );
+    assert_eq!(
+        restarted.find_watches_for_child(&c).len(),
+        1,
+        "B's rehydrated watch on C stays armed too"
+    );
+}
+
+/// Agent-waiting deferral in group rehydration: an after_all group whose
+/// child is RuntimeIdle + report but itself watches a third agent does NOT
+/// record that child at rehydration — the group stays open (no aggregated
+/// wake) until the child's genuine completion. Group rehydration runs BEFORE
+/// the watch registry loads at startup, so this exercises the persisted-row
+/// (durable) waiting classification.
+#[tokio::test]
+async fn group_rehydration_skips_agent_waiting_idle_child() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (p, b, c) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let p = create_agent(&svc, &ws, "P").await;
+        let b = create_agent(&svc, &ws, "B").await;
+        let c = create_agent(&svc, &ws, "C").await;
+        svc.app_agents_wait_op(
+            ws.clone(),
+            p.clone(),
+            vec![b.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all");
+        svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+            .expect("B watches C");
+        wait_for_persisted_watches(&svc, 2).await;
+        // Wait for the group row to persist (the upsert is spawned).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list persisted groups");
+            if !rows.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("waiting on my reviewer".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark B");
+        (p, b, c)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    // Startup order: groups rehydrate FIRST (watch registry still empty —
+    // the durable classification reads the persisted watch rows).
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate groups");
+    assert_eq!(loaded, 1, "group rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &p).await,
+        0,
+        "group did not fire at rehydration while B waits on C"
+    );
+    let group = restarted
+        .delegation_group_for_parent(&p)
+        .expect("group stays open");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "B not recorded as settled"
+    );
+    // Then watches heal (grouped P→B finds its live group; B→C loads too)
+    // and B's reconciliation defers again on the in-memory registry.
+    restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(parent_message_count(&restarted, &p).await, 0);
+    assert_eq!(restarted.find_watches_for_child(&b).len(), 1);
+
+    // C completes (retires B's watch on C), then B's real idle records and
+    // the sealed group settles with one aggregated wake.
+    restarted
+        .handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &c,
+            json!({ "agentId": c.0 }),
+        ))
+        .await;
+    restarted
+        .handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &b,
+            json!({ "agentId": b.0, "lastResponseSummary": "reviewer done" }),
+        ))
+        .await;
+    assert_eq!(
+        parent_message_count(&restarted, &p).await,
+        1,
+        "one aggregated wake after B's genuine completion"
+    );
+    assert!(restarted.delegation_group_for_parent(&p).is_none());
+}
+
+/// Agent-waiting deferral in the pre-publish group record: an idle agent
+/// holding an outgoing watch skips its group settlement record; the same call
+/// records once the waiting reason is gone.
+#[tokio::test]
+async fn pre_publish_group_record_skips_agent_waiting_child() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch P→B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+
+    // B idles while it watches C: pre-publish must NOT record it.
+    svc.record_group_completion_pre_publish(&ws, &b, &json!({ "agentId": b.0 }))
+        .await;
+    let group = svc.delegation_group_for_parent(&p).expect("group exists");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "agent-waiting child not recorded pre-publish"
+    );
+
+    // C settles B's outgoing watch; the same pre-publish call now records.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    svc.record_group_completion_pre_publish(&ws, &b, &json!({ "agentId": b.0 }))
+        .await;
+    let group = svc.delegation_group_for_parent(&p).expect("group exists");
+    assert!(
+        group.completed_agent_ids.contains(&b),
+        "child records once the waiting reason is gone"
+    );
+}
+
 /// Idle-visibility on the read surfaces: `agent.get`/`agent.list` overlay
 /// `waitingOnHooks` for hook-owning agents (omitted when empty) and
 /// `agent.diagnostics` agent rows carry the same list.
