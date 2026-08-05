@@ -262,6 +262,17 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
         .unwrap_or_else(|| intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.to_string())
 }
 
+/// True iff `base_uri` is the production github.com login host — the shared
+/// gate for gh CLI side effects (login sync on authorize, logout on revoke):
+/// a mock-host flow (test seam) stores a token gh cannot use, and touching
+/// `gh` from it would reach the host's real login state from tests. Trailing
+/// slashes are insignificant ("https://github.com/" is the same host), so
+/// normalize before comparing.
+pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
+    base_uri.trim_end_matches('/')
+        == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/')
+}
+
 /// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
 /// loopback host (`127.0.0.1`, `localhost`, `[::1]`).
 fn is_safe_login_base_uri(uri: &str) -> bool {
