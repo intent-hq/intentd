@@ -2763,7 +2763,10 @@ async fn dispatch(
         }
         "search.messages" => {
             // `workspaceId` is optional (absent → global search across all
-            // workspaces); `preferWorkspaceId` is a soft ranking boost.
+            // workspaces); `preferWorkspaceId` is a soft ranking boost, and
+            // archived-workspace matches get a soft penalty on the same
+            // bm25-unit scale, yielding the default tier order preferred →
+            // other active → archived.
             let ws = opt_workspace_id(params);
             let query = require_str_param(params, "query")?;
             let agent_id = opt_str(params, "agentId");
