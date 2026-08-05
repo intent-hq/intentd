@@ -23,6 +23,8 @@ Use the `gh` CLI for all GitHub work: creating PRs (`gh pr create`), status and 
 
 Use the plain `git` CLI for status, staging, diffs, and merge checks. The one git binding, `ws.git.commit(message, { files?, userRequested? })`, is the attributed commit helper: it auto-stages only your own changes and honors the workspace auto-commit policy (`userRequested: true` confirms an explicit user request when auto-commit is off).
 
+If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs (or GitHub is connected in app setup), and `ws.pr.snapshot` fails gracefully with a not-configured error. The daemon resolves its token as: secrets store → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh` CLI.
+
 ## Note Editing
 
 | Goal | Tool |
