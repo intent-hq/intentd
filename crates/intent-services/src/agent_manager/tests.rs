@@ -1420,7 +1420,7 @@ fn track_mock_agent_inner(
 fn test_provider() -> intent_providers::ProviderConfig {
     intent_providers::ProviderConfig {
         supports_authenticate: false,
-        ..*intent_providers::provider_config(intent_providers::default_provider_id())
+        ..*intent_providers::provider_config(intent_providers::first_provider_id())
     }
 }
 
@@ -7498,10 +7498,7 @@ async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
     let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
-    assert_eq!(
-        resolved.provider.id,
-        intent_providers::default_provider_id()
-    );
+    assert_eq!(resolved.provider.id, intent_providers::first_provider_id());
     assert!(resolved.model.is_none(), "no model selected");
     assert!(resolved.extra_env.is_empty());
     assert_eq!(resolved.cwd, std::env::temp_dir());

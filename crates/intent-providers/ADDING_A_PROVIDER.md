@@ -205,11 +205,11 @@ certainly needs new normalization arms:
   `crates/intent-providers/src/models.rs`); the bare part feeds `model_flag` /
   `session/set_model`, and the prefix feeds provider resolution (`resolve_provider_id`,
   `crates/intent-services/src/agent_session.rs`: compound prefix → session `provider`
-  field → default). Providers with a static catalog get a `PROVIDER_MODEL_TIERS` entry
-  (tier fallbacks for delegation); dynamic-catalog providers (opencode, droid) are
-  intentionally omitted. Cross-provider overrides go through `normalize_model_override`
-  and `resolve_preferred_model`. codex additionally splits reasoning effort from the
-  model id (`parse_codex_reasoning_effort`).
+  field → settings-derived default → first registered provider). Model discovery is
+  fully dynamic (`models.list` sources, `crates/intent-services/src/model_catalog.rs`);
+  there is no static tier catalog. Fuzzy model matching against a dynamic pool goes
+  through `resolve_preferred_model`. codex additionally splits reasoning effort from
+  the model id (`parse_codex_reasoning_effort`).
 
 ## 7. Tests and gates
 

@@ -5085,8 +5085,9 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
-/// daemon's default provider.
-fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
+/// settings-derived default provider (provider of `model.default`, else
+/// `providers.active`), bottoming out at the first registered provider.
+fn specialist_preview_provider(services: &Services, provider: Option<String>) -> Result<String> {
     match nonempty_owned(provider) {
         Some(p) => {
             if intent_providers::find_provider(&p).is_none() {
@@ -5094,7 +5095,10 @@ fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
             }
             Ok(p)
         }
-        None => Ok(intent_providers::default_provider_id().to_string()),
+        None => Ok(
+            agent_session::derived_default_provider(&services.effective_settings())
+                .unwrap_or_else(|| intent_providers::first_provider_id().to_string()),
+        ),
     }
 }
 
@@ -8729,7 +8733,7 @@ impl WorkspaceApi for Services {
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let provider = specialist_preview_provider(provider)?;
+            let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().list(ws_path)?;
             if let Some(specs) = result
@@ -8751,7 +8755,7 @@ impl WorkspaceApi for Services {
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let provider = specialist_preview_provider(provider)?;
+            let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().get(&id, ws_path)?;
             if let Some(def) = result.get_mut("specialist") {

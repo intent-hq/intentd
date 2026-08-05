@@ -29,7 +29,7 @@ use crate::agent_ops::{
     fetch_auggie_models, fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows,
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
     parse_model_list_json, parse_model_list_output, parse_session_stats_output,
-    resolve_auggie_bin_with, static_models,
+    resolve_auggie_bin_with,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -3617,7 +3617,7 @@ async fn create_records_session_started_usage_stats() {
             .sum()
     };
     assert_eq!(sessions_for("Opus 4.8"), 1);
-    assert_eq!(sessions_for(intent_providers::default_provider_id()), 1);
+    assert_eq!(sessions_for(intent_providers::first_provider_id()), 1);
     assert_eq!(sessions_for("unknown"), 0);
     // Both ticks carry the resolved provider id — the compound prefix for the
     // explicit model, the default provider for the no-model create.
@@ -3629,8 +3629,8 @@ async fn create_records_session_started_usage_stats() {
     };
     assert_eq!(provider_for("Opus 4.8"), vec!["auggie"]);
     assert_eq!(
-        provider_for(intent_providers::default_provider_id()),
-        vec![intent_providers::default_provider_id()]
+        provider_for(intent_providers::first_provider_id()),
+        vec![intent_providers::first_provider_id()]
     );
     assert!(
         rows.iter().all(|r| r.bucket_utc.ends_with(":00:00Z")),
@@ -3673,14 +3673,34 @@ async fn set_model_rejects_unknown_provider() {
 
 /// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
 /// an incident-shaped payload — an explicit `provider` plus a bare model id
-/// provably owned by another provider's *static* tiers. Dynamic-only models
-/// absent from `PROVIDER_MODEL_TIERS` (the actual incident model `fable-5`)
-/// are covered by cached-catalog evidence instead — see
+/// whose ownership by that provider is affirmatively disproven by cached
+/// catalogs (another provider's cache claims the id AND the requested
+/// provider's own cache lacks it). See also
 /// [`create_rejects_bare_dynamic_model_via_cached_catalog`].
 #[tokio::test]
 async fn create_rejects_bare_model_owned_by_other_provider() {
     let (_t, svc, ws) = setup().await;
-    // Incident shape: explicit grok provider + bare auggie static-tier model.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "cortex",
+        "",
+        vec![json!({ "id": "claude-sonnet-4-5", "name": "Sonnet", "provider": "cortex" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    // Incident shape: explicit grok provider + bare model claimed by auggie's
+    // cached catalog and absent from grok's.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
         ..Default::default()
@@ -3708,9 +3728,9 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
         msg.contains("auggie"),
         "owning provider must be named: {msg}"
     );
-    // Default-provider path (no provider param): a bare model owned
-    // exclusively by another provider is validated against the default
-    // provider (auggie) the same way.
+    // Derived-default path (no provider param, no settings): the guard runs
+    // against the first registered provider (auggie), whose cache disproves
+    // ownership of the cortex-claimed id the same way.
     let err = svc
         .agent_create_op(
             ws.clone(),
@@ -3734,13 +3754,13 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
     assert!(agents.is_empty(), "no session row persisted: {agents:?}");
 }
 
-/// Bare model ids pass `agent.create` when the provider matches the static
-/// tier owner, or when no static tier claims the id at all (dynamic-only
-/// model lists — ownership cannot be proven).
+/// Bare model ids pass `agent.create` when the provider's own cached catalog
+/// claims the id, or when no cached evidence disproves ownership (cold
+/// caches — ownership cannot be proven).
 #[tokio::test]
 async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     let (_t, svc, ws) = setup().await;
-    // Matching provider passes.
+    // With cold caches ownership cannot be proven, so bare ids pass.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("auggie".into()),
         ..Default::default()
@@ -3757,7 +3777,7 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     )
     .await
     .expect("matching provider + bare model");
-    // Bare id unknown to every static tier passes for any provider (grok's
+    // Bare id unknown to every cached catalog passes for any provider (grok's
     // model list is dynamic-only).
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
@@ -3774,11 +3794,11 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
         extra,
     )
     .await
-    .expect("bare id unknown to every static tier");
-    // Cold start (monorepo#607): grok + bare `fable-5`, an auggie *dynamic*
-    // model absent from `PROVIDER_MODEL_TIERS`, passes while no cached
-    // catalog provides ownership evidence — absence of evidence is not a
-    // mismatch. With a warm auggie cache the same payload is rejected — see
+    .expect("bare id unknown to every cached catalog");
+    // Cold start (monorepo#607): grok + bare `fable-5`, an auggie dynamic
+    // model, passes while no cached catalog provides ownership evidence —
+    // absence of evidence is not a mismatch. With a warm auggie cache the
+    // same payload is rejected — see
     // `create_rejects_bare_dynamic_model_via_cached_catalog`.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
@@ -3796,9 +3816,8 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     )
     .await
     .expect("cold start: bare fable-5 + grok passes without cache evidence");
-    // The literal "default" id is claude-code's smart-tier *sentinel* ("use
-    // the CLI default"), not an ownership claim — it must pass for every
-    // provider.
+    // The literal "default" id is a "use the CLI default" *sentinel*, not an
+    // ownership claim — it must pass for every provider.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
         ..Default::default()
@@ -4024,6 +4043,23 @@ async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
 #[tokio::test]
 async fn set_model_rejects_bare_model_owned_by_other_provider() {
     let (_t, svc, ws) = setup().await;
+    // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it —
+    // ownership by auggie is affirmatively disproven.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "haiku", "name": "Haiku", "provider": "claude-code" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
     // create_agent yields an auggie session (provider derived from the
     // compound model prefix).
     let id = create_agent(&svc, &ws, "BareGuard").await;
@@ -4051,21 +4087,36 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
         after.provider, before.provider,
         "provider must be unchanged"
     );
-    // Bare id unknown to every static tier still passes.
+    // Bare id unknown to every cached catalog still passes.
     svc.agent_set_model_op(id, "some-dynamic-model".into())
         .await
-        .expect("bare id unknown to every static tier");
+        .expect("bare id unknown to every cached catalog");
 }
 
 /// `agent.setModel` normalizes legacy default-provider aliases persisted on
 /// old sessions (`default`/`acp`/`augment` — `DEFAULT_PROVIDER_ALIASES`)
 /// before the bare-model ownership comparison: a session whose raw
-/// `session.provider` is `"acp"` spawns the default provider (auggie), so a
-/// bare auggie model must pass, and a bare model owned by a *different*
-/// provider is still rejected naming the normalized provider.
+/// `session.provider` is `"acp"` spawns the first registered provider
+/// (auggie), so a bare auggie model must pass, and a bare model owned by a
+/// *different* provider is still rejected naming the normalized provider.
 #[tokio::test]
 async fn set_model_normalizes_legacy_provider_aliases() {
     let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "haiku", "name": "Haiku", "provider": "claude-code" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
     let id = create_agent(&svc, &ws, "Alias").await;
     let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
     session.provider = Some("acp".into());
@@ -6290,28 +6341,18 @@ async fn summary_reports_counts_and_last_response() {
     assert_eq!(s["lastResponse"], "all done");
 }
 
+/// Regression (tier removal): with the auggie CLI unavailable,
+/// `agent.getModels` returns an empty model list — there is no static
+/// fallback catalog; the provider CLI owns model discovery.
 #[tokio::test]
-async fn get_models_returns_non_empty_catalog() {
-    let (_t, svc, _ws) = setup().await;
+async fn get_models_returns_empty_list_when_cli_unavailable() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let svc =
+        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     let res = svc.agent_get_models_op().await.expect("models");
     let models = res["models"].as_array().unwrap();
-    assert!(!models.is_empty());
-    assert!(models[0].get("id").is_some());
-    assert!(models[0].get("provider").is_some());
-}
-
-#[test]
-fn static_models_dedupes_and_labels_by_tier() {
-    let models = static_models();
-    assert!(models
-        .iter()
-        .any(|m| m["id"] == "haiku4.5" && m["name"] == "haiku4.5 (fast)"));
-    // cortex opus appears once though it is both balanced + smart.
-    let opus = models
-        .iter()
-        .filter(|m| m["provider"] == "cortex" && m["id"] == "claude-opus-4-5")
-        .count();
-    assert_eq!(opus, 1);
+    assert!(models.is_empty(), "no static fallback: {models:?}");
 }
 
 #[test]

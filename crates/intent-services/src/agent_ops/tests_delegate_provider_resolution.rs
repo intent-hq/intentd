@@ -3,14 +3,15 @@
 //!
 //! `agent.delegate` has no `provider` param on the wire (PROTOCOL §5.5), so
 //! before these tests the daemon left `AgentCreateExtra.provider` unset and
-//! the spawn path fell through to the hardcoded
-//! [`intent_providers::default_provider_id`] (Auggie) regardless of the
-//! user's actual configured default (`providers.active`). Covers the
+//! the spawn path fell through to the then-hardcoded default provider
+//! (Auggie) regardless of the user's actual configured default. Covers the
 //! resolution order:
 //! 1. specialist frontmatter `codingAgent` (or a compound `model` prefix)
-//! 2. the configured default (`providers.active`)
+//! 2. the settings-derived default
+//!    ([`crate::agent_session::derived_default_provider`]: registered
+//!    `model.default` compound prefix, else registered `providers.active`)
 //! 3. neither resolvable/available → a clear caller-surfaceable error, never
-//!    the hardcoded default provider
+//!    a hardcoded/positional default provider
 //!
 //! The `mock` provider ([`intent_providers::ACP_PROVIDERS`]) is used as the
 //! resolution target throughout: its availability is gated purely on the
@@ -93,6 +94,71 @@ async fn delegate_with_no_explicit_model_resolves_configured_default_provider() 
         got.provider.as_deref(),
         Some("mock"),
         "configured default provider persisted on the delegated session, not left unset/Auggie"
+    );
+}
+
+/// Within D2 step 2, the `model.default` compound prefix outranks
+/// `providers.active` — the derived default is the prefix's provider even
+/// when a different (also registered) `providers.active` is set.
+#[tokio::test]
+async fn delegate_model_default_prefix_outranks_providers_active() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    set(&svc, "model.default", json!("mock:test-model"));
+    // providers.active names a different registered provider; if the prefix
+    // did not outrank it, resolution would target codex (and fail on
+    // availability) rather than the available mock provider.
+    set(&svc, "providers.active", json!("codex"));
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate resolves the model.default prefix provider");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "model.default compound prefix outranks providers.active in the derived default"
+    );
+}
+
+/// An unknown `model.default` compound prefix is not trusted: it falls
+/// through to `providers.active` instead of hard-failing delegate with an
+/// unknown-provider error (or shadowing a valid configured default).
+#[tokio::test]
+async fn delegate_unknown_model_default_prefix_falls_through_to_active() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    set(&svc, "model.default", json!("typo:foo"));
+    set(&svc, "providers.active", json!("mock"));
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("unknown model.default prefix falls through instead of failing delegate");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "unknown model.default prefix falls through to providers.active"
     );
 }
 

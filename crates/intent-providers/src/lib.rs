@@ -33,8 +33,8 @@ pub use args::{
     UnslothEndpoint, UnslothModelLimit,
 };
 pub use config::{
-    all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,
-    default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
+    all_provider_ids, always_enabled_providers, auth_error_message, disableable_providers,
+    find_provider, first_provider_config, first_provider_id, is_provider_authentication_error,
     provider_config, InjectionMechanism, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
     PI_ACP_NPX_PACKAGE,
@@ -45,12 +45,10 @@ pub use discover::{
     NpxStatus, ProviderAvailability, SecondaryBinary,
 };
 pub use models::{
-    create_compound_model_id, default_model_for_provider, fuzzy_match_model_in_pool,
-    is_model_valid_for_provider, model_tier_from_model, normalize_model_override,
+    create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
     parse_codex_reasoning_effort, parse_compound_model_id, parse_grok_initialize_models,
     parse_grok_initialize_response_from_stdout, parse_grok_models_command_output,
-    providers_claiming_model, resolve_preferred_model, tiers_for, GrokModel,
-    GrokModelsCommandOutput, GrokParsedModels, ModelTier, ModelTiers, PROVIDER_MODEL_TIERS,
+    resolve_preferred_model, GrokModel, GrokModelsCommandOutput, GrokParsedModels,
 };
 
 #[cfg(test)]

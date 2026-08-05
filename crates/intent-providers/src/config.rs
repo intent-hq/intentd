@@ -141,8 +141,6 @@ pub struct ProviderConfig {
     pub mode_map: Option<&'static [(&'static str, &'static str)]>,
     /// Optional filter of available models for this provider.
     pub supported_models: Option<&'static [&'static str]>,
-    /// Whether this provider is the default/primary provider.
-    pub is_default: bool,
     /// Whether this provider can be disabled in settings.
     pub can_be_disabled: bool,
     /// Authentication error patterns used to detect auth failures.
@@ -205,7 +203,6 @@ impl ProviderConfig {
             remove_tool_flag: None,
             mode_map: None,
             supported_models: None,
-            is_default: false,
             can_be_disabled: false,
             auth_error_patterns: None,
             login_command_hint: None,
@@ -260,7 +257,6 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         mcp_config_flag: Some("--mcp-config"),
         quiet_flag: Some("--quiet"),
         remove_tool_flag: Some("--remove-tool"),
-        is_default: true,
         auth_error_patterns: Some(&[
             "authentication required",
             "auggie login",
@@ -426,19 +422,19 @@ pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
     ACP_PROVIDERS.iter().find(|p| p.id == provider_id)
 }
 
-/// The default/primary provider (the entry flagged `is_default`, else the
-/// first registered provider). Port of `getDefaultProviderConfig`.
-pub fn default_provider_config() -> &'static ProviderConfig {
+/// The first registered provider — a neutral positional last resort used
+/// ONLY when no settings-derived default (provider of `model.default`, else
+/// `providers.active`) is reachable. No provider carries a privileged
+/// default designation.
+pub fn first_provider_config() -> &'static ProviderConfig {
     ACP_PROVIDERS
-        .iter()
-        .find(|p| p.is_default)
-        .or_else(|| ACP_PROVIDERS.first())
+        .first()
         .expect("at least one ACP provider must be configured")
 }
 
-/// The default provider id. Port of `getDefaultProviderId`.
-pub fn default_provider_id() -> &'static str {
-    default_provider_config().id
+/// The first registered provider id (see [`first_provider_config`]).
+pub fn first_provider_id() -> &'static str {
+    first_provider_config().id
 }
 
 /// Legacy aliases for the default provider that are expected to miss the
@@ -446,18 +442,18 @@ pub fn default_provider_id() -> &'static str {
 /// suppression list in `getProviderConfig`.
 const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 
-/// Resolve a provider by id, falling back to the default when unknown.
-/// Unknown ids warn (see [`warns_on_unknown_provider`]) so registry gaps
-/// surface in logs instead of silently spawning the default agent.
-/// Port of `getProviderConfig`.
+/// Resolve a provider by id, falling back to the first registered provider
+/// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
+/// registry gaps surface in logs instead of silently spawning the fallback
+/// agent. Port of `getProviderConfig`.
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
     find_provider(provider_id).unwrap_or_else(|| {
-        let fallback = default_provider_config();
+        let fallback = first_provider_config();
         if warns_on_unknown_provider(provider_id) {
             tracing::warn!(
                 provider_id = provider_id,
                 fallback_id = fallback.id,
-                "unknown provider id; falling back to default provider"
+                "unknown provider id; falling back to the first registered provider"
             );
         }
         fallback
