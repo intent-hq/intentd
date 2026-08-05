@@ -284,16 +284,21 @@ fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value
 /// Leniently parse a frontmatter `modelOptions` scalar (the single-line
 /// JSON-array string). Files are never rejected on read: an unparseable value
 /// or a non-array yields `None` (treated like an omitted key, which inherits),
-/// and invalid entries are skipped individually. `Some(vec![])` is the
-/// explicit `[]` clear.
+/// and invalid entries are skipped individually. Only a literal `[]` is the
+/// explicit clear (`Some(vec![])`); a non-empty array whose entries are all
+/// unusable also yields `None`, so one bad hand-authored entry does not
+/// silently drop an inherited list.
 fn parse_model_options_frontmatter(raw: &str) -> Option<Vec<Value>> {
     let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
     let arr = parsed.as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(normalize_model_option_entry)
-            .collect(),
-    )
+    let normalized: Vec<Value> = arr
+        .iter()
+        .filter_map(normalize_model_option_entry)
+        .collect();
+    if normalized.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    Some(normalized)
 }
 
 /// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
@@ -1902,6 +1907,13 @@ mod tests {
             json!([{ "model": "opus4.5", "hint": "ok" }]),
             "invalid entries are skipped individually"
         );
+        let all_bad =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodelOptions: [{\"hint\":\"no model\"},{\"model\":\"\"}]\n---\n\nbody";
+        let def = build_def("z", all_bad, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("modelOptions").is_none(),
+            "a non-empty array with only unusable entries is treated as omitted, not a clear"
+        );
     }
 
     #[test]
@@ -1948,6 +1960,18 @@ mod tests {
             got["specialist"]["modelOptions"],
             json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
             "a non-empty list overrides wholesale, never merges"
+        );
+
+        // Non-empty but all-unusable → inherit, not clear.
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodelOptions: [{\"hint\":\"no model\"}]\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "smart" }]),
+            "an all-unusable non-empty array inherits instead of clearing"
         );
     }
 
