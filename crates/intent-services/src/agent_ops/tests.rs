@@ -18138,6 +18138,49 @@ async fn mark_seen_tolerates_dangling_ids() {
     assert_eq!(r["lastSeenMessageId"], json!(real.id));
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.last_seen_message_id(), Some(real.id.as_str()));
+
+    // Unknown NEW id over a resolvable current marker: the write-through is
+    // promised (PROTOCOL §5.5) — the gate only holds when BOTH sides resolve.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), "msg-unknown-2".to_string())
+        .await
+        .expect("mark unknown over real");
+    assert_eq!(r["lastSeenMessageId"], json!("msg-unknown-2"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some("msg-unknown-2"));
+}
+
+/// A non-object `agent_session.metadata` value is preserved under
+/// `priorNonObjectMetadata` when markSeen adds its marker (same defensive
+/// shape as `agent.dismissQuestions`, monorepo#751 review).
+#[tokio::test]
+async fn mark_seen_preserves_non_object_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    // Force the session's metadata column into a non-object shape — not
+    // reachable through the normal `agent.*` API, but defensively possible
+    // if the column is ever written to by another code path.
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!("legacy-string-metadata"));
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("force non-object metadata");
+
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("mark seen");
+
+    let after = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(after.last_seen_message_id(), Some("msg-1"));
+    assert_eq!(
+        after
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("priorNonObjectMetadata")),
+        Some(&json!("legacy-string-metadata")),
+        "prior non-object metadata must be preserved, not dropped"
+    );
 }
 
 /// The seen marker coexists with existing session metadata (including the
