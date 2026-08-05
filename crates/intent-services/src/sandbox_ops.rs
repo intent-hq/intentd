@@ -401,9 +401,7 @@ pub async fn merge_sandbox(
 
     // Auto-commit any dirty sandbox state (preserving agent attribution)
     if is_dirty(&sandbox_repo)? {
-        let sig = sandbox_repo
-            .signature()
-            .map_err(|e| Error::Internal(format!("get sandbox signature failed: {e}")))?;
+        let sig = resolve_signature(&sandbox_repo)?;
         let mut index = sandbox_repo
             .index()
             .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
@@ -847,6 +845,22 @@ fn restore_missing_tracked_files(
     Ok(())
 }
 
+/// Resolve a git signature for authoring commits, falling back to a stable
+/// default identity when the user has no `user.name`/`user.email` configured.
+///
+/// When git identity IS configured, the real signature is used unchanged. Only
+/// when `repo.signature()` fails (typically "config value 'user.name' was not
+/// found") do we fall back to a fixed `Intent <intent@localhost>` identity, so
+/// sandbox snapshot/auto-commit still succeeds on machines/CI without a git
+/// identity.
+fn resolve_signature(repo: &git2::Repository) -> Result<git2::Signature<'static>> {
+    match repo.signature() {
+        Ok(sig) => Ok(sig),
+        Err(_) => git2::Signature::now("Intent", "intent@localhost")
+            .map_err(|e| Error::Internal(format!("construct fallback signature failed: {e}"))),
+    }
+}
+
 /// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).
 fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
@@ -891,9 +905,7 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
         .and_then(|h| h.target())
         .and_then(|oid| repo.find_commit(oid).ok());
 
-    let sig = repo
-        .signature()
-        .map_err(|e| Error::Internal(format!("get signature failed: {e}")))?;
+    let sig = resolve_signature(repo)?;
 
     let message = format!("WIP snapshot for {}", agent_id.0);
     let parents: Vec<&git2::Commit> = parent.iter().collect();
