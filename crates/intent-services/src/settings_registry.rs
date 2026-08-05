@@ -80,6 +80,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.exposeGitCredentialToChildren",
     "accounts.sentry.organization",
     "voice.provider",
+    "voice.language",
     "voice.openai.model",
     "context.enabled",
     "context.auggiePath",
