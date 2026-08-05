@@ -17952,6 +17952,270 @@ async fn dismiss_questions_fails_closed() {
     ));
 }
 
+// -------------------------------------------------------------------------
+// `agent.markSeen` (PROTOCOL §5.5): per-conversation seen marker.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mark_seen_persists_marker_and_emits_agent_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let seen = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append message");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), seen.id.clone())
+        .await
+        .expect("mark seen");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["lastSeenMessageId"], json!(seen.id));
+
+    // Marker persisted on the session row (survives reload) and lifted into
+    // the AgentLite metadata projection.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    assert_eq!(
+        lite.metadata.last_seen_message_id.as_deref(),
+        Some(seen.id.as_str())
+    );
+
+    // `agent:updated` emitted, scoped to the workspace, carrying the marker.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(
+        batch[0].data["lastSeenMessageId"].as_str(),
+        Some(seen.id.as_str())
+    );
+}
+
+/// Monotonicity: marking a message OLDER than the current marker is a no-op
+/// returning the current marker (no write, no event); re-marking the same
+/// message is idempotent (no duplicate event); marking a NEWER message
+/// advances the marker.
+#[tokio::test]
+async fn mark_seen_is_monotonic_and_idempotent() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let first = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "one" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append first");
+    let second = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "two" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append second");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), second.id.clone())
+        .await
+        .expect("mark second");
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+
+    // Older message: no-op returning the CURRENT marker, no write, no event.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), first.id.clone())
+        .await
+        .expect("mark older");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(second.id.as_str()));
+
+    // Same message again: idempotent success, still no event.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), second.id.clone())
+        .await
+        .expect("re-mark");
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no agent:updated for the older-message no-op or the idempotent re-mark"
+    );
+
+    // A newer message advances the marker (and emits again).
+    let third = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "three" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append third");
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), third.id.clone())
+        .await
+        .expect("mark third");
+    assert_eq!(r["lastSeenMessageId"], json!(third.id));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(
+        batch[0].data["lastSeenMessageId"].as_str(),
+        Some(third.id.as_str())
+    );
+}
+
+/// Dangling ids are tolerated (same laxity as `agent.dismissQuestions`): an
+/// unknown NEW id writes through, and a dangling CURRENT marker (e.g. the row
+/// was truncated by `agent.editAndRegenerate`) never blocks an advance.
+#[tokio::test]
+async fn mark_seen_tolerates_dangling_ids() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let real = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append message");
+
+    // Unknown id: marker write allowed (dangling semantics).
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), "msg-unknown".to_string())
+        .await
+        .expect("mark unknown");
+    assert_eq!(r["lastSeenMessageId"], json!("msg-unknown"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some("msg-unknown"));
+
+    // Dangling current marker: a real message still advances it — the
+    // monotonicity gate only holds when BOTH sides resolve.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), real.id.clone())
+        .await
+        .expect("mark real");
+    assert_eq!(r["lastSeenMessageId"], json!(real.id));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(real.id.as_str()));
+}
+
+/// The seen marker coexists with existing session metadata (including the
+/// dismissal marker) and the targeted write preserves the stored
+/// `system_prompt`.
+#[tokio::test]
+async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!({ "source": "test-suite" }));
+    session.system_prompt = Some("You are a careful reviewer.".to_string());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("seed metadata + prompt");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-q1".to_string())
+        .await
+        .expect("dismiss");
+
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("mark seen");
+
+    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let metadata = after.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["source"], json!("test-suite"));
+    assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-q1"));
+    assert_eq!(metadata["lastSeenMessageId"], json!("msg-1"));
+    assert_eq!(
+        after.system_prompt.as_deref(),
+        Some("You are a careful reviewer."),
+        "markSeen must never clear the stored system_prompt"
+    );
+}
+
+#[tokio::test]
+async fn mark_seen_fails_closed() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+
+    // Unknown agent → NotFound.
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws.clone(), missing, "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Workspace mismatch → NotFound (defense-in-depth), no marker persisted.
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    assert!(matches!(
+        svc.agent_mark_seen_op(other_ws, id.clone(), "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), None);
+
+    // Blank messageId → InvalidParams.
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws.clone(), id.clone(), "  ".to_string())
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+
+    // Oversized messageId → InvalidParams.
+    let oversized = "m".repeat(crate::agent_ops::MAX_MESSAGE_ID_LEN + 1);
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws, id, oversized).await,
+        Err(Error::InvalidParams(_))
+    ));
+}
+
 /// An assistant content-block array carrying `n` question resource blocks.
 fn question_blocks_n(n: usize) -> serde_json::Value {
     let mut blocks = vec![json!({ "type": "text", "text": "I have questions." })];

@@ -3545,6 +3545,115 @@ impl Services {
         }))
     }
 
+    /// `agent.markSeen` (PROTOCOL §5.5): persist the per-conversation seen
+    /// marker (`message_id` — the newest transcript message the user has
+    /// seen) in the session metadata (survives daemon restarts) and emit
+    /// `agent:updated` so other clients converge. **Monotonic**: when both
+    /// the named message and the current marker resolve to transcript
+    /// positions and the named one is OLDER, the call is a no-op returning
+    /// the current marker (no write, no event). An id that does not resolve
+    /// (unknown, or truncated away by `agent.editAndRegenerate`) is tolerated
+    /// as dangling — same laxity as `agent.dismissQuestions` — and the write
+    /// proceeds (a dangling CURRENT marker likewise never blocks an advance).
+    /// **Idempotent**: re-marking the already-persisted id succeeds without a
+    /// write or a duplicate event. Fails closed on a nonexistent agent or a
+    /// workspace mismatch (`NotFound`).
+    pub(crate) async fn agent_mark_seen_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            return Err(Error::InvalidParams("messageId is required".to_string()));
+        }
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (defense-in-depth against bare-id probes).
+        let mut session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        let current = session.last_seen_message_id().map(str::to_string);
+        if current.as_deref() == Some(message_id.as_str()) {
+            // Already the persisted marker: no write, no duplicate event —
+            // the FE trigger is debounced but can still repeat.
+            return Ok(json!({
+                "success": true,
+                "lastSeenMessageId": message_id,
+            }));
+        }
+        // Monotonicity gate: only comparable when BOTH ids resolve to
+        // transcript positions (two bounded index seeks, no hydration). A
+        // dangling side — unknown id, or a marker naming a row truncated by
+        // `agent.editAndRegenerate` — never blocks the advance.
+        if let Some(current_id) = current.as_deref() {
+            let new_idx = self
+                .store
+                .get_agent_message_index(&agent_id, &message_id)
+                .await?;
+            let current_idx = self
+                .store
+                .get_agent_message_index(&agent_id, current_id)
+                .await?;
+            if let (Some(new_idx), Some(current_idx)) = (new_idx, current_idx) {
+                if new_idx < current_idx {
+                    return Ok(json!({
+                        "success": true,
+                        "lastSeenMessageId": current_id,
+                    }));
+                }
+            }
+        }
+        // Preserve non-object metadata verbatim under a side key rather than
+        // discarding it (same defensive shape as `agent.dismissQuestions`).
+        let mut metadata = match session.metadata.take() {
+            Some(Value::Object(map)) => map,
+            Some(other) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    "agent_session.metadata was a non-object JSON value; \
+                     preserving it under `priorNonObjectMetadata` while adding the \
+                     seen marker"
+                );
+                let mut map = serde_json::Map::new();
+                map.insert("priorNonObjectMetadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            intent_core::LAST_SEEN_MESSAGE_ID_KEY.to_string(),
+            Value::String(message_id.clone()),
+        );
+        // Targeted metadata+updated_at write: the session above came from the
+        // summary projection (no `system_prompt`), so a full-row
+        // `update_agent_session` write-back would clear the stored prompt.
+        let metadata = Value::Object(metadata);
+        self.store
+            .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "lastSeenMessageId": message_id,
+            }),
+        )
+        .await;
+        Ok(json!({
+            "success": true,
+            "lastSeenMessageId": message_id,
+        }))
+    }
+
     /// Number of question resource blocks on the dismissed assistant message.
     /// Bounded cost: an index seek plus a single-row page — no transcript
     /// hydration. Unknown or unreadable messages count zero, which routes the

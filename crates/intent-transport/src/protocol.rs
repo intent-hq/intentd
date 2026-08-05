@@ -20,9 +20,13 @@
 //! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
 //! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
 //! same `-32603` / "Internal error" envelope, no method-catalog change.
+//! Version 4.5 adds `agent.markSeen` (additive; §5.5): the per-conversation
+//! seen marker (`lastSeenMessageId` in session metadata, monotonic advance,
+//! `agent:updated` emit, served on the `AgentLite` metadata projection) —
+//! 279 router methods, 316 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.4";
+pub const PROTOCOL_VERSION: &str = "4.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

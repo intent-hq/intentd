@@ -1439,6 +1439,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.markSeen`: persist the per-conversation seen marker
+    /// (`message_id` — the newest transcript message the user has seen) on
+    /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:
+    /// naming a message OLDER than the current marker is a no-op returning
+    /// the current marker. Idempotent: re-marking the same message succeeds.
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_mark_seen not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.editAndRegenerate`: edit a past user message and regenerate from
     /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
     /// transcript to just before `message_id` (which must reference an existing
