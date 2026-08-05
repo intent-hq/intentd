@@ -11,8 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use intent_core::{
-    AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, FileStatus,
-    GitAgentCommitResult, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, NoteId,
+    AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, GitAgentCommitResult, NoteId,
     Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
 };
@@ -22,12 +21,8 @@ use crate::WorkspaceMcpServer;
 
 #[derive(Default)]
 struct FakeApi {
-    git_status_calls: Mutex<u32>,
-    stage_calls: Mutex<Vec<Value>>,
-    /// Recorded `git_commit` calls: (message, idempotency_key).
-    commit_calls: Mutex<Vec<(String, Option<String>)>>,
+    /// Recorded `git_agent_commit` calls: (message, agent_id, user_requested).
     agent_commit_calls: Mutex<Vec<(String, Option<String>, bool)>>,
-    merge_calls: Mutex<Vec<Option<String>>>,
     script_list_calls: Mutex<u32>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
     script_start_calls: Mutex<Vec<String>>,
@@ -254,57 +249,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn git_status(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
-        *self.git_status_calls.lock().unwrap() += 1;
-        Box::pin(async {
-            Ok(GitStatus {
-                branch: "main".to_string(),
-                ahead: 0,
-                behind: 0,
-                diverged: false,
-                files: vec![FileStatus {
-                    path: "a.txt".to_string(),
-                    status: GitFileStatus::Modified,
-                    staged: false,
-                }],
-                has_uncommitted_changes: true,
-                has_untracked_files: false,
-            })
-        })
-    }
-
-    fn git_stage(&self, _id: WorkspaceId, paths: Value) -> BoxFuture<'_, Result<Vec<String>>> {
-        self.stage_calls.lock().unwrap().push(paths.clone());
-        Box::pin(async move {
-            let out = paths
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            Ok(out)
-        })
-    }
-
-    fn git_commit(
-        &self,
-        _id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        self.commit_calls
-            .lock()
-            .unwrap()
-            .push((message, idempotency_key));
-        Box::pin(async {
-            Ok(GitCommitResult {
-                hash: "abc123".to_string(),
-                files: vec!["a.txt".to_string()],
-            })
-        })
-    }
-
     fn git_agent_commit(
         &self,
         _id: WorkspaceId,
@@ -324,23 +268,6 @@ impl WorkspaceApi for FakeApi {
                 hash: "def456".to_string(),
                 files: vec!["a.txt".to_string(), "b.txt".to_string()],
                 file_count: 2,
-            })
-        })
-    }
-
-    fn git_check_merge_conflicts(
-        &self,
-        _id: WorkspaceId,
-        target: Option<String>,
-    ) -> BoxFuture<'_, Result<GitMergeConflicts>> {
-        self.merge_calls.lock().unwrap().push(target.clone());
-        Box::pin(async move {
-            Ok(GitMergeConflicts {
-                has_conflicts: false,
-                conflicted_files: Vec::new(),
-                cannot_determine: None,
-                target_branch: target.unwrap_or_else(|| "main".to_string()),
-                current_branch: "feat".to_string(),
             })
         })
     }
@@ -950,228 +877,20 @@ async fn workspace_archive_not_found_errors() {
 // ============================================================================
 
 #[tokio::test]
-async fn git_status_returns_shaped_body() {
+async fn git_commit_requires_caller_context() {
     let (srv, api) = server();
-    let resp = call(&srv, "return await ws.git.status();").await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let v = body(&resp);
-    assert_eq!(v["branch"], json!("main"));
-    assert_eq!(v["files"][0]["path"], json!("a.txt"));
-    assert_eq!(*api.git_status_calls.lock().unwrap(), 1);
-}
-
-#[tokio::test]
-async fn git_stage_blocks_stage_all_dot() {
-    let (srv, api) = server();
-    let resp = call(&srv, "return await ws.git.stage('.');").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("Staging all files is not allowed"));
-    assert!(api.stage_calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn git_stage_blocks_stage_all_star() {
-    let (srv, _api) = server();
-    let resp = call(&srv, "return await ws.git.stage('*');").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("Staging all files is not allowed"));
-}
-
-#[tokio::test]
-async fn git_stage_blocks_dash_dash_all() {
-    let (srv, _api) = server();
-    let resp = call(&srv, "return await ws.git.stage('--all');").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("Staging all files is not allowed"));
-}
-
-#[tokio::test]
-async fn git_stage_accepts_array_of_paths() {
-    let (srv, api) = server();
-    let resp = call(&srv, "return await ws.git.stage(['a.txt', 'b.txt']);").await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let v = body(&resp);
-    assert_eq!(v["ok"], json!(true));
-    assert_eq!(v["paths"], json!(["a.txt", "b.txt"]));
-    assert_eq!(api.stage_calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn git_stage_rejects_non_string_array_entries() {
-    // The array form must reject any non-string element instead of silently
-    // dropping it (`filter_map(Value::as_str)` would let e.g. `['a.txt', 123]`
-    // stage only `a.txt`). Pin the "array of strings" contract explicitly.
-    let (srv, api) = server();
-    let resp = call(&srv, "return await ws.git.stage(['a.txt', 123]);").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("array of strings"));
-    assert!(api.stage_calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn git_stage_csv_string_splits_on_commas() {
-    let (srv, _api) = server();
-    let resp = call(&srv, "return await ws.git.stage('a.txt, b.txt');").await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let v = body(&resp);
-    assert_eq!(v["paths"], json!(["a.txt", "b.txt"]));
-}
-
-#[tokio::test]
-async fn git_stage_blocks_stage_all_in_array_form() {
-    // Array-wrapped sentinels must be rejected too — the string-only guard
-    // in the reference is not enough to honor the documented contract.
-    for input in [
-        "['.']",
-        "['*']",
-        "['--all']",
-        "['a.txt', '.']",
-        "['a.txt', '*']",
-        "['a.txt', '--all']",
-    ] {
-        let (srv, api) = server();
-        let resp = call(&srv, &format!("return await ws.git.stage({input});")).await;
-        assert_eq!(
-            resp["result"]["isError"],
-            json!(true),
-            "expected error for {input}"
-        );
-        assert!(
-            text(&resp).contains("Staging all files is not allowed"),
-            "expected stage-all error text for {input}"
-        );
-        assert!(
-            api.stage_calls.lock().unwrap().is_empty(),
-            "daemon must not be called for {input}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn git_stage_all_error_message_matches_reference_verbatim() {
-    // Pin the exact wording so the `\`-continuation whitespace bug cannot
-    // regress: matches ws-git-api.ts word-for-word and the message portion
-    // itself contains no runs of spaces (the surrounding JS stack trace does).
-    let expected = "Staging all files is not allowed. Please specify individual file paths to \
-                    stage. Use git_status to see which files you have modified, then stage only \
-                    those specific files.";
-    let (srv, _api) = server();
-    let resp = call(&srv, "return await ws.git.stage('.');").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    let got = text(&resp);
-    assert!(
-        got.contains(expected),
-        "message must match reference verbatim; got: {got:?}"
-    );
-    let start = got.find("Staging all files").expect("message present");
-    let end = got[start..]
-        .find("specific files.")
-        .expect("message end present")
-        + "specific files.".len();
-    let message = &got[start..start + end];
-    assert!(
-        !message.contains("  "),
-        "message must not contain runs of spaces; got: {message:?}"
-    );
-}
-
-#[tokio::test]
-async fn git_commit_appends_agent_id_when_caller_present() {
-    let (srv, api) = server_with_caller("agent-9");
     let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let v = body(&resp);
-    assert_eq!(v["hash"], json!("abc123"));
-    let msgs = api.commit_calls.lock().unwrap();
-    assert!(msgs[0].0.contains("Agent-Id: agent-9"));
-}
-
-#[tokio::test]
-async fn git_commit_mints_idempotency_key_when_absent() {
-    // Agents call `ws.git.commit(msg)` without an idempotencyKey; the binding
-    // must mint one so the services `with_idempotency` wrapper sees a key and
-    // the soft-launch warn never fires.
-    let (srv, api) = server_with_caller("agent-9");
-    let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let calls = api.commit_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    let key = calls[0]
-        .1
-        .as_deref()
-        .expect("git.commit must mint an idempotencyKey");
-    assert!(
-        uuid::Uuid::parse_str(key).is_ok(),
-        "minted key {key:?} is not a UUID"
-    );
-}
-
-#[tokio::test]
-async fn git_commit_passes_caller_idempotency_key_through() {
-    // A caller-supplied key is adopted verbatim so retries of the same tool
-    // call dedupe against the idempotency store.
-    let (srv, api) = server_with_caller("agent-9");
-    let resp = call(
-        &srv,
-        "return await host({ method: 'git.commit', args: { message: 'feat: x', idempotencyKey: 'key-from-caller' } });",
-    )
-    .await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let calls = api.commit_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].1.as_deref(), Some("key-from-caller"));
-}
-
-#[tokio::test]
-async fn git_commit_treats_blank_idempotency_key_as_absent() {
-    // A whitespace-only key must be treated as absent (parity with
-    // `comment.add`) so it cannot collapse dedupe across unrelated requests.
-    let (srv, api) = server_with_caller("agent-9");
-    let resp = call(
-        &srv,
-        "return await host({ method: 'git.commit', args: { message: 'feat: x', idempotencyKey: '   ' } });",
-    )
-    .await;
-    assert_eq!(resp["result"]["isError"], json!(false));
-    let calls = api.commit_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    let key = calls[0]
-        .1
-        .as_deref()
-        .expect("git.commit must mint an idempotencyKey");
-    assert!(
-        uuid::Uuid::parse_str(key).is_ok(),
-        "minted key {key:?} is not a UUID (got blank passthrough)"
-    );
-}
-
-#[tokio::test]
-async fn git_commit_rejects_caller_id_with_newline() {
-    // `AgentId` is a transparent `String` wrapper with no validation, so an
-    // id containing `\n` could inject an extra commit trailer via the
-    // `Agent-Id:` line. The binding must reject the caller id before
-    // formatting; nothing should reach the underlying `git_commit`.
-    let (srv, api) = server_with_caller("agent-9\nAgent-Id: attacker");
-    let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
-    assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("newline"));
-    assert!(api.commit_calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn git_agent_commit_requires_caller_context() {
-    let (srv, _api) = server();
-    let resp = call(&srv, "return await ws.git.agentCommit('feat: x');").await;
     assert_eq!(resp["result"]["isError"], json!(true));
     assert!(text(&resp).contains("No agent context available"));
+    assert!(api.agent_commit_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn git_agent_commit_returns_file_count_shape() {
+async fn git_commit_returns_file_count_shape() {
     let (srv, api) = server_with_caller("agent-9");
     let resp = call(
         &srv,
-        "return await ws.git.agentCommit('feat: x', { userRequested: true });",
+        "return await ws.git.commit('feat: x', { userRequested: true });",
     )
     .await;
     assert_eq!(resp["result"]["isError"], json!(false));
@@ -1184,14 +903,33 @@ async fn git_agent_commit_returns_file_count_shape() {
 }
 
 #[tokio::test]
-async fn git_check_merge_conflicts_returns_shape() {
-    let (srv, api) = server();
-    let resp = call(&srv, "return await ws.git.checkMergeConflicts('main');").await;
+async fn git_commit_defaults_user_requested_to_false() {
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(&srv, "return await ws.git.commit('feat: x');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
-    let v = body(&resp);
-    assert_eq!(v["hasConflicts"], json!(false));
-    assert_eq!(v["targetBranch"], json!("main"));
-    assert_eq!(api.merge_calls.lock().unwrap()[0], Some("main".to_string()));
+    let calls = api.agent_commit_calls.lock().unwrap();
+    assert_eq!(calls[0].0, "feat: x");
+    assert!(!calls[0].2);
+}
+
+#[tokio::test]
+async fn git_removed_methods_error_as_unknown() {
+    // The read/stage/merge-check `ws.git.*` surface (and the old staged-only
+    // commit's `agentCommit` spelling) was removed in favor of the plain
+    // `git` CLI; raw `host({...})` frames for the old methods must fail with
+    // the standard unknown-binding error.
+    let (srv, api) = server_with_caller("agent-9");
+    for method in ["status", "stage", "agentCommit", "checkMergeConflicts"] {
+        let code =
+            format!("return await host({{ method: 'git.{method}', args: {{ message: 'm' }} }});");
+        let resp = call(&srv, &code).await;
+        assert_eq!(resp["result"]["isError"], json!(true), "git.{method}");
+        assert!(
+            text(&resp).contains(&format!("unknown method `git.{method}`")),
+            "git.{method} must surface the unknown-binding error"
+        );
+    }
+    assert!(api.agent_commit_calls.lock().unwrap().is_empty());
 }
 
 // ============================================================================
