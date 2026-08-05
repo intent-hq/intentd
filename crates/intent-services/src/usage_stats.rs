@@ -256,7 +256,10 @@ pub fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// [`stats_model_key`] (normalized model, falling back to the resolved
 /// provider id when no model is resolved at creation time — D13). `provider`
 /// is the session's raw `provider` field; the resolved id follows the spawn
-/// precedence (compound model prefix → provider field → default provider).
+/// precedence (compound model prefix → provider field → configured default
+/// (`providers.active`) → hardcoded default provider), though this call site
+/// has no settings to offer and always passes `None` for the configured
+/// default.
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub async fn record_session_started(

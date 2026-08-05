@@ -332,8 +332,11 @@ fn ensure_bare_model_matches_provider(
 ///    session's `provider` stays unset, exactly like the pre-existing model
 ///    resolution's "no configured default" case. `resolve_provider_id`
 ///    (`agent_session.rs`) applies the same configured-default-over-
-///    hardcoded-Auggie precedence at spawn time, so this never surfaces as
-///    the hardcoded default either.
+///    hardcoded-Auggie precedence at spawn time, but with no configured
+///    default to offer either, that precedence itself bottoms out at the
+///    spawn path's hardcoded [`intent_providers::default_provider_id`]
+///    (Auggie) — this residual, no-config case is the one scenario where
+///    the hardcoded default still applies.
 fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
