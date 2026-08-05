@@ -1631,8 +1631,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getModels`: `{ models: [{ id, name, provider, description? }] }`
-    /// from the auggie CLI with a static tier fallback; no `workspaceId`
-    /// (PROTOCOL §5.5).
+    /// from the auggie CLI, degrading to an empty list when the CLI is
+    /// unavailable; no `workspaceId` (PROTOCOL §5.5).
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
@@ -1645,8 +1645,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// `workspaceId` (PROTOCOL §5.30). Without `provider_id` this is the
     /// backward-compatible auggie path —
     /// `{ models: [ModelInfo…], source: "auggie" | "static" }` from
-    /// `auggie model list --json` (plain-text fallback) with the static tier
-    /// catalog when the CLI is unavailable — except that `force_refresh` with
+    /// `auggie model list --json` (plain-text fallback), degrading to an
+    /// empty `source: "static"` list when the CLI is unavailable — except
+    /// that `force_refresh` with
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
@@ -4100,14 +4101,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `providers.catalog`: the static provider registry (monorepo#928) —
-    /// `{ providers: [...], defaultProviderId }`, one row per registered
-    /// provider in registry order, so clients no longer need a local copy of
-    /// the provider config. Each row is `{ id, displayName, shortName,
-    /// command, isDefault, canBeDisabled, loginCommandHint?, loginDocsUrl?,
-    /// authErrorPatterns?, requiresEnvVar?, requiresFeatureCode?, visible,
-    /// modelTiers? }`; `visible` is the daemon-evaluated gating result (env
-    /// var present / no feature code required) while the raw gating fields
-    /// are passed through when set. No params, no workspaceId — static data.
+    /// `{ providers: [...] }`, one row per registered provider in registry
+    /// order, so clients no longer need a local copy of the provider config.
+    /// Each row is `{ id, displayName, shortName, command, canBeDisabled,
+    /// loginCommandHint?, loginDocsUrl?, authErrorPatterns?,
+    /// requiresEnvVar?, requiresFeatureCode?, visible }`; `visible` is the
+    /// daemon-evaluated gating result (env var present / no feature code
+    /// required) while the raw gating fields are passed through when set. No
+    /// default designation and no tier metadata — clients derive an
+    /// effective default from settings (`model.default` prefix, else
+    /// `providers.active`). No params, no workspaceId — static data.
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

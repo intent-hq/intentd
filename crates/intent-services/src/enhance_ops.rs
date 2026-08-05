@@ -260,9 +260,10 @@ impl Services {
     /// `agent.enhancePrompt` (PROTOCOL §5.31): compose the mode-specific
     /// prompt, run the one-shot auggie CLI, clean the transcript, and parse
     /// the mode-specific result. `mode` is pre-validated by the router
-    /// (`"enhance"` or `"layout"`). Gated on auggie being the active provider
-    /// per spec Decision 5 — when the active provider is not auggie, returns
-    /// a typed "unavailable" capability response (no error crash).
+    /// (`"enhance"` or `"layout"`). Gated on auggie being the effective
+    /// provider per spec Decision 5 — the settings-derived default (provider
+    /// of `model.default`, else `providers.active`, else the first
+    /// registered provider) must be auggie.
     pub(crate) async fn agent_enhance_prompt_op(
         &self,
         prompt: String,
@@ -272,17 +273,12 @@ impl Services {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         // Provider neutrality gate: enhance-prompt is an auggie-specific capability.
-        // When the active provider is not auggie, return a typed unavailable response
-        // so the FE can hide the affordance gracefully without an error crash.
-        let active_provider = match self.store.get_setting("providers.active").await? {
-            Some(json_str) => serde_json::from_str::<serde_json::Value>(&json_str)
-                .ok()
-                .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "auggie".to_string()),
-            None => "auggie".to_string(), // Default to auggie when setting is unset
-        };
-        if active_provider != "auggie" {
+        // When the effective provider is not auggie, return a typed unavailable
+        // response so the FE can hide the affordance gracefully without an error crash.
+        let effective_provider =
+            crate::agent_session::derived_default_provider(&self.effective_settings())
+                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+        if effective_provider != "auggie" {
             return Ok(json!({
                 "available": false,
                 "reason": "enhance-prompt requires auggie as the active provider"

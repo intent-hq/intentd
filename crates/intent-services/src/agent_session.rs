@@ -554,22 +554,49 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
     }
 }
 
+/// Derive the user-configured default provider from the effective settings:
+/// the provider prefix of the configured default model (`model.default`
+/// compound prefix), else `providers.active`. `None` when neither is set —
+/// no provider carries a hardcoded default designation, so callers fall
+/// through to [`resolve_provider_id`]'s neutral positional last resort (the
+/// first registered provider).
+pub(crate) fn derived_default_provider(
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Option<String> {
+    settings
+        .model
+        .default
+        .as_deref()
+        .filter(|m| m.contains(':'))
+        .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            settings
+                .providers
+                .active
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+        })
+}
+
 /// Resolve the effective provider id for an agent session using the same precedence
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
 /// yields a non-empty provider) → `provider` field → `configured_default` (the
-/// daemon settings `providers.active`, when the caller has one to offer) → the
-/// hardcoded default provider. Malformed compound ids like `:sonnet` yield an
-/// empty prefix and fall through to the provider field / configured
-/// default / default. This ensures `_meta` injection, spawn args, and all
-/// provider-keyed logic use a consistent provider id.
+/// settings-derived default — see [`derived_default_provider`] — when the
+/// caller has one to offer) → the first registered provider (a neutral
+/// positional last resort; no provider carries a default designation).
+/// Malformed compound ids like `:sonnet` yield an empty prefix and fall
+/// through to the provider field / configured default / last resort. This
+/// ensures `_meta` injection, spawn args, and all provider-keyed logic use a
+/// consistent provider id.
 ///
-/// `configured_default` deliberately sits ABOVE the hardcoded
-/// [`intent_providers::default_provider_id`] (Auggie) in this precedence
+/// `configured_default` deliberately sits ABOVE the positional last resort
 /// (spec Decision D2): a session with no persisted `provider` (e.g. an older
 /// row, or a creation path that never resolved one) should still prefer the
-/// user's actual configured default over the hardcoded one. Callers without
-/// settings access (e.g. usage-stats attribution) pass `None`, preserving
-/// the previous hardcoded-default behavior for that narrower use.
+/// user's actual configured default. Callers without settings access (e.g.
+/// usage-stats attribution) pass `None`, bottoming out at the first
+/// registered provider for that narrower use.
 pub(crate) fn resolve_provider_id(
     model: Option<&str>,
     provider: Option<&str>,
@@ -585,7 +612,7 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(|p| p.to_string())
         })
-        .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
+        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1084,7 +1111,7 @@ impl Services {
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
-            self.effective_settings().providers.active.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
         );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
@@ -1146,7 +1173,7 @@ impl Services {
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
-            self.effective_settings().providers.active.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
         );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
@@ -1214,7 +1241,7 @@ impl Services {
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
-            self.effective_settings().providers.active.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
         );
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch

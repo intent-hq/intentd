@@ -375,9 +375,11 @@ async fn e2e_transport_full() {
     let frame = r#"{"jsonrpc":"2.0","id":7,"method":"agent.getModels"}"#;
     let wss = wss_call(bound_port, cfg.clone(), frame).await;
     assert_eq!(wss["id"], 7);
+    // The list may be empty when no auggie CLI is available (no static
+    // fallback catalog remains) — the transport-parity contract is the point.
     assert!(
-        !wss["result"]["models"].as_array().unwrap().is_empty(),
-        "models must be non-empty over WSS"
+        wss["result"]["models"].is_array(),
+        "models must be an array over WSS: {wss}"
     );
     let uds = uds_rpc(&socket, 7, "agent.getModels", json!({})).await;
     assert_eq!(wss["result"], uds["result"], "WSS result must match UDS");

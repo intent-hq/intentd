@@ -641,11 +641,12 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
 #[tokio::test]
 async fn specialist_resolution_preview() {
     let h = start().await;
-    // Pinned frontmatter model (unclaimed by any tier table → provider-agnostic).
+    // Pinned frontmatter model — bare ids are provider-agnostic while no
+    // cached catalog disproves ownership (cold caches in this harness).
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
     // Retired tier opt-in: tolerated in the file, ignored by resolution.
     write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
-    // Pin claimed by auggie's tier table → guarded away from other providers.
+    // A second bare pin behaves identically (no static tier tables remain).
     write_specialist_frontmatter(&h.user_dir, "auggie-pin", "model: \"opus4.7\"");
     // No model config at all → provider CLI default → fields omitted.
     write_specialist(&h.user_dir, "plain", "Plain", "d", "You work.");
@@ -671,7 +672,7 @@ async fn specialist_resolution_preview() {
     assert!(plain.get("resolvedModel").is_none());
     assert!(plain.get("resolvedProvider").is_none());
 
-    // Explicit provider context: codex tier table.
+    // Explicit provider context: codex.
     let list = ok(
         &mut w,
         &mut r,
@@ -684,12 +685,11 @@ async fn specialist_resolution_preview() {
     let tiered = find_spec(&list, "tiered");
     assert!(tiered.get("resolvedModel").is_none());
     assert!(tiered.get("resolvedProvider").is_none());
-    // The auggie-claimed pin does not leak into a codex context; with no
-    // settings chain the preview falls through to the CLI default (omitted).
+    // With no cached-catalog disproof, bare pins apply under codex too —
+    // absence of evidence is not a mismatch.
     let auggie_pin = find_spec(&list, "auggie-pin");
-    assert!(auggie_pin.get("resolvedModel").is_none());
-    assert!(auggie_pin.get("resolvedProvider").is_none());
-    // The unclaimed pin still applies under codex.
+    assert_eq!(auggie_pin["resolvedModel"], "opus4.7");
+    assert_eq!(auggie_pin["resolvedProvider"], "codex");
     let pinner = find_spec(&list, "pinner");
     assert_eq!(pinner["resolvedModel"], "opus4.5");
     assert_eq!(pinner["resolvedProvider"], "codex");
@@ -763,8 +763,8 @@ async fn specialist_resolution_preview_inherits_settings() {
     let (read, mut w) = connect_retry(&h.socket).await.into_split();
     let mut r = BufReader::new(read);
 
-    // Default provider (auggie): no providerDefaults entry → model.default,
-    // which auggie's tier table claims → resolves.
+    // Default provider (auggie): no providerDefaults entry → model.default
+    // resolves.
     let got = ok(
         &mut w,
         &mut r,
@@ -788,8 +788,9 @@ async fn specialist_resolution_preview_inherits_settings() {
     assert_eq!(got["specialist"]["resolvedModel"], "gpt-5.3-codex/high");
     assert_eq!(got["specialist"]["resolvedProvider"], "codex");
 
-    // claude-code: no providerDefaults entry, and model.default ("sonnet4.5")
-    // is claimed by auggie's tier table → provider guard rejects it → omitted.
+    // claude-code: no providerDefaults entry → model.default ("sonnet4.5")
+    // applies — with no cached-catalog disproof (cold caches) the ownership
+    // guard passes bare ids through.
     let got = ok(
         &mut w,
         &mut r,
@@ -798,8 +799,8 @@ async fn specialist_resolution_preview_inherits_settings() {
         json!({ "id": "plain", "provider": "claude-code" }),
     )
     .await;
-    assert!(got["specialist"].get("resolvedModel").is_none());
-    assert!(got["specialist"].get("resolvedProvider").is_none());
+    assert_eq!(got["specialist"]["resolvedModel"], "sonnet4.5");
+    assert_eq!(got["specialist"]["resolvedProvider"], "claude-code");
 
     // Frontmatter model still ranks above the settings chain.
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
@@ -814,8 +815,7 @@ async fn specialist_resolution_preview_inherits_settings() {
     assert_eq!(got["specialist"]["resolvedModel"], "opus4.5");
 
     // Retirement regression: a lingering `modelTier: "smart"` file resolves
-    // via the settings chain (model.default), not the old tier table
-    // (auggie smart would have been "opus4.7").
+    // via the settings chain (model.default), not any tier mapping.
     write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
     let got = ok(
         &mut w,

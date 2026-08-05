@@ -88,13 +88,14 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// cortex source: feature-code-gated static catalog. The gate is closed
-/// whenever the provider config demands an env var that is unset or a feature
-/// code (the daemon stores no feature-code enablement, so a configured code
-/// always gates — today's cortex config always takes this path); closed means
-/// an empty list + warning (mirroring the reference FE's default-deny) so the
-/// tier catalog is never leaked past the gate. The static-rows branch below
-/// only serves once the provider config stops requiring a code.
+/// cortex source: feature-code-gated catalog. The gate is closed whenever
+/// the provider config demands an env var that is unset or a feature code
+/// (the daemon stores no feature-code enablement, so a configured code
+/// always gates — today's cortex config always takes this path); closed
+/// means an empty list + warning (mirroring the reference FE's
+/// default-deny). Cortex has no dynamic model discovery (and the static tier
+/// catalog is retired), so an open gate also serves an empty list — the
+/// provider CLI owns model selection.
 fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         // A missing provider config is treated as gated (explicit default-deny),
@@ -113,15 +114,9 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
                 }
             }
         };
-        match gated {
-            Some(reason) => ModelFetchResult {
-                models: Some(Vec::new()),
-                warning: Some(format!("Cortex not available ({reason})")),
-            },
-            None => ModelFetchResult {
-                models: Some(crate::agent_ops::static_models_for("cortex")),
-                warning: None,
-            },
+        ModelFetchResult {
+            models: Some(Vec::new()),
+            warning: gated.map(|reason| format!("Cortex not available ({reason})")),
         }
     })
 }

@@ -1,171 +1,29 @@
-//! Model id + capability-tier helpers (§6.9).
+//! Model id helpers (§6.9).
 //!
-//! Ports the model helpers from `provider-config.ts`: compound model ids,
-//! `PROVIDER_MODEL_TIERS`, and fuzzy/tier resolution. Providers with dynamic
-//! model lists (opencode, droid, grok) are intentionally absent from the tier
-//! table. Grok's dynamic-model parsers (`grok models` stdout and the ACP
-//! `initialize` response) are ported from `grok-acp-probe.ts`.
+//! Ports the model helpers from `provider-config.ts`: compound model ids and
+//! fuzzy resolution against dynamic model pools. Grok's dynamic-model parsers
+//! (`grok models` stdout and the ACP `initialize` response) are ported from
+//! `grok-acp-probe.ts`.
 
 use serde_json::Value;
 
-use crate::config::default_provider_id;
-
-/// Capability tiers for a provider. Mirrors the TS `{ fast, balanced, smart }`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelTiers {
-    /// Quick, cheap models for background tasks.
-    pub fast: &'static str,
-    /// General-purpose models for most tasks.
-    pub balanced: &'static str,
-    /// High-capability models for complex reasoning.
-    pub smart: &'static str,
-}
-
-/// Model capability tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelTier {
-    /// Quick, cheap tier.
-    Fast,
-    /// General-purpose tier.
-    Balanced,
-    /// High-capability tier.
-    Smart,
-}
-
-impl ModelTier {
-    /// All tiers in resolution order (`fast`, `balanced`, `smart`).
-    pub const ALL: [ModelTier; 3] = [ModelTier::Fast, ModelTier::Balanced, ModelTier::Smart];
-
-    /// Parse a tier name (`"fast" | "balanced" | "smart"`). `None` for
-    /// anything else.
-    ///
-    /// No wire surface supplies tier names anymore (the frontmatter
-    /// `modelTier` step is retired), so this is currently unused outside
-    /// tests. Retained while the catalog `modelTiers` table still uses
-    /// [`ModelTier`]; removing both together is a stated follow-up.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "fast" => Some(ModelTier::Fast),
-            "balanced" => Some(ModelTier::Balanced),
-            "smart" => Some(ModelTier::Smart),
-            _ => None,
-        }
-    }
-
-    fn pick(self, tiers: &ModelTiers) -> &'static str {
-        match self {
-            ModelTier::Fast => tiers.fast,
-            ModelTier::Balanced => tiers.balanced,
-            ModelTier::Smart => tiers.smart,
-        }
-    }
-}
-
-/// Per-provider capability tiers, in definition order. Port of
-/// `PROVIDER_MODEL_TIERS`. opencode/droid are intentionally omitted (dynamic
-/// model lists fetched from the CLI at runtime).
-pub static PROVIDER_MODEL_TIERS: &[(&str, ModelTiers)] = &[
-    (
-        "auggie",
-        ModelTiers {
-            fast: "haiku4.5",
-            balanced: "sonnet4.5",
-            smart: "opus4.7",
-        },
-    ),
-    (
-        "claude-code",
-        ModelTiers {
-            fast: "haiku",
-            balanced: "sonnet",
-            smart: "default",
-        },
-    ),
-    (
-        "codex",
-        ModelTiers {
-            fast: "gpt-5.3-codex/medium",
-            balanced: "gpt-5.3-codex/high",
-            smart: "gpt-5.3-codex/xhigh",
-        },
-    ),
-    (
-        "cortex",
-        ModelTiers {
-            fast: "claude-sonnet-4-5",
-            balanced: "claude-opus-4-5",
-            smart: "claude-opus-4-5",
-        },
-    ),
-];
-
-/// Tier table for a provider, or `None` for dynamic-model providers.
-pub fn tiers_for(provider_id: &str) -> Option<&'static ModelTiers> {
-    PROVIDER_MODEL_TIERS
-        .iter()
-        .find(|(id, _)| *id == provider_id)
-        .map(|(_, t)| t)
-}
-
-/// Provider ids whose static tier table ([`PROVIDER_MODEL_TIERS`]) lists
-/// `model_id` exactly (any tier). Empty when no static tier claims the id —
-/// unknown or dynamic-only models — in which case ownership cannot be proven.
-///
-/// Caveat: claude-code's smart tier is the literal `"default"` *sentinel*
-/// ("use the CLI default"), so `providers_claiming_model("default")` returns
-/// `["claude-code"]`. Callers treating a claim as an ownership proof (e.g.
-/// the bare-model/provider mismatch guard) must special-case `"default"`.
-pub fn providers_claiming_model(model_id: &str) -> Vec<&'static str> {
-    PROVIDER_MODEL_TIERS
-        .iter()
-        .filter(|(_, tiers)| [tiers.fast, tiers.balanced, tiers.smart].contains(&model_id))
-        .map(|(id, _)| *id)
-        .collect()
-}
+use crate::config::first_provider_id;
 
 /// Parse a compound model id `{provider}:{model}` into its parts. A bare id
-/// (no `:`) belongs to the default provider. Port of `parseCompoundModelId`.
+/// (no `:`) is attributed to the first registered provider — a neutral
+/// positional last resort; callers that can derive a settings-based default
+/// should pre-filter on `:` and never rely on this attribution. Port of
+/// `parseCompoundModelId`.
 pub fn parse_compound_model_id(compound: &str) -> (String, String) {
     match compound.split_once(':') {
         Some((provider, model)) => (provider.to_string(), model.to_string()),
-        None => (default_provider_id().to_string(), compound.to_string()),
+        None => (first_provider_id().to_string(), compound.to_string()),
     }
 }
 
 /// Create a compound model id from provider + model. Port of `createCompoundModelId`.
 pub fn create_compound_model_id(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}:{model_id}")
-}
-
-/// Default model for a provider at a tier, strictly within the provider's own
-/// tier table. `None` for providers without tier mappings (opencode, droid,
-/// grok) — tiers never resolve to another provider's model (the historical
-/// auggie fallback was a cross-provider leak; see the monorepo spec "New
-/// resolution policy"). Callers must also treat claude-code's smart-tier
-/// `"default"` sentinel as "no pinned model", not a model id.
-pub fn default_model_for_provider(provider_id: &str, tier: ModelTier) -> Option<&'static str> {
-    tiers_for(provider_id).map(|t| tier.pick(t))
-}
-
-/// Reverse-map a concrete model id to its tier, checking the preferred provider
-/// first, then all providers. Port of `getModelTierFromModel`.
-pub fn model_tier_from_model(
-    model_id: &str,
-    preferred_provider_id: Option<&str>,
-) -> Option<ModelTier> {
-    if let Some(provider) = preferred_provider_id {
-        if let Some(tiers) = tiers_for(provider) {
-            if let Some(t) = ModelTier::ALL.iter().find(|t| t.pick(tiers) == model_id) {
-                return Some(*t);
-            }
-        }
-    }
-    for (_, tiers) in PROVIDER_MODEL_TIERS {
-        if let Some(t) = ModelTier::ALL.iter().find(|t| t.pick(tiers) == model_id) {
-            return Some(*t);
-        }
-    }
-    None
 }
 
 /// Whether a model (bare or compound) targets `target_provider_id`. Port of
@@ -206,27 +64,6 @@ fn fuzzy_pick<'a>(candidate: &str, pool: &[&'a str]) -> Option<&'a str> {
         .filter(|m| normalize_for_fuzzy_match(m).starts_with(&normalized))
         .max_by_key(|m| normalize_for_fuzzy_match(m).len())
         .copied()
-}
-
-/// Normalize a bare/fuzzy model name to the qualified `provider:alias` form for
-/// `target_provider_id`, using that provider's tier models as the pool. Returns
-/// the qualified compound id, or `None` if no reasonable match. Candidates that
-/// already contain `:` are returned unchanged. Port of `normalizeModelOverride`.
-pub fn normalize_model_override(candidate: &str, target_provider_id: &str) -> Option<String> {
-    if candidate.is_empty() {
-        return None;
-    }
-    if candidate.contains(':') {
-        return Some(candidate.to_string());
-    }
-    let tiers = tiers_for(target_provider_id)?;
-    let mut pool: Vec<&str> = Vec::new();
-    for v in [tiers.fast, tiers.balanced, tiers.smart] {
-        if !pool.contains(&v) {
-            pool.push(v);
-        }
-    }
-    fuzzy_pick(candidate, &pool).map(|m| create_compound_model_id(target_provider_id, m))
 }
 
 /// Fuzzy-match a candidate against an explicit pool of model ids (typically the

@@ -3,9 +3,8 @@
 //! Pure projections + the model-catalog helpers that back the `agent.*`
 //! `WorkspaceApi` methods (the trait bodies live in `lib.rs`). The
 //! [`AgentLite`] derivation (`lastAgentResponse`/`digest`) ports the TS
-//! `agent.list`/`agent.get` post-processing; [`static_models`] /
-//! [`parse_model_list_output`] port the `agent.getModels` static-tier fallback
-//! and auggie CLI parser respectively.
+//! `agent.list`/`agent.get` post-processing; [`parse_model_list_output`]
+//! ports the auggie CLI model-list parser.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -46,7 +45,6 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 /// consumers (activity feeds, filters) can trace provenance.
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
-use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -120,8 +118,18 @@ fn resolve_default_model_from_settings(
         }
     }
 
-    // 2. Check provider defaults
-    let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
+    // 2. Check provider defaults. With no explicit provider, key the lookup
+    // by the settings-derived default (model.default prefix, else
+    // providers.active), bottoming out at the first registered provider.
+    let derived;
+    let provider_key = match provider {
+        Some(p) => p,
+        None => {
+            derived = crate::agent_session::derived_default_provider(&settings)
+                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+            derived.as_str()
+        }
+    };
     if let Some(model) = settings.model.provider_defaults.get(provider_key) {
         if !model.is_empty() {
             return Some(model.clone());
@@ -164,10 +172,20 @@ pub(crate) fn resolve_agent_default_model(
     is_background: bool,
 ) -> Option<String> {
     // Normalize through provider_config so legacy default-provider aliases
-    // guard as the provider the spawn would actually run.
-    let effective_provider = intent_providers::provider_config(
-        provider.unwrap_or_else(|| intent_providers::default_provider_id()),
-    )
+    // guard as the provider the spawn would actually run. With no explicit
+    // provider, guard against the settings-derived default (model.default
+    // prefix, else providers.active), bottoming out at the first registered
+    // provider.
+    let derived;
+    let effective_provider = intent_providers::provider_config(match provider {
+        Some(p) => p,
+        None => {
+            derived =
+                crate::agent_session::derived_default_provider(&services.effective_settings())
+                    .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+            derived.as_str()
+        }
+    })
     .id;
 
     if let Some(spec_id) = specialist {
@@ -211,8 +229,7 @@ pub(crate) fn resolve_agent_default_model(
 /// provider was requested, where a known compound prefix *becomes* the
 /// resolved provider (`agent_create_op` derives `session.provider` from it).
 /// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
-/// evidence rules (static tiers + cached catalogs; absence of evidence
-/// passes).
+/// evidence rules (cached dynamic catalogs; absence of evidence passes).
 fn default_model_belongs_to_provider(
     services: &Services,
     provider_param: Option<&str>,
@@ -254,26 +271,21 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 /// Reject a bare model id that provably belongs to a different provider with
 /// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
-/// (monorepo#607). Ownership evidence is deterministic and probe-free:
-/// `PROVIDER_MODEL_TIERS` (static tiers) unioned with the in-memory
-/// last-good `ModelCatalogCache` entries under each provider's current
-/// registry version key — never a live fetch, so create/setModel cannot
-/// block on a catalog probe.
+/// (monorepo#607). Ownership evidence is deterministic and probe-free: the
+/// in-memory last-good `ModelCatalogCache` entries under each provider's
+/// current registry version key — never a live fetch, so create/setModel
+/// cannot block on a catalog probe. (The former static-tier evidence path
+/// went with the tier tables.)
 ///
-/// Evidence is asymmetric by strength:
-/// - a **static-tier** claim by another provider rejects outright (the
-///   original #425 rule, unchanged) unless the requested provider itself
-///   claims the id (static or cached);
-/// - a **cached-catalog** claim by another provider rejects only when the
-///   requested provider's ownership is affirmatively *disproven* — no static
-///   claim AND its own cached catalog exists but lacks the id. With no cache
-///   entry for the requested provider (cold start, expired pin), the bare id
-///   passes — absence of evidence is not a mismatch.
+/// Evidence stays asymmetric: a cached-catalog claim by another provider
+/// rejects only when the requested provider's ownership is affirmatively
+/// *disproven* — its own cached catalog exists but lacks the id. With no
+/// cache entry for the requested provider (cold start, expired pin), the
+/// bare id passes — absence of evidence is not a mismatch.
 ///
 /// Two spawn-parity carve-outs:
-/// - the literal `"default"` id is claude-code's smart-tier *sentinel*
-///   ("use the CLI default"), not an ownership claim — it passes for every
-///   provider;
+/// - the literal `"default"` id is a "use the CLI default" *sentinel*, not
+///   an ownership claim — it passes for every provider;
 /// - `provider_id` is normalized through `provider_config` first, so legacy
 ///   default-provider aliases persisted on old sessions (`default`/`acp`/
 ///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
@@ -288,28 +300,18 @@ fn ensure_bare_model_matches_provider(
         return Ok(());
     }
     let effective = intent_providers::provider_config(provider_id).id;
-    let static_owners = intent_providers::providers_claiming_model(model_id);
-    // The requested provider provably owns the id — static tier or its own
-    // current cached catalog — so any other claim is a shared id, not a
-    // mismatch.
+    // The requested provider provably owns the id via its own current cached
+    // catalog — any other claim is a shared id, not a mismatch.
     let requested_cache = cache.cached_catalog_claims(effective, model_id);
-    if static_owners.contains(&effective) || requested_cache == Some(true) {
+    if requested_cache == Some(true) {
         return Ok(());
     }
     let cached_owners = cache.providers_claiming_model_cached(model_id);
-    let reject =
-        !static_owners.is_empty() || (!cached_owners.is_empty() && requested_cache == Some(false));
-    if reject {
-        let mut owners: Vec<String> = static_owners.iter().map(|s| s.to_string()).collect();
-        for owner in cached_owners {
-            if !owners.contains(&owner) {
-                owners.push(owner);
-            }
-        }
+    if !cached_owners.is_empty() && requested_cache == Some(false) {
         return Err(Error::InvalidParams(format!(
             "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
-            owners.join(", ")
+            cached_owners.join(", ")
         )));
     }
     Ok(())
@@ -318,25 +320,25 @@ fn ensure_bare_model_matches_provider(
 /// Resolve the provider `agent.delegate` should spawn on when the caller
 /// supplies no explicit `model` (spec Decision D2). The wire has no
 /// `provider` param, so the daemon must derive one itself instead of leaving
-/// `AgentCreateExtra.provider` unset — which previously fell through to
-/// [`intent_providers::default_provider_id`] (Auggie) at spawn time
-/// regardless of the user's actual configured default.
+/// `AgentCreateExtra.provider` unset — which would fall through to the
+/// spawn path's positional last resort regardless of the user's actual
+/// configured default.
 ///
 /// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
 ///    when that is unset — the provider prefix of its compound `model`
 ///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
 ///    or the delegate fails with a clear error (never silently substituted).
-/// 2. The configured default (`providers.active`), with the same
-///    known/available requirement.
+/// 2. The settings-derived default (provider of `model.default`, else
+///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
+///    with the same known/available requirement.
 /// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
 ///    session's `provider` stays unset, exactly like the pre-existing model
 ///    resolution's "no configured default" case. `resolve_provider_id`
-///    (`agent_session.rs`) applies the same configured-default-over-
-///    hardcoded-Auggie precedence at spawn time, but with no configured
-///    default to offer either, that precedence itself bottoms out at the
-///    spawn path's hardcoded [`intent_providers::default_provider_id`]
-///    (Auggie) — this residual, no-config case is the one scenario where
-///    the hardcoded default still applies.
+///    (`agent_session.rs`) applies the same configured-default precedence at
+///    spawn time, but with no configured default to offer either, that
+///    precedence bottoms out at the first registered provider (neutral
+///    positional last resort) — this residual, no-config case is the one
+///    scenario where the positional fallback still applies.
 fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
@@ -361,16 +363,11 @@ fn resolve_delegate_provider(
         }
     }
 
-    match settings
-        .providers
-        .active
-        .as_deref()
-        .filter(|p| !p.is_empty())
-    {
-        Some(active) => {
-            ensure_known_provider("agent.delegate", active)?;
-            ensure_provider_available("agent.delegate", active, &settings.providers.paths)?;
-            Ok(Some(active.to_string()))
+    match crate::agent_session::derived_default_provider(&settings) {
+        Some(derived) => {
+            ensure_known_provider("agent.delegate", &derived)?;
+            ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
+            Ok(Some(derived))
         }
         None => Ok(None),
     }
@@ -736,31 +733,6 @@ fn strip_spans_capture(s: &str, start: &str, end: &str) -> Option<String> {
     Some(after[..j].to_string())
 }
 
-/// The static model catalog used as the `agent.getModels` fallback when the
-/// auggie CLI is unavailable: every `(provider, tier)` model from
-/// `PROVIDER_MODEL_TIERS`, deduped by `provider:model` (PROTOCOL §5.5).
-pub(crate) fn static_models() -> Vec<Value> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for (provider_id, tiers) in PROVIDER_MODEL_TIERS {
-        for (tier, model_id) in [
-            ("fast", tiers.fast),
-            ("balanced", tiers.balanced),
-            ("smart", tiers.smart),
-        ] {
-            let key = format!("{provider_id}:{model_id}");
-            if seen.insert(key) {
-                out.push(json!({
-                    "id": model_id,
-                    "name": format!("{model_id} ({tier})"),
-                    "provider": provider_id,
-                }));
-            }
-        }
-    }
-    out
-}
-
 /// Parse `auggie model list` output into `(value, label, description?)` rows,
 /// porting the TS `parseModelListOutput` (`- Label [model-id]` + an optional
 /// indented description on the next line).
@@ -803,23 +775,14 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
     Some((label, value))
 }
 
-/// The static tier rows for one provider: [`static_models`] filtered to
-/// `provider_id`. Empty for providers absent from `PROVIDER_MODEL_TIERS`
-/// (dynamic-only lists such as opencode/droid).
-pub(crate) fn static_models_for(provider_id: &str) -> Vec<Value> {
-    static_models()
-        .into_iter()
-        .filter(|m| m.get("provider").and_then(Value::as_str) == Some(provider_id))
-        .collect()
-}
-
-/// The per-provider `models.list` static-fallback response (PROTOCOL §5.30):
-/// the provider's static tier rows when it has any, else an empty list —
-/// always labeled with `source: "static"` and a `warning`, never an error.
+/// The per-provider `models.list` fallback response (PROTOCOL §5.30) when no
+/// dynamic discovery succeeded: an empty list labeled `source: "static"` with
+/// a `warning`, never an error. (The former static tier catalog went with the
+/// tier tables — the provider CLI owns model discovery.)
 pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
     json!({
         "providerId": provider_id,
-        "models": static_models_for(provider_id),
+        "models": [],
         "source": "static",
         "warning": warning,
     })
@@ -852,7 +815,7 @@ fn resolve_auggie_bin(auggie_bin: Option<std::path::PathBuf>) -> Option<std::pat
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
 /// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
 /// CLI is unavailable, hangs past [`AUGGIE_MODELS_TIMEOUT`], or yields
-/// nothing, so the caller can fall back to [`static_models`]. The binary
+/// nothing, so the caller can degrade to an empty model list. The binary
 /// comes from [`resolve_auggie_bin`] and runs via [`auggie_output`] (bounded,
 /// exec PATH) so its co-located `node` resolves in a packaged-app
 /// environment.
@@ -1005,7 +968,7 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
 /// then filter legacy models and sort ([`finalize_model_rows`]). Returns
 /// `None` when the CLI is unavailable, hangs past
 /// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
-/// fall back to [`static_models`]. `auggie_bin` overrides discovery
+/// degrade to an empty model list. `auggie_bin` overrides discovery
 /// (the [`crate::Services::with_auggie_bin`] test seam); otherwise the
 /// binary comes from [`resolve_auggie_bin`].
 pub(crate) async fn fetch_auggie_models_rich(
@@ -2137,13 +2100,13 @@ impl Services {
                 ensure_known_provider("agent.create", &model_provider)?;
             } else {
                 // A bare model that provably belongs to a different provider
-                // — static tiers or cached dynamic catalogs — must not be
-                // persisted either: the spawn would feed the effective
-                // provider another provider's model id (monorepo#607). The
-                // effective provider mirrors `resolve_provider_id` for a bare
-                // model: provider field → default. Bare ids with no ownership
-                // evidence pass — ownership cannot be proven for dynamic-only
-                // model lists that were never fetched.
+                // (cached dynamic catalogs) must not be persisted either: the
+                // spawn would feed the effective provider another provider's
+                // model id (monorepo#607). The effective provider mirrors
+                // `resolve_provider_id` for a bare model: provider field →
+                // settings-derived default → first registered provider. Bare
+                // ids with no ownership evidence pass — ownership cannot be
+                // proven for model lists that were never fetched.
                 //
                 // Only a *client-supplied* mismatch hard-fails. A mismatch in
                 // a derived default (specialist frontmatter / settings chain
@@ -2152,9 +2115,17 @@ impl Services {
                 // param) would reject a model the caller never sent and make
                 // the provider uncreatable until settings change; drop it to
                 // the CLI default instead (session.model stays None).
-                let effective = provider
-                    .as_deref()
-                    .unwrap_or(intent_providers::default_provider_id());
+                let derived;
+                let effective = match provider.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        derived = crate::agent_session::derived_default_provider(
+                            &self.effective_settings(),
+                        )
+                        .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+                        derived.as_str()
+                    }
+                };
                 match ensure_bare_model_matches_provider(
                     "agent.create",
                     &self.models_catalog,
@@ -2319,14 +2290,20 @@ impl Services {
         } else {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
-            // model has no prefix: session.provider → default): a bare id
-            // provably owned by another provider — static tiers or cached
-            // dynamic catalogs — is the same misroute vector (monorepo#607).
-            let effective = session
-                .provider
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(intent_providers::default_provider_id());
+            // model has no prefix: session.provider → settings-derived
+            // default → first registered provider): a bare id provably owned
+            // by another provider (cached dynamic catalogs) is the same
+            // misroute vector (monorepo#607).
+            let derived;
+            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => p,
+                None => {
+                    derived =
+                        crate::agent_session::derived_default_provider(&self.effective_settings())
+                            .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+                    derived.as_str()
+                }
+            };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
                 &self.models_catalog,
@@ -2893,25 +2870,25 @@ impl Services {
         Ok(truncated_count)
     }
 
-    /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
+    /// `agent.getModels` (PROTOCOL §5.5): auggie CLI fetch; an unavailable
+    /// CLI yields an empty model list (the provider CLI owns model
+    /// discovery — there is no static fallback catalog).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
-        let models = match fetch_auggie_models(self.auggie_bin.clone()).await? {
-            Some(m) => m,
-            None => static_models(),
-        };
+        let models = fetch_auggie_models(self.auggie_bin.clone())
+            .await?
+            .unwrap_or_default();
         Ok(json!({ "models": models }))
     }
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
     /// path — auggie CLI (JSON → plain-text fallback) with a 5-minute success
-    /// cache, degrading to the static tier catalog (`source: "static"`) when
-    /// the CLI is unavailable, so the result is never empty; `forceRefresh`
-    /// skips the cache read. With a `providerId` the request goes through the
-    /// generic per-provider cache ([`crate::model_catalog`]): registered
-    /// sources are probed and cached per (provider, version key); unknown
-    /// providers degrade to their static tier catalog (or an empty list) with
-    /// a `warning` — never an error.
+    /// cache, degrading to an empty list (`source: "static"`) when the CLI is
+    /// unavailable; `forceRefresh` skips the cache read. With a `providerId`
+    /// the request goes through the generic per-provider cache
+    /// ([`crate::model_catalog`]): registered sources are probed and cached
+    /// per (provider, version key); unknown providers degrade to an empty
+    /// list with a `warning` — never an error.
     pub(crate) async fn models_list_op(
         &self,
         provider_id: Option<String>,
@@ -2923,9 +2900,7 @@ impl Services {
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
-                format!(
-                    "no dynamic model discovery for provider '{provider_id}'; using static catalog"
-                ),
+                format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
         let version_key = (source.version_key)();
@@ -2952,9 +2927,9 @@ impl Services {
             }
             None => Ok(static_provider_response(
                 &provider_id,
-                resolved.warning.unwrap_or_else(|| {
-                    format!("model discovery for '{provider_id}' failed; using static catalog")
-                }),
+                resolved
+                    .warning
+                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
         }
     }
@@ -2964,11 +2939,10 @@ impl Services {
     /// id and same registry-derived version key — so the two can never
     /// diverge: one cache, one single-flight, one negative window. Only the
     /// wire shape differs: the response omits the `providerId` field,
-    /// `source` is `"auggie"` or `"static"`, and the static tier catalog
-    /// (never an empty list) is the fallback when the probe fails with no
-    /// last-good list. A failed probe with a last-good cached list serves it
-    /// labeled `stale: true` + `warning` — never silently — whether or not
-    /// the read was forced.
+    /// `source` is `"auggie"` or `"static"`, and an empty list is the
+    /// fallback when the probe fails with no last-good list. A failed probe
+    /// with a last-good cached list serves it labeled `stale: true` +
+    /// `warning` — never silently — whether or not the read was forced.
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
         let auggie_bin = self.auggie_bin.clone();
         self.models_list_auggie_with(
@@ -3034,7 +3008,7 @@ impl Services {
                 }
                 Ok(out)
             }
-            None => Ok(json!({ "models": static_models(), "source": "static" })),
+            None => Ok(json!({ "models": [], "source": "static" })),
         }
     }
 

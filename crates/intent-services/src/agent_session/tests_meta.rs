@@ -26,7 +26,7 @@ fn resolve_provider_id_none_uses_default() {
     let provider_id = resolve_provider_id(None, None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "None model + None provider -> default"
     );
 }
@@ -37,7 +37,7 @@ fn resolve_provider_id_bare_model_none_provider_uses_default() {
     let provider_id = resolve_provider_id(Some("sonnet4.5"), None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "bare model + None provider -> default"
     );
 }
@@ -55,7 +55,7 @@ fn resolve_provider_id_malformed_compound_falls_back() {
     let provider_id = resolve_provider_id(Some(":sonnet"), None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "malformed compound :sonnet with no provider -> default"
     );
 
@@ -63,7 +63,7 @@ fn resolve_provider_id_malformed_compound_falls_back() {
     let provider_id = resolve_provider_id(Some("gpt-4"), Some(""), None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "empty provider string falls back to default"
     );
 }
@@ -104,7 +104,7 @@ fn resolve_provider_id_provider_field_wins_over_configured_default() {
 #[test]
 fn resolve_provider_id_empty_configured_default_falls_back_to_hardcoded_default() {
     let provider_id = resolve_provider_id(None, None, Some(""));
-    assert_eq!(provider_id, intent_providers::default_provider_id());
+    assert_eq!(provider_id, intent_providers::first_provider_id());
 }
 
 #[test]
