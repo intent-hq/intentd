@@ -281,7 +281,7 @@ impl Services {
         if effective_provider != "auggie" {
             return Ok(json!({
                 "available": false,
-                "reason": "enhance-prompt requires auggie as the active provider"
+                "reason": "enhance-prompt requires auggie as the effective default provider"
             }));
         }
 

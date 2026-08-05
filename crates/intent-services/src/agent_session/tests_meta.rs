@@ -1,7 +1,8 @@
 //! Tests for `_meta` payload construction (§18.1 system-prompt injection via
 //! ACP extensibility).
 
-use super::{build_session_meta, resolve_provider_id};
+use super::{build_session_meta, derived_default_provider, resolve_provider_id};
+use intent_core::settings_file::SettingsFile;
 
 #[test]
 fn resolve_provider_id_from_compound_model() {
@@ -39,6 +40,91 @@ fn resolve_provider_id_bare_model_none_provider_uses_default() {
         provider_id,
         intent_providers::first_provider_id(),
         "bare model + None provider -> default"
+    );
+}
+
+/// A [`SettingsFile`] with the given `model.default` / `providers.active`.
+fn settings(model_default: Option<&str>, providers_active: Option<&str>) -> SettingsFile {
+    let mut s = SettingsFile::default();
+    s.model.default = model_default.map(str::to_string);
+    s.providers.active = providers_active.map(str::to_string);
+    s
+}
+
+#[test]
+fn derived_default_provider_prefix_beats_active() {
+    // model.default compound prefix outranks providers.active.
+    let s = settings(Some("claude-code:sonnet4.5"), Some("codex"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "model.default prefix wins over providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_bare_model_falls_through_to_active() {
+    // A bare model.default (no colon) carries no provider — providers.active wins.
+    let s = settings(Some("sonnet4.5"), Some("claude-code"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "bare model.default falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_malformed_prefix_falls_through() {
+    // ":sonnet" yields an empty prefix — falls through to providers.active.
+    let s = settings(Some(":sonnet"), Some("codex"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("codex"),
+        "malformed compound model.default falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_unknown_prefix_falls_through() {
+    // An unregistered prefix (stale value, typo, foreign-build id) must not
+    // be trusted — providers.active stays reachable.
+    let s = settings(Some("typo:foo"), Some("claude-code"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "unknown model.default prefix falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_unknown_active_yields_none() {
+    // An unregistered providers.active is not surfaced either.
+    let s = settings(None, Some("not-a-provider"));
+    assert_eq!(
+        derived_default_provider(&s),
+        None,
+        "unknown providers.active is not surfaced"
+    );
+}
+
+#[test]
+fn derived_default_provider_trims_whitespace() {
+    // Padded settings values still resolve to the registered id.
+    let s = settings(None, Some("  claude-code  "));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "whitespace-padded providers.active resolves trimmed"
+    );
+}
+
+#[test]
+fn derived_default_provider_both_unset_yields_none() {
+    let s = settings(None, None);
+    assert_eq!(
+        derived_default_provider(&s),
+        None,
+        "neither setting set -> None (callers use the positional last resort)"
     );
 }
 

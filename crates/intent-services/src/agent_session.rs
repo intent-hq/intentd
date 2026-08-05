@@ -556,28 +556,31 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 
 /// Derive the user-configured default provider from the effective settings:
 /// the provider prefix of the configured default model (`model.default`
-/// compound prefix), else `providers.active`. `None` when neither is set —
-/// no provider carries a hardcoded default designation, so callers fall
-/// through to [`resolve_provider_id`]'s neutral positional last resort (the
-/// first registered provider).
+/// compound prefix), else `providers.active`. Each candidate is validated
+/// against the provider registry ([`intent_providers::find_provider`]) so a
+/// stale, mistyped, or foreign-build id falls through to the next precedence
+/// step instead of being trusted (an unknown `model.default` prefix must not
+/// shadow a perfectly valid `providers.active`). `None` when neither yields
+/// a registered provider — no provider carries a hardcoded default
+/// designation, so callers fall through to [`resolve_provider_id`]'s neutral
+/// positional last resort (the first registered provider).
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
+    /// Accept a candidate id only when it names a registered provider
+    /// (whitespace-trimmed, so padded settings values still resolve).
+    fn registered(id: &str) -> Option<String> {
+        let id = id.trim();
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
+    }
     settings
         .model
         .default
         .as_deref()
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .filter(|id| !id.is_empty())
-        .or_else(|| {
-            settings
-                .providers
-                .active
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .map(|p| p.to_string())
-        })
+        .and_then(|id| registered(&id))
+        .or_else(|| settings.providers.active.as_deref().and_then(registered))
 }
 
 /// Resolve the effective provider id for an agent session using the same precedence

@@ -46,7 +46,7 @@ impl Services {
         if effective_provider != "auggie" {
             return Ok(json!({
                 "available": false,
-                "reason": "completeOnce requires auggie as the active provider"
+                "reason": "completeOnce requires auggie as the effective default provider"
             }));
         }
 

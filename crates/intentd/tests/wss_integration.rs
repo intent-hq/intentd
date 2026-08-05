@@ -2826,8 +2826,73 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "enhance-prompt requires auggie as the active provider"
+            "reason": "enhance-prompt requires auggie as the effective default provider"
         })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
+    // Gate precedence: the effective provider derives from the `model.default`
+    // compound prefix FIRST, then `providers.active`. Both directions:
+    // a non-auggie prefix closes the gate even with auggie active, and an
+    // auggie prefix opens it even with a non-auggie active provider. An
+    // unknown prefix is not trusted — it falls through to `providers.active`.
+    let (_auggie_dir, bin) = fake_auggie_script(
+        "prefix-enhance",
+        "printf '🤖\\n<augment-enhanced-prompt>Enhanced: via prefix</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    // Direction 1: claude-code prefix outranks auggie active → gate closes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":37,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 37);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "enhance-prompt requires auggie as the effective default provider"
+        }),
+        "non-auggie model.default prefix outranks auggie providers.active"
+    );
+
+    // Direction 2: auggie prefix outranks claude-code active → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":38,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 38);
+    assert_eq!(
+        resp["result"]["enhanced"], "Enhanced: via prefix",
+        "auggie model.default prefix outranks non-auggie providers.active"
+    );
+
+    // Unknown prefix: falls through to providers.active (auggie) → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("typo:foo"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":39,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 39);
+    assert_eq!(
+        resp["result"]["enhanced"], "Enhanced: via prefix",
+        "unknown model.default prefix falls through to providers.active"
     );
     srv.ws.stop().await;
 }
@@ -2953,8 +3018,52 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce requires auggie as the active provider"
+            "reason": "completeOnce requires auggie as the effective default provider"
         })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
+    // Gate precedence mirror of the enhance-prompt test: `model.default`
+    // compound prefix outranks `providers.active` in both directions.
+    let (_auggie_dir, bin) = fake_auggie_script("prefix-complete", "printf '🤖\\nvia-prefix\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    // Direction 1: claude-code prefix outranks auggie active → gate closes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":45,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 45);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires auggie as the effective default provider"
+        }),
+        "non-auggie model.default prefix outranks auggie providers.active"
+    );
+
+    // Direction 2: auggie prefix outranks claude-code active → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":46,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 46);
+    assert_eq!(
+        resp["result"]["text"], "via-prefix",
+        "auggie model.default prefix outranks non-auggie providers.active"
     );
     srv.ws.stop().await;
 }
