@@ -5017,6 +5017,95 @@ mod change_event_parity {
         assert_eq!(again.attention, WorkspaceAttention::None);
     }
 
+    /// Regression (intent-hq/monorepo#1466): acknowledging attention is not
+    /// "activity". `markSeen` clears the unread flag WITHOUT bumping
+    /// `updated_at`, so the derived `lastActivity` (sidebar label/sort) stays
+    /// put.
+    #[tokio::test]
+    async fn mark_seen_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        // Pin the row's timestamps to a fixed past instant so any bump shows.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "markSeen must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-02T00:00:00Z"),
+            "derived lastActivity must not move on markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1466): `dismissAttention` never bumps
+    /// `updated_at` — neither when attention is already `none` (a pure no-op:
+    /// the row is not rewritten) nor when it actually clears attention.
+    #[tokio::test]
+    async fn dismiss_attention_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        // No attention raised: dismiss is a pure no-op — updated_at untouched.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss noop");
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "no-op dismiss must not bump updated_at"
+        );
+
+        // With attention raised: dismiss clears it, still without bumping.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.updated_at = "2020-01-03T00:00:00Z".to_string();
+        h.store.update_workspace(&pinned).await.expect("re-pin");
+
+        let dismissed = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        assert_eq!(dismissed.attention, WorkspaceAttention::None);
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-03T00:00:00Z",
+            "dismiss must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on dismissAttention"
+        );
+    }
+
     /// `workspace.create` emits `workspace:created` after the row is inserted
     /// (§6.5), with the self-sufficient `{ workspaceId, workspace }` payload
     /// (§6.7). The new workspace mints its own id, so subscribe unfiltered.
@@ -18804,8 +18893,11 @@ mod last_activity_events {
         );
     }
 
-    /// `dismiss_attention` only emits `workspace:updated { lastActivity }` when
-    /// attention actually changed (idempotent no-op on already-clear).
+    /// `dismiss_attention` emits `workspace:attention-changed` only when
+    /// attention actually changed (idempotent no-op on already-clear), and —
+    /// since acknowledging attention is not "activity"
+    /// (intent-hq/monorepo#1466) — never a `workspace:updated
+    /// { lastActivity }`.
     #[tokio::test]
     async fn dismiss_attention_idempotent() {
         let _guard = DebounceEnvGuard::new("100");
@@ -18826,7 +18918,8 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss (should emit both events).
+        // Dismiss: attention-changed only — no updated_at bump, so no
+        // debounced workspace:updated { lastActivity } follows.
         h.services
             .dismiss_attention(h.ws.clone())
             .await
@@ -18835,8 +18928,13 @@ mod last_activity_events {
         let ev1 = recv_one(&mut sub).await;
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
-        let ev2 = recv_one(&mut sub).await;
-        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "dismiss must not emit a lastActivity workspace:updated"
+        );
 
         // Dismiss again (no-op, no events).
         h.services
