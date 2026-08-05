@@ -187,7 +187,7 @@ async fn connect_ws(
 
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     let mut ws = connect_ws(port, cfg).await;
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send");
     loop {
