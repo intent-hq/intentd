@@ -9824,7 +9824,7 @@ This note is your workspace for this task. Update it with your progress, finding
 \n\
 **SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
 \n\
-**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`.",
+**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`.",
         note_id = note.id.as_str(),
     );
     let first_message_text = child_session_first_message_text(&svc, &child).await;

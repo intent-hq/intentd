@@ -4530,7 +4530,7 @@ impl Services {
                 note_id = note_id,
             );
             let commit_instruction = if skip_auto_commit {
-                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
+                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`."
             } else {
                 ""
             };
