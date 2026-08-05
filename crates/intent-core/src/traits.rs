@@ -4610,7 +4610,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// user/assistant agent messages. `workspace_id` `None` → global across
     /// all workspaces; `Some` → hard scope filter. `prefer_workspace_id` is a
     /// soft ranking boost: results stay global but matches from that workspace
-    /// outrank equally-relevant matches elsewhere. Returns
+    /// outrank equally-relevant matches elsewhere. Archived-workspace matches
+    /// carry a soft ranking penalty, so equally-relevant matches tier
+    /// preferred → other active → archived. Returns
     /// `{ requestId, matches: MessageMatch[] }` inline, or
     /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).

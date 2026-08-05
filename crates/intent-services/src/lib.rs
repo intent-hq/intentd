@@ -338,6 +338,13 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_supervise_park` /
     /// `with_script_start_registration_park`.
     script_parks: script_ops::ScriptParks,
+    /// Test park seam (monorepo#1481) for the attention mutation race window
+    /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
+    /// immediately before their scoped attention write (the site of the
+    /// former read-modify-write window) so tests can deterministically
+    /// interleave a concurrent row mutation. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
+    attention_write_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -592,6 +599,7 @@ impl Services {
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
+            attention_write_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -984,6 +992,29 @@ impl Services {
     ) -> Self {
         self.script_parks.start_registration = Some(park);
         self
+    }
+
+    /// Test seam (monorepo#1481): park the attention mutation paths
+    /// (`raise_attention` / `mark_seen` / `dismiss_attention`) immediately
+    /// before their scoped attention write — the site of the former
+    /// read-modify-write window — so races against concurrent row mutations
+    /// are deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_attention_write_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.attention_write_park = Some(park);
+        self
+    }
+
+    /// Park immediately before the scoped attention write when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_attention_write(&self) {
+        if let Some(park) = &self.attention_write_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Test seam: observe/park the underlying `git.diffs` walk on the
@@ -1779,16 +1810,22 @@ impl Services {
         workspace_id: &WorkspaceId,
         level: WorkspaceAttention,
     ) -> Result<()> {
-        let mut ws = self.store.get_workspace(workspace_id).await?;
-        if ws.attention == level {
+        self.park_attention_write().await;
+        // Scoped, conditional write (monorepo#1481): set attention + bump
+        // `updated_at` (raising IS activity) in one guarded UPDATE — never a
+        // full-row replace, so a concurrent row mutation is never clobbered —
+        // and let the write's row count decide "changed", so the
+        // emit-only-on-change choice is atomic rather than read-based.
+        let changed = self
+            .store
+            .set_workspace_attention(workspace_id, level, Some(&now_iso()), None)
+            .await?;
+        if !changed {
             return Ok(());
         }
-        ws.attention = level;
-        ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
         publish_event(
             &self.event_bus,
-            attention_changed_event(&ws.id, ws.attention),
+            attention_changed_event(workspace_id, level),
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -2707,7 +2744,7 @@ impl Services {
             }
         }
 
-        let interim_idle = self.deliver_completion_to_watches(&child, event).await;
+        let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
@@ -2722,8 +2759,30 @@ impl Services {
         // seals there). The classification is the snapshot
         // `deliver_completion_to_watches` returned, so the seal path and the
         // watch-delivery path always agree on interim vs. real.
-        if event.event_type == AGENT_IDLE && !interim_idle {
+        //
+        // monorepo#1483: the seal gates on the QUEUE/BUSY classification
+        // alone. A hook-waiting idle (the agent owns active background
+        // hooks, monorepo#1336) defers only the agent's own settlement AS A
+        // CHILD — watch delivery and grouped recording — but its delegating
+        // turn is still over (a hook wake redrives a NEW turn). Gating the
+        // seal on `hook_waiting` too would starve a hook-chaining
+        // coordinator's group forever.
+        if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
+                if classification.hook_waiting {
+                    // On the canonical hook-waiting-only idle the group was
+                    // already sealed by the inline redelivery's hook guard
+                    // (delivery's tail re-check runs it first), so this
+                    // branch is the backstop for the races where that
+                    // redelivery early-returns without sealing (e.g. an
+                    // enqueue drained into a busy turn between the entry
+                    // snapshot and the redelivery's live busy probe).
+                    tracing::debug!(
+                        parent = %child.0,
+                        group = %gid,
+                        "sealed after_all group at a hook-waiting queue-idle (monorepo#1483)"
+                    );
+                }
                 self.try_fire_group(&gid).await;
             }
         }
@@ -2946,7 +3005,18 @@ impl Services {
         // the busy guard) so the hook's own terminal transition (dispatch /
         // eviction / expiry wake → turn-end idle, or the external-cancel
         // call into this function) synthesizes the completion later.
+        //
+        // monorepo#1483: hook deferral is scoped to the agent's settlement
+        // AS A CHILD (the synthesized watch delivery below); the agent is
+        // queue-idle here (empty queue, no worker in flight), so its
+        // delegating turn is over — seal its open after_all group NOW
+        // rather than starving the seal until the hooks resolve. Box::pin
+        // mirrors the seal below (try_fire_group → deliver_parent_wake →
+        // send_message → try_drain_queue → this function).
         if !self.active_hooks_for_agent(child_id).await.is_empty() {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
             return;
         }
         // Consume the marker only after the guards pass; losing this take to
@@ -3007,18 +3077,19 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        let classification = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
         // Real completion: seal the agent's open after_all group and try to
-        // fire it, mirroring `handle_completion_event`'s non-interim idle
-        // path (monorepo#1281). Gated on the delivery pass's own interim
-        // classification: an enqueue landing between this function's
+        // fire it, mirroring `handle_completion_event`'s non-queue-interim
+        // idle path (monorepo#1281). Gated on the delivery pass's own
+        // QUEUE/BUSY classification (monorepo#1483: `hook_waiting` never
+        // gates the seal): an enqueue landing between this function's
         // `has_ready_to_send` guard and the delivery re-classifies the
         // synthesized idle as interim (marker re-recorded, so a later
         // mutation/drain retries), and the seal must agree with that
         // snapshot. Box::pin breaks the async-recursion cycle this edge
         // closes (try_drain_queue → redeliver → try_fire_group →
         // deliver_parent_wake → send_message → try_drain_queue).
-        if !interim {
+        if !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
@@ -3063,6 +3134,9 @@ impl Services {
     /// yields the pre-deferral early wake). `agent:failed` /
     /// `agent:deleted` — and the attention / reportToParent immediate
     /// wakes, which run on their own paths — are never hook-deferred.
+    /// Hook deferral is scoped to the agent's settlement AS A CHILD: the
+    /// idling agent's own parent-side after_all seal gates on the
+    /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -3081,14 +3155,17 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     ///
-    /// Returns whether the event was classified as an interim idle, so the
-    /// caller's group-seal decision (`handle_completion_event`) shares this
-    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    /// Returns the pass's idle-classification snapshot, so the callers'
+    /// group-seal decisions (`handle_completion_event`,
+    /// `redeliver_completion_after_queue_mutation`) share it instead of
+    /// re-probing the queue (monorepo#1281) — and gate on `queue_interim`
+    /// alone, because `hook_waiting` must not block the parent-side seal
+    /// (monorepo#1483).
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
         event: &Event,
-    ) -> bool {
+    ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
         // worker is already busy in a new turn (monorepo#1297: an enqueue that
@@ -3119,9 +3196,12 @@ impl Services {
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle (or, for a
         // hook-deferred idle, the last active hook's terminal transition)
-        // can synthesize the real completion (redelivering any skipped
-        // watches AND sealing a watchless coordinator's open after_all
-        // group).
+        // can synthesize the real completion, redelivering any skipped
+        // watches. For a queue-interim coordinator the synthesized idle
+        // also seals its (watchless) open after_all group; a purely
+        // hook-deferred coordinator already seals at THIS idle
+        // (monorepo#1483: `hook_waiting` does not gate the seal), so the
+        // redelivery's seal is a no-op backstop for it.
         if interim_idle {
             self.mark_interim_skipped_idle(child_id);
         }
@@ -3372,7 +3452,10 @@ impl Services {
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
-        interim_idle
+        CompletionIdleClassification {
+            queue_interim,
+            hook_waiting,
+        }
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
@@ -7189,6 +7272,24 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| event.actor.id.clone())
+}
+
+/// Snapshot classification one [`Services::deliver_completion_to_watches`]
+/// pass took for an `agent:idle` event (both flags are always `false` for
+/// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
+/// delivery pass's probes instead of re-probing (monorepo#1281).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompletionIdleClassification {
+    /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
+    /// or a worker turn is in flight — the agent's delegating turn is not
+    /// over yet, so the parent-side after_all seal must wait for the real
+    /// completion.
+    pub(crate) queue_interim: bool,
+    /// Hook-waiting (monorepo#1336): the agent owns active background hooks —
+    /// its settlement AS A CHILD (ungrouped watch delivery, grouped
+    /// recording) defers until the hooks resolve, but this alone must NOT
+    /// gate the parent-side after_all seal (monorepo#1483).
+    pub(crate) hook_waiting: bool,
 }
 
 /// STAB-129: the group members whose recorded terminal event was
@@ -12077,19 +12178,25 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            let mut ws = store.get_workspace(&id).await?;
+            this.park_attention_write().await;
             // Dismissing attention merely acknowledges it — not "activity" —
             // so never touch `updated_at` (which feeds the derived
-            // `lastActivity`), and skip the row write entirely when attention
-            // is already clear (intent-hq/monorepo#1466).
-            if ws.attention != WorkspaceAttention::None {
-                ws.attention = WorkspaceAttention::None;
-                store.update_workspace(&ws).await?;
+            // `lastActivity`) (intent-hq/monorepo#1466). Scoped, conditional
+            // write (monorepo#1481): one guarded UPDATE touching only the
+            // attention column — a concurrent mutation of any other column is
+            // never clobbered — whose row count decides "changed", so the
+            // no-op skip and the emit decision are atomic rather than
+            // read-based.
+            let changed = store
+                .set_workspace_attention(&id, WorkspaceAttention::None, None, None)
+                .await?;
+            if changed {
                 // Self-sufficient `workspace:attention-changed` so every client
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
             }
+            let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
@@ -12106,16 +12213,28 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            let mut ws = store.get_workspace(&id).await?;
+            this.park_attention_write().await;
             // "Seen" clears the unread flag; review-required attention persists.
             // Merely looking at a workspace is not "activity", so `updated_at`
             // (which feeds the derived `lastActivity`) stays untouched
-            // (intent-hq/monorepo#1466).
-            if ws.attention == WorkspaceAttention::Unread {
-                ws.attention = WorkspaceAttention::None;
-                store.update_workspace(&ws).await?;
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            // (intent-hq/monorepo#1466). Scoped, conditional write
+            // (monorepo#1481): one UPDATE guarded on `attention = unread`
+            // touching only the attention column — a concurrent mutation of
+            // any other column is never clobbered — whose row count decides
+            // "changed", so the clear-only-when-unread rule and the emit
+            // decision are atomic rather than read-based.
+            let changed = store
+                .set_workspace_attention(
+                    &id,
+                    WorkspaceAttention::None,
+                    None,
+                    Some(WorkspaceAttention::Unread),
+                )
+                .await?;
+            if changed {
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
             }
+            let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
@@ -18517,6 +18636,13 @@ impl WorkspaceApi for Services {
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+            // gh CLI sync only makes sense against the production login host:
+            // a mock-host flow (test seam) stores a token gh cannot use, and
+            // syncing it would touch the host's real `gh` state from tests.
+            // Trailing slashes are insignificant ("https://github.com/" is the
+            // same host), so normalize before comparing.
+            let sync_gh = base_uri.trim_end_matches('/')
+                == intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.trim_end_matches('/');
             tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
@@ -18524,6 +18650,7 @@ impl WorkspaceApi for Services {
                 flow_id,
                 flow,
                 deadline,
+                sync_gh,
             ));
             let new_slot = github_auth_ops::FlowSlot {
                 flow_id,

@@ -2049,6 +2049,14 @@ const MESSAGE_FTS_TEXT_SQL: &str = "CASE \
 /// enough that a decisively better match from another workspace still wins.
 const PREFER_WORKSPACE_BOOST: f64 = 1.0;
 
+/// `search.messages` archived-workspace ranking penalty, in bm25 units,
+/// added to the bm25 rank (lower = better) of matches owned by an archived
+/// workspace. Mirrors [`PREFER_WORKSPACE_BOOST`] so equally-relevant matches
+/// tier as preferred workspace → other active workspaces → archived
+/// workspaces, while a decisively better match from an archived workspace
+/// still wins.
+const ARCHIVED_WORKSPACE_PENALTY: f64 = 1.0;
+
 /// One `search.messages` hit from [`Store::search_agent_messages_fts`]: the
 /// message/agent ids and result-row context (owning workspace, agent display
 /// name, role, decoded content, timestamp) plus the adjusted bm25 rank
@@ -2113,9 +2121,13 @@ impl Store {
     /// `prefer_workspace_id` is a soft ranking boost: matches from that
     /// workspace get [`PREFER_WORKSPACE_BOOST`] subtracted from their bm25
     /// rank (lower = better), so they outrank equally-relevant matches from
-    /// other workspaces without excluding anyone. Rows order by adjusted rank,
-    /// then newest-first, one row per matching message. `limit` `None` → no
-    /// cap.
+    /// other workspaces without excluding anyone. Matches owned by an
+    /// archived workspace get [`ARCHIVED_WORKSPACE_PENALTY`] added to their
+    /// rank regardless of `prefer_workspace_id`, tiering equally-relevant
+    /// matches preferred → other active → archived — both adjustments are
+    /// soft, so a decisively better bm25 match still wins. Rows order by
+    /// adjusted rank, then newest-first, one row per matching message.
+    /// `limit` `None` → no cap.
     pub async fn search_agent_messages_fts(
         &self,
         match_expr: &str,
@@ -2129,10 +2141,12 @@ impl Store {
             "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
                     s.workspace_id, s.name AS agent_name, \
                     bm25(agent_message_fts) \
-                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) AS adjusted_rank \
+                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
+                      + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
              FROM agent_message_fts \
              JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
              JOIN agent_session s ON s.id = m.agent_id \
+             JOIN workspace w ON w.id = s.workspace_id \
              WHERE agent_message_fts MATCH ? \
                AND (? IS NULL OR s.workspace_id = ?) \
                AND (? IS NULL OR m.agent_id = ?) \
@@ -2142,6 +2156,7 @@ impl Store {
         )
         .bind(prefer_workspace_id.map(|w| w.0.as_str()))
         .bind(PREFER_WORKSPACE_BOOST)
+        .bind(ARCHIVED_WORKSPACE_PENALTY)
         .bind(match_expr)
         .bind(workspace_id.map(|w| w.0.as_str()))
         .bind(workspace_id.map(|w| w.0.as_str()))
@@ -6862,5 +6877,165 @@ mod tests {
             fts_match_ids(&store, "postvacuumterm").await,
             vec![after.id]
         );
+    }
+
+    /// `search.messages` workspace tiering: with equally-relevant matches in
+    /// a preferred active workspace, another active workspace, and an
+    /// archived workspace, adjusted ranks order preferred → other active →
+    /// archived. The [`ARCHIVED_WORKSPACE_PENALTY`] applies with or without
+    /// `prefer_workspace_id`, and hard workspace scoping still returns
+    /// archived rows (the penalty is a ranking adjustment, never a filter).
+    #[tokio::test]
+    async fn search_messages_fts_tiers_active_above_archived() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_pref = WorkspaceId("ws-tier-pref".to_string());
+        let ws_active = WorkspaceId("ws-tier-active".to_string());
+        let ws_arch = WorkspaceId("ws-tier-arch".to_string());
+        for ws in [&ws_pref, &ws_active] {
+            store
+                .insert_workspace(&baseline_test_workspace(ws, &ts))
+                .await
+                .expect("insert workspace");
+        }
+        let mut archived_ws = baseline_test_workspace(&ws_arch, &ts);
+        archived_ws.archived = true;
+        archived_ws.archived_at = Some(ts.clone());
+        store
+            .insert_workspace(&archived_ws)
+            .await
+            .expect("insert archived workspace");
+        for (agent, ws) in [
+            ("agent-tier-pref", &ws_pref),
+            ("agent-tier-active", &ws_active),
+            ("agent-tier-arch", &ws_arch),
+        ] {
+            let agent = AgentId(agent.to_string());
+            store
+                .insert_agent_session(&baseline_test_session(&agent, ws, &ts, None))
+                .await
+                .expect("insert session");
+            store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!("tierterm equally relevant"),
+                    &ts,
+                )
+                .await
+                .expect("append message");
+        }
+        let ws_of = |hits: &[MessageFtsMatch]| {
+            hits.iter()
+                .map(|h| h.workspace_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // preferred → other active → archived under prefer_workspace_id.
+        let hits = store
+            .search_agent_messages_fts("tierterm", None, None, None, Some(&ws_pref), None)
+            .await
+            .expect("tiered search");
+        assert_eq!(
+            ws_of(&hits),
+            vec![ws_pref.0.clone(), ws_active.0.clone(), ws_arch.0.clone()]
+        );
+
+        // No prefer_workspace_id: the archived penalty still applies, by
+        // exactly ARCHIVED_WORKSPACE_PENALTY bm25 units on equal content.
+        let hits = store
+            .search_agent_messages_fts("tierterm", None, None, None, None, None)
+            .await
+            .expect("unpreferred search");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[2].workspace_id, ws_arch.0, "archived match ranks last");
+        assert!((hits[2].rank - hits[0].rank - ARCHIVED_WORKSPACE_PENALTY).abs() < 1e-9);
+
+        // Hard workspace scoping to the archived workspace still matches.
+        let hits = store
+            .search_agent_messages_fts("tierterm", Some(&ws_arch), None, None, None, None)
+            .await
+            .expect("scoped search");
+        assert_eq!(ws_of(&hits), vec![ws_arch.0.clone()]);
+    }
+
+    /// The archived-workspace penalty is a soft boost, not strict tiering: a
+    /// decisively better bm25 match from an archived workspace (short
+    /// document dense in the query term) still outranks a weak match from an
+    /// active workspace (single occurrence in a long document).
+    #[tokio::test]
+    async fn search_messages_fts_archived_penalty_is_soft() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_active = WorkspaceId("ws-soft-active".to_string());
+        let ws_arch = WorkspaceId("ws-soft-arch".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_active, &ts))
+            .await
+            .expect("insert workspace");
+        let mut archived_ws = baseline_test_workspace(&ws_arch, &ts);
+        archived_ws.archived = true;
+        archived_ws.archived_at = Some(ts.clone());
+        store
+            .insert_workspace(&archived_ws)
+            .await
+            .expect("insert archived workspace");
+        let active_agent = AgentId("agent-soft-active".to_string());
+        let arch_agent = AgentId("agent-soft-arch".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&active_agent, &ws_active, &ts, None))
+            .await
+            .expect("insert active session");
+        store
+            .insert_agent_session(&baseline_test_session(&arch_agent, &ws_arch, &ts, None))
+            .await
+            .expect("insert archived session");
+        // Filler documents keep the query term rare in the corpus (IDF up).
+        for _ in 0..8 {
+            store
+                .append_agent_message(
+                    &active_agent,
+                    "user",
+                    &serde_json::json!("padword ".repeat(8).trim()),
+                    &ts,
+                )
+                .await
+                .expect("append filler");
+        }
+        // Weak active match: one occurrence buried in a long document.
+        store
+            .append_agent_message(
+                &active_agent,
+                "user",
+                &serde_json::json!(format!("needleterm {}", "padword ".repeat(60).trim())),
+                &ts,
+            )
+            .await
+            .expect("append weak match");
+        // Decisively better archived match: short and dense in the term.
+        store
+            .append_agent_message(
+                &arch_agent,
+                "user",
+                &serde_json::json!("needleterm ".repeat(8).trim()),
+                &ts,
+            )
+            .await
+            .expect("append strong match");
+
+        let hits = store
+            .search_agent_messages_fts("needleterm", None, None, None, None, None)
+            .await
+            .expect("soft-boost search");
+        assert_eq!(hits.len(), 2, "penalty never excludes archived matches");
+        assert_eq!(
+            hits[0].workspace_id, ws_arch.0,
+            "decisively better archived match overcomes the penalty: {hits:?}"
+        );
+        assert_eq!(hits[1].workspace_id, ws_active.0);
     }
 }
