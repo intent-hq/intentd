@@ -3993,8 +3993,8 @@ mod change_event_parity {
     }
 
     /// Harness variant with the monorepo#1481 attention-write park seam
-    /// armed, so race tests can hold an attention path inside its
-    /// read→write window.
+    /// armed, so race tests can hold an attention path immediately before
+    /// its scoped attention write (the former read-modify-write window).
     async fn harness_with_attention_park(
         park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
     ) -> Harness {
@@ -5145,7 +5145,7 @@ mod change_event_parity {
             .await
             .expect("mark_seen reaches the attention write window");
 
-        // Concurrent mutation while mark_seen sits between read and write.
+        // Concurrent mutation while mark_seen sits parked before its write.
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
         concurrent.title = "renamed while parked".to_string();
         concurrent.updated_at = "2020-06-01T00:00:00Z".to_string();
