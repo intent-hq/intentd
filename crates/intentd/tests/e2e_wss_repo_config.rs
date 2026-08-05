@@ -188,7 +188,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -225,9 +225,9 @@ async fn repo_config_wss_e2e() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Create a temporary git repo
-    let repo_path = std::env::temp_dir().join(format!("repo-cfg-wss-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+    // Create a temporary git repo in a guarded dir (swept even on panic).
+    let repo_dir = common::test_tempdir("repo-cfg-wss-");
+    let repo_path = repo_dir.path().to_path_buf();
     let status = std::process::Command::new("git")
         .args(["init", "--initial-branch=main"])
         .current_dir(&repo_path)

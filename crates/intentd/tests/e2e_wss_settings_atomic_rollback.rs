@@ -193,7 +193,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -412,4 +412,129 @@ async fn retired_workspace_overrides_over_wss() {
         json!(-32602),
         "settings.get on the retired path must reject as unknown: {resp}"
     );
+}
+
+/// `workspaceApi.*` over WSS (per AGENTS.md testing gate): the two
+/// TOML-backed workspace_api output knobs appear in `settings.list` with
+/// their definitions, round-trip through `settings.update`/`settings.reset`,
+/// and out-of-range values reject with `-32602`.
+#[tokio::test]
+async fn workspace_api_settings_round_trip_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // settings.list — both keys advertised with their definitions + defaults.
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let chars = settings
+        .iter()
+        .find(|e| e["path"] == "workspaceApi.maxOutputChars")
+        .expect("workspaceApi.maxOutputChars missing from settings.list");
+    assert_eq!(chars["type"], json!("number"));
+    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["min"], json!(0.0));
+    assert_eq!(chars["max"], json!(10000000.0));
+    assert_eq!(chars["origin"], json!("default"));
+    let toon = settings
+        .iter()
+        .find(|e| e["path"] == "workspaceApi.toonOutput")
+        .expect("workspaceApi.toonOutput missing from settings.list");
+    assert_eq!(toon["type"], json!("boolean"));
+    assert_eq!(toon["value"], json!(true));
+    assert_eq!(toon["origin"], json!("default"));
+
+    // Update both → applied, get reads back with `file` origin.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [
+            {"path": "workspaceApi.maxOutputChars", "value": 250000},
+            {"path": "workspaceApi.toonOutput", "value": false}
+        ] }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "update errored: {resp}");
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 2, "{resp}");
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.get",
+        json!({"path": "workspaceApi.maxOutputChars"}),
+    )
+    .await;
+    // Registry-read numbers are reported as floats on the wire (see
+    // `wire_value`), matching the numeric shape of the catalog defaults.
+    assert_eq!(resp["result"]["value"], json!(250000.0));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({"path": "workspaceApi.toonOutput"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!(false));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // Sub-1000 non-zero / over-max values reject with -32602.
+    for bad in [json!(500), json!(20000000)] {
+        let resp = wss_rpc(
+            &mut ws,
+            5,
+            "settings.update",
+            json!({ "changes": [{"path": "workspaceApi.maxOutputChars", "value": bad}] }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+    }
+
+    // 0 = unlimited is accepted.
+    let resp = wss_rpc(
+        &mut ws,
+        6,
+        "settings.update",
+        json!({ "changes": [{"path": "workspaceApi.maxOutputChars", "value": 0}] }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "0 must be accepted: {resp}");
+
+    // Reset both back to their defaults.
+    let resp = wss_rpc(
+        &mut ws,
+        7,
+        "settings.reset",
+        json!({"path": "workspaceApi.maxOutputChars"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!(100000.0));
+    let resp = wss_rpc(
+        &mut ws,
+        8,
+        "settings.reset",
+        json!({"path": "workspaceApi.toonOutput"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!(true));
 }

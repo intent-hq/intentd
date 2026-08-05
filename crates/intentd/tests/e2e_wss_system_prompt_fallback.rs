@@ -192,7 +192,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -341,6 +341,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         })
         .await
         .expect("insert ws");
@@ -502,8 +503,14 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         second_text.contains("[Role Reminder:"),
         "per-turn role reminder still fires on turn 2: {second_text:?}"
     );
+    // The send may drain via the queue, which appends the dequeue-wait
+    // system note after the user content — strip it before the tail check.
+    let second_tail = second_text
+        .split("\n\n[SYSTEM NOTE] This message was queued at")
+        .next()
+        .unwrap();
     assert!(
-        second_text.ends_with("second user turn"),
+        second_tail.ends_with("second user turn"),
         "user content last on turn 2: {second_text:?}"
     );
 }

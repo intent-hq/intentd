@@ -10,6 +10,13 @@
 # tags and PRs created with GITHUB_TOKEN do not trigger other workflows, and
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
+#
+# Both jobs run on the self-hosted tinybox runners. They were moved to
+# GitHub-hosted runners while tinybox had a single slot: every push to main
+# triggers this workflow, and queueing behind that slot (shared with CI's
+# heavy jobs) ballooned wall clock to hours (intent-hq/monorepo#1221). With
+# 8 tinybox slots the queue-isolation rationale is gone. See
+# intentd#749/#787/#805 for the runner placement history.
 
 name: Release-plz
 
@@ -19,17 +26,42 @@ on:
   push:
     branches: [main]
 
+# Coalesce superseded ordinary-push runs: only the newest queued run per ref
+# matters — `release-plz release-pr` derives the Release PR from the current
+# repo/tag state, so the newest run does all the work any superseded queued
+# run would have done.
+#
+# Release-PR merge pushes get their own group and are never coalesced: with
+# `release_always = false`, `release-plz release` only pushes the tag when
+# the *latest* commit is a Release-PR merge, so if a queued merge-commit run
+# were superseded by an ordinary push, the newer run would silently skip the
+# tag. Merge commits are detected by the Release PR's squash title: both
+# release-plz pr_name forms this repo has produced — `chore: release vX.Y.Z`
+# (multi-package version_group cycles, v0.2.10+) and `chore(intentd):
+# release vX.Y.Z` (single-package cycles, v0.2.2–v0.2.9). A false positive
+# only costs coalescing; a false negative would reopen the dropped-tag bug.
+# Two Release-PR merges can't coalesce with each other in practice: the
+# next Release PR only exists after the previous merge's release-pr job has
+# run.
+#
+# `cancel-in-progress: false` is load-bearing in both groups: a run that is
+# mid-flight on a Release-PR merge commit must never be cancelled between
+# computing the next version and pushing the tag.
+concurrency:
+  group: "release-plz-${{ github.ref }}-${{ (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(intentd): release')) && 'release-merge' || 'push' }}"
+  cancel-in-progress: false
+
 jobs:
   # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
   # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
   # and the implicit token stays powerless.
+  # Any tinybox slot is plenty: on ordinary commits this job is a ~15s no-op,
+  # and on Release-PR merges it only does git/tag work (releases are
+  # git-tag-only per release-plz.toml — nothing is compiled or published).
   release-plz-release:
     name: Release-plz release
     runs-on: [self-hosted, Linux, X64]
     if: ${{ github.repository_owner == 'intent-hq' }}
-    concurrency:
-      group: release-plz-release-${{ github.ref }}
-      cancel-in-progress: false
     steps:
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
       # config scoped to the workspace, which release-plz's temp-dir copy of the
@@ -55,6 +87,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
+  # This job runs `cargo package --workspace`, which compiles the whole
+  # workspace — closer to ci.yml's coverage jobs (which also run on tinybox)
+  # than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
     runs-on: [self-hosted, Linux, X64]
@@ -64,6 +99,16 @@ jobs:
     # release job no-ops quickly, so the ordering costs nothing.
     needs: release-plz-release
     if: ${{ github.repository_owner == 'intent-hq' }}
+    # The workflow-level groups split release-merge and ordinary pushes, so
+    # two runs can be in flight at once. Serialize their release-pr jobs:
+    # concurrent `release-plz release-pr` executions would race on updating
+    # the release-plz-* branch and the Release PR. Coalescing a pending pr
+    # job here is safe — the tag work happened in the run's release job, and
+    # a newer pr job recomputes the Release PR from current state. Residual
+    # cross-group race (accepted): an ordinary run's pr job can grab this
+    # group during a merge run's ~15s release job and compute before the tag
+    # is visible, briefly leaving a stale Release PR — it self-heals on the
+    # next push to main.
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
@@ -74,6 +119,17 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # openssl-sys needs the OpenSSL headers (found via pkg-config);
+      # tinybox has pkg-config and libssl-dev installed, so this is normally
+      # a no-op — kept as an idempotent guard (ci.yml's guard, extended to
+      # also cover a missing pkg-config; relies on the runner user's
+      # passwordless sudo, same as ci.yml's self-hosted jobs).
+      - name: Install pkg-config/libssl-dev if missing
+        run: |
+          if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq pkg-config libssl-dev
+          fi
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -91,19 +147,15 @@ jobs:
       # files from disk instead of re-running `cargo package --list`
       # (which fails for internal path-only dependencies).
       #
-      # The dir deliberately coincides with rust-cache's default cache path
-      # (`$GITHUB_WORKSPACE/target`, from its default `workspaces: . ->
-      # target` input): rust-cache derives cached target paths only from
-      # that input — it never reads CARGO_TARGET_DIR — so pointing the
-      # build anywhere else (e.g. runner.temp) would silently skip caching
-      # the build dir. `/target` is gitignored, so it doesn't dirty the
-      # checkout for release-plz's git operations.
-      - name: Set shared cargo target dir
+      # Keep the dir OUTSIDE the runner work dir so it survives checkout's
+      # clean across runs (see ci.yml's `check` job comment), making
+      # Swatinem/rust-cache — which only ephemeral GitHub-hosted runners
+      # needed — pure overhead, so it was dropped. Key it on $RUNNER_NAME:
+      # the tinybox slots share one $HOME, and two slots must never write
+      # to the same target dir concurrently.
+      - name: Set persistent cargo target dir
         shell: bash
-        run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
-      # Cross-run build cache for the `cargo package --workspace` compiles;
-      # without it every run cold-compiles the whole workspace (~30-45 min).
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:

@@ -76,6 +76,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        disk_usage: None,
         display_status: None,
     }
 }
@@ -170,7 +171,10 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;

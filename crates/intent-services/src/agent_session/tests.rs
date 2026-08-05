@@ -559,6 +559,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -599,6 +600,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     }
 }
@@ -682,8 +684,10 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
     // The activity signal carries identifiers plus the server-derived live
     // preview — never the raw transcript content. The first activity fires
-    // after the first chunk ("Hello ") landed, so its preview reflects the
-    // streamed-so-far text.
+    // after the first chunk ("Hello ") landed, but that text has no newline
+    // yet, so the mid-turn preview clips it as a still-streaming partial line
+    // and omits `lastAgentResponse` entirely (it surfaces on the terminal
+    // stream:end below instead).
     let activity = events
         .iter()
         .find(|e| e.event_type == "agent:stream:activity")
@@ -697,10 +701,9 @@ async fn prompt_turn_streams_events_and_accumulates() {
         activity.data.get("content").is_none(),
         "activity payload never carries transcript content"
     );
-    assert_eq!(
-        activity.data["lastAgentResponse"],
-        json!("Hello"),
-        "first activity carries the preview derived from the first chunk"
+    assert!(
+        activity.data.get("lastAgentResponse").is_none(),
+        "mid-turn preview omitted until a completed (newline-terminated) line streams"
     );
     assert!(
         activity.data.get("digest").is_none(),
@@ -829,6 +832,107 @@ async fn prompt_turn_streams_events_and_accumulates() {
         end.data["lastAgentResponse"],
         json!("Hello world"),
         "terminal stream:end carries the final preview from the full turn text"
+    );
+}
+
+/// Mid-turn `agent:stream:activity` clips the preview at the last newline:
+/// the first chunk carries a completed line plus the start of the next one,
+/// so the activity serves only the completed line; a partial
+/// `<agent_digest>` opener streamed later never surfaces mid-turn. The
+/// terminal `agent:stream:end` re-derives from the full (complete) turn text
+/// and is unaffected by the clipping.
+#[tokio::test]
+async fn prompt_turn_activity_preview_clips_partial_line_and_digest() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = |text: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }
+        })
+        .to_string()
+    };
+    let updates = vec![
+        chunk("Completed line\nNext par"),
+        chunk("tial\n<agent_digest>sum"),
+        chunk("mary</agent_digest>"),
+    ];
+    let (conn, mut note_rx, _agent) = connect_with(updates);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // First activity fires on the first chunk: the trailing "Next par" is a
+    // still-streaming partial line and is excluded.
+    let activity = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:activity")
+        .expect("turn emits at least one activity signal");
+    assert_eq!(
+        activity.data["lastAgentResponse"],
+        json!("Completed line"),
+        "activity preview serves only the completed (newline-terminated) line"
+    );
+    assert!(
+        activity.data.get("digest").is_none(),
+        "no digest streamed by the first chunk"
+    );
+    // No mid-turn frame ever surfaces a partially-streamed digest span.
+    for ev in events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+    {
+        if let Some(d) = ev.data.get("digest").and_then(|d| d.as_str()) {
+            assert_eq!(d, "summary", "only a fully-streamed digest may surface");
+        }
+        if let Some(r) = ev.data.get("lastAgentResponse").and_then(|r| r.as_str()) {
+            assert!(
+                !r.contains("<agent_digest>"),
+                "digest markup never leaks into the preview: {r}"
+            );
+        }
+    }
+
+    // The terminal stream:end derives from the full turn text: the final line
+    // is complete by definition and the completed digest is extracted.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(
+        end.data["lastAgentResponse"],
+        json!("Next partial"),
+        "terminal preview keeps the turn-end (unclipped) semantics"
+    );
+    assert_eq!(
+        end.data["digest"],
+        json!("summary"),
+        "terminal frame carries the completed digest"
     );
 }
 
@@ -1578,6 +1682,283 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
         end.data["trailingBlocks"],
         json!([last.clone()]),
         "trailingBlocks are byte-identical to the persisted trailing blocks"
+    );
+}
+
+/// §6.5 step-0 turn-end trigger: a turn whose persisted assistant tail
+/// carries a question resource block promotes the workspace's derived
+/// `displayStatus` to `needs_attention` (and emits the transition); the next
+/// turn — after the user's answer superseded the questions — persists a
+/// question-free tail and the same turn-end recompute retires it back to
+/// `idle`.
+#[tokio::test]
+async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["workspace:displayStatus-changed".to_string()],
+        ..Default::default()
+    });
+
+    // Turn 1: an AtTurnEnd question attachment lands as the trailing
+    // resource block of the persisted assistant message (the shape
+    // `ws.app.question.ask` produces).
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-q1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "question://q-1".to_string(),
+            name: "Question".to_string(),
+            text: "{\"questions\":[]}".to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("ask")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+
+    // The user's answer supersedes the questions (appended directly — the
+    // send paths carry their own recompute, exercised elsewhere), then turn
+    // 2 persists a question-free tail: the turn-end recompute retires the
+    // hold and emits the demotion.
+    bus.store()
+        .append_agent_message(
+            &agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "answer" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append answer");
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+}
+
+/// Question resource content-block array — the tail shape
+/// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
+/// over the transcript-mutation ops below.
+fn question_blocks() -> Value {
+    json!([{
+        "type": "resource",
+        "resource": {
+            "uri": "intent-question://q-1266",
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "text": "{\"questions\":[]}"
+        }
+    }])
+}
+
+/// The `workspace:displayStatus-changed`-only subscription the monorepo#1266
+/// regression tests below assert against.
+fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["workspace:displayStatus-changed".to_string()],
+        ..Default::default()
+    })
+}
+
+/// monorepo#1266 regression (retire): a user row appended via
+/// `agent.appendMessage` supersedes a pending question tail, so the op's own
+/// recompute must retire the workspace's `needs_attention` displayStatus —
+/// not leave it stale until the next trigger or snapshot.
+#[tokio::test]
+async fn append_message_op_user_row_retires_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed a question-bearing assistant tail, then the last-observed
+    // baseline (needs_attention; a first observation never emits).
+    bus.store()
+        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question tail");
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer" }]),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+}
+
+/// monorepo#1266 regression (raise): an assistant row with a trailing
+/// question resource block appended via `agent.appendMessage` activates the
+/// question hold, so the op's own recompute must promote the workspace's
+/// displayStatus to `needs_attention` and emit the transition.
+#[tokio::test]
+async fn append_message_op_question_row_raises_needs_attention() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (idle; a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+}
+
+/// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
+/// transcript, which can move the question-hold derivation in either
+/// direction — a question-free swap retires `needs_attention`, a swap ending
+/// on a question-bearing assistant row raises it again. Both flips must emit.
+#[tokio::test]
+async fn replace_messages_op_moves_needs_attention_both_ways() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed a question-bearing tail, then the baseline (needs_attention).
+    bus.store()
+        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question tail");
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    // Retire: the swapped transcript ends on a user row.
+    services
+        .agent_replace_messages_op(
+            agent_id.clone(),
+            json!([
+                { "role": "assistant", "contentBlocks": question_blocks() },
+                { "role": "user", "contentBlocks": [{ "type": "text", "text": "answer" }] },
+            ]),
+        )
+        .await
+        .expect("replaceMessages succeeds");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("retire event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "idle" })
+    );
+
+    // Raise: swap back to a transcript ending on a question-bearing row.
+    services
+        .agent_replace_messages_op(
+            agent_id.clone(),
+            json!([{ "role": "assistant", "contentBlocks": question_blocks() }]),
+        )
+        .await
+        .expect("replaceMessages succeeds");
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("raise event delivered")
+        .expect("subscription open");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data,
+        json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
+    );
+}
+
+/// monorepo#1266 transition-only guard: an `agent.appendMessage` mutation
+/// that does NOT move the derivation (a user row onto an already-hold-free
+/// transcript) recomputes silently — no `workspace:displayStatus-changed`.
+#[tokio::test]
+async fn append_message_op_without_derivation_change_emits_nothing() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Seed the last-observed baseline (idle; a first observation never emits).
+    services
+        .maybe_emit_display_status_changed(&workspace_id)
+        .await;
+    let mut sub = display_status_sub(&bus, &workspace_id);
+
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "note to self" }]),
+            None,
+        )
+        .await
+        .expect("appendMessage succeeds");
+
+    assert!(
+        timeout(Duration::from_millis(750), sub.recv())
+            .await
+            .is_err(),
+        "no displayStatus event for a derivation-preserving mutation"
     );
 }
 

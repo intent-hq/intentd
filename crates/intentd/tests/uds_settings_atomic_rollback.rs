@@ -125,17 +125,21 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // Attach a mock ServerControl that always fails start_ws_listener
     services.attach_server_control(Arc::new(FailingServerControl));
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("at-{}.sock", Uuid::new_v4().simple()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-at-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -257,15 +261,19 @@ async fn successful_mixed_batch_persists_all() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     // No ServerControl attached, so no hooks run → success
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("at-{}.sock", Uuid::new_v4().simple()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-at-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -324,15 +332,19 @@ async fn single_key_failure_reverts() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("at-{}.sock", Uuid::new_v4().simple()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-at-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -381,15 +393,19 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("at-{}.sock", Uuid::new_v4().simple()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-at-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -505,15 +521,18 @@ async fn db_read_error_during_capture_fails_batch() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
-        .with_workspaces_root(common::hermetic_workspaces_root());
+        .with_workspaces_root(ws_root.path().to_path_buf());
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path =
-        std::env::temp_dir().join(format!("db-fail-{}.sock", Uuid::new_v4().simple()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "db-fail-");
+    let socket_path = sock_dir.path().join("uds.sock");
     let socket_path_clone = socket_path.clone();
     let bus_clone = bus.clone();
 

@@ -1,10 +1,31 @@
 # Steps injected into v-release.yml's build-local-artifacts job via the
 # `github-build-setup` dist setting (dist-workspace.toml). NOT a standalone
-# workflow. Needed because the self-hosted runners (tinybox / m1mac / 5090pc)
-# don't guarantee the preinstalled toolchain state of GitHub-hosted images:
-# tinybox has no rustup at all, and none of them necessarily have the pinned
-# toolchain or the cross targets (x86_64-apple-darwin on the arm64 Mac, musl
-# on Linux) installed.
+# workflow. Needed because the self-hosted runners (tinybox / 5090pc) don't
+# guarantee the preinstalled toolchain state of GitHub-hosted images:
+# tinybox has no rustup at all, and no runner (self-hosted or GitHub-hosted
+# macOS) necessarily has the pinned toolchain or the cross targets
+# (x86_64-apple-darwin on the arm64 Mac, musl on Linux) installed.
+#
+# On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the WSL
+# stub) shadows Git Bash in PATH, and WSL bash can't execute the runner's
+# Windows-path step scripts. Prepend Git's bin dir so every later
+# `shell: bash` step resolves Git Bash instead (same workaround as ci.yml's
+# build job).
+- name: Put Git Bash first on PATH (Windows)
+  if: runner.os == 'Windows'
+  shell: cmd
+  run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+# dist's generated "Install dependencies" step runs `sudo apt-get install`
+# without -y. GitHub-hosted Ubuntu images make that non-interactive via
+# /etc/apt/apt.conf.d/90assumeyes; tinybox doesn't have it, so apt prompts,
+# reads EOF, and aborts. Mirror the hosted-image config and export
+# DEBIAN_FRONTEND=noninteractive for the later steps.
+- name: Make apt-get non-interactive (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+    echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
 - name: Provision Rust toolchain and matrix targets (self-hosted runners)
   shell: bash
   run: |
@@ -18,6 +39,16 @@
     channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
     rustup toolchain install "$channel" --profile minimal --no-self-update
     rustup target add --toolchain "$channel" ${{ join(matrix.targets, ' ') }}
+    # Pin the rustup proxies to the toolchain provisioned above for all
+    # later steps. Without this, the first `cargo` invocation inside
+    # `dist build` re-enters rustup's rust-toolchain.toml sync to add the
+    # declared rustfmt/clippy components, which on the GitHub-hosted
+    # gh-linux-16x images collides with the preinstalled Rust ("failed to
+    # install component: 'rustfmt-preview-...', detected conflict:
+    # 'bin/cargo-fmt'"), rolls back, and leaves the shim reporting cargo
+    # as missing (v0.2.16 Release run 30706345522, aarch64-musl leg).
+    # The components aren't needed for release builds.
+    echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
     # dist's musl packages_install does a user-site `pip3 install
     # cargo-zigbuild` on the Linux runner, which lands in ~/.local/bin —
     # not on the runner service's PATH.

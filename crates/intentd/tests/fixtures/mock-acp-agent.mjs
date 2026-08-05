@@ -426,9 +426,12 @@ async function handlePrompt(id, params) {
   // resolving, so the daemon can issue `agent.stop` mid-turn. It is left pending
   // until a `session/cancel` arrives; the child stays alive for the follow-up.
   if (behavior.blockUntilCancel && promptCount === 1) {
+    // Newline-terminated: the daemon's mid-turn preview only surfaces
+    // COMPLETED (newline-terminated) lines, and the live-turn overlay e2e
+    // asserts this chunk is served while the turn is parked.
     note('session/update', {
       sessionId: SESSION_ID,
-      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'streaming-before-cancel' } },
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'streaming-before-cancel\n' } },
     });
     pendingPromptIds.push(id);
     return;

@@ -14,7 +14,7 @@ use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
-    PermissionPolicy, Services, WatcherRegistry,
+    GitStatusRefresher, PermissionPolicy, Services, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -29,6 +29,7 @@ mod client;
 mod git_credential;
 mod import;
 mod legacy_import;
+mod rpc_profile;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -474,7 +475,9 @@ fn to_exit(result: anyhow::Result<()>) -> ExitCode {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{
+        fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    };
 
     // Resolve the log file path: INTENTD_DATA_DIR/intentd.log
     let log_dir = match std::env::var_os("INTENTD_DATA_DIR") {
@@ -515,18 +518,33 @@ fn init_tracing() {
         }
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // The env filter is applied per output layer (not globally) so the RPC
+    // profiling layer below can observe the DEBUG-level `sqlx::query`
+    // statement events that the default `info` filter would otherwise
+    // disable at the callsite.
+    let output_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Set up dual output: stderr (for interactive use) and optionally file (for diagnostics)
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(output_filter());
+
+    // Per-RPC statement-count / duration WARN profiling (expensive-RPC
+    // guardrail); its warns flow through the output layers above.
+    let profile_layer =
+        rpc_profile::RpcProfileLayer::from_env().with_filter(rpc_profile::profile_filter());
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
+        .with(profile_layer)
         .with(stderr_layer);
 
     if let Some(appender) = file_appender {
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
+        let file_layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(output_filter());
         match subscriber.with(file_layer).try_init() {
             Ok(_) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
@@ -720,6 +738,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     intent_services::cleanup_retired_settings(&store)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time migration for the trimmed `voice.vocabulary` default: a stored
+    // row that only ever persisted the retired 17-term seed default is
+    // deleted so the new `["Intent"]` default applies; user-modified lists
+    // are never touched.
+    intent_services::migrate_default_vocabulary(&store)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An
@@ -744,7 +769,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_models_cache_dir(config.data_dir.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone())
-        .with_settings_registry(settings_registry.clone());
+        .with_settings_registry(settings_registry.clone())
+        .with_hooks_max_per_agent(config.hooks_max_per_agent);
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -771,6 +797,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        // Per-agent generated config files (`--mcp-config`, `--rules`,
+        // pi-extension delivery) are written under the daemon-owned
+        // `<data_dir>/agent-configs` instead of the global OS temp dir
+        // (monorepo#1302). Swept at startup (no agent child is live yet)
+        // so files leaked by a killed daemon don't accumulate.
+        .with_agent_config_root({
+            let root = intent_core::agent_configs_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_agent_configs(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "agent-configs sweep failed");
+            }
+            root
+        })
         // STAB-50: chief provider children spawn in the dedicated, empty
         // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
         // startup (no chief child is live yet) so leftovers a provider
@@ -866,6 +904,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
     }
+    // Rehydrate active background hooks (`scheduled`/`running` rows) so their
+    // schedules resume after a restart; hooks whose owning agent is gone are
+    // cancelled instead. Best-effort: a failure is logged but never aborts
+    // startup (agents can re-schedule).
+    match services.rehydrate_hooks().await {
+        Ok(0) => {}
+        Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
+        Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
+    }
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
@@ -896,7 +943,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // There is no scan RPC. Aborted on clean shutdown.
     let token_usage_scan =
         services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300));
-    // Completion-delivery worker (AS-3): wake parents holding a oneShot
+    // Completion-delivery worker (AS-3): wake parents holding a
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
     let completion_delivery = services.spawn_completion_delivery_loop();
@@ -946,13 +993,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
+    // file edits refresh the FE Changes panel without any in-app git action.
+    // Arc'd so the watcher registry's `.git` metadata watches feed the same
+    // debounced trigger path. Held for the lifetime of `serve` and torn down
+    // on return.
+    let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
     // Start the watcher registry (#611): seeds a filesystem watcher per active
-    // workspace (debounced `file:*` events), the skills watcher (`skills:changed`),
-    // and the specialists watcher (`specialists:changed`), then follows workspace
-    // lifecycle events so workspaces created/opened after boot gain watching and
-    // deleted/closed workspaces are torn down without a restart. The handle is
-    // held for the lifetime of `serve` and torn down on return.
-    let _watcher_registry = WatcherRegistry::start(bus.clone(), api.clone()).await;
+    // workspace (debounced `file:*` events), a narrow `.git` metadata watch per
+    // git workspace (external git operations → git-status refresh, monorepo#1397),
+    // the skills watcher (`skills:changed`), and the specialists watcher
+    // (`specialists:changed`), then follows workspace lifecycle events so
+    // workspaces created/opened after boot gain watching and deleted/closed
+    // workspaces are torn down without a restart. The handle is held for the
+    // lifetime of `serve` and torn down on return.
+    let _watcher_registry =
+        WatcherRegistry::start(bus.clone(), api.clone(), Arc::clone(&git_status_refresher)).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1928,14 +1984,28 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-/// UDS liveness probe: a successful connect means a daemon is listening.
-/// UDS is Unix-only; on other platforms there is no socket to probe.
+/// Local-transport liveness probe: a successful connect means a daemon is
+/// listening. Probes the UDS on Unix and the derived named pipe on Windows.
 #[cfg(unix)]
 async fn uds_is_live(socket_path: &Path) -> bool {
     tokio::net::UnixStream::connect(socket_path).await.is_ok()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn uds_is_live(socket_path: &Path) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let Ok(pipe) = intent_transport::pipe_name_for_socket_path(socket_path) else {
+        return false;
+    };
+    match ClientOptions::new().open(&pipe) {
+        Ok(_) => true,
+        // Every instance momentarily taken still means a live daemon owns it.
+        Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn uds_is_live(_socket_path: &Path) -> bool {
     false
 }
@@ -1944,6 +2014,18 @@ async fn uds_is_live(_socket_path: &Path) -> bool {
 /// owns the UDS or a live pid holds the pidfile; otherwise removes a stale
 /// socket/pidfile whose owner is gone and claims the pidfile with our pid.
 async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
+    // On Unix a leftover socket file marks a candidate daemon: probe it, and
+    // remove it when its owner is gone. On Windows named pipes are per-boot
+    // kernel objects with no filesystem entry, so probe the pipe directly —
+    // there is nothing stale to remove.
+    #[cfg(windows)]
+    if uds_is_live(&config.socket_path).await {
+        anyhow::bail!(
+            "intentd is already running on {} — refusing to start a second instance",
+            config.socket_path.display()
+        );
+    }
+    #[cfg(not(windows))]
     if config.socket_path.exists() {
         if uds_is_live(&config.socket_path).await {
             anyhow::bail!(
@@ -1956,7 +2038,15 @@ async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
     }
 
     if let Some(pid) = read_pid(&config.pid_path) {
-        if pid != std::process::id() && pid_is_alive(pid) {
+        // On Windows `pid_is_alive` cannot probe (no signal-0), and the pipe
+        // probe above is the authoritative liveness check — a pidfile that
+        // survives it is stale by definition and must not block startup.
+        let holder_is_alive = if cfg!(windows) {
+            false
+        } else {
+            pid_is_alive(pid)
+        };
+        if pid != std::process::id() && holder_is_alive {
             anyhow::bail!(
                 "intentd is already running (pid {pid}, pidfile {}) — refusing to start a second instance",
                 config.pid_path.display()
@@ -3083,6 +3173,7 @@ mod tests {
             pid_path: dir.join("intentd.pid"),
             idle_reap_minutes: 30,
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
+            hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             data_dir: dir,
         }
     }

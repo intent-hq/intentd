@@ -48,19 +48,18 @@ async fn parent_rewoken_after_send_to_settled_child() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
 
-    // Initial delegation: register oneShot completion watch.
+    // Initial delegation: register completion watch.
     svc.register_completion_watch(
         &ws,
         &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
-        true,
         None,
     )
     .expect("register watch");
 
-    // Child settles for the first time → parent woken, oneShot watch removed.
+    // Child settles for the first time → parent woken, watch removed.
     let event1 = completion_event(
         &ws,
         AGENT_IDLE,
@@ -133,7 +132,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
         "Parent should have 2 messages after second child completion (STAB-28: re-wake must fire)"
     );
 
-    // Second oneShot watch was also removed.
+    // Second watch was also removed.
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "OneShot watch should be removed after second completion"

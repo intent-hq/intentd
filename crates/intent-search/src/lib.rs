@@ -20,7 +20,8 @@ pub mod content;
 pub mod paths;
 
 pub use adapters::{
-    contains_ci, extract_symbol, make_preview, CodebaseMatch, EventMatch, MessageMatch, NoteMatch,
+    contains_ci, extract_symbol, fts_match_expr, fts_preview, make_preview, CodebaseMatch,
+    EventMatch, MessageMatch, NoteMatch,
 };
 pub use cancel::{mint_request_id, CancelRegistry, CancelToken};
 pub use content::{search_in_files, ContentSearchResult, SearchMatch, SearchOpts};

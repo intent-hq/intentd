@@ -73,6 +73,7 @@ fn slug_workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -96,8 +97,9 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     // A fresh workspace whose title still matches its id — the initial-agent
@@ -151,7 +153,10 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     .to_string();
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;

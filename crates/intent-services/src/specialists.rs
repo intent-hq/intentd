@@ -182,7 +182,7 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
             continue;
         };
         let key = line[..colon].trim();
-        if key.is_empty() {
+        if key.is_empty() || RETIRED_FRONTMATTER_KEYS.contains(&key) {
             continue;
         }
         let mut value = line[colon + 1..].trim().to_string();
@@ -204,9 +204,9 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// Optional frontmatter scalar keys carried through `build_def`/`render_file`
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
-/// `modelTier`, `roleReminder`, `agentType`).
+/// `roleReminder`, `agentType`).
 ///
-/// NOTE: the config scalars `codingAgent`/`model`/`modelTier`/`agentType`
+/// NOTE: the config scalars `codingAgent`/`model`/`agentType`
 /// ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit semantics across
 /// tiers, like `hidden` (PROTOCOL §5.11, intent-hq/monorepo#718): an omitted
 /// key keeps the lower tiers' effective value, an explicit empty value
@@ -215,17 +215,100 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
 /// stale summary of a body that no longer exists).
-const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
-    "codingAgent",
-    "model",
-    "modelTier",
-    "roleReminder",
-    "agentType",
-];
+const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &["codingAgent", "model", "roleReminder", "agentType"];
 
 /// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
 /// across tiers; each key inherits independently.
-const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "modelTier", "agentType"];
+const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "agentType"];
+
+/// Frontmatter/wire key for the ordered list of delegation model options —
+/// `{ model, hint }` pairs a delegating agent can pick from (PROTOCOL §5.11).
+/// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
+/// `modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"}]`) so it fits
+/// the line-based parser and round-trips losslessly. Resolution follows the
+/// same inherit-on-omit fold as [`INHERITED_CONFIG_KEYS`]: an omitted key
+/// inherits the lower tiers' effective list, an explicit `[]` clears it, and
+/// a non-empty list overrides it wholesale (entries never merge across tiers).
+const MODEL_OPTIONS_KEY: &str = "modelOptions";
+
+/// Normalize one `modelOptions` entry to its documented fields, or `None` when
+/// the entry is unusable: `model` must be a non-empty (non-whitespace) string;
+/// `hint` is carried when it is a string and defaults to `""` otherwise.
+fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
+    let obj = entry.as_object()?;
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?;
+    let hint = obj.get("hint").and_then(Value::as_str).unwrap_or("");
+    Some(json!({ "model": model, "hint": hint }))
+}
+
+/// Strictly validate a wire `modelOptions` value (`specialist.create`/`edit`
+/// specs): must be a JSON array of `{ model, hint? }` objects with a non-empty
+/// string `model` and a string `hint` (defaulting to `""` when absent).
+/// Returns the normalized entries in input order (`None` when the key is
+/// absent — the inherit-on-omit case); any invalid shape → `-32602`.
+fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::InvalidParams(
+            "modelOptions must be an array of { model, hint } objects".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        if !entry.is_object() {
+            return Err(Error::InvalidParams(
+                "modelOptions entries must be { model, hint } objects".to_string(),
+            ));
+        }
+        match entry.get("hint") {
+            None | Some(Value::String(_)) => {}
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "modelOptions entry hint must be a string".to_string(),
+                ));
+            }
+        }
+        let Some(normalized) = normalize_model_option_entry(entry) else {
+            return Err(Error::InvalidParams(
+                "modelOptions entry model must be a non-empty string".to_string(),
+            ));
+        };
+        out.push(normalized);
+    }
+    Ok(Some(out))
+}
+
+/// Leniently parse a frontmatter `modelOptions` scalar (the single-line
+/// JSON-array string). Files are never rejected on read: an unparseable value
+/// or a non-array yields `None` (treated like an omitted key, which inherits),
+/// and invalid entries are skipped individually. Only a literal `[]` is the
+/// explicit clear (`Some(vec![])`); a non-empty array whose entries are all
+/// unusable also yields `None`, so one bad hand-authored entry does not
+/// silently drop an inherited list.
+fn parse_model_options_frontmatter(raw: &str) -> Option<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
+    let arr = parsed.as_array()?;
+    let normalized: Vec<Value> = arr
+        .iter()
+        .filter_map(normalize_model_option_entry)
+        .collect();
+    if normalized.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
+/// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
+/// old-client `specialist.create`/`edit` specs may still carry them, but they
+/// are stripped on parse (never echoed by `get`/`list`), silently skipped by
+/// `render_file` (never rejected with `-32602`), and dropped from the file on
+/// its next rewrite. `modelTier` is retired: a specialist's model is either an
+/// explicit `model:` pin or inherited via the settings chain (§5.5).
+const RETIRED_FRONTMATTER_KEYS: &[&str] = &["modelTier"];
 
 /// Tri-state read of a frontmatter/spec `hidden` value: `Some(true)`/`Some(false)`
 /// when explicitly set, `None` when absent — an absent key **inherits** the
@@ -277,7 +360,8 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
 /// when the effective value is true. The config scalars
 /// ([`INHERITED_CONFIG_KEYS`]) inherit independently per key: an omitted key
 /// keeps the lower tiers' effective value, an explicit empty value clears it,
-/// and an explicit non-empty value overrides it. `roleReminder` does not
+/// and an explicit non-empty value overrides it; [`MODEL_OPTIONS_KEY`] follows
+/// the same fold with `[]` as the explicit clear. `roleReminder` does not
 /// inherit — it is emitted only when present in this file.
 fn build_def_inheriting(
     id: &str,
@@ -324,6 +408,31 @@ fn build_def_inheriting(
             None => {}
         }
     }
+    // `modelOptions` (PROTOCOL §5.11): same inherit-on-omit fold as the config
+    // scalars — an omitted key inherits the lower tiers' effective list, an
+    // explicit `[]` clears it, and a non-empty list overrides it wholesale.
+    // Unparseable frontmatter is tolerated like an omitted key (files are
+    // never rejected on read).
+    match fm
+        .get(MODEL_OPTIONS_KEY)
+        .and_then(Value::as_str)
+        .and_then(parse_model_options_frontmatter)
+    {
+        Some(opts) if !opts.is_empty() => {
+            def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts));
+        }
+        // Explicit `[]`: clears any inherited list (nothing emitted).
+        Some(_) => {}
+        None => {
+            if let Some(opts) = inherited
+                .and_then(|d| d.get(MODEL_OPTIONS_KEY))
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+            {
+                def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts.clone()));
+            }
+        }
+    }
     // Optional boolean: emitted only when the effective value is true so
     // pickers can filter hidden specialists (absent ⇒ not hidden, PROTOCOL
     // §5.11). A file that omits the key inherits from lower tiers.
@@ -353,8 +462,10 @@ fn build_def_inheriting(
 /// the prompt body. For the config scalars ([`INHERITED_CONFIG_KEYS`]) an
 /// explicit empty string writes `key: ""` — the explicit-clear that stops
 /// inheritance — while an absent key writes nothing (inherits); an empty
-/// `roleReminder` is skipped like an absent one. The body is taken from
-/// `prompt`, falling back to the `behaviorPrompt` alias (mirroring
+/// `roleReminder` is skipped like an absent one. A supplied
+/// [`MODEL_OPTIONS_KEY`] list is written as a single-line JSON-array scalar
+/// (an explicit `[]` is the clear; an absent key writes nothing). The body is
+/// taken from `prompt`, falling back to the `behaviorPrompt` alias (mirroring
 /// `SpecialistProposalPayload`). Only documented fields are written so
 /// parse→write→parse round-trips losslessly.
 fn render_file(id: &str, spec: &Value) -> String {
@@ -373,6 +484,14 @@ fn render_file(id: &str, spec: &Value) -> String {
                 fm.push(format!("{key}: \"{}\"", escape_yaml(v)));
             }
         }
+    }
+    // `modelOptions` is written as a single-line JSON-array scalar; an
+    // explicit empty array writes `modelOptions: []` — the explicit clear
+    // that stops inheritance — while an absent key writes nothing (inherits).
+    // `create`/`edit` validate the value before rendering (`-32602` on
+    // invalid shapes); `render_file` itself silently skips anything invalid.
+    if let Ok(Some(opts)) = validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY)) {
+        fm.push(format!("{MODEL_OPTIONS_KEY}: {}", Value::Array(opts)));
     }
     if let Some(hidden) = hidden_state(spec.get("hidden")) {
         fm.push(format!("hidden: {hidden}"));
@@ -770,6 +889,7 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if path.exists() {
@@ -803,6 +923,7 @@ impl SpecialistsService {
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
+        validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if !path.exists() {
@@ -863,7 +984,8 @@ mod tests {
         let (fm, body) = parse_frontmatter(content);
         assert_eq!(fm.get("codingAgent").unwrap(), "claude");
         assert_eq!(fm.get("model").unwrap(), "opus4.5");
-        assert_eq!(fm.get("modelTier").unwrap(), "smart");
+        // Retired keys are stripped on parse (RETIRED_FRONTMATTER_KEYS).
+        assert!(fm.get("modelTier").is_none());
         assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
         assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
         assert_eq!(body, "You loop.");
@@ -878,7 +1000,8 @@ mod tests {
         assert_eq!(def["description"], "Loops");
         assert_eq!(def["codingAgent"], "claude");
         assert_eq!(def["model"], "opus4.5");
-        assert_eq!(def["modelTier"], "smart");
+        // A retired `modelTier:` frontmatter line is never echoed on the wire.
+        assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
         assert_eq!(def["agentType"], "ralph-loop");
         assert_eq!(def["prompt"], "You loop.");
@@ -913,10 +1036,12 @@ mod tests {
             "prompt": "You loop.\nForever."
         });
         let rendered = render_file("ralph", &spec);
+        // A retired `modelTier` in the wire spec is dropped, never written.
+        assert!(!rendered.contains("modelTier"));
         let def = build_def("ralph", &rendered, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["codingAgent"], "claude");
         assert_eq!(def["model"], "opus4.5");
-        assert_eq!(def["modelTier"], "smart");
+        assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
         assert_eq!(def["agentType"], "ralph-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
@@ -1411,8 +1536,9 @@ mod tests {
     #[test]
     fn user_override_omitting_scalars_inherits_bundled_values() {
         // A user override that omits the config scalars (codingAgent, model,
-        // modelTier, agentType) inherits the bundled tier's effective values
-        // on get, list, and the spawn-time resolvers.
+        // agentType) inherits the bundled tier's effective values on get,
+        // list, and the spawn-time resolvers. A retired `modelTier:` line in
+        // the bundled file is ignored and never surfaces.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         bundled.write(
@@ -1429,7 +1555,7 @@ mod tests {
         assert_eq!(def["source"], "user");
         assert_eq!(def["codingAgent"], "claude", "codingAgent inherited on get");
         assert_eq!(def["model"], "opus4.5", "model inherited on get");
-        assert_eq!(def["modelTier"], "smart", "modelTier inherited on get");
+        assert!(def.get("modelTier").is_none(), "retired modelTier ignored");
         assert_eq!(def["agentType"], "zeta-type", "agentType inherited on get");
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
@@ -1439,7 +1565,10 @@ mod tests {
             "codingAgent inherited in list"
         );
         assert_eq!(zeta["model"], "opus4.5", "model inherited in list");
-        assert_eq!(zeta["modelTier"], "smart", "modelTier inherited in list");
+        assert!(
+            zeta.get("modelTier").is_none(),
+            "retired modelTier ignored in list"
+        );
         assert_eq!(
             zeta["agentType"], "zeta-type",
             "agentType inherited in list"
@@ -1454,7 +1583,7 @@ mod tests {
     #[test]
     fn user_override_of_embedded_inherits_scalars_at_spawn() {
         // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType/modelTier keeps the embedded values at spawn time.
+        // omits agentType keeps the embedded value at spawn time.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
@@ -1469,10 +1598,85 @@ mod tests {
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
-        assert_eq!(
-            got["specialist"]["modelTier"], "smart",
-            "modelTier inherited from the embedded floor"
+        assert!(
+            got["specialist"].get("modelTier").is_none(),
+            "modelTier is retired and never emitted"
         );
+    }
+
+    #[test]
+    fn create_and_edit_tolerate_and_drop_retired_model_tier() {
+        // Retirement regression (PROTOCOL §5.11): a `modelTier` in
+        // `specialist.create`/`edit` params succeeds (no -32602), is never
+        // echoed, and is never written to the file.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let created = svc
+            .create(
+                "tiered",
+                &json!({
+                    "id": "tiered", "name": "Tiered", "description": "d",
+                    "modelTier": "smart", "prompt": "body"
+                }),
+                None,
+                None,
+            )
+            .expect("create with retired modelTier succeeds");
+        assert!(created["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("tiered.md")).unwrap();
+        assert!(!content.contains("modelTier"), "never written: {content}");
+
+        let edited = svc
+            .edit(
+                "tiered",
+                &json!({
+                    "id": "tiered", "name": "Tiered", "description": "d",
+                    "modelTier": "fast", "prompt": "body v2"
+                }),
+                "user",
+                None,
+            )
+            .expect("edit with retired modelTier succeeds");
+        assert!(edited["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("tiered.md")).unwrap();
+        assert!(!content.contains("modelTier"), "never written: {content}");
+    }
+
+    #[test]
+    fn edit_rewrite_drops_preexisting_model_tier_line() {
+        // Retirement regression (PROTOCOL §5.11): a pre-existing `modelTier:`
+        // frontmatter line is ignored on parse (never echoed) and dropped from
+        // the file on the next `specialist.edit` rewrite.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "legacy",
+            "---\nname: \"Legacy\"\ndescription: \"d\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("legacy", None).unwrap();
+        assert!(got["specialist"].get("modelTier").is_none());
+        assert_eq!(got["specialist"]["model"], "opus4.5");
+
+        let edited = svc
+            .edit(
+                "legacy",
+                &json!({
+                    "id": "legacy", "name": "Legacy", "description": "d",
+                    "model": "opus4.5", "prompt": "body v2"
+                }),
+                "user",
+                None,
+            )
+            .expect("edit succeeds");
+        assert!(edited["specialist"].get("modelTier").is_none());
+        let content = std::fs::read_to_string(user.path.join("legacy.md")).unwrap();
+        assert!(
+            !content.contains("modelTier"),
+            "rewrite drops the retired key: {content}"
+        );
+        assert!(content.contains("model: \"opus4.5\""), "model kept");
     }
 
     #[test]
@@ -1633,5 +1837,223 @@ mod tests {
             !render_file("zeta", &spec).contains("roleReminder"),
             "empty roleReminder is still skipped"
         );
+    }
+
+    #[test]
+    fn model_options_round_trip_losslessly() {
+        // A wire spec's modelOptions list is written as a single-line
+        // JSON-array frontmatter scalar and parses back byte-identical.
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "modelOptions": [
+                { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
+                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+            ],
+            "prompt": "body"
+        });
+        let rendered = render_file("zeta", &spec);
+        assert!(
+            rendered.contains(
+                r#"modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap & fast"},{"model":"opus4.5","hint":"smart, \"expensive\""}]"#
+            ),
+            "single-line JSON-array scalar is written: {rendered}"
+        );
+        let def = build_def("zeta", &rendered, "user", Path::new("/tmp/zeta.md"));
+        assert_eq!(
+            def["modelOptions"],
+            json!([
+                { "model": "opencode:kimi-k3", "hint": "cheap & fast" },
+                { "model": "opus4.5", "hint": "smart, \"expensive\"" }
+            ]),
+            "parse→write→parse round-trips losslessly"
+        );
+        // A second write of the parsed def is byte-identical (stable order).
+        assert_eq!(render_file("zeta", &def), rendered);
+    }
+
+    #[test]
+    fn model_options_hint_defaults_to_empty_string() {
+        // An entry without a hint normalizes to hint: "" on parse and write.
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "modelOptions": [{ "model": "opus4.5" }],
+            "prompt": "body"
+        });
+        let rendered = render_file("zeta", &spec);
+        let def = build_def("zeta", &rendered, "user", Path::new("/tmp/zeta.md"));
+        assert_eq!(
+            def["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "" }])
+        );
+    }
+
+    #[test]
+    fn model_options_frontmatter_is_lenient_on_read() {
+        // Unparseable frontmatter is tolerated like an omitted key and
+        // unusable entries are skipped individually — files are never
+        // rejected on read.
+        let bad_json = "---\nname: \"Z\"\ndescription: \"d\"\nmodelOptions: not-json\n---\n\nbody";
+        let def = build_def("z", bad_json, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("modelOptions").is_none(),
+            "unparseable value is treated as omitted"
+        );
+        let mixed = "---\nname: \"Z\"\ndescription: \"d\"\nmodelOptions: [{\"model\":\"opus4.5\",\"hint\":\"ok\"},{\"model\":\"\"},{\"hint\":\"no model\"},\"scalar\"]\n---\n\nbody";
+        let def = build_def("z", mixed, "user", Path::new("/tmp/z.md"));
+        assert_eq!(
+            def["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "ok" }]),
+            "invalid entries are skipped individually"
+        );
+        let all_bad =
+            "---\nname: \"Z\"\ndescription: \"d\"\nmodelOptions: [{\"hint\":\"no model\"},{\"model\":\"\"}]\n---\n\nbody";
+        let def = build_def("z", all_bad, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("modelOptions").is_none(),
+            "a non-empty array with only unusable entries is treated as omitted, not a clear"
+        );
+    }
+
+    #[test]
+    fn model_options_inherit_across_tiers_with_explicit_clear() {
+        // Inherit-on-omit fold: a user file that omits the key inherits the
+        // bundled tier's list; an explicit `[]` clears it; a non-empty list
+        // overrides it wholesale (entries never merge).
+        let bundled_fm = "---\nname: \"Zeta\"\ndescription: \"d\"\nmodelOptions: [{\"model\":\"opus4.5\",\"hint\":\"smart\"}]\n---\n\nbody";
+
+        // Omit → inherit.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write("zeta", bundled_fm);
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "smart" }]),
+            "omitted key inherits the lower tier's list"
+        );
+
+        // Explicit `[]` → clear.
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodelOptions: []\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("modelOptions").is_none(),
+            "explicit [] clears the inherited list"
+        );
+
+        // Non-empty → wholesale override.
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["modelOptions"],
+            json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
+            "a non-empty list overrides wholesale, never merges"
+        );
+
+        // Non-empty but all-unusable → inherit, not clear.
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodelOptions: [{\"hint\":\"no model\"}]\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "smart" }]),
+            "an all-unusable non-empty array inherits instead of clearing"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_responses_fold_model_options_from_lower_tiers() {
+        // The create/edit response agrees with an immediately-following get
+        // when the written spec omits (or explicitly clears) modelOptions.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nmodelOptions: [{\"model\":\"opus4.5\",\"hint\":\"smart\"}]\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let spec = json!({ "name": "Zeta", "description": "user", "prompt": "body" });
+        let created = svc.create("zeta", &spec, Some("user"), None).unwrap();
+        assert_eq!(
+            created["specialist"]["modelOptions"],
+            json!([{ "model": "opus4.5", "hint": "smart" }]),
+            "create response inherits modelOptions from the bundled tier"
+        );
+        assert_eq!(
+            svc.get("zeta", None).unwrap()["specialist"]["modelOptions"],
+            created["specialist"]["modelOptions"],
+            "create response agrees with the following get"
+        );
+        let spec = json!({
+            "name": "Zeta",
+            "description": "user",
+            "modelOptions": [],
+            "prompt": "body"
+        });
+        let edited = svc.edit("zeta", &spec, "user", None).unwrap();
+        assert!(
+            edited["specialist"].get("modelOptions").is_none(),
+            "edit response honors the explicit [] clear"
+        );
+        assert!(
+            svc.get("zeta", None).unwrap()["specialist"]
+                .get("modelOptions")
+                .is_none(),
+            "edit response agrees with the following get"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_reject_invalid_model_options() {
+        // Any invalid wire shape → InvalidParams (-32602), for both create
+        // and edit, before anything is written.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let invalid_specs = [
+            json!({ "name": "Z", "description": "d", "modelOptions": "not-an-array" }),
+            json!({ "name": "Z", "description": "d", "modelOptions": ["scalar"] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "hint": "no model" }] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": "" }] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": "   " }] }),
+            json!({ "name": "Z", "description": "d", "modelOptions": [{ "model": 42 }] }),
+            json!({ "name": "Z", "description": "d",
+                "modelOptions": [{ "model": "opus4.5", "hint": 42 }] }),
+        ];
+        for spec in &invalid_specs {
+            let err = svc.create("zeta", spec, Some("user"), None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "create rejects {spec} with InvalidParams, got {err:?}"
+            );
+            assert!(
+                !user.path.join("zeta.md").exists(),
+                "nothing is written on a rejected create"
+            );
+        }
+        // Seed a valid file, then verify edit rejects the same shapes.
+        let valid = json!({ "name": "Z", "description": "d", "prompt": "body" });
+        svc.create("zeta", &valid, Some("user"), None).unwrap();
+        for spec in &invalid_specs {
+            let err = svc.edit("zeta", spec, "user", None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "edit rejects {spec} with InvalidParams, got {err:?}"
+            );
+        }
     }
 }

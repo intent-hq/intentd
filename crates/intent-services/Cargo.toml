@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.2.14"
+version = "0.4.2"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,17 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.2.14" }
-intent-store = { path = "../intent-store", version = "0.2.14" }
-intent-git = { path = "../intent-git", version = "0.2.14" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.2.14" }
-intent-linear = { path = "../intent-linear", version = "0.2.14" }
-intent-sentry = { path = "../intent-sentry", version = "0.2.14" }
-intent-acp = { path = "../intent-acp", version = "0.2.14" }
-intent-context = { path = "../intent-context", version = "0.2.14" }
-intent-providers = { path = "../intent-providers", version = "0.2.14" }
-intent-pty = { path = "../intent-pty", version = "0.2.14" }
-intent-search = { path = "../intent-search", version = "0.2.14" }
+intent-core = { path = "../intent-core", version = "0.4.2" }
+intent-store = { path = "../intent-store", version = "0.4.2" }
+intent-git = { path = "../intent-git", version = "0.4.2" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.4.2" }
+intent-linear = { path = "../intent-linear", version = "0.4.2" }
+intent-sentry = { path = "../intent-sentry", version = "0.4.2" }
+intent-voice = { path = "../intent-voice", version = "0.4.1" }
+intent-acp = { path = "../intent-acp", version = "0.4.2" }
+intent-js = { path = "../intent-js", version = "0.4.2" }
+intent-context = { path = "../intent-context", version = "0.4.2" }
+intent-providers = { path = "../intent-providers", version = "0.4.2" }
+intent-pty = { path = "../intent-pty", version = "0.4.2" }
+intent-search = { path = "../intent-search", version = "0.4.2" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 serde_json = { workspace = true }
@@ -44,6 +46,7 @@ uuid = { workspace = true }
 async-trait = "0.1"
 git2.workspace = true
 sqlx.workspace = true
+ctor = "1.0.10"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

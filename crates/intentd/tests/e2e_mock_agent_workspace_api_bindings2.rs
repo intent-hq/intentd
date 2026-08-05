@@ -63,6 +63,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -95,8 +96,9 @@ async fn event_bindings_recent_files_and_query() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-event-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -149,7 +151,10 @@ async fn event_bindings_recent_files_and_query() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -265,7 +270,10 @@ async fn file_bindings_read_write_list() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -368,8 +376,9 @@ async fn agent_bindings_list_and_status() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-agent-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -424,7 +433,10 @@ async fn agent_bindings_list_and_status() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -464,6 +476,645 @@ async fn agent_bindings_list_and_status() {
     // Verify agent exists
     let session = store.get_agent_session(&agent_id).await.expect("session");
     assert_eq!(session.id, agent_id);
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+}
+
+/// `ws.agent.getQueue` + `ws.agent.removeQueuedMessage` + the queue merged
+/// into `ws.agent.status`: another sender's entry surfaces with attribution
+/// (full content in getQueue, 200-char truncation in status), ordering is
+/// next-delivery-first (interrupt ahead of normal FIFO), removal of the
+/// caller's own entry succeeds, and removal of a foreign entry is rejected
+/// by the ownership guard.
+#[tokio::test]
+async fn agent_bindings_get_queue_and_remove_queued_message() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!("intentd-e2e-queue-{}.db", uuid::Uuid::new_v4()));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(serde_json::json!([
+            { "path": "workspaceApi.toonOutput", "value": false }
+        ]))
+        .await
+        .expect("disable toonOutput");
+
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws, None))
+        .await
+        .expect("insert ws");
+
+    let caller_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Queue Caller".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create caller");
+    let caller_id = AgentId::from(caller_val["agent"]["id"].as_str().unwrap());
+    let target_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Queue Target".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create target");
+    let target_id = AgentId::from(target_val["agent"]["id"].as_str().unwrap());
+
+    // Seed the target's queue via the durable snapshot + rehydration path.
+    // Stored order is deliberately divergent from drain order (normal entry
+    // ahead of the interrupt) to exercise the binding's next-delivery-first
+    // sort. Entry attribution mirrors the §5.5 `agent_message` auto-tag.
+    let long_content = "F".repeat(300);
+    let payload = |id: &str, content: &str, metadata: serde_json::Value, interrupt: bool| {
+        serde_json::json!({
+            "id": id,
+            "content": content,
+            "queuedAt": now_iso(),
+            "messageMetadata": metadata,
+            "interruptPriority": interrupt,
+        })
+    };
+    let rows = vec![
+        intent_store::AgentQueueRow {
+            id: "qmsg-foreign".into(),
+            agent_id: target_id.clone(),
+            position: 0,
+            payload: payload(
+                "qmsg-foreign",
+                &long_content,
+                serde_json::json!({
+                    "type": "agent_message",
+                    "fromAgentId": "agent-other",
+                    "fromAgentName": "Other Sender",
+                }),
+                false,
+            ),
+            created_at: now_iso(),
+            turn_id: "qmsg-foreign".into(),
+        },
+        intent_store::AgentQueueRow {
+            id: "qmsg-interrupt".into(),
+            agent_id: target_id.clone(),
+            position: 1,
+            payload: payload("qmsg-interrupt", "urgent", serde_json::Value::Null, true),
+            created_at: now_iso(),
+            turn_id: "qmsg-interrupt".into(),
+        },
+        intent_store::AgentQueueRow {
+            id: "qmsg-own".into(),
+            agent_id: target_id.clone(),
+            position: 2,
+            payload: payload(
+                "qmsg-own",
+                "retract me",
+                serde_json::json!({
+                    "type": "agent_message",
+                    "fromAgentId": caller_id.0,
+                    "fromAgentName": "E2E Queue Caller",
+                }),
+                false,
+            ),
+            created_at: now_iso(),
+            turn_id: "qmsg-own".into(),
+        },
+    ];
+    store
+        .replace_agent_queue(&target_id, &rows)
+        .await
+        .expect("seed queue");
+    let rehydrated = services
+        .rehydrate_agent_queues()
+        .await
+        .expect("rehydrate queues");
+    assert_eq!(rehydrated, 3, "all seeded entries rehydrated");
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    let js = format!(
+        r#"
+        const target = '{}';
+        const out = {{}};
+        out.queue = await ws.agent.getQueue(target);
+        out.status = await ws.agent.status(target);
+        out.removeOwn = await ws.agent.removeQueuedMessage(target, 'qmsg-own');
+        try {{
+            await ws.agent.removeQueuedMessage(target, 'qmsg-foreign');
+            out.removeForeignError = null;
+        }} catch (error) {{
+            out.removeForeignError = error.message;
+        }}
+        return out;
+        "#,
+        target_id.0
+    );
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "agent queue bindings e2e" }
+        },
+        "response": "queue inspected",
+        "emitToolBlocks": true,
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            caller_id.clone(),
+            ws.clone(),
+            "E2E Queue Caller",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&caller_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "inspect queue" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&caller_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    // Pull the JS return value out of the persisted tool-result block.
+    let transcript = services
+        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None, None)
+        .await
+        .expect("get conversation");
+    let messages = transcript["messages"].as_array().expect("messages array");
+    let last_output = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter_map(|b| {
+            (b["type"] == "tool_result")
+                .then(|| b["output"].as_array())
+                .flatten()
+                .and_then(|arr| arr.first())
+                .and_then(|item| item["text"].as_str())
+        })
+        .next_back()
+        .expect("tool result block in transcript");
+    let out: serde_json::Value =
+        serde_json::from_str(last_output).expect("tool output should be JSON");
+
+    // getQueue: drain order (interrupt first), attribution lifted, full content.
+    let queue = out["queue"]["queue"].as_array().expect("queue array");
+    assert_eq!(out["queue"]["queueLength"], 3, "{out}");
+    let ids: Vec<&str> = queue.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        ["qmsg-interrupt", "qmsg-foreign", "qmsg-own"],
+        "next-delivery-first: interrupt ahead of normal FIFO"
+    );
+    assert_eq!(queue[0]["interruptPriority"], true);
+    assert_eq!(queue[0]["position"], 0);
+    assert!(
+        queue[0].get("fromAgentId").is_none(),
+        "user-origin entry carries no attribution: {}",
+        queue[0]
+    );
+    assert_eq!(queue[1]["fromAgentId"], "agent-other");
+    assert_eq!(queue[1]["fromAgentName"], "Other Sender");
+    assert_eq!(
+        queue[1]["content"].as_str().unwrap().chars().count(),
+        300,
+        "getQueue carries full content"
+    );
+    assert_eq!(queue[2]["fromAgentId"], caller_id.0);
+
+    // status: same queue merged in, content truncated to 200 chars + '…'.
+    assert_eq!(out["status"]["queueLength"], 3, "{out}");
+    let status_queue = out["status"]["queue"].as_array().expect("status queue");
+    let foreign = &status_queue[1];
+    let content = foreign["content"].as_str().expect("truncated content");
+    assert_eq!(content.chars().count(), 201, "200 chars + ellipsis");
+    assert!(content.ends_with('…'));
+
+    // Removal: own entry succeeded, foreign entry rejected by ownership guard.
+    assert_eq!(out["removeOwn"]["ok"], true, "{out}");
+    let guard_err = out["removeForeignError"]
+        .as_str()
+        .expect("foreign removal must error");
+    assert!(
+        guard_err.contains("another sender"),
+        "ownership guard names the violation: {guard_err}"
+    );
+
+    // Backend state: only the caller's own entry was removed (raw service
+    // read is in stored order — foreign was seeded ahead of the interrupt).
+    let remaining = services
+        .agent_get_queue(target_id.clone(), Some(ws.clone()))
+        .await
+        .expect("backend queue");
+    let remaining_ids: Vec<&str> = remaining["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(remaining_ids, ["qmsg-foreign", "qmsg-interrupt"]);
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+}
+
+/// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
+/// the target is pinned behind a question hold so agent-origin sends park in
+/// its queue. The caller's FIRST send parks fine (a pre-seeded FOREIGN entry
+/// does not trigger the guard); the second send and a `sendToTask` against
+/// the same target are refused with `ok: false` + the full queue echo
+/// (drain order, 200-char truncation); after `removeQueuedMessage` retracts
+/// the caller's entry, a re-send parks again.
+#[tokio::test]
+async fn agent_bindings_send_single_pending_message_guard() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!("intentd-e2e-sguard-{}.db", uuid::Uuid::new_v4()));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(serde_json::json!([
+            { "path": "workspaceApi.toonOutput", "value": false }
+        ]))
+        .await
+        .expect("disable toonOutput");
+
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws, None))
+        .await
+        .expect("insert ws");
+
+    let caller_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Guard Caller".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create caller");
+    let caller_id = AgentId::from(caller_val["agent"]["id"].as_str().unwrap());
+    let target_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Guard Target".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create target");
+    let target_id = AgentId::from(target_val["agent"]["id"].as_str().unwrap());
+
+    // Pin the target behind a question hold (PROTOCOL §5.5): its last
+    // transcript message is an assistant row carrying a question resource
+    // block, so every agent-origin send parks in the queue instead of
+    // driving a turn — the deterministic way to exercise the guard.
+    store
+        .append_agent_message(
+            &target_id,
+            "assistant",
+            &serde_json::json!([{
+                "type": "resource",
+                "resource": {
+                    "uri": "question://hold-1",
+                    "mimeType": "application/vnd.intent.question+json",
+                    "text": "{\"question\":\"Which environment?\"}",
+                },
+            }]),
+            &now_iso(),
+        )
+        .await
+        .expect("seed question hold");
+
+    // Seed a FOREIGN pending entry (long content — the refusal echo must
+    // truncate it): another agent's parked send must NOT trigger the guard
+    // for this caller.
+    let long_content = "F".repeat(300);
+    store
+        .replace_agent_queue(
+            &target_id,
+            &[intent_store::AgentQueueRow {
+                id: "qmsg-foreign".into(),
+                agent_id: target_id.clone(),
+                position: 0,
+                payload: serde_json::json!({
+                    "id": "qmsg-foreign",
+                    "content": long_content,
+                    "queuedAt": now_iso(),
+                    "messageMetadata": {
+                        "type": "agent_message",
+                        "fromAgentId": "agent-other",
+                        "fromAgentName": "Other Sender",
+                    },
+                    "interruptPriority": false,
+                }),
+                created_at: now_iso(),
+                turn_id: "qmsg-foreign".into(),
+            }],
+        )
+        .await
+        .expect("seed foreign entry");
+    assert_eq!(
+        services
+            .rehydrate_agent_queues()
+            .await
+            .expect("rehydrate queues"),
+        1
+    );
+
+    // Task note assigned to the target — `sendToTask` must hit the same guard.
+    let task_note = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Guard Task".into(),
+                content: Some("Guarded task".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create task note");
+    services
+        .mark_as_task(
+            ws.clone(),
+            task_note.id.clone(),
+            "not_started".to_string(),
+            vec![],
+            None,
+        )
+        .await
+        .expect("mark as task");
+    services
+        .assign_agent(
+            ws.clone(),
+            task_note.id.clone(),
+            target_id.to_string(),
+            None,
+        )
+        .await
+        .expect("assign target");
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    let js = format!(
+        r#"
+        const target = '{}';
+        const out = {{}};
+        out.first = await ws.agent.send(target, 'first: please review the diff');
+        out.second = await ws.agent.send(target, 'second: also check the tests');
+        out.interrupt = await ws.agent.send(target, 'urgent: drop everything', 'interrupt');
+        out.toTask = await ws.agent.sendToTask('{}', 'task: status update please');
+        out.removed = await ws.agent.removeQueuedMessage(target, out.first.queuedMessage.id);
+        out.resend = await ws.agent.send(target, 'combined: review diff AND check tests');
+        return out;
+        "#,
+        target_id.0, task_note.id.0
+    );
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "single-pending guard e2e" }
+        },
+        "response": "guard exercised",
+        "emitToolBlocks": true,
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = Arc::new(
+        AgentManager::new(services.clone(), sink, 8)
+            .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd")),
+    );
+    services.attach_agent_manager(&manager);
+
+    manager
+        .create_agent(
+            caller_id.clone(),
+            ws.clone(),
+            "E2E Guard Caller",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&caller_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "exercise guard" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&caller_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    // Pull the JS return value out of the persisted tool-result block.
+    let transcript = services
+        .agent_get_conversation(caller_id.clone(), None, Some(ws.clone()), None, None)
+        .await
+        .expect("get conversation");
+    let messages = transcript["messages"].as_array().expect("messages array");
+    let last_output = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter_map(|b| {
+            (b["type"] == "tool_result")
+                .then(|| b["output"].as_array())
+                .flatten()
+                .and_then(|arr| arr.first())
+                .and_then(|item| item["text"].as_str())
+        })
+        .next_back()
+        .expect("tool result block in transcript");
+    let out: serde_json::Value =
+        serde_json::from_str(last_output).expect("tool output should be JSON");
+
+    // First send parks (question hold) despite the pre-seeded FOREIGN entry:
+    // another sender's pending message never triggers the guard.
+    assert_eq!(out["first"]["ok"], true, "{out}");
+    assert_eq!(out["first"]["queued"], true, "{out}");
+    assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
+    let first_id = out["first"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("first parked entry id");
+
+    // Second send REFUSED: ok:false, names the pending entry, echoes the
+    // target's full queue in drain order with 200-char truncation.
+    let second = &out["second"];
+    assert_eq!(second["ok"], false, "{out}");
+    assert_eq!(second["agentId"], target_id.0, "{out}");
+    assert_eq!(second["pendingMessageId"], first_id, "{out}");
+    assert!(
+        second["error"].as_str().unwrap().contains(first_id),
+        "refusal names the pending entry: {second}"
+    );
+    assert!(
+        second["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("removeQueuedMessage"),
+        "refusal instructs retract-and-resend: {second}"
+    );
+    assert_eq!(second["queueLength"], 2, "{out}");
+    let echo = second["queue"].as_array().expect("queue echo");
+    let echo_ids: Vec<&str> = echo.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        echo_ids,
+        ["qmsg-foreign", first_id],
+        "echo is the full queue in drain order"
+    );
+    assert_eq!(echo[0]["fromAgentId"], "agent-other", "{second}");
+    assert_eq!(echo[1]["fromAgentId"], caller_id.0, "{second}");
+    let foreign_echo = echo[0]["content"].as_str().unwrap();
+    assert_eq!(
+        foreign_echo.chars().count(),
+        201,
+        "echo content truncated to 200 chars + ellipsis"
+    );
+    assert!(foreign_echo.ends_with('…'));
+
+    // Interrupt-priority send from the same caller: refused all the same —
+    // interrupts get no exemption from the single-pending-message guard.
+    let interrupt = &out["interrupt"];
+    assert_eq!(interrupt["ok"], false, "{out}");
+    assert_eq!(interrupt["agentId"], target_id.0, "{out}");
+    assert_eq!(interrupt["pendingMessageId"], first_id, "{out}");
+
+    // sendToTask against the same target: same refusal, tagged with the task.
+    let to_task = &out["toTask"];
+    assert_eq!(to_task["ok"], false, "{out}");
+    assert_eq!(to_task["agentId"], target_id.0, "{out}");
+    assert_eq!(to_task["taskNoteId"], task_note.id.0, "{out}");
+    assert_eq!(to_task["pendingMessageId"], first_id, "{out}");
+
+    // Retract-and-resend: removal succeeds, the re-send parks again.
+    assert_eq!(out["removed"]["ok"], true, "{out}");
+    assert_eq!(out["resend"]["ok"], true, "{out}");
+    assert_eq!(out["resend"]["queued"], true, "{out}");
+
+    // Backend state: foreign entry untouched, caller's queue slot holds ONLY
+    // the combined re-send (the refused sends never parked).
+    let remaining = services
+        .agent_get_queue(target_id.clone(), Some(ws.clone()))
+        .await
+        .expect("backend queue");
+    let remaining = remaining["queue"].as_array().unwrap();
+    let ids: Vec<&str> = remaining
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "foreign + one caller entry: {ids:?}");
+    assert_eq!(ids[0], "qmsg-foreign");
+    let contents: Vec<&str> = remaining
+        .iter()
+        .map(|e| e["content"].as_str().unwrap())
+        .collect();
+    assert!(
+        contents[1].starts_with("combined:"),
+        "only the re-send parked: {contents:?}"
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -576,7 +1227,10 @@ async fn git_bindings_status_stage_commit() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -725,7 +1379,10 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -817,8 +1474,9 @@ async fn note_bindings_edit_and_edit_lines() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-note-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -888,7 +1546,10 @@ async fn note_bindings_edit_and_edit_lines() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;

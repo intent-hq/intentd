@@ -65,6 +65,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -95,9 +96,16 @@ async fn chief_agent_ws_app_workspaces_list() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-ws-app-{}.db", uuid::Uuid::new_v4()));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
 
     // Seed 2+ user workspaces
     let ws1 = WorkspaceId::new();
@@ -157,7 +165,10 @@ async fn chief_agent_ws_app_workspaces_list() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -191,7 +202,7 @@ async fn chief_agent_ws_app_workspaces_list() {
 
     // Assert the persisted tool output contains the seeded workspaces and __chief__ is excluded
     let transcript = services
-        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None, None)
         .await
         .expect("get conversation");
     let messages = transcript["messages"].as_array().expect("messages array");
@@ -259,8 +270,9 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     ));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -316,7 +328,10 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -353,7 +368,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     // The mock agent emits these via tool_call_update.rawOutput, which the daemon
     // stores in the tool_result block's `output` array.
     let conversation = services
-        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None, None)
         .await
         .expect("read conversation");
     let messages = conversation["messages"].as_array().expect("messages array");
@@ -421,8 +436,9 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     ));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -479,7 +495,10 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -512,7 +531,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let conversation = services
-        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None, None)
         .await
         .expect("read conversation");
     let messages = conversation["messages"].as_array().expect("messages array");
@@ -583,8 +602,9 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     ));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
 
     let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
@@ -640,7 +660,10 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -673,7 +696,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let conversation = services
-        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None, None)
         .await
         .expect("read conversation");
     let messages = conversation["messages"].as_array().expect("messages array");
@@ -743,9 +766,16 @@ async fn non_chief_agent_ws_app_gating_error() {
     ));
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
-        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone());
+    // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
+    // plain JSON for the serde_json assertions below (TOON is on by default).
+    services
+        .settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
 
     // Create a regular (non-chief) workspace
     let ws = WorkspaceId::new();
@@ -802,7 +832,10 @@ async fn non_chief_agent_ws_app_gating_error() {
 
     let mut extra_env = BTreeMap::new();
     extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
-    let cwd = std::env::temp_dir();
+    // Guarded agent cwd: context-engine children (auggie) write logs into
+    // their cwd; a bare temp_dir() would leak them at the TMPDIR root.
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
     let mut opts = SpawnOptions::new(&provider);
     opts.cwd = Some(&cwd);
     opts.extra_env = extra_env;
@@ -836,7 +869,7 @@ async fn non_chief_agent_ws_app_gating_error() {
 
     // Assert the persisted tool output contains success: false and the gating error string
     let transcript = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None)
         .await
         .expect("get conversation");
     let messages = transcript["messages"].as_array().expect("messages array");

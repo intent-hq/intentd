@@ -68,6 +68,7 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -202,7 +203,7 @@ async fn agent_conversation_and_summary() {
 
     // Read conversation
     let conversation = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None)
         .await
         .expect("get conversation");
     assert!(conversation["messages"].is_array());

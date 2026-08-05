@@ -173,7 +173,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -463,7 +463,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -700,7 +700,9 @@ async fn git_clone_missing_params_rejected_over_wss() {
     let (_daemon, port, cfg) = boot().await;
     let mut ws = connect_ws(port, cfg).await;
     let frame = json!({ "jsonrpc": "2.0", "id": 5, "method": "git.clone", "params": {} });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await

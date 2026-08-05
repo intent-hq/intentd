@@ -43,7 +43,21 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Kill the whole process group (daemon + any Node.js ACP provider
+        // children) BEFORE removing the data dir, so an orphaned child can't
+        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
+        // after cleanup. The daemon is spawned with process_group(0).
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+            let pid = Pid::from_raw(self.child.id() as i32);
+            let _ = signal::killpg(pid, Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -72,6 +86,12 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // Group leader so Daemon::drop can killpg the daemon + ACP children.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -190,7 +210,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -356,12 +376,15 @@ async fn mock_agent_full_turn_over_wss() {
         json!(note_id),
         json!(MARKER),
     );
+    // The response's first line completes (newline) while its second line
+    // never gets one: the mid-turn activity preview must clip at the newline
+    // and the terminal stream:end must carry the full-text derivation.
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
             "arguments": { "code": js, "summary": "WSS E2E ws.note.add" },
         },
-        "response": "added via mcp over wss",
+        "response": "first line done\nadded via mcp over wss",
     })
     .to_string();
     let env: [(&str, &str); 4] = [
@@ -477,8 +500,10 @@ async fn mock_agent_full_turn_over_wss() {
 
     // Live-preview enrichment: the activity signal carries the server-derived
     // `lastAgentResponse` (the mock streams its text response before the
-    // first activity emit) but never raw transcript `content`; the terminal
-    // stream:end carries the final preview values.
+    // first activity emit) but never raw transcript `content`. Mid-turn the
+    // preview is clipped at the last newline — only the completed first line
+    // surfaces, never the still-streaming second line; the terminal
+    // stream:end carries the final (full-text) preview values.
     let activity = first_activity_frame.expect("first activity frame captured");
     let activity_data = &activity["data"];
     assert_eq!(
@@ -490,17 +515,15 @@ async fn mock_agent_full_turn_over_wss() {
         activity_data.get("content").is_none(),
         "activity payload never carries transcript content: {activity}"
     );
-    assert!(
-        activity_data["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "activity carries a non-empty lastAgentResponse preview: {activity}"
+    assert_eq!(
+        activity_data["lastAgentResponse"].as_str(),
+        Some("first line done"),
+        "mid-turn activity preview clips at the last newline: {activity}"
     );
     let end = end_frame.expect("terminal stream:end frame captured");
-    assert!(
-        end["data"]["lastAgentResponse"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
+    assert_eq!(
+        end["data"]["lastAgentResponse"].as_str(),
+        Some("added via mcp over wss"),
         "terminal stream:end carries the final lastAgentResponse: {end}"
     );
 
@@ -863,6 +886,13 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         idle["isWaitingForOtherAgents"],
         json!(false),
         "agent:idle carries isWaitingForOtherAgents=false with no pending watches: {idle}"
+    );
+    // Idle-visibility: `waitingOnHooks` is stamped only when the idle agent
+    // owns active background hooks — this agent owns none, so the field is
+    // omitted entirely (absent, never `[]`).
+    assert!(
+        idle.get("waitingOnHooks").is_none(),
+        "agent:idle omits waitingOnHooks when the agent owns no active hook: {idle}"
     );
     assert!(
         transitions.contains(&("active".to_string(), true)),
@@ -3131,12 +3161,17 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///  - `agent.getSession` serves the pending `attentionRequest*` session
 ///    fields and the persisted notice with `meta.kind = "discussion-request"`,
 ///    and the agent's status is NOT `error` (the turn ended normally);
-///  - an AUTOMATIC delivery (`agent.sendToTask`, the A2A/system path) does
-///    NOT retire the request: no `attentionRequestCleared` fires and
-///    `agent.getSession` still serves the pending fields;
 ///  - the next USER message (`agent.sendMessage` front door) retires the
 ///    request: `agent:updated` with `attentionRequestCleared: true`, and the
-///    session fields are gone.
+///    session fields are gone;
+///  - after a re-raise, an AUTOMATIC delivery (`agent.sendToTask`, the
+///    A2A/system path) ALSO retires the request for THIS agent — the
+///    delegate is a BACKGROUND session (`agent.delegate` persists
+///    `isBackground: true`), and the child/background retire rule
+///    (PROTOCOL §5.5) makes the coordinator's follow-up the acknowledgement.
+///    (Top-level foreground agents keep the user-only dismissal — covered by
+///    the `attention_request_clear_gates` unit tests and, over the wire, by
+///    `attention_request_foreground_automatic_delivery_negative_over_wss`.)
 #[tokio::test]
 async fn attention_request_discussion_over_wss() {
     let Some(script) = gate("WSS attention-request discussion E2E") else {
@@ -3380,62 +3415,11 @@ async fn attention_request_discussion_over_wss() {
         "notice carries the reason: {notice}"
     );
 
-    // An AUTOMATIC delivery (agent.sendToTask — same default-origin path as
-    // A2A sends and system wakes) must NOT retire the pending request: the
-    // turn runs to idle without an attentionRequestCleared, and getSession
-    // still serves the fields afterwards.
-    let auto_sent = wss_rpc(
-        &mut rpc,
-        14,
-        "agent.sendToTask",
-        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
-    )
-    .await;
-    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the automatic turn's idle"),
-        };
-        let ev = &frame["params"]["event"];
-        let data = &ev["data"];
-        assert!(
-            !(ev["type"] == "agent:updated"
-                && data["agentId"] == json!(agent_id)
-                && data["attentionRequestCleared"] == true),
-            "automatic delivery must not clear the attention request"
-        );
-        if ev["type"] == "agent:idle" && data["agentId"] == json!(agent_id) {
-            break;
-        }
-    }
-    let got = wss_rpc(
-        &mut rpc,
-        15,
-        "agent.getSession",
-        json!({ "agentId": agent_id, "workspaceId": ws_id }),
-    )
-    .await;
-    let session = &got["session"];
-    assert_eq!(
-        session["attentionRequestKind"], "discussion",
-        "attentionRequestKind survives the automatic delivery"
-    );
-    assert_eq!(
-        session["attentionRequestReason"], REASON,
-        "attentionRequestReason survives the automatic delivery"
-    );
-    assert!(
-        session["attentionRequestTimestamp"].is_string(),
-        "attentionRequestTimestamp survives the automatic delivery"
-    );
-
     // The next USER message retires the pending request: agent:updated
     // with attentionRequestCleared, and the session fields are gone.
     let sent = wss_rpc(
         &mut rpc,
-        16,
+        14,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up" }),
     )
@@ -3457,7 +3441,7 @@ async fn attention_request_discussion_over_wss() {
     }
     let got = wss_rpc(
         &mut rpc,
-        17,
+        15,
         "agent.getSession",
         json!({ "agentId": agent_id, "workspaceId": ws_id }),
     )
@@ -3474,6 +3458,313 @@ async fn attention_request_discussion_over_wss() {
     assert!(
         !session.contains_key("attentionRequestTimestamp"),
         "attentionRequestTimestamp cleared on next message"
+    );
+
+    // Re-raise: a user message carrying the behavior marker drives another
+    // requestDiscussion turn (the turn-begin clear is a no-op — nothing is
+    // pending), leaving a fresh pending request on the session.
+    let sent = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{CHILD_MARKER} raise it again"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "re-raise sendMessage ok: {sent}");
+    let mut re_raised = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(re_raised && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                re_raised = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+
+    // An AUTOMATIC delivery (agent.sendToTask — same default-origin path as
+    // A2A sends and system wakes) ALSO retires the pending request for THIS
+    // agent: the delegate is a BACKGROUND session (`agent.delegate` persists
+    // `isBackground: true`), so the child/background retire rule applies
+    // (PROTOCOL §5.5) — the coordinator's follow-up is the acknowledgement.
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => {
+                panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
+            }
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"] == json!(agent_id)
+            && ev["data"]["attentionRequestCleared"] == true
+        {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = got["session"].as_object().expect("session object");
+    assert!(
+        !session.contains_key("attentionRequestKind"),
+        "attentionRequestKind cleared by the automatic delivery (background delegate)"
+    );
+    assert!(
+        !session.contains_key("attentionRequestReason"),
+        "attentionRequestReason cleared by the automatic delivery (background delegate)"
+    );
+    assert!(
+        !session.contains_key("attentionRequestTimestamp"),
+        "attentionRequestTimestamp cleared by the automatic delivery (background delegate)"
+    );
+}
+
+/// The preserved NEGATIVE case of the attention-clear gate over the wire
+/// (PROTOCOL §5.5, monorepo#1237): an AUTOMATIC delivery to a TOP-LEVEL
+/// FOREGROUND agent — created via `agent.create` (not a delegate), so no
+/// parent linkage and `isBackground` defaults to false — must NOT retire a
+/// pending `requestDiscussion` attention request. Only the user may dismiss
+/// a top-level foreground agent's request, so the `agent.sendToTask` nudge
+/// (the same default-origin path as A2A sends and system wakes) completes
+/// its turn WITHOUT emitting `attentionRequestCleared`, and
+/// `agent.getSession` still serves the pending `attentionRequest*` fields
+/// afterwards. Complements the child/background clear path in
+/// `attention_request_discussion_over_wss` and the unit-level
+/// `attention_request_clear_gates` suite.
+#[tokio::test]
+async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
+    let Some(script) = gate("WSS attention-request foreground negative E2E") else {
+        return;
+    };
+
+    const RAISE_MARKER: &str = "ATTN_FG_RAISE";
+    const REASON: &str = "ATTN_WSS foreground needs the user's decision";
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let request_js = format!(
+        "return await ws.agent.requestDiscussion({});",
+        json!(REASON)
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": RAISE_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": request_js, "summary": "raise discussion request" }
+            },
+            "response": "turn ended after requestDiscussion",
+        }],
+        "response": "automatic nudge acknowledged",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent events, registered BEFORE any turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // TOP-LEVEL FOREGROUND agent (`agent.create` front door — contrast the
+    // background delegate in `attention_request_discussion_over_wss`),
+    // assigned to the task note so `agent.sendToTask` resolves it as the
+    // assignee.
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "FG-Attn", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Raise: a user message carrying the behavior marker drives the
+    // requestDiscussion turn, leaving a pending request on the session.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{RAISE_MARKER} raise a discussion request"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "raise sendMessage ok: {sent}");
+    let mut raised = false;
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(raised && idle) {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the raise: raised={raised} idle={idle}"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent:updated"
+                if data["agentId"] == json!(agent_id)
+                    && data["attentionRequestKind"].is_string() =>
+            {
+                raised = true;
+            }
+            "agent:idle" if data["agentId"] == json!(agent_id) => idle = true,
+            _ => {}
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "pending attentionRequestKind before the automatic delivery: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "pending attentionRequestReason before the automatic delivery: {session}"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "pending attentionRequestTimestamp before the automatic delivery: {session}"
+    );
+
+    // The AUTOMATIC delivery (agent.sendToTask — same default-origin path
+    // as A2A sends and system wakes) must NOT retire the request for this
+    // top-level foreground agent. Were the clear to fire, its
+    // `agent:updated` would be published at the nudge turn's begin, BEFORE
+    // the turn runs — so the turn's terminal `agent:idle` bounds the
+    // negative wait deterministically (no sleeps).
+    let auto_sent = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendToTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id, "message": "automatic nudge" }),
+    )
+    .await;
+    assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!("timed out waiting for the automatic nudge turn's agent:idle"),
+        };
+        let ev = &frame["params"]["event"];
+        let data = &ev["data"];
+        if data["agentId"] != json!(agent_id) {
+            continue;
+        }
+        assert!(
+            !(ev["type"] == "agent:updated" && data["attentionRequestCleared"] == json!(true)),
+            "automatic delivery must NOT emit attentionRequestCleared for a \
+             top-level foreground agent: {ev}"
+        );
+        if ev["type"] == "agent:idle" {
+            break;
+        }
+    }
+    let got = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    let session = &got["session"];
+    assert_eq!(
+        session["attentionRequestKind"], "discussion",
+        "attentionRequestKind survives the automatic delivery: {session}"
+    );
+    assert_eq!(
+        session["attentionRequestReason"], REASON,
+        "attentionRequestReason survives the automatic delivery: {session}"
+    );
+    assert!(
+        session["attentionRequestTimestamp"].is_string(),
+        "attentionRequestTimestamp survives the automatic delivery: {session}"
     );
 }
 
@@ -3947,8 +4238,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services =
-        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
@@ -4026,6 +4317,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -4048,7 +4340,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -4230,9 +4522,9 @@ async fn router_read_lifecycle_arms_over_wss() {
         "script.create",
         json!({
             "workspaceId": ws_id,
-            "name": "echo-wss",
-            "command": "echo wss",
-            "mode": "command",
+            "name": "service-wss",
+            "command": "sleep 3600",
+            "mode": "service",
         }),
     )
     .await;
@@ -4254,6 +4546,70 @@ async fn router_read_lifecycle_arms_over_wss() {
     )
     .await;
     assert!(status.is_object(), "script.status object: {status}");
+    let started = wss_rpc(
+        &mut rpc,
+        101,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    assert_eq!(started["ok"], json!(true));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut poll_id = 102;
+    loop {
+        let runtime = wss_rpc(
+            &mut rpc,
+            poll_id,
+            "script.status",
+            json!({ "workspaceId": ws_id, "scriptId": script_id }),
+        )
+        .await;
+        poll_id += 1;
+        if runtime["status"] == "running" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "script did not reach running state: {runtime}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let script_terminals = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    poll_id += 1;
+    assert_eq!(
+        script_terminals["terminals"],
+        json!([]),
+        "running script PTY must not be exposed as a terminal tab"
+    );
+    // `terminal.list` responds with the `{ terminals, daemonBootId }` envelope
+    // (PROTOCOL §5.13; monorepo#1334) — even for an empty workspace.
+    let script_boot_id = script_terminals["daemonBootId"]
+        .as_str()
+        .expect("daemonBootId string")
+        .to_string();
+    let script_output = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    poll_id += 1;
+    assert!(script_output.is_string(), "script.output remains available");
+    let stopped = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    assert_eq!(stopped["ok"], json!(true));
     let removed = wss_rpc(
         &mut rpc,
         13,
@@ -4282,10 +4638,15 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id }),
     )
     .await;
-    let terms = term_list.as_array().expect("terminals array");
+    let terms = term_list["terminals"].as_array().expect("terminals array");
     assert!(
         terms.iter().any(|t| t["id"] == json!(terminal_id)),
         "created terminal listed: {term_list}"
+    );
+    assert_eq!(
+        term_list["daemonBootId"].as_str(),
+        Some(script_boot_id.as_str()),
+        "daemonBootId stable across calls within one daemon boot"
     );
     // `terminal.write` accepts base64-encoded stdin bytes (PROTOCOL §5.13).
     // "ZWNobyBoaQo=" is base64 for "echo hi\n" — short and stable.
@@ -4480,6 +4841,43 @@ async fn terminal_create_env_over_wss() {
         "terminal.create must overlay the caller's env onto the spawned child \
          (PROTOCOL §5.13); output was: {text:?}, saw_exit={saw_exit}"
     );
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        listed["terminals"]
+            .as_array()
+            .is_some_and(|terms| terms.iter().all(|term| term["id"] != terminal_id)),
+        "naturally exited terminal must be omitted from terminal.list: {listed}"
+    );
+    assert!(
+        listed["daemonBootId"].is_string(),
+        "terminal.list envelope carries daemonBootId: {listed}"
+    );
+
+    let buffer = wss_rpc(
+        &mut rpc,
+        4,
+        "terminal.getBuffer",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+    assert_eq!(buffer["terminalId"], json!(terminal_id));
+    assert!(buffer["data"].is_string(), "retained scrollback: {buffer}");
+
+    let released = wss_rpc(
+        &mut rpc,
+        5,
+        "terminal.kill",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+    assert_eq!(released["ok"], json!(true));
 }
 
 /// Regression (paste/echo throughput): `terminal:data` is transient /
@@ -5241,7 +5639,12 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("queued message"))
+        })
         .and_then(|m| m["id"].as_str())
         .expect("dequeued user message row present in transcript")
         .to_string();
@@ -5258,7 +5661,9 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
 // queued entry wire shape (`queuedMessage.messageMetadata`, PROTOCOL §5.5) and
 // (b) persist it on the drained user message row so `agent.getConversation`
 // returns the same `metadata` a directly-delivered send would have — e.g. a
-// parent wake's `event_notification` tag survives the busy-parent enqueue.
+// parent wake's `event_notification` tag survives the busy-parent enqueue —
+// plus (c) the drain-time `queueInfo` stamp ({ queuedAt, waitedMs }, PROTOCOL
+// §5.5 dequeue-wait annotation) alongside the caller's fields.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -5376,7 +5781,8 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     }
     assert_eq!(stream_end_count, 2, "both turns must complete");
 
-    // (b) The drained user message row persists the metadata verbatim.
+    // (b) The drained user message row persists the caller's metadata fields
+    // verbatim, PLUS the drain-time queueInfo stamp.
     let convo = wss_rpc(
         &mut rpc,
         14,
@@ -5388,18 +5794,36 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "tagged queued message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("tagged queued message"))
+        })
         .expect("drained user message row present");
+    for (key, want) in metadata.as_object().unwrap() {
+        assert_eq!(
+            &tagged["metadata"][key], want,
+            "drained user row must persist messageMetadata field {key}: {tagged}"
+        );
+    }
+    // (c) queueInfo carries the entry's enqueue timestamp (byte-identical to
+    // the queued entry's `queuedAt`) and an integer wait in millis.
+    let queue_info = &tagged["metadata"]["queueInfo"];
     assert_eq!(
-        tagged["metadata"], metadata,
-        "drained user row must persist messageMetadata: {tagged}"
+        queue_info["queuedAt"], send2["queuedMessage"]["queuedAt"],
+        "queueInfo.queuedAt is the queue entry's queuedAt: {tagged}"
+    );
+    assert!(
+        queue_info["waitedMs"].as_u64().is_some(),
+        "queueInfo.waitedMs is a non-negative integer: {tagged}"
     );
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
-    // (`deliver_wake_message` parity).
+    // (`deliver_wake_message` parity) — the fold carries queueInfo too.
     assert_eq!(
-        tagged["contentBlocks"][0]["messageMetadata"], metadata,
-        "drained user block must fold messageMetadata: {tagged}"
+        tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
+        "drained user block must fold the same messageMetadata: {tagged}"
     );
 }
 
@@ -5554,7 +5978,12 @@ async fn user_app_message_id_round_trips_over_wss() {
     assert_eq!(row1["metadata"]["userAppMessageId"], "app-msg-direct-1");
     let row2 = messages
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued tagged message")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("queued tagged message"))
+        })
         .expect("drained user row present");
     assert_eq!(row2["appMessageId"], "app-msg-queued-2");
     assert_eq!(row2["metadata"]["userAppMessageId"], "app-msg-queued-2");
@@ -7146,10 +7575,10 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
 /// `agent_manager::create_agent` for a top-level (non-sub-agent) interactive
 /// agent MUST contain the `## Suggested Next Steps` heading — the directive
 /// that tells the model to emit a `<!-- suggested-prompts ... -->` block at
-/// the end of user-facing responses. The daemon writes the temp file into
-/// `std::env::temp_dir()` and keeps it alive for the lifetime of the agent
-/// handle, so we redirect the daemon's `TMPDIR` to a test-controlled
-/// directory and scan it after the first turn kicks off spawning.
+/// the end of user-facing responses. The daemon writes the file into
+/// `<data_dir>/agent-configs` (monorepo#1302) and keeps it alive for the
+/// lifetime of the agent handle, so we scan that directory after the first
+/// turn kicks off spawning.
 #[tokio::test]
 async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     let Some(script) = gate("WSS SP-1 rules-file E2E") else {
@@ -7158,9 +7587,9 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    // Dedicated TMPDIR so the daemon's `std::env::temp_dir()` writes the
-    // `intentd-rules-*.md` and `intentd-mcp-*.json` files where this test
-    // can inspect them.
+    // Dedicated TMPDIR keeps the daemon's residual temp usage hermetic and
+    // lets this test assert the generated rules file no longer lands there
+    // (monorepo#1302 moved it under `<data_dir>/agent-configs`).
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp dir");
     let tmp_dir_s = tmp_dir.to_string_lossy().into_owned();
@@ -7214,19 +7643,23 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Poll the redirected TMPDIR for the `intentd-rules-*.md` the daemon
-    // writes during spawn. Bounded wait so a hung spawn fails loudly.
+    // Poll `<data_dir>/agent-configs` for the `intentd-rules-*.md` the daemon
+    // writes during spawn (the directory is created on demand at first spawn,
+    // so tolerate it not existing yet). Bounded wait so a hung spawn fails
+    // loudly.
+    let rules_dir = data_dir.join("agent-configs");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut rules_body: Option<String> = None;
     while std::time::Instant::now() < deadline {
-        let entries = std::fs::read_dir(&tmp_dir).expect("read TMPDIR");
         let mut hit: Option<PathBuf> = None;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_s = name.to_string_lossy();
-            if name_s.starts_with("intentd-rules-") && name_s.ends_with(".md") {
-                hit = Some(entry.path());
-                break;
+        if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_s = name.to_string_lossy();
+                if name_s.starts_with("intentd-rules-") && name_s.ends_with(".md") {
+                    hit = Some(entry.path());
+                    break;
+                }
             }
         }
         if let Some(path) = hit {
@@ -7240,8 +7673,22 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
         sleep(Duration::from_millis(100)).await;
     }
     let body = rules_body.expect(
-        "expected `intentd-rules-*.md` to be written under the redirected TMPDIR \
+        "expected `intentd-rules-*.md` to be written under <data_dir>/agent-configs \
          during agent spawn",
+    );
+    // Regression guard for monorepo#1302: the generated per-agent files must
+    // no longer land in the (redirected) OS temp dir.
+    let leaked_in_tmp = std::fs::read_dir(&tmp_dir)
+        .expect("read TMPDIR")
+        .flatten()
+        .any(|e| {
+            let name = e.file_name();
+            let name_s = name.to_string_lossy();
+            name_s.starts_with("intentd-rules-") || name_s.starts_with("intentd-mcp-")
+        });
+    assert!(
+        !leaked_in_tmp,
+        "generated agent config files must not be written into the OS temp dir"
     );
     // Debug tail walks forward to the next char boundary so the slice never
     // lands mid-multi-byte (the rules text includes non-ASCII like "2–4").
@@ -8137,6 +8584,27 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         Some(dequeued_message_id.as_str()),
         second_user_id,
         "dequeued agent:message event ID matches the second (queued) user message"
+    );
+
+    // Dequeue-wait note: the drained entry's delivered content (persisted
+    // user row == provider prompt) carries the enqueue-time annotation;
+    // the direct send was never queued, so its row stays untouched. Stable
+    // prefix of `DEQUEUE_WAIT_NOTE_PREFIX` in `intent-services`'s
+    // agent_manager.
+    const DEQUEUE_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+    let direct_text = serde_json::to_string(&user_messages[0]["contentBlocks"]).unwrap_or_default();
+    assert!(
+        !direct_text.contains(DEQUEUE_NOTE_PREFIX),
+        "immediate delivery is NOT annotated: {direct_text}"
+    );
+    let queued_text = serde_json::to_string(&user_messages[1]["contentBlocks"]).unwrap_or_default();
+    assert!(
+        queued_text.contains(DEQUEUE_NOTE_PREFIX),
+        "the drained message carries the dequeue-wait note: {queued_text}"
+    );
+    assert!(
+        queued_text.contains("before delivery."),
+        "the note names the wait duration: {queued_text}"
     );
 
     // Part 2: Wake delivery path (deliver_wake_message runtime).
@@ -9084,7 +9552,12 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
     let messages = conv["messages"].as_array().expect("messages array");
     let tagged = messages
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "cross-agent hello")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("cross-agent hello"))
+        })
         .expect("cross-agent user row present");
     assert_eq!(
         tagged["metadata"],
@@ -9131,7 +9604,12 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "human follow-up")
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("human follow-up"))
+        })
         .expect("human user row present")
         .clone();
     assert_ne!(
@@ -9144,8 +9622,9 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
 /// Sender attribution for the remaining agent-originated send paths
 /// (PROTOCOL §5.5): `ws.agent.sendToTask` must tag the assignee's delivered
 /// row with the `agent_message` attribution, and the `ws.agent.create`
-/// kickoff message must carry the same auto-tag — unless the caller supplies
-/// an explicit `messageMetadata`, which is persisted verbatim (precedence).
+/// kickoff message must carry the same auto-tag — an explicit
+/// `messageMetadata` keeps its own fields but the attribution fields are
+/// daemon-stamped (never caller-controlled).
 /// Drives all three through the full daemon stack: a real mock-ACP sender
 /// turn invokes the MCP `workspace_api` bindings, and the assertions read
 /// the persisted transcripts back over WSS `agent.getConversation`.
@@ -9344,7 +9823,12 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
             .as_array()
             .expect("messages array")
             .iter()
-            .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == text)
+            .find(|m| {
+                m["role"] == "user"
+                    && m["contentBlocks"][0]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with(text))
+            })
             .unwrap_or_else(|| panic!("user row `{text}` present: {conv}"))
             .clone()
     };
@@ -9377,8 +9861,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "create kickoff must carry sender attribution: {row}"
     );
 
-    // 3. create kickoff with explicit messageMetadata: persisted verbatim,
-    // taking precedence over the auto-tag.
+    // 3. create kickoff with explicit messageMetadata: the caller's own
+    // fields persist, with the attribution fields daemon-stamped (the
+    // guard/ownership key is never caller-controlled).
     let conv = wss_rpc(
         &mut rpc,
         18,
@@ -9389,8 +9874,13 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     let row = user_row(&conv, "kickoff explicit");
     assert_eq!(
         row["metadata"],
-        json!({ "type": "custom_tag", "note": "explicit wins" }),
-        "explicit messageMetadata must win over the auto-tag: {row}"
+        json!({
+            "type": "custom_tag",
+            "note": "explicit wins",
+            "fromAgentId": sender_id,
+            "fromAgentName": "SenderA",
+        }),
+        "explicit messageMetadata must keep its fields with daemon-stamped attribution: {row}"
     );
 }
 
@@ -9406,8 +9896,9 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
 ///   bystander is later woken by the parent's completion;
 /// - the parent's `chat.subscribe` delta for the delivered row lifts the
 ///   persisted `agent_message` sender-attribution `metadata` onto the wire
-///   entity (§7.1), while a human `agent.sendMessage` row keeps the lean
-///   metadata-free entity shape.
+///   entity (§7.1), while a human `agent.sendMessage` row carries no
+///   attribution metadata (lean metadata-free shape, or at most the drain-time
+///   `queueInfo` stamp if the send raced the parent's busy window).
 #[tokio::test]
 async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_wss() {
     let Some(script) = gate("WSS child→parent watch suppression + delta metadata E2E") else {
@@ -9483,6 +9974,20 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     assert!(sub_resp["subscriptionId"].is_string());
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Pin `workspaceApi.toonOutput` off so the persisted `ws.agent.send` tool
+    // result stays plain JSON for the `serde_json::from_str` extraction below
+    // (TOON encoding is on by default).
+    let updated = wss_rpc(
+        &mut rpc,
+        9,
+        "settings.update",
+        json!({ "changes": [ { "path": "workspaceApi.toonOutput", "value": false } ] }),
+    )
+    .await;
+    assert!(
+        updated["applied"].is_array(),
+        "toonOutput pinned: {updated}"
+    );
     let parent = wss_rpc(
         &mut rpc,
         10,
@@ -9650,7 +10155,39 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         "attribution carries the sender name: {tagged}"
     );
 
-    // Lean-shape control: a human send's delta entity carries NO metadata.
+    // Lean-shape control: a human send's delta entity carries NO
+    // sender-attribution metadata. Wait for the parent's child-message turn
+    // to finish on the chat channel first so the send is (usually) delivered
+    // directly — but if it still races the busy window and queues, the row
+    // legitimately gains ONLY the drain-time `queueInfo` stamp (PROTOCOL
+    // §5.5), never `agent_message` attribution; the assertion below allows
+    // exactly that.
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = wss_push(&mut chat, 60).await;
+            if frame["params"]["kind"] != "delta" {
+                continue;
+            }
+            let delta = frame["params"]["delta"].clone();
+            let done = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .any(|e| {
+                    e["role"] == "assistant"
+                        && e["streamingComplete"] == json!(true)
+                        && e["block"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("plain reply"))
+                });
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("parent's child-message turn replied on the chat channel");
     let human = wss_rpc(
         &mut rpc,
         14,
@@ -9683,10 +10220,23 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     })
     .await
     .expect("human row reached the chat channel");
-    assert!(
-        lean.get("metadata").is_none(),
-        "a metadata-free row keeps the lean entity shape: {lean}"
-    );
+    match lean.get("metadata") {
+        None => {} // direct delivery: the lean metadata-free entity shape
+        Some(md) => {
+            // Queued delivery race: only the drain-time queueInfo stamp is
+            // allowed — human sends never gain A2A attribution metadata.
+            let keys: Vec<&String> = md
+                .as_object()
+                .unwrap_or_else(|| panic!("metadata is an object: {lean}"))
+                .keys()
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["queueInfo"],
+                "a human row carries at most the queueInfo stamp: {lean}"
+            );
+        }
+    }
 
     // Contrast: a parentless BYSTANDER running the identical send DOES get
     // the SUB-1 sender watch — and is later woken by the parent's completion.
@@ -9741,7 +10291,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         "a non-child sender still gets the SUB-1 watch: {result}"
     );
 
-    // The parent's post-send idle fires the bystander's oneShot watch — the
+    // The parent's post-send idle fires the bystander's watch — the
     // wake lands in the bystander transcript. The CHILD, whose watch was
     // suppressed, has no wake despite the parent idling multiple times since
     // its earlier send.
@@ -11466,7 +12016,7 @@ async fn queue_drain_user_row_delta_over_chat_subscribe() {
                 }
             }
         }
-        role == "user" && text == "queued message"
+        role == "user" && text.starts_with("queued message")
     })
     .await;
     assert!(

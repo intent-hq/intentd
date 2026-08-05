@@ -58,6 +58,7 @@ fn sample_ws() -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -89,6 +90,19 @@ fn ws_with(id: &WorkspaceId) -> Workspace {
 }
 
 impl WorkspaceApi for FakeApi {
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "streams": [{
+                    "agentId": "agent-active",
+                    "sessionId": "agent-active",
+                    "workspaceId": "ws-active",
+                    "startTime": 1_750_000_000_000_i64,
+                }],
+            }))
+        })
+    }
+
     fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async { Ok(vec![sample_ws()]) })
     }
@@ -98,6 +112,22 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(ws_with(&id))
+        })
+    }
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "diskUsage": {
+                    "bytes": 4096,
+                    "fileCount": 1,
+                    "computedAt": "2026-01-01T00:00:00Z",
+                    "breakdown": [],
+                },
+                "refreshing": true,
+            }))
         })
     }
     fn create_workspace(
@@ -1074,16 +1104,22 @@ impl WorkspaceApi for FakeApi {
 
     fn search_messages(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         _query: String,
         _agent_id: Option<String>,
         _role: Option<String>,
         _limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            Ok(serde_json::json!({
+                "requestId": request_id,
+                "matches": [],
+                "workspaceId": workspace_id.map(|w| w.0),
+                "preferWorkspaceId": prefer_workspace_id.map(|w| w.0),
+            }))
         })
     }
 
@@ -1583,6 +1619,24 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    // `specialist.get`: unknown id → `NotFound`, empty id → `InvalidParams`,
+    // so the router tests can assert the formerly collapsed
+    // `InvalidParams | NotFound` arm carries per-origin discriminators
+    // (monorepo#1320).
+    fn specialist_get(
+        &self,
+        id: String,
+        _workspace_path: Option<String>,
+        _provider: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.is_empty() {
+                return Err(Error::InvalidParams("Invalid specialist id".to_string()));
+            }
+            Err(Error::NotFound(format!("Specialist not found: {id}")))
+        })
+    }
+
     fn get_repo_config(&self, id: WorkspaceId) -> BoxFuture<'_, Result<RepoConfig>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -2029,6 +2083,26 @@ async fn clone_failed_maps_to_structured_error_data() {
     );
 }
 
+#[test]
+fn voice_not_configured_maps_to_structured_error_data() {
+    // The voice.transcribe no-API-key failure (PROTOCOL §5.41,
+    // monorepo#1448) keeps the -32603 code and the generic "Internal error"
+    // message, and carries machine-readable
+    // `error.data = { code: "voice-no-api-key", detail }` with the
+    // descriptive text unchanged so clients stop matching on prose.
+    let detail = "voice not configured: voice: no API key found for elevenlabs \
+                  (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)";
+    let rpc = super::domain_to_rpc(intent_core::Error::VoiceNotConfigured {
+        detail: detail.to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(rpc.message, "Internal error");
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
 #[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
@@ -2112,6 +2186,46 @@ async fn workspace_get_missing_id_is_minus_32602_with_message() {
 async fn workspace_get_not_found_is_minus_32602_with_message() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.get","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.diskUsage` returns the service payload verbatim:
+/// `{ diskUsage?, refreshing }` with no extra envelope nesting.
+#[tokio::test]
+async fn workspace_disk_usage_returns_payload() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["refreshing"], serde_json::json!(true));
+    assert_eq!(v["result"]["diskUsage"]["bytes"], serde_json::json!(4096));
+    assert_eq!(v["result"]["diskUsage"]["fileCount"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();
@@ -2476,6 +2590,76 @@ async fn note_get_not_found_is_minus_32602_with_message() {
     .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(v["error"]["message"], serde_json::json!("Note not found"));
+}
+
+/// -32602 discriminator (monorepo#1320): a lookup of a nonexistent entity
+/// carries `error.data.code = "not-found"`; the message is unchanged.
+#[tokio::test]
+async fn not_found_minus_32602_carries_not_found_discriminator() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], serde_json::json!("Note not found"));
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+
+    // `workspace_err` path: missing workspace on `workspace.get`.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+}
+
+/// -32602 discriminator (monorepo#1320): param validation carries
+/// `error.data.code = "invalid-params"`; the message is unchanged.
+#[tokio::test]
+async fn invalid_params_minus_32602_carries_invalid_params_discriminator() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.get","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
+}
+
+/// The formerly collapsed `InvalidParams | NotFound` arms (e.g.
+/// `specialist.get`) are split so each origin carries its own discriminator
+/// (monorepo#1320).
+#[tokio::test]
+async fn specialist_get_splits_not_found_from_invalid_params() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"specialist.get","params":{"id":"nope"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Specialist not found: nope")
+    );
+    assert_eq!(v["error"]["data"]["code"], serde_json::json!("not-found"));
+
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"specialist.get","params":{"id":""}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Invalid specialist id")
+    );
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
 }
 
 #[tokio::test]
@@ -3052,6 +3236,22 @@ async fn agent_methods_are_routed_not_method_not_found() {
             .await
             .unwrap();
     assert_eq!(err_code(&v), -32603);
+
+    // agent.listActive is daemon-global and accepts an empty params object.
+    let v = call(r#"{"jsonrpc":"2.0","id":7,"method":"agent.listActive","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "streams": [{
+                "agentId": "agent-active",
+                "sessionId": "agent-active",
+                "workspaceId": "ws-active",
+                "startTime": 1_750_000_000_000_i64,
+            }],
+        })
+    );
 
     // agent.getModels takes no params and must route too.
     let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"agent.getModels"}"#)
@@ -3834,32 +4034,32 @@ async fn search_cancel_requires_request_id_and_is_ok() {
 }
 
 #[tokio::test]
-async fn search_messages_requires_workspace_and_query() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"query":"x"}}"#)
+async fn search_messages_requires_query_only() {
+    // workspaceId is optional (absent → global search); missing query → -32602.
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("workspaceId is required")
-    );
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
         serde_json::json!("Missing required parameter: query")
     );
-    // Routed + echoes the caller's requestId.
+    // Global (no workspaceId) routes + echoes the caller's requestId.
     let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1","query":"x","requestId":"srch-9"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"query":"x","requestId":"srch-9"}}"#,
     )
     .await
     .unwrap();
     assert_eq!(v["result"]["requestId"], serde_json::json!("srch-9"));
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!(null));
+    // workspaceId and preferWorkspaceId both plumb through to the API.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"search.messages","params":{"workspaceId":"ws-1","preferWorkspaceId":"ws-2","query":"x"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspaceId"], serde_json::json!("ws-1"));
+    assert_eq!(v["result"]["preferWorkspaceId"], serde_json::json!("ws-2"));
 }
 
 #[tokio::test]

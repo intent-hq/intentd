@@ -25,6 +25,15 @@ use std::time::Duration;
 #[ctor::ctor(unsafe)]
 fn force_hermetic_root_guard() {
     std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    // Node children spawned by tests (mock ACP agents, MCP fixtures) inherit
+    // this and skip `module.enableCompileCache()`, which would otherwise leave
+    // a `node-compile-cache/` residue at the TMPDIR root after the suite.
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+    // Daemon-spawned provider probes can exec a real `pi` CLI, whose jiti
+    // extension loader transpile-caches `.mjs` files under `$TMPDIR/jiti/`.
+    // jiti honors this boolean env (`_booleanEnv("JITI_FS_CACHE", ...)`), so
+    // disabling the fs cache keeps the TMPDIR root clean after e2e suites.
+    std::env::set_var("JITI_FS_CACHE", "false");
 }
 
 /// Apply the timeout multiplier from the environment for coverage
@@ -57,14 +66,47 @@ pub fn rpc_read_timeout() -> Duration {
     daemon_startup_timeout()
 }
 
+/// Create a temp dir with a recognizable `prefix` under the system temp root.
+/// The returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+pub fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
+/// Like [`test_tempdir`], but rooted at `base` instead of the system temp
+/// root. Use with `"/tmp"` when the dir must stay short enough for a UDS
+/// socket path (macOS caps them at ~104 bytes; `temp_dir()` resolves to a
+/// long `/var/folders/...` path).
+#[allow(dead_code)]
+pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
 /// Return a unique, hermetic workspaces root under the OS temp dir.
 ///
-/// In-process integration tests must chain `.with_workspaces_root(...)` onto
-/// every `Services::new(...)` so tests never resolve the real
-/// `~/intent/workspaces`. The directory is created on demand by the services
-/// layer, so this helper only reserves a unique path.
-pub fn hermetic_workspaces_root() -> PathBuf {
-    std::env::temp_dir().join(format!("itd-ws-{}", uuid::Uuid::new_v4()))
+/// In-process integration tests must chain
+/// `.with_workspaces_root(root.path().to_path_buf())` onto every
+/// `Services::new(...)` so tests never resolve the real `~/intent/workspaces`.
+/// The returned `TempDir` guard must be held for the full test lifetime: it
+/// removes the tree on drop (including on panic), so dropping it early would
+/// let the services layer recreate — and leak — the root. Set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir for debugging.
+pub fn hermetic_workspaces_root() -> tempfile::TempDir {
+    test_tempdir("itd-ws-")
 }
 
 /// Wait until a freshly spawned `intentd serve` child accepts connections on

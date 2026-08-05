@@ -10,50 +10,47 @@ permissions:
   pull-requests: read
 
 env:
-  # Burst the Linux jobs to WarpBuild when more than this many Linux
-  # jobs are queued/running ahead of this run (see the route job). Note
-  # that jobs still blocked on `needs` are invisible to the jobs API, so
-  # a queued run ahead of us counts only its utility jobs (pr-title /
-  # conflict-markers / deb-packaging when routed to tinybox) — one fully
-  # queued PR run is already enough to clear this threshold, which is
-  # intended: it means tinybox is at least one full run behind. Bursted
-  # jobs (utility included) don't carry the self-hosted+Linux labels and
-  # stop counting toward the depth, so the system naturally falls back
-  # to tinybox as it frees up.
-  LINUX_BURST_THRESHOLD: 2
+  # Burst the Linux jobs to GitHub-hosted larger runners when more than
+  # this many Linux jobs are queued/running ahead of this run (see the
+  # route job). tinybox runs 8 concurrent runner slots, so the threshold
+  # tolerates one queued/running job per slot before bursting. Note that
+  # jobs still blocked on `needs` are invisible to the jobs API, so only
+  # check/coverage jobs already released to tinybox (queued or running
+  # there) count toward the depth. Bursted jobs don't carry the
+  # self-hosted+Linux labels and stop counting toward the depth, so the
+  # system naturally falls back to tinybox as it frees up.
+  LINUX_BURST_THRESHOLD: 8
 
-# The heavy jobs share a single self-hosted runner slot and serialize, so
-# cancel superseded PR runs instead of letting them back up the queue (push
-# to main and merge-queue runs are never cancelled).
+# The heavy jobs share the tinybox's 8 self-hosted runner slots, so cancel
+# superseded PR runs instead of letting them back up the queue (push to
+# main and merge-queue runs are never cancelled).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the Linux jobs — heavy (check / coverage-e2e /
-  # coverage-all) and utility (pr-title / conflict-markers / deb-packaging)
-  # — run: the local tinybox runner normally, or WarpBuild ephemeral runners
-  # when the tinybox queue is backed up. Runs on a small WarpBuild ephemeral
-  # runner so the burst decision is independent of the tinybox queue: when
-  # the probe ran on tinybox it queued behind the very backlog it measures
-  # (and deadlocked entirely with tinybox offline). The probe fails open to
+  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all)
+  # run: the local tinybox runner normally, or GitHub-hosted larger runners
+  # when the tinybox queue is backed up. Runs on a GitHub-hosted runner so
+  # the burst decision is independent of the tinybox queue: when the probe
+  # ran on tinybox it queued behind the very backlog it measures (and
+  # deadlocked entirely with tinybox offline). The probe fails open to
   # tinybox on API errors; if the job itself fails (runner outage, timeout),
   # the routed jobs are skipped and need a re-run — a deliberate trade-off.
-  # The mac build is intentionally not routed — it stays pinned to m1mac.
+  # The mac build is intentionally not routed — it runs on a GitHub-hosted
+  # macOS runner (see the build job's matrix).
   route:
-    runs-on: warp-ubuntu-latest-x64-2x
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
       # Reads the Actions queue; job-level so the other jobs don't inherit
-      # it. The probe (and the optional cross-repo CI_QUEUE_READ_TOKEN)
-      # now runs on third-party WarpBuild ephemeral runners — an accepted
-      # trade-off.
+      # it (the optional cross-repo CI_QUEUE_READ_TOKEN is likewise only
+      # exposed to this job).
       actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
-      utility_labels: ${{ steps.decide.outputs.utility_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
     steps:
       - id: decide
@@ -61,7 +58,7 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
         with:
-          # tinybox serves several repos on one runner slot, so the probe
+          # tinybox serves several repos on its runner slots, so the probe
           # wants to size the queue across all of them — but the default
           # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
           # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
@@ -70,22 +67,20 @@ jobs:
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
-            // The coverage jobs run the whole instrumented suite and are
-            // sized to 32 vCPUs; check (fmt + clippy + a couple of tests)
-            // doesn't come close to saturating that, so it bursts to a
-            // cheaper 16x runner instead.
-            const burst = ["warp-ubuntu-latest-x64-32x"];
-            const checkBurst = ["warp-ubuntu-latest-x64-16x"];
-            // The utility jobs (pr-title / conflict-markers / deb-packaging)
-            // are seconds-long; a 2x runner is plenty when bursting.
-            const utilityBurst = ["warp-ubuntu-latest-x64-2x"];
-            const threshold = parseInt(process.env.THRESHOLD || "2", 10);
+            // The coverage jobs run the whole instrumented suite, so they
+            // burst to the biggest GH-hosted Linux runner (16-core); check
+            // (fmt + clippy + a couple of tests) doesn't come close to
+            // saturating that, so it bursts to a cheaper 8-core runner
+            // instead.
+            const burst = ["gh-linux-16x"];
+            const checkBurst = ["gh-linux-8x"];
+            const threshold = parseInt(process.env.THRESHOLD || "8", 10);
             // Count self-hosted Linux jobs that are queued or running in
-            // queued/in-progress runs: a running job occupies the single
-            // tinybox slot just as much as a queued one. WarpBuild jobs —
-            // including this route job and bursted heavy jobs — don't match
-            // the self-hosted+Linux label filter, so they never inflate the
-            // depth.
+            // queued/in-progress runs: a running job occupies a tinybox
+            // slot just as much as a queued one. GitHub-hosted jobs
+            // — including this route job and bursted heavy jobs — don't
+            // match the self-hosted+Linux label filter, so they never
+            // inflate the depth.
             const owner = context.repo.owner;
             const repos = ["intentd", "cloudlands-fe", "monorepo"];
             let depth = 0;
@@ -106,7 +101,6 @@ jobs:
             core.info(`linux queue depth=${depth} threshold=${threshold} burst=${useBurst}`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
-            core.setOutput("utility_labels", JSON.stringify(useBurst ? utilityBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
 
   check:
@@ -118,9 +112,50 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
-      # this job's target dir stays small, and tinybox has ~380G free.
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
+      # slots share one /raid CI-scratch volume, and the per-slot persistent
+      # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
+      # can fill it — a full volume kills jobs mid-run with ENOSPC. If free
+      # space is below the job's threshold, self-prune stale per-slot
+      # ci-target dirs first (mtime older than 2 days, oldest first, never
+      # this job's own dir, never anything outside /raid/ci-target — shared
+      # caches like ~/.cargo and ~/.rustup are untouched), then fail with an
+      # actionable message if space is still short. Thresholds: 10 GiB here
+      # (small target dir with debuginfo off), 30 GiB for the instrumented
+      # coverage jobs. Exact no-op on burst runners (step skipped).
+      # tinybox-prune.yml does the routine scheduled pruning; this is only
+      # the emergency backstop.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 10
+          JOB_TARGET_SUBDIR: check
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
       # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
       # relies on the runner user's passwordless sudo.
@@ -133,12 +168,21 @@ jobs:
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
       # the start of every job, and all jobs on this runner share one work
-      # dir. A per-job CARGO_TARGET_DIR under $HOME survives both, which is
+      # dir. A per-job CARGO_TARGET_DIR on /raid survives both, which is
       # what makes builds warm across runs (and why swatinem/rust-cache was
       # dropped: GH cache save/restore would be pure overhead on top of it).
+      # The path is also keyed on $RUNNER_NAME: the 8 tinybox runner slots
+      # share the box, and without the key concurrent jobs would serialize
+      # on cargo's target-dir lock (and the coverage jobs would clobber each
+      # other — see their comments). The dirs live on the 300G /raid volume,
+      # off the (much smaller) root volume that holds $HOME — the root
+      # volume reached box-level ENOSPC when they lived there (monorepo#1253).
+      # Trade-off: up to 8 per-slot copies of each job's target dir;
+      # tinybox-prune.yml prunes /raid/ci-target on a schedule and the
+      # preflight above is the emergency backstop.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/check" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -149,13 +193,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-check
+          shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -177,7 +221,71 @@ jobs:
           cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
           cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
 
+  # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
+  # only version strings + changelog, so the compiled code is identical to
+  # what main already tested and the heavy jobs (build matrix, coverage-all,
+  # coverage-e2e) add no signal — their ~20 min wall time just makes the PR
+  # lose the strict up-to-date race against main. This job diffs the PR
+  # against its base and emits fast_path=true only when the diff has exactly
+  # the release shape (files ⊆ {CHANGELOG.md, Cargo.lock, crates/*/Cargo.toml}
+  # and every non-changelog change is a uniform old→new version-string flip;
+  # see scripts/release-pr-fast-path.sh). The diff shape is the ONLY signal —
+  # never branch name or author — so a PR can't spoof its way past the heavy
+  # checks: any real code change breaks the shape. Fail-safe, not fail-open:
+  # the heavy jobs skip only when the output is exactly 'true' (script error,
+  # missing output, or job failure falls back to full CI), push / merge_group
+  # runs are never gated, and check / pr-title / conflict-markers /
+  # deb-packaging still run on every PR. Job names are unchanged, so the
+  # required-check ruleset needs no edits — but the gating mechanism differs
+  # by job shape. The non-matrix coverage jobs skip at job level (a skipped
+  # job still reports its required context). The build job CANNOT be skipped
+  # at job level: a job-level skip prevents the matrix from expanding, so
+  # GitHub reports a single skipped check named literally `matrix.name` and
+  # the required per-entry contexts (`build (aarch64-apple-darwin, macos-14)`
+  # etc.) are never reported, leaving release PRs blocked forever (intentd#868).
+  # Instead the build job always runs and every step is gated on
+  # fast_path != 'true', so on fast-path PRs each matrix entry completes as
+  # an all-steps-skipped success under its required name.
+  release-fast-path:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    outputs:
+      fast_path: ${{ steps.decide.outputs.fast_path }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch PR base commit
+        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+      - name: Evaluate diff shape
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Script contract: prints fast_path=true|false; non-zero exit means
+          # no-match. Never fail this step — a broken checker must degrade to
+          # full CI, not block the PR.
+          out=$(./scripts/release-pr-fast-path.sh "$BASE_SHA" HEAD) || {
+            echo "release-pr-fast-path.sh exited non-zero — falling back to full CI"
+            out="fast_path=false"
+          }
+          printf '%s\n' "$out"
+          line=$(printf '%s\n' "$out" | grep -E '^fast_path=(true|false)$' | tail -n1 || true)
+          echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
+
   build:
+    # Step-gated (NOT job-gated) when the diff is release-PR-shaped: every
+    # step below carries `needs.release-fast-path.outputs.fast_path != 'true'`
+    # so on fast-path PRs the matrix still expands and each entry reports its
+    # required check context as an all-steps-skipped success (see the
+    # release-fast-path comment for why a job-level skip breaks matrix
+    # required checks). Steps run unless the output is exactly 'true': on
+    # push / merge_group the fast-path job is skipped and the output is
+    # empty, and a fast-path failure leaves it empty too, so both fall back
+    # to running the full job. `!cancelled()` keeps the job from being
+    # auto-skipped when its `needs` dependency was skipped (push/merge_group).
+    needs: release-fast-path
+    if: ${{ !cancelled() }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -186,10 +294,18 @@ jobs:
           # temporarily disabled — re-enable when needed
           # - target: x86_64-unknown-linux-gnu
           #   os: ubuntu-latest
+          # GitHub-hosted Apple Silicon runner: the self-hosted m1mac went
+          # offline and PRs queued indefinitely behind it.
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64, m1mac]
+            os: macos-14
+            name: build (aarch64-apple-darwin, macos-14)
           - target: x86_64-pc-windows-msvc
             os: [self-hosted, Windows, X64]
+            name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
+    # Explicit per-entry names (instead of the default matrix-value join) so
+    # the required-check contexts in the main ruleset stay stable even when a
+    # matrix entry's runner labels change.
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Keeps the cargo-check steps free of debuginfo/incremental artifacts
@@ -202,62 +318,118 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+        if: needs.release-fast-path.outputs.fast_path != 'true'
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
       # runner's Windows-path step scripts. Prepend Git's bin dir so every
       # later `shell: bash` step resolves Git Bash instead.
       - name: Put Git Bash first on PATH (Windows)
-        if: runner.os == 'Windows'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale; re-add swatinem/rust-cache, keyed
-      # per target, if a GH-hosted matrix entry is re-enabled). On the Windows
-      # runner this runs under Git Bash, where $HOME is an MSYS-style path
-      # cargo (spawned from the default pwsh shell) can't use — $USERPROFILE
-      # carries the native C:\Users\... form, so prefer it when set.
-      - name: Point CARGO_TARGET_DIR outside the work dir
+      # Per-job persistent target dir outside the work dir, self-hosted
+      # runners only (see the `check` job's comment for the rationale). The
+      # self-hosted runners are single-slot, so no $RUNNER_NAME key. On the
+      # Windows runner this runs under Git Bash, where $HOME is an MSYS-style
+      # path cargo (spawned from the default pwsh shell) can't use —
+      # $USERPROFILE carries the native C:\Users\... form, so prefer it when
+      # set.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && contains(matrix.os, 'self-hosted')
         shell: bash
         run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
+        if: needs.release-fast-path.outputs.fast_path != 'true'
         id: toolchain
         shell: bash
         run: |
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
+        if: needs.release-fast-path.outputs.fast_path != 'true'
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there instead (mirrors the `check` job's
+      # burst-runner caching; pure overhead on the self-hosted runners).
+      - name: Rust cache (GitHub-hosted runner only)
+        if: ${{ needs.release-fast-path.outputs.fast_path != 'true' && !contains(matrix.os, 'self-hosted') }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gh-build-${{ matrix.target }}
       # On PRs a cheap `cargo check` proves per-target compilation; the full
       # `--release` build (the expensive part, esp. on Windows) only runs on
       # push to main and in the merge queue. The "Warm PR check cache" step
       # keeps the persistent target dir warm for PR checks after main builds.
       - name: Check (PR compilation proof)
-        if: github.event_name == 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request'
         run: cargo check --workspace --target ${{ matrix.target }}
       - name: Build (release)
-        if: github.event_name != 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'pull_request'
         run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: Warm PR check cache
-        if: github.event_name == 'push'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    needs: route
+    # Skipped at job level when the diff is release-PR-shaped (safe for
+    # non-matrix jobs — a skipped job still reports its required context;
+    # see release-fast-path). Fail-safe: skips only when the output is
+    # exactly 'true'. The route.result guard preserves the pre-existing
+    # behavior that a route failure skips this job.
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 32 (not 64) on the 64-core tinybox: at 64 threads the latency-bound
-      # stress tests (e.g. e2e_wss_pool_contention_stress's <2s read assert)
-      # blow their wall-clock bounds under llvm-cov load on both nextest
-      # tries. 32 keeps the box saturated without the latency spikes.
-      NEXTEST_TEST_THREADS: 32
+      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
+      # (at 64 threads the latency-bound stress tests — e.g.
+      # e2e_wss_pool_contention_stress's <2s read assert — blew their
+      # wall-clock bounds under llvm-cov load on both nextest tries), but up
+      # to 8 co-tenant jobs now share the box, so halve to 16 to keep those
+      # tests inside their bounds under co-tenancy. This also matches the
+      # 16-core gh-linux-16x burst runner, so the value no longer varies by
+      # route.
+      NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 30
+          JOB_TARGET_SUBDIR: coverage-e2e
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
@@ -269,9 +441,12 @@ jobs:
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
+      # The $RUNNER_NAME key is a correctness requirement here, not just
+      # lock avoidance: that same clean means two coverage jobs on different
+      # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-e2e" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -282,21 +457,45 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-coverage-e2e
+          shared-key: gh-burst-coverage-e2e
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # install-action derives every path it touches from $HOME: the bin dir
+      # (~/.install-action/bin here — tinybox's cargo lives at /usr/local/bin,
+      # outside $CARGO_HOME/bin, so the action always takes its fallback) and,
+      # crucially, its download scratch dir (~/.install-action/tmp), which is
+      # shared even when the bin dir isn't — so keying CARGO_HOME per slot
+      # would not help. The 8 tinybox slots share one $HOME, and concurrent
+      # installs clobber each other's downloads (curl error 23; monorepo#1239).
+      # Point the action at a per-slot HOME (keyed on $RUNNER_NAME like the
+      # ci-target dirs) so every path it derives is slot-private; only the
+      # install steps see the override, so rustup/CARGO_TARGET_DIR/registry
+      # caches under the real $HOME are untouched, and the action still adds
+      # its (now per-slot) bin dir to GITHUB_PATH for the later steps. Burst
+      # runners are ephemeral single-job machines, so they keep the real HOME.
+      - name: Key install-action dirs per runner slot
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run e2e coverage
         run: |
           cd ${{ github.workspace }}
@@ -324,21 +523,63 @@ jobs:
           retention-days: 3
 
   coverage-all:
-    needs: route
+    # Skipped at job level when the diff is release-PR-shaped (safe for
+    # non-matrix jobs — a skipped job still reports its required context;
+    # see release-fast-path). Fail-safe: skips only when the output is
+    # exactly 'true'. The route.result guard preserves the pre-existing
+    # behavior that a route failure skips this job.
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 32 (not 64) on the 64-core tinybox: at 64 threads the full workspace
-      # suite thrashes SQLite/WAL and wall-clock-timeout tests hard enough
-      # that even the nextest retry fails (concurrent_writes_no_sqlite_busy
-      # hit "database is locked" on both tries, bridge/auto-commit timing
-      # tests timed out). 32 keeps the box saturated without the lock storms.
-      NEXTEST_TEST_THREADS: 32
+      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
+      # (at 64 threads the full workspace suite thrashed SQLite/WAL and
+      # wall-clock-timeout tests hard enough that even the nextest retry
+      # failed: concurrent_writes_no_sqlite_busy hit "database is locked" on
+      # both tries, bridge/auto-commit timing tests timed out), but up to 8
+      # co-tenant jobs now share the box, so halve to 16 to avoid the lock
+      # storms under co-tenancy. This also matches the 16-core gh-linux-16x
+      # burst runner, so the value no longer varies by route.
+      NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
+      - name: Disk-space preflight (tinybox only)
+        if: needs.route.outputs.linux_burst != 'true'
+        env:
+          NEED_GIB: 30
+          JOB_TARGET_SUBDIR: coverage-all
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          while IFS= read -r entry; do
+            dir="${entry#* }"
+            case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+            [ "$dir" = "$own_dir" ] && continue
+            # Re-check recursively: only prune if nothing inside was touched
+            # within 2 days (a running job keeps its target dir fresh).
+            # -mmin gives a strict 48 h window (-mtime rounds to whole days);
+            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
+            echo "pruning: $dir"
+            rm -rf -- "$dir"
+            [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+          done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
@@ -346,13 +587,25 @@ jobs:
             sudo -n apt-get update -qq
             sudo -n apt-get install -y -qq libssl-dev
           fi
+      # Raise the per-user inotify instance ceiling. The instrumented full
+      # suite starts many real notify watchers in parallel (file, .git
+      # metadata, skills, specialists) and up to 8 co-tenant runner slots
+      # share the same user on the tinybox, so the kernel default of 128
+      # instances can exhaust mid-run — watcher starts in unrelated tests
+      # then fail with EMFILE "Too many open files" (intentd PR #882).
+      # Relies on the runner user's passwordless sudo, like the step above.
+      - name: Raise inotify instance limit
+        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
       # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
       # crates + profraw, so dependency artifacts stay warm across runs.
+      # The $RUNNER_NAME key is a correctness requirement here, not just
+      # lock avoidance: that same clean means two coverage jobs on different
+      # slots sharing a dir would delete each other's artifacts mid-run.
       - name: Point CARGO_TARGET_DIR outside the work dir
         if: needs.route.outputs.linux_burst != 'true'
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-all" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -363,21 +616,35 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral WarpBuild runners have no persistent target dir, so use
-      # the GH cache there (pure overhead on tinybox, hence burst-gated).
+      # Ephemeral GitHub-hosted runners have no persistent target dir, so
+      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       - name: Rust cache (burst runner only)
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: warp-burst-coverage-all
+          shared-key: gh-burst-coverage-all
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # Per-slot HOME for install-action — see the coverage-e2e job's comment
+      # for the full rationale (shared ~/.install-action tmp/bin race across
+      # the 8 tinybox slots; monorepo#1239).
+      - name: Key install-action dirs per runner slot
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Run combined coverage
         run: |
           cd ${{ github.workspace }}
@@ -404,8 +671,7 @@ jobs:
           retention-days: 3
 
   pr-title:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
       - uses: amannn/action-semantic-pull-request@v6
@@ -430,8 +696,7 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
     steps:
@@ -472,12 +737,11 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Routed like the other utility jobs: tinybox (Ubuntu 22.04) normally,
-  # a WarpBuild 2x runner when bursting — both have the required
-  # dpkg-deb / tar+xz toolchain preinstalled.
+  # Seconds-long like the other utility jobs, so it runs directly on
+  # ubuntu-latest, which has the required dpkg-deb / tar+xz toolchain
+  # preinstalled.
   deb-packaging:
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.utility_labels) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7

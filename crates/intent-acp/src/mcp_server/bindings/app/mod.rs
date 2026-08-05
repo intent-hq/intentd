@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
@@ -25,19 +26,17 @@ pub(crate) mod workspaces;
 
 /// Assemble the `ws.app.*` PRELUDE from all submodules. Each submodule
 /// installs its portion of the namespace (e.g., `ws.app.workspaces`,
-/// `ws.app.agents`). The prelude is unconditional; chief-gating is enforced
-/// server-side in dispatch.
-pub(crate) fn prelude() -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        workspaces::PRELUDE,
-        agents::PRELUDE,
-        proposal::PRELUDE,
-        question::PRELUDE,
-        settings::PRELUDE,
-        specialists::PRELUDE,
-        ui::PRELUDE,
-    )
+/// `ws.app.agents`). The prelude is unconditional (chief-gating is enforced
+/// server-side in dispatch) with ONE exception: `ws.app.question` is omitted
+/// when `agentFeatures.structuredQuestions` is off, so a disabled bridge
+/// fails with a clear `ws.app.question is undefined` TypeError.
+pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
+    let mut fragments = vec![workspaces::PRELUDE, agents::PRELUDE, proposal::PRELUDE];
+    if features.structured_questions {
+        fragments.push(question::PRELUDE);
+    }
+    fragments.extend([settings::PRELUDE, specialists::PRELUDE, ui::PRELUDE]);
+    fragments.join("\n")
 }
 
 /// Dispatch one `ws.app.<subns>.<method>` call to the matching submodule.

@@ -178,7 +178,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -299,6 +299,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -432,8 +433,10 @@ async fn agent_retry_redrive_preserves_original_turn_id_over_wss() {
                 );
                 saw_terminal_end = true;
             }
-            Some("agent:message") => {
+            Some("agent:message") if event["data"]["role"] == "user" => {
                 // The user-row echo of the direct send carries the same id.
+                // (System rows — e.g. the turn-failure transcript notice —
+                // carry no turnId and are skipped by the role guard.)
                 assert_eq!(
                     event["data"]["turnId"].as_str(),
                     Some(turn_id.as_str()),

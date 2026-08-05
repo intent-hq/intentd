@@ -146,12 +146,23 @@ pub(crate) fn success_frame(id: Value, result: Value) -> String {
         .unwrap_or_default()
 }
 
-/// Serialize a JSON-RPC error response for a fast-path request.
+/// Serialize a JSON-RPC error response for a fast-path request. A `-32602`
+/// carries the machine-readable discriminator `error.data.code =
+/// "invalid-params"` (PROTOCOL §3.3, monorepo#1364), mirroring the dispatcher's
+/// `invalid_params` helper: every fast-path `-32602` is a parameter-validation
+/// failure (the only entity-absent fast-path case — an unknown
+/// `host.execStream` `requestId` — is `-32603`), so the discriminator is
+/// attached centrally here rather than at each call site. A future fast-path
+/// site addressing a missing entity must emit `"not-found"` via a dedicated
+/// variant instead.
 pub(crate) fn error_frame(id: Value, code: i32, message: &str) -> String {
-    serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
-    )
-    .unwrap_or_default()
+    let error = if code == -32602 {
+        json!({ "code": code, "message": message, "data": { "code": "invalid-params" } })
+    } else {
+        json!({ "code": code, "message": message })
+    };
+    serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "error": error }))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -513,6 +513,71 @@ pub(crate) fn summarize_check_runs(runs: &[CheckRun]) -> CheckRunSummary {
     summary
 }
 
+/// Names of failing check runs (failure / cancelled) for the `ws.pr.snapshot`
+/// `checks.failedNames` list, in run order.
+pub(crate) fn failed_check_names(runs: &[CheckRun]) -> Vec<String> {
+    runs.iter()
+        .filter(|r| matches!(r.state, CheckState::Failure | CheckState::Cancelled))
+        .map(|r| r.name.clone())
+        .collect()
+}
+
+/// Comment tallies for the `ws.pr.snapshot` `comments` block: the total number
+/// of inline review comments across `threads` (EVERY thread comment counts,
+/// including replies inside a thread) and the number of unresolved threads.
+pub(crate) fn count_thread_comments(threads: &[ReviewThread]) -> (i64, i64) {
+    let review_comment_count = threads.iter().map(|t| t.comments.len() as i64).sum();
+    let unresolved = threads.iter().filter(|t| !t.is_resolved).count() as i64;
+    (review_comment_count, unresolved)
+}
+
+/// The `ws.pr.snapshot` `mergeBlockedReason` derivation: a human-readable
+/// reason merging is blocked, non-`None` exactly when the PR is open (incl.
+/// draft) and cannot be merged, from the [`derive_status_state`] `state`,
+/// `mergeable`, and raw `mergeable_state`. Merged/closed PRs yield `None`;
+/// for any other `mergeable_state` (e.g. still-computing `unknown`) a draft
+/// PR or an explicit `mergeable == Some(false)` still produces a reason
+/// before falling back to `None`.
+pub(crate) fn merge_blocked_reason(
+    state: &str,
+    mergeable: Option<bool>,
+    mergeable_state: &str,
+) -> Option<String> {
+    if state == "merged" || state == "closed" {
+        return None;
+    }
+    let reason = match mergeable_state {
+        "dirty" => Some("merge conflicts"),
+        "blocked" => Some("blocked by required checks or reviews"),
+        "behind" => Some("branch behind base"),
+        _ if state == "draft" => Some("draft PRs cannot be merged"),
+        _ if mergeable == Some(false) => Some("not mergeable"),
+        _ => None,
+    };
+    reason.map(str::to_string)
+}
+
+/// The `ws.pr.snapshot` `reviews.decision` derivation: `changes_requested` /
+/// `approved` from the aggregated actionable reviews; `review_required` when
+/// an open (incl. draft) PR has no actionable reviews but the forge reports
+/// the merge as `blocked` (required reviews / branch protection unmet); else
+/// `none`.
+pub(crate) fn snapshot_review_decision(
+    agg: &ReviewAggregate,
+    state: &str,
+    mergeable_state: &str,
+) -> &'static str {
+    if agg.changes_requested_count > 0 {
+        "changes_requested"
+    } else if agg.approval_count > 0 {
+        "approved"
+    } else if (state == "open" || state == "draft") && mergeable_state == "blocked" {
+        "review_required"
+    } else {
+        "none"
+    }
+}
+
 /// Validate `pr.listReviewComments` `status` (default `unresolved`); an invalid
 /// value throws in the TS builder → `-32603` here.
 pub(crate) fn validate_review_comment_status(status: Option<String>) -> Result<String> {
@@ -644,9 +709,6 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
 // `pr.*` write/action glue (PROTOCOL §5.7).
 // ===========================================================================
 
-/// `pr.waitForChanges` safety padding (TS `SAFETY_PADDING_SECONDS`).
-pub(crate) const SAFETY_PADDING_SECONDS: u64 = 10;
-
 /// Validate/default the `pr.merge` `mergeMethod` (TS `validateMergeMethod`,
 /// default `merge`); an invalid value throws → `-32603`.
 pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
@@ -666,18 +728,6 @@ pub(crate) fn merge_method_word(method: MergeMethod) -> &'static str {
         MergeMethod::Merge => "merge",
         MergeMethod::Squash => "squash",
         MergeMethod::Rebase => "rebase",
-    }
-}
-
-/// Validate/default the `pr.waitForChanges` `watch` mode (TS
-/// `validateWatchMode`, default `any`).
-pub(crate) fn validate_watch_mode(watch: Option<String>) -> Result<String> {
-    match watch.as_deref() {
-        None => Ok("any".to_string()),
-        Some(s @ ("any" | "checks" | "state" | "commits")) => Ok(s.to_string()),
-        Some(_) => Err(Error::Internal(
-            "watch must be one of: any, checks, state, commits".to_string(),
-        )),
     }
 }
 
@@ -704,252 +754,6 @@ pub(crate) fn validate_review_verdict(verdict: &str) -> Result<ReviewVerdict> {
             "verdict must be one of: approve, request-changes, comment".to_string(),
         )),
     }
-}
-
-/// Clamp the `pr.waitForChanges` timeout to `[10, 600]` seconds (default 300).
-pub(crate) fn clamp_timeout(secs: Option<i64>) -> u64 {
-    secs.unwrap_or(300).clamp(10, 600) as u64
-}
-
-/// Clamp the `pr.waitForChanges` poll interval to `[10, 60]` seconds (default 15).
-pub(crate) fn clamp_poll_interval(secs: Option<i64>) -> u64 {
-    secs.unwrap_or(15).clamp(10, 60) as u64
-}
-
-/// Source for a snapshot's check-runs: not attempted (no head SHA), fetched, or
-/// the fetch failed (TS distinguishes the empty-vs-failed cases).
-pub(crate) enum CheckFetch {
-    NotAttempted,
-    Ok(Vec<CheckRun>),
-    Failed,
-}
-
-/// A single check-run within a poll snapshot (name + normalized state word).
-#[derive(Clone)]
-pub(crate) struct CheckSnap {
-    pub name: String,
-    pub status: String,
-}
-
-/// A `pr.waitForChanges` poll snapshot (TS `PRSnapshot`).
-///
-/// PARITY NOTE: the host-agnostic [`CheckRun`] carries only the normalized
-/// [`CheckState`], so `status` here is that derived word rather than GitHub's
-/// raw `status`/`conclusion` pair; change detection compares the normalized
-/// state per check name.
-#[derive(Clone)]
-pub(crate) struct PrSnapshot {
-    pub head_sha: Option<String>,
-    pub state: String,
-    pub mergeable: Option<bool>,
-    pub mergeable_state: Option<String>,
-    pub updated_at: Option<String>,
-    pub check_runs: Vec<CheckSnap>,
-    pub check_runs_fetch_failed: bool,
-}
-
-/// Normalized lowercase word for a [`CheckState`].
-pub(crate) fn check_state_word(state: CheckState) -> &'static str {
-    match state {
-        CheckState::Pending => "pending",
-        CheckState::Success => "success",
-        CheckState::Failure => "failure",
-        CheckState::Neutral => "neutral",
-        CheckState::Cancelled => "cancelled",
-    }
-}
-
-/// Build a poll snapshot from a fetched PR and its check-runs (TS
-/// `captureSnapshot`).
-pub(crate) fn build_snapshot(pr: &PullRequest, checks: CheckFetch) -> PrSnapshot {
-    let (check_runs, failed) = match checks {
-        CheckFetch::NotAttempted => (Vec::new(), false),
-        CheckFetch::Failed => (Vec::new(), true),
-        CheckFetch::Ok(runs) => (
-            runs.into_iter()
-                .map(|r| CheckSnap {
-                    name: r.name,
-                    status: check_state_word(r.state).to_string(),
-                })
-                .collect(),
-            false,
-        ),
-    };
-    PrSnapshot {
-        head_sha: pr.head_sha.clone().filter(|s| !s.is_empty()),
-        state: derive_status_state(pr).to_string(),
-        mergeable: pr.mergeable,
-        mergeable_state: pr.mergeable_state.clone(),
-        updated_at: Some(pr.updated_at.clone()).filter(|s| !s.is_empty()),
-        check_runs,
-        check_runs_fetch_failed: failed,
-    }
-}
-
-fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(7)]
-}
-
-fn bool_word(b: Option<bool>) -> String {
-    match b {
-        Some(true) => "true".to_string(),
-        Some(false) => "false".to_string(),
-        None => "undefined".to_string(),
-    }
-}
-
-/// Diff two snapshots under a `watch` mode (TS `detectChanges`).
-pub(crate) fn detect_changes(
-    initial: &PrSnapshot,
-    current: &PrSnapshot,
-    watch: &str,
-) -> Vec<String> {
-    let mut changes: Vec<String> = Vec::new();
-
-    if watch == "any" || watch == "commits" {
-        if let (Some(i), Some(c)) = (&initial.head_sha, &current.head_sha) {
-            if i != c {
-                changes.push(format!("New commit: {} → {}", short_sha(i), short_sha(c)));
-            }
-        }
-    }
-
-    if watch == "any" || watch == "state" {
-        if initial.state != current.state {
-            changes.push(format!(
-                "State changed: {} → {}",
-                initial.state, current.state
-            ));
-        }
-        if initial.mergeable != current.mergeable {
-            changes.push(format!(
-                "Mergeable changed: {} → {}",
-                bool_word(initial.mergeable),
-                bool_word(current.mergeable)
-            ));
-        }
-        if initial.mergeable_state != current.mergeable_state {
-            let unknown = || "unknown".to_string();
-            changes.push(format!(
-                "Mergeable state changed: {} → {}",
-                initial.mergeable_state.clone().unwrap_or_else(unknown),
-                current.mergeable_state.clone().unwrap_or_else(unknown)
-            ));
-        }
-    }
-
-    if (watch == "any" || watch == "checks")
-        && !initial.check_runs_fetch_failed
-        && !current.check_runs_fetch_failed
-    {
-        let initial_map: HashMap<&str, &str> = initial
-            .check_runs
-            .iter()
-            .map(|c| (c.name.as_str(), c.status.as_str()))
-            .collect();
-        for c in &current.check_runs {
-            match initial_map.get(c.name.as_str()) {
-                None => changes.push(format!("New check: {} ({})", c.name, c.status)),
-                Some(prev) if *prev != c.status.as_str() => {
-                    changes.push(format!("Check \"{}\": {} → {}", c.name, prev, c.status))
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if watch == "any" {
-        if let (Some(i), Some(c)) = (&initial.updated_at, &current.updated_at) {
-            if i != c && changes.is_empty() {
-                changes.push(format!("PR updated: {i} → {c}"));
-            }
-        }
-    }
-
-    changes
-}
-
-/// Emoji for a normalized check status (TS `getCheckIcon`, adapted to the
-/// normalized [`CheckState`] words).
-pub(crate) fn check_icon(status: &str) -> &'static str {
-    match status {
-        "success" => "✅",
-        "failure" => "❌",
-        "cancelled" => "🚫",
-        "neutral" => "⏭️",
-        "pending" => "🔄",
-        _ => "•",
-    }
-}
-
-/// Human-readable change summary (TS `formatChangeSummary`).
-pub(crate) fn format_change_summary(
-    changes: &[String],
-    snapshot: &PrSnapshot,
-    elapsed_seconds: u64,
-) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!(
-        "✅ PR changes detected after {elapsed_seconds} seconds:"
-    ));
-    lines.push(String::new());
-    for c in changes {
-        lines.push(format!("  • {c}"));
-    }
-    lines.push(String::new());
-    lines.push("--- Current State ---".to_string());
-    lines.push(format!("State: {}", snapshot.state));
-    lines.push(format!(
-        "Head SHA: {}",
-        snapshot
-            .head_sha
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    lines.push(format!(
-        "Mergeable: {}",
-        snapshot
-            .mergeable
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    lines.push(format!(
-        "Mergeable State: {}",
-        snapshot
-            .mergeable_state
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    if !snapshot.check_runs.is_empty() {
-        lines.push(String::new());
-        lines.push("Check Runs:".to_string());
-        for c in &snapshot.check_runs {
-            lines.push(format!(
-                "  {} {}: {}",
-                check_icon(&c.status),
-                c.name,
-                c.status
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-/// Render a snapshot to the `pr.waitForChanges` wire shape (TS `PRSnapshot`).
-pub(crate) fn snapshot_json(s: &PrSnapshot) -> Value {
-    json!({
-        "headSha": s.head_sha,
-        "state": s.state,
-        "mergeable": s.mergeable,
-        "mergeableState": s.mergeable_state,
-        "updatedAt": s.updated_at,
-        "checkRuns": s.check_runs.iter().map(|c| json!({
-            "name": c.name,
-            "status": c.status,
-        })).collect::<Vec<_>>(),
-        "checkRunsFetchFailed": s.check_runs_fetch_failed,
-    })
 }
 
 #[cfg(test)]
@@ -1279,6 +1083,127 @@ mod tests {
     }
 
     #[test]
+    fn failed_check_names_lists_failure_and_cancelled_in_order() {
+        let mk = |name: &str, state: CheckState| CheckRun {
+            name: name.into(),
+            state,
+            url: None,
+        };
+        let runs = vec![
+            mk("build", CheckState::Success),
+            mk("test", CheckState::Failure),
+            mk("lint", CheckState::Pending),
+            mk("e2e", CheckState::Cancelled),
+            mk("docs", CheckState::Neutral),
+        ];
+        assert_eq!(
+            failed_check_names(&runs),
+            vec!["test".to_string(), "e2e".to_string()]
+        );
+        assert!(failed_check_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn thread_comment_count_includes_replies() {
+        let comment = |id: &str| ReviewThreadComment {
+            id: id.into(),
+            body: "b".into(),
+            author: "a".into(),
+            path: "x.rs".into(),
+            line: Some(1),
+            created_at: String::new(),
+        };
+        let threads = vec![
+            ReviewThread {
+                id: "RT1".into(),
+                is_resolved: false,
+                // Root comment + two replies: all three count.
+                comments: vec![comment("c1"), comment("c2"), comment("c3")],
+            },
+            ReviewThread {
+                id: "RT2".into(),
+                is_resolved: true,
+                comments: vec![comment("c4")],
+            },
+        ];
+        assert_eq!(count_thread_comments(&threads), (4, 1));
+        assert_eq!(count_thread_comments(&[]), (0, 0));
+    }
+
+    #[test]
+    fn merge_blocked_reason_matches_open_and_not_mergeable() {
+        // Blocked states on an open PR derive a human-readable reason.
+        assert_eq!(
+            merge_blocked_reason("open", Some(false), "dirty").as_deref(),
+            Some("merge conflicts")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(true), "blocked").as_deref(),
+            Some("blocked by required checks or reviews")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(true), "behind").as_deref(),
+            Some("branch behind base")
+        );
+        assert_eq!(
+            merge_blocked_reason("draft", Some(true), "clean").as_deref(),
+            Some("draft PRs cannot be merged")
+        );
+        // A blocked-state reason wins over the draft fallback.
+        assert_eq!(
+            merge_blocked_reason("draft", Some(false), "dirty").as_deref(),
+            Some("merge conflicts")
+        );
+        assert_eq!(
+            merge_blocked_reason("open", Some(false), "weird").as_deref(),
+            Some("not mergeable")
+        );
+        // Not blocked: mergeable/clean, unstable (non-required checks), and
+        // still-computing mergeability.
+        assert!(merge_blocked_reason("open", Some(true), "clean").is_none());
+        assert!(merge_blocked_reason("open", Some(true), "unstable").is_none());
+        assert!(merge_blocked_reason("open", None, "unknown").is_none());
+        // Merged/closed PRs never report a blocked reason.
+        assert!(merge_blocked_reason("merged", Some(false), "dirty").is_none());
+        assert!(merge_blocked_reason("closed", Some(false), "blocked").is_none());
+    }
+
+    #[test]
+    fn snapshot_decision_orders_changes_requested_approved_required_none() {
+        let agg = |approvals: i64, changes: i64| ReviewAggregate {
+            review_decision: None,
+            approval_count: approvals,
+            changes_requested_count: changes,
+            approved_by: Vec::new(),
+        };
+        assert_eq!(
+            snapshot_review_decision(&agg(1, 1), "open", "clean"),
+            "changes_requested"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(2, 0), "open", "blocked"),
+            "approved"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "open", "blocked"),
+            "review_required"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "draft", "blocked"),
+            "review_required"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "open", "clean"),
+            "none"
+        );
+        // Merged/closed PRs never derive `review_required` from `blocked`.
+        assert_eq!(
+            snapshot_review_decision(&agg(0, 0), "merged", "blocked"),
+            "none"
+        );
+    }
+
+    #[test]
     fn validates_status_and_clamps_count() {
         assert_eq!(validate_review_comment_status(None).unwrap(), "unresolved");
         assert_eq!(
@@ -1326,13 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_watch_action_verdict() {
-        assert_eq!(validate_watch_mode(None).unwrap(), "any");
-        assert_eq!(
-            validate_watch_mode(Some("checks".into())).unwrap(),
-            "checks"
-        );
-        assert!(validate_watch_mode(Some("nope".into())).is_err());
+    fn validates_action_and_verdict() {
         assert_eq!(validate_resolve_action(None).unwrap(), "resolve");
         assert_eq!(
             validate_resolve_action(Some("unresolve".into())).unwrap(),
@@ -1344,53 +1263,5 @@ mod tests {
             ReviewVerdict::RequestChanges
         );
         assert!(validate_review_verdict("nope").is_err());
-    }
-
-    #[test]
-    fn clamps_wait_knobs() {
-        assert_eq!(clamp_timeout(None), 300);
-        assert_eq!(clamp_timeout(Some(5)), 10);
-        assert_eq!(clamp_timeout(Some(9000)), 600);
-        assert_eq!(clamp_poll_interval(None), 15);
-        assert_eq!(clamp_poll_interval(Some(1)), 10);
-        assert_eq!(clamp_poll_interval(Some(120)), 60);
-    }
-
-    fn snap(head: &str, state: &str, checks: Vec<(&str, &str)>, failed: bool) -> PrSnapshot {
-        PrSnapshot {
-            head_sha: Some(head.to_string()),
-            state: state.to_string(),
-            mergeable: Some(true),
-            mergeable_state: Some("clean".into()),
-            updated_at: Some("2026-01-01".into()),
-            check_runs: checks
-                .into_iter()
-                .map(|(n, s)| CheckSnap {
-                    name: n.into(),
-                    status: s.into(),
-                })
-                .collect(),
-            check_runs_fetch_failed: failed,
-        }
-    }
-
-    #[test]
-    fn detects_commit_and_check_changes() {
-        let a = snap("aaaaaaaa", "open", vec![("build", "pending")], false);
-        let b = snap("bbbbbbbb", "open", vec![("build", "success")], false);
-        let changes = detect_changes(&a, &b, "any");
-        assert!(changes.iter().any(|c| c.starts_with("New commit:")));
-        assert!(changes.iter().any(|c| c.contains("Check \"build\"")));
-
-        // `commits` watch ignores check transitions.
-        let only_commits = detect_changes(&a, &b, "commits");
-        assert_eq!(only_commits.len(), 1);
-        assert!(only_commits[0].starts_with("New commit:"));
-    }
-
-    #[test]
-    fn detects_no_changes_when_identical() {
-        let a = snap("aaaaaaaa", "open", vec![("build", "success")], false);
-        assert!(detect_changes(&a, &a, "any").is_empty());
     }
 }

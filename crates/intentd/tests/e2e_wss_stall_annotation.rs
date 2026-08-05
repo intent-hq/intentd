@@ -182,7 +182,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -307,6 +307,7 @@ async fn seed_workspace_and_task_note(data_dir: &Path) -> String {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         })
         .await
         .expect("insert ws");

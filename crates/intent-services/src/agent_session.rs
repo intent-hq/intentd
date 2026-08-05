@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_ops::last_response_and_digest_from_blocks;
+use crate::agent_ops::{
+    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
+};
 use crate::{token_usage, usage_stats, Services};
 
 #[cfg(test)]
@@ -377,6 +379,15 @@ impl Transcript {
         }
         out
     }
+
+    /// Whether the FINAL text block is still open (text pending in the
+    /// coalescing buffer, not yet flushed by a non-text block boundary). The
+    /// live preview derivation only clips the trailing partial line of an
+    /// OPEN final block — a text block closed by e.g. a tool call is complete
+    /// even without a trailing newline.
+    fn final_text_block_open(&self) -> bool {
+        !self.text.is_empty()
+    }
 }
 
 /// The per-agent in-flight ("live") turn slot (CS-0 D5): the assistant message
@@ -389,6 +400,11 @@ impl Transcript {
 pub(crate) struct LiveTurn {
     pub(crate) message_id: String,
     pub(crate) blocks: Vec<Value>,
+    /// Whether the snapshot's FINAL text block was still open (mid-stream) at
+    /// capture time — see [`Transcript::final_text_block_open`]. Drives
+    /// whether the `AgentLite` live-preview derivation clips the trailing
+    /// partial line.
+    pub(crate) final_text_block_open: bool,
     /// RFC-3339 timestamp of the most recent stream event observed for this
     /// turn (STAB-125): set when the slot opens and refreshed on every
     /// [`update_live_turn`](Services::update_live_turn), so pollers can tell a
@@ -483,15 +499,37 @@ pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
 /// [`last_response_summary`]).
 const PREVIEW_RESPONSE_CAP: usize = 500;
 
-/// Stamp the server-derived live preview onto an event payload: derive
-/// `(lastAgentResponse, digest)` from `text_blocks` via the same helper the
-/// `AgentLite` live-turn overlay uses and set only the fields that derived to
-/// `Some` — a turn that has produced no text (or no digest) yet omits that
-/// field rather than sending an empty string. Mid-turn a chunk boundary can
-/// split a marker (`<agent_dig…`), letting the partial tag text surface for
-/// up to one throttle window; the next derivation strips the completed tag.
+/// Stamp the server-derived preview onto a TERMINAL event payload
+/// (`agent:stream:end`): derive `(lastAgentResponse, digest)` from the full
+/// turn's `text_blocks` — complete by definition — and set only the fields
+/// that derived to `Some`; a turn that produced no text (or no digest) omits
+/// that field rather than sending an empty string.
 pub(crate) fn stamp_preview_fields(data: &mut Value, text_blocks: &[String]) {
-    let (last_response, digest) = last_response_and_digest_from_blocks(text_blocks);
+    stamp_preview(data, last_response_and_digest_from_blocks(text_blocks));
+}
+
+/// [`stamp_preview_fields`] for MID-TURN frames (`agent:stream:activity`):
+/// derives via the live variant, which clips the still-streaming trailing
+/// partial line when the final text block is open (`final_block_open`) — the
+/// preview advances on newline boundaries, a turn that has not completed a
+/// non-empty line yet omits `lastAgentResponse`, and a partially-streamed
+/// `<agent_digest>` span (or split marker at a chunk boundary) never
+/// surfaces. A final text block CLOSED by a non-text block boundary (e.g. a
+/// tool call) is complete and serves its last line unclipped.
+pub(crate) fn stamp_live_preview_fields(
+    data: &mut Value,
+    text_blocks: &[String],
+    final_block_open: bool,
+) {
+    stamp_preview(
+        data,
+        live_response_and_digest_from_blocks(text_blocks, final_block_open),
+    );
+}
+
+/// Shared stamping core for [`stamp_preview_fields`] /
+/// [`stamp_live_preview_fields`].
+fn stamp_preview(data: &mut Value, (last_response, digest): (Option<String>, Option<String>)) {
     if let Some(r) = last_response {
         let chars: Vec<char> = r.chars().collect();
         let capped = if chars.len() > PREVIEW_RESPONSE_CAP {
@@ -689,13 +727,40 @@ impl Services {
     /// Set/replace an agent's live-turn slot. The streaming path drives this via
     /// [`update_live_turn`](Self::update_live_turn); it is also a test seam for
     /// simulating a mid-turn snapshot without spinning up a real ACP turn.
+    /// Marks the final text block as OPEN (mid-stream) — the common case; use
+    /// [`set_live_turn_closed_final_block`](Self::set_live_turn_closed_final_block)
+    /// to simulate a snapshot whose final text block was closed by a non-text
+    /// block boundary.
     pub fn set_live_turn(&self, agent_id: &AgentId, message_id: &str, blocks: Vec<Value>) {
+        self.insert_live_turn(agent_id, message_id, blocks, true);
+    }
+
+    /// Test seam: [`set_live_turn`](Self::set_live_turn) with the final text
+    /// block marked CLOSED (e.g. flushed by a tool call, no new text since) —
+    /// the live preview derivation must not clip it.
+    pub fn set_live_turn_closed_final_block(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        blocks: Vec<Value>,
+    ) {
+        self.insert_live_turn(agent_id, message_id, blocks, false);
+    }
+
+    fn insert_live_turn(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+        blocks: Vec<Value>,
+        final_text_block_open: bool,
+    ) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.insert(
                 agent_id.clone(),
                 LiveTurn {
                     message_id: message_id.to_string(),
                     blocks,
+                    final_text_block_open,
                     last_activity_at: now_iso(),
                     last_activity_emit: None,
                 },
@@ -710,6 +775,7 @@ impl Services {
         if let Ok(mut slots) = self.live_turns.lock() {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
+                slot.final_text_block_open = transcript.final_text_block_open();
                 slot.last_activity_at = now_iso();
             }
         }
@@ -753,16 +819,17 @@ impl Services {
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
-    /// without cloning the full slot — the `AgentLite` preview overlay only
-    /// needs the text strings, so `tool_use`/`tool_result` payloads (which can
-    /// be large mid-turn) stay untouched under the lock. `None` when no slot
-    /// is open; `Some(vec![])` when a slot is open but has no text blocks yet.
-    pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<Vec<String>> {
+    /// (plus the slot's final-text-block-open flag) without cloning the full
+    /// slot — the `AgentLite` preview overlay only needs the text strings, so
+    /// `tool_use`/`tool_result` payloads (which can be large mid-turn) stay
+    /// untouched under the lock. `None` when no slot is open;
+    /// `Some((vec![], _))` when a slot is open but has no text blocks yet.
+    pub(crate) fn live_turn_text_blocks(&self, agent_id: &AgentId) -> Option<(Vec<String>, bool)> {
         self.live_turns
             .lock()
             .ok()?
             .get(agent_id)
-            .map(|live| text_block_strings(&live.blocks))
+            .map(|live| (text_block_strings(&live.blocks), live.final_text_block_open))
     }
 
     /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
@@ -1374,6 +1441,14 @@ impl Services {
             self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
         }
+        // The new assistant tail moves the question-hold derivation (§6.5
+        // step 0): a trailing question resource block RAISES the workspace's
+        // needs_attention displayStatus; a question-free tail after a prior
+        // question message RETIRES it. Recompute-and-compare (transition-only
+        // emission inside) so steady-state question-free turns stay silent.
+        if message_persisted {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
@@ -1514,6 +1589,11 @@ impl Services {
                 // read can race the child's completion consuming the watch.
                 data["isWaitingForOtherAgents"] =
                     Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+                // Idle-visibility: an idle agent still owning active
+                // (scheduled/running) background hooks is waiting, not
+                // stalled — stamp `waitingOnHooks` (omitted when none) so
+                // subscribers and the completion-watch wake can surface it.
+                self.annotate_waiting_on_hooks(agent_id, &mut data).await;
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -1686,6 +1766,11 @@ impl Services {
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
+        // Same §6.5 step-0 recompute as the prompt-turn persist: the new
+        // assistant tail moves the question-hold derivation either way.
+        if message_persisted {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         self.clear_live_turn(agent_id);
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
@@ -1732,6 +1817,9 @@ impl Services {
         // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
         data["isWaitingForOtherAgents"] =
             Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+        // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
+        // idle (omitted when the agent owns no active hook).
+        self.annotate_waiting_on_hooks(agent_id, &mut data).await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
@@ -1932,7 +2020,11 @@ impl Services {
                         "agentId": agent_id.0,
                         "messageId": message_id,
                     });
-                    stamp_preview_fields(&mut activity_data, &transcript.text_block_strings());
+                    stamp_live_preview_fields(
+                        &mut activity_data,
+                        &transcript.text_block_strings(),
+                        transcript.final_text_block_open(),
+                    );
                     self.publish_agent_event(
                         workspace_id,
                         agent_id,

@@ -79,6 +79,9 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.oauthClientId",
     "sourceControl.github.exposeGitCredentialToChildren",
     "accounts.sentry.organization",
+    "voice.provider",
+    "voice.language",
+    "voice.openai.model",
     "context.enabled",
     "context.auggiePath",
     "context.allowIndexing",
@@ -87,7 +90,18 @@ pub const KNOWN_PATHS: &[&str] = &[
     "logging.level",
     "agents.maxConcurrent",
     "agents.idleReapMinutes",
+    "agents.flushQueuedMessages",
     "events.streamRetentionHours",
+    "workspaceApi.maxOutputChars",
+    "workspaceApi.toonOutput",
+    "agentFeatures.backgroundHooks",
+    "agentFeatures.hostExec",
+    "agentFeatures.scripts",
+    "agentFeatures.terminalAccess",
+    "agentFeatures.browserAutomation",
+    "agentFeatures.richChatBlocks",
+    "agentFeatures.structuredQuestions",
+    "agentFeatures.attentionRequests",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).
@@ -774,6 +788,7 @@ mod tests {
             "mcp.servers",
             "workspace.changeHistory",
             "workspaceInitializer.state",
+            "hardwareConsole.state",
             "repos.known",
             "endUserRules",
             "permissions.rules",
@@ -980,6 +995,61 @@ mod tests {
         assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
         assert_eq!(reg.get("server.wsApi.enabled"), Some(json!(true)));
         assert!(rx.has_changed().expect("sender alive"));
+    }
+
+    #[test]
+    fn flush_queued_messages_defaults_on_overrides_and_reloads() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        // Schema default: "all".
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::Default)
+        );
+
+        // File override via apply, surviving a fresh load from disk.
+        reg.apply(&set("agents.flushQueuedMessages", json!("systemOnly")))
+            .expect("apply");
+        assert_eq!(
+            reg.get("agents.flushQueuedMessages"),
+            Some(json!("systemOnly"))
+        );
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
+        let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
+        assert_eq!(
+            reloaded.get("agents.flushQueuedMessages"),
+            Some(json!("systemOnly"))
+        );
+
+        // External reload without the key restores the schema default.
+        let notice = reg.reload("").expect("reload");
+        assert!(notice.changed.contains("agents.flushQueuedMessages"));
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
+    }
+
+    #[test]
+    fn flush_queued_messages_legacy_boolean_file_loads_and_reapplies() {
+        // A `config.toml` written by an older daemon still loads, reporting
+        // the equivalent string value with `File` origin.
+        let (_dir, path) = temp_config(Some("[agents]\nflushQueuedMessages = true\n"));
+        let reg = SettingsRegistry::load(&path).expect("load legacy true");
+        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
+        assert_eq!(
+            reg.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
+
+        let (_dir2, path2) = temp_config(Some("[agents]\nflushQueuedMessages = false\n"));
+        let reg2 = SettingsRegistry::load(&path2).expect("load legacy false");
+        assert_eq!(reg2.get("agents.flushQueuedMessages"), Some(json!("off")));
+        assert_eq!(
+            reg2.origin("agents.flushQueuedMessages"),
+            Some(SettingOrigin::File)
+        );
     }
 
     #[test]

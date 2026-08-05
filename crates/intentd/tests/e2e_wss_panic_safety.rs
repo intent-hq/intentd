@@ -11,7 +11,6 @@
 #![cfg(unix)]
 
 use std::net::Ipv4Addr;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,18 +121,18 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, std::path::PathBuf) {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-panic-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = Store::open(&dir.join("intentd.db"))
+async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, tempfile::TempDir) {
+    // Short base under /tmp; the guard removes the dir on drop — hold it for
+    // the full test (`INTENTD_TEST_KEEP_TMP` keeps it for debugging).
+    let dir = common::test_tempdir_in("/tmp", "itd-panic-");
+    let store = Store::open(&dir.path().join("intentd.db"))
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let workspaces_root = dir.join("workspaces");
+    let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
     let services = Services::new(store)
-        .with_assets_root(dir.join("assets"))
+        .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, dir)
@@ -141,9 +140,9 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, std::path::PathBuf
 
 /// Start a WSS listener on a free localhost port; returns the server handle
 /// (kept alive), the port, and the pinning client config.
-async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, std::path::PathBuf) {
+async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, tempfile::TempDir) {
     let (api, bus, dir) = make_services().await;
-    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
@@ -216,8 +215,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
 
     // 1) Panicking REQUEST (spawned router path) → -32603 with echoed id.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":41,"method":"note.list","params":{"workspaceId":"w1"}}"#
-            .to_string(),
+        r#"{"jsonrpc":"2.0","id":41,"method":"note.list","params":{"workspaceId":"w1"}}"#.into(),
     ))
     .await
     .expect("send");
@@ -232,8 +230,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     //    read loop, so a (buggy) frame from it would have to arrive before the
     //    response to the next request — its absence below is the proof.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","method":"events.subscribe","params":{"eventTypes":["*"]}}"#
-            .to_string(),
+        r#"{"jsonrpc":"2.0","method":"events.subscribe","params":{"eventTypes":["*"]}}"#.into(),
     ))
     .await
     .expect("send");
@@ -241,7 +238,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // 3) Panicking REQUEST on the INLINE fast path → -32603 with echoed id.
     ws.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":42,"method":"events.subscribe","params":{"eventTypes":["*"]}}"#
-            .to_string(),
+            .into(),
     ))
     .await
     .expect("send");
@@ -255,7 +252,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
 
     // 4) The SAME connection keeps serving: a healthy request round-trips.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":43,"method":"workspace.list","params":{}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":43,"method":"workspace.list","params":{}}"#.into(),
     ))
     .await
     .expect("send");

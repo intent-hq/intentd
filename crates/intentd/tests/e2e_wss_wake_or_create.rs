@@ -194,7 +194,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -268,6 +268,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -280,8 +281,8 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services =
-        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
@@ -524,13 +525,44 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     )
     .await;
     assert_eq!(got["agent"]["id"], new_agent_id);
+
+    // (6) monorepo#1217: the `messageMetadata` from step (3) is persisted as
+    //     ROW-LEVEL metadata on the delivered wake user message (not just
+    //     folded onto the content block) — the FE attribution chip reads the
+    //     row's `metadata` via `agent.getConversation` / `chat.subscribe`.
+    let convo = wss_rpc(
+        &mut rpc,
+        7,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": new_agent_id }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let wake_row = messages
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("reboot"))
+        })
+        .unwrap_or_else(|| panic!("wake user row persisted: {convo}"));
+    assert_eq!(
+        wake_row["metadata"],
+        json!({ "type": "task_wake", "source": "wake" }),
+        "wake row carries row-level messageMetadata (monorepo#1217): {wake_row}"
+    );
+    assert_eq!(
+        wake_row["contentBlocks"][0]["messageMetadata"]["type"], "task_wake",
+        "in-block fold preserved alongside the row-level copy: {wake_row}"
+    );
 }
 
 /// monorepo#926: the create branch auto-subscribes the caller. A
 /// `agent.wakeOrCreate` with `callerAgentId` on a task with no live assignee
 /// (`action: created_new`) must return `subscriptionId` + the notification
 /// message line, and `agent.getSubscriptions` for the caller must list the
-/// oneShot watch on the created agent immediately — SUB-1 parity with the
+/// completion watch on the created agent immediately — SUB-1 parity with the
 /// wake/queued branches. Hermetic (no ACP provider needed).
 #[tokio::test]
 async fn wake_or_create_created_new_subscribes_caller_over_wss() {
@@ -588,9 +620,12 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
     let subs = subs_res["subscriptions"]
         .as_array()
         .expect("subscriptions array");
-    assert_eq!(subs.len(), 1, "one oneShot watch: {subs:?}");
+    assert_eq!(subs.len(), 1, "one completion watch: {subs:?}");
     assert_eq!(subs[0]["id"], json!(sub_id));
-    assert_eq!(subs[0]["oneShot"], json!(true));
+    assert!(
+        subs[0].get("oneShot").is_none(),
+        "oneShot dropped from wire"
+    );
     assert_eq!(subs[0]["actorIds"], json!([child_id]));
     assert_eq!(subs[0]["workspaceId"], json!(ws_id));
 }

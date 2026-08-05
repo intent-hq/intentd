@@ -2,15 +2,27 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.9 adds the
-//! `stats.getRateHistory` router method for the per-minute all-workspace
-//! token-rate history and the optional `parentAgentId` field on
-//! `agentSummary.agents[]` entries (§5.1 `WorkspaceAgentInfo`), covering
-//! 309 dispatchable method names (273 router + 34 fast-path + 2 aliases) +
-//! 1 notification + 4 reverse RPCs.
+//! `system.status` → `protocolVersion`. Version 3.0 removes the
+//! `pr.waitForChanges` router method (breaking; superseded by background
+//! hooks, §5.40), covering 311 dispatchable method names (275 router +
+//! 34 fast-path + 2 aliases) + 1 notification + 4 reverse RPCs. Version 3.1
+//! adds the hook TTL (additive; §5.40): `ttlMs` / `expiresAt`, the terminal
+//! `expired` state, and the `hook:expired` event — no method-catalog change.
+//! Version 4.0 changes the `terminal.list` response shape (breaking; §5.13,
+//! monorepo#1334): the bare terminals array is retired in favor of the
+//! `{ terminals, daemonBootId }` envelope — no method-catalog change. Version
+//! 4.1 adds `agent.listActive` (additive; §5.5, monorepo#1395). Version 4.2
+//! adds `workspace.diskUsage` and stops populating `Workspace.diskUsage` on
+//! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
+//! was optional, so row shapes remain valid for existing clients. Version 4.3
+//! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
+//! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
+//! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
+//! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
+//! same `-32603` / "Internal error" envelope, no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.9";
+pub const PROTOCOL_VERSION: &str = "4.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

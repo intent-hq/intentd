@@ -401,6 +401,7 @@ async fn boot_seeded(
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -442,7 +443,9 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
     timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
@@ -670,7 +673,9 @@ async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
 /// assert `error` payloads (code + message) instead of panicking on them.
 async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
     timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {

@@ -124,13 +124,17 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let bus = EventBus::new(store.clone());
     // Publish onto the SAME bus the transport reads; inject an in-memory secret
     // store so sensitive settings never touch the real keychain.
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );
-    let socket = std::env::temp_dir().join(format!("intentd-set-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-set-");
+    let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
@@ -402,6 +406,164 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!(ssh_path),
         "list returns plaintext path"
     );
+
+    // `workspaceApi.*` — the workspace_api output knobs are plain non-secret
+    // TOML-backed settings: list/get expose the defaults with their bounds,
+    // update/reset round-trip, and out-of-range / mistyped values → -32602.
+    let list = rpc(&mut w, &mut r, 18, "settings.list", json!({})).await;
+    let chars = entry(&list, "workspaceApi.maxOutputChars");
+    assert_eq!(chars["type"], "number");
+    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["min"], json!(0.0));
+    assert_eq!(chars["max"], json!(10000000.0));
+    assert!(chars.get("sensitive").is_none());
+    let toon = entry(&list, "workspaceApi.toonOutput");
+    assert_eq!(toon["type"], "boolean");
+    assert_eq!(toon["value"], json!(true));
+    let got = rpc(
+        &mut w,
+        &mut r,
+        19,
+        "settings.get",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(100000.0));
+    assert_eq!(got["definition"]["type"], "number");
+
+    // Catalog validation → -32602, nothing applied.
+    for bad in [
+        json!([{ "path": "workspaceApi.maxOutputChars", "value": 20000000 }]),
+        json!([{ "path": "workspaceApi.maxOutputChars", "value": "lots" }]),
+        json!([{ "path": "workspaceApi.toonOutput", "value": "yes" }]),
+    ] {
+        let resp = call(
+            &mut w,
+            &mut r,
+            20,
+            "settings.update",
+            json!({ "changes": bad }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+    }
+
+    // Round-trip: update both, then reset back to the defaults.
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        21,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "workspaceApi.maxOutputChars", "value": 250000 },
+            { "path": "workspaceApi.toonOutput", "value": false },
+        ] }),
+    )
+    .await;
+    assert_eq!(applied["applied"][0]["path"], "workspaceApi.maxOutputChars");
+    assert_eq!(applied["applied"][1]["path"], "workspaceApi.toonOutput");
+    assert_eq!(applied["applied"][1]["value"], json!(false));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        22,
+        "settings.get",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(250000));
+    let got = rpc(
+        &mut w,
+        &mut r,
+        23,
+        "settings.get",
+        json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false));
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        24,
+        "settings.reset",
+        json!({ "path": "workspaceApi.maxOutputChars" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(100000.0));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        25,
+        "settings.reset",
+        json!({ "path": "workspaceApi.toonOutput" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(true));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+
+    // `agentFeatures.*` — the eight agent feature toggles are plain non-secret
+    // TOML-backed booleans defaulting to on: list/get expose the defaults,
+    // update/reset round-trip, and mistyped values → -32602.
+    let list = rpc(&mut w, &mut r, 26, "settings.list", json!({})).await;
+    for path in [
+        "agentFeatures.backgroundHooks",
+        "agentFeatures.hostExec",
+        "agentFeatures.scripts",
+        "agentFeatures.terminalAccess",
+        "agentFeatures.browserAutomation",
+        "agentFeatures.richChatBlocks",
+        "agentFeatures.structuredQuestions",
+        "agentFeatures.attentionRequests",
+    ] {
+        let e = entry(&list, path);
+        assert_eq!(e["type"], "boolean", "{path}");
+        assert_eq!(e["value"], json!(true), "{path}");
+        assert_eq!(e["category"], "agentFeatures", "{path}");
+        assert!(e.get("sensitive").is_none(), "{path}");
+    }
+    let resp = call(
+        &mut w,
+        &mut r,
+        27,
+        "settings.update",
+        json!({ "changes": [{ "path": "agentFeatures.hostExec", "value": "off" }] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "expected -32602 for {resp}");
+    let applied = rpc(
+        &mut w,
+        &mut r,
+        28,
+        "settings.update",
+        json!({ "changes": [{ "path": "agentFeatures.hostExec", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        applied["applied"][0],
+        json!({ "path": "agentFeatures.hostExec", "value": false })
+    );
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        29,
+        "settings.get",
+        json!({ "path": "agentFeatures.hostExec" }),
+    )
+    .await;
+    assert_eq!(got["value"], json!(false));
+    let reset = rpc(
+        &mut w,
+        &mut r,
+        30,
+        "settings.reset",
+        json!({ "path": "agentFeatures.hostExec" }),
+    )
+    .await;
+    assert_eq!(reset["value"], json!(true));
+    let _ = read_json(&mut sr).await; // drain the settings:changed event.
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

@@ -2,15 +2,16 @@
 //!
 //! Ports `script-process-manager.ts` so scripts run as real PTYs in the *same*
 //! [`PtyHost`] that backs `terminal.*` — there is no separate process-spawning
-//! path. A script's PTY is workspace-scoped, so it appears in `terminal.list`
-//! and a terminal can read its scrollback via `terminal.getBuffer` (attach to a
-//! running script). `service` scripts auto-restart per the ported backoff
+//! path. Script PTYs are omitted from `terminal.list` because scripts have their
+//! own runtime UI, while their scrollback remains addressable by id and through
+//! `script.output`. `service` scripts auto-restart per the ported backoff
 //! policy; `command` scripts run once. Service output is scanned for a local
 //! dev-server URL, surfaced on the `script:state` event for the `forward.*`
 //! hook. Live output streams as `script:output` (base64 `chunk`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,23 @@ pub(crate) struct ManagedScript {
     pty_id: Option<PtyId>,
     stopped_by_user: bool,
     supervisor: Option<tokio::task::JoinHandle<()>>,
+    /// Identity stamp assigned at every registry insertion (monorepo#1194):
+    /// a supervisor captures the generation of the entry it was started for,
+    /// and every later status write validates it, so a supervisor spawned
+    /// against a removed+recreated entry (same key, new generation) can never
+    /// latch its PTY or state onto the recreated entry.
+    generation: u64,
+}
+
+/// Process-wide monotonic counter behind [`ManagedScript::generation`]. Every
+/// registry insertion (create, upsert, hydration, bootstrap) takes a fresh
+/// value, so two entries under the same key over time are always
+/// distinguishable.
+static SCRIPT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Next unique generation stamp for a registry insertion.
+fn next_generation() -> u64 {
+    SCRIPT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The shared registry of scripts, keyed by `(workspace_id, script_id)` so a
@@ -104,23 +122,33 @@ pub(crate) struct ScriptManager {
     /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
-    /// Test seam (monorepo#1180): when set, `supervise()` parks in its
-    /// pre-registration window — after `pty.spawn`, before `mark_running`
-    /// records the id — so teardown races are reproducible deterministically.
-    /// `None` in production wiring.
-    supervise_park: Option<Arc<SupervisePark>>,
+    /// Test park seams for the `script.*` race windows; all `None` in
+    /// production wiring.
+    parks: ScriptParks,
 }
 
-/// Test seam for the teardown-vs-registration race (monorepo#1180): lets a
-/// test hold `supervise()` inside the window where a fresh PTY exists but the
-/// registry does not yet record its id.
+/// Test seam for a race window: lets a test hold a task inside a window
+/// (signal `entered`, await `release`). Used for `supervise()`'s
+/// pre-registration window (monorepo#1180) and `start()`'s
+/// spawn-to-registration window (monorepo#1194).
 #[derive(Default)]
 pub(crate) struct SupervisePark {
-    /// Signaled by `supervise()` on entering the window (PTY spawned, not yet
-    /// recorded).
+    /// Signaled by the parked task on entering the window.
     pub(crate) entered: tokio::sync::Notify,
-    /// Held by `supervise()` inside the window until the test releases it.
+    /// Held by the parked task inside the window until the test releases it.
     pub(crate) release: tokio::sync::Notify,
+}
+
+/// The set of `script.*` test park seams (all `None` in production wiring),
+/// grouped so the manager constructor stays within arity limits.
+#[derive(Clone, Default)]
+pub(crate) struct ScriptParks {
+    /// Parks `supervise()` in its pre-registration window — after
+    /// `pty.spawn`, before `mark_running` records the id (monorepo#1180).
+    pub(crate) supervise: Option<Arc<SupervisePark>>,
+    /// Parks `start()` between spawning the supervisor task and taking the
+    /// registration lock (monorepo#1194).
+    pub(crate) start_registration: Option<Arc<SupervisePark>>,
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -133,6 +161,7 @@ struct RunReservation {
     mgr: ScriptManager,
     key: (WorkspaceId, String),
     prev: ScriptStatus,
+    generation: u64,
     armed: bool,
 }
 
@@ -142,10 +171,11 @@ impl Drop for RunReservation {
             return;
         }
         // Best-effort restore: a poisoned registry mutex must not abort the
-        // process by panicking inside a drop during unwinding.
+        // process by panicking inside a drop during unwinding. A recreated
+        // entry (new generation) is never touched — its state is not ours.
         if let Ok(mut guard) = self.mgr.scripts.lock() {
             if let Some(m) = guard.get_mut(&self.key) {
-                if m.state.status == ScriptStatus::Running {
+                if m.generation == self.generation && m.state.status == ScriptStatus::Running {
                     m.state.status = self.prev;
                 }
             }
@@ -162,7 +192,7 @@ impl ScriptManager {
         scripts: ScriptRegistry,
         bootstrap_locks: WorkspaceScriptLocks,
         too_fast_ms: u128,
-        supervise_park: Option<Arc<SupervisePark>>,
+        parks: ScriptParks,
     ) -> Self {
         Self {
             pty,
@@ -171,7 +201,7 @@ impl ScriptManager {
             scripts,
             bootstrap_locks,
             too_fast_ms,
-            supervise_park,
+            parks,
         }
     }
 
@@ -245,6 +275,7 @@ impl ScriptManager {
                 pty_id: None,
                 stopped_by_user: false,
                 supervisor: None,
+                generation: next_generation(),
             },
         );
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
@@ -267,6 +298,7 @@ impl ScriptManager {
                     pty_id: None,
                     stopped_by_user: false,
                     supervisor: None,
+                    generation: next_generation(),
                 }
             });
         }
@@ -372,6 +404,7 @@ impl ScriptManager {
                                         pty_id: None,
                                         stopped_by_user: false,
                                         supervisor: None,
+                                        generation: next_generation(),
                                     },
                                 );
                             }
@@ -499,7 +532,7 @@ impl ScriptManager {
     /// `workspace_id`.
     pub(crate) async fn start(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
-        let def = {
+        let (def, generation) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&key)
@@ -508,26 +541,37 @@ impl ScriptManager {
                 return Ok(json!({ "ok": true, "scriptId": script_id }));
             }
             m.stopped_by_user = false;
-            m.def.clone()
+            (m.def.clone(), m.generation)
         };
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let sid = script_id.to_string();
-        let handle = tokio::spawn(async move { mgr.supervise(ws, sid, def).await });
+        let handle = tokio::spawn(async move { mgr.supervise(ws, sid, def, generation).await });
+        // Test seam (monorepo#1194): park here so a test can remove+recreate
+        // the entry while the supervisor task exists but is not yet
+        // registered.
+        if let Some(park) = &self.parks.start_registration {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         let orphan = {
             let mut guard = self.scripts.lock().unwrap();
             match guard.get_mut(&key) {
-                Some(m) => {
+                // Only install the handle if the entry is still the same
+                // incarnation the supervisor was spawned for (monorepo#1194):
+                // a removed+recreated entry has a new generation, and the
+                // stale supervisor must not become its supervisor.
+                Some(m) if m.generation == generation => {
                     m.supervisor = Some(handle);
                     None
                 }
-                None => Some(handle),
+                _ => Some(handle),
             }
         };
-        // Removed concurrently between spawn and registration: *await* the
-        // supervisor (outside the lock) instead of aborting it (monorepo#1180)
-        // — `mark_running` finds the entry gone and the supervisor reaps any
-        // PTY it spawned before returning.
+        // Removed (or recreated) concurrently between spawn and registration:
+        // *await* the supervisor (outside the lock) instead of aborting it
+        // (monorepo#1180) — `mark_running` fails the generation check and the
+        // supervisor reaps any PTY it spawned before returning.
         if let Some(handle) = orphan {
             if let Err(e) = handle.await {
                 tracing::warn!(script = %script_id, error = %e, "script supervisor join failed during orphan teardown");
@@ -570,21 +614,27 @@ impl ScriptManager {
     }
 
     /// `script.restart`: stop, reset the restart counter, then start. Scoped to
-    /// `workspace_id`.
+    /// `workspace_id`. The stop→start gap is surfaced as `restarting`
+    /// (monorepo#1318) so a snapshot taken mid-restart never reports
+    /// `exited`/`idle`; `mark_running` flips it to `running` once the respawn
+    /// is up.
     pub(crate) async fn restart(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
     ) -> Result<Value> {
         self.stop(workspace_id, script_id).await?;
-        {
+        let state = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&(workspace_id.clone(), script_id.to_string()))
                 .ok_or_else(|| Error::NotFound(format!("script {script_id}")))?;
             m.state.restart_count = 0;
             m.stopped_by_user = false;
-        }
+            m.state.status = ScriptStatus::Restarting;
+            m.state.clone()
+        };
+        self.emit_state(workspace_id, script_id, &state).await;
         self.start(workspace_id, script_id).await
     }
 
@@ -604,7 +654,7 @@ impl ScriptManager {
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> Result<Value> {
-        let (def, prev_status) = {
+        let (def, prev_status, generation) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&(workspace_id.clone(), script_id.to_string()))
@@ -634,12 +684,13 @@ impl ScriptManager {
             let prev = m.state.status;
             m.state.status = ScriptStatus::Running;
             m.state.pid = None;
-            (m.def.clone(), prev)
+            (m.def.clone(), prev, m.generation)
         };
         let mut reservation = RunReservation {
             mgr: self.clone(),
             key: (workspace_id.clone(), script_id.to_string()),
             prev: prev_status,
+            generation,
             armed: true,
         };
         let ws = workspace_id.clone();
@@ -647,7 +698,7 @@ impl ScriptManager {
             Ok(cwd) => cwd,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string()).await;
                 return Err(e);
             }
         };
@@ -655,7 +706,7 @@ impl ScriptManager {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
-                self.fail(&ws, script_id, &e.to_string()).await;
+                self.fail(&ws, script_id, generation, &e.to_string()).await;
                 return Err(e);
             }
         };
@@ -670,10 +721,11 @@ impl ScriptManager {
         let sid = script_id.to_string();
         reservation.armed = false;
         let completion = tokio::spawn(async move {
-            // Removed concurrently (script.remove / create-upsert) between
-            // `pty.spawn` and here: the remover killed the *old* pty_id (or
-            // none), so reap the fresh PTY ourselves — mirrors `supervise()`.
-            if !mgr.mark_running(&ws_task, &sid, pty_id).await {
+            // Removed or recreated concurrently (script.remove /
+            // create-upsert) between the reservation and here: the entry is
+            // gone or carries a new generation, so reap the fresh PTY
+            // ourselves — mirrors `supervise()`.
+            if !mgr.mark_running(&ws_task, &sid, generation, pty_id).await {
                 mgr.pty.kill(pty_id).await;
                 return (None, false);
             }
@@ -693,8 +745,15 @@ impl ScriptManager {
                     false
                 }
             };
+            // Group-keyed liveness (monorepo#1300): before the
+            // exit is recorded, reap group members that outlived the shell
+            // (a descendant trapping TERM+HUP) so `exited` means the whole
+            // group is gone. No-op after the timeout kill (session gone) or
+            // when the group is already empty.
+            mgr.pty.reap_group_stragglers(pty_id).await;
             let exit = mgr.pty.try_exit(pty_id).ok().flatten();
-            mgr.mark_exited(&ws_task, &sid, exit.clone()).await;
+            mgr.mark_exited(&ws_task, &sid, generation, exit.clone())
+                .await;
             (exit, timed_out)
         });
         let (exit, timed_out) = completion
@@ -715,12 +774,15 @@ impl ScriptManager {
     /// The per-script supervisor: spawn → stream → (service) auto-restart per the
     /// ported backoff policy, until a user-stop, a command-mode exit, a too-fast
     /// crash, or the retry cap. Scoped to `workspace_id` so registry lookups use
-    /// the composite `(workspace_id, script_id)` key.
-    async fn supervise(self, ws: WorkspaceId, script_id: String, def: Script) {
+    /// the composite `(workspace_id, script_id)` key. `generation` is the stamp
+    /// of the entry this supervisor was started for; every status write
+    /// validates it so a stale supervisor can never mutate a recreated entry
+    /// (monorepo#1194).
+    async fn supervise(self, ws: WorkspaceId, script_id: String, def: Script, generation: u64) {
         let cwd = match self.resolve_cwd(&ws, &def).await {
             Ok(c) => c,
             Err(e) => {
-                self.fail(&ws, &script_id, &e.to_string()).await;
+                self.fail(&ws, &script_id, generation, &e.to_string()).await;
                 return;
             }
         };
@@ -733,33 +795,43 @@ impl ScriptManager {
             let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
                 Ok(id) => id,
                 Err(e) => {
-                    self.fail(&ws, &script_id, &e.to_string()).await;
+                    self.fail(&ws, &script_id, generation, &e.to_string()).await;
                     return;
                 }
             };
             prev = Some(pty_id);
             // Test seam (monorepo#1180): park here so a test can drive a
             // concurrent teardown while the fresh PTY is not yet recorded.
-            if let Some(park) = &self.supervise_park {
+            if let Some(park) = &self.parks.supervise {
                 park.entered.notify_one();
                 park.release.notified().await;
             }
             let started = Instant::now();
-            if !self.mark_running(&ws, &script_id, pty_id).await {
+            if !self.mark_running(&ws, &script_id, generation, pty_id).await {
                 self.pty.kill(pty_id).await;
                 return;
             }
             let exit = self.run_one(&ws, &script_id, pty_id, detect).await;
+            // The too-fast decision is based on the shell's actual runtime:
+            // capture it before the straggler reap below, whose TERM-grace
+            // wait must not inflate a genuinely quick exit past the floor.
+            let ran_for = started.elapsed();
+            // Group-keyed liveness (monorepo#1300): reap group
+            // members that outlived the shell (a descendant trapping
+            // TERM+HUP) before the exit is recorded, so `exited` means the
+            // whole group is gone — the script can never sit `running` (or
+            // flip to `exited`) while trapped survivors linger.
+            self.pty.reap_group_stragglers(pty_id).await;
             let (stopped_by_user, restart_count) =
-                match self.mark_exited(&ws, &script_id, exit).await {
+                match self.mark_exited(&ws, &script_id, generation, exit).await {
                     Some(v) => v,
                     None => return,
                 };
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
-            if started.elapsed().as_millis() < self.too_fast_ms {
-                let ms = started.elapsed().as_millis();
+            if ran_for.as_millis() < self.too_fast_ms {
+                let ms = ran_for.as_millis();
                 self.emit_separator(
                     &ws,
                     &script_id,
@@ -773,18 +845,26 @@ impl ScriptManager {
                 break;
             }
             let key = (ws.clone(), script_id.clone());
-            let attempt = {
+            // The restart is committed (service mode, not user-stopped, not
+            // too-fast, retries left): surface the backoff window as
+            // `restarting` (monorepo#1318) so clients can distinguish it from
+            // a final exit. The generation filter keeps a retired supervisor
+            // from overwriting a successor's status; `mark_running` flips the
+            // status back to `running` after the respawn.
+            let (attempt, state) = {
                 let mut guard = self.scripts.lock().unwrap();
-                let Some(m) = guard.get_mut(&key) else {
+                let Some(m) = guard.get_mut(&key).filter(|m| m.generation == generation) else {
                     return;
                 };
                 m.state.restart_count += 1;
-                m.state.restart_count
+                m.state.status = ScriptStatus::Restarting;
+                (m.state.restart_count, m.state.clone())
             };
+            self.emit_state(&ws, &script_id, &state).await;
             tokio::time::sleep(AUTO_RESTART_DELAY).await;
             {
                 let guard = self.scripts.lock().unwrap();
-                match guard.get(&key) {
+                match guard.get(&key).filter(|m| m.generation == generation) {
                     Some(m) if m.stopped_by_user => break,
                     Some(_) => {}
                     None => return,
@@ -881,13 +961,23 @@ impl ScriptManager {
         true
     }
 
-    /// Flip a script to `running` and emit `script:state`. Returns `false` if the
-    /// script was removed concurrently (caller should reap the PTY).
-    async fn mark_running(&self, ws: &WorkspaceId, script_id: &str, pty_id: PtyId) -> bool {
+    /// Flip a script to `running` and emit `script:state`. Returns `false` if
+    /// the script was removed — or removed and recreated under a new
+    /// generation (monorepo#1194) — concurrently (caller should reap the PTY).
+    async fn mark_running(
+        &self,
+        ws: &WorkspaceId,
+        script_id: &str,
+        generation: u64,
+        pty_id: PtyId,
+    ) -> bool {
         let pid = self.pty.pid(pty_id);
         let state = {
             let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard.get_mut(&(ws.clone(), script_id.to_string())) else {
+            let Some(m) = guard
+                .get_mut(&(ws.clone(), script_id.to_string()))
+                .filter(|m| m.generation == generation)
+            else {
                 return false;
             };
             m.pty_id = Some(pty_id);
@@ -905,16 +995,21 @@ impl ScriptManager {
     }
 
     /// Flip a script to `exited`, record the exit code, and emit `script:state`.
-    /// Returns `(stopped_by_user, restart_count)` for the restart decision.
+    /// Returns `(stopped_by_user, restart_count)` for the restart decision;
+    /// `None` when the entry is gone or recreated under a new generation
+    /// (the stale writer must not touch it — monorepo#1194).
     async fn mark_exited(
         &self,
         ws: &WorkspaceId,
         script_id: &str,
+        generation: u64,
         exit: Option<PtyExit>,
     ) -> Option<(bool, u32)> {
         let (state, flags) = {
             let mut guard = self.scripts.lock().unwrap();
-            let m = guard.get_mut(&(ws.clone(), script_id.to_string()))?;
+            let m = guard
+                .get_mut(&(ws.clone(), script_id.to_string()))
+                .filter(|m| m.generation == generation)?;
             m.state.status = ScriptStatus::Exited;
             m.state.exit_code = exit.as_ref().map(|e| e.exit_code as i64);
             m.state.stopped_at = Some(now_iso());
@@ -925,10 +1020,14 @@ impl ScriptManager {
     }
 
     /// Record a spawn/cwd failure on the runtime state and emit `script:state`.
-    async fn fail(&self, ws: &WorkspaceId, script_id: &str, err: &str) {
+    /// A gone or recreated entry (generation mismatch) is left untouched.
+    async fn fail(&self, ws: &WorkspaceId, script_id: &str, generation: u64, err: &str) {
         let state = {
             let mut guard = self.scripts.lock().unwrap();
-            let Some(m) = guard.get_mut(&(ws.clone(), script_id.to_string())) else {
+            let Some(m) = guard
+                .get_mut(&(ws.clone(), script_id.to_string()))
+                .filter(|m| m.generation == generation)
+            else {
                 return;
             };
             m.state.status = ScriptStatus::Exited;
@@ -1010,6 +1109,7 @@ impl ScriptManager {
         spec.cwd = cwd.clone();
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = SCRUBBED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        spec.listed = false;
         spec
     }
 }
@@ -1528,6 +1628,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         }
     }
 
@@ -1946,6 +2047,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_script_is_hidden_from_terminal_list_but_output_remains_available() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let terminals = h
+            .services
+            .terminal_list(h.ws.clone())
+            .await
+            .expect("terminal list");
+        assert_eq!(
+            terminals["terminals"],
+            json!([]),
+            "script PTY must not become a terminal tab"
+        );
+        assert!(
+            h.services
+                .script_output(h.ws.clone(), id.clone(), None, None, None)
+                .await
+                .expect("script output")
+                .is_string(),
+            "hidden PTY output remains available through script.output"
+        );
+
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+    }
+
+    #[tokio::test]
     async fn script_stop_on_idle_keeps_idle_state() {
         let h = harness().await;
         let id = create_simple(&h, "idle", "echo nope", ScriptMode::Command).await;
@@ -1991,6 +2128,110 @@ mod tests {
             .script_stop(h.ws.clone(), id)
             .await
             .expect("stop");
+    }
+
+    /// The `script.restart` stop→start gap reports `restarting` (monorepo#1318):
+    /// the status flips before `start()` is invoked and holds until the respawn's
+    /// `mark_running`, so a snapshot taken mid-restart never reads `exited`/`idle`.
+    /// The supervise park holds the respawn pre-`mark_running` so the window is
+    /// open deterministically.
+    #[tokio::test]
+    async fn script_restart_gap_reports_restarting() {
+        let h = harness().await;
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let v = services
+            .script_restart(h.ws.clone(), id.clone())
+            .await
+            .expect("restart");
+        assert_eq!(v["ok"], true);
+        // The old run's `exited` precedes the gap's `restarting` on the bus.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "restarting").await;
+        // With the respawn parked pre-`mark_running`, a snapshot inside the
+        // gap reads `restarting`.
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("respawn parked");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "restarting");
+        assert_eq!(st["restartCount"], 0, "restart() resets the counter");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
+    }
+
+    /// The auto-restart backoff window reports `restarting` (monorepo#1318):
+    /// once the supervise loop commits to a restart (service mode, not
+    /// user-stopped, not too-fast, retries left) the status flips before the
+    /// backoff sleep and holds until the respawn's `mark_running`. The
+    /// too-fast floor is injected as 0 so the immediate exit always restarts,
+    /// and the supervise park holds the respawn pre-`mark_running` so the
+    /// window is open deterministically. The flag file makes the second run
+    /// long-lived so teardown is a clean `script.stop`.
+    #[tokio::test]
+    async fn auto_restart_backoff_window_reports_restarting() {
+        let mut h = harness().await;
+        h.services = h.services.with_script_too_fast_ms(0);
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let flag = std::env::temp_dir().join(format!(
+            "intentd-scriptops-flag-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _flag = PidFile(flag.clone());
+        let cmd = format!(
+            "if [ -e \"{p}\" ]; then exec sleep 3600; else : > \"{p}\"; fi",
+            p = flag.display()
+        );
+        let id = create_simple(&h, "crashy", &cmd, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        // The immediate exit commits an auto-restart: `exited` then
+        // `restarting` (with the bumped counter) are emitted before the
+        // backoff sleep.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "restarting").await;
+        assert_eq!(ev["data"]["restartCount"], 1);
+        // With the respawn parked pre-`mark_running`, a snapshot inside the
+        // backoff window reads `restarting`.
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("respawn parked");
+        let st = services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "restarting");
+        assert_eq!(st["restartCount"], 1);
+        park.release.notify_one();
+        let ev = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        assert_eq!(ev["data"]["restartCount"], 1);
+        services.script_stop(h.ws.clone(), id).await.expect("stop");
     }
 
     #[tokio::test]
@@ -2136,6 +2377,147 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Poll until `pid` is gone, failing after the `LIVENESS` deadline.
+    async fn await_pid_dead(pid: i64, what: &str) {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        while pid_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} {pid} still alive after deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// SIGKILL a helper process on drop so a failed test cannot leak a
+    /// TERM/HUP-trapping `sleep 300` into the suite.
+    struct KillOnDrop(i64);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &self.0.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    /// Build a command whose shell backgrounds a TERM+HUP-trapping straggler:
+    /// the straggler touches `flag` only after its traps are installed, and
+    /// its pid is written to `pidfile`. `tail` runs in the direct shell after
+    /// the traps are confirmed active.
+    fn straggler_command(flag: &std::path::Path, pidfile: &std::path::Path, tail: &str) -> String {
+        format!(
+            r#"sh -c 'trap "" TERM HUP; : > "{f}"; sleep 300' & echo $! > "{p}"; while [ ! -e "{f}" ]; do sleep 0.05; done; {tail}"#,
+            f = flag.display(),
+            p = pidfile.display()
+        )
+    }
+
+    /// Poll `pidfile` (and the trap flag via the command's handshake) until it
+    /// yields the straggler's pid.
+    async fn await_straggler_pid(pidfile: &std::path::Path) -> i64 {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            if let Ok(s) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = s.trim().parse::<i64>() {
+                    return pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "straggler pid never written to {pidfile:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Unique temp paths for the straggler handshake files.
+    fn straggler_paths(tag: &str) -> (TempPath, TempPath) {
+        let unique = format!(
+            "{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        (
+            TempPath(std::env::temp_dir().join(format!("intent-script-flag-{unique}"))),
+            TempPath(std::env::temp_dir().join(format!("intent-script-pid-{unique}"))),
+        )
+    }
+
+    /// Removes the file on drop.
+    struct TempPath(std::path::PathBuf);
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Regression (monorepo#1300): `script.stop` must reap a descendant that
+    /// traps both SIGTERM and SIGHUP — the old escalation keyed SIGKILL on the
+    /// direct child still running, so a shell that exited within the grace
+    /// window left the trapped descendant alive forever.
+    #[tokio::test]
+    async fn script_stop_reaps_term_and_hup_trapping_descendant() {
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("stop");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "wait");
+        let id = create_simple(&h, "trapper", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        assert!(pid_alive(straggler), "straggler alive before stop");
+
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop");
+        await_pid_dead(straggler, "TERM+HUP-trapping descendant").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "running", "status reflects the dead group");
+    }
+
+    /// Regression (monorepo#1300): when the shell exits on its own but a
+    /// TERM+HUP-trapping group member lingers, the supervisor reaps the
+    /// group before recording the exit — the script cannot present as a
+    /// healthy `running` (or `exited`-with-survivors) while trapped
+    /// stragglers hold the group.
+    #[tokio::test]
+    async fn script_exit_with_trapped_straggler_reaps_group_before_exited() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let (flag, pidfile) = straggler_paths("exit");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "exit 0");
+        let id = create_simple(&h, "straggler", &cmd, ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+
+        // The shell exits immediately after the handshake; `exited` must not
+        // be recorded until the group has been reaped.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        await_pid_dead(straggler, "trapped straggler").await;
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "exited");
     }
 
     /// Regression (monorepo#1155): a `resolve_cwd` failure after the running
@@ -2531,6 +2913,126 @@ mod tests {
             .await
             .expect("status");
         assert_eq!(st["status"], "idle", "fresh entry starts idle");
+    }
+
+    /// Regression (monorepo#1194): `script.remove` + `script.create` with the
+    /// same `scriptId` racing `script.start`'s spawn-to-registration window
+    /// must not let the stale supervisor latch onto the recreated entry. Both
+    /// park seams hold the race open deterministically: the supervisor parks
+    /// pre-`mark_running` (PTY spawned) and `start()` parks pre-registration,
+    /// while the test removes and recreates the entry. Pre-fix, registration
+    /// installed the stale handle (entry present under the same key) and
+    /// `mark_running` flipped the recreated entry to `running` with the old
+    /// command's pid, leaking the old PTY.
+    #[tokio::test]
+    async fn script_recreate_in_start_registration_window_is_not_adopted() {
+        let h = harness().await;
+        let supervise_park = Arc::new(SupervisePark::default());
+        let start_park = Arc::new(SupervisePark::default());
+        let services = h
+            .services
+            .clone()
+            .with_script_supervise_park(supervise_park.clone())
+            .with_script_start_registration_park(start_park.clone());
+        let old_pidfile = std::env::temp_dir().join(format!(
+            "intentd-scriptops-pid-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _old_pidfile = PidFile(old_pidfile.clone());
+        let old_cmd = format!("echo $$ > \"{}\" && exec sleep 3600", old_pidfile.display());
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "old".into(),
+                command: old_cmd,
+                mode: ScriptMode::Service,
+                script_id: Some("gen-race".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Drive `start()` into its parked pre-registration window; the
+        // supervisor task independently parks pre-`mark_running` with the old
+        // command's PTY already spawned.
+        let svc = services.clone();
+        let ws = h.ws.clone();
+        let sid = id.clone();
+        let start_task = tokio::spawn(async move { svc.script_start(ws, sid).await });
+        tokio::time::timeout(LIVENESS, start_park.entered.notified())
+            .await
+            .expect("start parked before registration");
+        tokio::time::timeout(LIVENESS, supervise_park.entered.notified())
+            .await
+            .expect("supervise parked before mark_running");
+        let old_pid = read_pid(&old_pidfile).await;
+
+        // Remove + recreate the same id while both windows are held open.
+        h.services
+            .script_remove(h.ws.clone(), id.clone())
+            .await
+            .expect("remove");
+        let new_pidfile = std::env::temp_dir().join(format!(
+            "intentd-scriptops-pid-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _new_pidfile = PidFile(new_pidfile.clone());
+        let new_cmd = format!("echo $$ > \"{}\" && exec sleep 3600", new_pidfile.display());
+        let recreated = create(
+            &h,
+            ScriptCreateParams {
+                name: "new".into(),
+                command: new_cmd,
+                mode: ScriptMode::Service,
+                script_id: Some(id.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(recreated, id, "recreate keeps the id");
+
+        // Release both windows. The stale supervisor must fail the generation
+        // check, reap its own PTY, and exit; `start()`'s registration must
+        // treat the handle as an orphan and await it, so once `start()`
+        // returns the stale supervisor is fully drained.
+        supervise_park.release.notify_one();
+        start_park.release.notify_one();
+        tokio::time::timeout(LIVENESS, start_task)
+            .await
+            .expect("start returned before deadline")
+            .expect("join")
+            .expect("start ok");
+        assert_reaped(old_pid, "after remove+recreate in the registration window").await;
+
+        // The recreated entry never adopted the stale supervisor's PTY/pid.
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle", "recreated entry stays idle: {st:?}");
+        assert!(st["pid"].is_null(), "no stale pid latched: {st:?}");
+
+        // A follow-up start on the recreated entry is not blocked by a
+        // phantom `running` status and runs the NEW command.
+        let mut sub = subscribe(&h);
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start recreated");
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        let new_pid = read_pid(&new_pidfile).await;
+        assert_ne!(new_pid, old_pid, "new command's process, not the old one");
+        assert_eq!(
+            running["data"]["pid"].as_i64(),
+            Some(new_pid),
+            "running state reports the new command's pid"
+        );
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+        assert_reaped(new_pid, "after stopping the recreated script").await;
     }
 
     /// Two workspaces mint the same client-supplied `scriptId` concurrently

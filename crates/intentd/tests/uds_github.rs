@@ -34,9 +34,10 @@ async fn send(socket: &Path, frame: &str) -> Value {
 
 #[tokio::test]
 async fn uds_github_param_validation_and_routing() {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let base = Path::new("/tmp").join(format!("intentd-gh-{}", &short[..8]));
-    let data_dir = base.join("data");
+    // Short base under /tmp (UDS SUN_LEN cap); the guard removes the dir on
+    // drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
+    let base = common::test_tempdir_in("/tmp", "itd-gh-");
+    let data_dir = base.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     std::env::set_var("INTENTD_DATA_DIR", &data_dir);
@@ -44,8 +45,9 @@ async fn uds_github_param_validation_and_routing() {
 
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {

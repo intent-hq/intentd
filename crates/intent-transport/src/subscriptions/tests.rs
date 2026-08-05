@@ -1006,6 +1006,7 @@ mod chat_snapshot_bounded {
             limit: Option<i64>,
             _workspace_id: Option<WorkspaceId>,
             page_token: Option<String>,
+            _around_message_id: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The snapshot must ask for the newest page (no cursor) and must
@@ -1117,6 +1118,7 @@ mod chat_message_delta {
             _limit: Option<i64>,
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
+            _around_message_id: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();

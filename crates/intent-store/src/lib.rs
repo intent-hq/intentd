@@ -22,6 +22,7 @@ mod diffs_repo;
 mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
+mod hook_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
@@ -42,7 +43,7 @@ mod workspace_ui_context_repo;
 
 pub use agent_queue_repo::AgentQueueRow;
 pub use agent_repo::{
-    AgentUsageRow, InterruptedAgent, ReplaceMessage, SessionMessageProjection,
+    AgentUsageRow, InterruptedAgent, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
     PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -347,6 +348,10 @@ impl Store {
             .execute(&self.write_pool)
             .await
             .map_err(|e| Error::Internal(format!("activation VACUUM failed: {e}")))?;
+        // The full VACUUM may renumber `agent_message`'s implicit rowids
+        // (TEXT primary key), which key the rowid-mapped `agent_message_fts`
+        // index (0074) — rebuild it so the mapping stays correct.
+        self.rebuild_agent_message_fts().await?;
         let duration = started.elapsed();
         let pages_after = self.page_count().await?;
         Ok(AutoVacuumActivation::Activated {

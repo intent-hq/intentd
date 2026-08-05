@@ -22,6 +22,19 @@ pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 30;
 /// out and preserve all events.
 pub const DEFAULT_STREAM_RETENTION_HOURS: u32 = 72;
 
+/// Default max characters of one `workspace_api` tool result before the
+/// output is redirected to a file (`workspaceApi.maxOutputChars`); `0` means
+/// unlimited (never redirect).
+pub const DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS: u32 = 100_000;
+
+/// Default for `workspaceApi.toonOutput` — whether `workspace_api` tool
+/// results are TOON-encoded (token-efficient) instead of plain JSON.
+pub const DEFAULT_WORKSPACE_API_TOON_OUTPUT: bool = true;
+
+/// Default cap on concurrently active (scheduled/running) background hooks per
+/// agent (`hooks.maxPerAgent`).
+pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
+
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -43,6 +56,9 @@ pub struct Config {
     /// them (`events.streamRetentionHours`, §10.2); `0` disables the sweep.
     /// Lifecycle/tool/note/task/workspace events are preserved regardless of age.
     pub stream_retention_hours: u32,
+    /// Cap on concurrently active (scheduled/running) background hooks per
+    /// agent (`hooks.maxPerAgent`).
+    pub hooks_max_per_agent: u32,
 }
 
 impl Config {
@@ -77,6 +93,7 @@ impl Config {
             env_u32("INTENTD_IDLE_REAP_MINUTES").unwrap_or(settings.agents.idle_reap_minutes);
         let stream_retention_hours = env_u32("INTENTD_STREAM_RETENTION_HOURS")
             .unwrap_or(settings.events.stream_retention_hours);
+        let hooks_max_per_agent = settings.hooks.max_per_agent;
 
         Ok(Self {
             data_dir,
@@ -86,6 +103,7 @@ impl Config {
             pid_path,
             idle_reap_minutes,
             stream_retention_hours,
+            hooks_max_per_agent,
         })
     }
 }

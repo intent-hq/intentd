@@ -120,6 +120,7 @@ mod tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         }
     }
 
@@ -165,6 +166,7 @@ mod tests {
             sandbox_path: sandbox_path.clone(),
             sandbox_branch: sandbox_path.as_ref().map(|_| format!("sb/{}", agent_id.0)),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
@@ -285,7 +287,7 @@ mod tests {
             .with_event_bus(bus.clone())
             .with_workspaces_root(workspaces_root.clone());
 
-        // Register a completion watch: parent watches child (oneShot)
+        // Register a completion watch: parent watches child
         services
             .register_completion_watch(
                 &ws.id,
@@ -293,7 +295,6 @@ mod tests {
                 parent_id.clone(),
                 "Parent".to_string(),
                 child_id.clone(),
-                true, // oneShot
                 None, // no group
             )
             .expect("register watch");
@@ -455,7 +456,6 @@ mod tests {
                 parent_id.clone(),
                 "Parent".to_string(),
                 child_id.clone(),
-                true, // oneShot
                 None,
             )
             .expect("register watch");
@@ -629,7 +629,6 @@ mod tests {
                 parent_id.clone(),
                 "Parent".to_string(),
                 child_id.clone(),
-                true, // oneShot
                 None,
             )
             .expect("register watch");

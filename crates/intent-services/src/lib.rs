@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod disk_usage;
 mod drafts;
 mod enhance_ops;
 mod event_ops;
@@ -77,6 +78,7 @@ mod github_browse_ops;
 
 mod agent_list_cache;
 mod history_xml;
+mod hook_manager;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
@@ -99,6 +101,7 @@ mod shell;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
+mod voice_ops;
 mod workspace_aggregates;
 
 #[cfg(test)]
@@ -108,8 +111,8 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents, InMemorySecretStore,
-    SecretStore,
+    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
+    migrate_default_vocabulary, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -131,8 +134,8 @@ pub use agent_manager::{
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 pub use events::{
-    EventBus, FileWatcher, SkillsWatcher, SpecialistsWatcher, Subscription, SubscriptionFilter,
-    WatcherRegistry,
+    EventBus, FileWatcher, GitMetadataWatcher, GitStatusRefresher, SkillsWatcher,
+    SpecialistsWatcher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -210,11 +213,11 @@ pub struct Services {
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
-    /// same-workspace delegation and cross-workspace (chief) waits. A oneShot
-    /// watch is registered when an agent delegates with `waitMode` `immediate`
-    /// over the MCP front door; the delivery worker (AS-3) and the `after_all`
-    /// group fan-in (AS-4) consume it later. Shared across clones like the
-    /// other in-memory registries.
+    /// same-workspace delegation and cross-workspace (chief) waits. An
+    /// ungrouped watch is registered when an agent delegates with `waitMode`
+    /// `immediate` over the MCP front door; the delivery worker (AS-3) and
+    /// the `after_all` group fan-in (AS-4) consume it later. Shared across
+    /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
     /// `agent_id → (last error text, consecutive count)`. Incremented by the
@@ -235,6 +238,26 @@ pub struct Services {
     /// replayed. In-memory only, like the completion-watch registry's
     /// live delivery state.
     failure_wake_dedup: Arc<Mutex<HashMap<(AgentId, AgentId), String>>>,
+    /// Child agents whose most recent `agent:idle` was skipped as an interim
+    /// idle for at least one ungrouped watch (monorepo#1280). The follow-up
+    /// completion is normally guaranteed by the queue drain, but a retraction
+    /// (`agent.removeQueuedMessage` / the owned MCP variant) that empties the
+    /// ready-to-send queue while the child is idle leaves no further
+    /// `agent:idle` to deliver — the removal paths consult this marker and
+    /// re-run watch delivery so the skipped watch still gets its completion
+    /// wake. Cleared by any non-interim completion delivery. In-memory only,
+    /// like the other live delivery state.
+    interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
+    /// Message ids whose questions-dismissed notice has already been claimed
+    /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
+    /// dismissal marker is single-slot (most recent id only), so this set is
+    /// what makes the no-duplicate-notice guarantee hold across concurrent
+    /// dismissals of the same id (both read the marker before either writes)
+    /// and interleaved dismissals (A → B → A). In-memory only: after a
+    /// daemon restart only the single-slot marker guards, so a re-dismissal
+    /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
+    /// notice at worst.
+    dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -257,6 +280,12 @@ pub struct Services {
     /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
     /// "not configured" `Internal` error when no pair is available.
     sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
+    /// Active voice engine for `voice.transcribe`. `None` until wired by a
+    /// test; when unset, the handler builds the provider engine per call from
+    /// the `voice.provider` setting (key from the secrets store /
+    /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
+    /// "not configured" `Internal` error when no key is available.
+    voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -283,6 +312,12 @@ pub struct Services {
     /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
     /// terminals.
     pty: Arc<intent_pty::PtyHost>,
+    /// Per-boot daemon identifier (UUID v4) minted once at construction and
+    /// surfaced as `daemonBootId` on the `terminal.list` envelope so clients
+    /// can tell which daemon lifetime a (possibly empty) list belongs to
+    /// (monorepo#1334). Never persisted; clones carry the same value, so every
+    /// service handle in one process reports the same boot id.
+    daemon_boot_id: String,
     /// The shared `script.*` registry (definitions + runtime + supervisor tasks),
     /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
     /// `terminal.*`, so a terminal can attach to a running script (§12.2).
@@ -297,11 +332,12 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test seam (monorepo#1180): when set, `script.*` supervisors park in the
-    /// pre-registration window (after `pty.spawn`, before `mark_running`) so
-    /// teardown races are deterministic. `None` in production wiring; tests
-    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
-    script_supervise_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
+    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
+    /// All `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_script_supervise_park` /
+    /// `with_script_start_registration_park`.
+    script_parks: script_ops::ScriptParks,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -446,6 +482,12 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Per-workspace disk-usage cache backing the on-demand
+    /// `workspace.diskUsage` method (§5.1) — never the list/get emit path:
+    /// TTL'd stale-while-revalidate entries whose walks run detached on the
+    /// blocking pool, so serving the method never blocks a call (first
+    /// compute omits and backfills). Shared across clones.
+    disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
     /// memory instead of re-running the SQLite JSON window.
@@ -485,6 +527,25 @@ pub struct Services {
     /// tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
     git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Live per-hook scheduler tasks for the background hook service
+    /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
+    /// tasks themselves observe the same set; rehydrated from the `hook`
+    /// table at boot via [`Services::rehydrate_hooks`].
+    hook_tasks: hook_manager::HookTasks,
+    /// Cap on concurrently active (scheduled/running) hooks per agent
+    /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
+    /// composition root via [`Services::with_hooks_max_per_agent`].
+    hooks_max_per_agent: u32,
+    /// Wall-clock budget for one hook script run (60 s in production). Tests
+    /// compress it via the `#[cfg(test)]`-only `with_hook_eval_timeout` so
+    /// timeout-eviction coverage completes in milliseconds.
+    hook_eval_timeout: std::time::Duration,
+    /// Test-only clock skew (milliseconds) added to the instant hook TTL
+    /// expiry math measures against. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_hook_clock_skew` so a TTL
+    /// race can be decided by moving the deadline instead of racing wall
+    /// clock.
+    hook_clock_skew: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -514,19 +575,23 @@ impl Services {
             )),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
+            interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
+            voice_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
-            script_supervise_park: None,
+            script_parks: script_ops::ScriptParks::default(),
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -551,13 +616,54 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
+            hook_tasks: Arc::new(Mutex::new(HashMap::new())),
+            hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
+            hook_clock_skew: None,
         }
+    }
+
+    /// Override the per-agent active-hook cap (`[hooks] maxPerAgent`); wired
+    /// from `Config` by the composition root.
+    pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
+        self.hooks_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the hook script eval budget so timeout-eviction
+    /// coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.hook_eval_timeout = timeout;
+        self
+    }
+
+    /// Test-only: inject a shared clock skew (milliseconds) into the hook
+    /// TTL expiry math so a test can move a deadline deterministically
+    /// instead of racing wall clock.
+    #[cfg(test)]
+    pub(crate) fn with_hook_clock_skew(
+        mut self,
+        skew_ms: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        self.hook_clock_skew = Some(skew_ms);
+        self
+    }
+
+    /// The current hook-expiry clock skew in milliseconds (0 when no test
+    /// skew is injected).
+    pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
+        self.hook_clock_skew
+            .as_ref()
+            .map(|s| s.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -620,6 +726,12 @@ impl Services {
             .as_ref()
             .map(|r| r.snapshot().effective.clone())
             .unwrap_or_default()
+    }
+
+    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
+    /// at drain time by the agent manager; cheap registry-snapshot read.
+    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
+        self.effective_settings().agents.flush_queued_messages
     }
 
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
@@ -772,7 +884,7 @@ impl Services {
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
             self.script_too_fast_ms,
-            self.script_supervise_park.clone(),
+            self.script_parks.clone(),
         )
     }
 
@@ -793,7 +905,20 @@ impl Services {
         mut self,
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
-        self.script_supervise_park = Some(park);
+        self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam (monorepo#1194): park `script.start` between spawning the
+    /// supervisor task and taking the registration lock so remove+recreate
+    /// races inside that window are deterministic. Production wiring keeps
+    /// `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_start_registration_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.start_registration = Some(park);
         self
     }
 
@@ -1024,6 +1149,10 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
+        // diskUsage is deliberately NOT populated here: list/get/subscription
+        // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
+        // derived-field ladder). Clients fetch it on demand via the dedicated
+        // `workspace.diskUsage` method (monorepo#1396).
         // Derived "current cycle" display status over the active/latest PR and
         // the taskStats computed above; never persisted. Only populated when
         // taskStats was computable: on a transient notes-read failure the field
@@ -1037,8 +1166,13 @@ impl Services {
             // Derive from the row's own `activity` (set by every caller just
             // before enrichment) so a single response can never pair
             // `activity: "agent_running"` with `displayStatus: "idle"`.
+            // Active background hooks fold into the promotion (§6.5): an
+            // idle agent still watching via a hook reads as active work.
             let display_status = compute_display_status(
-                ws.activity == WorkspaceActivity::AgentRunning,
+                self.workspace_needs_attention(&ws.id).await,
+                ws.activity == WorkspaceActivity::AgentRunning
+                    || self.workspace_has_active_hooks(&ws.id).await
+                    || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1065,7 +1199,8 @@ impl Services {
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
     /// the derivation (task/note status updates, task-note deletion, PR
-    /// link/status changes, agent activity begin/debounced end) — never from
+    /// link/status changes, agent activity begin/debounced end, hook
+    /// lifecycle transitions) — never from
     /// a polling loop. The first
     /// observation for a workspace seeds the cache without emitting (no
     /// baseline to transition from); a read
@@ -1086,8 +1221,14 @@ impl Services {
             return;
         };
         let task_stats = compute_task_stats(&notes);
+        let needs_attention = self.workspace_needs_attention(workspace_id).await;
         let status = compute_display_status(
-            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
+            needs_attention,
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
+                || self.workspace_has_active_hooks(workspace_id).await
+                || self
+                    .workspace_has_waiting_agent_subscriptions(workspace_id)
+                    .await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -1107,6 +1248,41 @@ impl Services {
             )
             .await;
         }
+    }
+
+    /// Whether any **top-level** agent in the workspace is waiting on the
+    /// user (PROTOCOL §6.5, `needs_attention`): a session with no
+    /// `parent_agent_id`, not background, and not deleted, that either
+    /// carries a pending attention request (`attention_request_kind` —
+    /// `discussion`/`blocker`) or has pending structured questions
+    /// ([`Services::question_hold_active`]). Child/background sessions never
+    /// count — their attention surface is the parent/subscriber (attention
+    /// -retire taxonomy). The cheap metadata check runs over every candidate
+    /// first, so transcript tail reads only happen when no session already
+    /// flagged via an attention request. Best-effort: a store read failure
+    /// fails open to `false` (and `question_hold_active` fails open itself)
+    /// so list/get emission is never wedged.
+    pub(crate) async fn workspace_needs_attention(&self, workspace_id: &WorkspaceId) -> bool {
+        let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
+            return false;
+        };
+        let top_level: Vec<_> = sessions
+            .iter()
+            .filter(|s| {
+                s.parent_agent_id.is_none()
+                    && !s.is_background
+                    && s.status != intent_core::AgentStatus::Deleted
+            })
+            .collect();
+        if top_level.iter().any(|s| s.attention_request_kind.is_some()) {
+            return true;
+        }
+        for session in top_level {
+            if self.question_hold_active(&session.id).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -1281,6 +1457,70 @@ impl Services {
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
+    }
+
+    /// The daemon-managed directory whose footprint `workspace.diskUsage`
+    /// reports, or `None` for rows without one (remote / skip-isolation rows
+    /// and the virtual chief workspace). The directory is the provisioned
+    /// checkout's parent (`<parent>/<id>/<repo-slug>` → `<parent>/<id>`,
+    /// covering custom `workspace.worktreesLocation` roots) when it is named
+    /// for the workspace id, else `<workspaces_root>/<id>`.
+    fn disk_usage_dir(&self, ws: &Workspace) -> Option<PathBuf> {
+        if ws.is_remote || ws.skip_worktree || ws.id.is_chief() {
+            return None;
+        }
+        let dir = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|wt| {
+                let parent = Path::new(wt).parent()?;
+                (parent.file_name()? == std::ffi::OsStr::new(ws.id.as_str()))
+                    .then(|| parent.to_path_buf())
+            })
+            .unwrap_or_else(|| {
+                self.workspaces_root
+                    .clone()
+                    .unwrap_or_else(default_workspaces_root)
+                    .join(ws.id.as_str())
+            });
+        Some(dir)
+    }
+
+    /// `workspace.diskUsage` (§5.1): on-demand cached footprint of the
+    /// workspace's daemon-managed directory — `{ diskUsage?, refreshing }`
+    /// per the [`disk_usage::DiskUsageCache::poll`] semantics. Non-qualifying
+    /// rows (no daemon-managed directory, or one that was never provisioned)
+    /// answer `{ refreshing: false }` with the field omitted, without
+    /// touching the cache; an unknown id is `NotFound`.
+    pub(crate) async fn workspace_disk_usage_op(
+        &self,
+        id: WorkspaceId,
+    ) -> Result<serde_json::Value> {
+        let ws = if id.is_chief() {
+            chief_workspace()
+        } else {
+            self.store.get_workspace(&id).await?
+        };
+        let Some(dir) = self.disk_usage_dir(&ws) else {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        };
+        // A never-provisioned directory can never yield a value, so don't
+        // arm a walk (it would fail and leave `refreshing` forever-true).
+        let is_dir = tokio::fs::metadata(&dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            return Ok(serde_json::json!({ "refreshing": false }));
+        }
+        let (usage, refreshing) = self.disk_usage.poll(dir).await;
+        let mut result = serde_json::json!({ "refreshing": refreshing });
+        if let Some(usage) = usage {
+            result["diskUsage"] = serde_json::to_value(usage)
+                .map_err(|e| Error::Internal(format!("serialize diskUsage: {e}")))?;
+        }
+        Ok(result)
     }
 
     /// The currently configured `workspace.worktreesLocation` directory for
@@ -1521,6 +1761,15 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Wire the active voice engine used by `voice.transcribe`. Tests inject
+    /// a stub so the handler never touches the network; production leaves it
+    /// unset and the handler builds the provider engine per call from the
+    /// `voice.provider` setting.
+    pub fn with_voice_engine(mut self, voice_engine: Arc<dyn intent_voice::VoiceEngine>) -> Self {
+        self.voice_engine = Some(voice_engine);
         self
     }
 
@@ -2331,8 +2580,8 @@ impl Services {
     /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
     /// completion event set (agent:idle / agent:failed / agent:deleted) across
     /// every workspace and, on each child completion, wake every parent holding
-    /// a oneShot completion watch for that child (the same agent_send_message_op
-    /// path reportToParent uses), removing the oneShot watch after delivery.
+    /// a completion watch for that child (the same agent_send_message_op
+    /// path reportToParent uses), removing the watch after delivery.
     /// after_all delegation-group watches (group_id = Some) are left in place for
     /// AS-4. No-op-safe when no event bus is wired. Returns the task handle so the
     /// composition root can hold it for the process lifetime.
@@ -2394,11 +2643,22 @@ impl Services {
             }
         }
 
-        self.deliver_completion_to_watches(&child, event).await;
+        let interim_idle = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
-        if event.event_type == AGENT_IDLE {
+        //
+        // monorepo#1281: an INTERIM idle (the agent still has ready-to-send
+        // queued messages, or — monorepo#1297 — is already busy in a redriven
+        // turn) does NOT seal — the queued/redriven turn may delegate more
+        // children into the open group, so the expected set is not final
+        // yet. The seal happens at the real completion: the idle after the
+        // queue drains (this path), or the synthesized idle a queue
+        // retraction/edit produces (`redeliver_completion_after_queue_mutation`
+        // seals there). The classification is the snapshot
+        // `deliver_completion_to_watches` returned, so the seal path and the
+        // watch-delivery path always agree on interim vs. real.
+        if event.event_type == AGENT_IDLE && !interim_idle {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
                 self.try_fire_group(&gid).await;
             }
@@ -2559,12 +2819,186 @@ impl Services {
             .remove(&(parent_id.clone(), child_id.clone()));
     }
 
-    /// Wake every parent whose oneShot watch matches child_id, then drop that
-    /// watch. group_id = Some watches defer to the AS-4 delegation-group fan-in
-    /// and are left untouched. A single failed delivery is logged and skipped so
-    /// the remaining watches still fire. Wave B: remove oneShot watches BEFORE
+    /// Record that an `agent:idle` for `child_id` was classified as interim
+    /// (monorepo#1280) — recorded up front, whether or not any ungrouped
+    /// watch matched (monorepo#1281), and whether the classification came
+    /// from the queue probe or the busy probe (monorepo#1297) — so a later
+    /// queue retraction that empties the ready-to-send queue while the agent
+    /// is idle synthesizes the real completion: re-running watch delivery
+    /// and sealing the agent's open after_all group. A busy-classified
+    /// marker is superseded by the running turn's own terminal `agent:idle`
+    /// (the non-interim delivery takes the marker below).
+    fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
+    }
+
+    /// Whether an interim-skipped idle is recorded for `child_id`.
+    fn has_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .contains(child_id)
+    }
+
+    /// Take (check-and-clear) the interim-skip marker for `child_id`,
+    /// returning whether it was set. Clearing on read makes the retraction
+    /// redelivery at-most-once per skipped idle.
+    fn take_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .remove(child_id)
+    }
+
+    /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
+    /// queue mutation (retraction or an editing flip to under-edit) left an
+    /// idle agent with an empty ready-to-send queue. Without this, a watch
+    /// whose `agent:idle` was skipped as interim stays armed forever — the
+    /// queue drain that would have produced the follow-up completion never
+    /// runs because the mutation removed its input. No-op unless an
+    /// interim-skipped idle is recorded, the ready-to-send queue is empty,
+    /// and no worker is in flight (a busy agent emits its own terminal
+    /// `agent:idle` when the turn ends, which supersedes the marker).
+    /// Synthesizes a fresh `agent:idle` (same construction as the
+    /// rehydration reconcile path) rather than replaying the original event,
+    /// so the payload carries the session's current name/completionReport.
+    ///
+    /// monorepo#1281: the synthesized idle IS the agent's real completion
+    /// (queue empty, no worker in flight), so after re-running watch delivery
+    /// this also seals the agent's open `after_all` group — the mutation
+    /// removed the redrive whose terminal idle would otherwise have sealed it.
+    pub(crate) async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
+        if !self.has_interim_skipped_idle(child_id) {
+            return;
+        }
+        if self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()) {
+            return;
+        }
+        // Idle-visibility deferral: an idle agent still owning active
+        // background hooks has not settled — leave the marker in place (like
+        // the busy guard) so the hook's own terminal transition (dispatch /
+        // eviction / expiry wake → turn-end idle, or the external-cancel
+        // call into this function) synthesizes the completion later.
+        if !self.active_hooks_for_agent(child_id).await.is_empty() {
+            return;
+        }
+        // Consume the marker only after the guards pass; losing this take to
+        // a concurrent mutation path means that path owns the redelivery.
+        if !self.take_interim_skipped_idle(child_id) {
+            return;
+        }
+        let session = match self.store.get_agent_session(child_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(
+                    child = %child_id.0,
+                    error = %e,
+                    "queue-retraction redelivery: session lookup failed; watch stays armed and any open after_all group stays unsealed"
+                );
+                // Restore the marker so a later queue mutation (or drain
+                // no-op) can retry the redelivery — a transient store error
+                // must not permanently strand the watch or leave the agent's
+                // open after_all group unsealed forever (the retried
+                // redelivery seals it below).
+                self.mark_interim_skipped_idle(child_id);
+                return;
+            }
+        };
+        let mut data = serde_json::json!({
+            "agentId": child_id.0,
+            "reason": "queue_retraction",
+            "status": "idle",
+            "agentName": session.name,
+            "isBackground": session.is_background,
+        });
+        if let Some(report) = session.completion_report {
+            data["completionReport"] = serde_json::Value::String(report.clone());
+            data["report"] = serde_json::Value::String(report);
+        }
+        // Idle-visibility: the synthesized idle carries the same
+        // `waitingOnHooks` stamp as a real `agent:idle` emit — always empty
+        // (omitted) here, since the active-hooks guard above deferred when
+        // any hook was still active; kept for shape parity with the live
+        // emit sites should a hook be scheduled in the window.
+        self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        let event = Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: session.workspace_id,
+            timestamp: now_iso(),
+            event_type: AGENT_IDLE.to_string(),
+            actor: intent_core::EventActor {
+                actor_type: intent_core::ActorType::Agent,
+                id: Some(child_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(child_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        };
+        // Box::pin breaks the async-recursion cycles this edge closes
+        // (deliver → redeliver → deliver, and the drain's None-arm path
+        // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
+        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        // Real completion: seal the agent's open after_all group and try to
+        // fire it, mirroring `handle_completion_event`'s non-interim idle
+        // path (monorepo#1281). Gated on the delivery pass's own interim
+        // classification: an enqueue landing between this function's
+        // `has_ready_to_send` guard and the delivery re-classifies the
+        // synthesized idle as interim (marker re-recorded, so a later
+        // mutation/drain retries), and the seal must agree with that
+        // snapshot. Box::pin breaks the async-recursion cycle this edge
+        // closes (try_drain_queue → redeliver → try_fire_group →
+        // deliver_parent_wake → send_message → try_drain_queue).
+        if !interim {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
+        }
+    }
+
+    /// Wake every parent whose watch matches child_id, then drop that watch:
+    /// every ungrouped watch is deliver-once-and-retire. group_id = Some
+    /// watches defer to the AS-4 delegation-group fan-in and are left
+    /// untouched. A single failed delivery is logged and skipped so the
+    /// remaining watches still fire. STAB-18: remove ungrouped watches BEFORE
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
+    ///
+    /// Queue- and busy-aware completion: an `agent:idle` for a child with
+    /// ready-to-send queued messages OR a busy in-flight worker
+    /// (monorepo#1297: the queued message may already have been drained into
+    /// a running turn by the time the idle is delivered) is an interim idle —
+    /// ungrouped watches neither deliver nor retire on it (they stay armed
+    /// for the real completion after the queue drains / running turn ends).
+    /// Grouped watches are exempt: group settlement accounting must see every
+    /// completion or an `after_all` batch can hang. `agent:failed` /
+    /// `agent:deleted` are never classified interim — a failed child is
+    /// parked and a deleted one is gone, so their wakes must not be deferred.
+    ///
+    /// Idle-visibility deferral (within v3.1): an `agent:idle` for a child
+    /// that still owns ACTIVE (`scheduled`/`running`) background hooks is
+    /// not its real completion either — the child will run again when a
+    /// hook dispatches, fails, or expires (TTL-bounded, §5.40). Such a
+    /// hook-waiting idle defers like an interim idle: ungrouped watches
+    /// neither deliver nor retire, and — unlike the interim case — the
+    /// GROUPED path also skips recording, so an `after_all` group waits for
+    /// the child's genuine settlement (a later `agent:failed` /
+    /// `agent:deleted` still records normally). The interim-skip marker is
+    /// reused, and the hook's own terminal transitions re-run
+    /// [`Services::redeliver_completion_after_queue_mutation`] so an
+    /// external `hook.cancel` on an idle child settles the deferred watch.
+    /// The classification probes the hook store live at delivery time (not
+    /// the emit-time `waitingOnHooks` stamp), so a hook that settled
+    /// between emit and delivery never defers; a probe failure reads as no
+    /// hooks (fail-open: deferral is a nicety, a missed deferral only
+    /// yields the pre-deferral early wake). `agent:failed` /
+    /// `agent:deleted` — and the attention / reportToParent immediate
+    /// wakes, which run on their own paths — are never hook-deferred.
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -2582,9 +3016,64 @@ impl Services {
     /// on a different error or a non-failure completion); non-failure
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
-    pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
-        if event.event_type != AGENT_FAILED {
+    ///
+    /// Returns whether the event was classified as an interim idle, so the
+    /// caller's group-seal decision (`handle_completion_event`) shares this
+    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    pub(crate) async fn deliver_completion_to_watches(
+        &self,
+        child_id: &AgentId,
+        event: &Event,
+    ) -> bool {
+        // Queue- and busy-aware completion: an `agent:idle` for a child whose
+        // pending message queue still holds ready-to-send entries, OR whose
+        // worker is already busy in a new turn (monorepo#1297: an enqueue that
+        // raced the idle emit may have been dequeued and started before this
+        // delivery ran, leaving the queue empty but the busy slot held), is an
+        // interim idle — the child is about to be (or already is) redriven, so
+        // ungrouped watches neither deliver nor retire (they stay armed for
+        // the real completion). Grouped watches are unaffected: group
+        // settlement owns their accounting and lifecycle. Narrows the
+        // enqueue-vs-idle-emit race: the turn-end emit checks the queue before
+        // publishing, a message enqueued between that check and this delivery
+        // is caught by the queue probe, and a message already drained into a
+        // running turn is caught by the busy probe. (A snapshot, not a lock:
+        // an enqueue landing after both probes can still race a premature
+        // wake, but the window shrinks from emit→delivery to check→wake.)
+        let queue_interim = event.event_type == AGENT_IDLE
+            && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
+        // Idle-visibility deferral: probe the hook store LIVE (not the
+        // emit-time `waitingOnHooks` stamp — a hook that settled between
+        // emit and delivery must not defer). Probed even when the idle is
+        // already queue-interim, because the GROUPED branch below needs the
+        // hook classification independently (an interim idle still records
+        // for groups; a hook-waiting one must not).
+        let hook_waiting = event.event_type == AGENT_IDLE
+            && !self.active_hooks_for_agent(child_id).await.is_empty();
+        let interim_idle = queue_interim || hook_waiting;
+        // monorepo#1280/#1281: record the interim skip up front — even when
+        // no ungrouped watch matches — so a later queue retraction/edit that
+        // empties the ready-to-send queue while the agent is idle (or, for a
+        // hook-deferred idle, the last active hook's terminal transition)
+        // can synthesize the real completion (redelivering any skipped
+        // watches AND sealing a watchless coordinator's open after_all
+        // group).
+        if interim_idle {
+            self.mark_interim_skipped_idle(child_id);
+        }
+        // The dedup clear is completion-scoped: an interim idle is not a
+        // completion, so it must not clear failure-dedup state (a poisoned
+        // child's replayed identical failure could otherwise slip a
+        // duplicate wake through).
+        if event.event_type != AGENT_FAILED && !interim_idle {
             self.clear_failure_wake_dedup(child_id);
+        }
+        // monorepo#1280: any non-interim completion supersedes a recorded
+        // interim skip — the delivery below settles the watches, so the
+        // retraction-redelivery marker must not linger and produce a stale
+        // synthetic wake later.
+        if !interim_idle {
+            self.take_interim_skipped_idle(child_id);
         }
         let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
             event
@@ -2618,6 +3107,25 @@ impl Services {
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
+                // Idle-visibility deferral: a hook-waiting idle is NOT
+                // settlement — the child will run again when a hook
+                // dispatches, fails, or expires, so recording it now would
+                // let the group fire while the child still works. Skip the
+                // record and leave the grouped watch armed; the child's
+                // genuine completion (post-hook idle, failure, deletion, or
+                // the external-cancel redelivery) records normally. Unlike
+                // the queue-interim case below, grouped watches DO defer
+                // here: a hook-waiting child is bounded by the hook TTL
+                // (§5.40), so the group cannot hang forever.
+                if hook_waiting && event.event_type == AGENT_IDLE {
+                    tracing::debug!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        group = %gid,
+                        "deferring grouped agent:idle settlement — child owns active background hooks"
+                    );
+                    continue;
+                }
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
                 // fire path removes these watches once it settles (AS-4).
@@ -2687,6 +3195,22 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
+            // Interim idle (queue-/busy-/hook-aware completion): the child
+            // still has ready-to-send queued messages, a turn already in
+            // flight, or active background hooks it is waiting on, so this
+            // idle is not its real completion — deliver nothing and leave
+            // the watch (including a report_delivered one, which retires at
+            // the real completion) armed for the settlement that follows
+            // the queue drain / running turn / hook resolution. The
+            // interim-skip marker was recorded up front (monorepo#1280).
+            if interim_idle {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, or active background hooks (interim idle)"
+                );
+                continue;
+            }
             // Report-time wake suppression: if the watch has already delivered the
             // report wake (via agent.reportToParent), skip delivery ONLY for
             // agent:idle. agent:failed / agent:deleted still deliver (failure after
@@ -2697,16 +3221,15 @@ impl Services {
                     parent = %watch.parent_agent_id.0,
                     "skipping agent:idle wake — report already delivered at reportToParent time"
                 );
-                // Remove the oneShot watch now that the completion cycle is done.
-                if watch.one_shot {
-                    self.remove_watch(&watch.id);
+                // Remove the watch now that the completion cycle is done.
+                if self.remove_watch(&watch.id) {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
                 }
                 continue;
             }
             // monorepo#840: suppress a repeated identical failure wake to the
-            // same parent. Checked BEFORE the oneShot removal so a suppressed
+            // same parent. Checked BEFORE the watch removal so a suppressed
             // delivery leaves the watch in place for a future distinct signal.
             // Grouped watches never reach here (the group branch above owns
             // them), so group settlement accounting is unaffected.
@@ -2720,24 +3243,22 @@ impl Services {
                     continue;
                 }
             }
-            // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
+            // STAB-18 fix: remove the ungrouped watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
             // if delivery fails the parent misses the wake, but that's safer than
             // duplicate delivery (which we observed in production: STAB-5). Group
             // watches are still removed AFTER group settlement as before.
-            if watch.one_shot {
-                let removed = self.remove_watch(&watch.id);
-                if !removed {
-                    // Watch was concurrently removed (e.g. by another event or
-                    // cancelSubscriptions); skip delivery to avoid a duplicate.
-                    tracing::debug!(
-                        child = %child_id.0,
-                        parent = %watch.parent_agent_id.0,
-                        "oneShot watch already removed, skipping delivery"
-                    );
-                    continue;
-                }
+            let removed = self.remove_watch(&watch.id);
+            if !removed {
+                // Watch was concurrently removed (e.g. by another event or
+                // cancelSubscriptions); skip delivery to avoid a duplicate.
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "watch already removed, skipping delivery"
+                );
+                continue;
             }
             let wake = format_completion_wake(child_id, event, stall.as_ref());
             let metadata = build_event_notification_metadata(&[event]);
@@ -2763,11 +3284,31 @@ impl Services {
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
-            if watch.one_shot {
-                self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
-                    .await;
-            }
+            self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
+                .await;
         }
+        // monorepo#1280: `interim_idle` was snapshotted at entry; a
+        // retraction that emptied the queue in the window between that
+        // snapshot and the marker landing found no marker and no-op'd —
+        // re-check now and hand off to the mutation-path redelivery (its
+        // guards make this a no-op unless the queue really emptied and the
+        // agent is idle). The indirect async recursion is depth-1: the
+        // synthetic redelivery's event is non-interim by construction
+        // (queue empty), so its own pass never re-enters here.
+        //
+        // monorepo#1297: a BUSY-classified interim skip reaches this re-check
+        // on every pass (its queue is empty by definition). While the turn is
+        // genuinely in flight the redelivery's `agent_is_busy` guard no-ops
+        // WITHOUT consuming the marker; when the busy probe misclassified the
+        // turn's own terminal idle (emitted before the slot release), this
+        // re-check and the worker-exit redelivery hook (`run_message_worker`'s
+        // empty raced-drain arm) together heal it — whichever runs after the
+        // slot release observes marker + empty queue + not busy and
+        // synthesizes the real completion.
+        if interim_idle && !self.has_ready_to_send(child_id) {
+            Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
+        }
+        interim_idle
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
@@ -2787,7 +3328,7 @@ impl Services {
         // later; dropping every group watch here would leave the parent with
         // no wake path for that late settlement. `settle_group_watches`
         // atomically converts each failed-not-deleted member's grouped watch
-        // into an ungrouped oneShot watch (and drops the rest), so there is no
+        // into an ungrouped watch (and drops the rest), so there is no
         // window in which the child has neither a live group nor a watch.
         let failed_children = failed_group_children(&group);
         let retained = self.settle_group_watches(group_id, &failed_children);
@@ -2796,7 +3337,7 @@ impl Services {
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
                 retained,
-                "retained oneShot watch(es) for failed group member(s) after settlement"
+                "retained watch(es) for failed group member(s) after settlement"
             );
         }
         let wake = format_group_wake(&group);
@@ -4155,6 +4696,59 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
+/// Resolve the specialist preview provider context (`specialist.get`/`.list`
+/// optional `provider` param): a supplied id must be a registered provider
+/// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
+/// daemon's default provider.
+fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
+    match nonempty_owned(provider) {
+        Some(p) => {
+            if intent_providers::find_provider(&p).is_none() {
+                return Err(Error::InvalidParams(format!("unknown provider: {p}")));
+            }
+            Ok(p)
+        }
+        None => Ok(intent_providers::default_provider_id().to_string()),
+    }
+}
+
+/// Decorate one specialist def with the additive `resolvedModel`/
+/// `resolvedProvider` preview fields (PROTOCOL §5.11), computed by the same
+/// resolver every creation path uses ([`agent_ops::resolve_agent_default_model`],
+/// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
+/// so the preview matches what a no-model create would actually pin. Both
+/// fields are omitted when resolution yields the provider CLI default
+/// (clients render "Provider default"). Previews are context-free
+/// (`is_background = false`), so the background-only `backgroundAgents.*`
+/// settings steps do not apply.
+fn decorate_specialist_resolved(
+    services: &Services,
+    def: &mut serde_json::Value,
+    workspace_path: Option<&Path>,
+    provider: &str,
+) {
+    let Some(id) = def
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(model) = agent_ops::resolve_agent_default_model(
+        services,
+        Some(&id),
+        workspace_path,
+        Some(provider),
+        false,
+    ) else {
+        return;
+    };
+    if let Some(obj) = def.as_object_mut() {
+        obj.insert("resolvedModel".into(), serde_json::json!(model));
+        obj.insert("resolvedProvider".into(), serde_json::json!(provider));
+    }
+}
+
 /// Shared `primitive.*` glue: append the fenced `ws-block:<block_type>` JSON of
 /// `primitive` to the note, persist it, emit `note:updated`, and return the TS
 /// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
@@ -4253,34 +4847,44 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 
 /// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
 /// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
-/// in live agent activity (previously a client-side overlay):
-/// 0. `agent_running` → `in_progress` unconditionally: a live agent always
-///    reads as active work, whatever the PR/task rollup says.
-/// 1. Active PR — the linked `activePullRequest` when open/draft, else the
+/// in live agent activity (previously a client-side overlay) and the
+/// per-workspace needs-attention signal:
+/// 0. `needs_attention` → `needs_attention` unconditionally: a top-level
+///    agent waiting on the user outranks everything, including a running
+///    agent ([`Services::workspace_needs_attention`]).
+/// 1. `agent_running` → `in_progress`: a live agent always reads as active
+///    work, whatever the PR/task rollup says. Callers fold active-hook
+///    state into this flag ([`Services::workspace_has_active_hooks`]) so an
+///    idle agent still watching via a background hook reads the same.
+/// 2. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
 ///    When neither carries an open/draft entry but the workspace `prStatus`
 ///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
 ///    and yields `pr_open` (never `pr_ready`: the column carries no
 ///    mergeable info).
-/// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
+/// 3. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 3. Latest PR (linked, else most recently updated entry) merged — or
+/// 4. Latest PR (linked, else most recently updated entry) merged — or
 ///    `prStatus == Merged` — → `pr_merged`.
-/// 4. All tasks complete → `complete`; else `not_started`.
-/// 5. Without a running agent, a task-stage rollup (`in_progress` /
-///    `not_started` from steps 2/4) demotes to `idle`; the PR stages and
+/// 5. All tasks complete → `complete`; else `not_started`.
+/// 6. Without a running agent, a task-stage rollup (`in_progress` /
+///    `not_started` from steps 3/5) demotes to `idle`; the PR stages and
 ///    `complete` pass through unchanged.
 ///
-/// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 2 precedes the merged check).
+/// A merged PR in history never masks an open PR (step 2 scans `pullRequests`
+/// for open/draft entries) or open tasks (step 3 precedes the merged check).
 fn compute_display_status(
+    needs_attention: bool,
     agent_running: bool,
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
+    if needs_attention {
+        return WorkspaceDisplayStatus::NeedsAttention;
+    }
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
@@ -4292,8 +4896,9 @@ fn compute_display_status(
     }
 }
 
-/// PR/task-only precedence behind [`compute_display_status`] (steps 1–4);
-/// the caller applies the agent-activity promotion/demotion around it.
+/// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
+/// the caller applies the attention/agent-activity promotion/demotion
+/// around it.
 fn compute_base_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
@@ -6156,11 +6761,16 @@ mod github_token_source_tests {
     use super::*;
     use intent_sourcecontrol::TokenSource;
 
-    fn registry_with(value: Option<&str>) -> Arc<SettingsRegistry> {
-        // Persist the directory (no RAII cleanup) so the config file outlives
-        // the registry handle without leaking the allocation.
-        let dir = tempfile::tempdir().expect("temp config dir").keep();
-        let registry = SettingsRegistry::load(dir.join("config.toml")).expect("load registry");
+    /// A registry backed by a fresh temp config dir; the returned guard keeps
+    /// the dir alive for the test and removes it on drop. Set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn registry_with(value: Option<&str>) -> (Arc<SettingsRegistry>, tempfile::TempDir) {
+        let mut dir = tempfile::tempdir().expect("temp config dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        let registry =
+            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
         if let Some(v) = value {
             registry
                 .apply(&[(
@@ -6169,7 +6779,7 @@ mod github_token_source_tests {
                 )])
                 .expect("apply tokenSource");
         }
-        Arc::new(registry)
+        (Arc::new(registry), dir)
     }
 
     /// No registry and the schema default both resolve to the full `Auto`
@@ -6178,7 +6788,7 @@ mod github_token_source_tests {
     #[test]
     fn defaults_to_auto() {
         assert_eq!(github_token_source(None), TokenSource::Auto);
-        let registry = registry_with(None);
+        let (registry, _dir) = registry_with(None);
         assert_eq!(github_token_source(Some(&registry)), TokenSource::Auto);
     }
 
@@ -6192,7 +6802,7 @@ mod github_token_source_tests {
             ("gh-cli", TokenSource::GhCli),
             ("explicit", TokenSource::Explicit),
         ] {
-            let registry = registry_with(Some(wire));
+            let (registry, _dir) = registry_with(Some(wire));
             assert_eq!(
                 github_token_source(Some(&registry)),
                 expected,
@@ -6519,7 +7129,7 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
 
 /// STAB-129: the group members whose recorded terminal event was
 /// `agent:failed` and that were not deleted — the candidates whose grouped
-/// watch is retained (as an ungrouped oneShot) across settlement because the
+/// watch is retained (as an ungrouped watch) across settlement because the
 /// underlying agent may still be working and settle for real later. The
 /// `deleted_agent_ids` guard is defensive: `record_group_child_completion`
 /// records at most one terminal event per child, so a deleted member's raw
@@ -7712,10 +8322,21 @@ impl WorkspaceApi for Services {
     fn specialist_list(
         &self,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.specialists_service()
-                .list(workspace_path.as_deref().map(Path::new))
+            let provider = specialist_preview_provider(provider)?;
+            let ws_path = workspace_path.as_deref().map(Path::new);
+            let mut result = self.specialists_service().list(ws_path)?;
+            if let Some(specs) = result
+                .get_mut("specialists")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for def in specs {
+                    decorate_specialist_resolved(self, def, ws_path, &provider);
+                }
+            }
+            Ok(result)
         })
     }
 
@@ -7723,10 +8344,16 @@ impl WorkspaceApi for Services {
         &self,
         id: String,
         workspace_path: Option<String>,
+        provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.specialists_service()
-                .get(&id, workspace_path.as_deref().map(Path::new))
+            let provider = specialist_preview_provider(provider)?;
+            let ws_path = workspace_path.as_deref().map(Path::new);
+            let mut result = self.specialists_service().get(&id, ws_path)?;
+            if let Some(def) = result.get_mut("specialist") {
+                decorate_specialist_resolved(self, def, ws_path, &provider);
+            }
+            Ok(result)
         })
     }
 
@@ -7966,11 +8593,12 @@ impl WorkspaceApi for Services {
 
     fn search_messages(
         &self,
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         query: String,
         agent_id: Option<String>,
         role: Option<String>,
         limit: Option<i64>,
+        prefer_workspace_id: Option<WorkspaceId>,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
@@ -7979,17 +8607,26 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let token = registry.register(&request_id);
-            let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let sessions = store.list_agent_sessions(&workspace_id).await?;
-            let matches = search_ops::message_matches(
-                &sessions,
-                &query,
-                agent_id.as_deref(),
-                role.as_deref(),
-                limit,
-            );
-            let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, Some(workspace_id), matches, token))
+            // User-typed queries are never handed to the FTS5 parser verbatim
+            // (as-you-type input would surface `fts5: syntax error`); a query
+            // with no searchable tokens yields empty matches, not an error.
+            let hits = match intent_search::fts_match_expr(&query) {
+                Some(expr) => {
+                    store
+                        .search_agent_messages_fts(
+                            &expr,
+                            workspace_id.as_ref(),
+                            agent_id.as_deref(),
+                            role.as_deref(),
+                            prefer_workspace_id.as_ref(),
+                            limit,
+                        )
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            let matches = to_value_vec(search_ops::message_fts_matches(hits, &query))?;
+            Ok(services.deliver_search(request_id, workspace_id, matches, token))
         })
     }
 
@@ -8176,7 +8813,8 @@ impl WorkspaceApi for Services {
 
     fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let pty = self.pty.clone();
-        Box::pin(async move { terminal_ops::list(&pty, &workspace_id) })
+        let boot_id = self.daemon_boot_id.clone();
+        Box::pin(async move { terminal_ops::list(&pty, &workspace_id, &boot_id) })
     }
 
     fn terminal_read_output(
@@ -8816,7 +9454,10 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 if ws.task_stats.is_some() {
                     let display_status = compute_display_status(
-                        ws.activity == WorkspaceActivity::AgentRunning,
+                        this.workspace_needs_attention(&ws.id).await,
+                        ws.activity == WorkspaceActivity::AgentRunning
+                            || this.workspace_has_active_hooks(&ws.id).await
+                            || this.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
                         ws.pr_status,
@@ -8857,6 +9498,10 @@ impl WorkspaceApi for Services {
             this.enrich_workspace_aggregates(&mut ws).await;
             Ok(ws)
         })
+    }
+
+    fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_disk_usage_op(id).await })
     }
 
     fn create_workspace(
@@ -9252,6 +9897,7 @@ impl WorkspaceApi for Services {
                         cow_supported: None,
                         display_status: None,
                         checkout_mode: None,
+                        disk_usage: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -10264,8 +10910,8 @@ impl WorkspaceApi for Services {
             // Deterministic cross-workspace consumption (monorepo#463): the
             // publishes above are best-effort (`None` bus, logged-and-skipped
             // delivery failures), so a chief parent's watch on a child here
-            // could otherwise leak forever (no cleanup deadline on oneShot
-            // watches) and a chief-anchored after_all group would stay
+            // could otherwise leak forever (watches have no timed cleanup)
+            // and a chief-anchored after_all group would stay
             // incomplete until restart. Deliver the same synthetic
             // `agent:deleted` directly, BEFORE the store cascade drops the
             // session rows (grouped delivery still resolves the child's
@@ -10344,6 +10990,10 @@ impl WorkspaceApi for Services {
             // emits no further events) and the row is pruned by the next
             // startup heal's workspace-existence check.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree
@@ -10572,6 +11222,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the sweep and still archives.
+        let manager = self.agent_manager();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -10586,6 +11240,43 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // Gracefully interrupt every in-flight turn in the workspace —
+            // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+            // turn cancelled over the wire, draining worker aborted, terminal
+            // `agent:stream:end` emitted, provider child + ACP session kept
+            // alive. Unlike `delete_workspace` nothing is deleted: session
+            // rows, transcripts, completion watches, and pending message
+            // queues all survive so unarchive can resume work. Runs AFTER the
+            // archived row is persisted so any concurrent queue-drain kick
+            // observes the archived flag and parks instead of respawning a
+            // turn (see the archived gate in `try_drain_queue`).
+            //
+            // Residual race (deliberate trade-off): a drain that read the
+            // workspace row BEFORE the persist above can still claim the
+            // in-flight slot after the `list_busy` snapshot below, spawning
+            // one stray turn in the freshly archived workspace that this
+            // sweep misses. The window is a few statements wide and the
+            // failure is benign — that turn runs to completion once and every
+            // subsequent drain/wake parks behind the archived gates — so the
+            // sweep accepts it rather than adding a post-claim re-check to
+            // the hot drain path.
+            if let Some(manager) = manager {
+                for (agent_id, agent_ws) in manager.list_busy() {
+                    if agent_ws == id {
+                        manager.interrupt(&agent_id).await;
+                    }
+                }
+            }
+            // Cancel every active background hook in the workspace: task
+            // aborted, state persisted to `cancelled`, `hook:cancelled`
+            // emitted, owner woken with a notice. Unarchive does NOT
+            // resurrect cancelled hooks — the notice tells the owner to
+            // reschedule if the condition still matters. Runs AFTER the
+            // archived row is persisted so the cancel wakes park behind the
+            // archived gate in `deliver_wake_message` (queued at most, no
+            // turn spawned) — the same reason the interrupt sweep above
+            // runs post-persist.
+            this.cancel_workspace_hooks(&id).await;
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
@@ -10618,6 +11309,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        let manager = self.agent_manager();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -10628,6 +11320,36 @@ impl WorkspaceApi for Services {
             ws.archived_at = None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Re-engage queues parked by the archived gates
+            // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
+            // background agent's drain organically, so without this a queue
+            // parked during archive — including the hook-cancel wake notices
+            // — would stay stranded until someone happened to message the
+            // agent. Kick the drain for every workspace agent with
+            // ready-to-send work (cheap summary read, no message hydration);
+            // `try_drain_queue` re-checks its own gates (busy, question
+            // hold, Error park). Best-effort: a listing failure is logged
+            // and unarchive still succeeds — parked queues then drain on the
+            // next explicit kick.
+            if let Some(manager) = manager {
+                match store.list_agent_session_summaries(&id).await {
+                    Ok(sessions) => {
+                        for session in sessions {
+                            if this.has_ready_to_send(&session.id) {
+                                manager
+                                    .clone()
+                                    .try_drain_queue(session.id, id.clone())
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "unarchive: agent session listing failed; parked queues drain on next kick"
+                    ),
+                }
+            }
             this.derive_last_activity(&mut ws).await;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
@@ -10770,6 +11492,7 @@ impl WorkspaceApi for Services {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                disk_usage: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
@@ -11291,21 +12014,22 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
-            let changed = ws.attention != WorkspaceAttention::None;
-            ws.attention = WorkspaceAttention::None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
+            // Dismissing attention merely acknowledges it — not "activity" —
+            // so never touch `updated_at` (which feeds the derived
+            // `lastActivity`), and skip the row write entirely when attention
+            // is already clear (intent-hq/monorepo#1466).
+            if ws.attention != WorkspaceAttention::None {
+                ws.attention = WorkspaceAttention::None;
+                store.update_workspace(&ws).await?;
+                // Self-sufficient `workspace:attention-changed` so every client
+                // clears the blue dot together (PROTOCOL §6.5); emit only on an
+                // actual change.
+                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
-            // Self-sufficient `workspace:attention-changed` so every client clears
-            // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
-            if changed {
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
-            }
             Ok(ws)
         })
     }
@@ -11320,13 +12044,13 @@ impl WorkspaceApi for Services {
             }
             let mut ws = store.get_workspace(&id).await?;
             // "Seen" clears the unread flag; review-required attention persists.
+            // Merely looking at a workspace is not "activity", so `updated_at`
+            // (which feeds the derived `lastActivity`) stays untouched
+            // (intent-hq/monorepo#1466).
             if ws.attention == WorkspaceAttention::Unread {
                 ws.attention = WorkspaceAttention::None;
-                ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
             }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
@@ -13862,18 +14586,22 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }
             // Registers the subscription with a live bus delivery task
             // (matching + batching + subscriber wake, monorepo#937); bare `*`
-            // expands to the category wildcards inside registration.
+            // expands to the category wildcards inside registration
+            // (narrowed to the non-agent categories for agent subscribers).
             let (subscription_id, resolved) = self
                 .register_event_subscription(
                     &workspace_id,
@@ -15359,6 +16087,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_op(workspace_id).await })
     }
 
+    fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_list_active_op().await })
+    }
+
     fn agent_get(
         &self,
         agent_id: AgentId,
@@ -15373,10 +16105,17 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
+        around_message_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_get_conversation_op(agent_id, limit, workspace_id, page_token)
-                .await
+            self.agent_get_conversation_op(
+                agent_id,
+                limit,
+                workspace_id,
+                page_token,
+                around_message_id,
+            )
+            .await
         })
     }
 
@@ -15789,6 +16528,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_remove_queued_message_owned(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        caller_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_remove_queued_message_owned_op(agent_id, message_id, caller_agent_id)
+                .await
+        })
+    }
+
     fn agent_get_queue(
         &self,
         agent_id: AgentId,
@@ -16067,6 +16818,36 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_watch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_watch_op(workspace_id, caller_agent_id, target_agent_id)
+                .await
+        })
+    }
+
+    fn agent_unwatch(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        subscription_id: Option<String>,
+        target_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_unwatch_op(
+                workspace_id,
+                caller_agent_id,
+                subscription_id,
+                target_agent_id,
+            )
+            .await
+        })
+    }
+
     fn app_agents_wait(
         &self,
         workspace_id: WorkspaceId,
@@ -16199,12 +16980,15 @@ impl WorkspaceApi for Services {
             // would match EVERY event (and persist that across restarts).
             if event_types.is_empty() {
                 return Err(Error::Internal(
-                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                    "eventTypes is required. Specify category wildcards like \"file:*\", \"task:*\" or specific types like \"file:changed\".".to_string(),
                 ));
             }
-            // Fail closed on a phantom subscriber before registering
-            // (monorepo#568 precedent for agent.watchCompletion).
             if let Some(subscriber) = &subscriber_agent_id {
+                // Agent callers may not subscribe to agent events — they use
+                // ws.agent.watch instead (monorepo#1229).
+                event_subscriptions::validate_agent_event_types(&event_types)?;
+                // Fail closed on a phantom subscriber before registering
+                // (monorepo#568 precedent for agent.watchCompletion).
                 self.validate_event_subscriber(&workspace_id, subscriber)
                     .await?;
             }
@@ -16626,6 +17410,124 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_state(
+        &self,
+        workspace_id: WorkspaceId,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
+                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
+                    "PR #{pr_number} not found in the workspace repository"
+                )),
+                other => pr_ops::map_sc_err(other),
+            })?;
+            let state = pr_ops::derive_status_state(&pr);
+            let mergeable_state = pr
+                .mergeable_state
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let merge_blocked_reason =
+                pr_ops::merge_blocked_reason(state, pr.mergeable, &mergeable_state);
+
+            // Check runs on the PR head (SHA, else source branch). Providers
+            // without check-run support — or a PR whose head cannot be
+            // determined — report an empty tally rather than failing the
+            // whole snapshot.
+            let head_ref = pr
+                .head_sha
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
+            let (check_summary, failed_names) = match &head_ref {
+                Some(git_ref) if sc.capabilities().check_runs => {
+                    let runs = sc
+                        .check_runs(&repo_ref, git_ref)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                    (
+                        pr_ops::summarize_check_runs(&runs),
+                        pr_ops::failed_check_names(&runs),
+                    )
+                }
+                _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
+            };
+
+            let reviews = sc
+                .list_reviews(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let agg = pr_ops::aggregate_reviews(&reviews);
+            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+
+            let conversation = sc
+                .list_comments(&repo_ref, pr_number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let conversation_count = conversation.len() as i64;
+            // Inline review comments: threads via GraphQL when available,
+            // falling back to the flat REST list grouped by reply parent (the
+            // same fallback as `pr.listReviewComments`; resolution state is
+            // unavailable there, so every fallback thread counts as
+            // unresolved).
+            let threads =
+                match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
+                    .await
+                {
+                    Ok((threads, _, _)) => threads,
+                    Err(_) => {
+                        let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
+                            sc.list_review_comments(&repo_ref, pr_number, p)
+                        })
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                        pr_ops::fallback_threads(comments)
+                    }
+                };
+            let (review_comment_count, unresolved_thread_count) =
+                pr_ops::count_thread_comments(&threads);
+
+            Ok(serde_json::json!({
+                "prNumber": pr_number,
+                "title": pr.title,
+                "url": pr.url,
+                "state": state,
+                "isDraft": state == "draft",
+                "isMerged": state == "merged",
+                "isClosed": state == "closed",
+                "headSha": pr.head_sha,
+                "updatedAt": pr.updated_at,
+                "mergeable": pr.mergeable,
+                "mergeableState": mergeable_state,
+                "mergeBlockedReason": merge_blocked_reason,
+                "checks": {
+                    "total": check_summary.total,
+                    "passed": check_summary.passed,
+                    "failed": check_summary.failed,
+                    "pending": check_summary.pending,
+                    "failedNames": failed_names,
+                },
+                "reviews": {
+                    "decision": decision,
+                    "approvals": agg.approval_count,
+                    "changesRequested": agg.changes_requested_count,
+                },
+                "comments": {
+                    "conversationCount": conversation_count,
+                    "reviewCommentCount": review_comment_count,
+                    "unresolvedThreadCount": unresolved_thread_count,
+                    "totalCount": conversation_count + review_comment_count,
+                },
+            }))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // pr.* write/action surface (PROTOCOL §5.7). Same active-PR enforcement as
     // the read methods; validation/poll glue lives in `pr_ops`.
@@ -16879,86 +17781,6 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "review": review }))
-        })
-    }
-
-    fn pr_wait_for_changes(
-        &self,
-        workspace_id: WorkspaceId,
-        timeout_seconds: Option<i64>,
-        poll_interval_seconds: Option<i64>,
-        watch: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let watch = pr_ops::validate_watch_mode(watch)?;
-            let timeout = pr_ops::clamp_timeout(timeout_seconds);
-            let poll_interval = pr_ops::clamp_poll_interval(poll_interval_seconds);
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
-
-            let timeout_ms = timeout * 1000;
-            let poll_ms = poll_interval * 1000;
-            let safety_ms = pr_ops::SAFETY_PADDING_SECONDS * 1000;
-            let effective_ms = timeout_ms.min(poll_ms.max(timeout_ms.saturating_sub(safety_ms)));
-
-            let start = tokio::time::Instant::now();
-            let initial = capture_pr_snapshot(&*sc, &repo_ref, number)
-                .await
-                .ok_or_else(|| {
-                    Error::Internal(format!("Could not fetch PR #{number} for {owner}/{repo}."))
-                })?;
-            let mut baseline = initial.clone();
-            let mut last = initial;
-            let mut iterations: u64 = 0;
-
-            loop {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                if elapsed_ms >= effective_ms {
-                    break;
-                }
-                iterations += 1;
-                let remaining = effective_ms - elapsed_ms;
-                tokio::time::sleep(std::time::Duration::from_millis(poll_ms.min(remaining))).await;
-                let current = match capture_pr_snapshot(&*sc, &repo_ref, number).await {
-                    Some(s) => s,
-                    None => continue,
-                };
-                last = current.clone();
-                if baseline.check_runs_fetch_failed && !current.check_runs_fetch_failed {
-                    baseline.check_runs = current.check_runs.clone();
-                    baseline.check_runs_fetch_failed = false;
-                }
-                let changes = pr_ops::detect_changes(&baseline, &current, &watch);
-                if !changes.is_empty() {
-                    let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
-                    let summary = pr_ops::format_change_summary(&changes, &current, elapsed_s);
-                    return Ok(serde_json::json!({
-                        "changed": true,
-                        "changes": changes,
-                        "elapsedSeconds": elapsed_s,
-                        "iterations": iterations,
-                        "snapshot": pr_ops::snapshot_json(&current),
-                        "summary": summary,
-                    }));
-                }
-            }
-
-            let elapsed_s = ((start.elapsed().as_millis() as f64) / 1000.0).round() as u64;
-            Ok(serde_json::json!({
-                "changed": false,
-                "elapsedSeconds": elapsed_s,
-                "iterations": iterations,
-                "snapshot": pr_ops::snapshot_json(&last),
-                "summary": format!(
-                    "⏱️ Timeout reached after {elapsed_s} seconds without detecting changes.\n\
-                     Watched mode: {watch}\nPolls performed: {iterations}"
-                ),
-            }))
         })
     }
 
@@ -18019,6 +18841,73 @@ impl WorkspaceApi for Services {
         })
     }
 
+    // ========================================================================
+    // voice.transcribe — daemon-side speech-to-text. Maps onto the
+    // `VoiceEngine` trait; the engine resolves the API key (secrets store /
+    // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
+    // provider. A missing/invalid key → `VoiceNotConfigured` ("not
+    // configured", graceful). Validation/context-merging glue lives in
+    // `voice_ops`. The API keys are never logged or returned over the wire.
+    // ========================================================================
+
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.voice_engine.clone();
+        Box::pin(async move {
+            let parsed = voice_ops::parse_request(&params)?;
+            // Provider: per-call override, else the `voice.provider` setting.
+            let setting = self
+                .settings_service()
+                .get("voice.provider")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let provider = voice_ops::select_provider(setting.as_deref(), parsed.provider_override);
+            // Vocabulary: the `voice.vocabulary` setting (defaults from the
+            // catalog); a malformed stored value degrades to an empty list.
+            let vocabulary_value = self
+                .settings_service()
+                .get("voice.vocabulary")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").cloned());
+            let vocabulary = voice_ops::parse_vocabulary_setting(vocabulary_value.as_ref());
+            // OpenAI model: the `voice.openai.model` setting (catalog default
+            // applies when unset). Ignored by other providers.
+            let openai_model = self
+                .settings_service()
+                .get("voice.openai.model")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            // Language: per-call hint, else the `voice.language` setting,
+            // else none (provider auto-detection).
+            let language_setting = self
+                .settings_service()
+                .get("voice.language")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let language = voice_ops::resolve_language(
+                parsed.language.as_deref(),
+                language_setting.as_deref(),
+            );
+            let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
+            let transcript = engine
+                .transcribe(request)
+                .await
+                .map_err(voice_ops::map_voice_err)?;
+            Ok(serde_json::json!({
+                "text": transcript.text,
+                "provider": engine.provider_name(),
+                "durationMs": transcript.duration_ms,
+            }))
+        })
+    }
+
     fn file_tracking_get_changes(
         &self,
         workspace_id: WorkspaceId,
@@ -18460,6 +19349,61 @@ impl WorkspaceApi for Services {
                     })?;
             browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
         })
+    }
+
+    /// `ws.host.exec` (agent-JS binding seam): delegate to the shared one-shot
+    /// exec primitive with the caller's workspace pinned as the cwd
+    /// containment root. Semantics are identical to the wire `host.exec`
+    /// (argv-only, `timeoutMs` process-group reap, secret-safe env).
+    fn host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { host_exec::run_for_workspace(self, workspace_id, params).await })
+    }
+
+    /// `hook.schedule`: validate + immediate real run + persist + spawn the
+    /// per-hook scheduler task (see `hook_manager`).
+    fn hook_schedule(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.hook_schedule_op(&workspace_id, &agent_id, &params)
+                .await
+        })
+    }
+
+    /// `hook.list`: hooks in a workspace, optionally one agent's.
+    fn hook_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
+    }
+
+    /// `hook.cancel`: stop an active hook; a non-owner (FE) cancel wakes the
+    /// owning agent with a notice.
+    fn hook_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        by_owner: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_cancel_op(&workspace_id, &hook_id, by_owner).await })
+    }
+
+    /// `hook.runNow`: trigger an immediate run of an active hook.
+    fn hook_run_now(
+        &self,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
     }
 }
 
@@ -20103,26 +21047,6 @@ async fn ft_worktree(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBu
 /// The empty `file-tracking.getChanges` result (TS `emptyChangesResult`).
 fn empty_changes_result() -> serde_json::Value {
     serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
-}
-
-/// Capture a `pr.waitForChanges` poll snapshot (TS `captureSnapshot`): the PR
-/// plus its head-commit check-runs. Returns `None` when the PR cannot be
-/// fetched (the caller treats the initial `None` as fatal, later ones as a
-/// transient skip).
-async fn capture_pr_snapshot(
-    sc: &dyn intent_sourcecontrol::SourceControl,
-    repo_ref: &intent_sourcecontrol::RepoRef,
-    number: u64,
-) -> Option<pr_ops::PrSnapshot> {
-    let pr = sc.get_pr(repo_ref, number).await.ok()?;
-    let checks = match pr.head_sha.as_deref().filter(|s| !s.is_empty()) {
-        None => pr_ops::CheckFetch::NotAttempted,
-        Some(sha) => match sc.check_runs(repo_ref, sha).await {
-            Ok(runs) => pr_ops::CheckFetch::Ok(runs),
-            Err(_) => pr_ops::CheckFetch::Failed,
-        },
-    };
-    Some(pr_ops::build_snapshot(&pr, checks))
 }
 
 /// Load a workspace for a `pr.*` call, mapping a missing workspace onto the

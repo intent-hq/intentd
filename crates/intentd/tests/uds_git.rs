@@ -86,6 +86,7 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -127,8 +128,9 @@ async fn uds_git_write_ops_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -421,8 +423,9 @@ async fn uds_git_write_ops_wave_b_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -603,8 +606,9 @@ async fn uds_git_read_ops_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -762,8 +766,9 @@ async fn uds_git_commit_details_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -890,8 +895,9 @@ async fn uds_git_branch_status_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -1054,8 +1060,9 @@ async fn uds_git_get_branches_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -1199,8 +1206,9 @@ async fn uds_git_pull_round_trip() {
     };
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -1327,8 +1335,9 @@ async fn uds_git_read_ops_extensions_round_trip() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {

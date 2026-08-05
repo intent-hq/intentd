@@ -15,9 +15,9 @@
 //!   live in `secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
-//!   `workspaceInitializer.state`, `repos.known`, `endUserRules`,
-//!   `permissions.rules`, `userRules`, `workspaceRules`) — high-churn
-//!   state that stays SQLite-backed.
+//!   `workspaceInitializer.state`, `hardwareConsole.state`, `repos.known`,
+//!   `endUserRules`, `permissions.rules`, `userRules`, `workspaceRules`) —
+//!   high-churn state that stays SQLite-backed.
 //!
 //! Keys that older daemons **used to** persist here but that have since moved
 //! back to SQLite or been removed outright are listed in
@@ -34,7 +34,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS};
+use crate::config::{
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+};
 use crate::error::{Error, Result};
 
 /// Root of the `config.toml` schema. One field per top-level TOML table.
@@ -53,12 +56,16 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
+    pub voice: VoiceSettings,
     pub context: ContextSettings,
     pub storage: StorageSettings,
     pub workspaces: WorkspacesSettings,
     pub logging: LoggingSettings,
     pub agents: AgentsSettings,
     pub events: EventsSettings,
+    pub workspace_api: WorkspaceApiSettings,
+    pub hooks: HooksSettings,
+    pub agent_features: AgentFeaturesSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -355,6 +362,52 @@ pub struct SentrySettings {
     pub organization: Option<String>,
 }
 
+/// `[voice]` — speech-to-text (`voice.*`). The provider API keys
+/// (`voice.elevenlabs.apiKey`, `voice.openai.apiKey`) are secrets and live in
+/// `secrets.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceSettings {
+    /// `voice.provider` — active speech-to-text provider.
+    pub provider: VoiceProvider,
+    /// `voice.language` — default transcription language hint (ISO-639-1
+    /// code, e.g. `"en"`) applied when a `voice.transcribe` call carries no
+    /// per-call `language`. Unset/empty → provider auto-detection.
+    pub language: Option<String>,
+    /// `[voice.openai]` — OpenAI provider tuning.
+    pub openai: VoiceOpenAiSettings,
+}
+
+/// `voice.provider` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceProvider {
+    #[default]
+    Elevenlabs,
+    Openai,
+}
+
+/// `[voice.openai]` — OpenAI speech-to-text tuning (`voice.openai.*`,
+/// non-secret; the API key is a secret in `secrets.json`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceOpenAiSettings {
+    /// `voice.openai.model` — transcription model.
+    pub model: VoiceOpenAiModel,
+}
+
+/// `voice.openai.model` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VoiceOpenAiModel {
+    #[default]
+    #[serde(rename = "gpt-4o-transcribe")]
+    Gpt4oTranscribe,
+    #[serde(rename = "gpt-4o-mini-transcribe")]
+    Gpt4oMiniTranscribe,
+    #[serde(rename = "whisper-1")]
+    Whisper1,
+}
+
 /// `[context]` — context engine (`context.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -423,6 +476,12 @@ pub struct AgentsSettings {
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
+    /// `agents.flushQueuedMessages` — how the whole queued-message backlog
+    /// is delivered when an idle agent drains its queue: `all` batches every
+    /// ready entry into one turn, `systemOnly` batches only system-origin
+    /// entries (user-origin entries stay FIFO), `off` is one turn per queued
+    /// message.
+    pub flush_queued_messages: FlushQueuedMessagesMode,
 }
 
 impl Default for AgentsSettings {
@@ -430,6 +489,50 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
+            flush_queued_messages: FlushQueuedMessagesMode::All,
+        }
+    }
+}
+
+/// `agents.flushQueuedMessages` values. Serializes as camelCase strings
+/// (`"all"`, `"systemOnly"`, `"off"`); deserialization also accepts the
+/// legacy boolean shape (`true` → [`FlushQueuedMessagesMode::All`], `false` →
+/// [`FlushQueuedMessagesMode::Off`]) so an existing `config.toml` written by
+/// an older daemon still loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FlushQueuedMessagesMode {
+    /// Batch every ready-to-send entry into one combined turn.
+    #[default]
+    All,
+    /// Batch only system-origin ready entries; user-origin entries stay FIFO.
+    SystemOnly,
+    /// One turn per queued message (legacy `false`).
+    Off,
+}
+
+impl<'de> Deserialize<'de> for FlushQueuedMessagesMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            String(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(FlushQueuedMessagesMode::All),
+            Repr::Bool(false) => Ok(FlushQueuedMessagesMode::Off),
+            Repr::String(s) => match s.as_str() {
+                "all" => Ok(FlushQueuedMessagesMode::All),
+                "systemOnly" => Ok(FlushQueuedMessagesMode::SystemOnly),
+                "off" => Ok(FlushQueuedMessagesMode::Off),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown variant `{other}`, expected one of `all`, `systemOnly`, `off`"
+                ))),
+            },
         }
     }
 }
@@ -447,6 +550,92 @@ impl Default for EventsSettings {
     fn default() -> Self {
         Self {
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
+        }
+    }
+}
+
+/// `[workspaceApi]` — `workspace_api` tool output knobs (`workspaceApi.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkspaceApiSettings {
+    /// `workspaceApi.maxOutputChars` — max characters of one `workspace_api`
+    /// tool result before the output is redirected to a file (0 = unlimited;
+    /// min 1000 when non-zero, max 10000000).
+    pub max_output_chars: u32,
+    /// `workspaceApi.toonOutput` — TOON-encode `workspace_api` tool results
+    /// (token-efficient) instead of plain JSON.
+    pub toon_output: bool,
+}
+
+impl Default for WorkspaceApiSettings {
+    fn default() -> Self {
+        Self {
+            max_output_chars: DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+            toon_output: DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+        }
+    }
+}
+
+/// `[hooks]` — background-hook scheduler knobs (`hooks.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct HooksSettings {
+    /// `hooks.maxPerAgent` — cap on concurrently active (scheduled/running)
+    /// hooks per agent.
+    pub max_per_agent: u32,
+}
+
+impl Default for HooksSettings {
+    fn default() -> Self {
+        Self {
+            max_per_agent: DEFAULT_HOOKS_MAX_PER_AGENT,
+        }
+    }
+}
+
+/// `[agentFeatures]` — per-feature toggles for what agents see and may call
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentFeaturesSettings {
+    /// `agentFeatures.backgroundHooks` — expose background hooks
+    /// (`ws.hook.*`) to agents.
+    pub background_hooks: bool,
+    /// `agentFeatures.hostExec` — expose one-shot host command execution
+    /// (`ws.host.exec`) to agents.
+    pub host_exec: bool,
+    /// `agentFeatures.scripts` — expose saved scripts (`ws.script.*`) to
+    /// agents.
+    pub scripts: bool,
+    /// `agentFeatures.terminalAccess` — expose terminal read access
+    /// (`ws.terminal.*`) to agents.
+    pub terminal_access: bool,
+    /// `agentFeatures.browserAutomation` — expose browser automation
+    /// (`ws.browser.*`) to agents.
+    pub browser_automation: bool,
+    /// `agentFeatures.richChatBlocks` — include rich chat block guidance
+    /// (mermaid, ws-block, nav-link) in agent prompts.
+    pub rich_chat_blocks: bool,
+    /// `agentFeatures.structuredQuestions` — expose structured questions
+    /// (`ws.app.question.ask`) to agents.
+    pub structured_questions: bool,
+    /// `agentFeatures.attentionRequests` — expose attention requests
+    /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
+    pub attention_requests: bool,
+}
+
+impl Default for AgentFeaturesSettings {
+    fn default() -> Self {
+        Self {
+            background_hooks: true,
+            host_exec: true,
+            scripts: true,
+            terminal_access: true,
+            browser_automation: true,
+            rich_chat_blocks: true,
+            structured_questions: true,
+            attention_requests: true,
         }
     }
 }
@@ -593,6 +782,13 @@ impl SettingsFile {
                     "must be between 0 and 200, got {}",
                     self.agents.max_concurrent
                 ),
+            ));
+        }
+        let chars = self.workspace_api.max_output_chars;
+        if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
+            return Err(bad(
+                "workspaceApi.maxOutputChars",
+                format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
         Ok(())
@@ -782,6 +978,21 @@ exposeGitCredentialToChildren = true
 # accounts.sentry.token secret).
 # organization = "my-org"
 
+[voice]
+# Voice provider -- active speech-to-text provider: "elevenlabs" or "openai".
+# The API keys are secrets and live in secrets.json (voice.elevenlabs.apiKey /
+# voice.openai.apiKey).
+provider = "elevenlabs"
+# Voice language -- default transcription language hint (ISO-639-1 code)
+# used when a voice.transcribe call has no per-call language. Unset means
+# provider auto-detection.
+# language = "en"
+
+[voice.openai]
+# OpenAI voice model -- transcription model: "gpt-4o-transcribe",
+# "gpt-4o-mini-transcribe", or "whisper-1".
+model = "gpt-4o-transcribe"
+
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -810,11 +1021,51 @@ maxConcurrent = 0
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
+# Flush queued messages -- how the queued-message backlog is delivered when
+# an idle agent drains its queue: "all", "systemOnly", or "off".
+flushQueuedMessages = "all"
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
 # retention/compaction sweep deletes them (0 disables).
 streamRetentionHours = 72
+
+[workspaceApi]
+# Max workspace API output chars -- max characters of one workspace_api tool
+# result before the output is redirected to a file (0 = unlimited; min 1000
+# when non-zero).
+maxOutputChars = 100000
+# TOON output -- TOON-encode workspace_api tool results (token-efficient)
+# instead of plain JSON.
+toonOutput = true
+
+[hooks]
+# Max hooks per agent -- cap on concurrently active (scheduled/running)
+# background hooks per agent.
+maxPerAgent = 5
+
+[agentFeatures]
+# All toggles default to on; changes apply to new agent sessions only.
+# Background hooks -- expose background hooks (ws.hook.*) to agents.
+backgroundHooks = true
+# Host exec -- expose one-shot host command execution (ws.host.exec) to
+# agents.
+hostExec = true
+# Saved scripts -- expose saved scripts (ws.script.*) to agents.
+scripts = true
+# Terminal access -- expose terminal read access (ws.terminal.*) to agents.
+terminalAccess = true
+# Browser automation -- expose browser automation (ws.browser.*) to agents.
+browserAutomation = true
+# Rich chat blocks -- include rich chat block guidance (mermaid, ws-block,
+# nav-link) in agent prompts.
+richChatBlocks = true
+# Structured questions -- expose structured questions (ws.app.question.ask)
+# to agents.
+structuredQuestions = true
+# Attention requests -- expose attention requests (ws.agent.reportBlocker /
+# ws.agent.requestDiscussion) to agents.
+attentionRequests = true
 "##;
 
 #[cfg(test)]
@@ -880,28 +1131,73 @@ mod tests {
         );
         assert!(d.source_control.github.expose_git_credential_to_children);
         assert_eq!(d.accounts.sentry.organization, None);
+        assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
+        assert_eq!(d.voice.language, None);
+        assert_eq!(d.voice.openai.model, VoiceOpenAiModel::Gpt4oTranscribe);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
+        assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
         );
+        assert_eq!(
+            d.workspace_api.max_output_chars,
+            DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS
+        );
+        assert_eq!(
+            d.workspace_api.toon_output,
+            DEFAULT_WORKSPACE_API_TOON_OUTPUT
+        );
+        assert_eq!(d.hooks.max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
+        assert!(d.agent_features.background_hooks);
+        assert!(d.agent_features.host_exec);
+        assert!(d.agent_features.scripts);
+        assert!(d.agent_features.terminal_access);
+        assert!(d.agent_features.browser_automation);
+        assert!(d.agent_features.rich_chat_blocks);
+        assert!(d.agent_features.structured_questions);
+        assert!(d.agent_features.attention_requests);
     }
 
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\n\n[events]\nstreamRetentionHours = 24\n\n[server.wsApi]\nenabled = true\nport = 2000\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::Off
+        );
         assert_eq!(parsed.events.stream_retention_hours, 24);
+        assert_eq!(parsed.workspace_api.max_output_chars, 5000);
+        assert!(!parsed.workspace_api.toon_output);
         assert!(parsed.server.ws_api.enabled);
         assert_eq!(parsed.server.ws_api.port, 2000);
+        assert_eq!(parsed.hooks.max_per_agent, 9);
+        assert!(!parsed.agent_features.background_hooks);
+        assert!(!parsed.agent_features.host_exec);
+        assert!(!parsed.agent_features.rich_chat_blocks);
+        // Keys absent from a partial [agentFeatures] table keep their default.
+        assert!(parsed.agent_features.scripts);
+        assert!(parsed.agent_features.terminal_access);
+        assert!(parsed.agent_features.browser_automation);
+        assert!(parsed.agent_features.structured_questions);
+        assert!(parsed.agent_features.attention_requests);
+    }
+
+    #[test]
+    fn agent_features_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[agentFeatures]\nhostExek = false\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agentFeatures"), "names the table: {msg}");
+        assert!(msg.contains("hostExek"), "names the bad key: {msg}");
     }
 
     #[test]
@@ -943,6 +1239,43 @@ mod tests {
     }
 
     #[test]
+    fn flush_queued_messages_accepts_string_variants() {
+        for (raw, expected) in [
+            ("\"all\"", FlushQueuedMessagesMode::All),
+            ("\"systemOnly\"", FlushQueuedMessagesMode::SystemOnly),
+            ("\"off\"", FlushQueuedMessagesMode::Off),
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nflushQueuedMessages = {raw}\n"))
+                    .expect("parses");
+            assert_eq!(parsed.agents.flush_queued_messages, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn flush_queued_messages_accepts_legacy_booleans() {
+        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = true\n")
+            .expect("legacy true parses");
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::All
+        );
+        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = false\n")
+            .expect("legacy false parses");
+        assert_eq!(
+            parsed.agents.flush_queued_messages,
+            FlushQueuedMessagesMode::Off
+        );
+    }
+
+    #[test]
+    fn flush_queued_messages_rejects_unknown_string() {
+        let err =
+            SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
+        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
+    }
+
+    #[test]
     fn negative_integer_for_u32_is_rejected() {
         let err = SettingsFile::parse_str("[agents]\nidleReapMinutes = -1\n").unwrap_err();
         assert!(err.to_string().contains("agents.idleReapMinutes"), "{err}");
@@ -955,6 +1288,14 @@ mod tests {
             ("[server]\nport = 80\n", "server.port"),
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
+            (
+                "[workspaceApi]\nmaxOutputChars = 500\n",
+                "workspaceApi.maxOutputChars",
+            ),
+            (
+                "[workspaceApi]\nmaxOutputChars = 20000000\n",
+                "workspaceApi.maxOutputChars",
+            ),
         ] {
             let err = SettingsFile::parse_str(body).unwrap_err();
             assert!(
@@ -962,6 +1303,12 @@ mod tests {
                 "{body:?} should fail naming `{key}`: {err}"
             );
         }
+    }
+
+    #[test]
+    fn workspace_api_max_output_chars_zero_means_unlimited() {
+        let parsed = SettingsFile::parse_str("[workspaceApi]\nmaxOutputChars = 0\n").unwrap();
+        assert_eq!(parsed.workspace_api.max_output_chars, 0);
     }
 
     #[test]

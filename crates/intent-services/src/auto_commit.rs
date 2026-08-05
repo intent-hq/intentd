@@ -388,7 +388,12 @@ impl Services {
             task_title.as_deref(),
             &session.name,
         );
-        let system_prompt = get_instruction_with_common("commit-message");
+        // `commit-message` is a non-interactive background body with no
+        // feature-gated sections, so default flags are always correct here.
+        let system_prompt = get_instruction_with_common(
+            "commit-message",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        );
 
         // Call agent_complete_once_op.
         let result = self

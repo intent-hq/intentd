@@ -15,6 +15,16 @@ use intent_store::Store;
 
 use crate::Services;
 
+/// Runs before `main()` — and therefore before any test threads exist, making
+/// `set_var` race-free. Node children spawned by lib tests (e.g. the real
+/// `auggie` CLI in `auto_commit` tests) inherit this and skip
+/// `module.enableCompileCache()`, which would otherwise leave a
+/// `node-compile-cache/` residue at the TMPDIR root after the suite.
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
 /// Guard for tests that mutate debounce env vars to prevent parallel test
 /// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
 /// WORKSPACE_IDLE debounce vars.
@@ -56,6 +66,20 @@ impl Drop for DebounceEnvGuard {
             std::env::remove_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         }
     }
+}
+
+/// Create a temp dir with a recognizable `prefix` under the system temp root.
+/// The returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test tempdir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
 }
 
 struct TempDb {
@@ -143,6 +167,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -274,6 +299,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
     store
@@ -336,6 +362,80 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
+    // diskUsage left the hot read path (monorepo#1396): list/get rows never
+    // carry it — clients fetch it via the on-demand `workspace.diskUsage`.
+    assert!(got.disk_usage.is_none());
+    assert!(v.get("diskUsage").is_none());
+}
+
+/// `workspace.diskUsage` cache-state → response mapping: a qualifying row
+/// with a provisioned directory answers `{ refreshing: true }` first (walk
+/// armed, field omitted), backfills to `{ diskUsage, refreshing: false }`
+/// once the walk settles, a skip-isolation row and a never-provisioned
+/// directory answer `{ refreshing: false }` without arming anything, and an
+/// unknown id is `NotFound`.
+#[tokio::test]
+async fn workspace_disk_usage_op_maps_cache_states() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    // Qualifying row with a provisioned daemon-managed directory.
+    let ws = WorkspaceId::new();
+    let mut managed = workspace(&ws);
+    let checkout = root.path().join(ws.as_str()).join("repo");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    std::fs::write(checkout.join("data.bin"), vec![0xCD; 8192]).expect("seed file");
+    managed.worktree_path = Some(checkout.to_string_lossy().into_owned());
+    store.insert_workspace(&managed).await.expect("ws");
+
+    // Skip-isolation row: no daemon-managed directory by construction.
+    let ws_skip = WorkspaceId::new();
+    let mut skip = workspace(&ws_skip);
+    skip.skip_worktree = true;
+    store.insert_workspace(&skip).await.expect("ws skip");
+
+    // Qualifying row whose directory was never provisioned on disk.
+    let ws_bare = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws_bare))
+        .await
+        .expect("ws bare");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    // First call arms the walk: refreshing true, field omitted (absent, not null).
+    let first = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+    assert_eq!(first["refreshing"], serde_json::json!(true));
+    assert!(first.get("diskUsage").is_none(), "{first}");
+
+    // Bounded poll until the backfill settles: diskUsage + refreshing false.
+    let mut settled = None;
+    for _ in 0..200 {
+        let got = svc.workspace_disk_usage_op(ws.clone()).await.expect("op");
+        if got.get("diskUsage").is_some() && got["refreshing"] == serde_json::json!(false) {
+            settled = Some(got);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = settled.expect("diskUsage backfilled + settled");
+    assert!(got["diskUsage"]["bytes"].as_u64().unwrap() >= 8192);
+    assert_eq!(got["diskUsage"]["fileCount"], serde_json::json!(1));
+
+    // Skip-isolation and never-provisioned rows: nothing to walk or refresh.
+    for id in [&ws_skip, &ws_bare] {
+        let got = svc.workspace_disk_usage_op(id.clone()).await.expect("op");
+        assert_eq!(got["refreshing"], serde_json::json!(false), "{got}");
+        assert!(got.get("diskUsage").is_none(), "{got}");
+    }
+
+    // Unknown id: standard NotFound.
+    let err = svc
+        .workspace_disk_usage_op(WorkspaceId::from("ws_missing"))
+        .await
+        .expect_err("unknown id errors");
+    assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
 }
 
 /// Parity: the cheap store-level `count_task_stats` query (no note-body
@@ -1637,6 +1737,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
     };
     svc.store
@@ -3740,6 +3841,128 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     assert!(matches!(empty, Error::Internal(m) if m == "subscriptionId is required"));
 }
 
+/// Agent-owned subscriptions (monorepo#1229): explicit agent event types are
+/// rejected with `InvalidParams` on BOTH subscribe surfaces, and a bare `*`
+/// silently narrows to the non-agent categories. Front-door (subscriber-less)
+/// subscriptions keep the full stream — the `*` expansion in
+/// [`subscribe_resolves_star_and_unsubscribe_roundtrips`] still contains
+/// `agent:*`.
+#[tokio::test]
+async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
+    let (_tmp, svc, ws) = event_setup().await;
+    // A live subscriber session: the phantom-subscriber guard (monorepo#568)
+    // runs after the event-type guard, so this pins WHICH check fired.
+    let agent = AgentId::from("agent-sub-guard");
+    svc.store()
+        .insert_agent_session(&AgentSession {
+            id: agent.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "sub-guard".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        })
+        .await
+        .expect("insert agent session");
+
+    // Explicit agent-restricted types → InvalidParams pointing at
+    // ws.agent.watch, on `event.subscribe` …
+    for t in ["agent:*", "agent:idle", "chat:stream:delta"] {
+        let err = svc
+            .event_subscribe(
+                ws.clone(),
+                Some(agent.clone()),
+                vec![t.to_string()],
+                None,
+                None,
+            )
+            .await
+            .expect_err("agent-restricted type must be rejected");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("ws.agent.watch")),
+            "{t}: {err:?}"
+        );
+    }
+    // … and on the `agent.subscribe` alias (same guard, shared registration).
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["agent:*".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("alias must reject agent:* too");
+    assert!(
+        matches!(&err, Error::InvalidParams(m) if m.contains("ws.agent.watch")),
+        "alias: {err:?}"
+    );
+
+    // A mixed list is rejected atomically — nothing is registered.
+    let err = svc
+        .event_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["file:*".to_string(), "agent:idle".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("mixed list must be rejected");
+    assert!(matches!(&err, Error::InvalidParams(_)), "mixed: {err:?}");
+    assert!(svc.list_event_subscriptions_for_agent(&agent).is_empty());
+
+    // Bare `*` narrows for agents: no `agent:*`, other categories intact.
+    let sub = svc
+        .event_subscribe(
+            ws.clone(),
+            Some(agent.clone()),
+            vec!["*".to_string()],
+            None,
+            None,
+        )
+        .await
+        .expect("bare * subscribe");
+    assert!(
+        !sub.event_types.contains(&"agent:*".to_string()),
+        "agent bare * must not include agent:*: {:?}",
+        sub.event_types
+    );
+    assert!(sub.event_types.contains(&"file:*".to_string()));
+    assert!(sub.event_types.contains(&"task:*".to_string()));
+}
+
 /// camelCase parity fixtures for the change-event envelopes published by CRUD
 /// mutations (M2.6): the wire-serialized [`intent_core::Event`] must carry the
 /// exact field names + payload shapes the iOS client expects (PROTOCOL §6.5).
@@ -3996,6 +4219,7 @@ mod change_event_parity {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         h.store
@@ -4791,6 +5015,95 @@ mod change_event_parity {
             .await
             .expect("seen again");
         assert_eq!(again.attention, WorkspaceAttention::None);
+    }
+
+    /// Regression (intent-hq/monorepo#1466): acknowledging attention is not
+    /// "activity". `markSeen` clears the unread flag WITHOUT bumping
+    /// `updated_at`, so the derived `lastActivity` (sidebar label/sort) stays
+    /// put.
+    #[tokio::test]
+    async fn mark_seen_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        // Pin the row's timestamps to a fixed past instant so any bump shows.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "markSeen must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-02T00:00:00Z"),
+            "derived lastActivity must not move on markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1466): `dismissAttention` never bumps
+    /// `updated_at` — neither when attention is already `none` (a pure no-op:
+    /// the row is not rewritten) nor when it actually clears attention.
+    #[tokio::test]
+    async fn dismiss_attention_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        // No attention raised: dismiss is a pure no-op — updated_at untouched.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss noop");
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "no-op dismiss must not bump updated_at"
+        );
+
+        // With attention raised: dismiss clears it, still without bumping.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.updated_at = "2020-01-03T00:00:00Z".to_string();
+        h.store.update_workspace(&pinned).await.expect("re-pin");
+
+        let dismissed = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        assert_eq!(dismissed.attention, WorkspaceAttention::None);
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-03T00:00:00Z",
+            "dismiss must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on dismissAttention"
+        );
     }
 
     /// `workspace.create` emits `workspace:created` after the row is inserted
@@ -5882,6 +6195,7 @@ mod mcp_callback {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
@@ -6244,7 +6558,6 @@ mod drafts_events {
 
 mod pr {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -6265,9 +6578,6 @@ mod pr {
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
-        /// When set, each `get_pr` returns a fresh head SHA so the
-        /// `pr.waitForChanges` poll detects a commit change.
-        mutate_head: bool,
         /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
         /// link an unlinked workspace by head ref.
         discover: bool,
@@ -6302,12 +6612,13 @@ mod pr {
         /// contents payload: directory, non-base64/non-UTF-8), exercising the
         /// tolerant fold of `github.repoConfig.get`.
         file_content_decode_error: bool,
-        head_seq: AtomicU64,
-        /// Notified on the first `get_pr` call — the point at which
-        /// `pr.waitForChanges` has finished its one SQLite read and is past it.
-        /// The paused-clock poll tests use this as a barrier (see
-        /// `run_wait_for_changes`).
-        first_get_pr: Arc<tokio::sync::Notify>,
+        /// When set, `get_pr` returns `NotFound` for this PR number,
+        /// exercising the `pr_state` nonexistent-PR error path.
+        missing_pr: Option<u64>,
+        /// When true, `get_pr` reports the sample PR as unmergeable with
+        /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
+        /// exercising the `pr_state` `mergeBlockedReason` wiring.
+        dirty_pr: bool,
     }
 
     fn sample_pr() -> PullRequest {
@@ -6468,17 +6779,17 @@ mod pr {
                 updated_at: String::new(),
             })
         }
-        async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
-            // Signal that the one pre-loop SQLite read is done (see
-            // `run_wait_for_changes`); harmless for non-poll callers.
-            self.first_get_pr.notify_one();
+        async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            if self.missing_pr == Some(number) {
+                return Err(ScError::NotFound("no such PR".into()));
+            }
             let mut pr = sample_pr();
             if self.merged_linked {
                 pr.state = PrState::Merged;
             }
-            if self.mutate_head {
-                let n = self.head_seq.fetch_add(1, Ordering::SeqCst);
-                pr.head_sha = Some(format!("sha{n}"));
+            if self.dirty_pr {
+                pr.mergeable = Some(false);
+                pr.mergeable_state = Some("dirty".into());
             }
             Ok(pr)
         }
@@ -7072,43 +7383,6 @@ mod pr {
         assert_eq!(r["ok"], true);
     }
 
-    /// Drive `pr_wait_for_changes` deterministically under a paused clock.
-    ///
-    /// `pr_wait_for_changes` performs exactly one SQLite read (`load_ws_for_pr`)
-    /// before it captures the `initial` PR snapshot (the stub's first `get_pr`)
-    /// and enters its poll loop. That read crosses to sqlx's SQLite worker
-    /// thread; if the tokio clock is already paused the runtime's idle
-    /// auto-advance can fire the pool's `acquire_timeout` timer before the real
-    /// worker-thread reply lands, intermittently surfacing a spurious
-    /// `PoolTimedOut` (the pre-existing CI flake).
-    ///
-    /// So we run the call in a task while the clock still flows, wait on the
-    /// stub's first-`get_pr` signal (which fires immediately after that DB read),
-    /// and only then pause: by that point the read is provably done and the only
-    /// remaining timers are the poll-loop sleeps, which auto-advance instantly as
-    /// the tests intend. TEST-ONLY — no production change.
-    async fn run_wait_for_changes(
-        forge: StubForge,
-        timeout: Option<i64>,
-        poll: Option<i64>,
-        watch: &str,
-    ) -> serde_json::Value {
-        let ready = forge.first_get_pr.clone();
-        let (_t, svc, ws) = setup_with(forge, true).await;
-        let watch = watch.to_string();
-        let task = tokio::spawn(async move {
-            svc.pr_wait_for_changes(ws, timeout, poll, Some(watch))
-                .await
-        });
-        // The DB read finishes in real time; the stub signals once it is past it.
-        ready.notified().await;
-        tokio::time::pause();
-        // `_t` (the temp DB) must outlive the task.
-        let result = task.await.expect("join wait_for_changes task");
-        drop(_t);
-        result.expect("wait")
-    }
-
     #[tokio::test]
     async fn status_shape_is_parity_exact() {
         let (_t, svc, ws) = setup(false, true).await;
@@ -7257,6 +7531,121 @@ mod pr {
     async fn no_active_pr_is_internal_error() {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
+
+    #[tokio::test]
+    async fn state_snapshot_shape_and_counts() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["title"], "Add thing");
+        assert_eq!(v["url"], "https://github.com/o/r/pull/42");
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["isDraft"], false);
+        assert_eq!(v["isMerged"], false);
+        assert_eq!(v["isClosed"], false);
+        assert_eq!(v["headSha"], "deadbeef");
+        assert_eq!(v["mergeable"], true);
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+        // Check tally + failing names from the head SHA's runs.
+        assert_eq!(v["checks"]["total"], 3);
+        assert_eq!(v["checks"]["passed"], 1);
+        assert_eq!(v["checks"]["failed"], 1);
+        assert_eq!(v["checks"]["pending"], 1);
+        assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        // Review decision from the aggregated actionable reviews.
+        assert_eq!(v["reviews"]["decision"], "approved");
+        assert_eq!(v["reviews"]["approvals"], 1);
+        assert_eq!(v["reviews"]["changesRequested"], 0);
+        // 1 conversation comment + 2 inline thread comments (RT1 + RT2; the
+        // resolved thread's comment still counts), 1 unresolved thread.
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_counts_via_rest_fallback() {
+        // GraphQL threads unavailable: inline comments are counted from the
+        // flat REST list (replies included); resolution is unavailable there,
+        // so every fallback thread counts as unresolved.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_threads: true,
+                review_comment_pages: 2,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["comments"]["conversationCount"], 1);
+        assert_eq!(v["comments"]["reviewCommentCount"], 2);
+        assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert_eq!(v["comments"]["totalCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_dirty_pr_reports_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["mergeable"], false);
+        assert_eq!(v["mergeableState"], "dirty");
+        assert_eq!(v["mergeBlockedReason"], "merge conflicts");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_merged_pr_has_no_blocked_reason() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                merged_linked: true,
+                dirty_pr: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        assert_eq!(v["state"], "merged");
+        assert_eq!(v["isMerged"], true);
+        assert_eq!(v["isClosed"], false);
+        // A merged PR never reports a blocked reason, even when the forge
+        // still surfaces a dirty mergeable state.
+        assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_missing_pr_is_clear_error() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                missing_pr: Some(999),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc.pr_state(ws, 999).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found")));
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_requires_workspace_repo() {
+        // No repository on the workspace: same "No active PR" guard as the
+        // other pr.* methods (the required prNumber does not bypass it).
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc.pr_state(ws, 42).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
@@ -7506,40 +7895,6 @@ mod pr {
         .await;
         let err = svc.pr_list_check_runs(ws, None).await.unwrap_err();
         assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
-    }
-
-    #[tokio::test]
-    async fn wait_for_changes_detects_new_commit() {
-        let v = run_wait_for_changes(
-            StubForge {
-                mutate_head: true,
-                ..Default::default()
-            },
-            Some(30),
-            Some(10),
-            "commits",
-        )
-        .await;
-        assert_eq!(v["changed"], true);
-        assert!(v["changes"][0].as_str().unwrap().starts_with("New commit:"));
-        assert!(v["iterations"].as_u64().unwrap() >= 1);
-    }
-
-    #[tokio::test]
-    async fn wait_for_changes_times_out_without_changes() {
-        let v = run_wait_for_changes(StubForge::default(), Some(30), Some(10), "any").await;
-        assert_eq!(v["changed"], false);
-        assert!(v["summary"].as_str().unwrap().contains("Timeout reached"));
-    }
-
-    #[tokio::test]
-    async fn wait_for_changes_rejects_invalid_watch() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let err = svc
-            .pr_wait_for_changes(ws, None, None, Some("bogus".into()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m.contains("watch must be one of")));
     }
 
     // ------------------------------------------------------------------------
@@ -8274,7 +8629,8 @@ mod pr {
         let store = Store::open(&tmp.path).await.expect("store");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
-        ws.worktree_path = Some(unique_dir("intentd-ac-empty").to_string_lossy().to_string());
+        let empty_dir = crate::tests::test_tempdir("intentd-ac-empty-");
+        ws.worktree_path = Some(empty_dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
 
@@ -11093,19 +11449,16 @@ mod usage_stats_recording {
 mod search {
     use super::*;
 
-    struct TempTree(PathBuf);
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn worktree() -> TempTree {
-        let dir = std::env::temp_dir().join(format!("intentd-search-svc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    // TODO: x\n}\n").unwrap();
-        std::fs::write(dir.join("README.md"), "# readme\nTODO later\n").unwrap();
-        TempTree(dir)
+    fn worktree() -> tempfile::TempDir {
+        let dir = test_tempdir("intentd-search-svc-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    // TODO: x\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# readme\nTODO later\n").unwrap();
+        dir
     }
 
     async fn services_with_worktree(dir: &std::path::Path) -> (TempDb, Services, WorkspaceId) {
@@ -11122,7 +11475,7 @@ mod search {
     #[tokio::test]
     async fn in_files_echoes_request_id_and_returns_matches() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_in_files(ws, "TODO".into(), None, Some("srch-xyz".into()))
             .await
@@ -11135,7 +11488,7 @@ mod search {
     #[tokio::test]
     async fn in_files_mints_request_id_when_absent() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_in_files(ws, "TODO".into(), None, None)
             .await
@@ -11146,7 +11499,7 @@ mod search {
     #[tokio::test]
     async fn file_names_glob_returns_relative_paths() {
         let tree = worktree();
-        let (_tmp, svc, ws) = services_with_worktree(&tree.0).await;
+        let (_tmp, svc, ws) = services_with_worktree(tree.path()).await;
         let r = svc
             .search_file_names(ws, "*.rs".into(), None, Some("srch-f".into()))
             .await
@@ -11246,6 +11599,7 @@ mod search_adapters {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
@@ -11276,7 +11630,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, None, None, Some("srch-1".into()))
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                None,
+                None,
+                None,
+                Some("srch-1".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-1");
@@ -11302,7 +11664,15 @@ mod search_adapters {
         .await;
         let svc = Services::new(store);
         let r = svc
-            .search_messages(ws, "needle".into(), None, Some("user".into()), None, None)
+            .search_messages(
+                Some(ws),
+                "needle".into(),
+                None,
+                Some("user".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let matches = r["matches"].as_array().unwrap();
@@ -11397,14 +11767,18 @@ mod search_adapters {
     /// ripgrep/symbol output (§5.15, §8).
     #[tokio::test]
     async fn codebase_search_uses_context_engine_when_available() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-eng-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-eng-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Available {
@@ -11433,7 +11807,6 @@ mod search_adapters {
         assert_eq!(matches[0]["symbol"], "Widget");
         assert_eq!(matches[0]["line"], 7);
         assert_eq!(matches[0]["score"], 0.87);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (b) When the engine is `Unavailable`, `search.codebase` degrades to the
@@ -11441,14 +11814,18 @@ mod search_adapters {
     /// engine makes this deterministic regardless of the host PATH.
     #[tokio::test]
     async fn codebase_search_returns_symbol_matches() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-cb-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-cb-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Unavailable {
@@ -11466,7 +11843,6 @@ mod search_adapters {
         assert_eq!(matches[0]["file"], "src/main.rs");
         assert_eq!(matches[0]["symbol"], "main");
         assert!(matches[0]["score"].is_number());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (c) When the engine reports `Available` (binary present — e.g. auggie on
@@ -11477,14 +11853,18 @@ mod search_adapters {
     /// `Available` for `intentd doctor` (§8.3).
     #[tokio::test]
     async fn codebase_search_degrades_when_available_engine_cannot_retrieve() {
-        let dir = std::env::temp_dir().join(format!("intentd-search-deg-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+        let dir = crate::tests::test_tempdir("intentd-search-deg-");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         let mut w = workspace(&ws);
-        w.worktree_path = Some(dir.to_string_lossy().to_string());
+        w.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
         let engine = FakeEngine {
             availability: intent_core::EngineAvailability::Available {
@@ -11504,7 +11884,6 @@ mod search_adapters {
         assert_eq!(matches[0]["file"], "src/main.rs");
         assert_eq!(matches[0]["symbol"], "main");
         assert!(matches[0]["score"].is_number());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct StreamHarness {
@@ -11559,8 +11938,9 @@ mod search_adapters {
         let ack = h
             .services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
@@ -11601,8 +11981,9 @@ mod search_adapters {
         let mut sub = subscribe(&h);
         h.services
             .search_messages(
-                h.ws.clone(),
+                Some(h.ws.clone()),
                 "needle".into(),
+                None,
                 None,
                 None,
                 None,
@@ -11791,12 +12172,17 @@ mod terminal {
             .expect("resize");
 
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let terminals = list.as_array().expect("bare terminals array");
+        // Envelope shape: { terminals: [{ id, name, cwd, isExecutingCommand }],
+        // daemonBootId } (monorepo#1334).
+        assert!(
+            list["daemonBootId"].as_str().is_some_and(|s| !s.is_empty()),
+            "daemonBootId is a non-empty string: {list}"
+        );
+        let terminals = list["terminals"].as_array().expect("terminals array");
         let entry = terminals
             .iter()
             .find(|t| t["id"].as_str() == Some(terminal_id.as_str()))
             .expect("list contains terminal");
-        // Bare-array shape: { id, name, cwd, isExecutingCommand }.
         assert_eq!(entry["name"], "Terminal");
         assert!(entry["cwd"].is_string(), "cwd is a string");
         assert!(
@@ -11805,6 +12191,44 @@ mod terminal {
         );
 
         h.services.terminal_kill(terminal_id).await.expect("kill");
+    }
+
+    /// `terminal.list` reports the same `daemonBootId` on every call within
+    /// one `Services` instance (one daemon boot) and a fresh id for a new
+    /// instance (a restart) — the authoritative-lifetime signal clients use to
+    /// tell a same-boot empty list from a post-restart one (monorepo#1334).
+    #[tokio::test]
+    async fn list_boot_id_stable_within_boot_and_fresh_across_boots() {
+        let h1 = harness().await;
+        let first = h1
+            .services
+            .terminal_list(h1.ws.clone())
+            .await
+            .expect("list");
+        let second = h1
+            .services
+            .terminal_list(h1.ws.clone())
+            .await
+            .expect("list");
+        let boot1 = first["daemonBootId"].as_str().expect("daemonBootId string");
+        assert_eq!(
+            boot1,
+            second["daemonBootId"].as_str().unwrap(),
+            "bootId stable across calls within one instance"
+        );
+        assert!(first["terminals"].is_array(), "terminals array present");
+
+        let h2 = harness().await;
+        let other = h2
+            .services
+            .terminal_list(h2.ws.clone())
+            .await
+            .expect("list");
+        assert_ne!(
+            boot1,
+            other["daemonBootId"].as_str().unwrap(),
+            "a new Services instance mints a fresh bootId"
+        );
     }
 
     /// `terminal.readOutput` returns a formatted, ANSI-stripped string: a header
@@ -12302,11 +12726,10 @@ mod script {
             .expect("stop");
     }
 
-    /// The unified host: a running script's PTY is visible to `terminal.list` and
-    /// its scrollback is readable via `terminal.getBuffer` — a terminal attaching
-    /// to a live script (§12.2).
+    /// A running script's PTY stays hidden from `terminal.list` while its
+    /// scrollback remains readable through `script.output` (§12.2).
     #[tokio::test]
-    async fn terminal_attaches_to_running_script_pty() {
+    async fn running_script_is_hidden_but_output_remains_available() {
         let h = harness().await;
         let mut sub = subscribe(&h);
         let id = create(
@@ -12331,27 +12754,23 @@ mod script {
         })
         .await;
 
-        // The script's PTY appears in the workspace's terminal list...
+        // Script-owned PTYs do not hydrate as generic terminal tabs.
         let list = h.services.terminal_list(h.ws.clone()).await.expect("list");
-        let term_id = list
-            .as_array()
-            .expect("bare terminals array")
-            .iter()
-            .filter_map(|t| t["id"].as_str())
-            .next()
-            .expect("script PTY listed as a terminal")
-            .to_string();
-
-        // ...and a terminal reads its scrollback (attach to a running script).
-        let buf = h
-            .services
-            .terminal_get_buffer(term_id, None)
-            .await
-            .expect("getBuffer");
-        let bytes = decode(buf["data"].as_str().expect("data"));
         assert!(
-            contains(&bytes, b"SCRIPT-PTY-MARK"),
-            "terminal reads the running script's PTY output"
+            list["terminals"].as_array().is_some_and(Vec::is_empty),
+            "script PTY must not be listed: {list}"
+        );
+
+        // The same PTY scrollback remains available through the script API.
+        let output = h
+            .services
+            .script_output(h.ws.clone(), id.clone(), None, None, None)
+            .await
+            .expect("script output");
+        let text = output.as_str().expect("script output string");
+        assert!(
+            text.contains("SCRIPT-PTY-MARK"),
+            "script.output reads the hidden PTY output: {text:?}"
         );
         h.services
             .script_stop(h.ws.clone(), id)
@@ -12516,6 +12935,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12557,6 +12977,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12572,8 +12993,13 @@ mod rules {
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
         // No override and no `.intent/agent-rules/task-loop.md` → bundled built-in,
         // composed as common + workspace + specific (task-loop is a workspace agent).
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert!(rules.contains("# Task Loop Agent"), "bundled specific body");
         assert!(rules.contains("## Delegating Tasks"), "common layer");
         assert!(rules.contains("# Space"), "workspace layer");
@@ -12586,8 +13012,13 @@ mod rules {
         let dir = tree.0.join(".intent").join("agent-rules");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert_eq!(rules, "WORKSPACE_FILE_RULES");
     }
 
@@ -12602,8 +13033,13 @@ mod rules {
         svc.rules_update(ws, "task-loop".into(), "OVERRIDE_RULES".into(), None)
             .await
             .unwrap();
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert_eq!(rules, "OVERRIDE_RULES");
     }
 
@@ -12613,8 +13049,13 @@ mod rules {
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
         // The spawn default `interactive` is an unknown instruction id →
         // fallbackToWorkspace (common + workspace + workspace).
-        let rules =
-            crate::rules::get_specialization_rules(&store, Some(&tree.0), "interactive").await;
+        let rules = crate::rules::get_specialization_rules(
+            &store,
+            Some(&tree.0),
+            "interactive",
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+        )
+        .await;
         assert!(rules.contains("# Space"), "workspace body present");
         assert!(rules.contains("## Delegating Tasks"), "common prepended");
     }
@@ -12633,6 +13074,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12679,6 +13121,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12728,6 +13171,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12756,6 +13200,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12806,6 +13251,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12837,6 +13283,7 @@ mod rules {
             false,
             true,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12905,6 +13352,7 @@ mod rules {
             false,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
         )
@@ -12975,6 +13423,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -13009,6 +13458,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13024,6 +13474,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13107,6 +13558,7 @@ mod rules {
             cow_supported: Some(true),
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -13141,6 +13593,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13156,6 +13609,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13230,6 +13684,7 @@ mod rules {
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13263,6 +13718,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13278,6 +13734,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13348,6 +13805,7 @@ mod rules {
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -13381,6 +13839,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13396,6 +13855,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13465,6 +13925,7 @@ mod rules {
             cow_supported: Some(true), // CoW capable!
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -13499,6 +13960,7 @@ mod rules {
             sandbox_path: None, // NO sandbox — explicit "shared" override!
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13514,6 +13976,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -13587,6 +14050,7 @@ mod rules {
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -13621,6 +14085,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             is_background: false,
             metadata: None,
@@ -13636,6 +14101,7 @@ mod rules {
             true,
             false,
             false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
         )
@@ -14158,6 +14624,7 @@ mod known_repo {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -16106,6 +16573,7 @@ mod file_ops_service {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         };
         store
@@ -17092,6 +17560,7 @@ mod heal_stale_agent_sessions {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -18039,6 +18508,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18077,6 +18547,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18194,6 +18665,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         is_background: false,
         metadata: None,
@@ -18421,8 +18893,11 @@ mod last_activity_events {
         );
     }
 
-    /// `dismiss_attention` only emits `workspace:updated { lastActivity }` when
-    /// attention actually changed (idempotent no-op on already-clear).
+    /// `dismiss_attention` emits `workspace:attention-changed` only when
+    /// attention actually changed (idempotent no-op on already-clear), and —
+    /// since acknowledging attention is not "activity"
+    /// (intent-hq/monorepo#1466) — never a `workspace:updated
+    /// { lastActivity }`.
     #[tokio::test]
     async fn dismiss_attention_idempotent() {
         let _guard = DebounceEnvGuard::new("100");
@@ -18443,7 +18918,8 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss (should emit both events).
+        // Dismiss: attention-changed only — no updated_at bump, so no
+        // debounced workspace:updated { lastActivity } follows.
         h.services
             .dismiss_attention(h.ws.clone())
             .await
@@ -18452,8 +18928,13 @@ mod last_activity_events {
         let ev1 = recv_one(&mut sub).await;
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
-        let ev2 = recv_one(&mut sub).await;
-        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "dismiss must not emit a lastActivity workspace:updated"
+        );
 
         // Dismiss again (no-op, no events).
         h.services
@@ -18757,6 +19238,7 @@ mod last_activity_events {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -19043,6 +19525,7 @@ mod turn_token_usage {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
@@ -19662,11 +20145,11 @@ mod display_status {
     #[test]
     fn no_prs_no_tasks_is_idle() {
         assert_eq!(
-            compute_display_status(false, None, &[], None, None),
+            compute_display_status(false, false, None, &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(0, 0, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(0, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -19676,19 +20159,19 @@ mod display_status {
         // The base rollup is in_progress / not_started, but without a
         // running agent the task-stage statuses demote to idle.
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 0, 1))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 1))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 1, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 1, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19697,23 +20180,59 @@ mod display_status {
     fn running_agent_promotes_to_in_progress_unconditionally() {
         // A live agent wins over every PR/task rollup.
         assert_eq!(
-            compute_display_status(true, None, &[], None, None),
+            compute_display_status(false, true, None, &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(true, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(false, true, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::InProgress
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(true, Some(&ready), &[], None, None),
+            compute_display_status(false, true, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(true, Some(&merged), &[], None, None),
+            compute_display_status(false, true, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn needs_attention_wins_over_everything() {
+        // Step 0: the needs-attention signal outranks a running agent, every
+        // PR stage, and every task rollup.
+        assert_eq!(
+            compute_display_status(true, false, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(true, true, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(true, false, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(true, true, Some(&merged), &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(
+                true,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::NeedsAttention
         );
     }
 
@@ -19724,16 +20243,16 @@ mod display_status {
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&ready), &[], None, None),
+            compute_display_status(false, false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::PrReady
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, None),
+            compute_display_status(false, false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, None, &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(false, false, None, &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -19743,7 +20262,7 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
+            compute_display_status(false, false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19752,20 +20271,20 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&open), &[], None, None),
+            compute_display_status(false, false, Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&draft), &[], None, None),
+            compute_display_status(false, false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(false, Some(&flagged), &[], None, None),
+            compute_display_status(false, false, Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19778,6 +20297,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
                 None,
@@ -19787,6 +20307,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
@@ -19803,14 +20324,28 @@ mod display_status {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
-            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &list,
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut ready = open;
         ready.mergeable = Some(true);
         let list = vec![merged.clone(), ready];
         assert_eq!(
-            compute_display_status(false, Some(&merged), &list, None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &list,
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19822,7 +20357,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(false, None, &list, None, None),
+            compute_display_status(false, false, None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -19831,11 +20366,18 @@ mod display_status {
     fn merged_with_all_tasks_done_is_pr_merged() {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&merged),
+                &[],
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, Some(&merged), &[], None, None),
+            compute_display_status(false, false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19846,7 +20388,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(false, None, &list, None, None),
+            compute_display_status(false, false, None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19855,11 +20397,18 @@ mod display_status {
     fn closed_pr_falls_through_to_task_logic() {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, Some(&closed), &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(
+                false,
+                false,
+                Some(&closed),
+                &[],
+                None,
+                Some(&stats(2, 2, 0))
+            ),
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(false, Some(&closed), &[], None, None),
+            compute_display_status(false, false, Some(&closed), &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -19867,11 +20416,18 @@ mod display_status {
     #[test]
     fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Open), None),
+            compute_display_status(false, false, None, &[], Some(PullRequestStatus::Open), None),
             WorkspaceDisplayStatus::PrOpen
         );
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Draft), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Draft),
+                None
+            ),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -19883,6 +20439,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -19893,6 +20450,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Open),
@@ -19902,6 +20460,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 None,
                 &[],
@@ -19917,6 +20476,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 None,
                 &[],
                 Some(PullRequestStatus::Merged),
@@ -19925,7 +20485,14 @@ mod display_status {
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, None, &[], Some(PullRequestStatus::Merged), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Merged),
+                None
+            ),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -19936,6 +20503,7 @@ mod display_status {
         // the task-stage status reads as idle.
         assert_eq!(
             compute_display_status(
+                false,
                 false,
                 None,
                 &[],
@@ -19953,6 +20521,7 @@ mod display_status {
         assert_eq!(
             compute_display_status(
                 false,
+                false,
                 Some(&ready),
                 &[],
                 Some(PullRequestStatus::Merged),
@@ -19962,9 +20531,208 @@ mod display_status {
         );
         let list = vec![ready];
         assert_eq!(
-            compute_display_status(false, None, &list, Some(PullRequestStatus::Merged), None),
+            compute_display_status(
+                false,
+                false,
+                None,
+                &list,
+                Some(PullRequestStatus::Merged),
+                None
+            ),
             WorkspaceDisplayStatus::PrReady
         );
+    }
+}
+
+/// Per-workspace needs-attention signal (`Services::workspace_needs_attention`,
+/// PROTOCOL §6.5): true iff a **top-level** session (no parent, not
+/// background, not deleted) carries a pending attention request or pending
+/// structured questions; child/background/deleted sessions never count.
+mod workspace_needs_attention {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::json;
+
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    pub(super) fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Waiting,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// Assistant content carrying one structured-question resource block
+    /// (the shape `has_question_blocks` matches).
+    pub(super) fn question_content() -> serde_json::Value {
+        json!([{
+            "type": "resource",
+            "resource": {
+                "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+                "uri": "question://q-1",
+                "text": "{\"questions\":[]}"
+            }
+        }])
+    }
+
+    async fn setup() -> (Services, WorkspaceId, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (Services::new(store), ws, tmp)
+    }
+
+    #[tokio::test]
+    async fn no_sessions_is_false() {
+        let (svc, ws, _tmp) = setup().await;
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn plain_top_level_session_is_false() {
+        let (svc, ws, _tmp) = setup().await;
+        svc.store
+            .insert_agent_session(&mk_session(&ws, "agent-plain"))
+            .await
+            .unwrap();
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn top_level_attention_request_is_true() {
+        let (svc, ws, _tmp) = setup().await;
+        for kind in ["discussion", "blocker"] {
+            let mut s = mk_session(&ws, &format!("agent-{kind}"));
+            s.attention_request_kind = Some(kind.to_string());
+            svc.store.insert_agent_session(&s).await.unwrap();
+        }
+        assert!(svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn delegated_background_or_deleted_sessions_never_count() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut child = mk_session(&ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-parent"));
+        child.attention_request_kind = Some("blocker".to_string());
+        svc.store.insert_agent_session(&child).await.unwrap();
+
+        let mut background = mk_session(&ws, "agent-bg");
+        background.is_background = true;
+        background.attention_request_kind = Some("discussion".to_string());
+        svc.store.insert_agent_session(&background).await.unwrap();
+
+        let mut deleted = mk_session(&ws, "agent-deleted");
+        deleted.status = AgentStatus::Deleted;
+        deleted.attention_request_kind = Some("discussion".to_string());
+        svc.store.insert_agent_session(&deleted).await.unwrap();
+
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn pending_questions_on_top_level_session_is_true() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-q");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        svc.store
+            .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        assert!(svc.workspace_needs_attention(&ws).await);
+    }
+
+    #[tokio::test]
+    async fn superseded_or_dismissed_questions_are_false() {
+        let (svc, ws, _tmp) = setup().await;
+
+        // A user reply after the question row supersedes the hold.
+        let answered = mk_session(&ws, "agent-answered");
+        svc.store.insert_agent_session(&answered).await.unwrap();
+        svc.store
+            .append_agent_message(&answered.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        svc.store
+            .append_agent_message(
+                &answered.id,
+                "user",
+                &json!([{ "type": "text", "text": "answer" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+
+        // A persisted dismissal marker for the question message id.
+        let dismissed = mk_session(&ws, "agent-dismissed");
+        svc.store.insert_agent_session(&dismissed).await.unwrap();
+        let msg = svc
+            .store
+            .append_agent_message(&dismissed.id, "assistant", &question_content(), &now_iso())
+            .await
+            .unwrap();
+        let mut updated = dismissed.clone();
+        updated.metadata = Some(json!({
+            (intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY): msg.id
+        }));
+        svc.store.update_agent_session(&ws, &updated).await.unwrap();
+
+        assert!(!svc.workspace_needs_attention(&ws).await);
+    }
+
+    /// A store read failure fails open to `false` (list/get emission must
+    /// never be wedged by the attention probe).
+    #[tokio::test]
+    async fn store_read_failure_fails_open_to_false() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut s = mk_session(&ws, "agent-attn");
+        s.attention_request_kind = Some("blocker".to_string());
+        svc.store.insert_agent_session(&s).await.unwrap();
+        assert!(svc.workspace_needs_attention(&ws).await);
+
+        // Force list_agent_session_summaries to fail.
+        sqlx::query("DROP TABLE agent_session")
+            .execute(svc.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(!svc.workspace_needs_attention(&ws).await);
     }
 }
 
@@ -20291,6 +21059,137 @@ mod display_status_events {
             "cache must not be seeded from a stats-free compute"
         );
     }
+
+    /// Attention raise/retire triggers (§6.5 step 0): a top-level
+    /// `agent.requestAttention` raise promotes the derived rollup to
+    /// `needs_attention` and emits; the turn-begin clear
+    /// (`clear_attention_request_if_present`) retires it and emits the
+    /// demotion.
+    #[tokio::test]
+    async fn attention_raise_and_retire_transitions_emit() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-attn");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_request_attention_op(
+                h.ws.clone(),
+                "discussion".to_string(),
+                "need user input".to_string(),
+                Some(session.id.clone()),
+            )
+            .await
+            .expect("raise attention");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+
+        // Retire via the runtime's turn-begin clear hook.
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        manager
+            .clear_attention_request_if_present(&session.id, &h.ws)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
+    /// persisting the dismissal marker retires the question hold and emits the
+    /// needs_attention → idle demotion.
+    #[tokio::test]
+    async fn question_dismiss_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let msg = h
+            .store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &super::workspace_needs_attention::question_content(),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        // Seed: the pending question makes the baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_dismiss_questions_op(h.ws.clone(), session.id.clone(), msg.id)
+            .await
+            .expect("dismiss questions");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
+    /// the persisted user row supersedes the pending question tail
+    /// (store-only `agent.sendMessage` path) and emits the demotion.
+    #[tokio::test]
+    async fn user_answer_retires_question_hold_and_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-q2");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &super::workspace_needs_attention::question_content(),
+                &now_iso(),
+            )
+            .await
+            .expect("append question");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_send_message_op(
+                session.id.clone(),
+                "here is my answer".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("send answer");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
 }
 
 /// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
@@ -20375,16 +21274,9 @@ mod provider_discovery_payload {
     /// override path.
     #[test]
     fn overrides_flip_installed_but_paths_stay_auto_detected() {
-        let dir = std::env::temp_dir().join(format!(
-            "provider-discovery-payload-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let opencode = dir.join("opencode");
-        let unsloth_bin = dir.join("unsloth");
+        let dir = crate::tests::test_tempdir("provider-discovery-payload-");
+        let opencode = dir.path().join("opencode");
+        let unsloth_bin = dir.path().join("unsloth");
         for bin in [&opencode, &unsloth_bin] {
             #[cfg(unix)]
             {

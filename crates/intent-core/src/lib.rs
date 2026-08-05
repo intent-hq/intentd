@@ -5,6 +5,18 @@
 //! and the cross-layer traits (`WorkspaceApi`, `ContextEngine`) that higher
 //! layers implement and consume.
 
+/// Test-binary-wide guard: export `NODE_DISABLE_COMPILE_CACHE=1` before any
+/// test runs. `path_utils::login_shell_dirs()` spawns the user's interactive
+/// login shell, whose rc files may run node CLIs (nvm/npm, ng completion);
+/// those inherit this and skip `module.enableCompileCache()`, which would
+/// otherwise leave a `node-compile-cache/` residue at the TMPDIR root.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
+
+pub mod agent_configs;
 pub mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;
@@ -22,6 +34,9 @@ pub mod tilde;
 pub mod traits;
 pub mod turn_attachments;
 
+pub use agent_configs::{
+    agent_configs_root, create_agent_configs_dir, sweep_agent_configs, AGENT_CONFIGS_DIR_NAME,
+};
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
@@ -31,7 +46,7 @@ pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, pars
 pub use config::Config;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 pub use model::extract_spec_task_ids;
 pub use model::MessageOrigin;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
@@ -46,13 +61,13 @@ pub use model::{
     CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
     CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
     CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
-    ContextItem, Draft, Event, EventActor, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus,
-    GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus,
-    KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
-    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    ContextItem, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
+    GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor, LineAttributionComputeResult,
+    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript,
     RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script, ScriptCreateParams, ScriptMode,
@@ -63,13 +78,15 @@ pub use model::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
     WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDisplayStatus,
-    WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
+    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
+    WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use settings_file::{
-    LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
+    FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
+    LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{

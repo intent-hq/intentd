@@ -18,9 +18,20 @@
 //!   end and the queue drains interrupt-first.
 //! * Release path 2 (`agent.dismissQuestions`): persists the dismissal marker
 //!   (`agent:updated` with `dismissedQuestionsMessageId`, surfaced on the
-//!   `agent.list` metadata projection), and drains the held queue WITHOUT any
-//!   model notification — the asker's transcript gains ONLY the drained held
-//!   message, nothing about the dismissal itself.
+//!   `agent.list` metadata projection), delivers the questions-dismissed
+//!   system notice to the agent BEFORE any held entry (tagged
+//!   `messageMetadata.type: "questions_dismissed"` so the FE can render it
+//!   as a system chip), and drains the held queue behind it — the asker's
+//!   transcript gains the notice, then the drained held message.
+//! * Dismissal notice, idle agent + empty queue: `agent.dismissQuestions`
+//!   starts the notice turn IMMEDIATELY (never queues) — the mock's ack rule
+//!   matches on the notice wording, proving the turn prompt carried the
+//!   dismissal text, and the persisted user row carries the
+//!   `questions_dismissed` metadata.
+//! * Dismissal notice, undelivered queue entry: dismissing an OLDER question
+//!   while a NEWER one still holds automatic deliveries parks the notice —
+//!   `agent.getQueue` surfaces the entry with its `questions_dismissed`
+//!   metadata promoted to the queue head.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -60,6 +71,11 @@ const ASK_MARKER: &str = "ASK_HOLD_QUESTION_NOW_E2E";
 /// Trigger for the sibling sender's automatic `ws.agent.send` calls.
 const SEND_MARKER: &str = "SEND_HELD_MESSAGES_NOW_E2E";
 
+/// Trigger for the second sibling's automatic interrupt `ws.agent.send`
+/// (scenario 1 uses one sender per held message — the single-pending-message
+/// guard refuses a second parked send from the same caller).
+const SEND_URGENT_MARKER: &str = "SEND_HELD_URGENT_NOW_E2E";
+
 /// The two automatic messages parked by the hold in scenario 1.
 const HELD_NORMAL: &str = "held normal message";
 const HELD_URGENT: &str = "held urgent message";
@@ -67,8 +83,21 @@ const HELD_URGENT: &str = "held urgent message";
 /// The single automatic message parked by the hold in scenario 2.
 const HELD_DISMISS: &str = "held until dismissal";
 
+/// Trigger for the asker's SECOND question turn (queued-notice scenario:
+/// two distinct pending question messages).
+const ASK_AGAIN_MARKER: &str = "ASK_SECOND_QUESTION_NOW_E2E";
+
 /// The flattened `Q:`/`A:` answer a user sends after filling the QuestionCard.
 const ANSWER_TEXT: &str = "Q: Which environment should I deploy to?\nA: Staging";
+
+/// Leading wording of the questions-dismissed system notice (single-question
+/// dismissals — both scenarios below dismiss one-question messages).
+const NOTICE_PREFIX: &str = "User dismissed your 1 question without answering.";
+
+/// The mock's ack reply for the dismissal-notice turn: its rule matches on
+/// the notice wording, so this text appearing in the transcript proves the
+/// turn PROMPT carried the dismissal text.
+const DISMISS_ACK: &str = "dismissal notice acknowledged";
 
 /// Monotonic JSON-RPC id source shared by all helpers/tests in this file.
 static NEXT_ID: AtomicI64 = AtomicI64::new(100);
@@ -228,11 +257,11 @@ where
 {
     let id = next_id();
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(Duration::from_secs(30), ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
@@ -361,6 +390,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         })
         .await
         .expect("insert ws");
@@ -379,19 +409,35 @@ fn hold_question() -> Value {
     })
 }
 
-/// Mock-behavior rule that fires the asker's question on the kickoff turn.
-fn ask_rule() -> Value {
+/// Mock-behavior rule that fires the asker's question on the turn whose
+/// prompt carries `marker`.
+fn ask_rule_with(marker: &str) -> Value {
     let ask_code = format!(
         "return await ws.app.question.ask({});",
         json!(hold_question())
     );
     json!({
-        "ifPromptContains": ASK_MARKER,
+        "ifPromptContains": marker,
         "toolCall": {
             "name": "workspace_api",
             "arguments": { "code": ask_code, "summary": "ask hold question" }
         },
         "response": "I have a clarifying question before I proceed."
+    })
+}
+
+/// Mock-behavior rule that fires the asker's question on the kickoff turn.
+fn ask_rule() -> Value {
+    ask_rule_with(ASK_MARKER)
+}
+
+/// Mock-behavior rule acknowledging the questions-dismissed notice: it
+/// matches on the notice WORDING, so a [`DISMISS_ACK`] assistant reply in
+/// the transcript proves the turn prompt carried the dismissal text.
+fn dismiss_ack_rule() -> Value {
+    json!({
+        "ifPromptContains": NOTICE_PREFIX,
+        "response": DISMISS_ACK
     })
 }
 
@@ -490,8 +536,8 @@ where
         .to_string()
 }
 
-/// Read the sender-captured `hold-results` note and return its parsed JSON.
-async fn read_capture_note<S>(rpc: &mut WebSocketStream<S>, ws_id: &str) -> Value
+/// Read a sender-captured results note by title and return its parsed JSON.
+async fn read_capture_note<S>(rpc: &mut WebSocketStream<S>, ws_id: &str, title: &str) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -500,7 +546,7 @@ where
         .as_array()
         .expect("notes array")
         .iter()
-        .find(|n| n["title"] == "hold-results")
+        .find(|n| n["title"] == title)
         .expect("capture note created by the sender")["id"]
         .as_str()
         .expect("note id")
@@ -515,8 +561,10 @@ where
     serde_json::from_str(content).expect("capture note JSON")
 }
 
-/// Poll `agent.getConversation` until `pred` passes (bounded); returns the
-/// final conversation value.
+/// Poll `agent.getConversation` until `pred` passes (bounded at 90s — turn
+/// latency varies with host load, so the bound is deliberately generous;
+/// green runs return as soon as the predicate holds); returns the final
+/// conversation value.
 async fn await_conversation<S, F>(
     rpc: &mut WebSocketStream<S>,
     ws_id: &str,
@@ -528,7 +576,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: Fn(&[Value]) -> bool,
 {
-    for _ in 0..120 {
+    for _ in 0..360 {
         let conv = wss_rpc(
             rpc,
             "agent.getConversation",
@@ -544,7 +592,27 @@ where
     panic!("conversation predicate never satisfied: {what}");
 }
 
-/// 0-based index of the user row whose first text block equals `text`.
+/// Poll `agent.get` until the persisted status is `idle` (bounded).
+/// `agent:stream:end` precedes the status rewrite to idle by a small window,
+/// so tests that depend on the idle-agent immediate-delivery path must wait
+/// out that window explicitly instead of racing the dismissal against it.
+async fn await_agent_idle<S>(rpc: &mut WebSocketStream<S>, agent_id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..240 {
+        let got = wss_rpc(rpc, "agent.get", json!({ "agentId": agent_id })).await;
+        if got["agent"]["status"] == "idle" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(125)).await;
+    }
+    panic!("agent {agent_id} never reached idle status");
+}
+
+/// 0-based index of the user row whose first text block starts with `text`
+/// (held messages drain from the queue, so their rows may carry the appended
+/// dequeue-wait system note).
 fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
     messages.iter().position(|m| {
         m["role"] == "user"
@@ -552,7 +620,50 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|b| b["type"] == "text" && b["text"] == text)
+                .any(|b| {
+                    b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.starts_with(text))
+                })
+    })
+}
+
+/// 0-based index of the assistant row whose text contains `text`.
+fn assistant_row_index(messages: &[Value], text: &str) -> Option<usize> {
+    messages.iter().position(|m| {
+        m["role"] == "assistant"
+            && m["contentBlocks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|b| {
+                    b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.contains(text))
+                })
+    })
+}
+
+/// 0-based index of the user row whose block metadata marks it as the
+/// dismissal notice for `dismissed_mid` (both notices in the two-question
+/// scenario share the same wording, so text alone cannot tell them apart).
+fn notice_row_index(messages: &[Value], dismissed_mid: &str) -> Option<usize> {
+    messages.iter().position(|m| {
+        m["role"] == "user"
+            && m["contentBlocks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|b| {
+                    b["messageMetadata"]["dismissedQuestionsMessageId"] == json!(dismissed_mid)
+                })
+    })
+}
+
+/// The `messageMetadata` payload the dismissal notice carries on the wire —
+/// on the queued entry while undelivered and on the persisted user-row block
+/// once delivered (PROTOCOL §5.5).
+fn dismissal_metadata(dismissed_mid: &str) -> Value {
+    json!({
+        "type": "questions_dismissed",
+        "source": "system",
+        "dismissedQuestionsMessageId": dismissed_mid,
     })
 }
 
@@ -560,13 +671,14 @@ fn user_row_index(messages: &[Value], text: &str) -> Option<usize> {
 ///
 /// 1. The asker's kickoff turn emits a `ws.app.question.ask` question — the
 ///    hold activates (last transcript message = assistant question row).
-/// 2. A sibling fires two AUTOMATIC `ws.agent.send` deliveries at the asker
-///    (one normal, one `priority: "interrupt"`): both park in the queue with
-///    `heldForQuestions: true` on the send results, the interrupt entry FIRST
-///    (`interruptPriority: true` — spec §Decisions: interrupts are held too,
-///    no exceptions), and NO user row reaches the asker's transcript.
-///    `agent:queue:updated` carries the held snapshot in interrupt-first
-///    order.
+/// 2. Two siblings each fire one AUTOMATIC `ws.agent.send` at the asker
+///    (one normal, one `priority: "interrupt"` — one sender per message, the
+///    single-pending-message guard refuses a second parked send from the
+///    same caller): both park in the queue with `heldForQuestions: true` on
+///    the send results, the interrupt entry FIRST (`interruptPriority: true`
+///    — spec §Decisions: interrupts are held too, no exceptions), and NO
+///    user row reaches the asker's transcript. `agent:queue:updated` carries
+///    the held snapshot in interrupt-first order.
 /// 3. The user answers via `agent.sendMessage` — user origin is NEVER held:
 ///    the answer delivers immediately (`queued: false`), the hold flips
 ///    false, and the queue drains interrupt-first: transcript order is
@@ -576,12 +688,18 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let Some(script) = gate("WSS question-hold user-answer E2E") else {
         return;
     };
-    let send_code = format!(
+    let send_normal_code = format!(
         "const agents = await ws.agent.list(true); \
          const target = agents.find(a => a.name === 'AskerA'); \
          const first = await ws.agent.send(target.id, '{HELD_NORMAL}'); \
+         await ws.note.create('hold-results', JSON.stringify({{ first }})); \
+         return 'sent';"
+    );
+    let send_urgent_code = format!(
+        "const agents = await ws.agent.list(true); \
+         const target = agents.find(a => a.name === 'AskerA'); \
          const second = await ws.agent.send(target.id, '{HELD_URGENT}', 'interrupt'); \
-         await ws.note.create('hold-results', JSON.stringify({{ first, second }})); \
+         await ws.note.create('hold-results-urgent', JSON.stringify({{ second }})); \
          return 'sent';"
     );
     let behavior = json!({
@@ -591,9 +709,17 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
                 "ifPromptContains": SEND_MARKER,
                 "toolCall": {
                     "name": "workspace_api",
-                    "arguments": { "code": send_code, "summary": "held sends e2e" }
+                    "arguments": { "code": send_normal_code, "summary": "held send e2e" }
                 },
-                "response": "sends dispatched"
+                "response": "send dispatched"
+            },
+            {
+                "ifPromptContains": SEND_URGENT_MARKER,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_urgent_code, "summary": "held urgent send e2e" }
+                },
+                "response": "urgent send dispatched"
             }
         ],
         "response": "plain reply"
@@ -614,11 +740,12 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
     let sender_id = create_agent(&mut rpc, &ws_id, "SenderB").await;
+    let urgent_sender_id = create_agent(&mut rpc, &ws_id, "SenderC").await;
 
     // ---- (1) The asker's question turn activates the hold ----
     drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
 
-    // ---- (2) Automatic sends park in the queue ----
+    // ---- (2) Automatic sends park in the queue (one sender each) ----
     let sent = wss_rpc(
         &mut rpc,
         "agent.sendMessage",
@@ -630,6 +757,19 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
+    await_stream_end(&mut sub, &sender_id).await;
+
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": urgent_sender_id,
+            "content": format!("message the asker {SEND_URGENT_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "urgent sender kickoff ok: {sent}");
 
     // The wire contract (§6.5): an `agent:queue:updated` snapshot for the
     // asker carries BOTH held entries, interrupt-first. (The interim 1-entry
@@ -649,7 +789,7 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
                 }
             }
             Some("agent:stream:end")
-                if ev["data"]["agentId"].as_str() == Some(sender_id.as_str()) =>
+                if ev["data"]["agentId"].as_str() == Some(urgent_sender_id.as_str()) =>
             {
                 sender_done = true;
             }
@@ -659,7 +799,7 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
             break;
         }
     }
-    assert!(sender_done, "sender turn completed");
+    assert!(sender_done, "urgent sender turn completed");
     let snapshot = held_snapshot.expect("agent:queue:updated carried the 2-entry held snapshot");
     assert_eq!(
         snapshot[0]["content"], HELD_URGENT,
@@ -678,10 +818,13 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         "normal entry carries no interrupt marker: {snapshot:?}"
     );
 
-    // The senders saw the hold on the RPC results (captured via the note).
-    let capture = read_capture_note(&mut rpc, &ws_id).await;
-    for key in ["first", "second"] {
-        let r = &capture[key];
+    // The senders saw the hold on the RPC results (captured via the notes).
+    let normal_capture = read_capture_note(&mut rpc, &ws_id, "hold-results").await;
+    let urgent_capture = read_capture_note(&mut rpc, &ws_id, "hold-results-urgent").await;
+    for (key, r) in [
+        ("first", &normal_capture["first"]),
+        ("second", &urgent_capture["second"]),
+    ] {
         assert_eq!(r["success"], true, "{key} send ok: {r}");
         assert_eq!(r["queued"], true, "{key} send parked: {r}");
         assert_eq!(
@@ -690,8 +833,8 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         );
     }
     assert_eq!(
-        capture["second"]["queuedMessage"]["interruptPriority"], true,
-        "interrupt send's queue entry carries the marker: {capture}"
+        urgent_capture["second"]["queuedMessage"]["interruptPriority"], true,
+        "interrupt send's queue entry carries the marker: {urgent_capture}"
     );
 
     // `agent.getQueue` agrees with the event snapshot, and the held messages
@@ -760,9 +903,10 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
 ///    echoes `dismissedQuestionsMessageId`, `agent:updated` carries it on the
 ///    wire, and the `agent.list` metadata projection surfaces it (survives as
 ///    session metadata).
-/// 4. The dismissal kicks the drain WITHOUT any model notification: the
-///    asker's transcript gains ONLY the drained held message (user rows are
-///    exactly kickoff + held message — nothing about the dismissal), and the
+/// 4. The dismissal delivers the questions-dismissed system notice FIRST
+///    (user row tagged `messageMetadata.type: "questions_dismissed"`, wording
+///    carries the question count), then kicks the drain: the asker's user
+///    rows are exactly kickoff → notice → drained held message, and the
 ///    queue is empty.
 #[tokio::test]
 async fn question_hold_released_by_dismiss_questions_over_wss() {
@@ -823,7 +967,7 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
     assert_eq!(sent["success"], true, "sender kickoff ok: {sent}");
     await_stream_end(&mut sub, &sender_id).await;
 
-    let capture = read_capture_note(&mut rpc, &ws_id).await;
+    let capture = read_capture_note(&mut rpc, &ws_id, "hold-results").await;
     assert_eq!(capture["first"]["queued"], true, "parked: {capture}");
     assert_eq!(
         capture["first"]["heldForQuestions"], true,
@@ -878,19 +1022,19 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
         "dismissal marker persisted on the metadata projection: {listed}"
     );
 
-    // ---- (4) The dismissal released the hold and drained the queue ----
+    // ---- (4) The dismissal notified the agent, then drained the queue ----
     let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "held message drained", |m| {
         user_row_index(m, HELD_DISMISS).is_some()
     })
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
-    // NO model notification about the dismissal: the ONLY user rows are the
-    // kickoff and the drained held message.
+    // The dismissal system notice reaches the model BEFORE the held message:
+    // user rows are exactly kickoff → notice → drained held message.
     let user_rows: Vec<&Value> = messages.iter().filter(|m| m["role"] == "user").collect();
     assert_eq!(
         user_rows.len(),
-        2,
-        "exactly kickoff + drained held message — nothing about the dismissal: {user_rows:?}"
+        3,
+        "exactly kickoff + dismissal notice + drained held message: {user_rows:?}"
     );
     assert!(
         user_rows[0]["contentBlocks"][0]["text"]
@@ -903,14 +1047,285 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
                 .contains(ASK_MARKER),
         "first user row is the kickoff: {user_rows:?}"
     );
+    let notice_text = user_rows[1]["contentBlocks"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        notice_text.starts_with("User dismissed your 1 question without answering."),
+        "second user row is the dismissal notice with the question count: {user_rows:?}"
+    );
     assert_eq!(
-        user_rows[1]["contentBlocks"][0]["text"], HELD_DISMISS,
-        "second user row is the drained held message: {user_rows:?}"
+        user_rows[1]["contentBlocks"][0]["messageMetadata"],
+        json!({
+            "type": "questions_dismissed",
+            "source": "system",
+            "dismissedQuestionsMessageId": question_mid,
+        }),
+        "notice block carries the questions_dismissed metadata: {user_rows:?}"
+    );
+    assert!(
+        user_rows[2]["contentBlocks"][0]["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(HELD_DISMISS)),
+        "third user row is the drained held message: {user_rows:?}"
     );
 
     let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
     assert!(
         q["queue"].as_array().expect("queue array").is_empty(),
         "queue drained after dismissal: {q}"
+    );
+}
+
+/// Dismissal notice with an IDLE agent and an EMPTY queue (PROTOCOL §5.5):
+///
+/// 1. The asker's kickoff turn emits the question — hold active, queue empty.
+/// 2. `agent.dismissQuestions` starts the notice turn IMMEDIATELY (never
+///    queues): the mock's ack rule matches on the notice WORDING, so the
+///    [`DISMISS_ACK`] assistant reply proves the turn prompt carried the
+///    dismissal text.
+/// 3. The persisted user row starts with the count-carrying notice wording
+///    and its block carries the `questions_dismissed` metadata; the queue
+///    stays empty throughout.
+#[tokio::test]
+async fn dismiss_questions_idle_empty_queue_starts_notice_turn_over_wss() {
+    let Some(script) = gate("WSS dismissQuestions idle-agent E2E") else {
+        return;
+    };
+    let behavior = json!({
+        "rules": [ask_rule(), dismiss_ack_rule()],
+        "response": "plain reply"
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "sub: {sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
+
+    // ---- (1) Question turn: hold active, queue EMPTY ----
+    let question_mid = drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
+    // The immediate-delivery path requires a truly IDLE agent: stream:end
+    // precedes the status rewrite, and a dismissal racing into that window
+    // would take the queue path instead (flake observed at ~1 in 6 runs).
+    await_agent_idle(&mut rpc, &asker_id).await;
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "precondition: queue empty before the dismissal: {q}"
+    );
+
+    // ---- (2) Dismissal: the notice turn starts immediately ----
+    let dismissed = wss_rpc(
+        &mut rpc,
+        "agent.dismissQuestions",
+        json!({ "workspaceId": ws_id, "agentId": asker_id, "messageId": question_mid }),
+    )
+    .await;
+    assert_eq!(dismissed["success"], true, "dismiss ok: {dismissed}");
+    await_stream_end(&mut sub, &asker_id).await;
+
+    // ---- (3) Notice prompt + metadata persisted; mock acked the wording ----
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "dismissal ack", |m| {
+        assistant_row_index(m, DISMISS_ACK).is_some()
+    })
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let notice_idx =
+        notice_row_index(messages, &question_mid).expect("dismissal notice user row persisted");
+    let notice_block = &messages[notice_idx]["contentBlocks"][0];
+    assert!(
+        notice_block["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(NOTICE_PREFIX)),
+        "notice row carries the dismissal text with the question count: {notice_block}"
+    );
+    assert_eq!(
+        notice_block["messageMetadata"],
+        dismissal_metadata(&question_mid),
+        "notice block carries the questions_dismissed metadata: {notice_block}"
+    );
+    let ack_idx = assistant_row_index(messages, DISMISS_ACK).expect("ack row");
+    assert!(
+        notice_idx < ack_idx,
+        "the ack turn FOLLOWS the notice row (prompt carried the dismissal \
+         text): notice={notice_idx} ack={ack_idx}"
+    );
+
+    // Never queued: idle + empty queue delivers as an immediate turn.
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "notice never parked in the queue: {q}"
+    );
+}
+
+/// Dismissal notice as an UNDELIVERED queue entry (PROTOCOL §5.5):
+///
+/// 1. The asker emits question A (kickoff turn), then question B (second
+///    turn — a user-origin message is never held, so the turn runs while
+///    A's hold is active).
+/// 2. Dismissing A while B still holds automatic deliveries PARKS A's
+///    notice: `agent.getQueue` surfaces the entry at the queue HEAD with its
+///    `questions_dismissed` metadata — the DoD's undelivered-entry shape.
+/// 3. Dismissing B releases the hold: B's notice delivers first (immediate),
+///    A's parked notice drains behind it — transcript order B-notice →
+///    A-notice, queue empty.
+#[tokio::test]
+async fn dismiss_questions_queued_notice_surfaces_metadata_over_wss() {
+    let Some(script) = gate("WSS dismissQuestions queued-notice E2E") else {
+        return;
+    };
+    let behavior = json!({
+        "rules": [
+            ask_rule(),
+            ask_rule_with(ASK_AGAIN_MARKER),
+            dismiss_ack_rule()
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let (_daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "sub: {sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let asker_id = create_agent(&mut rpc, &ws_id, "AskerA").await;
+
+    // ---- (1) Two question turns: A then B (user origin is never held) ----
+    let mid_a = drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": asker_id,
+            "content": format!("one more thing {ASK_AGAIN_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "second ask kickoff ok: {sent}");
+    // User origin is never held by A's question hold, but a brief post-turn
+    // busy race can still park the send (`queued: true` WITHOUT
+    // `heldForQuestions`) — the drain delivers it either way, so it must
+    // never look hold-parked.
+    assert!(
+        sent["heldForQuestions"].as_bool() != Some(true),
+        "user origin is never held by A's question hold: {sent}"
+    );
+    await_stream_end(&mut sub, &asker_id).await;
+    // Question B is the LAST transcript row once its turn lands (polled: the
+    // busy-race park above delivers via the drain a beat after stream end).
+    let is_question_b = |messages: &[Value]| {
+        messages.last().is_some_and(|last| {
+            last["role"] == "assistant"
+                && last["contentBlocks"]
+                    .as_array()
+                    .and_then(|blocks| blocks.last())
+                    .is_some_and(|b| {
+                        b["type"] == "resource" && b["resource"]["mimeType"] == QUESTION_MIME
+                    })
+                && last["id"].as_str() != Some(mid_a.as_str())
+        })
+    };
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "question B row", |m| {
+        is_question_b(m)
+    })
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let last = messages.last().expect("non-empty transcript");
+    let mid_b = last["id"].as_str().expect("question B id").to_string();
+
+    // ---- (2) Dismiss A: B's hold parks the notice; getQueue surfaces it ----
+    let dismissed = wss_rpc(
+        &mut rpc,
+        "agent.dismissQuestions",
+        json!({ "workspaceId": ws_id, "agentId": asker_id, "messageId": mid_a }),
+    )
+    .await;
+    assert_eq!(dismissed["success"], true, "dismiss A ok: {dismissed}");
+
+    let mut queued_entry: Option<Value> = None;
+    for _ in 0..120 {
+        let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+        let queue = q["queue"].as_array().expect("queue array");
+        if !queue.is_empty() {
+            queued_entry = Some(queue[0].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let entry = queued_entry.expect("A's notice parked in the queue by B's hold");
+    assert!(
+        entry["content"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(NOTICE_PREFIX)),
+        "queued entry is the dismissal notice: {entry}"
+    );
+    assert_eq!(
+        entry["messageMetadata"],
+        dismissal_metadata(&mid_a),
+        "agent.getQueue surfaces the questions_dismissed metadata on the \
+         undelivered entry: {entry}"
+    );
+    assert_eq!(
+        entry["position"], 0,
+        "the notice is promoted to the queue HEAD: {entry}"
+    );
+
+    // A's notice must NOT have reached the transcript while parked.
+    let conv = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": asker_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert!(
+        notice_row_index(messages, &mid_a).is_none(),
+        "parked notice not yet delivered: {messages:?}"
+    );
+
+    // ---- (3) Dismiss B: its notice delivers first, A's drains behind ----
+    let dismissed = wss_rpc(
+        &mut rpc,
+        "agent.dismissQuestions",
+        json!({ "workspaceId": ws_id, "agentId": asker_id, "messageId": mid_b }),
+    )
+    .await;
+    assert_eq!(dismissed["success"], true, "dismiss B ok: {dismissed}");
+
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "both notices landed", |m| {
+        notice_row_index(m, &mid_a).is_some() && notice_row_index(m, &mid_b).is_some()
+    })
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let idx_b = notice_row_index(messages, &mid_b).expect("B notice row");
+    let idx_a = notice_row_index(messages, &mid_a).expect("A notice row");
+    assert!(
+        idx_b < idx_a,
+        "B's notice delivers FIRST, A's parked notice drains behind it: \
+         b={idx_b} a={idx_a}"
+    );
+
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert!(
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "queue drained after both dismissals: {q}"
     );
 }

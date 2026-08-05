@@ -174,7 +174,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -843,8 +843,46 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
         json!({ "workspaceId": dup_id }),
     )
     .await;
-    let _ = std::fs::remove_dir_all(&root);
+
+    // `workspace.delete` trash-renames the duplicate's checkout asynchronously
+    // (`source-repo` → `source-repo.deleting-*` under `<root>/<dup_id>`) and
+    // removes it in the background, which can race the sweep below and
+    // resurrect entries after `remove_dir_all` (leaves `itd-wss-wt-dupwt-*`
+    // residue under /tmp). Wait (bounded) for the async delete to settle, kill
+    // the daemon so nothing can recreate files, then sweep with one retry.
+    let dup_dir = root.join(dup_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut settled = false;
+    while tokio::time::Instant::now() < deadline {
+        let busy = std::fs::read_dir(&dup_dir)
+            .map(|entries| entries.flatten().next().is_some())
+            .unwrap_or(false);
+        if !busy {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !settled {
+        let remaining: Vec<String> = std::fs::read_dir(&dup_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "dupwt: async workspace.delete did not settle within 10s; {} still contains {remaining:?} — sweep may race and leave itd-wss-wt-dupwt-* residue",
+            dup_dir.display()
+        );
+    }
     drop(daemon);
+    let _ = std::fs::remove_dir_all(&root);
+    if root.exists() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// `workspace.duplicate` off a workspace created with `skipIsolation: true`

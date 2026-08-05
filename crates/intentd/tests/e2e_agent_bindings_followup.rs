@@ -60,6 +60,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -285,7 +286,7 @@ async fn agent_read_conversation_returns_messages() {
 
     // Call agent.readConversation
     let result = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None)
+        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None)
         .await
         .expect("get conversation");
 

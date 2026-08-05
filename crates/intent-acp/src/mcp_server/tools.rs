@@ -4,6 +4,9 @@
 //! suffix every tool with its MCP server name, so agents see
 //! `workspace_api_workspace-mcp`; baking the suffix in here would double it.
 
+use std::borrow::Cow;
+
+use intent_core::settings_file::AgentFeaturesSettings;
 use serde_json::{json, Map, Value};
 
 /// One input parameter of a tool, used to synthesize an MCP `inputSchema`.
@@ -158,8 +161,12 @@ API:
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
-  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
+  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
+  ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
+  ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
@@ -180,8 +187,8 @@ API:
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters.
-  ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["agent:*", "file:*"]`. Use explicit categories or event types such as `agent:*`, `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
-    Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms.
+  ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
+    Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
@@ -194,6 +201,16 @@ API:
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+
+  ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
+
+  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+    Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
+    Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
+  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
@@ -215,8 +232,9 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
+  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.waitForChanges({ timeoutSeconds?, pollIntervalSeconds?, watch? }?) → { ... }  // Waits for PR changes. `watch`: `"any"`, `"checks"`, `"state"`, or `"commits"`.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
   ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
@@ -345,6 +363,8 @@ API:
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
@@ -367,8 +387,8 @@ API:
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters.
-  ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["agent:*", "file:*"]`. Use explicit categories or event types such as `agent:*`, `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
-    Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms.
+  ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
+    Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
   ws.script.list() → [scripts]  // Lists saved scripts with runtime status when available.
@@ -381,6 +401,14 @@ API:
   ws.script.status(scriptId) → status  // Runtime state, pid, exit code, detected URL, timings.
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
+
+  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+    Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
+    Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
+  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
@@ -402,8 +430,9 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
+  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.waitForChanges({ timeoutSeconds?, pollIntervalSeconds?, watch? }?) → { ... }  // Waits for PR changes. `watch`: `"any"`, `"checks"`, `"state"`, or `"commits"`.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
   ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
   ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
@@ -450,9 +479,142 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
     params: &[p("code", "string", true), p("summary", "string", true)],
 }];
 
+/// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
+/// Namespace-level prefixes end with `.`; method-level prefixes (the
+/// `attentionRequests` pair) name one full method each. Shared by the
+/// description assembler below, the prelude assembler in [`super::bindings`],
+/// and the dispatch deny in [`super::bindings`] (via [`denied_feature`]), so
+/// the three layers cannot drift.
+fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    if !features.background_hooks {
+        out.push(("ws.hook.", "agentFeatures.backgroundHooks"));
+    }
+    if !features.host_exec {
+        out.push(("ws.host.", "agentFeatures.hostExec"));
+    }
+    if !features.scripts {
+        out.push(("ws.script.", "agentFeatures.scripts"));
+    }
+    if !features.terminal_access {
+        out.push(("ws.terminal.", "agentFeatures.terminalAccess"));
+    }
+    if !features.browser_automation {
+        out.push(("ws.browser.", "agentFeatures.browserAutomation"));
+    }
+    if !features.structured_questions {
+        out.push(("ws.app.question.", "agentFeatures.structuredQuestions"));
+    }
+    if !features.attention_requests {
+        out.push((
+            "ws.agent.requestDiscussion",
+            "agentFeatures.attentionRequests",
+        ));
+        out.push(("ws.agent.reportBlocker", "agentFeatures.attentionRequests"));
+    }
+    out
+}
+
+/// The `ws.agent.reportToParent` doc line's cross-reference to the two
+/// attention-request methods, scrubbed from the assembled description when
+/// `agentFeatures.attentionRequests` is off (a unit test guards that this
+/// clause still matches both description variants verbatim).
+const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
+
+/// The `[agentFeatures]` settings path whose toggle is off and gates `method`
+/// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
+/// method is not feature-gated or its toggle is on. The dispatch-deny layer
+/// in [`super::bindings::try_dispatch`] uses this as defense in depth behind
+/// the description/prelude pruning.
+pub(super) fn denied_feature(
+    features: &AgentFeaturesSettings,
+    method: &str,
+) -> Option<&'static str> {
+    gated_prefixes(features)
+        .into_iter()
+        .find_map(|(prefix, feature)| {
+            // Frame methods carry no `ws.` prefix.
+            let ns = prefix.strip_prefix("ws.").unwrap_or(prefix);
+            // Namespace entries end with `.` and gate everything under them;
+            // method-level entries (the `attentionRequests` pair) name one
+            // full method and must match exactly, so a future
+            // `agent.requestDiscussionHistory` would not be over-denied.
+            let hit = if ns.ends_with('.') {
+                method.starts_with(ns)
+            } else {
+                method == ns
+            };
+            hit.then_some(feature)
+        })
+}
+
+/// Assemble the `workspace_api` description for one bridge from the static
+/// variants, pruning the doc lines of every feature disabled in
+/// `[agentFeatures]` (a method line and its indented continuation lines drop
+/// together; doubled blank lines left by a removed namespace paragraph
+/// collapse to one). With every toggle on — the default — this returns the
+/// static const unchanged, so the all-defaults description is byte-identical
+/// to today's by construction.
+pub fn workspace_api_description(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+) -> Cow<'static, str> {
+    let base = if is_chief {
+        WORKSPACE_API_DESCRIPTION_CHIEF
+    } else {
+        WORKSPACE_API_DESCRIPTION
+    };
+    let gated = gated_prefixes(features);
+    if gated.is_empty() {
+        return Cow::Borrowed(base);
+    }
+    // Method doc lines sit at exactly two spaces of indentation
+    // (`  ws.<ns>.<method>(...`); their wrapped continuation lines are
+    // indented deeper. Anything else (Rules/Parameters/Examples prose) never
+    // matches a gated `ws.` prefix at indent 2.
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 2 && trimmed.starts_with("ws.") {
+            skipping = gated.iter().any(|(prefix, _)| trimmed.starts_with(prefix));
+        } else if indent < 4 || trimmed.is_empty() {
+            skipping = false;
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    let mut out = String::with_capacity(base.len());
+    let mut prev_blank = false;
+    for line in kept {
+        if line.is_empty() && prev_blank {
+            continue;
+        }
+        prev_blank = line.is_empty();
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    // Method-level scrub for `attentionRequests`: the surviving
+    // `ws.agent.reportToParent` doc line cross-references the two pruned
+    // methods, so drop that clause too.
+    if !features.attention_requests {
+        out = out.replacen(REPORT_TO_PARENT_ATTENTION_XREF, "", 1);
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF};
+    use super::{
+        denied_feature, workspace_api_description, AgentFeaturesSettings, Cow,
+        REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
+        WORKSPACE_API_DESCRIPTION_CHIEF,
+    };
     use std::collections::HashSet;
 
     // Source of every `ws.<ns>.<method>` binding actually dispatched by
@@ -473,6 +635,8 @@ mod tests {
     const BINDINGS_AGENT: &str = include_str!("bindings/agent.rs");
     const BINDINGS_EVENT: &str = include_str!("bindings/event.rs");
     const BINDINGS_GIT: &str = include_str!("bindings/git.rs");
+    const BINDINGS_HOST: &str = include_str!("bindings/host.rs");
+    const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
@@ -500,6 +664,8 @@ mod tests {
             ("agent", BINDINGS_AGENT),
             ("event", BINDINGS_EVENT),
             ("git", BINDINGS_GIT),
+            ("host", BINDINGS_HOST),
+            ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
             ("terminal", BINDINGS_TERMINAL),
             ("file", BINDINGS_FILE),
@@ -712,5 +878,291 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- [agentFeatures] segment-assembly tests ----------------------------
+
+    // The gated `ws.` doc prefixes paired with the mutator that flips their
+    // `[agentFeatures]` toggle off. Namespace-level toggles gate one
+    // `ws.<ns>.` prefix; method-level toggles (attentionRequests) gate one
+    // full method name per prefix.
+    type FeatureCase = (&'static [&'static str], fn(&mut AgentFeaturesSettings));
+
+    // Each toggle mapped to the `ws.` doc prefixes it prunes and a mutator
+    // that flips it off. Iterated by the assembly tests below so a new toggle
+    // cannot ship without joining the sweep.
+    fn feature_cases() -> Vec<FeatureCase> {
+        vec![
+            (&["ws.hook."], |f| f.background_hooks = false),
+            (&["ws.host."], |f| f.host_exec = false),
+            (&["ws.script."], |f| f.scripts = false),
+            (&["ws.terminal."], |f| f.terminal_access = false),
+            (&["ws.browser."], |f| f.browser_automation = false),
+            (&["ws.app.question."], |f| f.structured_questions = false),
+            (
+                &["ws.agent.requestDiscussion", "ws.agent.reportBlocker"],
+                |f| f.attention_requests = false,
+            ),
+        ]
+    }
+
+    // Hard requirement: with every toggle on (the default), the assembled
+    // description IS the static const — byte-identical, both variants.
+    #[test]
+    fn all_defaults_description_is_byte_identical() {
+        let features = AgentFeaturesSettings::default();
+        let base = workspace_api_description(false, &features);
+        assert!(
+            matches!(base, Cow::Borrowed(_)),
+            "all-on must not reassemble"
+        );
+        assert_eq!(&*base, WORKSPACE_API_DESCRIPTION);
+        let chief = workspace_api_description(true, &features);
+        assert!(
+            matches!(chief, Cow::Borrowed(_)),
+            "all-on must not reassemble"
+        );
+        assert_eq!(&*chief, WORKSPACE_API_DESCRIPTION_CHIEF);
+    }
+
+    // Disabling one feature removes exactly its own doc lines: no method
+    // matching a gated prefix stays documented (a passing textual
+    // cross-reference in another namespace's doc line — e.g. `ws.script.*`
+    // inside the `ws.host.exec` entry — may remain), every other documented
+    // method survives, and the pruned text never leaves doubled blank lines
+    // or continuation orphans behind.
+    #[test]
+    fn disabling_one_feature_prunes_only_its_lines() {
+        for is_chief in [false, true] {
+            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
+            let full_methods = extract_ws_methods(&full);
+            for (prefixes, disable) in feature_cases() {
+                let mut features = AgentFeaturesSettings::default();
+                disable(&mut features);
+                let pruned = workspace_api_description(is_chief, &features);
+                for prefix in prefixes {
+                    assert!(
+                        !pruned
+                            .lines()
+                            .any(|l| l.strip_prefix("  ").is_some_and(|t| t.starts_with(prefix))),
+                        "chief={is_chief}: a `{prefix}` doc line survived disabling its toggle"
+                    );
+                }
+                let pruned_methods = extract_ws_methods(&pruned);
+                for (ns, method) in &full_methods {
+                    let full_name = format!("ws.{ns}.{method}");
+                    if prefixes.iter().any(|p| full_name.starts_with(p)) {
+                        assert!(
+                            !pruned_methods.contains(&(ns.clone(), method.clone())),
+                            "chief={is_chief}: {full_name} still documented after \
+                             disabling `{prefixes:?}`"
+                        );
+                    } else {
+                        assert!(
+                            pruned_methods.contains(&(ns.clone(), method.clone())),
+                            "chief={is_chief}: disabling `{prefixes:?}` also dropped {full_name}"
+                        );
+                    }
+                }
+                assert!(
+                    !pruned.contains("\n\n\n"),
+                    "chief={is_chief}: pruning `{prefixes:?}` left doubled blank lines"
+                );
+            }
+        }
+    }
+
+    // All toggles off at once: every gated prefix is gone, the un-gated
+    // surface (notes, tasks, git, files, crossWorkspace, ...) is intact.
+    #[test]
+    fn disabling_all_features_keeps_ungated_surface() {
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            host_exec: false,
+            scripts: false,
+            terminal_access: false,
+            browser_automation: false,
+            rich_chat_blocks: false,
+            structured_questions: false,
+            attention_requests: false,
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features);
+            for (prefixes, _) in feature_cases() {
+                for prefix in prefixes {
+                    assert!(
+                        !pruned.contains(prefix),
+                        "chief={is_chief}: `{prefix}` survived"
+                    );
+                }
+            }
+            for kept in [
+                "ws.note.read(",
+                "ws.task.updateStatus(",
+                "ws.git.status(",
+                "ws.file.read(",
+                "ws.crossWorkspace.listSiblings(",
+                "ws.agent.create(",
+                "ws.agent.reportToParent(",
+                "ws.event.subscribe(",
+                "ws.pr.status(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
+    // `richChatBlocks` is prompt-only: flipping it must not touch the tool
+    // description at all.
+    #[test]
+    fn rich_chat_blocks_does_not_affect_description() {
+        let features = AgentFeaturesSettings {
+            rich_chat_blocks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        assert_eq!(
+            &*workspace_api_description(false, &features),
+            WORKSPACE_API_DESCRIPTION
+        );
+        assert_eq!(
+            &*workspace_api_description(true, &features),
+            WORKSPACE_API_DESCRIPTION_CHIEF
+        );
+    }
+
+    // `structuredQuestions` is method-level: other `ws.app.*` docs in the
+    // chief variant must survive it.
+    #[test]
+    fn structured_questions_off_keeps_other_app_docs_in_chief() {
+        let features = AgentFeaturesSettings {
+            structured_questions: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let pruned = workspace_api_description(true, &features);
+        assert!(!pruned.contains("ws.app.question."));
+        for kept in [
+            "ws.app.agents.list(",
+            "ws.app.settings.list(",
+            "ws.app.ui.navigate(",
+        ] {
+            assert!(pruned.contains(kept), "`{kept}` was wrongly pruned");
+        }
+    }
+
+    // Guard: the reportToParent cross-reference clause scrubbed by the
+    // `attentionRequests` gate still matches both description variants
+    // verbatim, so the `replacen` scrub cannot silently become a no-op.
+    #[test]
+    fn attention_xref_clause_is_present_in_both_variants() {
+        assert!(WORKSPACE_API_DESCRIPTION.contains(REPORT_TO_PARENT_ATTENTION_XREF));
+        assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains(REPORT_TO_PARENT_ATTENTION_XREF));
+    }
+
+    // `attentionRequests` is method-level: other `ws.agent.*` docs — most
+    // importantly `reportToParent`, minus its cross-reference to the pruned
+    // pair — must survive it, and no textual mention of the pruned methods
+    // may remain anywhere in the description.
+    #[test]
+    fn attention_requests_off_keeps_other_agent_docs() {
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features);
+            assert!(!pruned.contains("ws.agent.requestDiscussion"));
+            assert!(!pruned.contains("ws.agent.reportBlocker"));
+            for kept in [
+                "ws.agent.reportToParent(",
+                "ws.agent.create(",
+                "ws.agent.delegate(",
+                "ws.agent.watch(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
+    // The dispatch-deny mapping: gated frame methods name their feature,
+    // un-gated methods and enabled toggles pass through.
+    #[test]
+    fn denied_feature_maps_gated_methods_only() {
+        let all_off = AgentFeaturesSettings {
+            background_hooks: false,
+            host_exec: false,
+            scripts: false,
+            terminal_access: false,
+            browser_automation: false,
+            rich_chat_blocks: false,
+            structured_questions: false,
+            attention_requests: false,
+        };
+        assert_eq!(
+            denied_feature(&all_off, "hook.schedule"),
+            Some("agentFeatures.backgroundHooks")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "host.exec"),
+            Some("agentFeatures.hostExec")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "script.run"),
+            Some("agentFeatures.scripts")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "terminal.list"),
+            Some("agentFeatures.terminalAccess")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "browser.exec"),
+            Some("agentFeatures.browserAutomation")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "app.question.ask"),
+            Some("agentFeatures.structuredQuestions")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "agent.requestDiscussion"),
+            Some("agentFeatures.attentionRequests")
+        );
+        assert_eq!(
+            denied_feature(&all_off, "agent.reportBlocker"),
+            Some("agentFeatures.attentionRequests")
+        );
+        // Un-gated namespaces pass even with everything off.
+        assert_eq!(denied_feature(&all_off, "note.read"), None);
+        assert_eq!(
+            denied_feature(&all_off, "crossWorkspace.listSiblings"),
+            None
+        );
+        assert_eq!(denied_feature(&all_off, "app.settings.list"), None);
+        // Sibling `ws.agent.*` methods pass even with attentionRequests off.
+        assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
+        assert_eq!(denied_feature(&all_off, "agent.list"), None);
+        // Method-level entries match exactly: a longer method sharing the
+        // gated method as a prefix is not over-denied.
+        assert_eq!(
+            denied_feature(&all_off, "agent.requestDiscussionHistory"),
+            None
+        );
+        // Enabled toggles never deny.
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "host.exec"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
+            None
+        );
     }
 }

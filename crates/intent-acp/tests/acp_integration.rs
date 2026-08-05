@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -83,16 +83,17 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// A fresh, unique temp directory used as a session worktree (FS sandbox root).
-fn temp_dir() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("intent-acp-int-{nanos}-{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+/// A fresh, unique temp directory used as a session worktree (FS sandbox
+/// root). The returned guard removes the dir on drop (including on panic);
+/// set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn temp_dir() -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix("intent-acp-int-")
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
     dir
 }
 
@@ -404,6 +405,8 @@ struct Scenario {
     registry: Arc<PermissionRegistry>,
     mock: MockAgent,
     root: PathBuf,
+    /// RAII guard for `root`; removes the worktree when the scenario drops.
+    _root_guard: tempfile::TempDir,
 }
 
 /// Wire a mock agent (from `fixture`) to a `Connection` and a serving
@@ -435,7 +438,8 @@ fn build_inner(
     auth_patterns: Vec<String>,
     terminal_host: Option<Arc<dyn TerminalHost>>,
 ) -> Scenario {
-    let root = temp_dir();
+    let root_guard = temp_dir();
+    let root = root_guard.path().to_path_buf();
     let script = load_script(fixture, &root.to_string_lossy());
 
     let (c2a_client, c2a_agent) = tokio::io::duplex(64 * 1024);
@@ -490,6 +494,7 @@ fn build_inner(
         registry,
         mock,
         root,
+        _root_guard: root_guard,
     }
 }
 

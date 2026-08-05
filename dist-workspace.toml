@@ -21,40 +21,72 @@ hosting = "github"
 # sitter releases. Note: this renames the generated workflow to
 # .github/workflows/v-release.yml.
 tag-namespace = "v"
+# Self-referential on purpose (monorepo#1277): pointing github-releases-repo at
+# this same repo makes dist generate a release-create step that (a) authenticates
+# with the GH_RELEASES_TOKEN secret (a PAT) instead of the runner's GITHUB_TOKEN,
+# and (b) passes --target from the manifest's external_repo_commit, which is
+# absent here (no submodule path), so `gh` sends no target_commitish at all.
+# Both changes sidestep the 403 that GITHUB_TOKEN hits when the tagged commit
+# touches .github/workflows/* (cli/cli#9514); the tag always exists by the time
+# this workflow runs (release-plz pushes it), so no target is needed.
+# REQUIRES: a repo secret named GH_RELEASES_TOKEN (name is hardcoded by dist)
+# holding a PAT with contents:write on intent-hq/intentd.
+github-releases-repo = "intent-hq/intentd"
 # Whether to install an updater program
 install-updater = false
 # Post-announce: publish/update the stable.json / beta.json channel manifests
 post-announce-jobs = ["./publish-channel-manifest"]
+# The reusable publish-channel-manifest.yml job requests
+# {contents: write, pull-requests: read} (notifier reads squash-merged PR
+# bodies, see #815); the caller job's permissions must cover everything the
+# called reusable workflow requests or the run startup-fails. Overriding here
+# replaces the inherited workflow-level permissions, so contents: write must
+# be restated.
+github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read" } }
 # Injected into build-local-artifacts: provisions rustup/toolchain/targets on
 # the self-hosted runners, which don't have the hosted images' preinstalled
 # toolchains (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Build jobs run on the org's self-hosted runners (GH-hosted billing is
-# unavailable): tinybox (Linux x64, Ubuntu 22.04), m1mac (macOS arm64), 5090pc
-# (Windows x64). Runner values must be single labels here (the generated
+# Linux build jobs run on the org's self-hosted tinybox runner (Linux x64,
+# Ubuntu 22.04). Runner values must be single labels here (the generated
 # workflow interpolates them as strings), and each machine exposes its
 # hostname as a label.
 #
-# The global jobs (plan / build-global-artifacts / host / announce) run on
-# WarpBuild ephemeral runners instead: `plan` runs on every PR and the rest
-# fire at release time, so keeping them off tinybox isolates them from its
-# single-slot queue — the same rationale as ci.yml's route/burst pattern.
+# The macOS builds run on GitHub-hosted Apple Silicon runners (macos-14):
+# the self-hosted m1mac went offline and release builds queued forever
+# behind it.
+#
+# The Windows build runs on a GitHub-hosted runner: the self-hosted 5090pc
+# lacks PowerShell 7, so default-shell steps fall back to Windows PowerShell
+# 5.1, whose `>` redirection writes UTF-16 — dist's generated
+# `dist build ... > dist-manifest.json` step then produces a manifest dist
+# can't read back ("stream did not contain valid UTF-8"). Move it back to
+# 5090pc once pwsh 7 is installed there.
+#
+# The global jobs (plan / build-global-artifacts / host / announce) also
+# run on tinybox: they sat on GitHub-hosted runners while tinybox had a
+# single slot (`plan` runs on every PR and queueing it behind the heavy CI
+# jobs was the intentd#805 rationale), but with 8 tinybox slots that
+# queue-isolation concern is gone.
 #
 # `host` overrides tell dist the actual host triple where it differs from the
 # runner-name heuristic, so it picks the right cross strategy:
-# - m1mac is arm64, so x86_64-apple-darwin is a cross build (rustup target).
+# - macos-14 is arm64 (host pinned explicitly on both apple targets so the
+#   arch never depends on dist's runner-name heuristic), so
+#   x86_64-apple-darwin is a cross build (rustup target).
 # - tinybox runs the musl builds as cross builds from the glibc host triple,
 #   mirroring the previous ubuntu-22.04 setup (aarch64 musl via
 #   cargo-zigbuild, x86_64 musl via musl-tools).
 [dist.github-custom-runners]
-global = "warp-ubuntu-latest-x64-2x"
+global = "tinybox"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
-runner = "m1mac"
+runner = "macos-14"
+host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
-runner = "m1mac"
+runner = "macos-14"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
@@ -66,4 +98,4 @@ runner = "tinybox"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]
-runner = "5090pc"
+runner = "windows-2022"

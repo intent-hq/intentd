@@ -7,8 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    new_attachment_id, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
+    new_attachment_id, now_iso, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
     WorkspaceApi, WorkspaceId, ATTACHMENT_ID_KEY,
 };
 use intent_js::{eval as js_eval, BoxFuture, EvalOptions, HostFn, JsError};
@@ -41,6 +42,18 @@ fn workspace_api_timeout_from(raw: Option<&str>) -> Duration {
         .unwrap_or(WORKSPACE_API_TIMEOUT)
 }
 
+/// Default for `workspaceApi.maxOutputChars` — mirrors the settings-catalog
+/// default in `intent-services`; used when `settings.get` fails.
+const DEFAULT_MAX_OUTPUT_CHARS: usize = 100_000;
+
+/// Default for `workspaceApi.toonOutput` — mirrors the settings-catalog
+/// default in `intent-services`; used when `settings.get` fails.
+const DEFAULT_TOON_OUTPUT: bool = true;
+
+/// Head-preview size (characters) included in the redirect message when an
+/// oversized output is written to a file.
+const OUTPUT_PREVIEW_CHARS: usize = 2000;
+
 impl WorkspaceMcpServer {
     /// WSAPI-2 dispatch: evaluate agent-supplied JavaScript against the
     /// workspace API and shape the MCP tool result in-line (reference parity
@@ -54,18 +67,19 @@ impl WorkspaceMcpServer {
         // `summary` is required by the input schema but is not fed into the
         // engine — it is a UI hint for the caller, not part of the eval
         // environment. Accept and ignore for now.
-        let host = make_workspace_host(
+        let host = make_workspace_host_for(
             self.api.clone(),
             self.workspace_id.clone(),
             self.caller_agent_id.clone(),
             self.turn_attachments.clone(),
+            self.agent_features.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude();
+        let bindings_prelude = super::bindings::prelude_for(&self.agent_features);
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
@@ -99,14 +113,136 @@ impl WorkspaceMcpServer {
                         });
                     }
 
-                    let pretty = serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|_| "(unserializable)".into());
-                    workspace_api_success(&pretty)
+                    // Error results and the `__mcpContentItems` pass-through
+                    // above are exempt from both knobs: only the plain
+                    // success body is TOON-encoded / size-limited.
+                    let (toon_output, max_chars) = self.workspace_api_output_settings().await;
+                    let (body, ext) = render_workspace_api_value(&value, toon_output);
+                    self.finalize_workspace_api_output(body, ext, max_chars)
+                        .await
                 }
                 _ => workspace_api_error("Error: engine: unexpected workspace_api envelope"),
             },
             Err(e) => workspace_api_error(&format_js_error(&e)),
         }
+    }
+
+    /// Read the `workspaceApi.*` output knobs live for one invocation via
+    /// `settings.get`, falling back to the catalog defaults when the settings
+    /// backend errors or returns an unexpected shape.
+    async fn workspace_api_output_settings(&self) -> (bool, usize) {
+        let toon_output = match self
+            .api
+            .settings_get("workspaceApi.toonOutput".to_string())
+            .await
+        {
+            Ok(v) => v
+                .get("value")
+                .and_then(Value::as_bool)
+                .unwrap_or(DEFAULT_TOON_OUTPUT),
+            Err(_) => DEFAULT_TOON_OUTPUT,
+        };
+        let max_chars = match self
+            .api
+            .settings_get("workspaceApi.maxOutputChars".to_string())
+            .await
+        {
+            Ok(v) => v
+                .get("value")
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+            Err(_) => DEFAULT_MAX_OUTPUT_CHARS,
+        };
+        (toon_output, max_chars)
+    }
+
+    /// Enforce `workspaceApi.maxOutputChars` on one success text body: within
+    /// the limit (or unlimited, `0`) the text passes through unchanged; over
+    /// the limit the FULL text is written to `<workspace-folder>/tool-outputs/`
+    /// — the workspace's own directory, a SIBLING of the repo checkout, never
+    /// inside the git tree — and a short redirect message (total size, limit,
+    /// absolute path, head preview, inspection hints) is returned instead.
+    /// When the redirect cannot be written (e.g. no resolvable workspace
+    /// directory) the untruncated output is returned — the tool call never
+    /// fails because of the redirect.
+    async fn finalize_workspace_api_output(
+        &self,
+        text: String,
+        ext: &str,
+        max_chars: usize,
+    ) -> Value {
+        if max_chars == 0 {
+            return workspace_api_success(&text);
+        }
+        let total_chars = text.chars().count();
+        if total_chars <= max_chars {
+            return workspace_api_success(&text);
+        }
+        match self.write_oversized_output(&text, ext).await {
+            Ok(path) => {
+                let preview: String = text.chars().take(OUTPUT_PREVIEW_CHARS).collect();
+                workspace_api_success(&format!(
+                    "Output too large: {total_chars} characters (limit: {max_chars}). \
+                     The full output was written to:\n{path}\n\n\
+                     This file is OUTSIDE the workspace root (a sibling of the repo \
+                     checkout), so `ws.file.read` cannot reach it. Inspect it \
+                     selectively with terminal commands (grep, head, tail, ranged \
+                     reads) or absolute-path file tools instead of reading it \
+                     whole.\n\nFirst {OUTPUT_PREVIEW_CHARS} characters:\n{preview}"
+                ))
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
+                     could not be redirected to a file ({reason}); returning it untruncated"
+                );
+                workspace_api_success(&text)
+            }
+        }
+    }
+
+    /// Write one oversized output to
+    /// `<workspace-folder>/tool-outputs/<utc-timestamp>-<short-id>.<ext>`,
+    /// resolving `<workspace-folder>` as the parent of the workspace's
+    /// checkout (`worktreePath`, else `path`) — today's layout is
+    /// `<workspaces-root>/<workspace-name>/<repo-name>`, so the file lands
+    /// next to (not inside) the git tree and needs no git exclusion. Writes
+    /// through direct tokio fs on purpose: the `ws.file.*` surface is
+    /// worktree-rooted and cannot reach this folder. Returns the absolute
+    /// file path.
+    async fn write_oversized_output(
+        &self,
+        text: &str,
+        ext: &str,
+    ) -> std::result::Result<String, String> {
+        let ws = self
+            .api
+            .get_workspace(self.workspace_id.clone())
+            .await
+            .map_err(|e| format!("get_workspace: {e}"))?;
+        let checkout = ws
+            .worktree_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .or(ws.path.as_deref().filter(|p| !p.is_empty()))
+            .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
+        let folder = std::path::Path::new(checkout)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| format!("checkout path `{checkout}` has no parent directory"))?;
+        let dir = folder.join("tool-outputs");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let stamp = now_iso().replace(':', "-");
+        let short_id = uuid::Uuid::new_v4().simple().to_string();
+        let file = dir.join(format!("{stamp}-{}.{ext}", &short_id[..8]));
+        tokio::fs::write(&file, text)
+            .await
+            .map_err(|e| format!("write {}: {e}", file.display()))?;
+        Ok(file.to_string_lossy().into_owned())
     }
 
     /// §7.1 deterministic attach — registration side. For every well-formed
@@ -189,6 +325,22 @@ impl WorkspaceMcpServer {
     }
 }
 
+/// Render a `workspace_api` success value as a text body plus the file
+/// extension an oversized redirect would use. Object/array results are
+/// TOON-encoded when `workspaceApi.toonOutput` is enabled (falling back to
+/// pretty JSON if the encoder rejects the value); every other result
+/// (strings, numbers, booleans, `null`) keeps the pretty-JSON behavior.
+fn render_workspace_api_value(value: &Value, toon_output: bool) -> (String, &'static str) {
+    let is_structured = value.is_object() || value.is_array();
+    if toon_output && is_structured {
+        if let Ok(encoded) = toon_format::encode_default(value) {
+            return (encoded, "toon");
+        }
+    }
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| "(unserializable)".into());
+    (pretty, if is_structured { "json" } else { "txt" })
+}
+
 /// Stamp [`ATTACHMENT_ID_KEY`] into a serialized JSON **object** payload,
 /// returning the re-serialized text (`pretty` matches the pretty-printed text
 /// items the bindings emit; compact otherwise). `None` when the text is not a
@@ -216,37 +368,73 @@ fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> 
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
 /// `turn_attachments` is forwarded to bindings that register attachments
 /// mid-dispatch (`ws.app.question.ask`).
-fn make_workspace_host(
+///
+/// `pub` (re-exported as `intent_acp::make_workspace_host`) so callers that
+/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
+/// scheduler in `intent-services` — reuse the exact same host environment.
+/// All `[agentFeatures]` toggles are treated as on; feature-gated callers use
+/// [`make_workspace_host_for`].
+pub fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
 ) -> HostFn {
+    make_workspace_host_for(
+        api,
+        workspace_id,
+        caller_agent_id,
+        turn_attachments,
+        AgentFeaturesSettings::default(),
+    )
+}
+
+/// Feature-aware variant of [`make_workspace_host`]: frames whose method is
+/// gated by a disabled `[agentFeatures]` toggle are denied with an explicit
+/// "disabled in settings" error before reaching the bindings (defense in
+/// depth behind the description/prelude pruning — a raw `host({...})` call
+/// cannot bypass the gate).
+pub fn make_workspace_host_for(
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    caller_agent_id: Option<AgentId>,
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    agent_features: AgentFeaturesSettings,
+) -> HostFn {
+    let features = Arc::new(agent_features);
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
         let caller = caller_agent_id.clone();
         let registry = turn_attachments.clone();
-        Box::pin(
-            async move { workspace_host_dispatch(api, workspace_id, caller, registry, arg).await },
-        ) as BoxFuture<'static, std::result::Result<Value, String>>
+        let features = features.clone();
+        Box::pin(async move {
+            workspace_host_dispatch(api, workspace_id, caller, registry, &features, arg).await
+        }) as BoxFuture<'static, std::result::Result<Value, String>>
     })
 }
 
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
-/// trait mapping.
+/// trait mapping. Methods gated by a disabled `[agentFeatures]` toggle are
+/// denied before dispatch.
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    agent_features: &AgentFeaturesSettings,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
+    if let Some(feature) = super::tools::denied_feature(agent_features, method) {
+        return Err(format!(
+            "host: method `{method}` is disabled in settings ({feature} = false)"
+        ));
+    }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
     if let Some(v) = super::bindings::try_dispatch(
         &api,

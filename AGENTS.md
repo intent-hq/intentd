@@ -53,6 +53,57 @@ only on `intent-services`, never on `intent-store`.
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
+| RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
+
+## Performance — the RPC cost contract
+
+Read paths have bounded-cost expectations; every recent performance regression came from
+attaching unbounded-cost work to one of them. Precedent: intent-hq/monorepo#958
+(full-transcript hydration per page), intent-hq/monorepo#1010 (blob materialization
+before window filtering), intent-hq/monorepo#1061 (N+1 full-workdir git scans in
+`git.diffs`), intent-hq/monorepo#963 (diffSummary rollup loop), and
+intent-hq/monorepo#1396 (diskUsage enrichment on list). The durable version of these
+principles lives in `../../docs/ARCHITECTURE.md`; this section is the day-to-day
+contract for any PR touching the RPC boundary.
+
+### Hot RPCs and the invariant
+
+`workspace.list` / `workspace.get`, `agent.list` / `agent.get`, `agent.getConversation`,
+`note.list`, `git.diffs`, and subscription seq-0 snapshots are on the FE's hot path and
+fire constantly during normal use.
+
+**Invariant: handler cost must be O(rows returned).** Concretely:
+
+- No filesystem walks.
+- No per-item git operations or subprocess spawns.
+- No full-blob hydration — load projections, not whole payloads.
+- Paging, filtering, and projection happen in SQL, never in memory after fetching a
+  superset.
+
+### Derived fields — the decision ladder
+
+Any derived field on a wire payload must sit on exactly one rung:
+
+1. **Invalidated only by daemon-owned mutations** → compute on write and persist it
+   (scoped `UPDATE`); reads just select the column.
+2. **Invalidated by external activity (git / filesystem)** → TTL or watch-invalidated
+   cache refreshed *off* the read path (stale-while-revalidate), with a global
+   concurrency cap on the refresher.
+3. **Consumed only on hover / detail / expand** → keep it out of list payloads; expose
+   a dedicated on-demand RPC.
+
+### Burden of proof
+
+A PR that adds a field to a list-shaped payload must state which ladder rung the field
+sits on. "Computed inline on read" is not an option — that is exactly how the incidents
+above happened.
+
+### Runtime backstop
+
+The daemon profiles each RPC dispatch and logs one WARN (method, statement count,
+duration) when a dispatch exceeds the statement-count or duration threshold. Reviewers
+should watch dogfooding logs for these warnings after merging anything that touches a
+read path — a new WARN on a hot RPC is a regression, not noise.
 
 ## Testing — end-to-end against the real WSS transport
 
@@ -150,3 +201,7 @@ tracker for all components. Do not track issues in markdown files.
   comment on / link the existing issue instead of filing a duplicate.
 - **Cross-reference**: reference the issue number in related commits/PRs (e.g.
   `fix: handle empty envelope (#123)`).
+- **Fix references**: when a PR fixes a monorepo issue, use the full cross-repo form
+  `Fixes intent-hq/monorepo#N` in the squash-commit message or PR body — it auto-closes
+  the issue on merge and lets the release notifier (`scripts/notify-fixed-issues.sh`)
+  comment on it when the fix ships in a beta/stable release.

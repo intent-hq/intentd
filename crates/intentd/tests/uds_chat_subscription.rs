@@ -87,13 +87,19 @@ async fn boot(
     tokio::task::JoinHandle<()>,
     oneshot::Sender<()>,
     Arc<Services>,
+    tempfile::TempDir,
+    tempfile::TempDir,
 ) {
-    let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-uds-");
+    let socket = sock_dir.path().join("uds.sock");
     // Keep a typed handle so tests can drive the live-turn slot directly (the
     // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
+    let ws_root = common::hermetic_workspaces_root();
     let services = Arc::new(
         Services::new(bus.store().clone())
-            .with_workspaces_root(common::hermetic_workspaces_root())
+            .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
@@ -108,7 +114,7 @@ async fn boot(
             .await;
         }
     });
-    (socket, server, shutdown_tx, services)
+    (socket, server, shutdown_tx, services, ws_root, sock_dir)
 }
 
 /// Create a workspace + agent on a fresh control connection; return `(socket,
@@ -119,14 +125,24 @@ async fn setup() -> (
     oneshot::Sender<()>,
     TempDb,
     Arc<Services>,
+    tempfile::TempDir,
+    tempfile::TempDir,
 ) {
     let tmp = TempDb {
         path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services) = boot(&bus).await;
-    (socket, server, shutdown_tx, tmp, services)
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    (
+        socket,
+        server,
+        shutdown_tx,
+        tmp,
+        services,
+        ws_root,
+        sock_dir,
+    )
 }
 
 /// Like [`setup`] but also returns the live [`EventBus`] so a test can persist
@@ -138,14 +154,25 @@ async fn setup_with_bus() -> (
     TempDb,
     EventBus,
     Arc<Services>,
+    tempfile::TempDir,
+    tempfile::TempDir,
 ) {
     let tmp = TempDb {
         path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services) = boot(&bus).await;
-    (socket, server, shutdown_tx, tmp, bus, services)
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    (
+        socket,
+        server,
+        shutdown_tx,
+        tmp,
+        bus,
+        services,
+        ws_root,
+        sock_dir,
+    )
 }
 
 /// Publish one `agent:stream:*` event scoped to `agent_id` (the chat forwarder
@@ -260,7 +287,7 @@ fn is_terminal_delta(delta: &Value) -> bool {
 
 #[tokio::test]
 async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
-    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -345,7 +372,7 @@ async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
 
 #[tokio::test]
 async fn chat_subscribe_missing_agent_id_is_invalid_params() {
-    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
     let mut sub_reader = tokio::io::BufReader::new(sub_read);
     send(
@@ -370,7 +397,7 @@ async fn chat_subscribe_missing_agent_id_is_invalid_params() {
 
 #[tokio::test]
 async fn chat_subscribe_isolates_snapshot_per_agent() {
-    let (socket, server, shutdown_tx, _tmp, _services) = setup().await;
+    let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -432,7 +459,8 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 /// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
 #[tokio::test]
 async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
-    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -646,7 +674,8 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
 /// snapshot + deltas reconcile to a fresh `agent.getConversation` snapshot.
 #[tokio::test]
 async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
-    let (socket, server, shutdown_tx, _tmp, bus, services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -869,7 +898,8 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
 /// returns only the durable conversation page.
 #[tokio::test]
 async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
-    let (socket, server, shutdown_tx, _tmp, bus, services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -989,7 +1019,8 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
 /// (and only) delta A's subscription sees is A's own chunk.
 #[tokio::test]
 async fn chat_subscription_isolates_stream_across_agents() {
-    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -1081,7 +1112,8 @@ async fn chat_subscription_isolates_stream_across_agents() {
 /// delta plus, on the throttle's leading edge, the activity signal).
 #[tokio::test]
 async fn chat_subscription_coexists_with_events_firehose() {
-    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -1198,7 +1230,8 @@ async fn chat_subscription_coexists_with_events_firehose() {
 /// `agent.getConversation` snapshot, and the terminal `removedIds` is non-empty.
 #[tokio::test]
 async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
-    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(
@@ -1411,7 +1444,8 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
 /// client-pulled via `agent.getConversation { nextToken }`.
 #[tokio::test]
 async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
-    let (socket, server, shutdown_tx, _tmp, bus, _services) = setup_with_bus().await;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
     let ws = rpc(

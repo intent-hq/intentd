@@ -2,30 +2,25 @@
 //! fingerprint format parity with the TS implementation, regeneration on
 //! expired/corrupt input, and persisted file modes.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use time::{Duration, OffsetDateTime};
 
 use super::*;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "intentd-tls-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+/// A fresh RAII temp directory for `tag` under the system temp root. The
+/// returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn unique_dir(tag: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(&format!("intentd-tls-{tag}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
 }
 
 fn write_cert_with_validity(dir: &Path, not_before: OffsetDateTime, not_after: OffsetDateTime) {
@@ -41,12 +36,12 @@ fn write_cert_with_validity(dir: &Path, not_before: OffsetDateTime, not_after: O
 #[test]
 fn generate_persist_reload_roundtrip_same_fingerprint() {
     let dir = unique_dir("roundtrip");
-    let generated = generate_new_cert(&dir).unwrap();
+    let generated = generate_new_cert(dir.path()).unwrap();
 
-    assert!(dir.join("ws-cert.pem").exists());
-    assert!(dir.join("ws-key.pem").exists());
+    assert!(dir.path().join("ws-cert.pem").exists());
+    assert!(dir.path().join("ws-key.pem").exists());
 
-    let loaded = load_existing_cert(&dir).expect("valid cert should load");
+    let loaded = load_existing_cert(dir.path()).expect("valid cert should load");
     assert_eq!(generated.fingerprint256, loaded.fingerprint256);
     assert_eq!(generated.cert, loaded.cert);
     assert_eq!(generated.key, loaded.key);
@@ -55,7 +50,7 @@ fn generate_persist_reload_roundtrip_same_fingerprint() {
 #[test]
 fn fingerprint_is_32_uppercase_hex_pairs() {
     let dir = unique_dir("fpformat");
-    let cert = generate_new_cert(&dir).unwrap();
+    let cert = generate_new_cert(dir.path()).unwrap();
 
     let parts: Vec<&str> = cert.fingerprint256.split(':').collect();
     assert_eq!(parts.len(), 32, "SHA-256 fingerprint must be 32 byte pairs");
@@ -74,26 +69,26 @@ fn fingerprint_is_32_uppercase_hex_pairs() {
 fn expired_cert_triggers_regeneration() {
     let dir = unique_dir("expired");
     let now = OffsetDateTime::now_utc();
-    write_cert_with_validity(&dir, now - Duration::days(2), now - Duration::days(1));
+    write_cert_with_validity(dir.path(), now - Duration::days(2), now - Duration::days(1));
 
     assert!(
-        load_existing_cert(&dir).is_none(),
+        load_existing_cert(dir.path()).is_none(),
         "expired cert must be rejected",
     );
 
-    let regenerated = generate_new_cert(&dir).unwrap();
-    let loaded = load_existing_cert(&dir).expect("fresh cert should load");
+    let regenerated = generate_new_cert(dir.path()).unwrap();
+    let loaded = load_existing_cert(dir.path()).expect("fresh cert should load");
     assert_eq!(regenerated.fingerprint256, loaded.fingerprint256);
 }
 
 #[test]
 fn corrupt_cert_triggers_regeneration() {
     let dir = unique_dir("corrupt");
-    std::fs::write(dir.join("ws-cert.pem"), b"not a real certificate").unwrap();
-    std::fs::write(dir.join("ws-key.pem"), b"not a real key").unwrap();
+    std::fs::write(dir.path().join("ws-cert.pem"), b"not a real certificate").unwrap();
+    std::fs::write(dir.path().join("ws-key.pem"), b"not a real key").unwrap();
 
     assert!(
-        load_existing_cert(&dir).is_none(),
+        load_existing_cert(dir.path()).is_none(),
         "corrupt cert must be rejected",
     );
 }
@@ -112,14 +107,14 @@ fn persisted_file_modes_are_0644_and_0600() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = unique_dir("modes");
-    generate_new_cert(&dir).unwrap();
+    generate_new_cert(dir.path()).unwrap();
 
-    let cert_mode = std::fs::metadata(dir.join("ws-cert.pem"))
+    let cert_mode = std::fs::metadata(dir.path().join("ws-cert.pem"))
         .unwrap()
         .permissions()
         .mode()
         & 0o777;
-    let key_mode = std::fs::metadata(dir.join("ws-key.pem"))
+    let key_mode = std::fs::metadata(dir.path().join("ws-key.pem"))
         .unwrap()
         .permissions()
         .mode()
@@ -134,10 +129,10 @@ fn ensure_caches_and_exposes_fingerprint() {
     clear_cert_cache();
 
     let dir = unique_dir("ensure");
-    let cert = ensure_tls_certificate(&dir).unwrap();
+    let cert = ensure_tls_certificate(dir.path()).unwrap();
     assert_eq!(cert_fingerprint(), Some(cert.fingerprint256.clone()));
 
-    let again = ensure_tls_certificate(&dir).unwrap();
+    let again = ensure_tls_certificate(dir.path()).unwrap();
     assert_eq!(cert.fingerprint256, again.fingerprint256);
 
     // Clear cache after test to avoid polluting other tests.
@@ -150,7 +145,7 @@ fn generated_pem_parses_with_rustls_pemfile() {
     // cert/key PEM must remain parseable by `rustls_pemfile`, otherwise the
     // WSS listener cannot start in secure mode.
     let dir = unique_dir("rustlsparse");
-    let generated = generate_new_cert(&dir).unwrap();
+    let generated = generate_new_cert(dir.path()).unwrap();
 
     let mut cert_reader: &[u8] = generated.cert.as_bytes();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)

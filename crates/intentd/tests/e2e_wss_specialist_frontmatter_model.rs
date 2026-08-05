@@ -174,7 +174,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -474,6 +474,181 @@ async fn specialist_config_scalars_inherit_over_wss() {
     drop(daemon);
 }
 
+/// Like [`wss_rpc`] but returns the full response envelope so callers can
+/// assert JSON-RPC error codes (PROTOCOL §9).
+async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "invalid jsonrpc field");
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// WSS e2e for the `modelOptions` list (PROTOCOL §5.11): a user-tier override
+/// that omits the key inherits the bundled tier's list on `specialist.get`
+/// and `specialist.list`, an explicit `[]` clears it, `create` round-trips a
+/// supplied list, and an invalid `modelOptions` shape on `create` is rejected
+/// with `-32602`.
+#[tokio::test]
+async fn specialist_model_options_round_trip_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
+    let bundled_dir = data_dir.join("bundled-specialists");
+    std::fs::create_dir_all(&bundled_dir).expect("mkdir bundled dir");
+    std::fs::write(
+        bundled_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"Bundled\"\nmodelOptions: [{\"model\":\"auggie:opus\",\"hint\":\"smart\"}]\n---\n\nBundled body.",
+    )
+    .expect("write bundled zeta");
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    // Omits modelOptions: inherits the bundled tier's list.
+    std::fs::write(
+        specialists_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"User override\"\n---\n\nUser body.",
+    )
+    .expect("write user zeta");
+    // Explicit []: the explicit clear that stops inheritance.
+    std::fs::write(
+        specialists_dir.join("omega.md"),
+        "---\nname: \"Omega\"\ndescription: \"Cleared\"\nmodelOptions: []\n---\n\nUser body.",
+    )
+    .expect("write user omega");
+
+    let bundled_dir_str = bundled_dir
+        .to_str()
+        .expect("bundled dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let expected = json!([{ "model": "auggie:opus", "hint": "smart" }]);
+
+    // get — an omitted key inherits the bundled tier's list.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
+    assert_eq!(got["specialist"]["source"], "user", "user tier wins");
+    assert_eq!(
+        got["specialist"]["modelOptions"], expected,
+        "omitted modelOptions inherits the bundled list on specialist.get over WSS"
+    );
+
+    // list — the same fold applies to the list projection; the explicit []
+    // clear omits the field.
+    let list = wss_rpc(&mut ws, 3, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let zeta = specs
+        .iter()
+        .find(|s| s["id"] == "zeta")
+        .expect("zeta listed");
+    assert_eq!(
+        zeta["modelOptions"], expected,
+        "omitted modelOptions inherits in specialist.list over WSS"
+    );
+    let omega = specs
+        .iter()
+        .find(|s| s["id"] == "omega")
+        .expect("omega listed");
+    assert!(
+        omega.get("modelOptions").is_none(),
+        "explicit [] clears modelOptions in specialist.list over WSS"
+    );
+
+    // create — a supplied list round-trips through the write path.
+    let created = wss_rpc(
+        &mut ws,
+        4,
+        "specialist.create",
+        json!({
+            "id": "sigma",
+            "scope": "user",
+            "spec": {
+                "id": "sigma", "name": "Sigma", "description": "Authored",
+                "modelOptions": [{ "model": "opencode:kimi-k3", "hint": "cheap" }],
+                "prompt": "Sigma body."
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        created["specialist"]["modelOptions"],
+        json!([{ "model": "opencode:kimi-k3", "hint": "cheap" }]),
+        "create round-trips modelOptions over WSS"
+    );
+    let got = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "sigma" })).await;
+    assert_eq!(
+        got["specialist"]["modelOptions"], created["specialist"]["modelOptions"],
+        "create response agrees with the following get over WSS"
+    );
+
+    // create — an invalid modelOptions shape is rejected with -32602.
+    let rejected = wss_rpc_raw(
+        &mut ws,
+        6,
+        "specialist.create",
+        json!({
+            "id": "tau",
+            "scope": "user",
+            "spec": {
+                "id": "tau", "name": "Tau", "description": "Bad",
+                "modelOptions": [{ "hint": "no model" }],
+                "prompt": "Tau body."
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "invalid modelOptions → -32602 over WSS: {rejected}"
+    );
+
+    drop(daemon);
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
@@ -516,5 +691,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }

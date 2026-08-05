@@ -72,6 +72,7 @@ fn make_config(data_dir: &Path) -> Config {
         pid_path: data_dir.join("intentd.pid"),
         idle_reap_minutes: 0,
         stream_retention_hours: 0,
+        hooks_max_per_agent: 5,
     }
 }
 
@@ -116,6 +117,7 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -139,6 +141,7 @@ async fn serve(
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Sender<()>,
+    tempfile::TempDir,
 ) {
     {
         let store = Store::open(&config.db_path).await.expect("open store");
@@ -146,8 +149,9 @@ async fn serve(
     }
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let handle = tokio::spawn(async move {
@@ -163,7 +167,7 @@ async fn serve(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (handle, tx)
+    (handle, tx, ws_root)
 }
 
 fn tmp_base(tag: &str) -> PathBuf {
@@ -183,7 +187,7 @@ async fn undo_commit_soft_resets_and_restores_staging() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-undo-commit");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "main");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     // Missing hash → parity error with no step pushed.
     let resp = send(
@@ -235,7 +239,7 @@ async fn reset_to_trunk_guards_dirty_then_hard_resets() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-reset");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "feature");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     // Dirty worktree → reset is refused.
     std::fs::write(repo.join("dirty.txt"), "x\n").unwrap();
@@ -282,7 +286,7 @@ async fn rebase_onto_trunk_replays_branch() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-rebase");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "feature");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     let resp = send(
         &config.socket_path,
@@ -315,7 +319,7 @@ async fn merge_local_fast_forwards_trunk() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-merge");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "feature");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     let resp = send(
         &config.socket_path,
@@ -347,7 +351,7 @@ async fn merge_squash_creates_single_commit_on_trunk() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-squash");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "feature");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     let resp = send(
         &config.socket_path,
@@ -388,7 +392,7 @@ async fn undo_push_rewinds_remote_branch() {
     let config = make_config(&data_dir);
     let ws_id = WorkspaceId::from("ws-undo-push");
     let ws = workspace(&ws_id, repo.to_str().unwrap(), "main");
-    let (handle, tx) = serve(&config, &ws).await;
+    let (handle, tx, _ws_root) = serve(&config, &ws).await;
 
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"accept-changes.execute","params":{{"workspaceId":"ws-undo-push","action":"undo-push","upToCommitHash":"{first}"}}}}"#

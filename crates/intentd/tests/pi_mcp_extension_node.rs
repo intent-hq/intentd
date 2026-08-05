@@ -6,6 +6,10 @@
 //! forwarding, reconnect-on-drop, graceful degradation). Skipped if `node` is
 //! unavailable, matching the other node-gated suites.
 
+// Pulls in the shared ctor (hermetic-root guard + NODE_DISABLE_COMPILE_CACHE)
+// so the spawned node child cannot leave residue at the TMPDIR root.
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 

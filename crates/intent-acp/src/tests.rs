@@ -10,6 +10,20 @@ use tokio::task::JoinHandle;
 
 use crate::transport::{Connection, ConnectionHooks};
 
+/// A fresh RAII temp directory with `prefix` under the system temp root. The
+/// returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn test_temp_dir(prefix: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
+}
+
 /// Mock agent: read JSON-RPC lines, assert each frame parses cleanly (whole-line
 /// atomicity), and echo a result for any request. Returns every frame it saw.
 fn spawn_responder<R, W>(read: R, write: W) -> JoinHandle<Vec<Value>>
@@ -231,7 +245,8 @@ async fn stderr_captured_and_auth_flagged() {
 async fn stderr_capture_written_to_daily_log_file() {
     use crate::spawn::{spawn_provider, SpawnOptions};
 
-    let dir = std::env::temp_dir().join(format!("intent-acp-stderr-{}", uuid::Uuid::new_v4()));
+    let tmp = test_temp_dir("intent-acp-stderr-");
+    let dir = tmp.path().join("logs");
 
     let base = *intent_providers::find_provider("auggie").unwrap();
     let provider = intent_providers::ProviderConfig {
@@ -302,7 +317,6 @@ async fn stderr_capture_written_to_daily_log_file() {
     assert!(checked > 0, "at least one daily log file was checked");
 
     agent.kill().await.ok();
-    tokio::fs::remove_dir_all(&dir).await.ok();
 }
 
 /// Minimal portable ACP responder: echoes a `{protocolVersion:1}` result for
@@ -889,6 +903,37 @@ mod session_tests {
         assert_eq!(
             session::derive_tool_name("workspace-mcp_", None),
             "workspace-mcp_"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_rewrites_codex_dot_separated_mcp_titles() {
+        // Codex titles MCP tools `mcp.<server>.<tool>`; the title is
+        // rewritten to `{server}_{tool}` and fed through the affix strip —
+        // the same treatment as the codex nested-input unwrap.
+        assert_eq!(
+            session::derive_tool_name("mcp.workspace-mcp.workspace_api", None),
+            "workspace_api"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp.some-server.read_note", None),
+            "some-server_read_note"
+        );
+        // Prose titles containing dots (with whitespace) never match.
+        assert_eq!(
+            session::derive_tool_name("Read config.toml and summarize", None),
+            "Read config.toml and summarize"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp.workspace-mcp.some tool", None),
+            "mcp.workspace-mcp.some tool"
+        );
+        // Missing server or tool segment → no match, title passes through.
+        assert_eq!(session::derive_tool_name("mcp.server", None), "mcp.server");
+        assert_eq!(session::derive_tool_name("mcp..tool", None), "mcp..tool");
+        assert_eq!(
+            session::derive_tool_name("mcp.server.", None),
+            "mcp.server."
         );
     }
 
@@ -2166,8 +2211,6 @@ mod mcp_tests {
 mod client_served_tests {
     use super::*;
 
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use intent_core::{AgentId, BoxFuture, WorkspaceId};
@@ -2211,17 +2254,10 @@ mod client_served_tests {
         }
     }
 
-    /// A unique, freshly created temp directory for sandbox tests.
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-acp-test-{nanos}-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A unique, freshly created temp directory for sandbox tests; removed
+    /// when the returned guard drops.
+    fn temp_dir() -> tempfile::TempDir {
+        super::test_temp_dir("intent-acp-test-")
     }
 
     /// Wire a `Connection` whose agent→client requests land on `req_rx`. Returns
@@ -2295,7 +2331,7 @@ mod client_served_tests {
     #[test]
     fn sandbox_rejects_traversal_but_allows_in_scope() {
         let root = temp_dir();
-        let svc = FileService::new(&root);
+        let svc = FileService::new(root.path());
         // §11.3 path sandboxing: every shape of `..` escape outside the worktree
         // must be rejected, including nested and trailing traversal that lexically
         // climbs above the root.
@@ -2317,12 +2353,15 @@ mod client_served_tests {
         );
         // In-scope `..` that stays within the root resolves and stays inside it.
         let ok = svc.resolve(std::path::Path::new("sub/ok.txt")).unwrap();
-        assert!(ok.starts_with(&root), "in-scope path resolves inside root");
+        assert!(
+            ok.starts_with(root.path()),
+            "in-scope path resolves inside root"
+        );
         let in_scope = svc
             .resolve(std::path::Path::new("a/b/../c.txt"))
             .expect("in-bounds traversal resolves");
         assert!(
-            in_scope.starts_with(&root),
+            in_scope.starts_with(root.path()),
             "traversal that stays within the root remains sandboxed"
         );
     }
@@ -2362,13 +2401,13 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::new(),
         );
         let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
-        let path = root.join("notes/hello.txt");
+        let path = root.path().join("notes/hello.txt");
 
         let req = send(
             &mut writer,
@@ -2445,13 +2484,13 @@ mod client_served_tests {
             WorkspaceId::from_string("ws-1"),
             AgentId::from_string("agent-1"),
             "auggie",
-            FileService::new(&root),
+            FileService::new(root.path()),
             Arc::new(PermissionRegistry::new()),
             PermissionPolicy::Interactive,
             sink.clone(),
         );
         let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
-        let path = root.join("ordered.txt");
+        let path = root.path().join("ordered.txt");
 
         let req = send(
             &mut writer,
@@ -2517,7 +2556,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, registry) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::new(),
@@ -2576,7 +2615,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink.clone(),
             PermissionRegistry::with_timeout(Duration::from_millis(50)),
@@ -2605,7 +2644,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::AutoByRisk,
             sink.clone(),
             PermissionRegistry::new(),
@@ -2645,7 +2684,7 @@ mod client_served_tests {
         let root = temp_dir();
         let sink = Arc::new(MockSink::default());
         let (handler, _reg) = build_handler(
-            &root,
+            root.path(),
             PermissionPolicy::Interactive,
             sink,
             PermissionRegistry::new(),
@@ -4947,6 +4986,7 @@ mod workspace_api_tool_tests {
                 cow_supported: None,
                 display_status: None,
                 checkout_mode: None,
+                disk_usage: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
         }
@@ -4956,6 +4996,21 @@ mod workspace_api_tool_tests {
         fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
             let snapshot = self.ws.lock().unwrap().clone();
             Box::pin(async move { Ok(snapshot) })
+        }
+
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
         }
     }
 
@@ -5216,6 +5271,159 @@ mod workspace_api_tool_tests {
             .unwrap()
             .contains("`summary` is required and must be a string"));
     }
+
+    // ---- [agentFeatures] surface gating (description / prelude / dispatch) --
+
+    fn no_hooks_features() -> intent_core::settings_file::AgentFeaturesSettings {
+        intent_core::settings_file::AgentFeaturesSettings {
+            background_hooks: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_description_prunes_disabled_feature() {
+        // Layer (a): a bridge created with `backgroundHooks = false` must not
+        // advertise `ws.hook.*` in its `workspace_api` description, while an
+        // all-defaults bridge advertises it verbatim.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("ws.hook."),
+            "pruned description still advertises ws.hook.*"
+        );
+        assert!(
+            desc.contains("ws.note.read("),
+            "un-gated surface must stay advertised"
+        );
+
+        let default_srv = server("amber-forest", None);
+        let resp = default_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            crate::mcp_server::WORKSPACE_API_DESCRIPTION,
+            "all-defaults tools/list description must be byte-identical to the static const"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_namespace_is_absent_from_prelude() {
+        // Layer (b): with the toggle off, `ws.hook` is not installed, so
+        // touching it fails with the clear namespace-missing TypeError.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.hook.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("undefined"),
+            "expected undefined-namespace error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_method_is_denied_at_dispatch() {
+        // Layer (c): a raw `host({...})` frame cannot bypass the pruned
+        // prelude — dispatch denies it with the explicit settings error.
+        let srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'hook.list', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings") && text.contains("agentFeatures.backgroundHooks"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_features_dispatch_unaffected_by_other_toggles() {
+        // Disabling hooks must not disturb un-gated namespaces on the same
+        // bridge — `ws.workspace.info()` still round-trips.
+        let srv = server("amber-forest", Some("/tmp/amber-forest"))
+            .with_agent_features(no_hooks_features());
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+    }
+
+    #[tokio::test]
+    async fn structured_questions_off_denies_question_ask() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                structured_questions: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: ws.app.question is not installed.
+        let resp = call_workspace_api(
+            &srv,
+            "return await ws.app.question.ask({ question: 'q', header: 'h', options: [{label:'a'},{label:'b'}] });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        // Dispatch: the raw frame is denied with the settings error.
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'app.question.ask', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings")
+                && text.contains("agentFeatures.structuredQuestions"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attention_requests_off_denies_blocker_and_discussion() {
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                attention_requests: false,
+                ..Default::default()
+            },
+        );
+        // Prelude: the two attention-request installers are not present on
+        // `ws.agent`, while the rest of the namespace survives.
+        let resp = call_workspace_api(
+            &srv,
+            "return { rb: typeof ws.agent.reportBlocker, rd: typeof ws.agent.requestDiscussion, rtp: typeof ws.agent.reportToParent };",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["rb"], json!("undefined"));
+        assert_eq!(body["rd"], json!("undefined"));
+        assert_eq!(body["rtp"], json!("function"));
+        // Dispatch: the raw frames are denied with the settings error.
+        for method in ["agent.reportBlocker", "agent.requestDiscussion"] {
+            let resp = call_workspace_api(
+                &srv,
+                &format!("return await host({{ method: '{method}', args: {{ reason: 'r' }} }});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(true));
+            let text = tool_text(&resp);
+            assert!(
+                text.contains("disabled in settings")
+                    && text.contains("agentFeatures.attentionRequests"),
+                "expected explicit disabled-in-settings denial for {method}, got: {text}"
+            );
+        }
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,
@@ -5313,6 +5521,21 @@ mod wsapi3_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         // ---- note.* ----
         fn get_note(
             &self,
@@ -6647,7 +6870,6 @@ mod wsapi6_bindings_tests {
         Option<String>,
     );
     type PrReviewCommentsCall = (Option<String>, Option<String>);
-    type PrWaitCall = (Option<i64>, Option<i64>, Option<String>);
     type PrResolveThreadCall = (String, Option<String>);
     type PrReplyCall = (u64, String);
     type CrossReadCall = (String, String);
@@ -6656,6 +6878,7 @@ mod wsapi6_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         pr_status_calls: Mutex<u32>,
+        pr_snapshot_calls: Mutex<Vec<u64>>,
         pr_merge_calls: Mutex<Vec<PrMergeCall>>,
         pr_update_branch_calls: Mutex<u32>,
         pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
@@ -6663,7 +6886,6 @@ mod wsapi6_bindings_tests {
         pr_resolve_thread_calls: Mutex<Vec<PrResolveThreadCall>>,
         pr_list_comments_calls: Mutex<Vec<Option<i64>>>,
         pr_post_comment_calls: Mutex<Vec<String>>,
-        pr_wait_calls: Mutex<Vec<PrWaitCall>>,
         cross_list_siblings_calls: Mutex<u32>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
@@ -6675,6 +6897,21 @@ mod wsapi6_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         fn pr_status(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
             *self.pr_status_calls.lock().unwrap() += 1;
             let result = self.pr_status_result.lock().unwrap().clone();
@@ -6697,6 +6934,21 @@ mod wsapi6_bindings_tests {
                         "isClosed": false,
                         "summary": "✅ PR is mergeable with no conflicts.",
                     })
+                }))
+            })
+        }
+
+        fn pr_state(&self, _ws: WorkspaceId, pr_number: u64) -> BoxFuture<'_, Result<Value>> {
+            self.pr_snapshot_calls.lock().unwrap().push(pr_number);
+            Box::pin(async move {
+                Ok(json!({
+                    "prNumber": pr_number,
+                    "state": "open",
+                    "isMerged": false,
+                    "mergeBlockedReason": null,
+                    "checks": { "total": 0, "passed": 0, "failed": 0, "pending": 0, "failedNames": [] },
+                    "reviews": { "decision": "review_required", "approvals": 0, "changesRequested": 0 },
+                    "comments": { "conversationCount": 0, "reviewCommentCount": 0, "unresolvedThreadCount": 0, "totalCount": 0 },
                 }))
             })
         }
@@ -6734,28 +6986,6 @@ mod wsapi6_bindings_tests {
                     "alreadyUpToDate": false,
                     "message": "PR branch updated.",
                     "url": null,
-                }))
-            })
-        }
-
-        fn pr_wait_for_changes(
-            &self,
-            _ws: WorkspaceId,
-            timeout_seconds: Option<i64>,
-            poll_interval_seconds: Option<i64>,
-            watch: Option<String>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_wait_calls.lock().unwrap().push((
-                timeout_seconds,
-                poll_interval_seconds,
-                watch,
-            ));
-            Box::pin(async {
-                Ok(json!({
-                    "changed": false,
-                    "elapsedSeconds": 0,
-                    "iterations": 0,
-                    "summary": "no changes",
                 }))
             })
         }
@@ -7041,6 +7271,40 @@ mod wsapi6_bindings_tests {
     }
 
     #[tokio::test]
+    async fn pr_snapshot_forwards_pr_number_and_returns_shape() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["prNumber"], json!(42));
+        assert_eq!(v["isMerged"], json!(false));
+        assert_eq!(v["mergeBlockedReason"], json!(null));
+        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![42u64]);
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_requires_numeric_pr_number() {
+        // Missing, non-positive, and non-numeric prNumber all surface the
+        // same validation error before the trait method is called — parity
+        // with the `replyToReviewComment` commentId pattern.
+        let (srv, api) = server();
+        for code in [
+            "return await ws.pr.snapshot();",
+            "return await ws.pr.snapshot(0);",
+            "return await ws.pr.snapshot(-1);",
+            "return await ws.pr.snapshot('abc');",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
+            assert!(
+                text(&resp).contains("prNumber is required and must be a number"),
+                "code: {code}"
+            );
+        }
+        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn pr_merge_forwards_options_and_defaults_merge_method() {
         let (srv, api) = server();
         let resp = call(
@@ -7119,32 +7383,6 @@ mod wsapi6_bindings_tests {
         let resp = call(&srv, "return await ws.pr.updateBranch();").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(*api.pr_update_branch_calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn pr_wait_for_changes_validates_watch_mode() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.waitForChanges({ watch: 'bogus' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("watch must be one of"));
-        assert!(api.pr_wait_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pr_wait_for_changes_forwards_options() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.waitForChanges({ timeoutSeconds: 60, pollIntervalSeconds: 15, watch: 'checks' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.pr_wait_calls.lock().unwrap();
-        assert_eq!(calls[0], (Some(60), Some(15), Some("checks".to_string())));
     }
 
     #[tokio::test]
@@ -7370,6 +7608,9 @@ mod wsapi4_bindings_tests {
         event_dir_calls: Mutex<Vec<DirCall>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
+        /// Raw `agent.getQueue` entries served by `agent_get_queue`.
+        queue_entries: Mutex<Vec<Value>>,
+        remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -7391,6 +7632,7 @@ mod wsapi4_bindings_tests {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: vec![],
+            waiting_on_hooks: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: None,
@@ -7401,9 +7643,11 @@ mod wsapi4_bindings_tests {
             digest: None,
             last_agent_response: None,
             last_user_message: None,
+            last_message_role: None,
             context_references: None,
             image_blocks: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             metadata: AgentMetadata {
                 is_background: false,
@@ -7426,6 +7670,21 @@ mod wsapi4_bindings_tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+        // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+        // bodies; the TOON/limit paths are covered by
+        // `workspace_api_output_limit_tests`.
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
         fn agent_list(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
             *self.agent_list_calls.lock().unwrap() += 1;
             Box::pin(async move { Ok(vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]) })
@@ -7446,6 +7705,29 @@ mod wsapi4_bindings_tests {
                 }
                 Ok(stub_agent(&id, &ws))
             })
+        }
+
+        fn agent_get_queue(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let queue = self.queue_entries.lock().unwrap().clone();
+            Box::pin(async move { Ok(json!({ "success": true, "queue": queue })) })
+        }
+
+        fn agent_remove_queued_message_owned(
+            &self,
+            agent_id: AgentId,
+            message_id: String,
+            caller_agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.remove_queued_owned_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                message_id.clone(),
+                caller_agent_id.as_str().to_string(),
+            ));
+            Box::pin(async move { Ok(json!({ "success": true, "messageId": message_id })) })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -7758,6 +8040,99 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["id"], json!("a-42"));
         assert_eq!(api.agent_get_calls.lock().unwrap()[0], "a-42");
+        // The status result carries the merged (empty) queue view.
+        assert_eq!(v["queueLength"], json!(0));
+        assert_eq!(v["queue"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn agent_status_merges_truncated_queue() {
+        let (srv, api) = server();
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "q-1",
+            "content": "y".repeat(300),
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "a-9", "fromAgentName": "Nine" },
+        })];
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["queueLength"], json!(1));
+        let content = v["queue"][0]["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), 201, "200 chars + ellipsis");
+        assert!(content.ends_with('…'));
+        assert_eq!(v["queue"][0]["fromAgentId"], json!("a-9"));
+        assert_eq!(v["queue"][0]["fromAgentName"], json!("Nine"));
+    }
+
+    #[tokio::test]
+    async fn agent_get_queue_presents_drain_order_and_attribution() {
+        let (srv, api) = server();
+        *api.queue_entries.lock().unwrap() = vec![
+            json!({
+                "id": "q-normal",
+                "content": "normal",
+                "queuedAt": "2026-01-01T00:00:00Z",
+                "position": 0,
+                "messageMetadata": { "fromAgentId": "a-9", "fromAgentName": "Nine" },
+            }),
+            json!({
+                "id": "q-interrupt",
+                "content": "urgent",
+                "queuedAt": "2026-01-01T00:00:01Z",
+                "position": 1,
+                "interruptPriority": true,
+            }),
+        ];
+        let resp = call(&srv, "return await ws.agent.getQueue('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["agentId"], json!("a-42"));
+        assert_eq!(v["queueLength"], json!(2));
+        // Next delivery first: the interrupt entry ahead of normal FIFO.
+        assert_eq!(v["queue"][0]["id"], json!("q-interrupt"));
+        assert_eq!(v["queue"][0]["position"], json!(0));
+        assert_eq!(v["queue"][1]["id"], json!("q-normal"));
+        assert_eq!(v["queue"][1]["fromAgentId"], json!("a-9"));
+        assert!(v["queue"][1].get("messageMetadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_remove_queued_message_forwards_caller_identity() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.removeQueuedMessage('a-42', 'q-7');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["agentId"], json!("a-42"));
+        assert_eq!(v["messageId"], json!("q-7"));
+        let calls = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            (
+                "a-42".to_string(),
+                "q-7".to_string(),
+                "caller-1".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_remove_queued_message_requires_caller() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.removeQueuedMessage('a-42', 'q-7');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7900,10 +8275,11 @@ mod wsapi4_bindings_tests {
         );
     }
 
-    /// Explicit `messageMetadata` on `send` wins over the auto-tag — we never
-    /// overwrite metadata the caller supplied.
+    /// Explicit `messageMetadata` on `send` keeps its own fields, but the
+    /// attribution fields are daemon-stamped — the guard/ownership key
+    /// (`fromAgentId`) can be neither omitted nor spoofed by the caller.
     #[tokio::test]
-    async fn agent_send_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_send_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -7912,12 +8288,42 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_calls.lock().unwrap();
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom", "reason": "x" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "reason": "x",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
-    /// Explicit `messageMetadata` on `sendToTask` wins over the auto-tag.
+    /// A spoofed `fromAgentId` in explicit metadata is overwritten with the
+    /// real caller identity — attribution is daemon-stamped, never trusted.
     #[tokio::test]
-    async fn agent_send_to_task_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_send_spoofed_from_agent_id_is_overwritten() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', null, { fromAgentId: 'agent-victim', fromAgentName: 'Victim' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    /// Explicit `messageMetadata` on `sendToTask` keeps its own fields with
+    /// the attribution fields daemon-stamped.
+    #[tokio::test]
+    async fn agent_send_to_task_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -7926,13 +8332,20 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_to_task_calls.lock().unwrap();
-        assert_eq!(calls[0].2, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].2,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
-    /// Explicit `messageMetadata` in `create()` opts wins over the auto-tag on
-    /// the kickoff delivery.
+    /// Explicit `messageMetadata` in `create()` opts keeps its own fields on
+    /// the kickoff delivery, with the attribution fields daemon-stamped.
     #[tokio::test]
-    async fn agent_create_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_create_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -7942,7 +8355,14 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_calls.lock().unwrap();
         assert_eq!(calls[0].0, "child-1");
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
     /// `wakeOrCreate`'s delivered context message is an agent-originated send
@@ -7969,9 +8389,9 @@ mod wsapi4_bindings_tests {
     }
 
     /// Explicit `messageMetadata` on `wakeOrCreate` (new optional 4th arg)
-    /// wins over the auto-tag.
+    /// keeps its own fields with the attribution fields daemon-stamped.
     #[tokio::test]
-    async fn agent_wake_or_create_explicit_metadata_wins_over_auto_tag() {
+    async fn agent_wake_or_create_explicit_metadata_merged_with_stamped_attribution() {
         let (srv, api) = server_with_caller("caller-1");
         let resp = call(
             &srv,
@@ -7980,7 +8400,14 @@ mod wsapi4_bindings_tests {
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_wake_or_create_calls.lock().unwrap();
-        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "custom",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
     }
 
     /// Caller-less (FE/RPC front door) wakes stay untagged.
@@ -8074,6 +8501,26 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["subscriptionId"], json!("sub-9"));
         assert_eq!(v["ok"], json!(true));
         assert_eq!(api.agent_unsubscribe_calls.lock().unwrap()[0], "sub-9");
+    }
+
+    /// monorepo#1229: `ws.agent.unwatch()` with a missing or empty argument
+    /// fails the required-parameter validation instead of reaching the
+    /// service with an empty subscriptionId.
+    #[tokio::test]
+    async fn agent_unwatch_missing_or_empty_argument_errors() {
+        let (srv, _api) = server_with_caller("caller-1");
+        for script in [
+            "return await ws.agent.unwatch();",
+            "return await ws.agent.unwatch('');",
+        ] {
+            let resp = call(&srv, script).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "script: {script}");
+            assert!(
+                text(&resp).contains("subscriptionId or agentId is required"),
+                "script: {script}, text: {}",
+                text(&resp)
+            );
+        }
     }
 
     #[tokio::test]
@@ -8202,16 +8649,15 @@ mod wsapi4_bindings_tests {
     }
 
     #[tokio::test]
-    async fn event_subscribe_expands_wildcard_star() {
+    async fn event_subscribe_passes_wildcard_star_through() {
+        // The binding no longer expands `*` — the daemon resolves it
+        // per-subscriber (agents get the non-agent categories only,
+        // monorepo#1229), so the wildcard must reach the API verbatim.
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.event.subscribe(['*']);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.event_subscribe_calls.lock().unwrap();
-        let resolved = &calls[0].0;
-        assert!(resolved.contains(&"agent:*".to_string()));
-        assert!(resolved.contains(&"file:*".to_string()));
-        assert!(resolved.contains(&"comment:*".to_string()));
-        assert_eq!(resolved.len(), 12);
+        assert_eq!(calls[0].0, vec!["*".to_string()]);
     }
 
     #[tokio::test]
@@ -8238,5 +8684,275 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["subscriptionId"], json!("sub-5"));
         assert_eq!(v["ok"], json!(true));
+    }
+}
+
+/// `workspace_api` output shaping: the `workspaceApi.toonOutput` and
+/// `workspaceApi.maxOutputChars` knobs read live per invocation. Covers TOON
+/// on/off, under/over-limit, the oversized-output redirect into the
+/// workspace folder's `tool-outputs/` directory (a SIBLING of the repo
+/// checkout), unlimited (`0`), and the unresolvable-workspace-dir fallback.
+#[cfg(test)]
+mod workspace_api_output_limit_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+        WorkspaceId, WorkspaceStatus,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    /// Mock whose `settings_get` serves configurable `workspaceApi.*` knobs
+    /// and whose `get_workspace` reports an optional on-disk checkout path.
+    struct OutputLimitMockApi {
+        checkout: Mutex<Option<String>>,
+        toon_output: Mutex<Value>,
+        max_output_chars: Mutex<Value>,
+    }
+
+    impl OutputLimitMockApi {
+        fn new(checkout: Option<&str>, toon_output: bool, max_output_chars: u64) -> Arc<Self> {
+            Arc::new(Self {
+                checkout: Mutex::new(checkout.map(str::to_string)),
+                toon_output: Mutex::new(json!(toon_output)),
+                max_output_chars: Mutex::new(json!(max_output_chars)),
+            })
+        }
+    }
+
+    impl WorkspaceApi for OutputLimitMockApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            let checkout = self.checkout.lock().unwrap().clone();
+            Box::pin(async move {
+                let now = "2026-01-01T00:00:00Z".to_string();
+                Ok(Workspace {
+                    id: id.clone(),
+                    title: id.as_str().to_string(),
+                    branch: id.as_str().to_string(),
+                    base_ref: None,
+                    base_commit_sha: None,
+                    status: WorkspaceStatus::Active,
+                    status_message: None,
+                    status_image_asset_id: None,
+                    activity: WorkspaceActivity::Idle,
+                    attention: WorkspaceAttention::None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    last_activity: None,
+                    tags: Vec::new(),
+                    path: None,
+                    repository_path: None,
+                    repository_owner: None,
+                    repository_name: None,
+                    worktree_path: checkout,
+                    scope: None,
+                    skip_worktree: false,
+                    setup_script: None,
+                    is_remote: false,
+                    default_model: None,
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    active_pull_request: None,
+                    pull_requests: None,
+                    archived: false,
+                    archived_at: None,
+                    task_stats: None,
+                    agent_summary: None,
+                    diff_summary: None,
+                    token_usage: None,
+                    cow_supported: None,
+                    display_status: None,
+                    checkout_mode: None,
+                    disk_usage: None,
+                })
+            })
+        }
+
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            let toon = self.toon_output.lock().unwrap().clone();
+            let max = self.max_output_chars.lock().unwrap().clone();
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => toon,
+                    "workspaceApi.maxOutputChars" => max,
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+    }
+
+    /// A fresh `<workspaces-root>/<workspace-name>/<repo-name>` layout on
+    /// disk; returns the workspace folder guard and the checkout path inside
+    /// it. The folder is removed when the guard drops.
+    fn temp_workspace_layout() -> (tempfile::TempDir, String) {
+        let folder = super::test_temp_dir("intent-acp-outlimit-");
+        let checkout = folder.path().join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout = checkout.to_string_lossy().into_owned();
+        (folder, checkout)
+    }
+
+    fn server(
+        checkout: Option<&str>,
+        toon_output: bool,
+        max_output_chars: u64,
+    ) -> WorkspaceMcpServer {
+        let api = OutputLimitMockApi::new(checkout, toon_output, max_output_chars);
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    async fn call(srv: &WorkspaceMcpServer, code: &str) -> Value {
+        srv.handle_message(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "unit test" }
+            }
+        }))
+        .await
+        .expect("tools/call must produce a response")
+    }
+
+    fn tool_text(resp: &Value) -> &str {
+        assert_eq!(resp["result"]["isError"], json!(false));
+        resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    /// The single file the redirect wrote under `<folder>/tool-outputs/`.
+    fn only_tool_output(folder: &std::path::Path) -> PathBuf {
+        let dir = folder.join("tool-outputs");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly one redirect file");
+        entries[0].path()
+    }
+
+    #[tokio::test]
+    async fn under_limit_output_passes_through_unchanged() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 1000);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let v: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(v, json!({ "a": 1, "b": "two" }));
+        // No redirect file is created for an in-limit body.
+        assert!(!folder.path().join("tool-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn over_limit_output_redirects_to_tool_outputs_file() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 50);
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+
+        // The file lands in `<workspace-folder>/tool-outputs/`, a sibling of
+        // the repo checkout, with the FULL body and a `.json` extension
+        // (TOON disabled).
+        let path = only_tool_output(folder.path());
+        assert_eq!(path.parent().unwrap(), folder.path().join("tool-outputs"));
+        assert_eq!(path.extension().unwrap(), "json");
+        let full = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+
+        // The message carries total size, limit, the absolute path, a head
+        // preview, and the ws.file.read caveat.
+        let total = full.chars().count();
+        assert!(text.contains(&format!("Output too large: {total} characters (limit: 50)")));
+        assert!(text.contains(path.to_str().unwrap()));
+        assert!(text.contains("First 2000 characters:"));
+        let head: String = full.chars().take(50).collect();
+        assert!(text.contains(&head));
+        assert!(text.contains("`ws.file.read` cannot reach it"));
+    }
+
+    #[tokio::test]
+    async fn toon_encodes_object_results_when_enabled() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 0);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let text = tool_text(&resp);
+        let expected = toon_format::encode_default(&json!({ "a": 1, "b": "two" })).unwrap();
+        assert_eq!(text, expected);
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "TOON body must not parse as JSON: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toon_enabled_keeps_non_object_results_as_json() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 0);
+        assert_eq!(tool_text(&call(&srv, "return 'hello';").await), "\"hello\"");
+        assert_eq!(tool_text(&call(&srv, "return 42;").await), "42");
+        assert_eq!(tool_text(&call(&srv, "return null;").await), "null");
+    }
+
+    #[tokio::test]
+    async fn toon_disabled_returns_pretty_json() {
+        let (_folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 0);
+        let resp = call(&srv, "return { a: 1, b: 'two' };").await;
+        let text = tool_text(&resp);
+        assert_eq!(
+            text,
+            serde_json::to_string_pretty(&json!({ "a": 1, "b": "two" })).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn toon_over_limit_redirect_writes_toon_file() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), true, 50);
+        let resp = call(
+            &srv,
+            "return [{ id: 1, data: 'x'.repeat(200) }, { id: 2, data: 'y' }];",
+        )
+        .await;
+        let text = tool_text(&resp);
+        let path = only_tool_output(folder.path());
+        assert_eq!(path.extension().unwrap(), "toon");
+        let full = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            full,
+            toon_format::encode_default(
+                &json!([{ "id": 1, "data": "x".repeat(200) }, { "id": 2, "data": "y" }])
+            )
+            .unwrap()
+        );
+        assert!(text.contains("Output too large:"));
+        assert!(text.contains(path.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn zero_limit_means_unlimited() {
+        let (folder, checkout) = temp_workspace_layout();
+        let srv = server(Some(&checkout), false, 0);
+        // Larger than the 100k catalog default, proving `0` disables the
+        // limit rather than falling back to it.
+        let resp = call(&srv, "return 'x'.repeat(120000);").await;
+        let text = tool_text(&resp);
+        assert_eq!(text.chars().count(), 120_002); // quotes included
+        assert!(!folder.path().join("tool-outputs").exists());
+    }
+
+    #[tokio::test]
+    async fn unresolvable_workspace_dir_falls_back_to_untruncated_output() {
+        // No on-disk checkout path: the redirect cannot be written, so the
+        // full body comes back untruncated and the call still succeeds.
+        let srv = server(None, false, 50);
+        let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
+        let text = tool_text(&resp);
+        assert!(!text.contains("Output too large:"));
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["data"].as_str().unwrap().len(), 200);
     }
 }

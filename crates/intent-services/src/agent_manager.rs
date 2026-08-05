@@ -81,6 +81,110 @@ fn stale_redrive_note(report_timestamp: &str) -> String {
 const STALE_REDRIVE_NOTE_PREFIX: &str =
     "[SYSTEM NOTE] This message was queued before you completed";
 
+/// Deterministic system note appended to every drained queue entry so the
+/// target agent knows when the message entered the queue and how long it
+/// waited before delivery. Messages delivered immediately (never queued)
+/// are NOT annotated — the note is applied only on the queue-drain paths.
+/// Coexists with the #576 stale-redrive note (both may appear).
+fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
+    format!(
+        "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
+    )
+}
+
+/// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
+/// idempotent when an already-annotated entry is requeued and drained again
+/// (the original wait deliberately stays — a terminal-failure requeue keeps
+/// its first-delivery numbers). Distinct from [`STALE_REDRIVE_NOTE_PREFIX`]
+/// ("…queued before you completed"), so the two checks never shadow each
+/// other.
+const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+
+/// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
+/// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
+fn format_wait_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Dequeue-wait annotation: appends [`dequeue_wait_note`] to a drained
+/// entry's content so the target knows when it was enqueued and how long it
+/// waited. Idempotent across requeues via the stable prefix check.
+/// `persisted: true` entries (terminal-failure requeues whose transcript row
+/// is already durable) are never rewritten — mirroring the stale-redrive
+/// constraint — so those redrives skip the note entirely: the delivered
+/// prompt stays byte-identical to the persisted row, at the cost of no wait
+/// note for that entry. Fail open: an unparseable `queued_at` leaves the
+/// content untouched.
+///
+/// Alongside the content note, the entry's `messageMetadata` is stamped with
+/// structured queue info — `queueInfo: { queuedAt, waitedMs }` (PROTOCOL
+/// §5.5) — so the persisted user row carries machine-readable enqueue time +
+/// wait for clients, riding the same metadata plumbing as the A2A sender
+/// attribution. Same guards as the note: an existing `queueInfo` is never
+/// overwritten (first-delivery numbers stay across requeues), and the
+/// persisted-entry / unparseable-`queued_at` skips above cover the stamp too.
+fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
+    if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
+        return;
+    }
+    let Some(queued) = parse_iso(&msg.queued_at) else {
+        tracing::warn!(
+            queued_at = %msg.queued_at,
+            "dequeue-wait annotation skipped: queued_at parse failed"
+        );
+        return;
+    };
+    let elapsed = time::OffsetDateTime::now_utc() - queued;
+    msg.content = format!(
+        "{}\n\n{}",
+        msg.content,
+        dequeue_wait_note(
+            &msg.queued_at,
+            &format_wait_duration(elapsed.whole_seconds())
+        )
+    );
+    // Negative waits (clock skew) clamp to 0, matching the note's formatting.
+    let waited_ms = u64::try_from(elapsed.whole_milliseconds().max(0)).unwrap_or(u64::MAX);
+    let queue_info = json!({ "queuedAt": msg.queued_at, "waitedMs": waited_ms });
+    match msg.message_metadata.as_mut() {
+        None => msg.message_metadata = Some(json!({ "queueInfo": queue_info })),
+        Some(Value::Object(map)) => {
+            map.entry("queueInfo").or_insert(queue_info);
+        }
+        Some(_) => {
+            tracing::warn!(
+                id = %msg.id,
+                queued_at = %msg.queued_at,
+                "dequeue-wait queueInfo stamp skipped: messageMetadata is not an object"
+            );
+        }
+    }
+}
+
+/// Combined provider prompt for a batch flush (`agents.flushQueuedMessages`):
+/// a header naming the flushed count, then each entry's content under a
+/// `Message #N:` label in delivery order. Entry contents already carry their
+/// per-entry [`dequeue_wait_note`] (and any #576 stale-redrive note), so each
+/// section retains its own queuedAt time and wait duration. Wire-only — the
+/// transcript persists each entry as its own user row; this combined text is
+/// never persisted.
+fn flush_combined_prompt(entries: &[QueuedMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("{} queued messages while you were working", entries.len());
+    for (i, m) in entries.iter().enumerate() {
+        let _ = write!(out, "\n\nMessage #{}:\n{}", i + 1, m.content);
+    }
+    out
+}
+
 const GB: u64 = 1024 * 1024 * 1024;
 
 /// Whether a `session/cancel` error means the child's transport is already
@@ -243,6 +347,27 @@ fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
         intent_core::MessageOrigin::User
     } else {
         intent_core::MessageOrigin::Automatic
+    }
+}
+
+/// Rebuild the single-entry drain [`TurnOptions`] for one queue entry — the
+/// exact shape the non-flush drain arms construct inline. Used by the
+/// batch-flush persist-failure path so the failed entry is parked/requeued
+/// with the same options a single-entry drain would have used.
+fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
+    TurnOptions {
+        image_blocks: entry.image_blocks.clone(),
+        file_blocks: entry.file_blocks.clone(),
+        message_metadata: entry.message_metadata.clone(),
+        suppress_report_clear: stale,
+        queued_at: Some(entry.queued_at.clone()),
+        prepend_content: entry.prepend_content.clone(),
+        prepend_image_blocks: entry.prepend_image_blocks.clone(),
+        prepend_file_blocks: entry.prepend_file_blocks.clone(),
+        turn_id: Some(entry.turn_id.clone()),
+        interrupt_priority: entry.interrupt_priority,
+        origin: origin_from_user_flag(entry.user_origin),
+        ..TurnOptions::default()
     }
 }
 
@@ -828,22 +953,20 @@ struct PiExtensionDelivery {
 }
 
 impl PiExtensionDelivery {
-    /// Write the extension + wrapper (0755) temp files. The wrapper only
+    /// Write the extension + wrapper (0755) files into `dir`. The wrapper only
     /// appends our `-e` flag — user-installed pi extensions stay enabled.
     #[cfg(unix)]
-    fn write(real_pi_command: &str) -> Result<Self> {
+    fn write(real_pi_command: &str, dir: &Path) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
-        let extension_path =
-            std::env::temp_dir().join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
+        let extension_path = dir.join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
         std::fs::write(&extension_path, PI_MCP_EXTENSION_SOURCE)
             .map_err(|e| Error::Internal(format!("write pi extension failed: {e}")))?;
         let extension = TempConfigFile {
             path: extension_path,
         };
 
-        let wrapper_path =
-            std::env::temp_dir().join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
+        let wrapper_path = dir.join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
         let script = format!(
             "#!/bin/sh\nexec {} -e {} \"$@\"\n",
             sh_squote(real_pi_command),
@@ -864,7 +987,7 @@ impl PiExtensionDelivery {
     /// non-unix equivalent, so fail with a clear error instead of spawning pi
     /// with a script it cannot execute.
     #[cfg(not(unix))]
-    fn write(_real_pi_command: &str) -> Result<Self> {
+    fn write(_real_pi_command: &str, _dir: &Path) -> Result<Self> {
         Err(Error::Internal(
             "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
         ))
@@ -885,15 +1008,19 @@ impl PiExtensionDelivery {
     }
 }
 
-/// Write the pi-extension delivery files for providers flagged
+/// Write the pi-extension delivery files into `dir` for providers flagged
 /// `mcp_via_pi_extension`; `None` for every other provider.
-fn pi_extension_delivery(provider: &ProviderConfig) -> Result<Option<PiExtensionDelivery>> {
+fn pi_extension_delivery(
+    provider: &ProviderConfig,
+    dir: &Path,
+) -> Result<Option<PiExtensionDelivery>> {
     if !provider.mcp_via_pi_extension {
         return Ok(None);
     }
-    Ok(Some(
-        PiExtensionDelivery::write(&resolve_real_pi_command())?,
-    ))
+    Ok(Some(PiExtensionDelivery::write(
+        &resolve_real_pi_command(),
+        dir,
+    )?))
 }
 
 /// Single-quote a string for inert interpolation into a `sh` script: quotes
@@ -1002,6 +1129,12 @@ pub struct AgentManager {
     /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
     /// `<data_dir>/agent-logs`; `None` (tests / bare wiring) disables capture.
     agent_log_root: Option<PathBuf>,
+    /// Daemon-owned directory the per-agent generated config files
+    /// (`--mcp-config`, `--rules`, pi-extension delivery) are written into
+    /// (monorepo#1302). The composition root wires `<data_dir>/agent-configs`
+    /// and sweeps leftovers at startup; `None` (tests / bare wiring) falls
+    /// back to the OS temp dir.
+    agent_config_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
@@ -1127,6 +1260,7 @@ impl AgentManager {
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
+            agent_config_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -1166,12 +1300,40 @@ impl AgentManager {
         self
     }
 
+    /// Set the daemon-owned directory the per-agent generated config files
+    /// are written into (monorepo#1302). The composition root passes
+    /// `intent_core::agent_configs_root(&config.data_dir)` after sweeping
+    /// leftovers; the directory is created on demand right before a spawn
+    /// writes into it.
+    pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.agent_config_root = Some(root.into());
+        self
+    }
+
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
     /// The composition root passes `intent_core::chief_cwd_root(&config.data_dir)`;
     /// the directory is created on demand right before a chief spawn resolves.
     pub fn with_chief_cwd_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.chief_cwd_root = Some(root.into());
         self
+    }
+
+    /// Directory the per-agent generated config files are written into: the
+    /// wired `<data_dir>/agent-configs` dir, created on demand — or the OS
+    /// temp dir when no root is wired (tests / bare wiring) or creation fails.
+    fn agent_config_dir(&self) -> PathBuf {
+        let Some(root) = self.agent_config_root.as_ref() else {
+            return std::env::temp_dir();
+        };
+        if let Err(e) = intent_core::agent_configs::create_agent_configs_dir(root) {
+            tracing::warn!(
+                error = %e,
+                path = %root.display(),
+                "failed to create agent-configs dir; falling back to temp dir"
+            );
+            return std::env::temp_dir();
+        }
+        root.clone()
     }
 
     /// Stderr capture directory for `agent_id`, when capture is enabled —
@@ -1263,11 +1425,20 @@ impl AgentManager {
                 .with_caller_agent_id(Some(agent_id.clone()))
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
-                .with_turn_attachments(Some(self.services.turn_attachments())),
+                .with_turn_attachments(Some(self.services.turn_attachments()))
+                // `[agentFeatures]` toggles are captured here, at bridge
+                // creation, so they apply to new sessions only — a settings
+                // change never mutates a live agent's surface.
+                .with_agent_features(self.services.effective_settings().agent_features),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
+
+        // Directory the generated per-agent files below are written into:
+        // `<data_dir>/agent-configs` when wired (swept at startup so a killed
+        // daemon's leftovers don't accumulate, monorepo#1302), else temp dir.
+        let config_dir = self.agent_config_dir();
 
         // Generated MCP config (auggie format) pointing at the bridge
         // subcommand, written only for providers that consume an MCP-config flag.
@@ -1275,7 +1446,7 @@ impl AgentManager {
         let mut mcp_config_path: Option<String> = None;
         if opts.provider.supports_mcp_config {
             let config = self.generate_mcp_config(&bridge).await?;
-            let path = std::env::temp_dir().join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
+            let path = config_dir.join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
             let bytes = serde_json::to_vec_pretty(&config)
                 .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
             std::fs::write(&path, bytes)
@@ -1298,7 +1469,7 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
-        let pi_extension = pi_extension_delivery(opts.provider)?;
+        let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup
         // (claude-code, codex, droid, grok), the same normalized server set is
@@ -1326,10 +1497,13 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `rtk.enabled` is a global (non-workspace-scoped) setting;
-            // auto-commit resolves per-workspace (persisted override →
-            // global `git.autoCommit` fallback, spec Diagnosis §3b) so the
-            // prompt reflects what the commit gate will actually enforce.
+            // `rtk.enabled` and the `[agentFeatures]` toggles are global
+            // (non-workspace-scoped) settings, captured once here so the
+            // persisted prompt reflects the flags at session creation
+            // ("new sessions only"); auto-commit resolves per-workspace
+            // (persisted override → global `git.autoCommit` fallback, spec
+            // Diagnosis §3b) so the prompt reflects what the commit gate
+            // will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
@@ -1351,13 +1525,13 @@ impl AgentManager {
                 is_sub_agent,
                 auto_commit_enabled,
                 settings.rtk.enabled,
+                &settings.agent_features,
                 workspace.as_ref(),
                 Some(&session),
             )
             .await
             {
-                let path =
-                    std::env::temp_dir().join(format!("intentd-rules-{}.md", Uuid::new_v4()));
+                let path = config_dir.join(format!("intentd-rules-{}.md", Uuid::new_v4()));
                 std::fs::write(&path, prompt.as_bytes())
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
                 rules_file_path = Some(path.to_string_lossy().into_owned());
@@ -2656,6 +2830,12 @@ impl AgentManager {
                         data["report"] = json!(report);
                     }
                 }
+                // Idle-visibility: same `waitingOnHooks` stamp as the
+                // settlement idle in `run_prompt_turn` (omitted when the
+                // agent owns no active hook).
+                self.services
+                    .annotate_waiting_on_hooks(agent_id, &mut data)
+                    .await;
                 self.services
                     .publish_agent_event(
                         &workspace_id,
@@ -2675,6 +2855,32 @@ impl AgentManager {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
+    /// Snapshot every agent with a turn currently in flight together with its
+    /// owning workspace. This is the daemon-global source for
+    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    ///
+    /// Lock-order invariant: `busy` is always acquired before `agent_ws`
+    /// (here and in every busy/agent_ws mutator — `try_begin`,
+    /// `release_in_flight_slot`, `end_turn`), and mutators update both maps
+    /// while holding the `busy` lock. That makes a claim/release visible
+    /// atomically from this snapshot's perspective: a busy agent always has
+    /// its `agent_ws` entry.
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let busy = self.busy.lock().unwrap();
+        let agent_ws = self.agent_ws.lock().unwrap();
+        let mut active = busy
+            .iter()
+            .filter_map(|agent_id| {
+                agent_ws
+                    .get(agent_id)
+                    .cloned()
+                    .map(|workspace_id| (agent_id.clone(), workspace_id))
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        active
+    }
+
     /// Atomically claim the in-flight slot for `agent_id` in `workspace_id`:
     /// `true` when the agent was idle (now marked busy), `false` when a turn is
     /// already running. On a successful claim the agent's workspace is recorded
@@ -2685,12 +2891,21 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
+        // Insert into `agent_ws` while still holding the `busy` lock
+        // (busy → agent_ws order, matching `list_busy`) so a concurrent
+        // `list_busy` never observes a busy agent without its workspace.
+        let claimed = {
+            let mut busy = self.busy.lock().unwrap();
+            let claimed = busy.insert(agent_id.clone());
+            if claimed {
+                self.agent_ws
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), workspace_id.clone());
+            }
+            claimed
+        };
         if claimed {
-            self.agent_ws
-                .lock()
-                .unwrap()
-                .insert(agent_id.clone(), workspace_id.clone());
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -2709,14 +2924,24 @@ impl AgentManager {
     /// terminal spawn failure already persisted Error status and we only need
     /// to release busy/agent_ws so a future message can restart the worker).
     async fn release_in_flight_slot(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
         }
+    }
+
+    /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
+    /// `list_busy` (both maps mutated under the `busy` lock, busy → agent_ws
+    /// order). Returns `None` when the agent was not busy, otherwise the
+    /// removed `agent_ws` entry.
+    fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
+        let mut busy = self.busy.lock().unwrap();
+        if !busy.remove(agent_id) {
+            return None;
+        }
+        Some(self.agent_ws.lock().unwrap().remove(agent_id))
     }
 
     /// Release the in-flight slot, recomputing the owning workspace's derived
@@ -2725,11 +2950,9 @@ impl AgentManager {
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
-        let was_busy = self.busy.lock().unwrap().remove(agent_id);
-        if !was_busy {
+        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
-        }
-        let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+        };
         if let Some(workspace_id) = workspace_id {
             self.services.agent_activity_end(&workspace_id).await;
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
@@ -2782,22 +3005,28 @@ impl AgentManager {
         }
     }
 
-    /// Clear a pending attention request when a USER-ORIGIN turn begins — the
+    /// Clear a pending attention request when a qualifying turn begins — the
     /// request (`ws.agent.requestDiscussion` / `ws.agent.reportBlocker`) is a
     /// pending state that retires as soon as the agent next receives a
     /// user-origin message (`agent.sendMessage` front door,
     /// `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`, or a drained
-    /// user-origin queue entry). Automatic deliveries (A2A sends, parent /
-    /// subscription wakes, `agent.sendToTask`, `agent.wakeOrCreate`, stale
-    /// redrives of automatic entries) never retire it — the call site gates
-    /// on `TurnOptions::origin.is_user()`. A stale redrive of a USER-ORIGIN
-    /// entry still clears: the drain handoff restores `origin = User`, unlike
-    /// the completion-report clear, which staleness suppresses regardless of
-    /// origin (`suppress_report_clear`). Skips the store write and event when
-    /// no request is pending (the common case). Emits `agent:updated` with
-    /// `attentionRequestCleared: true` when one was present and cleared so
-    /// clients retire the sidebar/footer indicator.
-    async fn clear_attention_request_if_present(
+    /// user-origin queue entry). For CHILD (`parent_agent_id` set) and
+    /// BACKGROUND (`is_background`) sessions, automatic deliveries (A2A
+    /// sends, parent / subscription wakes, `agent.sendToTask`,
+    /// `agent.wakeOrCreate`, drained automatic entries, stale redrives) ALSO
+    /// retire it — the parent/coordinator is those agents' attention surface,
+    /// so its follow-up is the acknowledgement. Top-level foreground agents
+    /// keep the user-only dismissal: an automatic message must never dismiss
+    /// a request the user has not seen. The call site gates on
+    /// `TurnOptions::origin.is_user()` OR the child/background session shape.
+    /// A stale redrive of a USER-ORIGIN entry still clears: the drain handoff
+    /// restores `origin = User`, unlike the completion-report clear, which
+    /// staleness suppresses regardless of origin (`suppress_report_clear`).
+    /// Skips the store write and event when no request is pending (the common
+    /// case). Emits `agent:updated` with `attentionRequestCleared: true` when
+    /// one was present and cleared so clients retire the sidebar/footer
+    /// indicator.
+    pub(crate) async fn clear_attention_request_if_present(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -2817,6 +3046,12 @@ impl AgentManager {
                         intent_core::events::AGENT_UPDATED,
                         json!({ "agentId": agent_id.0, "attentionRequestCleared": true }),
                     )
+                    .await;
+                // Retiring the request can retire the workspace's
+                // needs_attention displayStatus (§6.5 step 0):
+                // recompute-and-compare.
+                self.services
+                    .maybe_emit_display_status_changed(workspace_id)
                     .await;
             }
             Ok(false) => {
@@ -2973,6 +3208,9 @@ impl AgentManager {
         // when setting (Some(Some(x))), JSON null when clearing (Some(None)). When the
         // parameter is None (unchanged), omit the field so unrelated status changes
         // don't clobber the FE's canonical session state (cloudlands-fe#147).
+        // "stopReasonTimestamp" rides along with the same set/clear semantics: the
+        // persisted timestamp is coupled to stop_reason (see
+        // `Store::set_agent_session_status`), so the event mirrors the store.
         let mut data = json!({
             "agentId": agent_id.0,
             "status": serialized_status,
@@ -2981,6 +3219,10 @@ impl AgentManager {
         if let Some(reason) = &stop_reason_for_event {
             data["stopReason"] = match reason {
                 Some(r) => Value::String(r.clone()),
+                None => Value::Null,
+            };
+            data["stopReasonTimestamp"] = match reason {
+                Some(_) => Value::String(ts.clone()),
                 None => Value::Null,
             };
         }
@@ -3250,6 +3492,12 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
+        // The persisted user row supersedes a pending question tail, which
+        // can retire the workspace's needs_attention displayStatus (§6.5
+        // step 0): recompute-and-compare.
+        self.services
+            .maybe_emit_display_status_changed(&workspace_id)
+            .await;
         self.spawn_worker(agent_id, workspace_id, content, options, true);
         Ok(json!({
             "success": true,
@@ -3276,6 +3524,35 @@ impl AgentManager {
         // remaining queued item has `editing = true`).
         if !self.services.has_ready_to_send(&agent_id) {
             return;
+        }
+        // Archived-workspace gate: the archive sweep interrupts in-flight
+        // turns but KEEPS pending queues persisted, so the automatic drain
+        // must not respawn a turn while the workspace is archived — messages
+        // park until unarchive, which kicks this drain for every parked
+        // queue (see `unarchive_workspace`). Chief is virtual and never
+        // archived, so skip the row read. Fail open on a lookup error: the
+        // gate only parks affirmatively-archived workspaces; a transient
+        // store error must not strand the queue.
+        if !workspace_id.is_chief() {
+            match self.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "skipping queue drain: workspace is archived"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "queue drain: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
         }
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
         // parked while the agent's last assistant message carries
@@ -3335,6 +3612,33 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
+        // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
+        // batching mode and MORE THAN ONE eligible entry waiting (under an
+        // active hold: user-origin entries only — the hold contract is
+        // unchanged), drain them all into ONE combined provider turn while
+        // persisting each entry as its own transcript row. A single eligible
+        // entry (or the `off` mode) falls through to the existing
+        // single-entry path unchanged.
+        {
+            let mode = self.services.flush_queued_messages_mode();
+            if let Some(batch) = self
+                .services
+                .dequeue_flush_batch(&agent_id, mode, hold_drain, 2)
+            {
+                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn { content, options } => {
+                        self.spawn_worker(agent_id, workspace_id, content, *options, true);
+                    }
+                    FlushPrep::Parked => {
+                        // Release the slot without overwriting the Error
+                        // status just persisted, so `agent.retry` (or a
+                        // future message) can redrive.
+                        self.release_in_flight_slot(&agent_id).await;
+                    }
+                }
+                return;
+            }
+        }
         // Under an active hold only a user-origin entry may drain; the
         // normal path pops the queue head as before.
         let dequeued = if hold_drain {
@@ -3348,6 +3652,16 @@ impl AgentManager {
                 // Raced with another mutation (e.g. remove) that emptied the
                 // ready-to-send queue between the check above and the dequeue.
                 self.end_turn(&agent_id).await;
+                // monorepo#1280: the racing retraction saw this drain's
+                // in-flight slot (`agent_is_busy` true) and skipped its own
+                // redelivery, expecting a turn to end with a terminal
+                // `agent:idle` — but this arm emits none. Re-run the
+                // mutation-path redelivery now that the slot is released;
+                // its guards (marker set, queue empty, not busy) make it a
+                // no-op in every other interleaving.
+                self.services
+                    .redeliver_completion_after_queue_mutation(&agent_id)
+                    .await;
                 return;
             }
         };
@@ -3362,6 +3676,9 @@ impl AgentManager {
         // annotated content reaches both the persisted user row and the
         // provider prompt.
         let stale = self.annotate_stale_redrive(&agent_id, &mut next).await;
+        // Dequeue-wait note: same placement contract — the persisted row and
+        // the provider prompt both carry the enqueue time + wait.
+        annotate_dequeue_wait(&mut next);
         // Drain-start signal (monorepo#1022): the entry just flipped to
         // in-flight; its `turnId` covers redrives that skip the user-row
         // append below. Emitted AFTER the stale-redrive annotation so the
@@ -3502,6 +3819,9 @@ impl AgentManager {
         // agent's entry that predates the delivered completion report is
         // annotated and keeps the report queryable.
         let stale = self.annotate_stale_redrive(&agent_id, &mut entry).await;
+        // Dequeue-wait note: parity with the drain paths — the "send now"
+        // delivery tells the target when the entry was enqueued.
+        annotate_dequeue_wait(&mut entry);
         // Publish the shrunk snapshot (write-through persist inside) so
         // clients see the entry leave the queue before the turn starts.
         self.services
@@ -3604,6 +3924,12 @@ impl AgentManager {
                         Some(entry.turn_id.as_str()),
                     ),
                 )
+                .await;
+            // The persisted user row supersedes a pending question tail,
+            // which can retire the workspace's needs_attention displayStatus
+            // (§6.5 step 0): recompute-and-compare.
+            self.services
+                .maybe_emit_display_status_changed(&workspace_id)
                 .await;
         }
         let entry_id = entry.id.clone();
@@ -5681,12 +6007,32 @@ async fn run_message_worker(
                     mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
                         .await;
                 }
-                // A pending attention request retires only on a USER-ORIGIN
+                // A pending attention request retires on a USER-ORIGIN
                 // delivery (sendMessage front door, sendQueuedMessageNow,
-                // editAndRegenerate, drained user-origin queue entry) — an
+                // editAndRegenerate, drained user-origin queue entry) for
+                // every agent, and ALSO on an automatic delivery (A2A send,
+                // parent wake, sendToTask, wakeOrCreate, subscription batch,
+                // drained automatic entry) when the session is a CHILD
+                // (`parent_agent_id` set) or BACKGROUND (`is_background`)
+                // agent — the parent/coordinator is those agents' attention
+                // surface, so its follow-up is the acknowledgement. Top-level
+                // foreground agents keep the user-only dismissal: an
                 // automatic/system message must never dismiss a request the
-                // user has not seen.
-                if options.origin.is_user() {
+                // user has not seen. Fail closed on a session-load error
+                // (leave the request pending).
+                let clear_attention = options.origin.is_user()
+                    || match mgr.services.store.get_agent_session(&agent_id).await {
+                        Ok(s) => s.parent_agent_id.is_some() || s.is_background,
+                        Err(e) => {
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "attention-clear gate: session lookup failed; leaving request pending"
+                            );
+                            false
+                        }
+                    };
+                if clear_attention {
                     mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
                         .await;
                 }
@@ -5941,7 +6287,38 @@ async fn run_message_worker(
         // between `has_user_origin_ready` returning false and the slot's
         // release would otherwise strand behind a gone worker with nothing to
         // kick `try_drain_queue`.
-        let drained = if mgr.services.question_hold_active(&agent_id).await {
+        let hold_active = mgr.services.question_hold_active(&agent_id).await;
+        // Batch flush (`agents.flushQueuedMessages`): same contract as the
+        // `try_drain_queue` flush arm — ≥2 eligible entries (user-origin only
+        // under an active hold) drain into one combined provider turn;
+        // otherwise the single-entry arm below runs unchanged.
+        {
+            let mode = mgr.services.flush_queued_messages_mode();
+            if let Some(batch) = mgr
+                .services
+                .dequeue_flush_batch(&agent_id, mode, hold_active, 2)
+            {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let drained = if hold_active {
             if mgr.services.has_user_origin_ready(&agent_id) {
                 mgr.services.dequeue_user_origin_message(&agent_id)
             } else {
@@ -5967,6 +6344,8 @@ async fn run_message_worker(
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Dequeue-wait note: same placement contract as the stale check.
+            annotate_dequeue_wait(&mut next);
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
@@ -6037,9 +6416,70 @@ async fn run_message_worker(
             mgr.services.dequeue_message(&agent_id)
         };
         let Some(mut next) = raced else {
+            // monorepo#1297: heal a busy-misclassified terminal idle. The
+            // turn's `agent:idle` is published while this worker still holds
+            // the busy slot (`end_turn` above runs after `run_prompt_turn`
+            // returns), so an asynchronous delivery that raced ahead of the
+            // release classified it interim on the busy probe and recorded
+            // the interim-skip marker — with no further completion event
+            // coming. Re-run the mutation-path redelivery now that the slot
+            // is released and the queue is empty; its guards (marker set,
+            // queue empty, not busy) make it a no-op in every other
+            // interleaving, and the delivery pass's own post-skip re-check
+            // covers the complementary ordering (marker recorded after this
+            // hook ran ⇒ that re-check observes the released slot).
+            mgr.services
+                .redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
+            // Batch flush (`agents.flushQueuedMessages`): `next` was popped
+            // before the slot re-claim, so fold any FURTHER eligible entries
+            // in behind it and run them as one combined turn. Mode `all`:
+            // any further ready entry (min 1 more ⇒ ≥2 total, user-origin
+            // only under an active hold, matching the other flush arms).
+            // Mode `systemOnly`: only when `next` is ITSELF system-origin
+            // (and no hold is active) — a user-origin `next` never batches
+            // under `systemOnly`, so it falls through to the single-entry
+            // path below unchanged. With no extra entry (or the `off` mode)
+            // the single-entry path below also runs unchanged.
+            let mode = mgr.services.flush_queued_messages_mode();
+            let hold = mgr.services.question_hold_active(&agent_id).await;
+            let extra_batch = match mode {
+                intent_core::FlushQueuedMessagesMode::All => {
+                    mgr.services.dequeue_ready_batch(&agent_id, hold, 1)
+                }
+                intent_core::FlushQueuedMessagesMode::SystemOnly => {
+                    if hold || next.user_origin {
+                        None
+                    } else {
+                        mgr.services.dequeue_system_only_batch(&agent_id, 1)
+                    }
+                }
+                intent_core::FlushQueuedMessagesMode::Off => None,
+            };
+            if let Some(mut batch) = extra_batch {
+                batch.insert(0, next);
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
+                }
+            }
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -6051,6 +6491,8 @@ async fn run_message_worker(
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Dequeue-wait note: same placement contract as the stale check.
+            annotate_dequeue_wait(&mut next);
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
@@ -6115,6 +6557,162 @@ async fn run_message_worker(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    }
+}
+
+/// Outcome of [`prepare_flush_turn`]: either the combined turn is ready to
+/// run, or a persist failure parked the agent in `Error` (the caller must
+/// release the in-flight slot without starting a turn).
+enum FlushPrep {
+    Turn {
+        content: String,
+        options: Box<TurnOptions>,
+    },
+    Parked,
+}
+
+/// Prepare a batch-flushed turn (`agents.flushQueuedMessages`, default on):
+/// the caller has already claimed the in-flight slot and batch-dequeued ≥2
+/// ready-to-send entries in drain order. This mirrors the single-entry drain
+/// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
+/// then the transcript row append (`persist_user`; entries already persisted
+/// by a terminal-failure requeue are not re-appended) — while emitting ONE
+/// `agent:queue:updated` (the fully-shrunk queue) and ONE
+/// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
+/// turn's id). Each row persist emits its normal `agent:message`, so clients
+/// render N stacked user rows — and every row echo carries the COMBINED
+/// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
+/// correlate with the single `agent:queue:processing`/`agent:stream:*`
+/// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
+/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
+///
+/// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
+/// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
+/// `prepend_*` payloads from all entries in message order; head entry's
+/// `turn_id` / `queued_at` / `interrupt_priority` / `messageMetadata`;
+/// `origin` is User when ANY entry is user-origin (a user message is being
+/// delivered); the turn-begin report clear is suppressed only when EVERY
+/// entry is a stale redrive (any fresh entry means the clear should happen).
+///
+/// Fail closed (#547, never-lost): when an entry's row append exhausts the
+/// bounded retry, the agent parks in `Error` via
+/// [`handle_drain_persist_failure`] (which requeues the FAILED entry at the
+/// queue front, `persisted: false`) and the other flushed entries are
+/// requeued around it in original order — entries whose rows already
+/// persisted carry `persisted: true` so the retry drain never
+/// double-appends. Returns [`FlushPrep::Parked`].
+async fn prepare_flush_turn(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    mut entries: Vec<QueuedMessage>,
+) -> FlushPrep {
+    mgr.services
+        .publish_queue_updated_for(
+            agent_id,
+            workspace_id,
+            mgr.services.queue_snapshot(agent_id),
+        )
+        .await;
+    // Per-entry annotations, same order as the single-entry drain arms: the
+    // stale check before the wait note, both before the row persist so the
+    // persisted row and the provider prompt carry the same content.
+    let mut stale_flags = Vec::with_capacity(entries.len());
+    for entry in entries.iter_mut() {
+        let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
+        annotate_dequeue_wait(entry);
+        stale_flags.push(stale);
+    }
+    // Drain-start signal (monorepo#1022): one event for the combined turn,
+    // keyed on the head entry (its `turn_id` IS the turn's id below).
+    mgr.services
+        .publish_queue_processing(agent_id, workspace_id, &entries[0])
+        .await;
+    // All rows persist under the combined turn's id — the provider turn runs
+    // once, under the head entry's `turn_id`, so a per-entry id on row #2+
+    // would never match any processing/stream event.
+    let combined_turn_id = entries[0].turn_id.clone();
+    for i in 0..entries.len() {
+        if entries[i].persisted {
+            continue;
+        }
+        if persist_user(
+            mgr,
+            agent_id,
+            workspace_id,
+            &entries[i].content,
+            entries[i].image_blocks.as_ref(),
+            entries[i].file_blocks.as_ref(),
+            entries[i].message_metadata.as_ref(),
+            Some(&combined_turn_id),
+        )
+        .await
+        {
+            // The row is durable: a later mid-flush failure requeues this
+            // entry with `persisted: true` so the retry drain skips the
+            // duplicate append (STAB-51).
+            entries[i].persisted = true;
+            continue;
+        }
+        // Fail closed: restore the queue in original order — tail first,
+        // then the failed entry (the handler's own front requeue), then the
+        // already-persisted head entries ahead of it.
+        let stale = stale_flags[i];
+        let failed = entries.remove(i);
+        let tail = entries.split_off(i);
+        let head = entries;
+        let options = turn_options_for_entry(&failed, stale);
+        mgr.services.requeue_front_batch(agent_id, tail);
+        handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options).await;
+        mgr.services.requeue_front_batch(agent_id, head);
+        // The handler's queue publish preceded the head requeue: re-publish
+        // so clients see the fully-restored queue.
+        mgr.services
+            .publish_queue_updated_for(
+                agent_id,
+                workspace_id,
+                mgr.services.queue_snapshot(agent_id),
+            )
+            .await;
+        return FlushPrep::Parked;
+    }
+    let content = flush_combined_prompt(&entries);
+    let mut image_blocks = None;
+    let mut file_blocks = None;
+    let mut prepend_content: Option<String> = None;
+    let mut prepend_image_blocks = None;
+    let mut prepend_file_blocks = None;
+    for entry in &entries {
+        image_blocks = merge_block_arrays(image_blocks, entry.image_blocks.clone());
+        file_blocks = merge_block_arrays(file_blocks, entry.file_blocks.clone());
+        if let Some(p) = entry.prepend_content.as_deref().filter(|p| !p.is_empty()) {
+            prepend_content = Some(match prepend_content.take() {
+                Some(existing) => format!("{existing}\n\n{p}"),
+                None => p.to_string(),
+            });
+        }
+        prepend_image_blocks =
+            merge_block_arrays(prepend_image_blocks, entry.prepend_image_blocks.clone());
+        prepend_file_blocks =
+            merge_block_arrays(prepend_file_blocks, entry.prepend_file_blocks.clone());
+    }
+    let options = TurnOptions {
+        image_blocks,
+        file_blocks,
+        message_metadata: entries[0].message_metadata.clone(),
+        suppress_report_clear: stale_flags.iter().all(|&s| s),
+        queued_at: Some(entries[0].queued_at.clone()),
+        prepend_content,
+        prepend_image_blocks,
+        prepend_file_blocks,
+        turn_id: Some(entries[0].turn_id.clone()),
+        interrupt_priority: entries[0].interrupt_priority,
+        origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
+        ..TurnOptions::default()
+    };
+    FlushPrep::Turn {
+        content,
+        options: Box::new(options),
     }
 }
 
@@ -6230,6 +6828,12 @@ async fn persist_user(
             intent_core::events::AGENT_MESSAGE,
             crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
+        .await;
+    // The persisted user row supersedes a pending question tail, which can
+    // retire the workspace's needs_attention displayStatus (§6.5 step 0):
+    // recompute-and-compare.
+    mgr.services
+        .maybe_emit_display_status_changed(workspace_id)
         .await;
     true
 }
@@ -6506,9 +7110,19 @@ async fn publish_terminal_failure_events(
 /// the failed message to the front of the queue so `agent.retry` — or a future
 /// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
 /// turn-failure paths. The `error_text` argument is persisted into
-/// `agent_session.stop_reason` and included in the `agent:status-changed` event's
-/// `stopReason` field (durable-before-observable). `persisted` reports whether
-/// the failed turn's user row durably reached the transcript (STAB-51).
+/// `agent_session.stop_reason` (stamping `stop_reason_timestamp`) and included
+/// in the `agent:status-changed` event's `stopReason` / `stopReasonTimestamp`
+/// fields (durable-before-observable). `persisted` reports whether the failed
+/// turn's user row durably reached the transcript (STAB-51). A system-role
+/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
+/// the InterruptionNotice shape, §5.35) is appended best-effort for each
+/// DISTINCT terminal failure — a repeat of the identical failure text with
+/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
+/// fresh redrive of the same message that fails again the same way) skips
+/// the append so the transcript never stacks duplicate cards. `agent.retry`
+/// clears the streak (the deliberate quarantine escape hatch), so a failure
+/// with the SAME text immediately after a retry still gets its own card —
+/// the user acted and it failed again, which is new information.
 async fn persist_error_and_requeue(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -6554,7 +7168,9 @@ async fn persist_error_and_requeue(
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
     } else {
-        // Emit agent:status-changed with stopReason so live subscribers get the canonical field.
+        // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
+        // subscribers get the canonical fields (the timestamp matches the value
+        // persisted alongside stop_reason by `set_agent_session_status`).
         // `sessionCorrupted: true` is included only when the failure classifies as
         // corrupted/poisoned (absent otherwise, matching the serialized projections).
         let mut data = json!({
@@ -6562,13 +7178,14 @@ async fn persist_error_and_requeue(
             "status": "error",
             "isActive": false,
             "stopReason": error_text,
+            "stopReasonTimestamp": ts,
         });
         if session_corrupted {
             data["sessionCorrupted"] = json!(true);
         }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
-            timestamp: ts,
+            timestamp: ts.clone(),
             event_type: AGENT_STATUS_CHANGED.to_string(),
             actor: agent_actor(agent_id),
             session_id: Some(agent_id.0.clone()),
@@ -6623,6 +7240,54 @@ async fn persist_error_and_requeue(
             mgr.services.queue_snapshot(agent_id),
         )
         .await;
+
+    // Durable transcript record of the terminal failure: a system-role message
+    // with a single text block carrying the error text and
+    // `meta.kind = "turn-failure"` (the InterruptionNotice shape, §5.35 — the
+    // same pattern as the discussion-request/blocker-report notices in
+    // `agent_request_attention_op`). Appended only on the FIRST occurrence of
+    // a failure text in the current streak (streak == 1): a same-text failure
+    // repeating with no intervening `agent.retry` or successful turn already
+    // has its card in the transcript, so the append is skipped instead of
+    // stacking duplicates. `agent.retry` resets the streak, so a same-text
+    // failure right after a retry DOES get a fresh card (streak restarts at
+    // 1) — the user acted and it failed again, which is new information.
+    // Best-effort and deliberately LAST: the persisted (status, stop_reason,
+    // stop_reason_timestamp) and the requeue above are the durable contract —
+    // an append failure is logged and swallowed, and the append never delays
+    // the status-changed → requeue sequence clients key on.
+    if streak == 1 {
+        let notice_content = json!([{
+            "type": "text",
+            "text": error_text,
+            "meta": { "kind": "turn-failure" }
+        }]);
+        match mgr
+            .services
+            .store
+            .append_agent_message(agent_id, "system", &notice_content, &ts)
+            .await
+        {
+            Ok(message) => {
+                mgr.services.invalidate_agent_list_cache(workspace_id);
+                mgr.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_MESSAGE,
+                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "failed to append turn-failure transcript notice"
+                );
+            }
+        }
+    }
 }
 
 /// Handle terminal spawn failure after all retries are exhausted. Publishes
@@ -6850,7 +7515,10 @@ fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     };
     format!(
         "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
-         and was interrupted. Assess where you left off and continue the work."
+         and was interrupted. If you were waiting on something external, schedule a \
+         `ws.hook.schedule` background hook to watch the condition and end your turn instead \
+         of blocking — the hook's wake message resumes you. Assess where you left off and \
+         continue the work."
     )
 }
 
@@ -6908,11 +7576,11 @@ mod role_reminder_tests {
     use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
     use intent_store::Store;
 
-    /// Seed a hermetic specialists dir under temp with one `<id>.md`.
-    fn write_specialist(id: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("intentd-spc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{id}.md")), content).unwrap();
+    /// Seed a hermetic specialists dir under temp with one `<id>.md`. Keep the
+    /// returned RAII guard alive for the test (dropping it removes the dir).
+    fn write_specialist(id: &str, content: &str) -> tempfile::TempDir {
+        let dir = crate::tests::test_tempdir("intentd-spc-");
+        std::fs::write(dir.path().join(format!("{id}.md")), content).unwrap();
         dir
     }
 
@@ -6957,6 +7625,7 @@ mod role_reminder_tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
         }
     }
 
@@ -7001,16 +7670,20 @@ mod role_reminder_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
 
-    /// Build a manager over a temp store seeded with a workspace + agent session.
+    /// Build a manager over a temp store seeded with a workspace + agent
+    /// session. The returned RAII guard owns the db dir (db + `-wal`/`-shm`
+    /// sidecars); keep it alive for the duration of the test.
     pub(super) async fn manager_with(
         specialist: Option<&str>,
         specialists_dir: Option<PathBuf>,
-    ) -> (AgentManager, AgentId) {
-        let path = std::env::temp_dir().join(format!("intentd-rr-{}.db", uuid::Uuid::new_v4()));
+    ) -> (AgentManager, AgentId, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-rr-");
+        let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone())
@@ -7030,7 +7703,7 @@ mod role_reminder_tests {
             .await
             .unwrap();
         let sink = Arc::new(BusEventSink::new(bus));
-        (AgentManager::new(services, sink, 4), agent_id)
+        (AgentManager::new(services, sink, 4), agent_id, db_dir)
     }
 
     /// First text block's text from a built prompt.
@@ -7048,7 +7721,7 @@ mod role_reminder_tests {
     /// turn.
     #[tokio::test]
     async fn stop_preserves_force_recreate_but_clears_recreated() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         mgr.force_recreate.lock().unwrap().insert(agent_id.clone());
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         mgr.stop(&agent_id).await;
@@ -7068,7 +7741,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Interval = 1 → every turn carries the prefix.
         for _ in 0..2 {
             let prompt = mgr
@@ -7094,7 +7768,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         // Flag the agent's session as recreated; the reminder must still prepend.
         mgr.recreated.lock().unwrap().insert(agent_id.clone());
         let prompt = mgr
@@ -7116,7 +7791,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn no_injection_without_specialist() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let prompt = mgr
             .build_turn_prompt(
                 &agent_id,
@@ -7133,7 +7808,7 @@ mod role_reminder_tests {
         // Reference-parity `acp-provider.ts` §5.5: `stdinContext` is prepended
         // to the outbound prompt as `Context:\n<ctx>\n\n---\n\n<body>` before
         // any role reminder. Applies to both plain and specialist agents.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some("hello ctx".to_string()),
             ..TurnOptions::default()
@@ -7154,7 +7829,7 @@ mod role_reminder_tests {
     async fn stdin_context_empty_string_is_not_prepended() {
         // An empty `stdinContext` is treated as absent so we do not emit a
         // stray `Context:` header with nothing under it.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let opts = TurnOptions {
             stdin_context: Some(String::new()),
             ..TurnOptions::default()
@@ -7173,7 +7848,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let opts = TurnOptions {
             stdin_context: Some("ctx".to_string()),
             ..TurnOptions::default()
@@ -7197,7 +7873,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nImplement the task.",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let inj = mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7216,7 +7893,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nFile body.",
         );
-        let (mgr, _first) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         let agent_id = AgentId::from("agent-2");
         let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), Some("implementor"));
         s.metadata = Some(serde_json::json!({ "behaviorPrompt": "Custom override." }));
@@ -7237,7 +7915,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn specialist_injection_none_for_plain_agent() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         assert!(mgr
             .services
             .agent_specialist_injection(&agent_id, None)
@@ -7267,7 +7945,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_fires_once_per_fresh_session() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "You are helpful.").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -7304,7 +7982,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_refires_after_recreate() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "SP body").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         // Fresh session → fires; consumed by the first turn.
@@ -7338,7 +8016,7 @@ mod role_reminder_tests {
 
     #[tokio::test]
     async fn first_turn_prepend_not_armed_for_native_mechanism_providers() {
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         set_system_prompt(&mgr, &agent_id, "native SP").await;
         // Native-mechanism providers (rules file / _meta / env) never arm the
         // fallback — no double injection.
@@ -7457,7 +8135,7 @@ mod role_reminder_tests {
     async fn first_turn_prepend_skipped_when_no_system_prompt() {
         // Armed but the session has no persisted system_prompt (or blank) —
         // no stray empty <system> block; the flag is still consumed.
-        let (mgr, agent_id) = manager_with(None, None).await;
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
         let text = prompt_text(
@@ -7481,7 +8159,8 @@ mod role_reminder_tests {
             "implementor",
             "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
         );
-        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
         set_system_prompt(&mgr, &agent_id, "SP").await;
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
@@ -7592,7 +8271,7 @@ mod dead_child_respawn_tests {
     async fn reuses_cached_session_when_child_alive() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-alive");
         seed_mock_session(&mgr, &agent_id, "acp-cached").await;
         let _ends = install_fake_handle(&mgr, &agent_id, None);
@@ -7615,7 +8294,7 @@ mod dead_child_respawn_tests {
     async fn respawns_when_cached_child_is_dead() {
         let script = mock_agent_script();
         let _env = mock_env(&script);
-        let (mgr, _seeded) = manager_with(None, None).await;
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-dead");
         seed_mock_session(&mgr, &agent_id, "acp-stale").await;
 
@@ -7774,7 +8453,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn write_creates_extension_and_executable_wrapper() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
 
         let ext = std::fs::read_to_string(&delivery._extension.path).unwrap();
         assert_eq!(ext, PI_MCP_EXTENSION_SOURCE);
@@ -7801,7 +8480,8 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn wrapper_single_quotes_special_characters() {
-        let delivery = PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi").unwrap();
+        let delivery =
+            PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi", &std::env::temp_dir()).unwrap();
         let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
         assert!(
             script.contains("exec '/opt/pi'\\''s \"odd$\" bin/pi' -e '"),
@@ -7810,8 +8490,19 @@ mod pi_extension_delivery_tests {
     }
 
     #[test]
+    fn write_places_files_in_the_given_dir() {
+        let dir = std::env::temp_dir().join(format!("intentd-pi-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &dir).unwrap();
+        assert_eq!(delivery._extension.path.parent().unwrap(), dir);
+        assert_eq!(delivery.wrapper.path.parent().unwrap(), dir);
+        drop(delivery);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn temp_files_removed_when_delivery_drops() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let ext = delivery._extension.path.clone();
         let wrapper = delivery.wrapper.path.clone();
         drop(delivery);
@@ -7821,7 +8512,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
-        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let mut extra_env = BTreeMap::new();
         delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
         assert_eq!(
@@ -7839,7 +8530,7 @@ mod pi_extension_delivery_tests {
     #[test]
     fn delivery_gated_on_capability_flag() {
         let pi = intent_providers::find_provider("pi").unwrap();
-        let delivery = pi_extension_delivery(pi).unwrap();
+        let delivery = pi_extension_delivery(pi, &std::env::temp_dir()).unwrap();
         assert!(delivery.is_some(), "pi must get the extension delivery");
 
         for provider in intent_providers::ACP_PROVIDERS
@@ -7847,7 +8538,9 @@ mod pi_extension_delivery_tests {
             .filter(|p| p.id != "pi")
         {
             assert!(
-                pi_extension_delivery(provider).unwrap().is_none(),
+                pi_extension_delivery(provider, &std::env::temp_dir())
+                    .unwrap()
+                    .is_none(),
                 "{} must not get a wrapper or extension",
                 provider.id
             );
@@ -8216,7 +8909,10 @@ mod turn_failure_tests {
         assert_eq!(
             text,
             "[SYSTEM WARNING] Your turn exceeded the inactivity timeout (1800s of silence) and \
-             was interrupted. Assess where you left off and continue the work."
+             was interrupted. If you were waiting on something external, schedule a \
+             `ws.hook.schedule` background hook to watch the condition and end your turn \
+             instead of blocking — the hook's wake message resumes you. Assess where you left \
+             off and continue the work."
         );
         // The window is the actual configured value, not a hardcoded literal,
         // and sub-second precision is preserved rather than truncated.
@@ -8413,6 +9109,7 @@ mod agent_retry_tests {
             cow_supported: None,
             display_status: None,
             checkout_mode: None,
+            disk_usage: None,
             task_stats: None,
         }
     }
@@ -8454,16 +9151,20 @@ mod agent_retry_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
         }
     }
 
+    /// The returned RAII guard owns the db dir (db + `-wal`/`-shm` sidecars);
+    /// keep it alive for the duration of the test.
     async fn manager_with_session(
         agent_id: &AgentId,
         ws: &WorkspaceId,
         status: AgentStatus,
-    ) -> Arc<AgentManager> {
-        let path = std::env::temp_dir().join(format!("intentd-retry-{}.db", uuid::Uuid::new_v4()));
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-retry-");
+        let path = db_dir.path().join("store.db");
         let db = Store::open(&path).await.expect("temp store");
         db.insert_workspace(&workspace(ws))
             .await
@@ -8474,14 +9175,14 @@ mod agent_retry_tests {
         let bus = EventBus::new(db.clone());
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
-        Arc::new(AgentManager::new(services, sink, 8))
+        (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
     #[tokio::test]
     async fn retry_from_error_status_with_empty_queue_clears_to_idle() {
         let agent_id = AgentId::from("agent-1");
         let ws = WorkspaceId::from("ws-1");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -8507,7 +9208,7 @@ mod agent_retry_tests {
     async fn retry_from_error_status_with_queued_message_redrives() {
         let agent_id = AgentId::from("agent-redrive");
         let ws = WorkspaceId::from("ws-redrive");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services.enqueue_message(
@@ -8547,7 +9248,7 @@ mod agent_retry_tests {
             let id = format!("agent-race-{yields}");
             let agent_id = AgentId::from(id.as_str());
             let ws = WorkspaceId::from("ws-race");
-            let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
+            let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Error).await;
 
             let retry_fut = mgr.agent_retry(agent_id.clone(), ws.clone());
             let enqueue_fut = async {
@@ -8594,7 +9295,7 @@ mod agent_retry_tests {
     async fn retry_from_pending_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-2");
         let ws = WorkspaceId::from("ws-2");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Pending).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -8616,7 +9317,7 @@ mod agent_retry_tests {
     async fn retry_from_active_status_returns_ok_false() {
         let agent_id = AgentId::from("agent-3");
         let ws = WorkspaceId::from("ws-3");
-        let mgr = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
+        let (mgr, _db) = manager_with_session(&agent_id, &ws, AgentStatus::Active).await;
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())

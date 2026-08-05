@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -110,16 +110,20 @@ pub enum NoteVisibility {
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned "current cycle" status rollup over the active/latest PR,
-/// `taskStats`, and live agent activity. Wire values are the snake_case
-/// variant names, matching the FE union exactly. A running agent promotes
-/// the rollup to `InProgress`; without one, a task-stage rollup
-/// (`InProgress`/`NotStarted`) demotes to `Idle` — so `NotStarted` and the
-/// task-derived `InProgress` never reach the wire on their own.
+/// `taskStats`, live agent activity, and the per-workspace needs-attention
+/// signal. Wire values are the snake_case variant names, matching the FE
+/// union exactly. A top-level agent waiting on the user (pending attention
+/// request or pending structured questions) promotes the rollup to
+/// `NeedsAttention` above everything else; a running agent promotes it to
+/// `InProgress`; without one, a task-stage rollup (`InProgress`/`NotStarted`)
+/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
+/// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
     NotStarted,
     InProgress,
+    NeedsAttention,
     Idle,
     Complete,
     PrReady,
@@ -231,6 +235,16 @@ pub struct Workspace {
     /// paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
+    /// Disk footprint of the daemon-managed workspace directory
+    /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
+    /// sandboxes, everything). Never populated on `workspace.list` /
+    /// `workspace.get` rows (monorepo#1396) — clients fetch it on demand via
+    /// the dedicated `workspace.diskUsage` method (§5.1), which serves a
+    /// cached background walk; never persisted. Omitted (not `null`) until
+    /// the first walk completes and for rows without a daemon-managed
+    /// directory (remote / skip-isolation / chief).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<WorkspaceDiskUsage>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -241,6 +255,35 @@ pub enum CheckoutMode {
     Worktree,
     /// Standalone copy-on-write clone of the source repository directory.
     Cow,
+}
+
+/// Disk footprint of a workspace's daemon-managed directory
+/// (`Workspace.diskUsage`). Reports **physical (allocated) bytes** — sparse
+/// regions excluded, hard links deduped within one walk — so the number is an
+/// upper bound for CoW-clone checkouts (clone-shared extents count at full
+/// size in every workspace that references them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiskUsage {
+    /// Physical (allocated) bytes for the whole workspace folder.
+    pub bytes: u64,
+    /// Regular files that contributed bytes (hard-link duplicates once).
+    pub file_count: u64,
+    /// RFC-3339 wall-clock time the walk completed.
+    pub computed_at: String,
+    /// Per top-level entry of the workspace folder, sorted by bytes desc
+    /// (loose top-level files grouped under `"other"`).
+    pub breakdown: Vec<DiskUsageBreakdownEntry>,
+}
+
+/// One top-level entry of a workspace folder's disk-usage breakdown
+/// (directory name, or `"other"` for loose files).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskUsageBreakdownEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub file_count: u64,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -295,6 +338,7 @@ pub fn chief_workspace() -> Workspace {
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
@@ -2052,6 +2096,13 @@ pub struct AgentSession {
     /// omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// ISO timestamp recorded when `stop_reason` was persisted (terminal agent
+    /// failures). Set alongside `stop_reason`, cleared wherever `stop_reason`
+    /// clears (turn begin, `agent.retry`), so clients can render how long ago
+    /// a parked-in-error session failed. Serialized as `stopReasonTimestamp`
+    /// on both `AgentSession` and `AgentLite`; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_timestamp: Option<String>,
     /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940): `true`
     /// when the session is parked in `error` AND the failure classifies as
     /// session-fatal (provider block or deterministic prompt rejection) or the
@@ -2192,6 +2243,15 @@ pub struct AgentLite {
     /// service projection.
     #[serde(default)]
     pub waiting_for_agent_ids: Vec<AgentId>,
+    /// Idle-visibility: light metadata for the agent's active
+    /// (`scheduled`/`running`) background hooks —
+    /// `[{ hookId, name, nextRunAt?, expiresAt? }]` — so a parent/client can
+    /// tell a hook-waiting idle agent from a stalled one. Omitted when the
+    /// agent owns no active hook. Stays empty in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by
+    /// the service projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_hooks: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -2218,6 +2278,14 @@ pub struct AgentLite {
     pub last_agent_response: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_message: Option<String>,
+    /// Role (`"user"` / `"assistant"`) of the session's newest
+    /// user/assistant transcript message — system (and any other) rows are
+    /// transparent. Additive wire field; omitted when the session has no
+    /// user/assistant message. Mid-turn, the service projection overlays
+    /// `"assistant"` once the in-flight turn has derivable streamed text
+    /// (the same gate as the live `lastAgentResponse` overlay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2232,6 +2300,10 @@ pub struct AgentLite {
     /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// When `stopReason` was recorded; see [`AgentSession::stop_reason_timestamp`].
+    /// Top-level `stopReasonTimestamp`; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_timestamp: Option<String>,
     /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940); see
     /// [`AgentSession::session_corrupted`]. Overlaid by the service projection
     /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
@@ -2249,6 +2321,7 @@ impl AgentLite {
         last_agent_response: Option<String>,
         last_user_message: Option<String>,
         digest: Option<String>,
+        last_message_role: Option<String>,
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
@@ -2287,6 +2360,7 @@ impl AgentLite {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: Vec::new(),
+            waiting_on_hooks: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: session.stats,
@@ -2296,10 +2370,12 @@ impl AgentLite {
             message_count,
             last_agent_response,
             last_user_message,
+            last_message_role,
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
             stop_reason: session.stop_reason,
+            stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             metadata,
         }
@@ -2536,13 +2612,18 @@ pub enum ScriptMode {
     Command,
 }
 
-/// Runtime status of a script process (ported from the TS `ScriptStatus`).
+/// Runtime status of a script process (ported from the TS `ScriptStatus`,
+/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
+/// restart-in-flight window (the auto-restart backoff and the `script.restart`
+/// stop→start gap) so clients can distinguish it from a final exit; the
+/// respawn flips it back to `running`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
     Running,
+    Restarting,
     Exited,
 }
 
@@ -2619,6 +2700,67 @@ pub struct ScriptCreateParams {
     pub category: Option<String>,
     pub auto_start: Option<bool>,
     pub script_id: Option<String>,
+}
+
+/// Lifecycle state of a background hook. `scheduled` and `running` are the
+/// active states (rehydrated into the scheduler at boot); `dispatched`,
+/// `evicted`, `cancelled`, and `expired` are terminal. Wire/DB words are the
+/// lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookState {
+    /// Waiting for its next run (sleeping `delayMs`).
+    Scheduled,
+    /// A run is currently executing.
+    Running,
+    /// A run signalled dispatch; the owner was woken and the hook terminated.
+    Dispatched,
+    /// Evicted after a throw/timeout; the owner was woken with the reason.
+    Evicted,
+    /// Cancelled by the owner or from the FE.
+    Cancelled,
+    /// TTL elapsed (`expiresAt` passed); the owner was woken so it can
+    /// reschedule if the condition is still worth watching.
+    Expired,
+}
+
+/// A background hook: a small agent-owned script the daemon runs periodically
+/// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
+/// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
+/// survive a daemon restart; the name length cap (≤19 chars) is enforced at
+/// the service layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hook {
+    pub hook_id: HookId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub code: String,
+    pub delay_ms: i64,
+    pub state: HookState,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    pub run_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Captured `console.*` output from the most recent completed run
+    /// (overwritten each run; capped/head-truncated at the service layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_logs: Option<String>,
+    /// JSON-serialized state returned by the most recent completed run and
+    /// injected into the next run as the `hookState` global (overwritten
+    /// each run; size-capped at the service layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<String>,
+    /// TTL deadline (`createdAt` + clamped `ttlMs`, ≤ 60 minutes): the hook
+    /// expires when this passes. `None` only on pre-TTL legacy rows, which
+    /// never expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
@@ -2741,6 +2883,18 @@ mod tests {
         );
         let back: Event = serde_json::from_value(wire).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn script_status_serializes_restarting_lowercase() {
+        // The restart-in-flight window (monorepo#1318) rides the same
+        // lowercase wire encoding as the ported statuses.
+        assert_eq!(
+            serde_json::to_value(ScriptStatus::Restarting).unwrap(),
+            json!("restarting")
+        );
+        let back: ScriptStatus = serde_json::from_value(json!("restarting")).unwrap();
+        assert_eq!(back, ScriptStatus::Restarting);
     }
 
     #[test]
@@ -3043,6 +3197,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
+            disk_usage: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -3057,6 +3212,7 @@ mod tests {
             "repositoryOwner",
             "lastActivity",
             "archivedAt",
+            "diskUsage",
         ] {
             assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
         }
@@ -3479,6 +3635,7 @@ mod tests {
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
             })),
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
@@ -3486,7 +3643,14 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
+        let lite = AgentLite::from_session(
+            session,
+            0,
+            None,
+            Some("hi".to_string()),
+            None,
+            Some("user".to_string()),
+        );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
         // The question-dismissal marker is lifted out of the free-form session
@@ -3505,6 +3669,7 @@ mod tests {
         // to `[]` when no completion watches are pending (PROTOCOL §5.5/§7.1).
         assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
+        assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastActivity"], "t1");
     }
 
@@ -3552,6 +3717,7 @@ mod tests {
             is_background: false,
             metadata: None,
             stop_reason: None,
+            stop_reason_timestamp: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),

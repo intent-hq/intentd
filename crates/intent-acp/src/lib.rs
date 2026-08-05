@@ -53,7 +53,10 @@ pub use mcp_env::{
     build_baseline_mcp_env, build_baseline_mcp_env_from_process, is_likely_secret_env_key,
     merge_mcp_env, redact_mcp_env_for_logging, EnvMap, REDACTED_VALUE,
 };
-pub use mcp_server::{ToolDef, WorkspaceMcpServer, MCP_PROTOCOL_VERSION};
+pub use mcp_server::{
+    bindings_prelude, bindings_prelude_for, make_workspace_host, make_workspace_host_for, ToolDef,
+    WorkspaceMcpServer, MCP_PROTOCOL_VERSION,
+};
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
     DEFAULT_PERMISSION_TIMEOUT,
@@ -76,6 +79,17 @@ mod tests;
 
 #[cfg(test)]
 mod tests_wsapi5;
+
+/// Test-only process-global env setup. Runs before `main()` — and therefore
+/// before any test threads exist, making `set_var` race-free. Node children
+/// spawned by lib tests (e.g. MCP fixture servers) inherit this and skip
+/// `module.enableCompileCache()`, which would otherwise leave a
+/// `node-compile-cache/` residue at the TMPDIR root after the suite.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn disable_node_compile_cache() {
+    std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
+}
 
 /// ACP client handle. Holds the `WorkspaceApi` callback supplied by the
 /// composition root (§6.8). Provider configuration is resolved on demand from

@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 273 canonical methods routed through the main dispatch match in
+/// These are the 278 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -36,6 +36,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.getSessionStats",
     "agent.getSubscriptions",
     "agent.list",
+    "agent.listActive",
     "agent.listInterrupted",
     "agent.pendingPermissions",
     "agent.queueMessage",
@@ -130,6 +131,9 @@ pub const ROUTER_METHODS: &[&str] = &[
     "github.resolveThread",
     "github.revoke",
     "github.unresolveThread",
+    "hook.cancel",
+    "hook.list",
+    "hook.runNow",
     "linear.authStatus",
     "linear.createIssue",
     "linear.getIssue",
@@ -188,7 +192,6 @@ pub const ROUTER_METHODS: &[&str] = &[
     "pr.resolveThread",
     "pr.status",
     "pr.updateBranch",
-    "pr.waitForChanges",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",
@@ -265,11 +268,13 @@ pub const ROUTER_METHODS: &[&str] = &[
     "terminal.write",
     "unsloth.status",
     "unsloth.stop",
+    "voice.transcribe",
     "workspace.archive",
     "workspace.cleanup",
     "workspace.create",
     "workspace.delete",
     "workspace.detectProjectType",
+    "workspace.diskUsage",
     "workspace.dismissAttention",
     "workspace.duplicate",
     "workspace.findRepositories",
@@ -302,7 +307,7 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 34 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 35 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`, `server.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -321,6 +326,7 @@ pub const FASTPATH_METHODS: &[&str] = &[
     "forward.list",
     "host.checkAuggie",
     "host.checkGit",
+    "host.createDirectory",
     "host.directoryStatus",
     "host.env",
     "host.exec",

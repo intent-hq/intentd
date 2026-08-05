@@ -116,14 +116,14 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
-    assert_eq!(local["protocolVersion"], "2.9");
+    assert_eq!(local["protocolVersion"], "4.4");
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
-    assert_eq!(remote["protocolVersion"], "2.9");
+    assert_eq!(remote["protocolVersion"], "4.4");
 }
 
 #[test]
@@ -240,6 +240,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     let parsed: Value =
         serde_json::from_str(&handle(invalid, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
     let positional = classify(&json!({
         "jsonrpc": "2.0", "id": 13, "method": "system.importLegacy", "params": []
@@ -248,6 +249,7 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
     let parsed: Value =
         serde_json::from_str(&handle(positional, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32602);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid-params");
 
     let remote = classify(&json!({
         "jsonrpc": "2.0", "id": 14, "method": "system.importLegacy",

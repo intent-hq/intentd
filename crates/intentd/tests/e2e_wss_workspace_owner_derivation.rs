@@ -44,11 +44,12 @@ impl Drop for Daemon {
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-owner-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// root on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps
+/// it). The `Daemon` drop still removes `data`/`scratch` first so the daemon
+/// is dead before its tree goes away.
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-owner-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -201,7 +202,7 @@ async fn wss_rpc(
         "method": method,
         "params": params
     });
-    ws.send(Message::Text(msg.to_string()))
+    ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send rpc");
     let resp = timeout(Duration::from_secs(10), ws.next())
@@ -259,7 +260,7 @@ fn make_repo_with_github_remote(scratch: &Path) -> PathBuf {
 #[tokio::test]
 async fn wss_workspace_create_derives_owner_and_name() {
     let root = scratch_dir("create");
-    let (daemon, port, cfg) = boot(&root).await;
+    let (daemon, port, cfg) = boot(root.path()).await;
     let repo = make_repo_with_github_remote(&daemon.scratch);
 
     let mut ws = connect_ws(port, cfg).await;

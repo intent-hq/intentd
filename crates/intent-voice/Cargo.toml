@@ -1,0 +1,22 @@
+[package]
+name = "intent-voice"
+version = "0.4.1"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "VoiceEngine + providers for the voice.* surface (speech-to-text over reqwest)"
+
+[dependencies]
+intent-core = { path = "../intent-core", version = "0.4.2" }
+reqwest = { workspace = true, features = ["multipart"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

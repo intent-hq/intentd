@@ -221,7 +221,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -342,6 +342,7 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the

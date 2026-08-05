@@ -59,7 +59,9 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
+    // 15s (not 2s): the `resolvedModel` preview's ownership guard can capture
+    // the login-shell PATH on first use (one-time per process, 5s cap).
+    let n = timeout(Duration::from_secs(15), reader.read_line(&mut line))
         .await
         .expect("timed out waiting for a frame")
         .expect("read failed");
@@ -107,15 +109,28 @@ struct Harness {
     _bundled: TempDir,
     _work: TempDir,
     _tmp: TempDb,
+    _ws_root: tempfile::TempDir,
     user_dir: PathBuf,
     bundled_dir: PathBuf,
     work_dir: PathBuf,
     socket: PathBuf,
+    _sock_dir: tempfile::TempDir,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn start() -> Harness {
+    start_with_config(None).await
+}
+
+/// Like [`start`] but wires a [`intent_services::SettingsRegistry`] loaded
+/// from the given `config.toml` text, so the settings chain participates in
+/// the `resolvedModel` preview.
+async fn start_with_settings(config_toml: &str) -> Harness {
+    start_with_config(Some(config_toml)).await
+}
+
+async fn start_with_config(config_toml: Option<&str>) -> Harness {
     let tag = Uuid::new_v4();
     let user = TempDir(std::env::temp_dir().join(format!("intentd-spec-user-{tag}")));
     let bundled = TempDir(std::env::temp_dir().join(format!("intentd-spec-bundled-{tag}")));
@@ -128,13 +143,23 @@ async fn start() -> Harness {
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
-            .with_workspaces_root(common::hermetic_workspaces_root())
-            .with_event_bus(bus.clone())
-            .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone())),
-    );
-    let socket = std::env::temp_dir().join(format!("is-{tag}.sock"));
+    let ws_root = common::hermetic_workspaces_root();
+    let mut services = Services::new(store)
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_event_bus(bus.clone())
+        .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone()));
+    if let Some(toml) = config_toml {
+        // The config file lives inside the work temp dir so it is swept with it.
+        let config_path = work.0.join("config.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        let registry = intent_services::SettingsRegistry::load(&config_path).expect("load config");
+        services = services.with_settings_registry(Arc::new(registry));
+    }
+    let services: Arc<dyn WorkspaceApi> = Arc::new(services);
+    // Socket lives in a guarded dir under /tmp so the path stays short
+    // (macOS SUN_LEN) and the file is swept even if the test panics.
+    let sock_dir = common::test_tempdir_in("/tmp", "is-");
+    let socket = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
         let socket = socket.clone();
@@ -153,7 +178,9 @@ async fn start() -> Harness {
         _bundled: bundled,
         _work: work,
         _tmp: tmp,
+        _ws_root: ws_root,
         socket,
+        _sock_dir: sock_dir,
         shutdown_tx: Some(shutdown_tx),
         server: Some(server),
     }
@@ -226,7 +253,8 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     assert_eq!(got["specialist"]["source"], "bundled");
     assert_eq!(got["specialist"]["prompt"], "You verify.");
 
-    // create — user scope (default) authors a new specialist file.
+    // create — user scope (default) authors a new specialist file. A retired
+    // `modelTier` in the spec is tolerated-and-ignored (never echoed).
     let created = ok(
         &mut w,
         &mut r,
@@ -239,7 +267,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     )
     .await;
     assert_eq!(created["specialist"]["source"], "user");
-    assert_eq!(created["specialist"]["modelTier"], "high");
+    assert!(created["specialist"].get("modelTier").is_none());
     assert!(h.user_dir.join("reviewer.md").exists());
 
     // 3-tier: user file with the same id as bundled wins over bundled.
@@ -328,7 +356,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
 async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
-    // plus the optional `hidden` boolean.
+    // plus the optional `hidden` boolean and a retired `modelTier` line.
     let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\nhidden: true\n---\n\nYou loop.";
     std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
 
@@ -347,7 +375,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     let s = &got["specialist"];
     assert_eq!(s["codingAgent"], "claude");
     assert_eq!(s["model"], "opus4.5");
-    assert_eq!(s["modelTier"], "smart");
+    assert!(
+        s.get("modelTier").is_none(),
+        "retired modelTier is never echoed"
+    );
     assert_eq!(s["roleReminder"], "Never stop early");
     assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "You loop.");
@@ -367,8 +398,9 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(ralph["isCustomized"], false);
     assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
 
-    // create→get round-trip: a user specialist persists every field losslessly,
-    // and the body may be supplied via the `behaviorPrompt` alias.
+    // create→get round-trip: a user specialist persists every live field
+    // losslessly (the retired `modelTier` is dropped), and the body may be
+    // supplied via the `behaviorPrompt` alias.
     let created = ok(
         &mut w,
         &mut r,
@@ -401,7 +433,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(s["source"], "user");
     assert_eq!(s["codingAgent"], "claude");
     assert_eq!(s["model"], "opus4.5");
-    assert_eq!(s["modelTier"], "smart");
+    assert!(
+        s.get("modelTier").is_none(),
+        "retired modelTier is dropped on create"
+    );
     assert_eq!(s["roleReminder"], "Keep going");
     assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "Loop body.");
@@ -580,6 +615,219 @@ async fn specialist_bundled_read_only_and_invalid_params() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    h.shutdown().await;
+}
+
+/// Write a specialist file with extra frontmatter lines (e.g. `model`) for
+/// the resolution-preview tests.
+fn write_specialist_frontmatter(dir: &Path, id: &str, extra_frontmatter: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let body =
+        format!("---\nname: \"{id}\"\ndescription: \"d\"\n{extra_frontmatter}\n---\n\nYou work.");
+    std::fs::write(dir.join(format!("{id}.md")), body).unwrap();
+}
+
+/// Find one specialist def by id in a `specialist.list` result.
+fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["specialists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("specialist {id} missing from list"))
+}
+
+#[tokio::test]
+async fn specialist_resolution_preview() {
+    let h = start().await;
+    // Pinned frontmatter model (unclaimed by any tier table → provider-agnostic).
+    write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
+    // Retired tier opt-in: tolerated in the file, ignored by resolution.
+    write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
+    // Pin claimed by auggie's tier table → guarded away from other providers.
+    write_specialist_frontmatter(&h.user_dir, "auggie-pin", "model: \"opus4.7\"");
+    // No model config at all → provider CLI default → fields omitted.
+    write_specialist(&h.user_dir, "plain", "Plain", "d", "You work.");
+
+    let (read, mut w) = connect_retry(&h.socket).await.into_split();
+    let mut r = BufReader::new(read);
+
+    // No provider param → default provider (auggie) context.
+    let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
+    let pinner = find_spec(&list, "pinner");
+    assert_eq!(pinner["resolvedModel"], "opus4.5");
+    assert_eq!(pinner["resolvedProvider"], "auggie");
+    // Retired modelTier: never echoed, never resolved — with no settings
+    // chain the preview falls through to the CLI default (omitted).
+    let tiered = find_spec(&list, "tiered");
+    assert!(tiered.get("modelTier").is_none());
+    assert!(tiered.get("resolvedModel").is_none());
+    assert!(tiered.get("resolvedProvider").is_none());
+    let auggie_pin = find_spec(&list, "auggie-pin");
+    assert_eq!(auggie_pin["resolvedModel"], "opus4.7");
+    // No settings chain → CLI default → both preview fields omitted.
+    let plain = find_spec(&list, "plain");
+    assert!(plain.get("resolvedModel").is_none());
+    assert!(plain.get("resolvedProvider").is_none());
+
+    // Explicit provider context: codex tier table.
+    let list = ok(
+        &mut w,
+        &mut r,
+        2,
+        "specialist.list",
+        json!({ "provider": "codex" }),
+    )
+    .await;
+    // The retired tier does not resolve under codex either.
+    let tiered = find_spec(&list, "tiered");
+    assert!(tiered.get("resolvedModel").is_none());
+    assert!(tiered.get("resolvedProvider").is_none());
+    // The auggie-claimed pin does not leak into a codex context; with no
+    // settings chain the preview falls through to the CLI default (omitted).
+    let auggie_pin = find_spec(&list, "auggie-pin");
+    assert!(auggie_pin.get("resolvedModel").is_none());
+    assert!(auggie_pin.get("resolvedProvider").is_none());
+    // The unclaimed pin still applies under codex.
+    let pinner = find_spec(&list, "pinner");
+    assert_eq!(pinner["resolvedModel"], "opus4.5");
+    assert_eq!(pinner["resolvedProvider"], "codex");
+
+    // specialist.get mirrors the omission for the retired tier.
+    let got = ok(
+        &mut w,
+        &mut r,
+        3,
+        "specialist.get",
+        json!({ "id": "tiered", "provider": "claude-code" }),
+    )
+    .await;
+    assert!(got["specialist"].get("resolvedModel").is_none());
+
+    // Same probe under grok — a tierless provider (dynamic model list).
+    let got = ok(
+        &mut w,
+        &mut r,
+        4,
+        "specialist.get",
+        json!({ "id": "tiered", "provider": "grok" }),
+    )
+    .await;
+    assert!(got["specialist"].get("resolvedModel").is_none());
+
+    // specialist.get mirrors the list decoration.
+    let got = ok(
+        &mut w,
+        &mut r,
+        5,
+        "specialist.get",
+        json!({ "id": "pinner" }),
+    )
+    .await;
+    assert_eq!(got["specialist"]["resolvedModel"], "opus4.5");
+    assert_eq!(got["specialist"]["resolvedProvider"], "auggie");
+
+    // Unknown provider → -32602 on both methods.
+    let resp = call(
+        &mut w,
+        &mut r,
+        6,
+        "specialist.list",
+        json!({ "provider": "nope" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    let resp = call(
+        &mut w,
+        &mut r,
+        7,
+        "specialist.get",
+        json!({ "id": "pinner", "provider": "nope" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn specialist_resolution_preview_inherits_settings() {
+    let h = start_with_settings(
+        "[model]\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
+    )
+    .await;
+    // No frontmatter model config → settings chain decides.
+    write_specialist(&h.user_dir, "plain", "Plain", "d", "You work.");
+
+    let (read, mut w) = connect_retry(&h.socket).await.into_split();
+    let mut r = BufReader::new(read);
+
+    // Default provider (auggie): no providerDefaults entry → model.default,
+    // which auggie's tier table claims → resolves.
+    let got = ok(
+        &mut w,
+        &mut r,
+        1,
+        "specialist.get",
+        json!({ "id": "plain" }),
+    )
+    .await;
+    assert_eq!(got["specialist"]["resolvedModel"], "sonnet4.5");
+    assert_eq!(got["specialist"]["resolvedProvider"], "auggie");
+
+    // codex: providerDefaults.codex wins over model.default.
+    let got = ok(
+        &mut w,
+        &mut r,
+        2,
+        "specialist.get",
+        json!({ "id": "plain", "provider": "codex" }),
+    )
+    .await;
+    assert_eq!(got["specialist"]["resolvedModel"], "gpt-5.3-codex/high");
+    assert_eq!(got["specialist"]["resolvedProvider"], "codex");
+
+    // claude-code: no providerDefaults entry, and model.default ("sonnet4.5")
+    // is claimed by auggie's tier table → provider guard rejects it → omitted.
+    let got = ok(
+        &mut w,
+        &mut r,
+        3,
+        "specialist.get",
+        json!({ "id": "plain", "provider": "claude-code" }),
+    )
+    .await;
+    assert!(got["specialist"].get("resolvedModel").is_none());
+    assert!(got["specialist"].get("resolvedProvider").is_none());
+
+    // Frontmatter model still ranks above the settings chain.
+    write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
+    let got = ok(
+        &mut w,
+        &mut r,
+        4,
+        "specialist.get",
+        json!({ "id": "pinner" }),
+    )
+    .await;
+    assert_eq!(got["specialist"]["resolvedModel"], "opus4.5");
+
+    // Retirement regression: a lingering `modelTier: "smart"` file resolves
+    // via the settings chain (model.default), not the old tier table
+    // (auggie smart would have been "opus4.7").
+    write_specialist_frontmatter(&h.user_dir, "tiered", "modelTier: \"smart\"");
+    let got = ok(
+        &mut w,
+        &mut r,
+        5,
+        "specialist.get",
+        json!({ "id": "tiered" }),
+    )
+    .await;
+    assert!(got["specialist"].get("modelTier").is_none());
+    assert_eq!(got["specialist"]["resolvedModel"], "sonnet4.5");
+    assert_eq!(got["specialist"]["resolvedProvider"], "auggie");
 
     h.shutdown().await;
 }

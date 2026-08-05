@@ -109,10 +109,26 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         cow_supported: None,
         display_status: None,
         checkout_mode: None,
+        disk_usage: None,
     }
 }
 
 impl WorkspaceApi for FakeApi {
+    // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
+    // pretty JSON, no size limit) so this fixture keeps asserting raw JSON
+    // bodies; the TOON/limit paths are covered by
+    // `workspace_api_output_limit_tests`.
+    fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let value = match path.as_str() {
+                "workspaceApi.toonOutput" => json!(false),
+                "workspaceApi.maxOutputChars" => json!(0),
+                _ => Value::Null,
+            };
+            Ok(json!({ "path": path, "value": value }))
+        })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let variant = *self.workspace_variant.lock().unwrap();
         let override_sm = self.status_message_state.lock().unwrap().clone();
@@ -388,7 +404,12 @@ impl WorkspaceApi for FakeApi {
 
     fn terminal_list(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         *self.terminal_list_calls.lock().unwrap() += 1;
-        Box::pin(async { Ok(json!([{ "id": "t-1", "name": "Terminal" }])) })
+        Box::pin(async {
+            Ok(json!({
+                "terminals": [{ "id": "t-1", "name": "Terminal" }],
+                "daemonBootId": "boot-fixed",
+            }))
+        })
     }
 
     fn terminal_read_output(
@@ -786,6 +807,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         is_waiting_on_tool: false,
         is_waiting_for_other_agents: false,
         waiting_for_agent_ids: vec![],
+        waiting_on_hooks: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         stats: None,
@@ -795,10 +817,12 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         message_count: 0,
         last_agent_response: None,
         last_user_message: None,
+        last_message_role: None,
         digest: None,
         context_references: None,
         image_blocks: None,
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         metadata: AgentMetadata {
             is_background: false,
@@ -1291,8 +1315,11 @@ async fn terminal_list_returns_array() {
     let (srv, api) = server();
     let resp = call(&srv, "return await ws.terminal.list();").await;
     assert_eq!(resp["result"]["isError"], json!(false));
+    // The binding unwraps the wire `{ terminals, daemonBootId }` envelope so
+    // agents keep seeing the bare terminals array (monorepo#1334).
     let arr = body(&resp);
     assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["id"], json!("t-1"));
     assert_eq!(*api.terminal_list_calls.lock().unwrap(), 1);
 }
 

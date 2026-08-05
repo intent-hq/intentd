@@ -1,20 +1,20 @@
 //! Unit tests for the `host.*` host-services pure operations.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
-fn unique_temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let pid = std::process::id();
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("intent-host-{tag}-{pid}-{nanos}-{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+/// A fresh RAII temp directory for `tag` under the system temp root. The
+/// returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(&format!("intent-host-{tag}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
     dir
 }
 
@@ -82,6 +82,7 @@ fn check_auggie_reports_available_with_version_and_path() {
 fn resolve_auggie_prefers_configured_path_when_it_exists() {
     use std::os::unix::fs::PermissionsExt;
     let dir = unique_temp_dir("auggie-cfg");
+    let dir = dir.path();
     let configured = dir.join("auggie-custom");
     std::fs::write(&configured, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -125,9 +126,10 @@ fn expand_path_handles_tilde_root_and_subpath() {
 #[test]
 fn list_directory_with_returns_home_when_path_is_empty_or_missing() {
     let home = unique_temp_dir("ls-empty");
+    let home = home.path();
     std::fs::create_dir_all(home.join("Documents")).unwrap();
     std::fs::write(home.join("readme.txt"), "hi").unwrap();
-    let v = list_directory_with(None, &home).unwrap();
+    let v = list_directory_with(None, home).unwrap();
     assert_eq!(v["path"], home.to_string_lossy().into_owned());
     assert_eq!(v["home"], home.to_string_lossy().into_owned());
     let entries = v["entries"].as_array().unwrap();
@@ -142,11 +144,12 @@ fn list_directory_with_returns_home_when_path_is_empty_or_missing() {
 #[test]
 fn list_directory_with_marks_nested_git_repo() {
     let home = unique_temp_dir("ls-git");
+    let home = home.path();
     let repo = home.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let plain = home.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    let v = list_directory_with(Some(home.to_str().unwrap()), &home).unwrap();
+    let v = list_directory_with(Some(home.to_str().unwrap()), home).unwrap();
     let entries = v["entries"].as_array().unwrap();
     let repo_entry = entries.iter().find(|e| e["name"] == "repo").unwrap();
     assert_eq!(repo_entry["isGitRepo"], true);
@@ -157,10 +160,11 @@ fn list_directory_with_marks_nested_git_repo() {
 #[test]
 fn list_directory_with_marks_worktree_dot_git_file_as_git_repo() {
     let home = unique_temp_dir("ls-worktree");
+    let home = home.path();
     let wt = home.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
-    let v = list_directory_with(Some(home.to_str().unwrap()), &home).unwrap();
+    let v = list_directory_with(Some(home.to_str().unwrap()), home).unwrap();
     let entries = v["entries"].as_array().unwrap();
     let wt_entry = entries.iter().find(|e| e["name"] == "wt").unwrap();
     assert_eq!(wt_entry["isGitRepo"], true);
@@ -169,8 +173,9 @@ fn list_directory_with_marks_worktree_dot_git_file_as_git_repo() {
 #[test]
 fn list_directory_with_expands_tilde() {
     let home = unique_temp_dir("ls-tilde");
+    let home = home.path();
     std::fs::create_dir_all(home.join("inside")).unwrap();
-    let v = list_directory_with(Some("~"), &home).unwrap();
+    let v = list_directory_with(Some("~"), home).unwrap();
     assert_eq!(v["path"], home.to_string_lossy().into_owned());
     let entries = v["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
@@ -183,9 +188,10 @@ fn list_directory_with_expands_tilde_subpath() {
     // under `home`, and the returned `path`/`parent` must be fully expanded so
     // the FE picker can navigate from the listing.
     let home = unique_temp_dir("ls-tilde-sub");
+    let home = home.path();
     let sub = home.join("sub");
     std::fs::create_dir_all(sub.join("nested")).unwrap();
-    let v = list_directory_with(Some("~/sub"), &home).unwrap();
+    let v = list_directory_with(Some("~/sub"), home).unwrap();
     assert_eq!(v["path"], sub.to_string_lossy().into_owned());
     assert_eq!(v["parent"], home.to_string_lossy().into_owned());
     assert_eq!(v["home"], home.to_string_lossy().into_owned());
@@ -205,9 +211,10 @@ fn list_directory_with_keeps_double_slash_tilde_under_home() {
     // like `~/sub` does — before delegating to the shared tilde helper it
     // expanded to the absolute `//sub` and listed outside `home`.
     let home = unique_temp_dir("ls-tilde-dslash");
+    let home = home.path();
     let sub = home.join("sub");
     std::fs::create_dir_all(sub.join("nested")).unwrap();
-    let v = list_directory_with(Some("~//sub"), &home).unwrap();
+    let v = list_directory_with(Some("~//sub"), home).unwrap();
     assert_eq!(v["path"], sub.to_string_lossy().into_owned());
     assert_eq!(v["parent"], home.to_string_lossy().into_owned());
     let entries = v["entries"].as_array().unwrap();
@@ -218,17 +225,70 @@ fn list_directory_with_keeps_double_slash_tilde_under_home() {
 #[test]
 fn list_directory_with_returns_error_for_missing_path() {
     let home = unique_temp_dir("ls-missing");
+    let home = home.path();
     let missing = home.join("nope");
-    let err = list_directory_with(Some(missing.to_str().unwrap()), &home).unwrap_err();
+    let err = list_directory_with(Some(missing.to_str().unwrap()), home).unwrap_err();
     assert!(err.contains("nope"));
+}
+
+#[test]
+fn create_directory_with_creates_directory() {
+    let home = unique_temp_dir("mkdir-basic");
+    let home = home.path();
+    let target = home.join("newdir");
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_creates_nested_parents() {
+    let home = unique_temp_dir("mkdir-nested");
+    let home = home.path();
+    let target = home.join("a").join("b").join("c");
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_succeeds_when_already_exists() {
+    let home = unique_temp_dir("mkdir-exists");
+    let home = home.path();
+    let target = home.join("existing");
+    std::fs::create_dir_all(&target).unwrap();
+    let v = create_directory_with(target.to_str().unwrap(), home).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(v["path"], target.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_expands_tilde() {
+    let home = unique_temp_dir("mkdir-tilde");
+    let home = home.path();
+    let v = create_directory_with("~/projects/new", home).unwrap();
+    let expected = home.join("projects").join("new");
+    assert!(expected.is_dir());
+    assert_eq!(v["path"], expected.to_string_lossy().into_owned());
+}
+
+#[test]
+fn create_directory_with_returns_error_when_path_is_a_file() {
+    let home = unique_temp_dir("mkdir-file");
+    let home = home.path();
+    let file = home.join("occupied");
+    std::fs::write(&file, "hi").unwrap();
+    let err = create_directory_with(file.to_str().unwrap(), home).unwrap_err();
+    assert!(err.contains("occupied"));
 }
 
 #[test]
 fn directory_status_with_reports_existing_git_repo() {
     let home = unique_temp_dir("ds-repo");
+    let home = home.path();
     let repo = home.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
-    let v = directory_status_with(repo.to_str().unwrap(), &home);
+    let v = directory_status_with(repo.to_str().unwrap(), home);
     assert_eq!(v["exists"], true);
     assert_eq!(v["isDirectory"], true);
     assert_eq!(v["isGitRepo"], true);
@@ -239,11 +299,12 @@ fn directory_status_with_reports_existing_git_repo() {
 #[test]
 fn directory_status_with_reports_subdirectory_of_git_repo() {
     let home = unique_temp_dir("ds-sub");
+    let home = home.path();
     let repo = home.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let sub = repo.join("src").join("inner");
     std::fs::create_dir_all(&sub).unwrap();
-    let v = directory_status_with(sub.to_str().unwrap(), &home);
+    let v = directory_status_with(sub.to_str().unwrap(), home);
     assert_eq!(v["exists"], true);
     assert_eq!(v["isDirectory"], true);
     assert_eq!(v["isGitRepo"], false);
@@ -255,8 +316,9 @@ fn directory_status_with_reports_subdirectory_of_git_repo() {
 #[test]
 fn directory_status_with_reports_nonexistent_path() {
     let home = unique_temp_dir("ds-nope");
+    let home = home.path();
     let missing = home.join("absent");
-    let v = directory_status_with(missing.to_str().unwrap(), &home);
+    let v = directory_status_with(missing.to_str().unwrap(), home);
     assert_eq!(v["exists"], false);
     assert_eq!(v["isDirectory"], false);
     assert_eq!(v["isGitRepo"], false);
@@ -266,10 +328,11 @@ fn directory_status_with_reports_nonexistent_path() {
 #[test]
 fn directory_status_with_handles_worktree_dot_git_file() {
     let home = unique_temp_dir("ds-worktree");
+    let home = home.path();
     let wt = home.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
-    let v = directory_status_with(wt.to_str().unwrap(), &home);
+    let v = directory_status_with(wt.to_str().unwrap(), home);
     assert_eq!(v["isGitRepo"], true);
     assert_eq!(v["isSubdirectoryOfGitRepo"], false);
 }
@@ -277,9 +340,10 @@ fn directory_status_with_handles_worktree_dot_git_file() {
 #[test]
 fn directory_status_with_treats_empty_dir_as_empty() {
     let home = unique_temp_dir("ds-empty");
+    let home = home.path();
     let empty = home.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    let v = directory_status_with(empty.to_str().unwrap(), &home);
+    let v = directory_status_with(empty.to_str().unwrap(), home);
     assert_eq!(v["exists"], true);
     assert_eq!(v["isEmpty"], true);
 }
@@ -339,6 +403,7 @@ fn find_binary_op_rejects_unsafe_names_without_spawning() {
 fn resolve_binary_path_finds_caller_common_path() {
     use std::os::unix::fs::PermissionsExt;
     let dir = unique_temp_dir("resolve-common");
+    let dir = dir.path();
     let bin = dir.join("totally-bogus-binary-xyzzy");
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -360,6 +425,7 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
     // scratch home is injected via resolve_binary_path_with_home instead of
     // mutating process-global HOME, which would race parallel tests.
     let test_dir = unique_temp_dir("enriched-home");
+    let test_dir = test_dir.path();
     let local_bin = test_dir.join(".local").join("bin");
     std::fs::create_dir_all(&local_bin).unwrap();
 
@@ -371,9 +437,7 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let resolved = resolve_binary_path_with_home(&test_bin_name, &[], &test_dir);
-
-    std::fs::remove_dir_all(&test_dir).ok();
+    let resolved = resolve_binary_path_with_home(&test_bin_name, &[], test_dir);
 
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));
 }
@@ -504,6 +568,7 @@ fn is_safe_app_name_accepts_spaces_and_rejects_traversal() {
 #[test]
 fn find_macos_app_bundle_finds_first_existing_dir() {
     let root = unique_temp_dir("find-app");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Cursor.app")).unwrap();
     let user_apps = root.join("UserApplications");
@@ -516,6 +581,7 @@ fn find_macos_app_bundle_finds_first_existing_dir() {
 #[test]
 fn find_macos_app_bundle_returns_none_when_missing() {
     let root = unique_temp_dir("find-app-missing");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(&apps).unwrap();
     let dirs = vec![apps];
@@ -525,6 +591,7 @@ fn find_macos_app_bundle_returns_none_when_missing() {
 #[test]
 fn find_macos_app_bundle_rejects_unsafe_names() {
     let root = unique_temp_dir("find-app-unsafe");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(&apps).unwrap();
     assert!(find_macos_app_bundle("../escape", &[apps]).is_none());
@@ -533,6 +600,7 @@ fn find_macos_app_bundle_rejects_unsafe_names() {
 #[test]
 fn find_app_with_returns_installed_with_source_on_macos() {
     let root = unique_temp_dir("find-app-with");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Zed.app")).unwrap();
     let v = find_app_with("Zed", std::slice::from_ref(&apps), true);
@@ -547,6 +615,7 @@ fn find_app_with_returns_installed_with_source_on_macos() {
 #[test]
 fn find_app_with_returns_uninstalled_when_not_macos() {
     let root = unique_temp_dir("find-app-not-mac");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Zed.app")).unwrap();
     let v = find_app_with("Zed", &[apps], false);
@@ -557,6 +626,7 @@ fn find_app_with_returns_uninstalled_when_not_macos() {
 #[test]
 fn find_app_with_returns_uninstalled_for_unsafe_name() {
     let root = unique_temp_dir("find-app-unsafe-name");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(&apps).unwrap();
     let v = find_app_with("../../etc/passwd", &[apps], true);
@@ -566,6 +636,7 @@ fn find_app_with_returns_uninstalled_for_unsafe_name() {
 #[test]
 fn list_installed_editors_with_detects_macos_app_bundles() {
     let root = unique_temp_dir("list-mac");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Visual Studio Code.app")).unwrap();
     std::fs::create_dir_all(apps.join("Cursor.app")).unwrap();
@@ -603,6 +674,7 @@ fn list_installed_editors_with_detects_macos_app_bundles() {
 #[test]
 fn list_installed_editors_with_skips_windows_only_editors_on_macos() {
     let root = unique_temp_dir("list-mac-skip-win");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(&apps).unwrap();
     let v = list_installed_editors_with(
@@ -624,6 +696,7 @@ fn list_installed_editors_with_skips_windows_only_editors_on_macos() {
 #[test]
 fn list_installed_editors_with_reports_finder_always_installed_on_macos() {
     let root = unique_temp_dir("list-mac-finder");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(&apps).unwrap();
     let v = list_installed_editors_with(
@@ -645,6 +718,7 @@ fn list_installed_editors_with_reports_finder_always_installed_on_macos() {
 #[test]
 fn list_installed_editors_with_prefers_probed_finder_bundle_over_builtin_path() {
     let root = unique_temp_dir("list-mac-finder-probe");
+    let root = root.path();
     let apps = root.join("Applications");
     std::fs::create_dir_all(apps.join("Finder.app")).unwrap();
     let v = list_installed_editors_with(
@@ -778,6 +852,7 @@ fn run_version_enriches_path_with_binary_parent_dir_for_env_shebangs() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = unique_temp_dir("run-version-env-shebang");
+    let dir = dir.path();
 
     // Create fake 'node' interpreter that responds to --version
     let fake_node = dir.join("node");

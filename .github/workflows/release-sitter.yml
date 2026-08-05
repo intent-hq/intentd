@@ -90,14 +90,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Self-hosted runners: m1mac (macOS arm64; x86_64 target is a cross
-          # build, smoke-tested under Rosetta 2), tinybox (Linux x64; musl
+          # macOS targets build on GitHub-hosted Apple Silicon runners (the
+          # self-hosted m1mac went offline and releases queued forever
+          # behind it); the x86_64 target is a cross build, smoke-tested
+          # under Rosetta 2. Self-hosted runners: tinybox (Linux x64; musl
           # targets cross-built with cargo-zigbuild as before), 5090pc
           # (Windows x64).
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64, m1mac]
+            os: macos-14
           - target: x86_64-apple-darwin
-            os: [self-hosted, macOS, ARM64, m1mac]
+            os: macos-14
           - target: x86_64-unknown-linux-musl
             os: [self-hosted, Linux, X64]
             zigbuild: true
@@ -164,8 +166,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path staging | Out-Null
           Copy-Item "target\$env:TARGET\release\intentd-sitter.exe" staging\intentd.exe
           Compress-Archive -Path staging\intentd.exe -DestinationPath "intentd-$env:TARGET.zip" -Force
-      # GNU-style "HASH *NAME" output. The self-hosted Mac has no GNU
-      # coreutils (its /sbin/sha256sum is a Darwin variant with different
+      # GNU-style "HASH *NAME" output. macOS ships no GNU coreutils (its
+      # sha256sum, where present, is a Darwin variant with different
       # flags/output), so use shasum there — `-b` emits the same
       # "HASH *NAME" format as `sha256sum --binary`.
       - name: Checksum sidecar
@@ -278,6 +280,9 @@ jobs:
             fi
           fi
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          # Re-stamp published_at so the fixed release reflects this refresh
+          # (GitHub never updates it on asset uploads).
+          ./scripts/refresh-release-published-at.sh sitter-latest "$GITHUB_REPOSITORY"
 
   # Mirror the sitter installer assets to the public intent-hq/intentd-releases
   # repo (same pattern as the daemon mirroring in publish-channel-manifest.yml
@@ -353,6 +358,9 @@ jobs:
           PRUNE_STALE: "true"
         run: |
           ./scripts/mirror-release-assets.sh sitter-latest
+          # Re-stamp published_at on the mirrored fixed release too.
+          GH_TOKEN="$DEST_GH_TOKEN" \
+            ./scripts/refresh-release-published-at.sh sitter-latest "$DEST_REPO"
 
   # Render the hand-maintained formula template with the real version +
   # sha256s and push it to the tap as Formula/intentd.rb. Skipped on
@@ -495,3 +503,6 @@ jobs:
             intentd_amd64.deb intentd_amd64.deb.sha256 \
             intentd_arm64.deb intentd_arm64.deb.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
+          # Re-stamp published_at so the fixed release reflects this refresh
+          # (GitHub never updates it on asset uploads).
+          ./scripts/refresh-release-published-at.sh sitter-latest "$GITHUB_REPOSITORY"

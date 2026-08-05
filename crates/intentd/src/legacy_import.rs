@@ -1455,6 +1455,7 @@ fn session_from_legacy_json(
         is_background,
         metadata: Some(Value::Object(metadata)),
         stop_reason: None,
+        stop_reason_timestamp: None,
         session_corrupted: false,
         created_at,
         updated_at,
@@ -1834,13 +1835,18 @@ mod tests {
 
     /// Fresh throwaway fixture root under the system temp dir (never `~/intent`
     /// — STAB-138: tests must not pollute the developer's real workspace dirs).
-    fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "intentd-legacy-{tag}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    /// Returns the path plus an RAII guard that removes the dir on drop
+    /// (including on panic); set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it
+    /// around for debugging.
+    fn temp_root(tag: &str) -> (PathBuf, tempfile::TempDir) {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intentd-legacy-{tag}-"))
+            .tempdir()
+            .expect("create test tempdir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        (dir.path().to_path_buf(), dir)
     }
 
     /// Write `<root>/<id>/.workspace/workspace.json` with `extra` fields merged
@@ -1874,9 +1880,12 @@ mod tests {
         dir
     }
 
-    async fn open_store() -> Store {
-        let db = std::env::temp_dir().join(format!("intentd-legacy-{}.db", uuid::Uuid::new_v4()));
-        Store::open(&db).await.expect("open store")
+    /// Open a store backed by a guarded temp dir; the returned guard removes
+    /// the db plus its `-wal`/`-shm` sidecars on drop.
+    async fn open_store() -> (Store, tempfile::TempDir) {
+        let (dir, guard) = temp_root("db");
+        let db = dir.join("legacy.db");
+        (Store::open(&db).await.expect("open store"), guard)
     }
 
     fn opts(roots: Vec<PathBuf>) -> Options {
@@ -1922,7 +1931,7 @@ mod tests {
 
     #[tokio::test]
     async fn imports_legacy_workspaces_and_drops_legacy_fields() {
-        let root = temp_root("import");
+        let (root, _root_g) = temp_root("import");
         write_legacy_workspace(&root, "ws-a", json!({}));
         write_legacy_workspace(
             &root,
@@ -1932,7 +1941,7 @@ mod tests {
         // Entries without .workspace/workspace.json are ignored.
         std::fs::create_dir_all(root.join("not-a-workspace")).unwrap();
         std::fs::write(root.join("stray-file"), "x").unwrap();
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.imported(), 2, "{report}");
@@ -1951,13 +1960,11 @@ mod tests {
             .await
             .unwrap();
         assert!(b.archived);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn imports_legacy_string_setup_script_and_child_note() {
-        let root = temp_root("setup-script");
+        let (root, _root_g) = temp_root("setup-script");
         let ws_dir = write_legacy_workspace(
             &root,
             "ws-setup-script",
@@ -1968,7 +1975,7 @@ mod tests {
             "extra.md",
             "---\nid: extra\ntitle: Imported extra\n---\n\nChild note body\n",
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.imported(), 1, "{report}");
@@ -1984,16 +1991,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(note.content, "Child note body\n");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Hostile manifest ids (path traversal, absolute paths, separators) are
     /// rejected before any row insert or asset copy can use them.
     #[tokio::test]
     async fn rejects_workspace_ids_that_are_not_plain_path_segments() {
-        let root = temp_root("hostile-id");
-        let assets_root = temp_root("hostile-id-assets");
+        let (root, _root_g) = temp_root("hostile-id");
+        let (assets_root, _assets_g) = temp_root("hostile-id-assets");
         for (dir_name, hostile_id) in [
             ("evil-a", "../../escape"),
             ("evil-b", "/abs/path"),
@@ -2008,7 +2013,7 @@ mod tests {
             std::fs::create_dir_all(&assets_dir).unwrap();
             std::fs::write(assets_dir.join("asset-1"), "payload").unwrap();
         }
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(
             &store,
@@ -2031,9 +2036,6 @@ mod tests {
         assert!(store.list_workspaces(true).await.unwrap().is_empty());
         // Nothing escaped the assets root (nothing was written at all).
         assert!(std::fs::read_dir(&assets_root).unwrap().next().is_none());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&assets_root).ok();
     }
 
     #[test]
@@ -2051,9 +2053,9 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_reports_plan_without_writing() {
-        let root = temp_root("dry");
+        let (root, _root_g) = temp_root("dry");
         write_legacy_workspace(&root, "ws-dry", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(
             &store,
@@ -2068,15 +2070,13 @@ mod tests {
         assert_eq!(report.imported(), 1);
         assert!(report.to_string().contains("would import"), "{report}");
         assert!(store.list_workspaces(true).await.unwrap().is_empty());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn existing_ids_are_skipped_unless_forced() {
-        let root = temp_root("idem");
+        let (root, _root_g) = temp_root("idem");
         write_legacy_workspace(&root, "ws-x", json!({"title": "Old title"}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
 
         // Second run: idempotent skip.
@@ -2104,14 +2104,12 @@ mod tests {
             .unwrap();
         assert_eq!(ws.title, "New title");
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn missing_worktree_falls_back_to_skip_worktree() {
-        let root = temp_root("worktree");
-        let live_dir = temp_root("live-worktree");
+        let (root, _root_g) = temp_root("worktree");
+        let (live_dir, _live_g) = temp_root("live-worktree");
         write_legacy_workspace(
             &root,
             "ws-live",
@@ -2122,7 +2120,7 @@ mod tests {
             "ws-gone",
             json!({"worktreePath": "/nonexistent/legacy/worktree", "skipWorktree": false}),
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
 
         let live = store
@@ -2142,22 +2140,19 @@ mod tests {
         assert_eq!(gone.worktree_path, None);
         assert!(gone.skip_worktree);
         assert_eq!(gone.branch, "branch-ws-gone");
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&live_dir).ok();
     }
 
     #[tokio::test]
     async fn skips_chief_duplicates_and_malformed_manifests() {
-        let root_a = temp_root("roots-a");
-        let root_b = temp_root("roots-b");
+        let (root_a, _root_a_g) = temp_root("roots-a");
+        let (root_b, _root_b_g) = temp_root("roots-b");
         write_legacy_workspace(&root_a, "__chief__", json!({}));
         write_legacy_workspace(&root_a, "ws-dup", json!({"title": "From root A"}));
         write_legacy_workspace(&root_b, "ws-dup", json!({"title": "From root B"}));
         let broken = root_a.join("ws-broken").join(".workspace");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("workspace.json"), "{ nope").unwrap();
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root_a.clone(), root_b.clone()]))
             .await
@@ -2174,16 +2169,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dup.title, "From root A");
-
-        std::fs::remove_dir_all(&root_a).ok();
-        std::fs::remove_dir_all(&root_b).ok();
     }
 
     #[tokio::test]
     async fn first_boot_hook_imports_once_and_writes_marker() {
-        let root = temp_root("boot");
+        let (root, _root_g) = temp_root("boot");
         write_legacy_workspace(&root, "ws-boot", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         // Fresh DB, no marker → import runs and the marker is written.
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
@@ -2198,16 +2190,14 @@ mod tests {
         write_legacy_workspace(&root, "ws-later", json!({}));
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn first_boot_hook_does_not_write_marker_after_parse_failure() {
-        let root = temp_root("boot-parse-failure");
+        let (root, _root_g) = temp_root("boot-parse-failure");
         write_legacy_workspace(&root, "ws-good", json!({}));
         write_legacy_workspace(&root, "ws-bad", json!({"setupScript": 42}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
 
@@ -2217,16 +2207,14 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn second_run_recovers_parse_failure_and_skips_existing_workspace() {
-        let root = temp_root("parse-recovery");
+        let (root, _root_g) = temp_root("parse-recovery");
         write_legacy_workspace(&root, "ws-existing", json!({}));
         write_legacy_workspace(&root, "ws-recovered", json!({"setupScript": 42}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let first = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(first.imported(), 1, "{first}");
@@ -2248,16 +2236,14 @@ mod tests {
             .iter()
             .any(|entry| entry.id == "ws-recovered" && entry.outcome == Outcome::Imported));
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 2);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn skips_daemon_managed_manifest_without_force() {
-        let root = temp_root("managed");
+        let (root, _root_g) = temp_root("managed");
         write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
         write_legacy_workspace(&root, "ws-legacy", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
 
@@ -2273,15 +2259,13 @@ mod tests {
             .get_workspace(&WorkspaceId::from("ws-managed"))
             .await
             .is_err());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn first_boot_hook_skips_daemon_managed_manifest_and_writes_marker() {
-        let root = temp_root("boot-managed");
+        let (root, _root_g) = temp_root("boot-managed");
         write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
 
@@ -2291,15 +2275,13 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn force_imports_daemon_managed_manifest() {
-        let root = temp_root("managed-force");
+        let (root, _root_g) = temp_root("managed-force");
         write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let force_opts = Options {
             roots: vec![root.clone()],
@@ -2316,15 +2298,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws.title, "Legacy ws-managed");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn first_boot_hook_skips_preexisting_db() {
-        let root = temp_root("boot-existing");
+        let (root, _root_g) = temp_root("boot-existing");
         write_legacy_workspace(&root, "ws-pre", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, true, vec![root.clone()], None, None).await;
         assert!(store.list_workspaces(true).await.unwrap().is_empty());
@@ -2333,21 +2313,19 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Empty roots fully disable the hook: no app-dir read, no marker write —
     /// so `INTENTD_LEGACY_IMPORT_ROOTS=""` really turns the feature off.
     #[tokio::test]
     async fn first_boot_hook_disabled_by_empty_roots() {
-        let app_dir = temp_root("boot-empty-app");
+        let (app_dir, _app_g) = temp_root("boot-empty-app");
         std::fs::write(
             app_dir.join("repo-registry.json"),
             r#"{"knownRepos": [{"path": "/tmp/repo"}]}"#,
         )
         .unwrap();
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, Vec::new(), None, Some(app_dir.clone())).await;
         assert!(store.list_workspaces(true).await.unwrap().is_empty());
@@ -2358,27 +2336,23 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-
-        std::fs::remove_dir_all(&app_dir).ok();
     }
 
     #[tokio::test]
     async fn source_is_never_mutated() {
-        let root = temp_root("readonly");
+        let (root, _root_g) = temp_root("readonly");
         write_legacy_workspace(&root, "ws-ro", json!({}));
         let manifest = root.join("ws-ro").join(".workspace").join("workspace.json");
         let before = std::fs::read(&manifest).unwrap();
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(std::fs::read(&manifest).unwrap(), before);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn imports_notes_with_frontmatter_spec_and_task() {
-        let root = temp_root("notes");
+        let (root, _root_g) = temp_root("notes");
         let ws_dir = write_legacy_workspace(&root, "ws-notes", json!({}));
         write_legacy_note(
             &ws_dir,
@@ -2398,7 +2372,7 @@ mod tests {
         std::fs::write(meta.join("versions").join("spec.jsonl"), "{}").unwrap();
         // Non-markdown files are ignored.
         write_legacy_note(&ws_dir, "scratch.txt", "not a note");
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.imported(), 1, "{report}");
@@ -2443,13 +2417,11 @@ mod tests {
         assert_eq!(plain.title, "plain");
         assert_eq!(plain.content, "Just a body\n");
         assert!(!plain.is_pinned);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn malformed_note_frontmatter_imports_body_best_effort() {
-        let root = temp_root("notes-malformed");
+        let (root, _root_g) = temp_root("notes-malformed");
         let ws_dir = write_legacy_workspace(&root, "ws-bad-notes", json!({}));
         // Unparseable YAML between valid delimiters: body still lands, with a
         // filename-derived title.
@@ -2472,7 +2444,7 @@ mod tests {
             "empties.md",
             "---\nid: empties\ntitle: \"\"\ncreated: \"\"\n---\n\nEmpty meta body\n",
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.entries[0].notes.imported, 3, "{report}");
@@ -2501,20 +2473,18 @@ mod tests {
         assert_eq!(empties.title, "empties");
         assert!(!empties.created_at.is_empty());
         assert_eq!(empties.created_at, empties.updated_at);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn notes_import_is_idempotent_per_note_id() {
-        let root = temp_root("notes-idem");
+        let (root, _root_g) = temp_root("notes-idem");
         let ws_dir = write_legacy_workspace(&root, "ws-note-idem", json!({}));
         write_legacy_note(
             &ws_dir,
             "spec.md",
             "---\nid: spec\ntitle: Spec\n---\n\nOriginal spec\n",
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
 
         // Re-run with --force (workspace row updates, extras re-run): the
@@ -2542,8 +2512,6 @@ mod tests {
         let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
         assert_eq!(spec.content, "Original spec\n");
         assert_eq!(store.list_notes(&ws_id).await.unwrap().len(), 2);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Write `<ws-dir>/.workspace/notes/.meta/<name>` with raw contents.
@@ -2564,7 +2532,7 @@ mod tests {
 
     #[tokio::test]
     async fn imports_comments_with_threads_anchors_and_extras() {
-        let root = temp_root("comments");
+        let (root, _root_g) = temp_root("comments");
         let ws_dir = write_legacy_workspace(&root, "ws-comments", json!({}));
         write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec body\n");
         // Realistic legacy sidecar: a root comment with anchor/extras, a reply
@@ -2637,7 +2605,7 @@ mod tests {
         );
         // Non-comments .meta files are ignored.
         write_legacy_meta(&ws_dir, "spec.versions.jsonl", "{}");
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         let counts = report.entries[0].comments;
@@ -2701,13 +2669,11 @@ mod tests {
         assert_eq!(sugg_extra["isOrphaned"], json!("yes"));
 
         assert!(store.get_comment("c-ghost").await.is_err());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn comments_import_is_idempotent_and_survives_malformed_files() {
-        let root = temp_root("comments-idem");
+        let (root, _root_g) = temp_root("comments-idem");
         let ws_dir = write_legacy_workspace(&root, "ws-c-idem", json!({}));
         write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec\n");
         write_legacy_note(&ws_dir, "other.md", "---\nid: other\n---\n\nOther\n");
@@ -2728,7 +2694,7 @@ mod tests {
         );
         // Whole-file garbage: counted failed, never fatal.
         write_legacy_meta(&ws_dir, "other.comments.json", "{ nope");
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.entries[0].comments.imported, 1, "{report}");
@@ -2757,8 +2723,6 @@ mod tests {
                 .len(),
             1
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Write `<ws-dir>/.workspace/agents/<name>` with raw contents.
@@ -2845,7 +2809,7 @@ mod tests {
 
     #[tokio::test]
     async fn imports_agent_transcripts_as_completed_sessions() {
-        let root = temp_root("agents");
+        let (root, _root_g) = temp_root("agents");
         let ws_dir = write_legacy_workspace(&root, "ws-agents", json!({}));
         write_legacy_agent(
             &ws_dir,
@@ -2858,7 +2822,7 @@ mod tests {
         write_legacy_agent(&ws_dir, "notes.txt", "not an agent");
         // Whole-file garbage: counted failed, never fatal.
         write_legacy_agent(&ws_dir, "agent-broken.json", "{ nope");
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         let counts = report.entries[0].agents;
@@ -2969,13 +2933,11 @@ mod tests {
         );
         let m2 = msgs[2].metadata.as_ref().unwrap();
         assert_eq!(m2["legacyRole"], json!("error"));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn agent_import_is_idempotent_and_mints_ids_for_invalid() {
-        let root = temp_root("agents-idem");
+        let (root, _root_g) = temp_root("agents-idem");
         let ws_dir = write_legacy_workspace(&root, "ws-agent-idem", json!({}));
         write_legacy_agent(
             &ws_dir,
@@ -2990,7 +2952,7 @@ mod tests {
             })
             .to_string(),
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(report.entries[0].agents.sessions_imported, 1, "{report}");
@@ -3025,13 +2987,11 @@ mod tests {
         let sessions = store.list_agent_sessions(&ws_id).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].messages.len(), 1);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn imported_agent_sessions_are_never_swept_as_interrupted() {
-        let root = temp_root("agents-heal");
+        let (root, _root_g) = temp_root("agents-heal");
         let ws_dir = write_legacy_workspace(&root, "ws-agent-heal", json!({}));
         // Legacy file frozen mid-flight ("Processing"): imports as Completed.
         write_legacy_agent(
@@ -3039,7 +2999,7 @@ mod tests {
             &format!("{LEGACY_AGENT_ID}.json"),
             &legacy_agent_fixture().to_string(),
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
 
         // The startup heal sweep must not touch the imported session.
@@ -3053,8 +3013,6 @@ mod tests {
             .unwrap();
         assert_eq!(session.status, AgentStatus::Completed);
         assert!(!session.is_active);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Symlinks under `.workspace/` are never followed: a hostile link
@@ -3063,8 +3021,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_files_are_never_imported() {
-        let root = temp_root("symlink");
-        let outside = temp_root("symlink-outside");
+        let (root, _root_g) = temp_root("symlink");
+        let (outside, _outside_g) = temp_root("symlink-outside");
         std::fs::write(outside.join("secret.txt"), b"outside-data").unwrap();
         let ws_dir = write_legacy_workspace(&root, "ws-symlink", json!({}));
         let assets_dir = ws_dir.join(".workspace").join("assets");
@@ -3093,7 +3051,7 @@ mod tests {
         .unwrap();
         // A symlinked workspace DIRECTORY pointing outside the root is never
         // a discovery candidate either.
-        let outside_ws = temp_root("symlink-outside-ws");
+        let (outside_ws, _outside_ws_g) = temp_root("symlink-outside-ws");
         let outside_ws_dir = outside_ws.join("ws-evil-dir");
         let outside_meta = outside_ws_dir.join(".workspace");
         std::fs::create_dir_all(&outside_meta).unwrap();
@@ -3103,8 +3061,8 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(&outside_ws_dir, root.join("ws-evil-dir")).unwrap();
-        let assets_root = temp_root("symlink-dest");
-        let store = open_store().await;
+        let (assets_root, _assets_g) = temp_root("symlink-dest");
+        let (store, _db_g) = open_store().await;
 
         let report = run(
             &store,
@@ -3134,17 +3092,12 @@ mod tests {
         let dest = assets_root.join("ws-symlink");
         assert!(dest.join("real.bin").is_file());
         assert!(!dest.join("linked-asset").exists());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&outside).ok();
-        std::fs::remove_dir_all(&outside_ws).ok();
-        std::fs::remove_dir_all(&assets_root).ok();
     }
 
     #[tokio::test]
     async fn imports_assets_into_workspace_scoped_root() {
-        let root = temp_root("assets");
-        let assets_root = temp_root("assets-dest");
+        let (root, _root_g) = temp_root("assets");
+        let (assets_root, _assets_g) = temp_root("assets-dest");
         let ws_dir = write_legacy_workspace(&root, "ws-assets", json!({}));
         let src = ws_dir.join(".workspace").join("assets");
         std::fs::create_dir_all(&src).unwrap();
@@ -3157,7 +3110,7 @@ mod tests {
         // Dotfiles and subdirectories are ignored.
         std::fs::write(src.join(".DS_Store"), "x").unwrap();
         std::fs::create_dir_all(src.join("subdir")).unwrap();
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(
             &store,
@@ -3197,18 +3150,15 @@ mod tests {
             std::fs::read(dest.join("img1.png")).unwrap(),
             b"already-migrated"
         );
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&assets_root).ok();
     }
 
     #[tokio::test]
     async fn no_assets_dir_or_root_is_a_noop() {
-        let root = temp_root("assets-none");
+        let (root, _root_g) = temp_root("assets-none");
         write_legacy_workspace(&root, "ws-no-assets", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         // assets_root set but the legacy workspace has no assets dir.
-        let assets_root = temp_root("assets-none-dest");
+        let (assets_root, _assets_g) = temp_root("assets-none-dest");
         let report = run(
             &store,
             &Options {
@@ -3221,9 +3171,6 @@ mod tests {
         .unwrap();
         assert_eq!(report.entries[0].assets, AssetCounts::default(), "{report}");
         assert!(!assets_root.join("ws-no-assets").exists());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&assets_root).ok();
     }
 
     /// Write app-level `repo-registry.json` / `config.json` fixtures into a dir.
@@ -3234,8 +3181,8 @@ mod tests {
 
     #[tokio::test]
     async fn imports_app_level_blobs_when_absent() {
-        let root = temp_root("app-blobs");
-        let app_dir = temp_root("app-dir");
+        let (root, _root_g) = temp_root("app-blobs");
+        let (app_dir, _app_g) = temp_root("app-dir");
         write_legacy_workspace(&root, "ws-hist", json!({}));
         write_app_file(
             &app_dir,
@@ -3253,7 +3200,7 @@ mod tests {
                 "ws-unknown": [{"file": "b.rs", "summary": "dropped"}]
             }}),
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         let report = run(
             &store,
@@ -3285,15 +3232,12 @@ mod tests {
         .unwrap();
         assert!(history.get("ws-hist").is_some());
         assert!(history.get("ws-unknown").is_none());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&app_dir).ok();
     }
 
     #[tokio::test]
     async fn app_level_blobs_never_clobber_existing_settings() {
-        let root = temp_root("app-preserve");
-        let app_dir = temp_root("app-preserve-dir");
+        let (root, _root_g) = temp_root("app-preserve");
+        let (app_dir, _app_g) = temp_root("app-preserve-dir");
         write_legacy_workspace(&root, "ws-keep", json!({}));
         write_app_file(
             &app_dir,
@@ -3305,7 +3249,7 @@ mod tests {
             "config.json",
             &json!({"changeHistory": {"ws-keep": [{"file": "x"}]}}),
         );
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
         store
             .set_setting("repos.known", &json!([{"path": "/tmp/mine"}]).to_string())
             .await
@@ -3347,19 +3291,16 @@ mod tests {
         )
         .unwrap();
         assert!(history.get("ws-mine").is_some());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&app_dir).ok();
     }
 
     #[tokio::test]
     async fn app_dir_dry_run_missing_or_malformed_files() {
-        let root = temp_root("app-edge");
+        let (root, _root_g) = temp_root("app-edge");
         write_legacy_workspace(&root, "ws-edge", json!({}));
-        let store = open_store().await;
+        let (store, _db_g) = open_store().await;
 
         // Dry-run never touches app settings even with an app_dir configured.
-        let app_dir = temp_root("app-edge-dir");
+        let (app_dir, _app_g) = temp_root("app-edge-dir");
         write_app_file(
             &app_dir,
             "repo-registry.json",
@@ -3398,9 +3339,6 @@ mod tests {
         assert_eq!(app.failed, 1, "{report}");
         assert_eq!(app.repos_imported, 0, "{report}");
         assert!(store.get_setting("repos.known").await.unwrap().is_none());
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&app_dir).ok();
     }
 
     #[test]
