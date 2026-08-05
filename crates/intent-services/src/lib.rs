@@ -155,6 +155,19 @@ fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
     )
 }
 
+/// Test park for the completion-delivery classify→mark window (issue
+/// intent-hq/monorepo#1468 follow-up): `deliver_completion_to_watches` parks
+/// between the `agent_waiting` probe and `mark_interim_skipped_idle` so a
+/// test can land a concurrent watch removal deterministically inside that
+/// window. Same shape as [`script_ops::SupervisePark`].
+#[derive(Default)]
+pub(crate) struct CompletionClassifyPark {
+    /// Signaled by the parked delivery on entering the window.
+    pub(crate) entered: tokio::sync::Notify,
+    /// Held by the parked delivery inside the window until the test releases it.
+    pub(crate) release: tokio::sync::Notify,
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -338,6 +351,14 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_supervise_park` /
     /// `with_script_start_registration_park`.
     script_parks: script_ops::ScriptParks,
+    /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
+    /// completion-delivery classify→mark window: parks
+    /// `deliver_completion_to_watches` after the `agent_waiting` probe and
+    /// before `mark_interim_skipped_idle`, so an `agent.unwatch` /
+    /// `agent.cancelSubscriptions` landing inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_completion_classify_park`.
+    completion_classify_park: Option<Arc<CompletionClassifyPark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -592,6 +613,7 @@ impl Services {
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
+            completion_classify_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -983,6 +1005,20 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.start_registration = Some(park);
+        self
+    }
+
+    /// Test seam (issue intent-hq/monorepo#1468 follow-up): park
+    /// `deliver_completion_to_watches` in its classify→mark window (after the
+    /// `agent_waiting` probe, before `mark_interim_skipped_idle`) so a
+    /// concurrent watch removal inside that window is deterministic.
+    /// Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_completion_classify_park(
+        mut self,
+        park: Arc<CompletionClassifyPark>,
+    ) -> Self {
+        self.completion_classify_park = Some(park);
         self
     }
 
@@ -2918,11 +2954,15 @@ impl Services {
     }
 
     /// Whether `agent_id` is currently idle-but-waiting on OTHER agents: it
-    /// holds at least one outgoing completion watch whose target has not yet
-    /// settled. Mirrors the hook-waiting classification — such an agent will
-    /// run again when a watched target completes (which retires that outgoing
-    /// watch), so an `agent:idle` emitted while it waits is not its real
-    /// completion and must not fire the agent's own watchers (issue
+    /// holds at least one live outgoing completion watch. The predicate never
+    /// probes the target's settlement itself — it relies on the
+    /// retire-at-settlement invariant (a watch is removed when its target
+    /// settles), so any live outgoing watch counts, including one on an
+    /// idle-but-itself-waiting target (a chained deferral is intentionally
+    /// still a waiting reason). Mirrors the hook-waiting classification — such
+    /// an agent will run again when a watched target completes (which retires
+    /// that outgoing watch), so an `agent:idle` emitted while it waits is not
+    /// its real completion and must not fire the agent's own watchers (issue
     /// intent-hq/monorepo#1468: an implementor idling while it waits on its PR
     /// reviewer must not wake its coordinator into a no-progress loop). Grouped
     /// (after_all) watches count too: a coordinator idling while its delegation
@@ -2935,7 +2975,13 @@ impl Services {
     /// counted as a waiting reason, so the deadlocked pair delivers as before
     /// (both watchers fire). A mutual pair whose counterpart is still busy is a
     /// genuine wait (the busy side will complete and wake this one), so it
-    /// still defers.
+    /// still defers. The guard fails open in one asymmetric case: a
+    /// counterpart that is idle but itself hook-waiting or agent-waiting on a
+    /// third agent is not actually deadlocked (it will run again when its own
+    /// wait resolves), yet the edge is still declassified and this agent's
+    /// watchers fire early. That is the safe direction (an early wake, not a
+    /// stall) — the same class of accepted imprecision as deeper cycles
+    /// (A→B→C→A), which the guard does not detect either.
     ///
     /// The waiting classification is exposed as a reusable predicate so the
     /// reconciliation paths can share it with the live delivery path.
@@ -3241,7 +3287,7 @@ impl Services {
         // delivery time (like the hook probe) and with the 2-cycle deadlock
         // guard baked into the predicate. This defers WATCH delivery only; it
         // must NOT defer the child's own after_all group seal (see the
-        // `watch_interim` vs. `seal_interim` split below): a coordinator that
+        // `interim_idle` vs. `seal_interim` split below): a coordinator that
         // delegated with `after_all` always holds grouped outgoing watches on
         // its own children, so gating the seal on agent-waiting would deadlock
         // the group (the seal is what ends the coordinator's delegating turn).
@@ -3252,11 +3298,18 @@ impl Services {
         //   that delegates more children, so its open after_all group is not
         //   final — the caller must not seal. Agent-waiting is excluded: the
         //   post-wait turn reopens a FRESH group, so the current one seals now.
-        // - `watch_interim`: seal-interim OR agent-waiting — the child has not
+        // - `interim_idle`: seal-interim OR agent-waiting — the child has not
         //   settled, so its ungrouped watchers neither deliver nor retire and
         //   its grouped memberships skip the settlement record.
         let seal_interim = queue_interim || hook_waiting;
         let interim_idle = seal_interim || agent_waiting;
+        // Test seam: park in the classify→mark window so a test can land a
+        // concurrent watch removal between the `agent_waiting` probe above
+        // and the marker write below.
+        if let Some(park) = &self.completion_classify_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         // monorepo#1280/#1281: record the interim skip up front — even when
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle (or, for a
@@ -3509,10 +3562,11 @@ impl Services {
         // synthetic redelivery's event is non-interim by construction
         // (queue empty), so its own pass never re-enters here. An
         // agent-waiting-only idle (issue intent-hq/monorepo#1468) is
-        // deliberately excluded here — it has no queue-race to heal and its
-        // synthetic pass would re-classify as agent-waiting (a loop); its
-        // deferred watches settle via the backstop paths that re-run
-        // redelivery when the last outgoing watch is removed.
+        // deliberately excluded from THIS re-check — it has no queue-race to
+        // heal and an unconditional synthetic pass would re-classify as
+        // agent-waiting (a loop); its deferred watches settle via the
+        // backstop paths that re-run redelivery when the last outgoing watch
+        // is removed, plus the guarded classify→mark re-probe below.
         //
         // monorepo#1297: a BUSY-classified interim skip reaches this re-check
         // on every pass (its queue is empty by definition). While the turn is
@@ -3524,6 +3578,20 @@ impl Services {
         // slot release observes marker + empty queue + not busy and
         // synthesizes the real completion.
         if seal_interim && !self.has_ready_to_send(child_id) {
+            Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
+        }
+        // Agent-waiting classify→mark race (issue intent-hq/monorepo#1468):
+        // `agent_waiting` was probed while the child's outgoing watch still
+        // existed, but the marker only landed later. An `agent.unwatch` /
+        // `agent.cancelSubscriptions` removing the child's last outgoing
+        // watch inside that window runs its backstop redelivery BEFORE the
+        // marker exists and no-ops — this delivery then defers on the stale
+        // snapshot with no future trigger. Re-probe now that the marker is
+        // in place: if the watch set emptied, hand off to the mutation-path
+        // redelivery (same heal shape as the monorepo#1280 re-check above).
+        // No re-classification loop: the synthetic pass probes agent-waiting
+        // live, which this re-probe just observed as false.
+        if agent_waiting && !seal_interim && !self.agent_is_waiting_on_agents(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
         // Return the SEAL-interim classification (queue/busy/hook), NOT

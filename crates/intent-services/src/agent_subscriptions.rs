@@ -1624,8 +1624,13 @@ impl Services {
                             continue;
                         }
                         // Same emit-time `isWaitingForOtherAgents` stamp as
-                        // the live idle emits (always false here — a waiting
-                        // child skipped above).
+                        // the live idle emits. Usually false here (a waiting
+                        // child was skipped above), but not always: the skip
+                        // uses the durable classification WITH the 2-cycle
+                        // guard, while this stamp is the raw in-memory watch
+                        // derivation — a child whose only outgoing watch was
+                        // declassified as a mutual-idle 2-cycle reaches this
+                        // line and stamps `true`.
                         if event_type == intent_core::events::AGENT_IDLE {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
                                 .list_watches_for_parent(&child_id)
