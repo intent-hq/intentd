@@ -2169,6 +2169,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Sandbox record lookup for one agent: `{ id, status, path, branch,
+    /// mergeOnTurnEnd, ... }` (the serialized store record) or `null` when
+    /// the agent has no sandbox. Backs the `ws.agent.status` sandbox
+    /// enrichment — one cheap store lookup, MCP-side only (no wire RPC).
+    fn sandbox_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `sandbox.profiles.list`: the configured execution-environment profiles
     /// (global, no `workspaceId`) — `{ defaultType, profiles: [{ type,
     /// enabled, image? }] }`, one row per type in catalog order (`direct`,

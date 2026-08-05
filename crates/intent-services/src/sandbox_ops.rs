@@ -176,7 +176,23 @@ pub async fn provision_sandbox(
         return Ok(ProvisionOutcome::Unsupported);
     };
 
-    // Persist the sandbox record
+    // Persist the sandbox record. `merge_on_turn_end` comes from the child's
+    // session metadata (stamped by delegate/create from the `mergeOnTurnEnd`
+    // input) so both provisioning paths — the background delegate task and
+    // the synchronous microVM first-spawn — pick it up uniformly, and the
+    // flag survives respawn/daemon restart. Default `true` = today's
+    // merge-on-completion behavior.
+    let merge_on_turn_end = store
+        .get_agent_session_summary(agent_id)
+        .await
+        .ok()
+        .and_then(|s| {
+            s.metadata
+                .as_ref()
+                .and_then(|m| m.get("mergeOnTurnEnd"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true);
     let now = now_iso();
     let sandbox = Sandbox {
         id: uuid::Uuid::new_v4().to_string(),
@@ -189,6 +205,7 @@ pub async fn provision_sandbox(
         last_merged_commit_sha: None,
         status: SandboxStatus::Created,
         retry_count: 0,
+        merge_on_turn_end,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -1811,6 +1828,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -1914,6 +1932,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: intent_store::SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2557,6 +2576,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2890,6 +2910,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3249,6 +3270,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3333,6 +3355,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3382,6 +3405,7 @@ mod tests {
             last_merged_commit_sha: None,
             status: SandboxStatus::Created,
             retry_count: 0,
+            merge_on_turn_end: true,
             created_at: now_iso(),
             updated_at: now_iso(),
         };

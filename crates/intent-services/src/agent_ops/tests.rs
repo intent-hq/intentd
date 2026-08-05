@@ -16314,6 +16314,7 @@ async fn fake_provisioned_sandbox(
         last_merged_commit_sha: None,
         status: intent_store::SandboxStatus::Created,
         retry_count: 0,
+        merge_on_turn_end: true,
         created_at: now_iso(),
         updated_at: now_iso(),
     };
@@ -17856,6 +17857,53 @@ async fn delegate_unoccupied_task_succeeds_without_force() {
         .await
         .expect("first delegate must pass the guard");
     assert_eq!(resp["ok"], true);
+}
+
+/// `mergeOnTurnEnd` is stamped onto the child's persisted metadata (the
+/// hand-off point `provision_sandbox` reads at provision time), and omitted
+/// when not supplied.
+#[tokio::test]
+async fn delegate_stamps_merge_on_turn_end_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "NoMerge").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                merge_on_turn_end: Some(false),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert_eq!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("mergeOnTurnEnd"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "child metadata must persist mergeOnTurnEnd=false"
+    );
+
+    let note_id2 = seed_task(&svc, &ws, "DefaultMerge").await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id2, None), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("mergeOnTurnEnd"))
+            .is_none(),
+        "metadata omits mergeOnTurnEnd when not supplied (default = merge)"
+    );
 }
 
 /// Occupied task (live assigned agent) → second delegate is rejected with

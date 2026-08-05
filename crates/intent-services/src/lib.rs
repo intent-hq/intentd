@@ -1454,6 +1454,24 @@ impl Services {
         self.compute_cow_supported().await
     }
 
+    /// Non-panicking CoW-capability hint for per-bridge description gating
+    /// (`WorkspaceMcpServer::with_cow_capable`). Unlike
+    /// [`Self::compute_cow_supported`] this never falls through to
+    /// `default_workspaces_root()`'s hermetic-test guard: with no injected
+    /// root and no `$INTENTD_WORKSPACES_DIR` it reports `false` under
+    /// `cfg(test)` instead of panicking. Description-only consumers tolerate
+    /// the conservative answer.
+    pub(crate) async fn cow_capable_hint(&self) -> bool {
+        let root = match self.workspaces_root.clone() {
+            Some(r) => r,
+            None if cfg!(test) && std::env::var_os("INTENTD_WORKSPACES_DIR").is_none() => {
+                return false;
+            }
+            None => default_workspaces_root(),
+        };
+        self.workspace_aggregates.cow_supported(root).await == Some(true)
+    }
+
     /// The daemon-managed directory whose footprint `workspace.diskUsage`
     /// reports, or `None` for rows without one (remote / skip-isolation rows
     /// and the virtual chief workspace). The directory is the provisioned
@@ -3381,6 +3399,20 @@ impl Services {
             }
         };
 
+        // Parent opted out of turn-end merges (`mergeOnTurnEnd: false`):
+        // skip the merge entirely — no status transition, no bounce — and
+        // propagate completion normally. The sandbox stays live in its
+        // current status; the manual `sandbox.cow.merge` RPC is the way to
+        // merge later, and the retry sweep skips these sandboxes too.
+        if !sandbox.merge_on_turn_end {
+            tracing::info!(
+                agent = %agent_id.0,
+                sandbox = %sandbox.id,
+                "sandbox has mergeOnTurnEnd=false; skipping turn-end merge"
+            );
+            return true;
+        }
+
         // Check retry count (cap at 2 bounces)
         const MAX_RETRIES: i64 = 2;
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
@@ -3833,6 +3865,21 @@ impl Services {
         for sandbox in pending {
             let workspace_id = sandbox.workspace_id.clone();
             let agent_id = sandbox.agent_id.clone();
+
+            // `mergeOnTurnEnd: false` sandboxes only reach `merge_pending`
+            // via a failed manual `sandbox.cow.merge`; auto-retrying would
+            // undermine the parent's control over when merging happens, so
+            // leave them for another explicit merge (or discard).
+            if !sandbox.merge_on_turn_end {
+                summary.skipped_manual_merge += 1;
+                tracing::debug!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    "merge retry sweep: sandbox has mergeOnTurnEnd=false; skipping (manual merge only)"
+                );
+                continue;
+            }
 
             if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
                 summary.skipped_capped += 1;
@@ -7089,6 +7136,8 @@ pub struct MergeSweepSummary {
     pub skipped_busy: usize,
     /// Sandboxes skipped because another merge path claimed them first.
     pub skipped_raced: usize,
+    /// Sandboxes skipped because `merge_on_turn_end=false` (manual merge only).
+    pub skipped_manual_merge: usize,
     /// Hard errors (claim failures or merge errors; retry consumed on merge errors).
     pub errors: usize,
 }
@@ -17334,6 +17383,19 @@ impl WorkspaceApi for Services {
     // sandbox.* surface (PROTOCOL §5.34). Manual escape-hatch RPCs for
     // triggering merge-back or discarding a sandbox when auto-merge fails.
     // ========================================================================
+
+    fn sandbox_get(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let sandbox = store.get_sandbox(&workspace_id, &agent_id).await?;
+            serde_json::to_value(sandbox)
+                .map_err(|e| Error::Internal(format!("serialize sandbox failed: {e}")))
+        })
+    }
 
     fn sandbox_merge(
         &self,

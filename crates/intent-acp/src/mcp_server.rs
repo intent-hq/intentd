@@ -82,6 +82,14 @@ pub struct WorkspaceMcpServer {
     /// Disabled features are pruned from the tool description and JS prelude
     /// and denied at dispatch. Defaults to all-on (FE front door, tests).
     agent_features: AgentFeaturesSettings,
+    /// Whether the workspace can run CoW sandboxes (CoW probe supported OR a
+    /// microVM execution environment). Gates the sandbox-related doc clauses
+    /// (`mergeOnTurnEnd`, sandbox fields) in the `workspace_api` description
+    /// — description-only: dispatch accepts and ignores `mergeOnTurnEnd`
+    /// regardless (advisory; no sandbox exists to honor it when not
+    /// capable). Defaults to `true` (FE front door, tests) so the
+    /// all-defaults description stays byte-identical to the static const.
+    cow_capable: bool,
 }
 
 impl WorkspaceMcpServer {
@@ -99,6 +107,7 @@ impl WorkspaceMcpServer {
             workspace_api_timeout: dispatch::default_workspace_api_timeout(),
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
+            cow_capable: true,
         }
     }
 
@@ -150,6 +159,16 @@ impl WorkspaceMcpServer {
     /// from the tool description and JS prelude and denied at dispatch.
     pub fn with_agent_features(mut self, features: AgentFeaturesSettings) -> Self {
         self.agent_features = features;
+        self
+    }
+
+    /// Capture whether this bridge's workspace can run CoW sandboxes (the
+    /// spawn-time wiring point, like `with_agent_features`). When `false`
+    /// the sandbox doc clauses (`mergeOnTurnEnd`, sandbox status fields) are
+    /// scrubbed from the `workspace_api` description — description-only,
+    /// dispatch is unaffected.
+    pub fn with_cow_capable(mut self, cow_capable: bool) -> Self {
+        self.cow_capable = cow_capable;
         self
     }
 
@@ -212,8 +231,12 @@ impl WorkspaceMcpServer {
                 // disabled surface; with all defaults on the assembled text is
                 // the static const unchanged.
                 let description = if t.name == "workspace_api" {
-                    tools::workspace_api_description(self.is_chief, &self.agent_features)
-                        .into_owned()
+                    tools::workspace_api_description(
+                        self.is_chief,
+                        &self.agent_features,
+                        self.cow_capable,
+                    )
+                    .into_owned()
                 } else {
                     t.description.to_string()
                 };

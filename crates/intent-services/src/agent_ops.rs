@@ -4319,6 +4319,13 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        // Parent-controlled turn-end merge (advisory without a sandbox):
+        // persisted on the child's metadata so `provision_sandbox` can stamp
+        // it onto the sandbox record — in both the background delegate path
+        // and the synchronous microVM path — surviving respawn/restart.
+        if let Some(merge) = input.merge_on_turn_end {
+            extra_metadata.insert("mergeOnTurnEnd".to_string(), json!(merge));
+        }
         let extra = AgentCreateExtra {
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable

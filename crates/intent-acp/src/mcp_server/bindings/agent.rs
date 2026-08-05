@@ -160,6 +160,12 @@ async fn create(
     if let Some(tn) = &task_note_id {
         metadata.insert("taskNoteId".to_string(), Value::String(tn.clone()));
     }
+    // Advisory when the workspace is not CoW-capable: the flag is persisted
+    // onto the child's metadata but no sandbox ever exists to honor it, so
+    // passing it never errors (accept-and-ignore).
+    if let Some(m) = opt_bool(args, "mergeOnTurnEnd") {
+        metadata.insert("mergeOnTurnEnd".to_string(), Value::Bool(m));
+    }
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
         is_background: Some(is_background),
@@ -274,6 +280,9 @@ async fn delegate(
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
+        // Advisory when the workspace is not CoW-capable: accepted and
+        // ignored (no sandbox exists to honor it), never an error.
+        merge_on_turn_end: opt_bool(args, "mergeOnTurnEnd"),
         force: opt_bool(args, "force"),
     };
     let v = api
@@ -484,6 +493,9 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
 /// by `agent.get`/`agent.list` is untouched. Queue entries use the
 /// `getQueue` presentation (drain order, lifted attribution) with `content`
 /// truncated to [`STATUS_QUEUE_PREVIEW_MAX_CHARS`] chars (`…` appended).
+/// For sandboxed agents (`metadata.sandboxPath` set) the sandbox record's
+/// merge state is merged in too (`sandboxStatus` + `mergeOnTurnEnd`) — one
+/// cheap store lookup, best-effort (a lookup failure never fails status).
 async fn status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -495,12 +507,25 @@ async fn status(
         .agent_get(agent_id.clone(), Some(ws.clone()))
         .await
         .map_err(map_err)?;
+    let sandboxed = agent.metadata.sandbox_path.is_some();
     let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
     let queue = fetch_presented_queue(api, ws, &agent_id).await?;
     let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
     if let Some(obj) = out.as_object_mut() {
         obj.insert("queueLength".to_string(), json!(queue.len()));
         obj.insert("queue".to_string(), Value::Array(queue));
+    }
+    if sandboxed {
+        if let Ok(sandbox) = api.sandbox_get(ws.clone(), agent_id).await {
+            if let (Some(obj), Some(sb)) = (out.as_object_mut(), sandbox.as_object()) {
+                if let Some(status) = sb.get("status") {
+                    obj.insert("sandboxStatus".to_string(), status.clone());
+                }
+                if let Some(merge) = sb.get("mergeOnTurnEnd") {
+                    obj.insert("mergeOnTurnEnd".to_string(), merge.clone());
+                }
+            }
+        }
     }
     Ok(out)
 }

@@ -155,16 +155,18 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
-  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
+  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
+  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars). Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
@@ -357,16 +359,18 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
   ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
-  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
-  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
+  ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
+  ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
@@ -521,6 +525,23 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
 /// clause still matches both description variants verbatim).
 const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
 
+/// Sandbox doc clauses scrubbed from the assembled description when the
+/// workspace is NOT CoW-capable (no CoW filesystem support and not a microVM
+/// workspace): the `mergeOnTurnEnd` continuation line under
+/// `ws.agent.create`/`ws.agent.delegate` (whole line, scrubbed twice per
+/// variant), the `mergeOnTurnEnd?` arg in the delegate signature, and the
+/// sandbox-field cross-references on the `ws.agent.list`/`ws.agent.status`
+/// doc lines. Description-only — dispatch accepts and ignores
+/// `mergeOnTurnEnd` regardless (advisory; no sandbox exists to honor it).
+/// Unit tests guard that each clause matches both description variants
+/// verbatim so the `replacen` scrubs cannot silently become no-ops.
+const SANDBOX_MERGE_ON_TURN_END_DOC_LINE: &str = "    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.\n";
+const SANDBOX_DELEGATE_MERGE_ARG: &str = ", mergeOnTurnEnd?";
+const SANDBOX_LIST_FIELDS_XREF: &str =
+    " Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.";
+const SANDBOX_STATUS_FIELDS_XREF: &str =
+    " Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).";
+
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
 /// method is not feature-gated or its toggle is on. The dispatch-deny layer
@@ -552,12 +573,14 @@ pub(super) fn denied_feature(
 /// variants, pruning the doc lines of every feature disabled in
 /// `[agentFeatures]` (a method line and its indented continuation lines drop
 /// together; doubled blank lines left by a removed namespace paragraph
-/// collapse to one). With every toggle on — the default — this returns the
-/// static const unchanged, so the all-defaults description is byte-identical
-/// to today's by construction.
+/// collapse to one), then scrubbing the sandbox doc clauses when the
+/// workspace is not CoW-capable. With every toggle on and `cow_capable` —
+/// the default — this returns the static const unchanged, so the
+/// all-defaults description is byte-identical to today's by construction.
 pub fn workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    cow_capable: bool,
 ) -> Cow<'static, str> {
     let base = if is_chief {
         WORKSPACE_API_DESCRIPTION_CHIEF
@@ -565,7 +588,7 @@ pub fn workspace_api_description(
         WORKSPACE_API_DESCRIPTION
     };
     let gated = gated_prefixes(features);
-    if gated.is_empty() {
+    if gated.is_empty() && cow_capable {
         return Cow::Borrowed(base);
     }
     // Method doc lines sit at exactly two spaces of indentation
@@ -604,6 +627,16 @@ pub fn workspace_api_description(
     // methods, so drop that clause too.
     if !features.attention_requests {
         out = out.replacen(REPORT_TO_PARENT_ATTENTION_XREF, "", 1);
+    }
+    // Clause-level scrub for non-CoW-capable workspaces: the sandbox doc
+    // clauses on `agent.create`/`agent.delegate`/`agent.list`/`agent.status`
+    // advertise behavior that needs a sandbox to exist. Dispatch is NOT
+    // gated — `mergeOnTurnEnd` stays accepted-and-ignored (advisory).
+    if !cow_capable {
+        out = out.replacen(SANDBOX_MERGE_ON_TURN_END_DOC_LINE, "", 2);
+        out = out.replacen(SANDBOX_DELEGATE_MERGE_ARG, "", 1);
+        out = out.replacen(SANDBOX_LIST_FIELDS_XREF, "", 1);
+        out = out.replacen(SANDBOX_STATUS_FIELDS_XREF, "", 1);
     }
     Cow::Owned(out)
 }
@@ -911,13 +944,13 @@ mod tests {
     #[test]
     fn all_defaults_description_is_byte_identical() {
         let features = AgentFeaturesSettings::default();
-        let base = workspace_api_description(false, &features);
+        let base = workspace_api_description(false, &features, true);
         assert!(
             matches!(base, Cow::Borrowed(_)),
             "all-on must not reassemble"
         );
         assert_eq!(&*base, WORKSPACE_API_DESCRIPTION);
-        let chief = workspace_api_description(true, &features);
+        let chief = workspace_api_description(true, &features, true);
         assert!(
             matches!(chief, Cow::Borrowed(_)),
             "all-on must not reassemble"
@@ -934,12 +967,12 @@ mod tests {
     #[test]
     fn disabling_one_feature_prunes_only_its_lines() {
         for is_chief in [false, true] {
-            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
+            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default(), true);
             let full_methods = extract_ws_methods(&full);
             for (prefixes, disable) in feature_cases() {
                 let mut features = AgentFeaturesSettings::default();
                 disable(&mut features);
-                let pruned = workspace_api_description(is_chief, &features);
+                let pruned = workspace_api_description(is_chief, &features, true);
                 for prefix in prefixes {
                     assert!(
                         !pruned
@@ -987,7 +1020,7 @@ mod tests {
             attention_requests: false,
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             for (prefixes, _) in feature_cases() {
                 for prefix in prefixes {
                     assert!(
@@ -1024,11 +1057,11 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         assert_eq!(
-            &*workspace_api_description(false, &features),
+            &*workspace_api_description(false, &features, true),
             WORKSPACE_API_DESCRIPTION
         );
         assert_eq!(
-            &*workspace_api_description(true, &features),
+            &*workspace_api_description(true, &features, true),
             WORKSPACE_API_DESCRIPTION_CHIEF
         );
     }
@@ -1041,7 +1074,7 @@ mod tests {
             structured_questions: false,
             ..AgentFeaturesSettings::default()
         };
-        let pruned = workspace_api_description(true, &features);
+        let pruned = workspace_api_description(true, &features, true);
         assert!(!pruned.contains("ws.app.question."));
         for kept in [
             "ws.app.agents.list(",
@@ -1061,6 +1094,59 @@ mod tests {
         assert!(WORKSPACE_API_DESCRIPTION_CHIEF.contains(REPORT_TO_PARENT_ATTENTION_XREF));
     }
 
+    // Guard: each sandbox doc clause scrubbed by the CoW-capability gate
+    // matches both description variants verbatim (the mergeOnTurnEnd doc
+    // line appears twice per variant — under create and delegate), so the
+    // `replacen` scrubs cannot silently become no-ops.
+    #[test]
+    fn sandbox_doc_clauses_are_present_in_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert_eq!(
+                desc.matches(super::SANDBOX_MERGE_ON_TURN_END_DOC_LINE)
+                    .count(),
+                2,
+                "mergeOnTurnEnd doc line must appear under both create and delegate"
+            );
+            assert!(desc.contains(super::SANDBOX_DELEGATE_MERGE_ARG));
+            assert!(desc.contains(super::SANDBOX_LIST_FIELDS_XREF));
+            assert!(desc.contains(super::SANDBOX_STATUS_FIELDS_XREF));
+        }
+    }
+
+    // CoW-capable (the default): the sandbox clauses are present and the
+    // all-defaults description is byte-identical to the static const.
+    // Not capable: every sandbox clause is scrubbed while the method lines
+    // themselves survive.
+    #[test]
+    fn cow_capability_gates_sandbox_doc_clauses() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let capable = workspace_api_description(is_chief, &features, true);
+            assert!(capable.contains("mergeOnTurnEnd"));
+
+            let pruned = workspace_api_description(is_chief, &features, false);
+            assert!(
+                !pruned.contains("mergeOnTurnEnd"),
+                "chief={is_chief}: mergeOnTurnEnd must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("sandboxStatus") && !pruned.contains("sandboxId"),
+                "chief={is_chief}: sandbox field docs must be scrubbed when not CoW-capable"
+            );
+            for kept in [
+                "ws.agent.create(",
+                "ws.agent.delegate(",
+                "ws.agent.list(",
+                "ws.agent.status(",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
     // `attentionRequests` is method-level: other `ws.agent.*` docs — most
     // importantly `reportToParent`, minus its cross-reference to the pruned
     // pair — must survive it, and no textual mention of the pruned methods
@@ -1072,7 +1158,7 @@ mod tests {
             ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
-            let pruned = workspace_api_description(is_chief, &features);
+            let pruned = workspace_api_description(is_chief, &features, true);
             assert!(!pruned.contains("ws.agent.requestDiscussion"));
             assert!(!pruned.contains("ws.agent.reportBlocker"));
             for kept in [

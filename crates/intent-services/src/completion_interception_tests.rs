@@ -1087,6 +1087,242 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
+    /// Provision a sandbox for an agent whose session metadata opts out of
+    /// turn-end merges (`mergeOnTurnEnd: false` — the delegate/create path
+    /// stamps this), with one clean commit in the sandbox. Returns `None`
+    /// when CoW is unsupported (test should skip).
+    #[allow(clippy::type_complexity)]
+    async fn setup_no_merge_sandbox(
+        store: &Store,
+        name: &str,
+        child_id: &AgentId,
+        parent_id: &AgentId,
+    ) -> Option<(
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        intent_core::Workspace,
+        Services,
+        EventBus,
+    )> {
+        let (test_root, repo_path) = temp_repo_in_target(name);
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return None;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        // Child session carries the delegate-stamped opt-out metadata BEFORE
+        // provisioning so provision_sandbox picks it up.
+        create_agent_session(store, &ws.id, child_id, Some(parent_id), None).await;
+        let mut session = store.get_agent_session(child_id).await.unwrap();
+        session.metadata = Some(json!({ "mergeOnTurnEnd": false }));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(store, &ws.id, child_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(child_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", child_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        create_agent_session(store, &ws.id, parent_id, None, None).await;
+
+        // Clean commit in the sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("kept.txt"), "kept content").unwrap();
+        let mut index = sandbox_repo.index().unwrap();
+        index.add_path(Path::new("kept.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+        let parent_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Kept work",
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap();
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root);
+
+        Some((test_root, repo_path, sandbox_path, ws, services, bus))
+    }
+
+    #[tokio::test]
+    async fn test_merge_on_turn_end_false_skips_completion_merge() {
+        // mergeOnTurnEnd=false: completion propagates normally, but NO merge
+        // runs — canonical untouched, sandbox intact in its current status,
+        // no sandbox:cow:merged event, no bounce message.
+
+        let (store, _db) = temp_store().await;
+        let child_id = AgentId::from("agent-nomerge");
+        let parent_id = AgentId::from("agent-parent");
+        let Some((test_root, repo_path, sandbox_path, ws, services, bus)) =
+            setup_no_merge_sandbox(&store, "no-merge", &child_id, &parent_id).await
+        else {
+            return;
+        };
+
+        // The provisioned record carries the opt-out flag.
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert!(
+            !sandbox.merge_on_turn_end,
+            "Sandbox record must persist mergeOnTurnEnd=false from session metadata"
+        );
+
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                None,
+            )
+            .expect("register watch");
+        let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
+
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+
+        // Completion propagated to the parent.
+        let parent_messages = store.get_agent_messages(&parent_id, None).await.unwrap();
+        assert!(
+            parent_messages.iter().any(|m| m.role == "user"),
+            "Parent should have received a wake message despite the skipped merge"
+        );
+
+        // No merge happened: canonical untouched, sandbox intact & Created.
+        assert!(
+            !repo_path.join("kept.txt").exists(),
+            "Canonical must be untouched when mergeOnTurnEnd=false"
+        );
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::Created,
+            "Sandbox must stay in its current status (no merging transition)"
+        );
+        assert!(sandbox_path.exists(), "Sandbox directory must stay live");
+        let merged_event =
+            tokio::time::timeout(std::time::Duration::from_millis(300), merged_sub.recv()).await;
+        assert!(
+            merged_event.is_err(),
+            "No sandbox:cow:merged event when the merge is skipped"
+        );
+
+        // No bounce message queued to the child.
+        let messages = store.get_agent_messages(&child_id, None).await.unwrap();
+        assert!(
+            !messages.iter().any(|m| m.role == "user"),
+            "No bounce message should be queued when the merge is skipped"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_manual_merge_works_on_merge_on_turn_end_false_sandbox() {
+        // The "decide later" story: after a skipped turn-end merge, the
+        // manual sandbox.cow.merge RPC still merges the sandbox.
+
+        use intent_core::WorkspaceApi;
+
+        let (store, _db) = temp_store().await;
+        let child_id = AgentId::from("agent-later");
+        let parent_id = AgentId::from("agent-parent");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_no_merge_sandbox(&store, "manual-later", &child_id, &parent_id).await
+        else {
+            return;
+        };
+
+        // Completion runs first (merge skipped).
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+        assert!(!repo_path.join("kept.txt").exists());
+
+        // Manual merge via the sandbox.cow.merge RPC path.
+        let result = services
+            .sandbox_merge(ws.id.clone(), child_id.clone())
+            .await
+            .expect("manual merge should succeed");
+        assert_eq!(result["status"], json!("merged"));
+        assert!(
+            repo_path.join("kept.txt").exists(),
+            "Manual merge must land the sandbox commit in canonical"
+        );
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::Merged);
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_skips_merge_on_turn_end_false_sandbox() {
+        // A merge_pending sandbox with mergeOnTurnEnd=false (e.g. a failed
+        // manual merge) must NOT be auto-retried by the sweep.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-optout");
+        let Some((test_root, repo_path, sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-optout", &agent_id).await
+        else {
+            return;
+        };
+
+        // Flip the provisioned record to the opt-out flag (re-insert; there
+        // is deliberately no runtime mutator for the flag).
+        let mut sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        store.delete_sandbox(&ws.id, &agent_id).await.unwrap();
+        sandbox.merge_on_turn_end = false;
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(
+            summary.skipped_manual_merge, 1,
+            "Opt-out sandbox must be skipped by the sweep"
+        );
+        assert_eq!(summary.merged, 0);
+
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::MergePending);
+        assert!(
+            !repo_path.join("swept.txt").exists(),
+            "Canonical must stay untouched"
+        );
+        assert!(sandbox_path.exists(), "Sandbox must not be discarded");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
     #[tokio::test]
     async fn test_recover_stranded_merging_sandboxes() {
         // A sandbox stranded `merging` by a daemon that died mid-merge is

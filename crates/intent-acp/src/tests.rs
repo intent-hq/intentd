@@ -7638,6 +7638,12 @@ mod wsapi4_bindings_tests {
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
         queue_entries: Mutex<Vec<Value>>,
         remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
+        /// `mergeOnTurnEnd` observed by `agent_delegate` per call.
+        agent_delegate_merge_flags: Mutex<Vec<Option<bool>>>,
+        /// When true, `agent_get` returns a sandboxed agent and `sandbox_get`
+        /// serves a sandbox record (status enrichment path).
+        sandboxed: Mutex<bool>,
+        sandbox_get_calls: Mutex<Vec<String>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -7726,11 +7732,40 @@ mod wsapi4_bindings_tests {
             self.agent_get_calls.lock().unwrap().push(id.clone());
             let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
             let error = self.agent_get_error.lock().unwrap().clone();
+            let sandboxed = *self.sandboxed.lock().unwrap();
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
                 }
-                Ok(stub_agent(&id, &ws))
+                let mut agent = stub_agent(&id, &ws);
+                if sandboxed {
+                    agent.metadata.sandbox_id = Some("sb-1".to_string());
+                    agent.metadata.sandbox_path = Some("/tmp/sb-1".to_string());
+                    agent.metadata.sandbox_branch = Some(format!("sb/{id}"));
+                }
+                Ok(agent)
+            })
+        }
+
+        fn sandbox_get(
+            &self,
+            _workspace_id: WorkspaceId,
+            agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.sandbox_get_calls
+                .lock()
+                .unwrap()
+                .push(agent_id.as_str().to_string());
+            let sandboxed = *self.sandboxed.lock().unwrap();
+            Box::pin(async move {
+                if !sandboxed {
+                    return Ok(Value::Null);
+                }
+                Ok(json!({
+                    "id": "sb-1",
+                    "status": "created",
+                    "mergeOnTurnEnd": false,
+                }))
             })
         }
 
@@ -7851,6 +7886,10 @@ mod wsapi4_bindings_tests {
                 input.wait_mode.clone(),
                 caller.as_ref().map(|c| c.as_str().to_string()),
             ));
+            self.agent_delegate_merge_flags
+                .lock()
+                .unwrap()
+                .push(input.merge_on_turn_end);
             Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
         }
 
@@ -8091,6 +8130,58 @@ mod wsapi4_bindings_tests {
         assert!(content.ends_with('…'));
         assert_eq!(v["queue"][0]["fromAgentId"], json!("a-9"));
         assert_eq!(v["queue"][0]["fromAgentName"], json!("Nine"));
+    }
+
+    // Sandboxed agent: `ws.agent.status` surfaces the sandbox metadata fields
+    // (via AgentLite.metadata serialization) plus the sandbox record's merge
+    // state (`sandboxStatus` + `mergeOnTurnEnd`) from the sandbox_get lookup.
+    #[tokio::test]
+    async fn agent_status_surfaces_sandbox_fields_for_sandboxed_agent() {
+        let (srv, api) = server();
+        *api.sandboxed.lock().unwrap() = true;
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["metadata"]["sandboxId"], json!("sb-1"));
+        assert_eq!(v["metadata"]["sandboxPath"], json!("/tmp/sb-1"));
+        assert_eq!(v["metadata"]["sandboxBranch"], json!("sb/a-42"));
+        assert_eq!(v["sandboxStatus"], json!("created"));
+        assert_eq!(v["mergeOnTurnEnd"], json!(false));
+        assert_eq!(api.sandbox_get_calls.lock().unwrap().as_slice(), ["a-42"]);
+    }
+
+    // Non-sandboxed agent: no sandbox_get lookup and no sandbox keys in the
+    // status result.
+    #[tokio::test]
+    async fn agent_status_skips_sandbox_lookup_without_sandbox() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert!(v.get("sandboxStatus").is_none());
+        assert!(v.get("mergeOnTurnEnd").is_none());
+        assert!(api.sandbox_get_calls.lock().unwrap().is_empty());
+    }
+
+    // `mergeOnTurnEnd` threads from the delegate args into
+    // AgentDelegateInput; omitting it leaves None (default = merge).
+    #[tokio::test]
+    async fn agent_delegate_threads_merge_on_turn_end() {
+        let (srv, api) = server_with_caller("agent-parent");
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 'n-1', mergeOnTurnEnd: false });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 'n-2' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let flags = api.agent_delegate_merge_flags.lock().unwrap();
+        assert_eq!(flags.as_slice(), [Some(false), None]);
     }
 
     #[tokio::test]

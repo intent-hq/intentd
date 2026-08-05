@@ -72,18 +72,25 @@ pub struct Sandbox {
     pub last_merged_commit_sha: Option<String>,
     pub status: SandboxStatus,
     pub retry_count: i64,
+    /// Whether the completion path auto-merges this sandbox when the agent's
+    /// turn ends. `false` (parent opted out via `mergeOnTurnEnd: false`) keeps
+    /// the sandbox live at turn end; merging happens only via the manual
+    /// `sandbox.cow.merge` RPC. The retry sweep also skips such sandboxes.
+    pub merge_on_turn_end: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha, \
-    snapshot_commit_sha, last_merged_commit_sha, status, retry_count, created_at, updated_at";
+    snapshot_commit_sha, last_merged_commit_sha, status, retry_count, merge_on_turn_end, \
+    created_at, updated_at";
 
 impl Store {
     /// Insert a new sandbox record.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
-        let sql =
-            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = format!(
+            "INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
         sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id.0)
@@ -95,6 +102,7 @@ impl Store {
             .bind(&s.last_merged_commit_sha)
             .bind(s.status.to_db())
             .bind(s.retry_count)
+            .bind(s.merge_on_turn_end)
             .bind(&s.created_at)
             .bind(&s.updated_at)
             .execute(self.write_pool())
@@ -341,6 +349,9 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
         retry_count: row
             .try_get("retry_count")
             .map_err(|e| intent_core::Error::Internal(format!("get retry_count failed: {e}")))?,
+        merge_on_turn_end: row.try_get("merge_on_turn_end").map_err(|e| {
+            intent_core::Error::Internal(format!("get merge_on_turn_end failed: {e}"))
+        })?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| intent_core::Error::Internal(format!("get created_at failed: {e}")))?,

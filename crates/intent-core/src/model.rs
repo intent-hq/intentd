@@ -2485,6 +2485,11 @@ pub struct AgentDelegateInput {
     /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
     /// the workspace directory. Falls back to shared mode if CoW is unsupported.
     pub isolation: Option<String>,
+    /// Whether the child's sandbox auto-merges back into canonical when its
+    /// turn ends (default `true` = today's behavior). `false` keeps the
+    /// sandbox live at turn end so the parent can inspect it and merge later
+    /// via `sandbox.cow.merge`. Advisory when the agent has no sandbox.
+    pub merge_on_turn_end: Option<bool>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.

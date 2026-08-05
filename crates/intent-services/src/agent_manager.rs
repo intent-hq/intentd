@@ -1471,6 +1471,13 @@ impl AgentManager {
             .ok()
             .filter(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm));
 
+        // Whether the sandbox doc clauses (`mergeOnTurnEnd`, sandbox fields)
+        // appear in this bridge's `workspace_api` description: the machine
+        // CoW capability OR a microVM workspace (whose agents always get a
+        // sandbox). Description-only — dispatch accepts and ignores
+        // `mergeOnTurnEnd` either way.
+        let cow_capable = microvm_ws.is_some() || self.services.cow_capable_hint().await;
+
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
@@ -1485,7 +1492,8 @@ impl AgentManager {
                 // `[agentFeatures]` toggles are captured here, at bridge
                 // creation, so they apply to new sessions only — a settings
                 // change never mutates a live agent's surface.
-                .with_agent_features(self.services.effective_settings().agent_features),
+                .with_agent_features(self.services.effective_settings().agent_features)
+                .with_cow_capable(cow_capable),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await
