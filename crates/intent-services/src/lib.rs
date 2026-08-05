@@ -17413,18 +17413,26 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
+        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
+            // workspace repo; either way the resolved repo is echoed in the
+            // result so a wrong-repo read is detectable.
+            let (owner, repo) = match repo {
+                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+                None => pr_ops::repo_of(&ws)?,
+            };
+            let repo_slug = format!("{owner}/{repo}");
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
-                    "PR #{pr_number} not found in the workspace repository"
-                )),
+                intent_sourcecontrol::Error::NotFound(_) => {
+                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
+                }
                 other => pr_ops::map_sc_err(other),
             })?;
             let state = pr_ops::derive_status_state(&pr);
@@ -17493,6 +17501,7 @@ impl WorkspaceApi for Services {
                 pr_ops::count_thread_comments(&threads);
 
             Ok(serde_json::json!({
+                "repo": repo_slug,
                 "prNumber": pr_number,
                 "title": pr.title,
                 "url": pr.url,

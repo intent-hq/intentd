@@ -18,7 +18,8 @@ pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
         status: () => host({ method: 'pr.status', args: {} }),
-        snapshot: (prNumber) => host({ method: 'pr.snapshot', args: { prNumber } }),
+        snapshot: (prNumber, options) =>
+            host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
         merge: (options) => host({ method: 'pr.merge', args: { ...(options || {}) } }),
         updateBranch: () => host({ method: 'pr.updateBranch', args: {} }),
         listReviewComments: (options) =>
@@ -67,7 +68,9 @@ async fn snapshot(
     if pr_number <= 0 {
         return Err("prNumber is required and must be a number".to_string());
     }
-    api.pr_state(ws.clone(), pr_number as u64)
+    // Optional cross-repo override; slug validation lives in the engine.
+    let repo = opt_str(args, "repo");
+    api.pr_state(ws.clone(), pr_number as u64, repo)
         .await
         .map_err(map_err)
 }

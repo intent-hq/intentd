@@ -6870,6 +6870,7 @@ mod wsapi6_bindings_tests {
         Option<String>,
     );
     type PrReviewCommentsCall = (Option<String>, Option<String>);
+    type PrSnapshotCall = (u64, Option<String>);
     type PrResolveThreadCall = (String, Option<String>);
     type PrReplyCall = (u64, String);
     type CrossReadCall = (String, String);
@@ -6878,7 +6879,7 @@ mod wsapi6_bindings_tests {
     #[derive(Default)]
     struct FakeApi {
         pr_status_calls: Mutex<u32>,
-        pr_snapshot_calls: Mutex<Vec<u64>>,
+        pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
         pr_merge_calls: Mutex<Vec<PrMergeCall>>,
         pr_update_branch_calls: Mutex<u32>,
         pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
@@ -6938,10 +6939,19 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn pr_state(&self, _ws: WorkspaceId, pr_number: u64) -> BoxFuture<'_, Result<Value>> {
-            self.pr_snapshot_calls.lock().unwrap().push(pr_number);
+        fn pr_state(
+            &self,
+            _ws: WorkspaceId,
+            pr_number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_snapshot_calls
+                .lock()
+                .unwrap()
+                .push((pr_number, repo.clone()));
             Box::pin(async move {
                 Ok(json!({
+                    "repo": repo.unwrap_or_else(|| "o/r".to_string()),
                     "prNumber": pr_number,
                     "state": "open",
                     "isMerged": false,
@@ -7276,10 +7286,29 @@ mod wsapi6_bindings_tests {
         let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
+        assert_eq!(v["repo"], json!("o/r"));
         assert_eq!(v["prNumber"], json!(42));
         assert_eq!(v["isMerged"], json!(false));
         assert_eq!(v["mergeBlockedReason"], json!(null));
-        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![42u64]);
+        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![(42u64, None)]);
+    }
+
+    #[tokio::test]
+    async fn pr_snapshot_forwards_cross_repo_arg_and_echoes_repo() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.pr.snapshot(7, { repo: 'acme/widgets' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["repo"], json!("acme/widgets"));
+        assert_eq!(v["prNumber"], json!(7));
+        assert_eq!(
+            *api.pr_snapshot_calls.lock().unwrap(),
+            vec![(7u64, Some("acme/widgets".to_string()))]
+        );
     }
 
     #[tokio::test]

@@ -7450,7 +7450,8 @@ mod pr {
     #[tokio::test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
         assert_eq!(v["title"], "Add thing");
         assert_eq!(v["url"], "https://github.com/o/r/pull/42");
@@ -7494,7 +7495,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
@@ -7511,7 +7512,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
         assert_eq!(v["mergeBlockedReason"], "merge conflicts");
@@ -7528,7 +7529,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
         assert_eq!(v["isClosed"], false);
@@ -7547,8 +7548,8 @@ mod pr {
             true,
         )
         .await;
-        let err = svc.pr_state(ws, 999).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found")));
+        let err = svc.pr_state(ws, 999, None).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[tokio::test]
@@ -7556,8 +7557,37 @@ mod pr {
         // No repository on the workspace: same "No active PR" guard as the
         // other pr.* methods (the required prNumber does not bypass it).
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_state(ws, 42).await.unwrap_err();
+        let err = svc.pr_state(ws, 42, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_cross_repo_arg_overrides_workspace_repo() {
+        // Workspace has no repository at all: the explicit `repo` slug alone
+        // scopes the lookup (no "No active PR" guard), and the resolved repo
+        // is echoed back.
+        let (_t, svc, ws) = setup(false, false).await;
+        let v = svc
+            .pr_state(ws, 42, Some("acme/widgets".into()))
+            .await
+            .expect("snapshot");
+        assert_eq!(v["repo"], "acme/widgets");
+        assert_eq!(v["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_rejects_malformed_repo_arg() {
+        let (_t, svc, ws) = setup(false, true).await;
+        for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
+            let err = svc
+                .pr_state(ws.clone(), 42, Some(bad.into()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
+                "repo arg `{bad}` should be rejected, got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
