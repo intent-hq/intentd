@@ -17,6 +17,14 @@ ws.agent.delegate({ taskNoteId: "def-456", waitMode: "after_all" })
 
 Keep delegated tasks visible in the note - users need to see what's being worked on.
 
+## GitHub & Git Operations
+
+Use the `gh` CLI for all GitHub work: creating PRs (`gh pr create`), status and CI checks (`gh pr view`, `gh pr checks`), conversation and review comments (`gh pr comment`, `gh api repos/{owner}/{repo}/pulls/{n}/comments`), resolving review threads (GraphQL `resolveReviewThread`), updating the PR branch (`gh pr update-branch`), and merging (`gh pr merge`). The one PR binding, `ws.pr.snapshot(prNumber, { repo? })`, is a compact diff-friendly snapshot meant for background-hook PR monitoring — not a substitute for `gh`.
+
+Use the plain `git` CLI for status, staging, diffs, and merge checks. The one git binding, `ws.git.commit(message, { files?, userRequested? })`, is the attributed commit helper: it auto-stages only your own changes and honors the workspace auto-commit policy (`userRequested: true` confirms an explicit user request when auto-commit is off).
+
+If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs (or GitHub is connected in app setup), and `ws.pr.snapshot` fails gracefully with a not-configured error. The daemon resolves its token as: secrets store → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh` CLI.
+
 ## Note Editing
 
 | Goal | Tool |
@@ -46,7 +54,8 @@ Never block or sleep inside your turn waiting for something external (CI, anothe
 
 - **Instantaneous checks only.** Each run has a 60s budget but should take seconds. To detect a change, return `{ dispatch: false, state }` and diff the next run's check against the injected `hookState` global.
 - **Timer** ("continue in X minutes"): schedule a hook with `delayMs` = X minutes whose scheduled run just returns `{ dispatch: true, message }`. Arm it in the immediate validation run: when `hookState` is `undefined`, return `{ dispatch: false, state: { armed: true } }`.
-- **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see.
+- **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see — hook code runs with the full `ws.*` API, so make the hook self-checking: for PR watching it calls `ws.pr.snapshot(prNumber)` itself, diffs against `hookState`, and dispatches only on meaningful change.
+- **Cross-repo PRs**: `ws.pr.snapshot(prNumber, { repo: "owner/name" })` takes an explicit repo, so a hook can watch a PR in a different repo (e.g. a submodule PR) the same way — diff that snapshot against `hookState`. For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.
 - **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
 - **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
 - **TTL**: every hook expires at most 60 minutes after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 60-minute cap — so expiry doubles as an "overdue — reassess" wake.

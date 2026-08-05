@@ -210,7 +210,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -1112,6 +1112,10 @@ async fn agent_stop_keep_alive_resume_over_wss() {
                 data["stopReason"], "interrupted",
                 "interrupt stream:end carries stopReason: {data}"
             );
+            assert_eq!(
+                data["interruptReason"], "user_stop",
+                "agent.stop stream:end carries interruptReason: {data}"
+            );
             interrupted_message_id = Some(
                 data["messageId"]
                     .as_str()
@@ -1146,6 +1150,10 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     assert_eq!(
         row["metadata"]["interrupted"], true,
         "interrupted row tagged metadata.interrupted: {row}"
+    );
+    assert_eq!(
+        row["metadata"]["interruptReason"], "user_stop",
+        "interrupted row carries the machine-readable reason: {row}"
     );
 
     // Keep-alive: a follow-up resumes the SAME child (mock reports turn=2).
@@ -1578,12 +1586,20 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
                 interrupted_idles += 1;
             }
             Some("agent:stream:end") if !saw_preempt_end => {
+                let data = &frame["params"]["event"]["data"];
                 assert_eq!(
-                    frame["params"]["event"]["data"]["agentId"]
-                        .as_str()
-                        .unwrap_or_default(),
+                    data["agentId"].as_str().unwrap_or_default(),
                     agent_id,
                     "terminal stream:end carries the agent id"
+                );
+                assert_eq!(
+                    data["interruptReason"], "preempted_by_message",
+                    "preemption stream:end carries interruptReason: {data}"
+                );
+                assert_eq!(
+                    data["interruptedBy"],
+                    json!({ "kind": "user" }),
+                    "FE-originated interrupt send stamps user attribution: {data}"
                 );
                 saw_preempt_end = true;
             }
@@ -4340,7 +4356,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -8860,11 +8876,11 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
         "combined delivery leaves the queue empty (no requeue): {queue}"
     );
 
-    // No phantom row: the zero-output interrupt-send must NOT persist an
-    // interrupted assistant row (contrast the plain `agent.stop` path, which
-    // persists an empty synthetic one — see
-    // `agent_stop_before_first_token_persists_empty_interrupted_row_over_wss`).
-    // Transcript keeps BOTH user rows intact (combined delivery is prompt-only).
+    // Durable interruption marker: the zero-output interrupt-send persists an
+    // EMPTY interrupted assistant row, stamped with the machine-readable
+    // reason + user sender attribution — but it never counts as turn progress
+    // (the combined delivery above still fired). Transcript keeps BOTH user
+    // rows intact, with the marker BETWEEN them (interrupted turn first).
     let conv = wss_rpc(
         &mut rpc,
         14,
@@ -8873,12 +8889,24 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
     )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
-    let phantom = messages
+    let markers: Vec<&Value> = messages
         .iter()
-        .find(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true);
-    assert!(
-        phantom.is_none(),
-        "STAB-114: zero-output interrupt-send persists no interrupted assistant row: {conv}"
+        .filter(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true)
+        .collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "zero-output interrupt-send persists exactly one interrupted marker row: {conv}"
+    );
+    let marker = markers[0];
+    assert_eq!(
+        marker["metadata"]["interruptReason"], "preempted_by_message",
+        "marker row carries the machine-readable reason: {marker}"
+    );
+    assert_eq!(
+        marker["metadata"]["interruptedBy"],
+        json!({ "kind": "user" }),
+        "FE-originated interrupt send stamps user attribution: {marker}"
     );
     let user_texts: Vec<&str> = messages
         .iter()
@@ -8889,6 +8917,20 @@ async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
         user_texts,
         vec!["first", "urgent"],
         "both user rows persist in original order: {conv}"
+    );
+    // Ordering: the marker row lands between the preempted user row and the
+    // interrupt message's user row.
+    let marker_idx = messages
+        .iter()
+        .position(|m| m["id"] == marker["id"])
+        .unwrap();
+    let urgent_idx = messages
+        .iter()
+        .position(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "urgent")
+        .unwrap();
+    assert!(
+        marker_idx < urgent_idx,
+        "interrupted marker row precedes the interrupt message row: {conv}"
     );
 }
 
@@ -9003,11 +9045,10 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
 
 /// Pre-first-token stop: a plain `agent.stop` landing after the turn started
 /// but BEFORE any assistant content streamed persists an EMPTY interrupted
-/// assistant row (explicit opt-in on the plain-stop path only), and the
+/// assistant row (every interruption records the marker row), and the
 /// terminal `agent:stream:end` carries `stopReason: "interrupted"` plus the
 /// synthetic row's `messageId` so clients can render the Stopped indicator
-/// live. Contrast the STAB-114 interrupt-send path above, which keeps the
-/// zero-output no-op (no phantom row).
+/// live.
 #[tokio::test]
 async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss() {
     let Some(script) = gate("pre-first-token agent.stop E2E") else {
@@ -9098,6 +9139,10 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
                 data["stopReason"], "interrupted",
                 "pre-first-token stop stream:end carries stopReason: {data}"
             );
+            assert_eq!(
+                data["interruptReason"], "user_stop",
+                "pre-first-token stop stream:end carries interruptReason: {data}"
+            );
             interrupted_message_id = Some(
                 data["messageId"]
                     .as_str()
@@ -9137,6 +9182,10 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
     assert_eq!(
         row["metadata"]["interrupted"], true,
         "synthetic row tagged metadata.interrupted: {row}"
+    );
+    assert_eq!(
+        row["metadata"]["interruptReason"], "user_stop",
+        "synthetic row carries the machine-readable reason: {row}"
     );
 }
 

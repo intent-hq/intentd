@@ -192,7 +192,9 @@ async fn wss_connect(port: u16, cfg: Arc<ClientConfig>) -> Ws {
 
 async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
     loop {
         let msg = timeout(Duration::from_secs(10), ws.next())
             .await
@@ -836,5 +838,128 @@ async fn agent_features_gate_new_sessions_only() {
             && prompt_a2.contains("## Rich Chat Rendering")
             && prompt_a2.contains("## Raising Attention"),
         "A's persisted prompt must keep the gated sections after the flip"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: specialist `modelOptions` (PROTOCOL §5.11) surface in the per-agent
+// bridge's `workspace_api` description — delegate docs list the compound ids
+// and hints of every visible specialist that carries options, while a bridge
+// created with no such specialist keeps the default description free of the
+// injected block.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn specialist_model_options_surface_in_bridge_description() {
+    let Some(script) = gate("specialist modelOptions description E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+    let behavior = json!({ "response": "done" }).to_string();
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/. One specialist carries options (with and
+    // without a hint), one does not.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("chooser.md"),
+        "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nChooser body.",
+    )
+    .expect("write chooser specialist");
+    std::fs::write(
+        specialists_dir.join("plain.md"),
+        "---\nname: \"Plain\"\ndescription: \"No options\"\n---\n\nPlain body.",
+    )
+    .expect("write plain specialist");
+
+    let home = data_dir.to_str().expect("data_dir to str").to_string();
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+                ("HOME", &home),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().expect("fp");
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let cfg = client_config(fp);
+
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "modelOptions description WS",
+            "branch": "feat/model-options-desc-e2e",
+            "idempotencyKey": "model-options-desc-e2e-1",
+            "initialAgent": {
+                "prompt": "say done",
+                "name": "Options Agent",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    let agent = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_stream_end(&mut sub, &agent).await;
+
+    let configs = mcp_config_files(&data_dir);
+    assert_eq!(configs.len(), 1, "one agent → one mcp config: {configs:?}");
+    let addr = bridge_addr_from_config(&configs[0]);
+    let mut bridge = BridgeClient::connect(&addr).await;
+
+    let desc = bridge.workspace_api_description().await;
+    assert!(
+        desc.contains("Specialist model options"),
+        "delegate docs must carry the options header:\n{desc}"
+    );
+    assert!(
+        desc.contains("chooser: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+        "options line must list compound ids + hints in order: {desc}"
+    );
+    assert!(
+        !desc.contains("plain:"),
+        "specialists without options must not be listed"
+    );
+    // The block reads as part of the delegate entry: between the
+    // `ws.agent.delegate` doc line and the next method line.
+    let delegate_idx = desc.find("ws.agent.delegate(").expect("delegate line");
+    let block_idx = desc.find("Specialist model options").expect("block");
+    let send_idx = desc[delegate_idx..]
+        .find("ws.agent.send(")
+        .map(|i| i + delegate_idx)
+        .expect("send line after delegate");
+    assert!(
+        delegate_idx < block_idx && block_idx < send_idx,
+        "options block must sit inside the delegate docs"
     );
 }

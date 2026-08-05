@@ -1,9 +1,11 @@
-//! Wire-policy glue for the read-only `pr.*` methods (§5.7, §7.5).
+//! Wire-policy glue for the `pr.*` survivors and shared forge plumbing
+//! (§5.7, §7.5, §7.6).
 //!
 //! Pure mapping/aggregation ported from the TS ground truth (`ws-pr-api.ts`,
-//! `github.service.ts`): the `pr.status` summary, the `pr.getReviews` decision
-//! aggregation, the `pr.listCheckRuns` tally, and the `pr.listReviewComments`
-//! thread shaping. The forge calls themselves go through the host-agnostic
+//! `github.service.ts`): the `pr.status` summary, the workspace↔PR linkage
+//! rules behind `pr.refresh` and the background sweep, and the review /
+//! check-run / thread aggregation backing the MCP-only `ws.pr.snapshot`
+//! engine. The forge calls themselves go through the host-agnostic
 //! [`SourceControl`] trait; this module owns only the parity-critical glue so it
 //! stays unit-testable without a network.
 
@@ -17,10 +19,9 @@ use intent_sourcecontrol::{
     Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, SourceControl,
     SourceControlRegistry, SourceControlSettings,
 };
-use serde_json::{json, Value};
 use time::OffsetDateTime;
 
-/// TS `NO_ACTIVE_PR_ERROR`; every `pr.*` method needs an active PR (§5.7).
+/// TS `NO_ACTIVE_PR_ERROR`; every active-PR-scoped method needs one (§5.7).
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 
 /// Map a forge error onto the domain `Internal` error (→ `-32603`): the TS
@@ -34,20 +35,6 @@ pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
             Error::Internal(format!("unsupported by provider: {msg}"))
         }
         other => Error::Internal(other.to_string()),
-    }
-}
-
-/// Runtime capability gate (§7.2/§7.4): `supported` is the relevant
-/// [`intent_sourcecontrol::ScCapabilities`] flag of the active host; `false`
-/// surfaces [`intent_sourcecontrol::Error::Unsupported`] through
-/// [`map_sc_err`] (stable `unsupported by provider:` message, code `-32603`).
-pub(crate) fn require_capability(supported: bool, operation: &str) -> Result<()> {
-    if supported {
-        Ok(())
-    } else {
-        Err(map_sc_err(intent_sourcecontrol::Error::Unsupported(
-            operation.to_string(),
-        )))
     }
 }
 
@@ -78,6 +65,20 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
         (Some(owner), Some(name)) => Ok((owner.to_string(), name.to_string())),
         _ => Err(Error::Internal(NO_ACTIVE_PR.to_string())),
     }
+}
+
+/// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
+/// with exactly one `/` and both halves non-empty.
+pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
+    let trimmed = slug.trim();
+    if let Some((owner, name)) = trimmed.split_once('/') {
+        if !owner.is_empty() && !name.is_empty() && !name.contains('/') {
+            return Ok((owner.to_string(), name.to_string()));
+        }
+    }
+    Err(Error::InvalidParams(format!(
+        "repo must be an \"owner/name\" slug, got `{slug}`"
+    )))
 }
 
 /// Background-sweep activity window (§7.6/§7.7): workspaces whose
@@ -423,15 +424,14 @@ pub(crate) fn build_status_summary(
     parts.join(" ")
 }
 
-/// Aggregated review decision for `pr.getReviews`.
+/// Aggregated actionable-review counts for the `ws.pr.snapshot` `reviews`
+/// block.
 pub(crate) struct ReviewAggregate {
-    pub review_decision: Option<String>,
     pub approval_count: i64,
     pub changes_requested_count: i64,
-    pub approved_by: Vec<String>,
 }
 
-/// `pr.listCheckRuns` tally.
+/// Check-run tally for the `ws.pr.snapshot` `checks` block.
 pub(crate) struct CheckRunSummary {
     pub total: i64,
     pub passed: i64,
@@ -468,29 +468,16 @@ pub(crate) fn aggregate_reviews(reviews: &[Review]) -> ReviewAggregate {
     }
     let mut approval_count = 0;
     let mut changes_requested_count = 0;
-    let mut approved_by = Vec::new();
     for login in &order {
         match latest.get(login) {
-            Some((ReviewVerdict::Approve, _)) => {
-                approval_count += 1;
-                approved_by.push(login.clone());
-            }
+            Some((ReviewVerdict::Approve, _)) => approval_count += 1,
             Some((ReviewVerdict::RequestChanges, _)) => changes_requested_count += 1,
             _ => {}
         }
     }
-    let review_decision = if changes_requested_count > 0 {
-        Some("CHANGES_REQUESTED".to_string())
-    } else if approval_count > 0 {
-        Some("APPROVED".to_string())
-    } else {
-        None
-    };
     ReviewAggregate {
-        review_decision,
         approval_count,
         changes_requested_count,
-        approved_by,
     }
 }
 
@@ -578,35 +565,19 @@ pub(crate) fn snapshot_review_decision(
     }
 }
 
-/// Validate `pr.listReviewComments` `status` (default `unresolved`); an invalid
-/// value throws in the TS builder → `-32603` here.
-pub(crate) fn validate_review_comment_status(status: Option<String>) -> Result<String> {
-    match status.as_deref() {
-        None => Ok("unresolved".to_string()),
-        Some(s @ ("unresolved" | "resolved" | "all")) => Ok(s.to_string()),
-        Some(_) => Err(Error::Internal(
-            "status must be one of: unresolved, resolved, all".to_string(),
-        )),
-    }
-}
-
-/// Clamp the `pr.listComments` `count` to `[1, 100]` (default 20), mirroring TS.
-pub(crate) fn clamp_count(count: Option<i64>) -> usize {
-    count.unwrap_or(20).clamp(1, 100) as usize
-}
-
-/// Page size for the exhaustive `pr.listReviewComments` fetch.
+/// Page size for the exhaustive review-thread fetch (`ws.pr.snapshot`).
 pub(crate) const REVIEW_FETCH_PAGE_LIMIT: u8 = 100;
 
-/// Page cap for the exhaustive `pr.listReviewComments` fetch: at most 10 pages
+/// Page cap for the exhaustive review-thread fetch: at most 10 pages
 /// (× [`REVIEW_FETCH_PAGE_LIMIT`] items) per request; when the cap stops the
 /// loop early the reply reports `hasMore: true`.
 pub(crate) const REVIEW_FETCH_MAX_PAGES: usize = 10;
 
-/// Drain a cursor-paginated forge read for `pr.listReviewComments`: fetch
-/// pages of [`REVIEW_FETCH_PAGE_LIMIT`] via `next_cursor` until exhausted or
-/// [`REVIEW_FETCH_MAX_PAGES`] is hit. Returns `(items, pages_fetched,
-/// has_more)`, `has_more` being true iff the cap stopped the loop early.
+/// Drain a cursor-paginated forge read (`ws.pr.snapshot` thread/comment
+/// counting): fetch pages of [`REVIEW_FETCH_PAGE_LIMIT`] via `next_cursor`
+/// until exhausted or [`REVIEW_FETCH_MAX_PAGES`] is hit. Returns `(items,
+/// pages_fetched, has_more)`, `has_more` being true iff the cap stopped the
+/// loop early.
 pub(crate) async fn fetch_all_pages<T, F, Fut>(
     mut fetch: F,
 ) -> std::result::Result<(Vec<T>, usize, bool), intent_sourcecontrol::Error>
@@ -631,33 +602,6 @@ where
         }
     }
     Ok((items, pages_fetched, true))
-}
-
-/// Render review threads to the wire shape (`author` nested as `{ login }`).
-pub(crate) fn thread_list_json(threads: &[ReviewThread]) -> Vec<Value> {
-    threads
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.id,
-                "isResolved": t.is_resolved,
-                "comments": t.comments.iter().map(|c| json!({
-                    "id": c.id,
-                    "body": c.body,
-                    "author": { "login": c.author },
-                    "path": c.path,
-                    "line": c.line,
-                    "createdAt": c.created_at,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect()
-}
-
-/// Retain only threads with a comment on `path` (the `pr.listReviewComments`
-/// path filter).
-pub(crate) fn retain_path(threads: &mut Vec<ReviewThread>, path: &str) {
-    threads.retain(|t| t.comments.iter().any(|c| c.path == path));
 }
 
 /// Group flat REST review comments into synthetic threads via `in_reply_to_id`
@@ -706,10 +650,10 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
 }
 
 // ===========================================================================
-// `pr.*` write/action glue (PROTOCOL §5.7).
+// Merge glue shared by `github.pulls.merge` and `accept-changes.mergePR`.
 // ===========================================================================
 
-/// Validate/default the `pr.merge` `mergeMethod` (TS `validateMergeMethod`,
+/// Validate/default the `mergeMethod` argument (TS `validateMergeMethod`,
 /// default `merge`); an invalid value throws → `-32603`.
 pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
     match method.as_deref() {
@@ -718,40 +662,6 @@ pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMetho
         Some("rebase") => Ok(MergeMethod::Rebase),
         Some(_) => Err(Error::Internal(
             "mergeMethod must be one of: merge, squash, rebase".to_string(),
-        )),
-    }
-}
-
-/// Wire word for a [`MergeMethod`] (echoed back in the `pr.merge` result).
-pub(crate) fn merge_method_word(method: MergeMethod) -> &'static str {
-    match method {
-        MergeMethod::Merge => "merge",
-        MergeMethod::Squash => "squash",
-        MergeMethod::Rebase => "rebase",
-    }
-}
-
-/// Validate/default the `pr.resolveThread` `action` (TS
-/// `validateResolveThreadAction`, default `resolve`).
-pub(crate) fn validate_resolve_action(action: Option<String>) -> Result<String> {
-    match action.as_deref() {
-        None => Ok("resolve".to_string()),
-        Some(s @ ("resolve" | "unresolve")) => Ok(s.to_string()),
-        Some(_) => Err(Error::Internal(
-            "action must be one of: resolve, unresolve".to_string(),
-        )),
-    }
-}
-
-/// Validate the `pr.createReview` `verdict` onto a [`ReviewVerdict`] (§5.18
-/// kebab-case wire values).
-pub(crate) fn validate_review_verdict(verdict: &str) -> Result<ReviewVerdict> {
-    match verdict {
-        "approve" => Ok(ReviewVerdict::Approve),
-        "request-changes" => Ok(ReviewVerdict::RequestChanges),
-        "comment" => Ok(ReviewVerdict::Comment),
-        _ => Err(Error::Internal(
-            "verdict must be one of: approve, request-changes, comment".to_string(),
         )),
     }
 }
@@ -785,6 +695,29 @@ mod tests {
             verdict,
             body: None,
             submitted_at: at.into(),
+        }
+    }
+
+    #[test]
+    fn parse_repo_slug_accepts_owner_name_and_trims() {
+        assert_eq!(
+            parse_repo_slug("acme/widgets").unwrap(),
+            ("acme".to_string(), "widgets".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug("  acme/widgets  ").unwrap(),
+            ("acme".to_string(), "widgets".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_slug_rejects_malformed_slugs() {
+        for bad in ["", " ", "acme", "acme/", "/widgets", "a/b/c"] {
+            let err = parse_repo_slug(bad).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
+                "slug `{bad}` should be rejected, got {err:?}"
+            );
         }
     }
 
@@ -1038,15 +971,13 @@ mod tests {
         let agg = aggregate_reviews(&reviews);
         assert_eq!(agg.approval_count, 1);
         assert_eq!(agg.changes_requested_count, 1);
-        assert_eq!(agg.approved_by, vec!["bob".to_string()]);
-        assert_eq!(agg.review_decision.as_deref(), Some("CHANGES_REQUESTED"));
     }
 
     #[test]
-    fn aggregate_empty_is_null_decision() {
+    fn aggregate_empty_has_zero_counts() {
         let agg = aggregate_reviews(&[]);
-        assert!(agg.review_decision.is_none());
         assert_eq!(agg.approval_count, 0);
+        assert_eq!(agg.changes_requested_count, 0);
     }
 
     #[test]
@@ -1171,10 +1102,8 @@ mod tests {
     #[test]
     fn snapshot_decision_orders_changes_requested_approved_required_none() {
         let agg = |approvals: i64, changes: i64| ReviewAggregate {
-            review_decision: None,
             approval_count: approvals,
             changes_requested_count: changes,
-            approved_by: Vec::new(),
         };
         assert_eq!(
             snapshot_review_decision(&agg(1, 1), "open", "clean"),
@@ -1201,19 +1130,6 @@ mod tests {
             snapshot_review_decision(&agg(0, 0), "merged", "blocked"),
             "none"
         );
-    }
-
-    #[test]
-    fn validates_status_and_clamps_count() {
-        assert_eq!(validate_review_comment_status(None).unwrap(), "unresolved");
-        assert_eq!(
-            validate_review_comment_status(Some("all".into())).unwrap(),
-            "all"
-        );
-        assert!(validate_review_comment_status(Some("bad".into())).is_err());
-        assert_eq!(clamp_count(None), 20);
-        assert_eq!(clamp_count(Some(0)), 1);
-        assert_eq!(clamp_count(Some(500)), 100);
     }
 
     #[test]
@@ -1247,21 +1163,5 @@ mod tests {
             MergeMethod::Rebase
         );
         assert!(validate_merge_method(Some("bad".into())).is_err());
-        assert_eq!(merge_method_word(MergeMethod::Squash), "squash");
-    }
-
-    #[test]
-    fn validates_action_and_verdict() {
-        assert_eq!(validate_resolve_action(None).unwrap(), "resolve");
-        assert_eq!(
-            validate_resolve_action(Some("unresolve".into())).unwrap(),
-            "unresolve"
-        );
-        assert!(validate_resolve_action(Some("x".into())).is_err());
-        assert_eq!(
-            validate_review_verdict("request-changes").unwrap(),
-            ReviewVerdict::RequestChanges
-        );
-        assert!(validate_review_verdict("nope").is_err());
     }
 }

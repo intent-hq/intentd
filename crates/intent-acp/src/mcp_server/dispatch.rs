@@ -364,7 +364,7 @@ fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> 
 /// the shared `WorkspaceApi`. Every namespace lives in `super::bindings`;
 /// unknown methods surface as a JS-visible error frame. `caller_agent_id`
 /// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (e.g. `workspace.setAgentName`, `git.commit`, `git.agentCommit`,
+/// agent (e.g. `workspace.setAgentName`, `git.commit`,
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
 /// `turn_attachments` is forwarded to bindings that register attachments
 /// mid-dispatch (`ws.app.question.ask`).
@@ -441,6 +441,7 @@ async fn workspace_host_dispatch(
         &workspace_id,
         &caller_agent_id,
         turn_attachments.as_ref(),
+        agent_features,
         method,
         &args,
     )

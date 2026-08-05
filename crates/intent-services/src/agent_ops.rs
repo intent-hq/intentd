@@ -76,6 +76,9 @@ mod tests_stab115;
 #[cfg(test)]
 mod tests_specialist_frontmatter;
 
+#[cfg(test)]
+mod tests_delegate_provider_resolution;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000):
@@ -307,6 +310,97 @@ fn ensure_bare_model_matches_provider(
             "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
             owners.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the provider `agent.delegate` should spawn on when the caller
+/// supplies no explicit `model` (spec Decision D2). The wire has no
+/// `provider` param, so the daemon must derive one itself instead of leaving
+/// `AgentCreateExtra.provider` unset — which previously fell through to
+/// [`intent_providers::default_provider_id`] (Auggie) at spawn time
+/// regardless of the user's actual configured default.
+///
+/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
+///    when that is unset — the provider prefix of its compound `model`
+///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
+///    or the delegate fails with a clear error (never silently substituted).
+/// 2. The configured default (`providers.active`), with the same
+///    known/available requirement.
+/// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
+///    session's `provider` stays unset, exactly like the pre-existing model
+///    resolution's "no configured default" case. `resolve_provider_id`
+///    (`agent_session.rs`) applies the same configured-default-over-
+///    hardcoded-Auggie precedence at spawn time, but with no configured
+///    default to offer either, that precedence itself bottoms out at the
+///    spawn path's hardcoded [`intent_providers::default_provider_id`]
+///    (Auggie) — this residual, no-config case is the one scenario where
+///    the hardcoded default still applies.
+fn resolve_delegate_provider(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let settings = services.effective_settings();
+
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            ensure_known_provider("agent.delegate", &provider_id)?;
+            ensure_provider_available("agent.delegate", &provider_id, &settings.providers.paths)?;
+            return Ok(Some(provider_id));
+        }
+    }
+
+    match settings
+        .providers
+        .active
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        Some(active) => {
+            ensure_known_provider("agent.delegate", active)?;
+            ensure_provider_available("agent.delegate", active, &settings.providers.paths)?;
+            Ok(Some(active.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Reject a known provider id that the daemon's own provider discovery
+/// reports as unavailable (not installed, or gated off by a missing env
+/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
+/// can toast it — instead of letting the delegate succeed and the spawn fail
+/// later with a raw "No such file or directory" (spec Decision D2 step 3).
+/// Mirrors `resolve_spawn`'s override-aware resolution (monorepo#1065) via
+/// [`intent_providers::discover_providers_with_overrides`], keyed by the
+/// same `providers.paths` settings.
+fn ensure_provider_available(
+    method: &str,
+    provider_id: &str,
+    provider_paths: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let available = intent_providers::discover_providers_with_overrides(&|key| {
+        provider_paths.get(key).cloned()
+    })
+    .into_iter()
+    .find(|p| p.id == provider_id)
+    .is_some_and(|p| p.installed);
+    if !available {
+        let display = intent_providers::provider_config(provider_id).display_name;
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — it is not \
+             installed, or is disabled. Choose an available provider in Settings > Agents, or \
+             install {display}."
         )));
     }
     Ok(())
@@ -3440,7 +3534,7 @@ impl Services {
         }
         // Metadata-only lookup (no transcript hydration); workspace mismatch
         // surfaces as NotFound (defense-in-depth against bare-id probes).
-        let mut session = self.store.get_agent_session_summary(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {agent_id}")));
         }
@@ -3464,36 +3558,25 @@ impl Services {
                 .insert(message_id.clone());
             persisted || claimed
         };
-        // Preserve non-object metadata verbatim under a side key rather than
-        // discarding it: the column is documented/typed as a free-form
-        // object today, but silently replacing a non-object value (should
-        // one ever land there) would drop data (monorepo#751 review).
-        let mut metadata = match session.metadata.take() {
-            Some(Value::Object(map)) => map,
-            Some(other) => {
-                tracing::warn!(
-                    agent = %agent_id,
-                    "agent_session.metadata was a non-object JSON value; \
-                     preserving it under `priorNonObjectMetadata` while adding the \
-                     dismissal marker"
-                );
-                let mut map = serde_json::Map::new();
-                map.insert("priorNonObjectMetadata".to_string(), other);
-                map
-            }
-            None => serde_json::Map::new(),
-        };
-        metadata.insert(
-            intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
-            Value::String(message_id.clone()),
-        );
-        // Targeted metadata+updated_at write: the session above came from the
-        // summary projection (no `system_prompt`), so a full-row
-        // `update_agent_session` write-back would clear the stored prompt.
-        let metadata = Value::Object(metadata);
+        // Atomic single-key write (store-side `json_set`): sibling metadata
+        // keys — e.g. a concurrently-advanced `lastSeenMessageId`
+        // (`agent.markSeen`) — are preserved rather than clobbered by a
+        // whole-column replacement, non-object metadata is preserved under
+        // `priorNonObjectMetadata` (monorepo#751 review), and only
+        // `metadata`+`updated_at` are touched so the stored `system_prompt`
+        // (absent from the summary projection above) survives. Unconditional
+        // (no CAS guard): the last dismissal wins, matching the single-slot
+        // marker semantics.
         if let Err(e) = self
             .store
-            .update_agent_session_metadata(&workspace_id, &agent_id, Some(&metadata), &now_iso())
+            .set_agent_session_metadata_key(
+                &workspace_id,
+                &agent_id,
+                intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY,
+                &message_id,
+                None,
+                &now_iso(),
+            )
             .await
         {
             // Release the notice claim so a retried dismissal (after this
@@ -3543,6 +3626,126 @@ impl Services {
             "success": true,
             "dismissedQuestionsMessageId": message_id,
         }))
+    }
+
+    /// `agent.markSeen` (PROTOCOL §5.5): persist the per-conversation seen
+    /// marker (`message_id` — the newest transcript message the user has
+    /// seen) in the session metadata (survives daemon restarts) and emit
+    /// `agent:updated` so other clients converge. **Monotonic**: when both
+    /// the named message and the current marker resolve to transcript
+    /// positions and the named one is OLDER, the call is a no-op returning
+    /// the current marker (no write, no event) — enforced against concurrent
+    /// markers too: the store write is a compare-and-set on the current
+    /// marker value (atomic single-key `json_set`, sibling metadata keys
+    /// preserved), and a CAS miss re-reads and re-applies the gate. An id
+    /// that does not resolve (unknown, or truncated away by
+    /// `agent.editAndRegenerate`) is tolerated as dangling — same laxity as
+    /// `agent.dismissQuestions` — and the write proceeds (a dangling CURRENT
+    /// marker likewise never blocks an advance). **Idempotent**: re-marking
+    /// the already-persisted id succeeds without a write or a duplicate
+    /// event. Fails closed on a nonexistent agent or a workspace mismatch
+    /// (`NotFound`).
+    pub(crate) async fn agent_mark_seen_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            return Err(Error::InvalidParams("messageId is required".to_string()));
+        }
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        // Bounded CAS retry: each iteration re-reads the current marker,
+        // re-applies the monotonicity gate, and attempts a guarded write. A
+        // miss means another writer moved the marker between our read and
+        // write; the loop converges because the marker only ever advances.
+        // The cap is defensive — two racing debounced FE triggers settle in
+        // one retry.
+        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
+        for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
+            // Metadata-only lookup (no transcript hydration); workspace
+            // mismatch surfaces as NotFound (defense-in-depth against
+            // bare-id probes).
+            let session = self.store.get_agent_session_summary(&agent_id).await?;
+            if session.workspace_id != workspace_id {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+            let current = session.last_seen_message_id().map(str::to_string);
+            if current.as_deref() == Some(message_id.as_str()) {
+                // Already the persisted marker: no write, no duplicate event —
+                // the FE trigger is debounced but can still repeat.
+                return Ok(json!({
+                    "success": true,
+                    "lastSeenMessageId": message_id,
+                }));
+            }
+            // Monotonicity gate: only comparable when BOTH ids resolve to
+            // transcript positions (two bounded index seeks, no hydration). A
+            // dangling side — unknown id, or a marker naming a row truncated
+            // by `agent.editAndRegenerate` — never blocks the advance.
+            if let Some(current_id) = current.as_deref() {
+                let new_idx = self
+                    .store
+                    .get_agent_message_index(&agent_id, &message_id)
+                    .await?;
+                let current_idx = self
+                    .store
+                    .get_agent_message_index(&agent_id, current_id)
+                    .await?;
+                if let (Some(new_idx), Some(current_idx)) = (new_idx, current_idx) {
+                    if new_idx < current_idx {
+                        return Ok(json!({
+                            "success": true,
+                            "lastSeenMessageId": current_id,
+                        }));
+                    }
+                }
+            }
+            // Guarded atomic single-key write: `json_set` on exactly
+            // `lastSeenMessageId` (sibling keys — e.g. a concurrent
+            // `dismissedQuestionsMessageId` — are preserved; only
+            // `metadata`+`updated_at` are touched so the stored
+            // `system_prompt` survives), conditioned on the marker still
+            // holding the value the gate above was computed against.
+            let wrote = self
+                .store
+                .set_agent_session_metadata_key(
+                    &workspace_id,
+                    &agent_id,
+                    intent_core::LAST_SEEN_MESSAGE_ID_KEY,
+                    &message_id,
+                    Some(current.as_deref()),
+                    &now_iso(),
+                )
+                .await?;
+            if !wrote {
+                // Marker moved underneath us: re-read and re-gate.
+                continue;
+            }
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                &agent_id,
+                AGENT_UPDATED,
+                json!({
+                    "agentId": agent_id.0,
+                    "lastSeenMessageId": message_id,
+                }),
+            )
+            .await;
+            return Ok(json!({
+                "success": true,
+                "lastSeenMessageId": message_id,
+            }));
+        }
+        Err(Error::Internal(format!(
+            "agent.markSeen: seen-marker CAS did not settle after \
+             {MARK_SEEN_CAS_ATTEMPTS} attempts for agent {agent_id}"
+        )))
     }
 
     /// Number of question resource blocks on the dismissed assistant message.
@@ -4327,7 +4530,7 @@ impl Services {
                 note_id = note_id,
             );
             let commit_instruction = if skip_auto_commit {
-                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
+                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`."
             } else {
                 ""
             };
@@ -4448,6 +4651,28 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
+        // D2: resolve the provider up front when the caller gave no explicit
+        // `model` — the wire has no `provider` param on `agent.delegate`, so
+        // without this the created session's `provider` stays `None` and the
+        // spawn path falls through to the hardcoded default (Auggie),
+        // regardless of the user's actual configured default. A compound
+        // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
+        // provider via `agent_create_op`'s existing derivation, so D2 is
+        // skipped in that case.
+        let delegate_provider = if input.model.is_none() {
+            // SECURITY: derive workspace_path from the stored workspace
+            // record, never a client-supplied value (same rationale as
+            // `agent_create_op`'s model resolution).
+            let wp = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w));
+            resolve_delegate_provider(self, input.specialist.as_deref(), wp.as_deref())?
+        } else {
+            None
+        };
         let mut extra_metadata = serde_json::Map::new();
         if let Some(depth) = delegation_depth {
             extra_metadata.insert("delegationDepth".to_string(), json!(depth));
@@ -4459,6 +4684,7 @@ impl Services {
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
+            provider: delegate_provider,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable
             // by the child's opening-turn `ws.workspace.setAgentName`
@@ -5116,6 +5342,15 @@ impl Services {
         if removed {
             self.publish_subscriptions_changed(&watch.parent_workspace_id, &caller_agent_id)
                 .await;
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // the caller's own `agent:idle` may have been deferred (not fired,
+            // watch armed) because it held this outgoing watch. Removing it
+            // here is outside the wake path, so re-run the mutation-path
+            // redelivery — a no-op unless the caller is idle with no remaining
+            // waiting reason, in which case it synthesizes the caller's real
+            // completion and settles its own deferred watchers.
+            self.redeliver_completion_after_queue_mutation(&caller_agent_id)
+                .await;
         }
         Ok(json!({ "ok": true, "removed": removed }))
     }
@@ -5470,6 +5705,12 @@ impl Services {
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
             }
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // dropping every outgoing watch may remove the caller's last
+            // waiting reason, so re-run the mutation-path redelivery to settle
+            // any watch on the caller whose `agent:idle` was deferred.
+            self.redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
             return Ok(json!({ "success": true }));
         }
 
@@ -5536,6 +5777,12 @@ impl Services {
         for anchor in &anchors {
             self.publish_subscriptions_changed(anchor, &agent_id).await;
         }
+        // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+        // cancelling a scoped outgoing watch may remove the caller's last
+        // waiting reason, so re-run the mutation-path redelivery to settle any
+        // watch on the caller whose `agent:idle` was deferred.
+        self.redeliver_completion_after_queue_mutation(&agent_id)
+            .await;
         Ok(json!({ "success": true }))
     }
 
@@ -8070,7 +8317,7 @@ impl Services {
                     self.register_completion_watch(
                         &parent_home_ws,
                         &workspace_id,
-                        parent,
+                        parent.clone(),
                         parent_name,
                         agent_id.clone(),
                         Some(gid),
@@ -8089,7 +8336,7 @@ impl Services {
                             .register_completion_watch(
                                 &parent_home_ws,
                                 &workspace_id,
-                                parent,
+                                parent.clone(),
                                 parent_name,
                                 agent_id.clone(),
                                 None,
@@ -8097,14 +8344,24 @@ impl Services {
                             .map(|_| ()),
                     }
                 };
-                if let Err(e) = registered {
-                    // Scope-gate rejection is non-fatal on resume: the agent
-                    // still continues; only the parent wake path is lost.
-                    tracing::warn!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "resume: completion-watch re-registration rejected"
-                    );
+                match registered {
+                    // The re-armed watch changed (or refreshed) the parent's
+                    // watch set: publish the subscriptions snapshot like every
+                    // other watch-lifecycle site (monorepo#1449) — the publish
+                    // also recomputes the anchor workspace's displayStatus.
+                    Ok(()) => {
+                        self.publish_subscriptions_changed(&parent_home_ws, &parent)
+                            .await;
+                    }
+                    Err(e) => {
+                        // Scope-gate rejection is non-fatal on resume: the agent
+                        // still continues; only the parent wake path is lost.
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            error = %e,
+                            "resume: completion-watch re-registration rejected"
+                        );
+                    }
                 }
             }
         }

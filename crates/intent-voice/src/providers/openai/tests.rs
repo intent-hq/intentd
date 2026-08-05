@@ -91,7 +91,7 @@ async fn no_fallback_when_whisper_selected() {
     let (base_url, captured) = mock_http::spawn(vec![(404, not_found)]).await;
     let engine = OpenAiEngine::new("sk-key", Some(&base_url), Some("whisper-1")).unwrap();
     let err = engine.transcribe(request()).await.unwrap_err();
-    assert!(matches!(err, Error::NotConfigured(_)), "got {err:?}");
+    assert!(matches!(err, Error::ModelUnavailable(_)), "got {err:?}");
 
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 1, "no fallback when whisper-1 is selected");

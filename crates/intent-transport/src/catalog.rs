@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 278 canonical methods routed through the main dispatch match in
+/// These are the 268 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -38,6 +38,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "agent.list",
     "agent.listActive",
     "agent.listInterrupted",
+    "agent.markSeen",
     "agent.pendingPermissions",
     "agent.queueMessage",
     "agent.removeQueuedMessage",
@@ -179,19 +180,8 @@ pub const ROUTER_METHODS: &[&str] = &[
     "note.setContent",
     "note.update",
     "note.updateMetadata",
-    "pr.capabilities",
-    "pr.createReview",
-    "pr.getReviews",
-    "pr.listCheckRuns",
-    "pr.listComments",
-    "pr.listReviewComments",
-    "pr.merge",
-    "pr.postComment",
     "pr.refresh",
-    "pr.replyToReviewComment",
-    "pr.resolveThread",
     "pr.status",
-    "pr.updateBranch",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",

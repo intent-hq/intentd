@@ -54,7 +54,7 @@ jobs:
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
     steps:
       - id: decide
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
         with:
@@ -467,7 +467,7 @@ jobs:
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       # install-action derives every path it touches from $HOME: the bin dir
@@ -626,7 +626,7 @@ jobs:
       # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
       # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
       # self-skip without it, which silently drops coverage below the floor.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       # Per-slot HOME for install-action — see the coverage-e2e job's comment

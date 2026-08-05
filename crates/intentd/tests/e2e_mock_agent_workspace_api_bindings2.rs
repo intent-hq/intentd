@@ -1127,7 +1127,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
 //
 
 #[tokio::test]
-async fn git_bindings_status_stage_commit() {
+async fn git_bindings_commit() {
     let Some(script) = gate() else { return };
 
     // Skip if git is not available
@@ -1210,10 +1210,8 @@ async fn git_bindings_status_stage_commit() {
     };
 
     let js = r#"
-        const status = await ws.git.status();
-        await ws.git.stage('test.txt');
-        const committed = await ws.git.agentCommit('test commit', { userRequested: true });
-        return { status: status, committed: committed };
+        const committed = await ws.git.commit('test commit', { files: ['test.txt'], userRequested: true });
+        return { committed: committed };
     "#;
 
     let behavior = serde_json::json!({
@@ -1276,9 +1274,9 @@ async fn git_bindings_status_stage_commit() {
     let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
-/// Attribution-filtered `ws.git.agentCommit` fallback (monorepo#939): an
+/// Attribution-filtered `ws.git.commit` fallback (monorepo#939): an
 /// agent-context `ws.file.write` records a `tracked_changes` attribution row,
-/// and a subsequent no-`files` `ws.git.agentCommit` commits only the agent's
+/// and a subsequent no-`files` `ws.git.commit` commits only the agent's
 /// attributed path — a pre-existing unattributed dirty file stays in the
 /// worktree. This drives the full ingest → filter loop over the real MCP
 /// bridge (the same path idle auto-commit takes).
@@ -1364,14 +1362,14 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     // the fallback must pick up only the attributed write.
     let js = r#"
         await ws.file.write('agent-file.txt', 'agent content\n');
-        const committed = await ws.git.agentCommit('agent scoped commit');
+        const committed = await ws.git.commit('agent scoped commit');
         return { committed: committed };
     "#;
 
     let behavior = serde_json::json!({
         "toolCall": {
             "name": "workspace_api",
-            "arguments": { "code": js, "summary": "attributed agentCommit e2e" }
+            "arguments": { "code": js, "summary": "attributed commit e2e" }
         },
         "response": "scoped commit done",
     })

@@ -1439,6 +1439,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.markSeen`: persist the per-conversation seen marker
+    /// (`message_id` — the newest transcript message the user has seen) on
+    /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:
+    /// naming a message OLDER than the current marker is a no-op returning
+    /// the current marker. Idempotent: re-marking the same message succeeds.
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_mark_seen not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.editAndRegenerate`: edit a past user message and regenerate from
     /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
     /// transcript to just before `message_id` (which must reference an existing
@@ -2978,21 +2997,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.capabilities`: the active provider's id + capability flags so
-    /// clients can gate UI on what the host supports. Requires a resolvable
-    /// provider but NOT an active PR (PROTOCOL §5.7 extension).
-    fn pr_capabilities(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_capabilities not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -3018,180 +3022,24 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.listComments`: conversation-level comments on the active PR, clamped to
-    /// `count` (default 20, max 100) (PROTOCOL §5.7).
-    fn pr_list_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        count: Option<i64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, count);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_comments not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.listReviewComments`: line-anchored review threads on the active PR,
-    /// filtered by `path` / `status` (PROTOCOL §5.7).
-    fn pr_list_review_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        path: Option<String>,
-        status: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, status);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_review_comments not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.getReviews`: the review decision aggregate + reviews for the active PR
-    /// (or `pr_number` when given) (PROTOCOL §5.7 extension).
-    fn pr_get_reviews(
-        &self,
-        workspace_id: WorkspaceId,
-        pr_number: Option<u64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_get_reviews not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.listCheckRuns`: CI check-run tally + runs for `git_ref` (defaults to
-    /// the PR head) (PROTOCOL §5.7 extension).
-    fn pr_list_check_runs(
-        &self,
-        workspace_id: WorkspaceId,
-        git_ref: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, git_ref);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_check_runs not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
-    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` in the
-    /// workspace's repo — state, mergeability + blocked reason, check-run
-    /// tally, review decision, and comment counts — for hook-based PR
-    /// monitoring. `pr_number` is REQUIRED; there is no active-PR fallback.
+    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
+    /// mergeability + blocked reason, check-run tally, review decision, and
+    /// comment counts — for hook-based PR monitoring. Scoped to the
+    /// workspace's repo unless `repo` (an `"owner/name"` slug) overrides it;
+    /// the result always echoes the resolved repo as `repo` so a wrong-repo
+    /// read is detectable. `pr_number` is REQUIRED; there is no active-PR
+    /// fallback.
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
+        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number);
+        let _ = (workspace_id, pr_number, repo);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_state not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.merge`: merge the active PR with `merge_method` (default `merge`) and
-    /// optional commit overrides. Requires an active PR (PROTOCOL §5.7).
-    fn pr_merge(
-        &self,
-        workspace_id: WorkspaceId,
-        merge_method: Option<String>,
-        commit_title: Option<String>,
-        commit_message: Option<String>,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (
-            workspace_id,
-            merge_method,
-            commit_title,
-            commit_message,
-            idempotency_key,
-        );
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_merge not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.updateBranch`: update the active PR branch from its base (PROTOCOL §5.7).
-    fn pr_update_branch(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_update_branch not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.postComment`: post a conversation comment on the active PR (PROTOCOL §5.7).
-    fn pr_post_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_post_comment not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.replyToReviewComment`: reply to a review comment on the active PR
-    /// (PROTOCOL §5.7).
-    fn pr_reply_to_review_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        comment_id: u64,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, comment_id, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_reply_to_review_comment not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.resolveThread`: resolve/unresolve a review thread (default `resolve`)
-    /// on the active PR (PROTOCOL §5.7).
-    fn pr_resolve_thread(
-        &self,
-        workspace_id: WorkspaceId,
-        thread_id: String,
-        action: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, thread_id, action);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_resolve_thread not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.createReview`: submit a review (`approve` / `request-changes` /
-    /// `comment`) on the active PR (PROTOCOL §5.7 extension).
-    fn pr_create_review(
-        &self,
-        workspace_id: WorkspaceId,
-        verdict: String,
-        body: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, verdict, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_create_review not implemented".to_string(),
             ))
         })
     }
@@ -4587,7 +4435,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// user/assistant agent messages. `workspace_id` `None` → global across
     /// all workspaces; `Some` → hard scope filter. `prefer_workspace_id` is a
     /// soft ranking boost: results stay global but matches from that workspace
-    /// outrank equally-relevant matches elsewhere. Returns
+    /// outrank equally-relevant matches elsewhere. Archived-workspace matches
+    /// carry a soft ranking penalty, so equally-relevant matches tier
+    /// preferred → other active → archived. Returns
     /// `{ requestId, matches: MessageMatch[] }` inline, or
     /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).

@@ -1049,6 +1049,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             &["elevenlabs", "openai"],
             "elevenlabs",
         ),
+        string(
+            "voice.language",
+            "Voice language",
+            "Default transcription language hint (ISO-639-1 code) when a voice.transcribe call has no per-call language; unset means auto-detect",
+            "voice",
+            None,
+        ),
         secret(
             "voice.elevenlabs.apiKey",
             "ElevenLabs API key",
@@ -2590,6 +2597,66 @@ mod tests {
         assert_eq!(reset["value"], json!("gpt-4o-transcribe"));
         let got = svc.get(path).await.expect("get after reset");
         assert_eq!(got["value"], json!("gpt-4o-transcribe"));
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `voice.language` is a TOML-backed optional string (no default —
+    /// unset means provider auto-detection); it persists through
+    /// `settings.update` to config.toml (never SQLite).
+    #[tokio::test]
+    async fn voice_language_is_a_toml_backed_optional_string() {
+        let path = "voice.language";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "voice");
+        assert_eq!(def.default_value, None);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-voicelang-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-voicelang-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Unset by default with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        // A stored language persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": "de" }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!("de"));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("de"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Reset restores the unset default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
         assert_eq!(got["origin"], json!("default"));
 
         let _ = std::fs::remove_file(&config_path);

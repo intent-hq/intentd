@@ -1,10 +1,11 @@
-//! WSS end-to-end `specialists:changed` emission: drives a real pinned-TLS
-//! WebSocket against a live `intentd serve`, subscribes via `events.subscribe`,
-//! mutates a project-tier specialist `<id>.md` file on disk, and asserts the
-//! resulting `events.event` notification carries `{ workspaceId }` (PROTOCOL
-//! §6.5). The specialists watcher enumerates workspaces at boot, so the
-//! workspace is created first and the daemon restarted over the same data dir
-//! before subscribing — mirroring the persistence-restart harness.
+//! WSS end-to-end gitignore suppression (intent-hq/monorepo#1457): the
+//! per-workspace `FileWatcher` drops git-ignored paths before they reach the
+//! event bus, so a live `events.subscribe` client never sees `file:*` frames
+//! for them. Drives a real `intentd serve` over pinned-TLS WSS: a workspace
+//! whose checkout is a git repo with a `.gitignore` gets an ignored write and
+//! a control write; only the control surfaces as `events.event`. Mirrors the
+//! harness of `e2e_wss_workspace_lifecycle_watchers.rs` (runtime watcher
+//! registration on `workspace.create`).
 
 #![cfg(unix)]
 
@@ -33,13 +34,13 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-spec-chg-{prefix}-{}", &id[..8]));
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-gitignore-{prefix}-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
     dir
 }
 
-/// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
-/// directory (`~/.intent/specialists`) never touches the real home.
+/// Spawn `intentd serve` with a hermetic HOME so host git config (global
+/// excludes) never leaks into the watcher under test.
 fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -201,85 +202,110 @@ where
     }
 }
 
-/// Wait up to `secs` for the next `events.event` notification whose payload
-/// `type` matches one of `types`; ignore other frames. Returns the event
-/// object (the `params.event` sub-object).
-async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -> Value
-where
+/// `git init` the checkout (plus local user config) so the daemon's watcher
+/// sees a real repo.
+fn git_init(root: &Path) {
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "e2e@example.com"]);
+    run(&["config", "user.name", "E2E"]);
+}
+
+/// Drain `events.event` frames until the control path's `file:*` event
+/// arrives (proving the watcher processed the batch), asserting no frame for
+/// a suppressed path shows up — then keep draining through an 800 ms quiet
+/// window to catch stragglers flushed after the control.
+async fn expect_suppressed_over_wss<S>(
+    ws: &mut WebSocketStream<S>,
+    suppressed: &[&str],
+    control: &str,
+    secs: u64,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut seen_control = false;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
-        let next = timeout(remaining, ws.next())
-            .await
-            .expect("timeout elapsed");
-        match next {
-            Some(Ok(Message::Text(text))) => {
+        let wait = if seen_control {
+            Duration::from_millis(800)
+        } else {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "control event for {control} never arrived"
+            );
+            remaining
+        };
+        match timeout(wait, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
                 let v: Value = match serde_json::from_str(&text) {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
-                if v["method"] == json!("events.event") {
-                    let evt = &v["params"]["event"];
-                    let ty = evt["type"].as_str().unwrap_or("");
-                    if types.contains(&ty) {
-                        return evt.clone();
-                    }
+                if v["method"] != json!("events.event") {
+                    continue;
+                }
+                let evt = &v["params"]["event"];
+                let ty = evt["type"].as_str().unwrap_or("");
+                if !ty.starts_with("file:") {
+                    continue;
+                }
+                let rel = evt["data"]["relativePath"].as_str().unwrap_or_default();
+                assert!(
+                    !suppressed.contains(&rel),
+                    "suppressed path {rel} surfaced over WSS: {evt}"
+                );
+                if rel == control {
+                    seen_control = true;
                 }
             }
-            Some(Ok(Message::Ping(p))) => {
+            Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
-            other => panic!("expected text frame, got {other:?}"),
+            Ok(Some(Ok(_))) => continue,
+            Ok(other) => panic!("subscription socket ended: {other:?}"),
+            Err(_) => {
+                if seen_control {
+                    return;
+                }
+                // Keep waiting until the outer deadline trips the assert.
+            }
         }
     }
 }
 
-/// Drain any additional `events.event` frames matching `event_type` in
-/// `window_ms`; return the first extra observed, or `None` if the socket
-/// stayed quiet.
-async fn drain_extra<S>(
-    ws: &mut WebSocketStream<S>,
-    event_type: &str,
-    window_ms: u64,
-) -> Option<Value>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
-                    }
-                }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
-            }
-        }
-    })
-    .await
-    .ok()
-}
+/// End-to-end (intent-hq/monorepo#1457): with a live `events.subscribe` on
+/// `file:*`, a write to a `.gitignore`d path inside the workspace checkout
+/// never surfaces as an `events.event` frame, while a non-ignored control
+/// write in the same batch does — proving suppression holds through the
+/// full daemon transport (watcher → bus → WSS fan-out), not just in-crate.
+#[tokio::test]
+async fn gitignored_write_is_suppressed_over_wss() {
+    let data_dir = scratch_dir("data");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
+    // On-disk checkout: a git repo whose .gitignore suppresses generated/.
+    let checkout = data_dir.join("checkout");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    git_init(&checkout);
+    std::fs::write(checkout.join(".gitignore"), "generated/\n*.secret\n")
+        .expect("write .gitignore");
+    std::fs::create_dir_all(checkout.join("generated")).expect("mkdir generated");
 
-/// Boot (or re-boot) a daemon over an existing data dir, returning the child
-/// and a pinned-TLS WSS client config for its live port.
-async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
-    let child = spawn_serve(data_dir, home_dir);
+    let child = spawn_serve(&data_dir, &home_dir);
+    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -288,42 +314,16 @@ async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig
         .as_str()
         .expect("fingerprint")
         .to_string();
-    (child, port, client_config(&fingerprint))
-}
+    let cfg = client_config(&fingerprint);
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn specialist_md(name: &str, body: &str) -> String {
-    format!("---\nname: \"{name}\"\ndescription: \"d\"\n---\n\n{body}")
-}
-
-/// End-to-end: a subscribed WSS client sees `specialists:changed` with the
-/// minimal `{ workspaceId }` payload when a project-tier specialist `<id>.md`
-/// file is created under `<workspace>/.intent/specialists/`. The watcher
-/// enumerates workspaces at boot, so the workspace is bootstrapped over UDS on
-/// a first daemon and the emission asserted against a restarted one.
-#[tokio::test]
-async fn specialist_file_change_emits_specialists_changed_over_wss() {
-    let data_dir = scratch_dir("data");
-    let home_dir = data_dir.join("home");
-    std::fs::create_dir_all(&home_dir).expect("mkdir hermetic home");
-    // On-disk workspace checkout whose project tier the watcher will cover.
-    let checkout = data_dir.join("checkout");
-    let specialists_dir = checkout.join(".intent").join("specialists");
-    std::fs::create_dir_all(&specialists_dir).expect("mkdir project specialists tier");
-
-    // Boot #1: create the workspace pointing at the on-disk checkout.
-    let (child, _port, _cfg) = boot(&data_dir, &home_dir).await;
-    let socket = data_dir.join("intentd.sock");
+    // Create the workspace over the existing checkout: `workspace:created`
+    // registers the FileWatcher at runtime (#611), gitignore matcher included.
     let create = uds_rpc(
         &socket,
         2,
         "workspace.create",
         json!({
-            "title": "Specialists",
+            "title": "Gitignore suppression",
             "branch": "main",
             "skipWorktree": true,
             "path": checkout.to_string_lossy(),
@@ -334,46 +334,33 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
         .as_str()
         .expect("workspace id")
         .to_string();
-    stop(child);
-
-    // Boot #2: the specialists watcher now covers the workspace's project tier.
-    let (child, port, cfg) = boot(&data_dir, &home_dir).await;
-    let _guard = common::DaemonGuard::new(child, data_dir.clone(), true);
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["specialists:changed"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["file:*"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Let the lifecycle event route through the registry and the OS watch
+    // establish before mutating (FSEvents/inotify warm-up).
+    tokio::time::sleep(Duration::from_millis(750)).await;
 
-    // Mutate: create a project-tier specialist file.
-    std::fs::write(
-        specialists_dir.join("custom.md"),
-        specialist_md("Custom", "project-tier body"),
+    // Ignored writes first, then the control: the control frame arriving
+    // proves the batch was processed while the ignored paths stayed silent.
+    std::fs::write(checkout.join("generated/out.js"), b"x").expect("write ignored");
+    std::fs::write(checkout.join("data.secret"), b"x").expect("write ignored glob");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(checkout.join("control.txt"), b"c").expect("write control");
+
+    expect_suppressed_over_wss(
+        &mut sub,
+        &["generated", "generated/out.js", "data.secret"],
+        "control.txt",
+        20,
     )
-    .expect("write specialist");
-
-    let evt = next_event(&mut sub, &["specialists:changed"], 20).await;
-    assert_eq!(evt["type"], json!("specialists:changed"));
-    assert_eq!(evt["workspaceId"], ws_id.as_str());
-    assert!(evt["id"].is_string(), "event id: {evt}");
-    assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    // The watcher emits a bare system actor (no id/name; optional fields are
-    // omitted from the wire per §9.1).
-    assert_eq!(evt["actor"], json!({ "type": "system" }));
-    assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
-
-    // Debounce coalesces the single write to exactly one emission.
-    let extra = drain_extra(&mut sub, "specialists:changed", 700).await;
-    assert!(
-        extra.is_none(),
-        "single specialist write must publish exactly one specialists:changed, got extra: {extra:?}"
-    );
+    .await;
 }

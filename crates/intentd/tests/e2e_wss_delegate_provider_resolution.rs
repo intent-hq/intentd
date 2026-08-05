@@ -1,10 +1,15 @@
-//! WSS e2e test for STAB-115: `agent.setModel` triggering provider respawn.
+//! WSS e2e regression for spec Decision D2: `agent.delegate` provider
+//! resolution across the real websocket/router path (intentd#910 review).
 //!
-//! Boots a real `intentd serve` (WSS listener enabled via config) against the mock ACP provider and
-//! verifies that calling `agent.setModel` while a provider child is live causes
-//! the next turn to respawn the child with the new model.
-//!
-//! Gated on `node` + the mock script; skips cleanly otherwise.
+//! `agent.delegate` has no `provider` param on the wire (PROTOCOL §5.5).
+//! `crates/intent-services/src/agent_ops/tests_delegate_provider_resolution.rs`
+//! already covers the resolution order at the service-layer seam; this file
+//! locks the same behavior through the router + a real WSS connection:
+//! - no explicit `model`, no specialist → the configured default
+//!   (`providers.active`) is resolved onto the created session, never left
+//!   to fall through to the hardcoded default provider (Auggie).
+//! - an unavailable configured default fails the RPC with a clear error
+//!   naming the configured provider, never silently substituting Auggie.
 
 #![cfg(unix)]
 
@@ -45,7 +50,7 @@ impl Drop for Daemon {
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-setmodel-{}", &id[..8]));
+    let dir = PathBuf::from("/tmp").join(format!("itd-wss-delegprov-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir data dir");
     dir
 }
@@ -166,7 +171,10 @@ async fn connect_ws(
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+/// One WSS JSON-RPC round-trip, returning the raw envelope (caller checks
+/// `error`/`result` itself) — used by the unavailable-provider test, which
+/// expects an RPC error rather than a result.
+async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -182,8 +190,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -195,6 +202,16 @@ where
     }
 }
 
+/// [`wss_rpc_raw`], asserting the call succeeded and returning `result`.
+async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let v = wss_rpc_raw(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -203,33 +220,28 @@ fn gate() -> Option<String> {
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
-        eprintln!("skipping WSS setModel E2E: node not on PATH");
+        eprintln!("skipping WSS delegate-provider-resolution E2E: node not on PATH");
         return None;
     }
     if !std::path::Path::new(&script).exists() {
-        eprintln!("skipping WSS setModel E2E: mock script missing at {script}");
+        eprintln!("skipping WSS delegate-provider-resolution E2E: mock script missing at {script}");
         return None;
     }
     Some(script)
 }
 
-/// STAB-115: agent.setModel triggers respawn on next turn when provider child is live.
-/// 1. Create agent with model "auggie:sonnet4.5"
-/// 2. Send message (spawns child with sonnet4.5)
-/// 3. Call agent.setModel to change to "auggie:haiku"
-/// 4. Send another message (should respawn with haiku)
-/// 5. Verify agent.get shows model="auggie:haiku"
+/// D2 step 2: no explicit `model`, no specialist — `agent.delegate` resolves
+/// the configured default (`providers.active`) onto the created session,
+/// instead of leaving `provider` unset and falling through to the spawn
+/// path's hardcoded default (Auggie).
 #[tokio::test]
-async fn agent_set_model_triggers_respawn_over_wss() {
+async fn delegate_resolves_configured_default_provider_over_wss() {
     let Some(script) = gate() else {
         return;
     };
 
     let data_dir = temp_data_dir();
-    let behavior = json!({
-        "response": "mock response",
-    })
-    .to_string();
+    let behavior = json!({ "response": "mock response" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
@@ -253,97 +265,114 @@ async fn agent_set_model_triggers_respawn_over_wss() {
 
     let mut ws = connect_ws(port, cfg).await;
 
-    // Create workspace
     let ws_result = wss_rpc(
         &mut ws,
         10,
         "workspace.create",
-        json!({ "title": "STAB-115 WSS E2E", "noPrompt": true }),
+        json!({ "title": "D2 WSS E2E", "noPrompt": true }),
     )
     .await;
     let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
 
-    // Create agent with initial model "auggie:sonnet4.5"
-    let agent_result = wss_rpc(
+    wss_rpc(
         &mut ws,
         20,
-        "agent.create",
-        json!({
-            "workspaceId": ws_id,
-            "name": "SetModel Test",
-            "model": "auggie:sonnet4.5",
-        }),
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
     )
     .await;
-    let agent_id = agent_result["agent"]["id"].as_str().expect("agent id");
 
-    // Send first message (spawns child with sonnet4.5)
-    wss_rpc(
+    let delegate_result = wss_rpc(
         &mut ws,
         30,
-        "agent.sendMessage",
+        "agent.delegate",
         json!({
             "workspaceId": ws_id,
-            "agentId": agent_id,
-            "content": "first message",
+            "agentInstructions": "do the thing",
         }),
     )
     .await;
+    let agent_id = delegate_result["agentId"].as_str().expect("agentId");
 
-    // Change model to "auggie:haiku"
-    wss_rpc(
+    let get_result = wss_rpc(
         &mut ws,
         40,
-        "agent.setModel",
-        json!({
-            "workspaceId": ws_id,
-            "agentId": agent_id,
-            "modelId": "auggie:haiku",
-        }),
+        "agent.get",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
     )
     .await;
+    assert_eq!(
+        get_result["agent"]["provider"].as_str(),
+        Some("mock"),
+        "configured default provider persisted on the delegated session, not left unset/Auggie: {get_result}"
+    );
+}
 
-    // Send second message (should trigger respawn with haiku)
+/// D2 step 3 (error path): the configured default (`providers.active`) is
+/// unavailable — `agent.delegate` fails the RPC with a clear error naming the
+/// configured provider, never silently substituting/spawning the hardcoded
+/// default provider (Auggie).
+#[tokio::test]
+async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss() {
+    let data_dir = temp_data_dir();
+    // Deliberately no MOCK_AGENT_SCRIPT_PATH: "mock" stays gated off/unavailable.
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "D2 WSS E2E unavailable", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
     wss_rpc(
         &mut ws,
-        50,
-        "agent.sendMessage",
-        json!({
-            "workspaceId": ws_id,
-            "agentId": agent_id,
-            "content": "second message",
-        }),
+        20,
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.active", "value": "mock" }] }),
     )
     .await;
 
-    // Verify the model changed via agent.get. The respawn applies the new
-    // model asynchronously after agent.sendMessage returns, so poll with a
-    // bounded deadline instead of asserting immediately.
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(30));
-    let mut rpc_id = 60;
-    loop {
-        let get_result = wss_rpc(
-            &mut ws,
-            rpc_id,
-            "agent.get",
-            json!({
-                "agentId": agent_id,
-                "workspaceId": ws_id,
-            }),
+    let delegate_resp = wss_rpc_raw(
+        &mut ws,
+        30,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+        }),
+    )
+    .await;
+    let error = delegate_resp.get("error").unwrap_or_else(|| {
+        panic!(
+            "unavailable configured default must fail, not silently spawn Auggie: {delegate_resp}"
         )
-        .await;
-        let model = get_result["agent"]["model"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if model == "auggie:haiku" {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "model should have changed to auggie:haiku after setModel; last saw {model:?}"
-        );
-        rpc_id += 1;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    });
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("mock"),
+        "error names the unavailable configured provider: {message}"
+    );
+    assert!(
+        !message.to_ascii_lowercase().contains("auggie"),
+        "error must never silently point at the hardcoded default provider: {message}"
+    );
 }

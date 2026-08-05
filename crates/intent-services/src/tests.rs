@@ -3989,15 +3989,27 @@ mod change_event_parity {
     }
 
     async fn harness() -> Harness {
+        harness_with_attention_park(None).await
+    }
+
+    /// Harness variant with the monorepo#1481 attention-write park seam
+    /// armed, so race tests can hold an attention path immediately before
+    /// its scoped attention write (the former read-modify-write window).
+    async fn harness_with_attention_park(
+        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let mut services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
+        if let Some(park) = park {
+            services = services.with_attention_write_park(park);
+        }
         Harness {
             _tmp: tmp,
             _ws_root: ws_root,
@@ -5015,6 +5027,233 @@ mod change_event_parity {
             .await
             .expect("seen again");
         assert_eq!(again.attention, WorkspaceAttention::None);
+    }
+
+    /// Regression (intent-hq/monorepo#1466): acknowledging attention is not
+    /// "activity". `markSeen` clears the unread flag WITHOUT bumping
+    /// `updated_at`, so the derived `lastActivity` (sidebar label/sort) stays
+    /// put.
+    #[tokio::test]
+    async fn mark_seen_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        // Pin the row's timestamps to a fixed past instant so any bump shows.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "markSeen must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-02T00:00:00Z"),
+            "derived lastActivity must not move on markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1466): `dismissAttention` never bumps
+    /// `updated_at` — neither when attention is already `none` (a pure no-op:
+    /// the row is not rewritten) nor when it actually clears attention.
+    #[tokio::test]
+    async fn dismiss_attention_does_not_bump_updated_at() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        let h = harness().await;
+        // No attention raised: dismiss is a pure no-op — updated_at untouched.
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.created_at = "2020-01-01T00:00:00Z".to_string();
+        pinned.updated_at = "2020-01-02T00:00:00Z".to_string();
+        pinned.last_activity = None;
+        h.store.update_workspace(&pinned).await.expect("pin");
+
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss noop");
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "no-op dismiss must not bump updated_at"
+        );
+
+        // With attention raised: dismiss clears it, still without bumping.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let mut pinned = h.store.get_workspace(&h.ws).await.expect("load");
+        pinned.updated_at = "2020-01-03T00:00:00Z".to_string();
+        h.store.update_workspace(&pinned).await.expect("re-pin");
+
+        let dismissed = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        assert_eq!(dismissed.attention, WorkspaceAttention::None);
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.updated_at, "2020-01-03T00:00:00Z",
+            "dismiss must not bump updated_at"
+        );
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on dismissAttention"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): the attention paths must scope
+    /// their write to the attention column (plus `updated_at` where intended)
+    /// — never a full-row replace — so a concurrent row mutation landing
+    /// just before the attention write (the former read-modify-write window)
+    /// survives. Parks `mark_seen` immediately before its scoped write,
+    /// mutates `title`/`updated_at` concurrently, and asserts the mutation
+    /// is not clobbered.
+    #[tokio::test]
+    async fn mark_seen_race_preserves_concurrent_row_mutation() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+        // Seed attention via the store (the armed park would hold the
+        // service-path raise too).
+        let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
+        seeded.attention = WorkspaceAttention::Unread;
+        seeded.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store.update_workspace(&seeded).await.expect("seed");
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move { services.mark_seen(ws_id).await });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("mark_seen reaches the attention write window");
+
+        // Concurrent mutation while mark_seen sits parked before its write.
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-06-01T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        let seen = task.await.expect("join").expect("mark_seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive markSeen"
+        );
+        assert_eq!(
+            reloaded.updated_at, "2020-06-01T00:00:00Z",
+            "concurrent updated_at change must survive markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): same race window as above, for
+    /// `dismissAttention`.
+    #[tokio::test]
+    async fn dismiss_attention_race_preserves_concurrent_row_mutation() {
+        use intent_core::{WorkspaceApi, WorkspaceAttention};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+        let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
+        seeded.attention = WorkspaceAttention::ReviewRequired;
+        seeded.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store.update_workspace(&seeded).await.expect("seed");
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move { services.dismiss_attention(ws_id).await });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("dismiss_attention reaches the attention write window");
+
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-06-01T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        let dismissed = task.await.expect("join").expect("dismiss");
+        assert_eq!(dismissed.attention, WorkspaceAttention::None);
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive dismissAttention"
+        );
+        assert_eq!(
+            reloaded.updated_at, "2020-06-01T00:00:00Z",
+            "concurrent updated_at change must survive dismissAttention"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1481): same race window as above, for
+    /// `raise_attention`. Raising IS activity — `updated_at` moves — but the
+    /// write must still be scoped to attention + updated_at, so a concurrent
+    /// title change survives.
+    #[tokio::test]
+    async fn raise_attention_race_preserves_concurrent_title_change() {
+        use intent_core::WorkspaceAttention;
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_attention_park(Some(park.clone())).await;
+
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move {
+            services
+                .raise_attention(&ws_id, WorkspaceAttention::Unread)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("raise_attention reaches the attention write window");
+
+        let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
+        concurrent.title = "renamed while parked".to_string();
+        concurrent.updated_at = "2020-01-02T00:00:00Z".to_string();
+        h.store
+            .update_workspace(&concurrent)
+            .await
+            .expect("concurrent write");
+        park.release.notify_one();
+
+        task.await.expect("join").expect("raise");
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::Unread);
+        assert_eq!(
+            reloaded.title, "renamed while parked",
+            "concurrent title change must survive raiseAttention"
+        );
+        assert_ne!(
+            reloaded.updated_at, "2020-01-02T00:00:00Z",
+            "raiseAttention intentionally bumps updated_at"
+        );
     }
 
     /// `workspace.create` emits `workspace:created` after the row is inserted
@@ -7269,7 +7508,11 @@ mod pr {
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());
         crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
             .expect("seed token");
-        let svc = svc.with_secret_store(mem.clone());
+        // Mock login host: the production-host gate must skip the gh CLI
+        // logout side effect, so this test never spawns a real `gh`.
+        let svc = svc
+            .with_secret_store(mem.clone())
+            .with_github_login_base_uri("http://127.0.0.1:0");
         {
             let mut slot = svc.github_auth_flow.lock().await;
             *slot = Some(crate::github_auth_ops::FlowSlot {
@@ -7309,136 +7552,6 @@ mod pr {
     }
 
     #[tokio::test]
-    async fn get_reviews_aggregates_and_serializes_verdicts() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_get_reviews(ws, None).await.expect("reviews");
-        assert_eq!(v["reviewDecision"], "APPROVED");
-        assert_eq!(v["approvalCount"], 1);
-        assert_eq!(v["changesRequestedCount"], 0);
-        assert_eq!(v["approvedBy"][0], "alice");
-        assert_eq!(v["reviews"].as_array().unwrap().len(), 2);
-        assert_eq!(v["reviews"][0]["verdict"], "approve");
-        assert_eq!(v["reviews"][1]["verdict"], "comment");
-    }
-
-    #[tokio::test]
-    async fn list_check_runs_tallies() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_list_check_runs(ws, None).await.expect("checks");
-        assert_eq!(v["total"], 3);
-        assert_eq!(v["passed"], 1);
-        assert_eq!(v["failed"], 1);
-        assert_eq!(v["pending"], 1);
-        assert_eq!(v["runs"].as_array().unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn list_review_comments_filters_unresolved() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc
-            .pr_list_review_comments(ws, None, None)
-            .await
-            .expect("review comments");
-        assert_eq!(v["usingFallback"], false);
-        assert_eq!(v["threadCount"], 1);
-        assert_eq!(v["threads"][0]["id"], "RT1");
-        assert_eq!(v["threads"][0]["comments"][0]["author"]["login"], "rev");
-        assert_eq!(v["filter"]["status"], "unresolved");
-    }
-
-    #[tokio::test]
-    async fn list_review_comments_falls_back_to_rest() {
-        let (_t, svc, ws) = setup(true, true).await;
-        let v = svc
-            .pr_list_review_comments(ws, None, None)
-            .await
-            .expect("review comments");
-        assert_eq!(v["usingFallback"], true);
-        assert_eq!(v["threadCount"], 1);
-        assert_eq!(v["threads"][0]["id"], "rest-thread-5");
-        assert!(v["note"].is_string());
-    }
-
-    #[tokio::test]
-    async fn list_review_comments_merges_thread_pages() {
-        // Threads spanning multiple GraphQL pages are merged into one reply
-        // with truthful pagination metadata.
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                thread_pages: 3,
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let v = svc
-            .pr_list_review_comments(ws, None, None)
-            .await
-            .expect("review comments");
-        assert_eq!(v["usingFallback"], false);
-        assert_eq!(v["threadCount"], 3);
-        assert_eq!(v["threads"][0]["id"], "RT1");
-        assert_eq!(v["threads"][2]["id"], "RT3");
-        assert_eq!(v["pagination"]["totalCount"], 3);
-        assert_eq!(v["pagination"]["pagesFetched"], 3);
-        assert_eq!(v["pagination"]["hasMore"], false);
-    }
-
-    #[tokio::test]
-    async fn list_review_comments_page_cap_reports_has_more() {
-        // More pages than the cap: the loop stops at REVIEW_FETCH_MAX_PAGES
-        // (10) and reports `hasMore: true`.
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                thread_pages: 12,
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let v = svc
-            .pr_list_review_comments(ws, None, None)
-            .await
-            .expect("review comments");
-        assert_eq!(v["usingFallback"], false);
-        assert_eq!(v["threadCount"], 10);
-        assert_eq!(v["pagination"]["totalCount"], 10);
-        assert_eq!(v["pagination"]["pagesFetched"], 10);
-        assert_eq!(v["pagination"]["hasMore"], true);
-    }
-
-    #[tokio::test]
-    async fn list_review_comments_fallback_merges_pages() {
-        // REST fallback also drains all pages and reports honest metadata.
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                fail_threads: true,
-                review_comment_pages: 2,
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let v = svc
-            .pr_list_review_comments(ws, None, None)
-            .await
-            .expect("review comments");
-        assert_eq!(v["usingFallback"], true);
-        assert_eq!(v["threadCount"], 2);
-        assert_eq!(v["pagination"]["totalFetched"], 2);
-        assert_eq!(v["pagination"]["pagesFetched"], 2);
-        assert_eq!(v["pagination"]["hasMore"], false);
-    }
-
-    #[tokio::test]
-    async fn list_comments_returns_count() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_list_comments(ws, Some(5)).await.expect("comments");
-        assert_eq!(v["count"], 1);
-        assert_eq!(v["comments"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
     async fn no_active_pr_is_internal_error() {
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_status(ws).await.unwrap_err();
@@ -7450,7 +7563,8 @@ mod pr {
     #[tokio::test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
         assert_eq!(v["title"], "Add thing");
         assert_eq!(v["url"], "https://github.com/o/r/pull/42");
@@ -7494,7 +7608,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
@@ -7511,7 +7625,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
         assert_eq!(v["mergeBlockedReason"], "merge conflicts");
@@ -7528,7 +7642,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42).await.expect("snapshot");
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
         assert_eq!(v["isClosed"], false);
@@ -7547,8 +7661,8 @@ mod pr {
             true,
         )
         .await;
-        let err = svc.pr_state(ws, 999).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found")));
+        let err = svc.pr_state(ws, 999, None).await.unwrap_err();
+        assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[tokio::test]
@@ -7556,256 +7670,37 @@ mod pr {
         // No repository on the workspace: same "No active PR" guard as the
         // other pr.* methods (the required prNumber does not bypass it).
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_state(ws, 42).await.unwrap_err();
+        let err = svc.pr_state(ws, 42, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
     }
 
     #[tokio::test]
-    async fn merge_returns_parity_shape() {
-        let (_t, svc, ws) = setup(false, true).await;
+    async fn state_snapshot_cross_repo_arg_overrides_workspace_repo() {
+        // Workspace has no repository at all: the explicit `repo` slug alone
+        // scopes the lookup (no "No active PR" guard), and the resolved repo
+        // is echoed back.
+        let (_t, svc, ws) = setup(false, false).await;
         let v = svc
-            .pr_merge(ws, Some("squash".into()), None, None, None)
+            .pr_state(ws, 42, Some("acme/widgets".into()))
             .await
-            .expect("merge");
-        assert_eq!(v["merged"], true);
-        assert_eq!(v["sha"], "mergedsha");
-        assert_eq!(v["mergeMethod"], "squash");
+            .expect("snapshot");
+        assert_eq!(v["repo"], "acme/widgets");
         assert_eq!(v["prNumber"], 42);
     }
 
     #[tokio::test]
-    async fn merge_rejects_invalid_method() {
+    async fn state_snapshot_rejects_malformed_repo_arg() {
         let (_t, svc, ws) = setup(false, true).await;
-        let err = svc
-            .pr_merge(ws, Some("ff".into()), None, None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m.contains("mergeMethod must be one of")));
-    }
-
-    #[tokio::test]
-    async fn merge_requires_active_pr() {
-        let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_merge(ws, None, None, None, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
-    }
-
-    #[tokio::test]
-    async fn post_comment_and_reply_surface_html_url() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc
-            .pr_post_comment(ws.clone(), "ship it".into())
-            .await
-            .expect("post");
-        assert_eq!(v["id"], "777");
-        assert!(v["htmlUrl"].as_str().unwrap().contains("issuecomment-777"));
-
-        let r = svc
-            .pr_reply_to_review_comment(ws, 5, "agreed".into())
-            .await
-            .expect("reply");
-        assert_eq!(r["id"], 6);
-        assert!(r["htmlUrl"].as_str().unwrap().contains("discussion_r999"));
-    }
-
-    #[tokio::test]
-    async fn resolve_thread_reports_action() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc
-            .pr_resolve_thread(ws, "RT1".into(), Some("resolve".into()))
-            .await
-            .expect("resolve");
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["threadId"], "RT1");
-        assert_eq!(v["action"], "resolve");
-    }
-
-    #[tokio::test]
-    async fn unresolve_thread_failure_is_internal_error() {
-        // The stub `unresolve_thread` returns `false` (not resolved), which the
-        // service treats as a silent failure.
-        let (_t, svc, ws) = setup(false, true).await;
-        let err = svc
-            .pr_resolve_thread(ws, "RT1".into(), Some("unresolve".into()))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m.contains("Failed to unresolve thread")));
-    }
-
-    #[tokio::test]
-    async fn create_review_returns_review() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc
-            .pr_create_review(ws, "approve".into(), Some("LGTM".into()))
-            .await
-            .expect("review");
-        assert_eq!(v["review"]["verdict"], "approve");
-        assert_eq!(v["review"]["body"], "LGTM");
-    }
-
-    #[tokio::test]
-    async fn update_branch_reports_success() {
-        let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_update_branch(ws).await.expect("update branch");
-        assert_eq!(v["method"], "merge");
-        assert_eq!(v["alreadyUpToDate"], false);
-    }
-
-    // ---- pr.capabilities + runtime gating (§5.7 extension, §7.2/§7.4) ------
-
-    /// All capability flags disabled except plain merge (which is never gated).
-    fn no_caps() -> ScCapabilities {
-        ScCapabilities {
-            draft_prs: false,
-            squash_merge: false,
-            rebase_merge: false,
-            review_required_changes: false,
-            check_runs: false,
-            issues: false,
+        for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
+            let err = svc
+                .pr_state(ws.clone(), 42, Some(bad.into()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
+                "repo arg `{bad}` should be rejected, got {err:?}"
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn capabilities_returns_provider_and_camel_case_flags() {
-        // `with_pr: false` — pr.capabilities must NOT require an active PR.
-        let (_t, svc, ws) = setup(false, false).await;
-        let v = svc.pr_capabilities(ws).await.expect("capabilities");
-        assert_eq!(v["provider"], "stub");
-        let caps = &v["capabilities"];
-        assert_eq!(caps["draftPrs"], true);
-        assert_eq!(caps["squashMerge"], true);
-        assert_eq!(caps["rebaseMerge"], true);
-        assert_eq!(caps["reviewRequiredChanges"], true);
-        assert_eq!(caps["checkRuns"], true);
-        assert_eq!(caps["issues"], true);
-    }
-
-    #[tokio::test]
-    async fn capabilities_reflects_provider_flags() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            false,
-        )
-        .await;
-        let v = svc.pr_capabilities(ws).await.expect("capabilities");
-        assert_eq!(v["capabilities"]["squashMerge"], false);
-        assert_eq!(v["capabilities"]["checkRuns"], false);
-    }
-
-    #[tokio::test]
-    async fn capabilities_unknown_workspace_is_not_found() {
-        let (_t, svc, _ws) = setup(false, false).await;
-        let err = svc
-            .pr_capabilities(WorkspaceId::from_string("nope"))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn merge_gated_when_squash_unsupported() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let err = svc
-            .pr_merge(ws, Some("squash".into()), None, None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn merge_gated_when_rebase_unsupported() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let err = svc
-            .pr_merge(ws, Some("rebase".into()), None, None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
-    }
-
-    #[tokio::test]
-    async fn plain_merge_not_gated_by_capabilities() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let v = svc
-            .pr_merge(ws, None, None, None, None)
-            .await
-            .expect("merge");
-        assert_eq!(v["merged"], true);
-        assert_eq!(v["mergeMethod"], "merge");
-    }
-
-    #[tokio::test]
-    async fn create_review_gated_when_request_changes_unsupported() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let err = svc
-            .pr_create_review(ws, "request-changes".into(), Some("needs work".into()))
-            .await
-            .unwrap_err();
-        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
-    }
-
-    #[tokio::test]
-    async fn create_review_approve_not_gated() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let v = svc
-            .pr_create_review(ws, "approve".into(), None)
-            .await
-            .expect("review");
-        assert_eq!(v["review"]["verdict"], "approve");
-    }
-
-    #[tokio::test]
-    async fn list_check_runs_gated_when_unsupported() {
-        let (_t, svc, ws) = setup_with(
-            StubForge {
-                capabilities: Some(no_caps()),
-                ..Default::default()
-            },
-            true,
-        )
-        .await;
-        let err = svc.pr_list_check_runs(ws, None).await.unwrap_err();
-        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
     }
 
     // ------------------------------------------------------------------------
@@ -18804,8 +18699,11 @@ mod last_activity_events {
         );
     }
 
-    /// `dismiss_attention` only emits `workspace:updated { lastActivity }` when
-    /// attention actually changed (idempotent no-op on already-clear).
+    /// `dismiss_attention` emits `workspace:attention-changed` only when
+    /// attention actually changed (idempotent no-op on already-clear), and —
+    /// since acknowledging attention is not "activity"
+    /// (intent-hq/monorepo#1466) — never a `workspace:updated
+    /// { lastActivity }`.
     #[tokio::test]
     async fn dismiss_attention_idempotent() {
         let _guard = DebounceEnvGuard::new("100");
@@ -18826,7 +18724,8 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss (should emit both events).
+        // Dismiss: attention-changed only — no updated_at bump, so no
+        // debounced workspace:updated { lastActivity } follows.
         h.services
             .dismiss_attention(h.ws.clone())
             .await
@@ -18835,8 +18734,13 @@ mod last_activity_events {
         let ev1 = recv_one(&mut sub).await;
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
-        let ev2 = recv_one(&mut sub).await;
-        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "dismiss must not emit a lastActivity workspace:updated"
+        );
 
         // Dismiss again (no-op, no events).
         h.services

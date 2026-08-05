@@ -418,6 +418,73 @@ pub(crate) struct LiveTurn {
     pub(crate) last_activity_emit: Option<std::time::Instant>,
 }
 
+/// Machine-readable cause of a turn interruption, stamped as
+/// `metadata.interruptReason` on the persisted interrupted assistant row and
+/// carried on the terminal `agent:stream:end` (PROTOCOL §7) so clients can
+/// render a reason-specific Stopped indicator live AND after reload. Rows
+/// without the field are legacy and render the generic "Stopped".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptReason {
+    /// Plain `agent.stop` keep-alive interrupt (user clicked Stop).
+    ///
+    /// NOT exhaustive per-trigger: a user stop that lands with no live
+    /// connection or no `acpSessionId` falls back to the hard kill path and
+    /// surfaces as [`AgentStopped`](InterruptReason::AgentStopped) — clients
+    /// must not assume every user-initiated stop carries `user_stop`.
+    UserStop,
+    /// Preempted by an interrupt-priority message (user or agent sender —
+    /// see [`InterruptedBy`]).
+    PreemptedByMessage,
+    /// Graceful daemon shutdown captured the in-flight turn.
+    DaemonShutdown,
+    /// Hard stop/kill teardown (agent delete, kill-path fallback, …).
+    AgentStopped,
+}
+
+impl InterruptReason {
+    /// The wire string persisted in metadata and emitted on `stream:end`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            InterruptReason::UserStop => "user_stop",
+            InterruptReason::PreemptedByMessage => "preempted_by_message",
+            InterruptReason::DaemonShutdown => "daemon_shutdown",
+            InterruptReason::AgentStopped => "agent_stopped",
+        }
+    }
+}
+
+/// Sender attribution for [`InterruptReason::PreemptedByMessage`]: who sent
+/// the interrupt-priority message that preempted the turn. Serialized as
+/// `{ "kind": "user" }` or `{ "kind": "agent", "agentId": "…", "name": "…" }`
+/// under `metadata.interruptedBy` / the `stream:end` `interruptedBy` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterruptedBy {
+    /// FE-originated send (`MessageOrigin::User`).
+    User,
+    /// Agent-to-agent send, attributed via the `messageMetadata`
+    /// `fromAgentId`/`fromAgentName` sender-attribution payload (PROTOCOL §5.5).
+    Agent {
+        agent_id: String,
+        name: Option<String>,
+    },
+}
+
+impl InterruptedBy {
+    /// The wire JSON shape (see the enum docs).
+    pub(crate) fn to_json(&self) -> Value {
+        match self {
+            InterruptedBy::User => json!({ "kind": "user" }),
+            InterruptedBy::Agent { agent_id, name } => {
+                let mut v = json!({ "kind": "agent", "agentId": agent_id });
+                if let Some(name) = name {
+                    v["name"] = json!(name);
+                }
+                v
+            }
+        }
+    }
+}
+
 /// Minimum spacing between `agent:stream:activity` emissions per agent
 /// (leading-edge throttle, PROTOCOL §7): the first activity of a turn emits
 /// immediately, then at most one per window.
@@ -556,16 +623,35 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 
 /// Resolve the effective provider id for an agent session using the same precedence
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
-/// yields a non-empty provider) → `provider` field → default provider. Malformed
-/// compound ids like `:sonnet` yield an empty prefix and fall through to the provider
-/// field / default. This ensures `_meta` injection, spawn args, and all provider-keyed
-/// logic use a consistent provider id.
-pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
+/// yields a non-empty provider) → `provider` field → `configured_default` (the
+/// daemon settings `providers.active`, when the caller has one to offer) → the
+/// hardcoded default provider. Malformed compound ids like `:sonnet` yield an
+/// empty prefix and fall through to the provider field / configured
+/// default / default. This ensures `_meta` injection, spawn args, and all
+/// provider-keyed logic use a consistent provider id.
+///
+/// `configured_default` deliberately sits ABOVE the hardcoded
+/// [`intent_providers::default_provider_id`] (Auggie) in this precedence
+/// (spec Decision D2): a session with no persisted `provider` (e.g. an older
+/// row, or a creation path that never resolved one) should still prefer the
+/// user's actual configured default over the hardcoded one. Callers without
+/// settings access (e.g. usage-stats attribution) pass `None`, preserving
+/// the previous hardcoded-default behavior for that narrower use.
+pub(crate) fn resolve_provider_id(
+    model: Option<&str>,
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> String {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
         .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            configured_default
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+        })
         .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
 }
 
@@ -861,12 +947,18 @@ impl Services {
     /// swallowed: this must never block shutdown or the interrupted_agent row
     /// insert.
     ///
-    /// Empty-blocks slots (turn started, nothing streamed yet) are a no-op
-    /// unless `allow_empty` is set — the STAB-114 zero-output combined
-    /// delivery in `interrupt_send_message` and the graceful-shutdown capture
-    /// must never see a phantom row. Only the plain `agent.stop` interrupt
-    /// opts in, so a pre-first-token stop durably records the interruption as
-    /// an empty assistant row the FE can key the Stopped indicator off.
+    /// The row also carries a machine-readable `interruptReason` (plus
+    /// `interruptedBy` sender attribution for message preemption) so the FE
+    /// can render a reason-specific Stopped indicator that survives reloads —
+    /// see [`InterruptReason`] for the enum ↔ wire-string mapping.
+    ///
+    /// Empty-blocks slots (turn started, nothing streamed yet) persist too:
+    /// EVERY interruption durably records an interrupted assistant row —
+    /// empty blocks allowed — so the FE always has a row to anchor the
+    /// indicator on, even when the turn produced zero output. (This
+    /// supersedes the STAB-114 phantom-row-free zero-output preemption; the
+    /// combined-delivery re-queue check in `preempt_busy_turn` excludes the
+    /// row this flush appends.)
     ///
     /// Returns the persisted interrupted row's message id (`Some` only when
     /// this flush appended the row), so the interrupt path can carry
@@ -875,16 +967,23 @@ impl Services {
         &self,
         agent_id: &AgentId,
         live: LiveTurn,
-        allow_empty: bool,
+        reason: InterruptReason,
+        interrupted_by: Option<&InterruptedBy>,
     ) -> Option<String> {
-        if live.blocks.is_empty() && !allow_empty {
-            return None;
-        }
-        let metadata = json!({
+        let mut metadata = json!({
             "interrupted": true,
             "stopReason": "interrupted",
             "status": "interrupted",
+            "interruptReason": reason.as_str(),
         });
+        // `interruptedBy` is defined ONLY for message preemption (wire
+        // contract): the reason gate keeps a misusing caller from leaking
+        // attribution onto other interruption reasons.
+        if reason == InterruptReason::PreemptedByMessage {
+            if let Some(by) = interrupted_by {
+                metadata["interruptedBy"] = by.to_json();
+            }
+        }
         match self
             .store
             .append_agent_message_with_id(
@@ -1060,8 +1159,13 @@ impl Services {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → default), then build provider-specific _meta.
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        // prefix → provider field → configured default → default), then build
+        // provider-specific _meta.
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1119,7 +1223,11 @@ impl Services {
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection (recreate path sends
         // the same prompt as new/load).
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1183,7 +1291,11 @@ impl Services {
         }
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection.
-        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let provider_id = resolve_provider_id(
+            stored.model.as_deref(),
+            stored.provider.as_deref(),
+            self.effective_settings().providers.active.as_deref(),
+        );
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -1923,8 +2035,11 @@ impl Services {
         let now = time::OffsetDateTime::now_utc();
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
+        // Stats attribution only: no configured-default upgrade here (unlike
+        // the spawn-adjacent call sites above), matching the pre-existing
+        // `usage_stats.rs` helpers this mirrors — out of scope for D2.
         let provider_id =
-            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref()));
+            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None));
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),

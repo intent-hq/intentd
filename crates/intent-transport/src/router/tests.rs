@@ -2083,6 +2083,26 @@ async fn clone_failed_maps_to_structured_error_data() {
     );
 }
 
+#[test]
+fn voice_not_configured_maps_to_structured_error_data() {
+    // The voice.transcribe no-API-key failure (PROTOCOL §5.41,
+    // monorepo#1448) keeps the -32603 code and the generic "Internal error"
+    // message, and carries machine-readable
+    // `error.data = { code: "voice-no-api-key", detail }` with the
+    // descriptive text unchanged so clients stop matching on prose.
+    let detail = "voice not configured: voice: no API key found for elevenlabs \
+                  (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)";
+    let rpc = super::domain_to_rpc(intent_core::Error::VoiceNotConfigured {
+        detail: detail.to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(rpc.message, "Internal error");
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
 #[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
@@ -5004,6 +5024,77 @@ mod dismiss_questions_dispatch {
         }
         assert!(
             api.dismissed.lock().unwrap().is_none(),
+            "the API must not be called on a malformed request"
+        );
+    }
+}
+
+/// `agent.markSeen` (PROTOCOL §5.5, seen marker): the dispatch arm forwards
+/// `workspaceId`/`agentId`/`messageId` verbatim and rejects missing params
+/// with `-32602` before any API call.
+mod mark_seen_dispatch {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    #[derive(Default)]
+    struct RecordingApi {
+        seen: Arc<Mutex<Option<(WorkspaceId, AgentId, String)>>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn agent_mark_seen(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            message_id: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.seen.clone();
+            Box::pin(async move {
+                let seen = message_id.clone();
+                *slot.lock().unwrap() = Some((workspace_id, agent_id, message_id));
+                Ok(json!({ "success": true, "lastSeenMessageId": seen }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_seen_forwards_ids_verbatim() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"agent.markSeen",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"msg-7"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+        assert_eq!(v["result"]["lastSeenMessageId"], "msg-7");
+        let cap = api.seen.lock().unwrap().clone().expect("captured");
+        assert_eq!(cap.0.as_str(), "ws-1");
+        assert_eq!(cap.1.as_str(), "agent-1");
+        assert_eq!(cap.2, "msg-7");
+    }
+
+    #[tokio::test]
+    async fn mark_seen_missing_params_are_invalid_params() {
+        let api = RecordingApi::default();
+        for params in [
+            r#"{"agentId":"agent-1","messageId":"msg-7"}"#,
+            r#"{"workspaceId":"ws-1","messageId":"msg-7"}"#,
+            r#"{"workspaceId":"ws-1","agentId":"agent-1"}"#,
+        ] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.markSeen","params":{params}}}"#
+            );
+            let out = handle_message(&api, &msg).await.expect("response");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["error"]["code"], json!(-32602), "params: {params}");
+        }
+        assert!(
+            api.seen.lock().unwrap().is_none(),
             "the API must not be called on a malformed request"
         );
     }

@@ -215,8 +215,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
 
     // 1) Panicking REQUEST (spawned router path) → -32603 with echoed id.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":41,"method":"note.list","params":{"workspaceId":"w1"}}"#
-            .to_string(),
+        r#"{"jsonrpc":"2.0","id":41,"method":"note.list","params":{"workspaceId":"w1"}}"#.into(),
     ))
     .await
     .expect("send");
@@ -231,8 +230,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     //    read loop, so a (buggy) frame from it would have to arrive before the
     //    response to the next request — its absence below is the proof.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","method":"events.subscribe","params":{"eventTypes":["*"]}}"#
-            .to_string(),
+        r#"{"jsonrpc":"2.0","method":"events.subscribe","params":{"eventTypes":["*"]}}"#.into(),
     ))
     .await
     .expect("send");
@@ -240,7 +238,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // 3) Panicking REQUEST on the INLINE fast path → -32603 with echoed id.
     ws.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":42,"method":"events.subscribe","params":{"eventTypes":["*"]}}"#
-            .to_string(),
+            .into(),
     ))
     .await
     .expect("send");
@@ -254,7 +252,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
 
     // 4) The SAME connection keeps serving: a healthy request round-trips.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":43,"method":"workspace.list","params":{}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":43,"method":"workspace.list","params":{}}"#.into(),
     ))
     .await
     .expect("send");

@@ -11,11 +11,22 @@
 //! rename` verb regardless of the event type, matching the TS `FileChangedEvent`
 //! wire shape. Raw FS callbacks (sync, off-runtime) feed a tokio debounce task
 //! that coalesces rapid changes per path before publishing to the [`EventBus`].
+//!
+//! Git-ignored paths are suppressed at ingest time via the `ignore` crate
+//! (ripgrep's gitignore engine): a [`GitignoreMatcher`] built at watcher start
+//! (and rebuilt when ignore rules change) drops ignored paths before they
+//! enter the debounce map, so per-file events, burst summaries, and the
+//! shutdown flush are all clean. `file:*` rows persisted before this filter
+//! existed are historical noise aged out by the existing retention sweep
+//! (`delete_ephemeral_events_before` in intent-store's event repo); the query
+//! path is unchanged.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{Match, WalkBuilder};
 use intent_core::{now_iso, ActorType, EventActor, WorkspaceId};
 use intent_store::NewEvent;
 use notify::event::{EventKind, ModifyKind};
@@ -89,6 +100,28 @@ const IGNORED_DIRS: &[&str] = &[
     ".workspace",
 ];
 
+/// Default ignore patterns applied below every gitignore source, ported from
+/// the pre-port TS `GitignoreManager.DEFAULT_PATTERNS`. They hold even in
+/// non-git workspaces (the TS fallback behavior), and a user `.gitignore`
+/// negation (e.g. `!dist`) overrides them because gitignore files rank higher
+/// in the matcher chain.
+const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".DS_Store",
+    "Thumbs.db",
+    "dist",
+    "build",
+    ".next",
+    ".svelte-kit",
+    "coverage",
+    ".cache",
+    "*.log",
+    ".env",
+    ".env.local",
+    ".augment/*",
+];
+
 /// The raw change verb carried in `data.action` of every `file:*` event
 /// (`file:created`/`file:deleted`/`file:changed` alike, per the module docs).
 /// Serializes to the lowercase TS values (`change.action.toLowerCase()`).
@@ -156,6 +189,314 @@ fn should_ignore(relative: &Path) -> bool {
         Component::Normal(name) => name.to_str().is_some_and(|n| IGNORED_DIRS.contains(&n)),
         _ => false,
     })
+}
+
+/// Outcome of consulting the gitignore matcher chain for one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoreVerdict {
+    /// Some gitignore source ignores the path — suppress the event.
+    Ignore,
+    /// A negation (`!pattern`) explicitly re-includes the path; also rescues
+    /// paths the [`IGNORED_DIRS`] prefilter would drop.
+    Whitelist,
+    /// No gitignore source matched.
+    None,
+}
+
+fn to_verdict<T>(m: Match<T>) -> IgnoreVerdict {
+    if m.is_ignore() {
+        IgnoreVerdict::Ignore
+    } else if m.is_whitelist() {
+        IgnoreVerdict::Whitelist
+    } else {
+        IgnoreVerdict::None
+    }
+}
+
+/// Locate the repository git dir for `root`, handling both a `.git` directory
+/// and a `.git` **file** (`gitdir: <path>`) as written by linked worktrees and
+/// CoW checkouts. Returns `None` for non-git roots.
+fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta = std::fs::metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let target = Path::new(contents.strip_prefix("gitdir:")?.trim());
+    Some(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        root.join(target)
+    })
+}
+
+/// Locate `info/exclude` for `git_dir`. Linked worktrees keep it under the
+/// *common* dir (the `commondir` file inside the worktree's git dir points
+/// there); primary checkouts use the git dir itself.
+fn resolve_exclude_file(git_dir: &Path) -> PathBuf {
+    let base = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(contents) => {
+            let common = Path::new(contents.trim());
+            if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                git_dir.join(common)
+            }
+        }
+        Err(_) => git_dir.to_path_buf(),
+    };
+    base.join("info").join("exclude")
+}
+
+/// Ingest-time gitignore evaluation, mirroring how the pre-port TS filtered
+/// through `gitignore-manager.ts` before debouncing but with full Git
+/// semantics via the `ignore` crate. Sources are consulted highest precedence
+/// first: `.gitignore` files (deepest directory wins, per Git), then
+/// `.git/info/exclude`, then global excludes (`core.excludesFile`), then the
+/// [`DEFAULT_IGNORE_PATTERNS`]; within each source the usual last-match-wins
+/// gitignore rule applies, so the first source with a definitive match
+/// decides.
+///
+/// The matcher is rebuilt lazily (on next use) after a raw event touches a
+/// `.gitignore` file at any depth or the repo's `info/exclude`, so rule edits
+/// take effect without a daemon restart. External edits to *global* excludes
+/// are outside the watched root and stay restart-scoped. Failures degrade
+/// gracefully: a source that fails to load simply drops out of the chain, so
+/// legitimate events are never suppressed by an error.
+struct GitignoreMatcher {
+    root: PathBuf,
+    /// Resolved `<gitdir>/info/exclude` (worktree-aware), watched for edits.
+    /// Detected on the absolute path before the [`IGNORED_DIRS`] prefilter,
+    /// which would otherwise drop everything under `.git`. Both the resolved
+    /// and canonicalized forms are kept (deduped): `notify` may report either
+    /// shape (symlinked roots, `..` segments from a worktree `commondir`), so
+    /// comparing against both keeps invalidation robust.
+    exclude_paths: Vec<PathBuf>,
+    /// `.gitignore` matchers paired with their containing directory, ordered
+    /// deepest-first so nested files take precedence per Git.
+    gitignores: Vec<(PathBuf, Gitignore)>,
+    exclude: Option<Gitignore>,
+    global: Option<Gitignore>,
+    defaults: Option<Gitignore>,
+    /// Whether any source carries a `!` negation. When false, nothing can
+    /// rescue a prefiltered path, so ingest skips the match entirely for
+    /// [`IGNORED_DIRS`] paths (the fast path).
+    has_whitelists: bool,
+    dirty: bool,
+}
+
+impl GitignoreMatcher {
+    fn new(root: PathBuf) -> Self {
+        let mut matcher = Self {
+            root,
+            exclude_paths: Vec::new(),
+            gitignores: Vec::new(),
+            exclude: None,
+            global: None,
+            defaults: None,
+            has_whitelists: false,
+            dirty: false,
+        };
+        matcher.rebuild();
+        matcher
+    }
+
+    /// Mark the matcher dirty when a raw event touches an ignore-rule file:
+    /// a `.gitignore` at any depth or the repo's `info/exclude`. Rebuilding is
+    /// deferred to the next [`Self::verdict`] call.
+    ///
+    /// `.gitignore` files under [`IGNORED_DIRS`] (e.g. `target/.gitignore`
+    /// written by cargo, or files shipped inside `vendor/`) are skipped by the
+    /// discovery walk in [`Self::rebuild`], so a rebuild for them would be a
+    /// no-op — don't mark dirty for those (checked via `rel`, the
+    /// workspace-relative path). The `exclude_paths` comparison stays on the
+    /// absolute path: `info/exclude` intentionally lives under `.git`. The
+    /// incoming path is canonicalized only on the cheap file-name match, and
+    /// both it and its canonical form are compared against both stored forms,
+    /// since `notify` and `resolve_exclude_file` may disagree on symlinks.
+    fn note_raw_change(&mut self, abs: &Path, rel: Option<&str>) {
+        if !self.exclude_paths.is_empty() && abs.file_name().is_some_and(|n| n == "exclude") {
+            let canon = std::fs::canonicalize(abs).ok();
+            if self
+                .exclude_paths
+                .iter()
+                .any(|p| p == abs || Some(p) == canon.as_ref())
+            {
+                self.dirty = true;
+                return;
+            }
+        }
+        if abs.file_name().is_some_and(|n| n == ".gitignore")
+            && rel.is_some_and(|r| !should_ignore(Path::new(r)))
+        {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether any source carries a `!` negation. Rebuilds first when the
+    /// matcher is dirty so the ingest fast-path never consults a stale
+    /// answer: a stale `false` would let the [`IGNORED_DIRS`] prefilter drop
+    /// a path that a freshly added negation rescues.
+    fn has_whitelists(&mut self) -> bool {
+        if self.dirty {
+            self.rebuild();
+        }
+        self.has_whitelists
+    }
+
+    /// Evaluate `abs` (with `rel`, its workspace-relative form) against the
+    /// source chain. Uses parent-aware matching so files under an ignored
+    /// directory (e.g. `.svelte-kit/output/x.d.ts` with a `.svelte-kit/`
+    /// rule) match even after deletion: with no stat available the path is
+    /// treated as a file, but its ancestors are checked as directories.
+    fn verdict(&mut self, abs: &Path, rel: &str) -> IgnoreVerdict {
+        if self.dirty {
+            self.rebuild();
+        }
+        let is_dir = abs.is_dir();
+        for (dir, matcher) in &self.gitignores {
+            if !abs.starts_with(dir) {
+                continue;
+            }
+            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            if v != IgnoreVerdict::None {
+                return v;
+            }
+        }
+        if let Some(matcher) = &self.exclude {
+            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            if v != IgnoreVerdict::None {
+                return v;
+            }
+        }
+        if let Some(matcher) = &self.global {
+            // The global matcher is rooted at "" (per `Gitignore::global`), so
+            // it must see the relative path, not the absolute one.
+            let v = to_verdict(matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
+            if v != IgnoreVerdict::None {
+                return v;
+            }
+        }
+        if let Some(matcher) = &self.defaults {
+            return to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+        }
+        IgnoreVerdict::None
+    }
+
+    /// (Re)load every source. Runs at watcher start and after ignore-rule
+    /// edits; the `.gitignore` discovery walk is itself gitignore-aware and
+    /// skips [`IGNORED_DIRS`], so it stays cheap even on large trees.
+    fn rebuild(&mut self) {
+        self.dirty = false;
+        self.gitignores.clear();
+        self.exclude = None;
+        self.global = None;
+        self.exclude_paths.clear();
+
+        let mut defaults = GitignoreBuilder::new(&self.root);
+        for pattern in DEFAULT_IGNORE_PATTERNS {
+            let _ = defaults.add_line(None, pattern);
+        }
+        self.defaults = match defaults.build() {
+            Ok(matcher) => Some(matcher),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to build default ignore matcher; only IGNORED_DIRS filtering applies"
+                );
+                None
+            }
+        };
+
+        if let Some(git_dir) = resolve_git_dir(&self.root) {
+            let (global, err) = Gitignore::global();
+            if let Some(e) = err {
+                tracing::debug!(error = %e, "failed to load global git excludes");
+            }
+            if global.num_ignores() + global.num_whitelists() > 0 {
+                self.global = Some(global);
+            }
+
+            let exclude_path = resolve_exclude_file(&git_dir);
+            if exclude_path.is_file() {
+                let mut builder = GitignoreBuilder::new(&self.root);
+                if let Some(e) = builder.add(&exclude_path) {
+                    tracing::debug!(error = %e, "failed to read .git/info/exclude");
+                }
+                match builder.build() {
+                    Ok(matcher) => self.exclude = Some(matcher),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "failed to build info/exclude matcher");
+                    }
+                }
+            }
+            if let Ok(canon) = std::fs::canonicalize(&exclude_path) {
+                if canon != exclude_path {
+                    self.exclude_paths.push(canon);
+                }
+            }
+            self.exclude_paths.push(exclude_path);
+
+            let mut files: Vec<PathBuf> = Vec::new();
+            // Keep discovery deterministic for a given tree: don't consult
+            // parent-of-root ignore rules, `.ignore` files, host global
+            // excludes, or `.git/info/exclude` during the walk — the sources
+            // we honor are added to the matcher chain explicitly above.
+            // In-tree `.gitignore` awareness stays on so ignored subtrees are
+            // pruned from the walk itself.
+            let walker = WalkBuilder::new(&self.root)
+                .hidden(false)
+                .follow_links(false)
+                .parents(false)
+                .ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .filter_entry(|entry| {
+                    !entry.file_type().is_some_and(|t| t.is_dir())
+                        || !entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|n| IGNORED_DIRS.contains(&n))
+                })
+                .build();
+            for entry in walker.flatten() {
+                if entry.file_type().is_some_and(|t| t.is_file())
+                    && entry.file_name() == ".gitignore"
+                {
+                    files.push(entry.into_path());
+                }
+            }
+            files.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+            for file in files {
+                let Some(dir) = file.parent().map(Path::to_path_buf) else {
+                    continue;
+                };
+                let mut builder = GitignoreBuilder::new(&dir);
+                if let Some(e) = builder.add(&file) {
+                    tracing::debug!(error = %e, path = %file.display(), "failed to read .gitignore");
+                }
+                match builder.build() {
+                    Ok(matcher) => self.gitignores.push((dir, matcher)),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            path = %file.display(),
+                            "failed to build .gitignore matcher"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.has_whitelists = self
+            .gitignores
+            .iter()
+            .map(|(_, m)| m)
+            .chain(self.exclude.iter())
+            .chain(self.global.iter())
+            .any(|m| m.num_whitelists() > 0);
+    }
 }
 
 /// Workspace-relative, forward-slash path for the event payload, or `None` when
@@ -237,6 +578,7 @@ async fn debounce_loop(
     root: PathBuf,
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
 ) {
+    let mut matcher = GitignoreMatcher::new(root.clone());
     let mut pending: HashMap<String, (Action, tokio::time::Instant)> = HashMap::new();
     let mut burst_until: Option<tokio::time::Instant> = None;
     loop {
@@ -244,8 +586,8 @@ async fn debounce_loop(
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
                 Some(event) => {
-                    ingest(&root, &event, &mut pending);
-                    drain_ready(&root, &mut raw_rx, &mut pending);
+                    ingest(&root, &mut matcher, &event, &mut pending);
+                    drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
                 }
                 // Watcher dropped: flush whatever is pending, then stop.
                 None => {
@@ -257,7 +599,7 @@ async fn debounce_loop(
                 // Ingest everything already delivered before deciding what is
                 // due, so the burst decision sees the full backlog even when
                 // publishes are slow (STAB-121).
-                drain_ready(&root, &mut raw_rx, &mut pending);
+                drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
                 flush_due(&bus, &workspace_id, &mut pending, &mut burst_until).await;
             }
         }
@@ -272,20 +614,24 @@ async fn debounce_loop(
 /// (STAB-121).
 fn drain_ready(
     root: &Path,
+    matcher: &mut GitignoreMatcher,
     raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
     for _ in 0..DRAIN_MAX_PER_CALL {
         match raw_rx.try_recv() {
-            Ok(event) => ingest(root, &event, pending),
+            Ok(event) => ingest(root, matcher, &event, pending),
             Err(_) => break,
         }
     }
 }
 
 /// Fold one raw event into `pending`, resetting each affected path's deadline.
+/// Gitignored paths are dropped here — before they enter `pending` — so
+/// ignored churn never inflates the burst threshold.
 fn ingest(
     root: &Path,
+    matcher: &mut GitignoreMatcher,
     event: &notify::Event,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
@@ -294,11 +640,26 @@ fn ingest(
     };
     let deadline = tokio::time::Instant::now() + DEBOUNCE;
     for abs in &event.paths {
-        let Some(rel) = relative_path(root, abs) else {
+        // Observe ignore-rule edits before any filtering: info/exclude lives
+        // under `.git`, which the IGNORED_DIRS prefilter drops.
+        let rel = relative_path(root, abs);
+        matcher.note_raw_change(abs, rel.as_deref());
+        let Some(rel) = rel else {
             continue;
         };
-        if rel.is_empty() || should_ignore(Path::new(&rel)) {
+        if rel.is_empty() {
             continue;
+        }
+        let prefiltered = should_ignore(Path::new(&rel));
+        // Fast path: without any `!` negation nothing can rescue a
+        // prefiltered path, so skip the gitignore match entirely.
+        if prefiltered && !matcher.has_whitelists() {
+            continue;
+        }
+        match matcher.verdict(abs, &rel) {
+            IgnoreVerdict::Ignore => continue,
+            IgnoreVerdict::None if prefiltered => continue,
+            IgnoreVerdict::Whitelist | IgnoreVerdict::None => {}
         }
         let merged = match pending.get(&rel) {
             Some((existing, _)) if existing.rank() >= action.rank() => *existing,
@@ -561,5 +922,44 @@ mod tests {
         assert_eq!(parent_dir("src/main.rs"), "src");
         assert_eq!(parent_dir("a/b/c.txt"), "a/b");
         assert_eq!(parent_dir(""), "");
+    }
+
+    #[test]
+    fn resolve_git_dir_handles_dir_gitdir_file_and_non_git() {
+        let tmp = std::env::temp_dir().join(format!("intentd-gitdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tmp.join("a/.git")).unwrap();
+        assert_eq!(resolve_git_dir(&tmp.join("a")), Some(tmp.join("a/.git")));
+
+        // Linked worktree / CoW checkout: `.git` is a file with a relative
+        // gitdir pointer, resolved against the root.
+        std::fs::create_dir_all(tmp.join("b")).unwrap();
+        std::fs::write(tmp.join("b/.git"), "gitdir: ../a/.git/worktrees/b\n").unwrap();
+        assert_eq!(
+            resolve_git_dir(&tmp.join("b")),
+            Some(tmp.join("b").join("../a/.git/worktrees/b"))
+        );
+
+        std::fs::create_dir_all(tmp.join("c")).unwrap();
+        assert_eq!(resolve_git_dir(&tmp.join("c")), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_exclude_file_honors_commondir() {
+        let tmp = std::env::temp_dir().join(format!("intentd-excl-{}", uuid::Uuid::new_v4()));
+        let git_dir = tmp.join("gd");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        assert_eq!(
+            resolve_exclude_file(&git_dir),
+            git_dir.join("info").join("exclude")
+        );
+
+        // Worktree git dirs carry a `commondir` file pointing at the shared dir.
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(
+            resolve_exclude_file(&git_dir),
+            git_dir.join("../..").join("info").join("exclude")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

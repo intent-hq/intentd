@@ -107,6 +107,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": category.as_str(), "detail": detail })),
         },
+        // Missing voice provider API key: same -32603 code and "Internal
+        // error" message as before (deliberately not the variant's Display,
+        // which carries the detail), plus machine-readable `data.code` with
+        // the descriptive text preserved in `data.detail` (monorepo#1448).
+        ref e @ Error::VoiceNotConfigured { ref detail } => RpcErr {
+            code: e.code(),
+            message: "Internal error".to_string(),
+            data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -1224,6 +1233,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.markSeen" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_mark_seen(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.editAndRegenerate" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -1996,13 +2015,6 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        "pr.capabilities" => {
-            // §5.7 extension: requires a resolvable provider but NOT an
-            // active PR — the FE gates UI on the flags before any PR exists.
-            let ws = require_ws_note(params)?;
-            let r = api.pr_capabilities(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "pr.status" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
@@ -2011,105 +2023,6 @@ async fn dispatch(
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
-            Ok(r)
-        }
-        "pr.listComments" => {
-            let ws = require_ws_note(params)?;
-            let count = opt_int(params, "count");
-            let r = api
-                .pr_list_comments(ws, count)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.listReviewComments" => {
-            let ws = require_ws_note(params)?;
-            let path = opt_str(params, "path");
-            let status = opt_str(params, "status");
-            let r = api
-                .pr_list_review_comments(ws, path, status)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.getReviews" => {
-            let ws = require_ws_note(params)?;
-            let pr_number = opt_int(params, "prNumber").and_then(|n| u64::try_from(n).ok());
-            let r = api
-                .pr_get_reviews(ws, pr_number)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.listCheckRuns" => {
-            let ws = require_ws_note(params)?;
-            let git_ref = opt_str(params, "ref");
-            let r = api
-                .pr_list_check_runs(ws, git_ref)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.merge" => {
-            let ws = require_ws_note(params)?;
-            let merge_method = opt_str(params, "mergeMethod");
-            let commit_title = opt_str(params, "commitTitle");
-            let commit_message = opt_str(params, "commitMessage");
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let r = api
-                .pr_merge(
-                    ws,
-                    merge_method,
-                    commit_title,
-                    commit_message,
-                    idempotency_key,
-                )
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.updateBranch" => {
-            let ws = require_ws_note(params)?;
-            let r = api.pr_update_branch(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.postComment" => {
-            let ws = require_ws_note(params)?;
-            let body = require_str_param(params, "body")?;
-            let r = api.pr_post_comment(ws, body).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.replyToReviewComment" => {
-            let ws = require_ws_note(params)?;
-            let comment_id = params
-                .get("commentId")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| invalid_params("Missing required parameter: commentId"))?;
-            let body = require_str_param(params, "body")?;
-            let r = api
-                .pr_reply_to_review_comment(ws, comment_id, body)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.resolveThread" => {
-            let ws = require_ws_note(params)?;
-            let thread_id = require_str_param(params, "threadId")?;
-            let action = opt_str(params, "action");
-            let r = api
-                .pr_resolve_thread(ws, thread_id, action)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "pr.createReview" => {
-            let ws = require_ws_note(params)?;
-            let verdict = require_str_param(params, "verdict")?;
-            let body = opt_str(params, "body");
-            let r = api
-                .pr_create_review(ws, verdict, body)
-                .await
-                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
@@ -2744,7 +2657,10 @@ async fn dispatch(
         }
         "search.messages" => {
             // `workspaceId` is optional (absent → global search across all
-            // workspaces); `preferWorkspaceId` is a soft ranking boost.
+            // workspaces); `preferWorkspaceId` is a soft ranking boost, and
+            // archived-workspace matches get a soft penalty on the same
+            // bm25-unit scale, yielding the default tier order preferred →
+            // other active → archived.
             let ws = opt_workspace_id(params);
             let query = require_str_param(params, "query")?;
             let agent_id = opt_str(params, "agentId");

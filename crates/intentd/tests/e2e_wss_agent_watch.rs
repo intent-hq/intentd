@@ -16,7 +16,14 @@
 //!  - a bare-`*` agent subscription never wakes on another agent's
 //!    message/tool-call/idle events but does wake on non-agent categories;
 //!  - the FE `events.subscribe` stream still receives `agent:message` and
-//!    `agent:tool:call` (the restriction is agent-caller-only).
+//!    `agent:tool:call` (the restriction is agent-caller-only);
+//!  - agent-waiting deferral (monorepo#1468): a completion watch on an
+//!    idle-but-waiting target (one that itself holds a live outgoing
+//!    completion watch on a third agent) does not fire on the target's
+//!    interim idle (stamped `isWaitingForOtherAgents: true`) — on both the
+//!    live delivery path and the registration-time reconcile (re-arm on an
+//!    already-idle-but-waiting target) — and delivers exactly once when the
+//!    chain settles.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -182,7 +189,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
@@ -373,8 +380,10 @@ async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> Stri
         .to_string()
 }
 
-/// Await `agent:idle` for `agent_id` on the subscriber stream.
-async fn await_idle(sub: &mut TlsWs, agent_id: &str, secs: u64) {
+/// Await `agent:idle` for `agent_id` on the subscriber stream and return the
+/// full event payload (for idle-annotation assertions such as
+/// `isWaitingForOtherAgents`).
+async fn await_idle_event(sub: &mut TlsWs, agent_id: &str, secs: u64) -> Value {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
     loop {
         let frame = wss_event_opt_until(sub, deadline)
@@ -385,11 +394,16 @@ async fn await_idle(sub: &mut TlsWs, agent_id: &str, secs: u64) {
             continue;
         }
         match event["type"].as_str() {
-            Some("agent:idle") => return,
+            Some("agent:idle") => return event.clone(),
             Some("agent:failed") => panic!("agent:failed while awaiting idle: {frame}"),
             _ => {}
         }
     }
+}
+
+/// Await `agent:idle` for `agent_id` on the subscriber stream.
+async fn await_idle(sub: &mut TlsWs, agent_id: &str, secs: u64) {
+    let _ = await_idle_event(sub, agent_id, secs).await;
 }
 
 /// Serialized conversation text for an agent.
@@ -997,4 +1011,350 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         text.contains(&format!("Child agent {target}")),
         "failure wake names the target: {text}"
     );
+}
+
+/// Number of the agent's persisted wake rows (user rows framed with
+/// `[WORKSPACE EVENTS]`) whose text contains `needle`.
+async fn wake_row_count(
+    rpc: &mut TlsWs,
+    id: i64,
+    ws_id: &str,
+    agent_id: &str,
+    needle: &str,
+) -> usize {
+    let convo = wss_rpc(
+        rpc,
+        id,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(blocks_text)
+        .filter(|t| t.contains("[WORKSPACE EVENTS]") && t.contains(needle))
+        .count()
+}
+
+/// DEFER-1 (monorepo#1468): live-path agent-waiting deferral through the real
+/// MCP bridge. Coord watches Middle; Middle's turn registers its own watch on
+/// Leaf, so Middle's idle is interim (stamped `isWaitingForOtherAgents: true`)
+/// and Coord's watch neither delivers nor retires. When Leaf completes, the
+/// chain settles bottom-up — Middle wakes, goes genuinely idle, and Coord
+/// receives exactly ONE completion wake for Middle.
+#[tokio::test]
+async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
+    let Some(script) = gate("WSS agent-waiting deferral E2E") else {
+        return;
+    };
+
+    const COORD_GO: &str = "WATCH3_COORD_GO";
+    const MIDDLE_GO: &str = "WATCH3_MIDDLE_GO";
+    const LEAF_GO: &str = "WATCH3_LEAF_GO";
+
+    let coord_watch_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'DeferMiddle');
+        const r = await ws.agent.watch(t.id);
+        return 'coordWatched=' + r.ok;
+    "#;
+    let middle_watch_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'DeferLeaf');
+        const r = await ws.agent.watch(t.id);
+        return 'midWatched=' + r.ok;
+    "#;
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
+            {
+                "ifPromptContains": COORD_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": coord_watch_js, "summary": "coord watches middle" }
+                },
+                "emitToolBlocks": true,
+                "response": "coord watch registered",
+            },
+            {
+                "ifPromptContains": MIDDLE_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": middle_watch_js, "summary": "middle watches leaf" }
+                },
+                "emitToolBlocks": true,
+                "response": "middle watch registered",
+            },
+            { "ifPromptContains": LEAF_GO, "response": "leaf turn done" },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    let ws_id = setup.ws_id.clone();
+
+    // Watch targets FIRST so the watchers' ws.agent.list lookups find them.
+    let leaf = create_agent(&mut setup.rpc, 10, &ws_id, "DeferLeaf").await;
+    let middle = create_agent(&mut setup.rpc, 11, &ws_id, "DeferMiddle").await;
+    let coord = create_agent(&mut setup.rpc, 12, &ws_id, "DeferCoord").await;
+
+    // Coord registers its watch on Middle through the bridge. Its own idle is
+    // stamped interim — it now holds a live outgoing watch on Middle.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": coord, "content": COORD_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "coord watch send ok: {sent}");
+    let coord_idle = await_idle_event(&mut setup.sub, &coord, 60).await;
+    assert_eq!(
+        coord_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "coord idle is stamped agent-waiting: {coord_idle}"
+    );
+    let mut req_id = 20i64;
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &coord,
+        "coordWatched=true",
+        30,
+    )
+    .await;
+
+    // Middle's turn registers ITS watch on Leaf, then ends. That idle is
+    // interim (Middle waits on Leaf), so Coord's watch must neither deliver
+    // nor retire.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": middle, "content": MIDDLE_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "middle send ok: {sent}");
+    let middle_idle = await_idle_event(&mut setup.sub, &middle, 60).await;
+    assert_eq!(
+        middle_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "middle interim idle is stamped agent-waiting: {middle_idle}"
+    );
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &middle,
+        "midWatched=true",
+        30,
+    )
+    .await;
+
+    // Deferred: no wake reached Coord and its watch on Middle stays armed.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord).await;
+    assert!(
+        !text.contains("Child agent"),
+        "no completion wake may be delivered on the interim idle: {text}"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &coord, &middle).await;
+    req_id += 1;
+    assert_eq!(n, 1, "coord's watch on middle stays armed while deferred");
+
+    // Leaf completes → Middle's watch fires → Middle's wake turn ends in a
+    // GENUINE idle (its watch on Leaf was retired at delivery) → Coord's
+    // deferred watch finally delivers, exactly once.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        50,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": leaf, "content": LEAF_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "leaf send ok: {sent}");
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &coord,
+        "Child agent DeferMiddle",
+        120,
+    )
+    .await;
+    assert!(
+        text.contains("completed."),
+        "settlement wake reports middle completed: {text}"
+    );
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &coord, &middle, 0).await;
+    // Exactly-one wake: drain Coord's wake turns, then count the persisted
+    // wake rows naming Middle.
+    await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord).await;
+    let wakes = wake_row_count(
+        &mut setup.rpc,
+        req_id,
+        &ws_id,
+        &coord,
+        "Child agent DeferMiddle",
+    )
+    .await;
+    assert_eq!(wakes, 1, "exactly one completion wake for middle");
+}
+
+/// DEFER-2 (monorepo#1468): registration-time reconcile honors the deferral.
+/// Arming `ws.agent.watch` on a target that is ALREADY idle-but-agent-waiting
+/// (Middle idled holding its own live watch on Leaf) must not fire the
+/// synthetic completion — the watch stays armed until the chain settles, then
+/// delivers exactly once.
+#[tokio::test]
+async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
+    let Some(script) = gate("WSS agent-waiting re-arm deferral E2E") else {
+        return;
+    };
+
+    const MIDDLE_GO: &str = "WATCH4_MIDDLE_GO";
+    const REARM_GO: &str = "WATCH4_REARM_GO";
+    const LEAF_GO: &str = "WATCH4_LEAF_GO";
+
+    let middle_watch_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'RearmLeaf');
+        const r = await ws.agent.watch(t.id);
+        return 'midWatched=' + r.ok;
+    "#;
+    let rearm_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'RearmMiddle');
+        const r = await ws.agent.watch(t.id);
+        return 'rearmed=' + r.ok;
+    "#;
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
+            {
+                "ifPromptContains": MIDDLE_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": middle_watch_js, "summary": "middle watches leaf" }
+                },
+                "emitToolBlocks": true,
+                "response": "middle watch registered",
+            },
+            {
+                "ifPromptContains": REARM_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": rearm_js, "summary": "watch the idle-but-waiting middle" }
+                },
+                "emitToolBlocks": true,
+                "response": "rearm done",
+            },
+            { "ifPromptContains": LEAF_GO, "response": "leaf turn done" },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    let ws_id = setup.ws_id.clone();
+
+    let leaf = create_agent(&mut setup.rpc, 10, &ws_id, "RearmLeaf").await;
+    let middle = create_agent(&mut setup.rpc, 11, &ws_id, "RearmMiddle").await;
+    let watcher = create_agent(&mut setup.rpc, 12, &ws_id, "Rearmer").await;
+
+    // Middle runs FIRST: it watches Leaf, then idles — the idle-but-waiting
+    // shape the re-arm reconcile must treat as interim.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": middle, "content": MIDDLE_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "middle send ok: {sent}");
+    let middle_idle = await_idle_event(&mut setup.sub, &middle, 60).await;
+    assert_eq!(
+        middle_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "middle interim idle is stamped agent-waiting: {middle_idle}"
+    );
+    let mut req_id = 20i64;
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &middle,
+        "midWatched=true",
+        30,
+    )
+    .await;
+
+    // NOW the watcher arms a watch on the already-idle Middle. Without the
+    // deferral the registration-time reconcile would fire an instant
+    // synthetic "completed" wake off the RuntimeIdle status.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": watcher, "content": REARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "rearm send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        "rearmed=true",
+        60,
+    )
+    .await;
+
+    // No synthetic completion: the watcher's transcript stays wake-free and
+    // its watch on Middle stays armed.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &watcher).await;
+    assert!(
+        !text.contains("Child agent"),
+        "re-arm on an idle-but-waiting target must not fire synthetically: {text}"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &watcher, &middle).await;
+    req_id += 1;
+    assert_eq!(n, 1, "watch on the waiting middle stays armed");
+
+    // Leaf completes → Middle wakes and settles → the watcher's deferred
+    // watch delivers exactly once.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        50,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": leaf, "content": LEAF_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "leaf send ok: {sent}");
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        "Child agent RearmMiddle",
+        120,
+    )
+    .await;
+    assert!(
+        text.contains("completed."),
+        "settlement wake reports middle completed: {text}"
+    );
+    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &middle, 0).await;
+    await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &watcher).await;
+    let wakes = wake_row_count(
+        &mut setup.rpc,
+        req_id,
+        &ws_id,
+        &watcher,
+        "Child agent RearmMiddle",
+    )
+    .await;
+    assert_eq!(wakes, 1, "exactly one completion wake for middle");
 }
