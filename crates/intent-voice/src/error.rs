@@ -10,8 +10,17 @@
 pub enum Error {
     /// No usable API key for the selected provider. The daemon keeps running
     /// and voice features report this (graceful, mirroring intent-linear).
+    /// This variant is exclusively the missing-key case — it drives the
+    /// structured `voice-no-api-key` wire code (monorepo#1448) — so provider
+    /// failures must not reuse it.
     #[error("voice not configured: {0}")]
     NotConfigured(String),
+
+    /// The requested transcription model is unavailable on this account
+    /// (provider returned 404). Distinct from [`Error::NotConfigured`] so a
+    /// model-unavailable failure is never mislabeled as a missing API key.
+    #[error("voice model unavailable: {0}")]
+    ModelUnavailable(String),
 
     /// Invalid or malformed settings (e.g. a bad `apiBaseUrl`).
     #[error("voice configuration error: {0}")]

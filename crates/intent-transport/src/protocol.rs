@@ -17,10 +17,12 @@
 //! was optional, so row shapes remain valid for existing clients. Version 4.3
 //! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
 //! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
-//! 315 total.
+//! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
+//! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
+//! same `-32603` / "Internal error" envelope, no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.3";
+pub const PROTOCOL_VERSION: &str = "4.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

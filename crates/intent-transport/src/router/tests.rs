@@ -2083,6 +2083,26 @@ async fn clone_failed_maps_to_structured_error_data() {
     );
 }
 
+#[test]
+fn voice_not_configured_maps_to_structured_error_data() {
+    // The voice.transcribe no-API-key failure (PROTOCOL §5.41,
+    // monorepo#1448) keeps the -32603 code and the generic "Internal error"
+    // message, and carries machine-readable
+    // `error.data = { code: "voice-no-api-key", detail }` with the
+    // descriptive text unchanged so clients stop matching on prose.
+    let detail = "voice not configured: voice: no API key found for elevenlabs \
+                  (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)";
+    let rpc = super::domain_to_rpc(intent_core::Error::VoiceNotConfigured {
+        detail: detail.to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(rpc.message, "Internal error");
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "voice-no-api-key", "detail": detail })
+    );
+}
+
 #[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
