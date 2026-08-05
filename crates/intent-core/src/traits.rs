@@ -3012,10 +3012,36 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
-    /// active PR; otherwise `-32603` (PROTOCOL §5.7).
-    fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+    /// Router-compat shim: resolve the FE-facing active-PR context for a
+    /// `pr.*` router arm — the workspace's linked repo as an `"owner/name"`
+    /// slug plus `explicit_pr` when given, else the linked PR number.
+    /// Errors with the §5.7 "No active PR" surface (`-32603`) when the
+    /// workspace is missing/unlinked. This is the ONLY remaining implicit
+    /// active-PR resolution; every `pr_*` data method below takes explicit
+    /// `repo` + `pr_number`.
+    fn pr_active_context(
+        &self,
+        workspace_id: WorkspaceId,
+        explicit_pr: Option<u64>,
+    ) -> BoxFuture<'_, Result<(String, u64)>> {
+        let _ = (workspace_id, explicit_pr);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_active_context not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `pr.status`: state, mergeability, and summary of PR `pr_number` in
+    /// `repo` (an `"owner/name"` slug) (PROTOCOL §5.7; explicit addressing —
+    /// the FE router arm resolves the active PR via [`Self::pr_active_context`]).
+    fn pr_status(
+        &self,
+        workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, repo, pr_number);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_status not implemented".to_string(),
@@ -3037,14 +3063,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.listComments`: conversation-level comments on the active PR, clamped to
-    /// `count` (default 20, max 100) (PROTOCOL §5.7).
+    /// `pr.listComments`: conversation-level comments on PR `pr_number` in
+    /// `repo`, clamped to `count` (default 20, max 100) (PROTOCOL §5.7).
     fn pr_list_comments(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         count: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, count);
+        let _ = (workspace_id, repo, pr_number, count);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_list_comments not implemented".to_string(),
@@ -3052,15 +3080,17 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.listReviewComments`: line-anchored review threads on the active PR,
-    /// filtered by `path` / `status` (PROTOCOL §5.7).
+    /// `pr.listReviewComments`: line-anchored review threads on PR `pr_number`
+    /// in `repo`, filtered by `path` / `status` (PROTOCOL §5.7).
     fn pr_list_review_comments(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         path: Option<String>,
         status: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, status);
+        let _ = (workspace_id, repo, pr_number, path, status);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_list_review_comments not implemented".to_string(),
@@ -3068,14 +3098,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.getReviews`: the review decision aggregate + reviews for the active PR
-    /// (or `pr_number` when given) (PROTOCOL §5.7 extension).
+    /// `pr.getReviews`: the review decision aggregate + reviews for PR
+    /// `pr_number` in `repo` (PROTOCOL §5.7 extension).
     fn pr_get_reviews(
         &self,
         workspace_id: WorkspaceId,
-        pr_number: Option<u64>,
+        repo: String,
+        pr_number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number);
+        let _ = (workspace_id, repo, pr_number);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_get_reviews not implemented".to_string(),
@@ -3084,13 +3115,15 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `pr.listCheckRuns`: CI check-run tally + runs for `git_ref` (defaults to
-    /// the PR head) (PROTOCOL §5.7 extension).
+    /// the head of PR `pr_number` in `repo`) (PROTOCOL §5.7 extension).
     fn pr_list_check_runs(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, git_ref);
+        let _ = (workspace_id, repo, pr_number, git_ref);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_list_check_runs not implemented".to_string(),
@@ -3099,20 +3132,19 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
-    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
-    /// mergeability + blocked reason, check-run tally, review decision, and
-    /// comment counts — for hook-based PR monitoring. Scoped to the
-    /// workspace's repo unless `repo` (an `"owner/name"` slug) overrides it;
-    /// the result always echoes the resolved repo as `repo` so a wrong-repo
-    /// read is detectable. `pr_number` is REQUIRED; there is no active-PR
-    /// fallback.
+    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` in
+    /// `repo` — state, mergeability + blocked reason, check-run tally,
+    /// review decision, and comment counts — for hook-based PR monitoring.
+    /// Both `repo` (an `"owner/name"` slug) and `pr_number` are REQUIRED;
+    /// there is no active-PR or workspace-repo fallback. The result echoes
+    /// the resolved `repo` so a wrong-repo read is detectable.
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
         pr_number: u64,
-        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number, repo);
+        let _ = (workspace_id, repo, pr_number);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_state not implemented".to_string(),
@@ -3120,11 +3152,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.merge`: merge the active PR with `merge_method` (default `merge`) and
-    /// optional commit overrides. Requires an active PR (PROTOCOL §5.7).
+    /// `pr.merge`: merge PR `pr_number` in `repo` with `merge_method`
+    /// (default `merge`) and optional commit overrides (PROTOCOL §5.7).
+    #[allow(clippy::too_many_arguments)]
     fn pr_merge(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
@@ -3132,6 +3167,8 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
+            repo,
+            pr_number,
             merge_method,
             commit_title,
             commit_message,
@@ -3144,12 +3181,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.updateBranch`: update the active PR branch from its base (PROTOCOL §5.7).
+    /// `pr.updateBranch`: update the branch of PR `pr_number` in `repo` from
+    /// its base (PROTOCOL §5.7).
     fn pr_update_branch(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+        let _ = (workspace_id, repo, pr_number);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_update_branch not implemented".to_string(),
@@ -3157,13 +3197,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.postComment`: post a conversation comment on the active PR (PROTOCOL §5.7).
+    /// `pr.postComment`: post a conversation comment on PR `pr_number` in
+    /// `repo` (PROTOCOL §5.7).
     fn pr_post_comment(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, body);
+        let _ = (workspace_id, repo, pr_number, body);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_post_comment not implemented".to_string(),
@@ -3171,15 +3214,17 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.replyToReviewComment`: reply to a review comment on the active PR
-    /// (PROTOCOL §5.7).
+    /// `pr.replyToReviewComment`: reply to a review comment on PR `pr_number`
+    /// in `repo` (PROTOCOL §5.7).
     fn pr_reply_to_review_comment(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         comment_id: u64,
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, comment_id, body);
+        let _ = (workspace_id, repo, pr_number, comment_id, body);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_reply_to_review_comment not implemented".to_string(),
@@ -3187,15 +3232,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.resolveThread`: resolve/unresolve a review thread (default `resolve`)
-    /// on the active PR (PROTOCOL §5.7).
+    /// `pr.resolveThread`: resolve/unresolve a review thread (default
+    /// `resolve`) on PR `pr_number` in `repo` (PROTOCOL §5.7). The forge call
+    /// keys off the thread id alone; `repo` + `pr_number` are still required
+    /// so the addressing contract stays uniform.
     fn pr_resolve_thread(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         thread_id: String,
         action: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, thread_id, action);
+        let _ = (workspace_id, repo, pr_number, thread_id, action);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_resolve_thread not implemented".to_string(),
@@ -3204,14 +3253,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `pr.createReview`: submit a review (`approve` / `request-changes` /
-    /// `comment`) on the active PR (PROTOCOL §5.7 extension).
+    /// `comment`) on PR `pr_number` in `repo` (PROTOCOL §5.7 extension).
     fn pr_create_review(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         verdict: String,
         body: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, verdict, body);
+        let _ = (workspace_id, repo, pr_number, verdict, body);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_create_review not implemented".to_string(),

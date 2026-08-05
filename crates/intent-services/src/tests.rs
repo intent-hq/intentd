@@ -7386,7 +7386,8 @@ mod pr {
     #[tokio::test]
     async fn status_shape_is_parity_exact() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_status(ws).await.expect("status");
+        let v = svc.pr_status(ws, "o/r".into(), 42).await.expect("status");
+        assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
         assert_eq!(v["title"], "Add thing");
         assert_eq!(v["state"], "open");
@@ -7400,7 +7401,12 @@ mod pr {
     #[tokio::test]
     async fn get_reviews_aggregates_and_serializes_verdicts() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_get_reviews(ws, None).await.expect("reviews");
+        let v = svc
+            .pr_get_reviews(ws, "o/r".into(), 42)
+            .await
+            .expect("reviews");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["reviewDecision"], "APPROVED");
         assert_eq!(v["approvalCount"], 1);
         assert_eq!(v["changesRequestedCount"], 0);
@@ -7413,7 +7419,12 @@ mod pr {
     #[tokio::test]
     async fn list_check_runs_tallies() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_list_check_runs(ws, None).await.expect("checks");
+        let v = svc
+            .pr_list_check_runs(ws, "o/r".into(), 42, None)
+            .await
+            .expect("checks");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["total"], 3);
         assert_eq!(v["passed"], 1);
         assert_eq!(v["failed"], 1);
@@ -7425,9 +7436,11 @@ mod pr {
     async fn list_review_comments_filters_unresolved() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_list_review_comments(ws, None, None)
+            .pr_list_review_comments(ws, "o/r".into(), 42, None, None)
             .await
             .expect("review comments");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["usingFallback"], false);
         assert_eq!(v["threadCount"], 1);
         assert_eq!(v["threads"][0]["id"], "RT1");
@@ -7439,7 +7452,7 @@ mod pr {
     async fn list_review_comments_falls_back_to_rest() {
         let (_t, svc, ws) = setup(true, true).await;
         let v = svc
-            .pr_list_review_comments(ws, None, None)
+            .pr_list_review_comments(ws, "o/r".into(), 42, None, None)
             .await
             .expect("review comments");
         assert_eq!(v["usingFallback"], true);
@@ -7461,7 +7474,7 @@ mod pr {
         )
         .await;
         let v = svc
-            .pr_list_review_comments(ws, None, None)
+            .pr_list_review_comments(ws, "o/r".into(), 42, None, None)
             .await
             .expect("review comments");
         assert_eq!(v["usingFallback"], false);
@@ -7486,7 +7499,7 @@ mod pr {
         )
         .await;
         let v = svc
-            .pr_list_review_comments(ws, None, None)
+            .pr_list_review_comments(ws, "o/r".into(), 42, None, None)
             .await
             .expect("review comments");
         assert_eq!(v["usingFallback"], false);
@@ -7509,7 +7522,7 @@ mod pr {
         )
         .await;
         let v = svc
-            .pr_list_review_comments(ws, None, None)
+            .pr_list_review_comments(ws, "o/r".into(), 42, None, None)
             .await
             .expect("review comments");
         assert_eq!(v["usingFallback"], true);
@@ -7522,16 +7535,68 @@ mod pr {
     #[tokio::test]
     async fn list_comments_returns_count() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_list_comments(ws, Some(5)).await.expect("comments");
+        let v = svc
+            .pr_list_comments(ws, "o/r".into(), 42, Some(5))
+            .await
+            .expect("comments");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["count"], 1);
         assert_eq!(v["comments"].as_array().unwrap().len(), 1);
     }
 
+    // ---- pr_active_context (FE router-compat shim) -----------------------
+
     #[tokio::test]
-    async fn no_active_pr_is_internal_error() {
+    async fn active_context_resolves_linked_repo_and_pr() {
+        let (_t, svc, ws) = setup(false, true).await;
+        let (repo, number) = svc.pr_active_context(ws, None).await.expect("context");
+        assert_eq!(repo, "o/r");
+        assert_eq!(number, 42);
+    }
+
+    #[tokio::test]
+    async fn active_context_explicit_pr_wins_over_linked() {
+        // The pr.getReviews wire-compat path: an explicit prNumber overrides
+        // the linked PR (and is accepted even when no PR is linked, as long
+        // as the repo is).
+        let (_t, svc, ws) = setup(false, true).await;
+        let (repo, number) = svc.pr_active_context(ws, Some(7)).await.expect("context");
+        assert_eq!(repo, "o/r");
+        assert_eq!(number, 7);
+    }
+
+    #[tokio::test]
+    async fn active_context_without_linkage_is_no_active_pr() {
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_status(ws).await.unwrap_err();
+        let err = svc.pr_active_context(ws, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+    }
+
+    #[tokio::test]
+    async fn explicit_methods_reject_malformed_repo_slug() {
+        // The explicit data methods never consult workspace linkage; a
+        // malformed slug is an InvalidParams error even on an unlinked
+        // workspace.
+        let (_t, svc, ws) = setup(false, false).await;
+        let err = svc
+            .pr_status(ws, "not-a-slug".into(), 42)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("owner/name")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_methods_work_without_workspace_linkage() {
+        // Explicit addressing needs no linked repo/PR on the workspace.
+        let (_t, svc, ws) = setup(false, false).await;
+        let v = svc.pr_status(ws, "o/r".into(), 42).await.expect("status");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["state"], "open");
     }
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
@@ -7539,7 +7604,7 @@ mod pr {
     #[tokio::test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        let v = svc.pr_state(ws, "o/r".into(), 42).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
         assert_eq!(v["title"], "Add thing");
@@ -7584,7 +7649,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        let v = svc.pr_state(ws, "o/r".into(), 42).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
@@ -7601,7 +7666,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        let v = svc.pr_state(ws, "o/r".into(), 42).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
         assert_eq!(v["mergeBlockedReason"], "merge conflicts");
@@ -7618,7 +7683,7 @@ mod pr {
             true,
         )
         .await;
-        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        let v = svc.pr_state(ws, "o/r".into(), 42).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
         assert_eq!(v["isClosed"], false);
@@ -7637,27 +7702,18 @@ mod pr {
             true,
         )
         .await;
-        let err = svc.pr_state(ws, 999, None).await.unwrap_err();
+        let err = svc.pr_state(ws, "o/r".into(), 999).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[tokio::test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
-        let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
-    }
-
-    #[tokio::test]
-    async fn state_snapshot_cross_repo_arg_overrides_workspace_repo() {
+    async fn state_snapshot_cross_repo_needs_no_workspace_linkage() {
         // Workspace has no repository at all: the explicit `repo` slug alone
         // scopes the lookup (no "No active PR" guard), and the resolved repo
         // is echoed back.
         let (_t, svc, ws) = setup(false, false).await;
         let v = svc
-            .pr_state(ws, 42, Some("acme/widgets".into()))
+            .pr_state(ws, "acme/widgets".into(), 42)
             .await
             .expect("snapshot");
         assert_eq!(v["repo"], "acme/widgets");
@@ -7668,10 +7724,7 @@ mod pr {
     async fn state_snapshot_rejects_malformed_repo_arg() {
         let (_t, svc, ws) = setup(false, true).await;
         for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
-            let err = svc
-                .pr_state(ws.clone(), 42, Some(bad.into()))
-                .await
-                .unwrap_err();
+            let err = svc.pr_state(ws.clone(), bad.into(), 42).await.unwrap_err();
             assert!(
                 matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
                 "repo arg `{bad}` should be rejected, got {err:?}"
@@ -7683,9 +7736,18 @@ mod pr {
     async fn merge_returns_parity_shape() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_merge(ws, Some("squash".into()), None, None, None)
+            .pr_merge(
+                ws,
+                "o/r".into(),
+                42,
+                Some("squash".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .expect("merge");
+        assert_eq!(v["repo"], "o/r");
         assert_eq!(v["merged"], true);
         assert_eq!(v["sha"], "mergedsha");
         assert_eq!(v["mergeMethod"], "squash");
@@ -7696,33 +7758,40 @@ mod pr {
     async fn merge_rejects_invalid_method() {
         let (_t, svc, ws) = setup(false, true).await;
         let err = svc
-            .pr_merge(ws, Some("ff".into()), None, None, None)
+            .pr_merge(ws, "o/r".into(), 42, Some("ff".into()), None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("mergeMethod must be one of")));
     }
 
     #[tokio::test]
-    async fn merge_requires_active_pr() {
+    async fn merge_rejects_malformed_repo_slug() {
         let (_t, svc, ws) = setup(false, false).await;
-        let err = svc.pr_merge(ws, None, None, None, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        let err = svc
+            .pr_merge(ws, "not-a-slug".into(), 42, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("owner/name")));
     }
 
     #[tokio::test]
     async fn post_comment_and_reply_surface_html_url() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_post_comment(ws.clone(), "ship it".into())
+            .pr_post_comment(ws.clone(), "o/r".into(), 42, "ship it".into())
             .await
             .expect("post");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["id"], "777");
         assert!(v["htmlUrl"].as_str().unwrap().contains("issuecomment-777"));
 
         let r = svc
-            .pr_reply_to_review_comment(ws, 5, "agreed".into())
+            .pr_reply_to_review_comment(ws, "o/r".into(), 42, 5, "agreed".into())
             .await
             .expect("reply");
+        assert_eq!(r["repo"], "o/r");
+        assert_eq!(r["prNumber"], 42);
         assert_eq!(r["id"], 6);
         assert!(r["htmlUrl"].as_str().unwrap().contains("discussion_r999"));
     }
@@ -7731,10 +7800,12 @@ mod pr {
     async fn resolve_thread_reports_action() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_resolve_thread(ws, "RT1".into(), Some("resolve".into()))
+            .pr_resolve_thread(ws, "o/r".into(), 42, "RT1".into(), Some("resolve".into()))
             .await
             .expect("resolve");
         assert_eq!(v["ok"], true);
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["threadId"], "RT1");
         assert_eq!(v["action"], "resolve");
     }
@@ -7745,7 +7816,7 @@ mod pr {
         // service treats as a silent failure.
         let (_t, svc, ws) = setup(false, true).await;
         let err = svc
-            .pr_resolve_thread(ws, "RT1".into(), Some("unresolve".into()))
+            .pr_resolve_thread(ws, "o/r".into(), 42, "RT1".into(), Some("unresolve".into()))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("Failed to unresolve thread")));
@@ -7755,9 +7826,11 @@ mod pr {
     async fn create_review_returns_review() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc
-            .pr_create_review(ws, "approve".into(), Some("LGTM".into()))
+            .pr_create_review(ws, "o/r".into(), 42, "approve".into(), Some("LGTM".into()))
             .await
             .expect("review");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["review"]["verdict"], "approve");
         assert_eq!(v["review"]["body"], "LGTM");
     }
@@ -7765,7 +7838,12 @@ mod pr {
     #[tokio::test]
     async fn update_branch_reports_success() {
         let (_t, svc, ws) = setup(false, true).await;
-        let v = svc.pr_update_branch(ws).await.expect("update branch");
+        let v = svc
+            .pr_update_branch(ws, "o/r".into(), 42)
+            .await
+            .expect("update branch");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["prNumber"], 42);
         assert_eq!(v["method"], "merge");
         assert_eq!(v["alreadyUpToDate"], false);
     }
@@ -7835,7 +7913,15 @@ mod pr {
         )
         .await;
         let err = svc
-            .pr_merge(ws, Some("squash".into()), None, None, None)
+            .pr_merge(
+                ws,
+                "o/r".into(),
+                42,
+                Some("squash".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7855,7 +7941,15 @@ mod pr {
         )
         .await;
         let err = svc
-            .pr_merge(ws, Some("rebase".into()), None, None, None)
+            .pr_merge(
+                ws,
+                "o/r".into(),
+                42,
+                Some("rebase".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
@@ -7872,7 +7966,7 @@ mod pr {
         )
         .await;
         let v = svc
-            .pr_merge(ws, None, None, None, None)
+            .pr_merge(ws, "o/r".into(), 42, None, None, None, None)
             .await
             .expect("merge");
         assert_eq!(v["merged"], true);
@@ -7890,7 +7984,13 @@ mod pr {
         )
         .await;
         let err = svc
-            .pr_create_review(ws, "request-changes".into(), Some("needs work".into()))
+            .pr_create_review(
+                ws,
+                "o/r".into(),
+                42,
+                "request-changes".into(),
+                Some("needs work".into()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
@@ -7907,7 +8007,7 @@ mod pr {
         )
         .await;
         let v = svc
-            .pr_create_review(ws, "approve".into(), None)
+            .pr_create_review(ws, "o/r".into(), 42, "approve".into(), None)
             .await
             .expect("review");
         assert_eq!(v["review"]["verdict"], "approve");
@@ -7923,7 +8023,10 @@ mod pr {
             true,
         )
         .await;
-        let err = svc.pr_list_check_runs(ws, None).await.unwrap_err();
+        let err = svc
+            .pr_list_check_runs(ws, "o/r".into(), 42, None)
+            .await
+            .unwrap_err();
         assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
     }
 

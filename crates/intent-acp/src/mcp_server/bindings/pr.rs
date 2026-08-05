@@ -1,11 +1,12 @@
 //! `ws.pr.*` bindings (WSAPI-6).
 //!
-//! Thin wrappers over the [`WorkspaceApi`] active-PR surface. The daemon
-//! resolves the active PR from workspace state and the `github.*` engine
-//! shapes the payload; the binding only peels arguments, mirrors the same
-//! client-side enum validation as `ws-pr-api.ts` (so agents see the same
-//! error strings whether the FE or daemon MCP is the front door), and
-//! forwards the trait's `serde_json::Value` result unchanged.
+//! Thin wrappers over the [`WorkspaceApi`] explicit-addressing PR surface:
+//! every method requires `repo` (an `"owner/name"` slug) and `prNumber` —
+//! there is no active-PR or workspace-repo fallback on the agent-facing MCP
+//! surface, so there is never ambiguity about which PR is addressed. The
+//! binding peels + validates arguments (stable error strings, before any
+//! trait call) and forwards the trait's `serde_json::Value` result — which
+//! echoes the resolved `repo`/`prNumber` — unchanged.
 
 use std::sync::Arc;
 
@@ -17,20 +18,23 @@ use super::{map_err, opt_str, req_i64, req_str};
 pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
-        status: () => host({ method: 'pr.status', args: {} }),
-        snapshot: (prNumber, options) =>
-            host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
-        merge: (options) => host({ method: 'pr.merge', args: { ...(options || {}) } }),
-        updateBranch: () => host({ method: 'pr.updateBranch', args: {} }),
-        listReviewComments: (options) =>
-            host({ method: 'pr.listReviewComments', args: { ...(options || {}) } }),
-        replyToReviewComment: (commentId, body) =>
-            host({ method: 'pr.replyToReviewComment', args: { commentId, body } }),
-        resolveThread: (threadId, action) =>
-            host({ method: 'pr.resolveThread', args: { threadId, action } }),
-        listComments: (options) =>
-            host({ method: 'pr.listComments', args: { ...(options || {}) } }),
-        postComment: (body) => host({ method: 'pr.postComment', args: { body } }),
+        status: (repo, prNumber) => host({ method: 'pr.status', args: { repo, prNumber } }),
+        snapshot: (repo, prNumber) =>
+            host({ method: 'pr.snapshot', args: { repo, prNumber } }),
+        merge: (repo, prNumber, options) =>
+            host({ method: 'pr.merge', args: { repo, prNumber, ...(options || {}) } }),
+        updateBranch: (repo, prNumber) =>
+            host({ method: 'pr.updateBranch', args: { repo, prNumber } }),
+        listReviewComments: (repo, prNumber, options) =>
+            host({ method: 'pr.listReviewComments', args: { repo, prNumber, ...(options || {}) } }),
+        replyToReviewComment: (repo, prNumber, commentId, body) =>
+            host({ method: 'pr.replyToReviewComment', args: { repo, prNumber, commentId, body } }),
+        resolveThread: (repo, prNumber, threadId, action) =>
+            host({ method: 'pr.resolveThread', args: { repo, prNumber, threadId, action } }),
+        listComments: (repo, prNumber, options) =>
+            host({ method: 'pr.listComments', args: { repo, prNumber, ...(options || {}) } }),
+        postComment: (repo, prNumber, body) =>
+            host({ method: 'pr.postComment', args: { repo, prNumber, body } }),
     };
 "#;
 
@@ -41,10 +45,10 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "status" => status(api, ws).await,
+        "status" => status(api, ws, args).await,
         "snapshot" => snapshot(api, ws, args).await,
         "merge" => merge(api, ws, args).await,
-        "updateBranch" => update_branch(api, ws).await,
+        "updateBranch" => update_branch(api, ws, args).await,
         "listReviewComments" => list_review_comments(api, ws, args).await,
         "replyToReviewComment" => reply_to_review_comment(api, ws, args).await,
         "resolveThread" => resolve_thread(api, ws, args).await,
@@ -54,8 +58,31 @@ pub(crate) async fn dispatch(
     }
 }
 
-async fn status(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    api.pr_status(ws.clone()).await.map_err(map_err)
+/// Peel the required `repo` ("owner/name" string) + `prNumber` (positive
+/// number) pair every `ws.pr.*` method takes. Validation errors surface
+/// before any trait call; slug-shape validation lives in the engine.
+fn req_repo_and_pr(args: &Value) -> Result<(String, u64), String> {
+    let repo = match args.get("repo") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return Err("repo is required and must be an \"owner/name\" string".to_string()),
+    };
+    let pr_number =
+        req_i64(args, "prNumber").map_err(|_| "prNumber is required and must be a number")?;
+    if pr_number <= 0 {
+        return Err("prNumber is required and must be a number".to_string());
+    }
+    Ok((repo, pr_number as u64))
+}
+
+async fn status(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
+    api.pr_status(ws.clone(), repo, pr_number)
+        .await
+        .map_err(map_err)
 }
 
 async fn snapshot(
@@ -63,20 +90,8 @@ async fn snapshot(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
-    let pr_number =
-        req_i64(args, "prNumber").map_err(|_| "prNumber is required and must be a number")?;
-    if pr_number <= 0 {
-        return Err("prNumber is required and must be a number".to_string());
-    }
-    // Optional cross-repo override; slug validation lives in the engine, but
-    // a present-yet-non-string value fails fast rather than silently falling
-    // back to the workspace repo.
-    let repo = match args.get("repo") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => return Err("repo must be an \"owner/name\" string".to_string()),
-    };
-    api.pr_state(ws.clone(), pr_number as u64, repo)
+    let (repo, pr_number) = req_repo_and_pr(args)?;
+    api.pr_state(ws.clone(), repo, pr_number)
         .await
         .map_err(map_err)
 }
@@ -86,6 +101,7 @@ async fn merge(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let merge_method = match opt_str(args, "mergeMethod") {
         Some(m) if !matches!(m.as_str(), "merge" | "squash" | "rebase") => {
             return Err("mergeMethod must be one of: merge, squash, rebase".to_string())
@@ -105,6 +121,8 @@ async fn merge(
         .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
     api.pr_merge(
         ws.clone(),
+        repo,
+        pr_number,
         merge_method,
         commit_title,
         commit_message,
@@ -114,8 +132,15 @@ async fn merge(
     .map_err(map_err)
 }
 
-async fn update_branch(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    api.pr_update_branch(ws.clone()).await.map_err(map_err)
+async fn update_branch(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
+    api.pr_update_branch(ws.clone(), repo, pr_number)
+        .await
+        .map_err(map_err)
 }
 
 async fn list_review_comments(
@@ -123,6 +148,7 @@ async fn list_review_comments(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let path = opt_str(args, "path");
     let status = match opt_str(args, "status") {
         Some(s) if !matches!(s.as_str(), "unresolved" | "resolved" | "all") => {
@@ -130,7 +156,7 @@ async fn list_review_comments(
         }
         s => s,
     };
-    api.pr_list_review_comments(ws.clone(), path, status)
+    api.pr_list_review_comments(ws.clone(), repo, pr_number, path, status)
         .await
         .map_err(map_err)
 }
@@ -140,6 +166,7 @@ async fn reply_to_review_comment(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let comment_id =
         req_i64(args, "commentId").map_err(|_| "commentId is required and must be a number")?;
     if comment_id < 0 {
@@ -149,7 +176,7 @@ async fn reply_to_review_comment(
     if body.is_empty() {
         return Err("body is required and must be a string".to_string());
     }
-    api.pr_reply_to_review_comment(ws.clone(), comment_id as u64, body)
+    api.pr_reply_to_review_comment(ws.clone(), repo, pr_number, comment_id as u64, body)
         .await
         .map_err(map_err)
 }
@@ -159,6 +186,7 @@ async fn resolve_thread(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let thread_id =
         req_str(args, "threadId").map_err(|_| "threadId is required and must be a string")?;
     if thread_id.is_empty() {
@@ -170,7 +198,7 @@ async fn resolve_thread(
         }
         a => a,
     };
-    api.pr_resolve_thread(ws.clone(), thread_id, action)
+    api.pr_resolve_thread(ws.clone(), repo, pr_number, thread_id, action)
         .await
         .map_err(map_err)
 }
@@ -180,8 +208,9 @@ async fn list_comments(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let count = args.get("count").and_then(Value::as_i64);
-    api.pr_list_comments(ws.clone(), count)
+    api.pr_list_comments(ws.clone(), repo, pr_number, count)
         .await
         .map_err(map_err)
 }
@@ -191,9 +220,12 @@ async fn post_comment(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    let (repo, pr_number) = req_repo_and_pr(args)?;
     let body = req_str(args, "body").map_err(|_| "body is required and must be a string")?;
     if body.is_empty() {
         return Err("body is required and must be a string".to_string());
     }
-    api.pr_post_comment(ws.clone(), body).await.map_err(map_err)
+    api.pr_post_comment(ws.clone(), repo, pr_number, body)
+        .await
+        .map_err(map_err)
 }

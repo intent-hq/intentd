@@ -138,7 +138,7 @@ fn remove_section(text: &str, heading: &str) -> String {
 /// common.md's "Waiting on External Conditions" section: its `gh api` recipe
 /// only works when `agentFeatures.hostExec` is on, so it is scrubbed when the
 /// toggle is off — the bullet itself survives, since its primary
-/// `ws.pr.snapshot({ repo })` path needs no host exec (a unit test guards
+/// `ws.pr.snapshot(repo, prNumber)` path needs no host exec (a unit test guards
 /// that this text still matches the bundled body verbatim).
 const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
 
@@ -351,9 +351,9 @@ mod tests {
         let common = gated_common(&features);
         assert!(common.contains("## Waiting on External Conditions"));
         assert!(!common.contains("ws.host.exec"));
-        // The bullet survives, still leading with the snapshot override…
+        // The bullet survives, still leading with the explicit-repo snapshot…
         assert!(common.contains("**Cross-repo PRs**"));
-        assert!(common.contains("ws.pr.snapshot(prNumber, { repo: \"owner/name\" })"));
+        assert!(common.contains("ws.pr.snapshot(repo, prNumber)"));
         // …and the scrub leaves a clean sentence boundary before the next bullet.
         assert!(common.contains("diff that snapshot against `hookState`.\n- **Hygiene**"));
     }

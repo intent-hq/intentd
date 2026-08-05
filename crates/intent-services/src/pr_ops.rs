@@ -1,11 +1,10 @@
-//! Wire-policy glue for the read-only `pr.*` methods (§5.7, §7.5).
+//! Wire-policy glue for the `pr.*` methods (§5.7).
 //!
-//! Pure mapping/aggregation ported from the TS ground truth (`ws-pr-api.ts`,
-//! `github.service.ts`): the `pr.status` summary, the `pr.getReviews` decision
-//! aggregation, the `pr.listCheckRuns` tally, and the `pr.listReviewComments`
-//! thread shaping. The forge calls themselves go through the host-agnostic
-//! [`SourceControl`] trait; this module owns only the parity-critical glue so it
-//! stays unit-testable without a network.
+//! Pure mapping/aggregation: the `pr.status` summary, the `pr.getReviews`
+//! decision aggregation, the `pr.listCheckRuns` tally, and the
+//! `pr.listReviewComments` thread shaping. The forge calls themselves go
+//! through the host-agnostic [`SourceControl`] trait; this module owns only
+//! the parity-critical glue so it stays unit-testable without a network.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,7 +19,9 @@ use intent_sourcecontrol::{
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
-/// TS `NO_ACTIVE_PR_ERROR`; every `pr.*` method needs an active PR (§5.7).
+/// The §5.7 "No active PR" error surfaced by the FE-facing router-compat
+/// shim (`pr_active_context`) when a workspace has no linked repo/PR. The
+/// explicit-parameter `pr_*` data methods never raise it.
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 
 /// Map a forge error onto the domain `Internal` error (→ `-32603`): the TS
@@ -68,8 +69,10 @@ pub(crate) async fn resolve_source_control(
     }
 }
 
-/// The `(owner, repo)` pair for the workspace's active provider, or
-/// [`NO_ACTIVE_PR`] when either is unset (§7.6).
+/// The `(owner, repo)` pair for the workspace's linked repository, or
+/// [`NO_ACTIVE_PR`] when either is unset. Used only by the router-compat
+/// shim (`pr_active_context`) and the class-c sweep/accept-changes linkage
+/// machinery — never by the explicit-parameter `pr_*` data methods.
 pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
     match (
         ws.repository_owner.as_deref().filter(|s| !s.is_empty()),
@@ -80,8 +83,8 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
     }
 }
 
-/// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
-/// with exactly one `/` and both halves non-empty.
+/// Parse an explicit `pr.*` repo argument: an `"owner/name"` slug with
+/// exactly one `/` and both halves non-empty.
 pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
     let trimmed = slug.trim();
     if let Some((owner, name)) = trimmed.split_once('/') {
@@ -92,6 +95,14 @@ pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
     Err(Error::InvalidParams(format!(
         "repo must be an \"owner/name\" slug, got `{slug}`"
     )))
+}
+
+/// Parse an explicit `"owner/name"` slug into the engine [`RepoRef`] plus
+/// the normalized slug echoed as `repo` in every `pr.*` result payload.
+pub(crate) fn repo_ref_from_slug(slug: &str) -> Result<(RepoRef, String)> {
+    let (owner, name) = parse_repo_slug(slug)?;
+    let normalized = format!("{owner}/{name}");
+    Ok((RepoRef::new(owner, name), normalized))
 }
 
 /// Background-sweep activity window (§7.6/§7.7): workspaces whose
@@ -127,7 +138,8 @@ pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, t
     active(&ws.updated_at) || ws.last_activity.as_deref().is_some_and(active)
 }
 
-/// The workspace's active PR number, or [`NO_ACTIVE_PR`] when unlinked.
+/// The workspace's linked PR number, or [`NO_ACTIVE_PR`] when unlinked.
+/// Router-compat shim (`pr_active_context`) only — see [`repo_of`].
 pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
     ws.pr_number
         .ok_or_else(|| Error::Internal(NO_ACTIVE_PR.to_string()))
@@ -392,8 +404,8 @@ pub(crate) fn derive_status_state(pr: &PullRequest) -> &'static str {
     }
 }
 
-/// Port of `buildStatusSummary` (`ws-pr-api.ts`): a human-readable one-liner
-/// from the derived `state`, `mergeable`, and raw `mergeable_state`.
+/// The `pr.status` summary: a human-readable one-liner from the derived
+/// `state`, `mergeable`, and raw `mergeable_state`.
 pub(crate) fn build_status_summary(
     state: &str,
     mergeable: Option<bool>,
@@ -675,7 +687,7 @@ pub(crate) fn retain_path(threads: &mut Vec<ReviewThread>, path: &str) {
 }
 
 /// Group flat REST review comments into synthetic threads via `in_reply_to_id`
-/// (the GraphQL-unavailable fallback in `ws-pr-api.ts`).
+/// (the GraphQL-unavailable fallback for `pr.listReviewComments`).
 pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewThread> {
     comments.sort_by_key(|c| c.id);
     let mut order: Vec<u64> = Vec::new();

@@ -279,16 +279,17 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+  Every ws.pr.* method addresses a PR explicitly: `repo` is a required `"owner/name"` string and `prNumber` a required number — there is no active-PR or workspace-repo fallback, so any repo's PRs (e.g. a submodule's) are equally reachable and there is never ambiguity about which PR is addressed. Results echo the resolved `repo` + `prNumber` so a wrong-repo call is detectable.
+  ws.pr.merge(repo, prNumber, { mergeMethod?, commitTitle?, commitMessage? }?) → { repo, merged, sha, mergeMethod, message, prNumber }  // `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
+  ws.pr.status(repo, prNumber) → { repo, prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }
+  ws.pr.snapshot(repo, prNumber) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in `repo`.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+  ws.pr.updateBranch(repo, prNumber) → { ... }  // Updates the PR branch from its base branch when supported.
+  ws.pr.listReviewComments(repo, prNumber, { path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
+  ws.pr.replyToReviewComment(repo, prNumber, commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
+  ws.pr.resolveThread(repo, prNumber, threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
+  ws.pr.listComments(repo, prNumber, { count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
+  ws.pr.postComment(repo, prNumber, body) → { ... }  // Posts a conversation-level PR comment.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -499,16 +500,17 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+  Every ws.pr.* method addresses a PR explicitly: `repo` is a required `"owner/name"` string and `prNumber` a required number — there is no active-PR or workspace-repo fallback, so any repo's PRs (e.g. a submodule's) are equally reachable and there is never ambiguity about which PR is addressed. Results echo the resolved `repo` + `prNumber` so a wrong-repo call is detectable.
+  ws.pr.merge(repo, prNumber, { mergeMethod?, commitTitle?, commitMessage? }?) → { repo, merged, sha, mergeMethod, message, prNumber }  // `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
+  ws.pr.status(repo, prNumber) → { repo, prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }
+  ws.pr.snapshot(repo, prNumber) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in `repo`.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+  ws.pr.updateBranch(repo, prNumber) → { ... }  // Updates the PR branch from its base branch when supported.
+  ws.pr.listReviewComments(repo, prNumber, { path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
+  ws.pr.replyToReviewComment(repo, prNumber, commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
+  ws.pr.resolveThread(repo, prNumber, threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
+  ws.pr.listComments(repo, prNumber, { count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
+  ws.pr.postComment(repo, prNumber, body) → { ... }  // Posts a conversation-level PR comment.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -1587,7 +1589,7 @@ mod tests {
                 "ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot",
                 "ws.hook.schedule(",
                 "including `ws.pr.snapshot`",
-                "ws.pr.snapshot(prNumber, { repo? }?)",
+                "ws.pr.snapshot(repo, prNumber)",
             ] {
                 assert!(
                     pruned.contains(kept),

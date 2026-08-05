@@ -17240,9 +17240,31 @@ impl WorkspaceApi for Services {
 
     // ========================================================================
     // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
-    // `SourceControl` trait (§7.5); every method requires an active PR on the
-    // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
+    // `SourceControl` trait; every data method takes an explicit
+    // `repo` ("owner/name") + `pr_number` — the FE router arms resolve the
+    // workspace's linked PR via `pr_active_context` (the only remaining
+    // implicit resolution). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
+
+    fn pr_active_context(
+        &self,
+        workspace_id: WorkspaceId,
+        explicit_pr: Option<u64>,
+    ) -> BoxFuture<'_, Result<(String, u64)>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // Router-compat shim: the §5.7 "No active PR" surface for
+            // missing/unlinked workspaces lives HERE, not in the explicit
+            // data methods below.
+            let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            let (owner, name) = pr_ops::repo_of(&ws)?;
+            let number = match explicit_pr {
+                Some(n) => n,
+                None => pr_ops::active_pr_number(&ws)?,
+            };
+            Ok((format!("{owner}/{name}"), number))
+        })
+    }
 
     fn pr_capabilities(
         &self,
@@ -17264,17 +17286,20 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn pr_status(
+        &self,
+        workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
-                .get_pr(&repo_ref, number)
+                .get_pr(&repo_ref, pr_number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let state = pr_ops::derive_status_state(&pr);
@@ -17284,7 +17309,8 @@ impl WorkspaceApi for Services {
                 .unwrap_or_else(|| "unknown".to_string());
             let summary = pr_ops::build_status_summary(state, pr.mergeable, &mergeable_state);
             Ok(serde_json::json!({
-                "prNumber": number,
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "title": pr.title,
                 "url": pr.url,
                 "state": state,
@@ -17322,29 +17348,36 @@ impl WorkspaceApi for Services {
     fn pr_list_comments(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         count: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let comments = sc
-                .list_comments(&repo_ref, number)
+                .list_comments(&repo_ref, pr_number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let limit = pr_ops::clamp_count(count);
             let comments: Vec<_> = comments.into_iter().take(limit).collect();
-            Ok(serde_json::json!({ "count": comments.len(), "comments": comments }))
+            Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
+                "count": comments.len(),
+                "comments": comments,
+            }))
         })
     }
 
     fn pr_list_review_comments(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         path: Option<String>,
         status: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -17352,11 +17385,10 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let status = pr_ops::validate_review_comment_status(status)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
+            let number = pr_number;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, number, p)).await {
                 Ok((mut threads, pages_fetched, has_more)) => {
                     let total = threads.len() as i64;
@@ -17370,6 +17402,8 @@ impl WorkspaceApi for Services {
                     }
                     let json_threads = pr_ops::thread_list_json(&threads);
                     Ok(serde_json::json!({
+                        "repo": repo_slug,
+                        "prNumber": number,
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": false,
@@ -17399,6 +17433,8 @@ impl WorkspaceApi for Services {
                         serde_json::Value::Null
                     };
                     Ok(serde_json::json!({
+                        "repo": repo_slug,
+                        "prNumber": number,
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": true,
@@ -17414,25 +17450,23 @@ impl WorkspaceApi for Services {
     fn pr_get_reviews(
         &self,
         workspace_id: WorkspaceId,
-        pr_number: Option<u64>,
+        repo: String,
+        pr_number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = match pr_number {
-                Some(n) => n,
-                None => pr_ops::active_pr_number(&ws)?,
-            };
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let reviews = sc
-                .list_reviews(&repo_ref, number)
+                .list_reviews(&repo_ref, pr_number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let agg = pr_ops::aggregate_reviews(&reviews);
             Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "reviewDecision": agg.review_decision,
                 "approvalCount": agg.approval_count,
                 "changesRequestedCount": agg.changes_requested_count,
@@ -17445,22 +17479,22 @@ impl WorkspaceApi for Services {
     fn pr_list_check_runs(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             pr_ops::require_capability(sc.capabilities().check_runs, "check runs")?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let git_ref = match git_ref {
                 Some(r) => r,
                 None => {
                     let pr = sc
-                        .get_pr(&repo_ref, number)
+                        .get_pr(&repo_ref, pr_number)
                         .await
                         .map_err(pr_ops::map_sc_err)?;
                     pr.head_sha
@@ -17477,6 +17511,8 @@ impl WorkspaceApi for Services {
                 .map_err(pr_ops::map_sc_err)?;
             let s = pr_ops::summarize_check_runs(&runs);
             Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "total": s.total,
                 "passed": s.passed,
                 "failed": s.failed,
@@ -17489,23 +17525,17 @@ impl WorkspaceApi for Services {
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
         pr_number: u64,
-        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
-            // workspace repo; either way the resolved repo is echoed in the
-            // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
-                None => pr_ops::repo_of(&ws)?,
-            };
-            let repo_slug = format!("{owner}/{repo}");
+            store.get_workspace(&workspace_id).await?;
+            // Explicit addressing: the resolved repo is echoed in the result
+            // so a wrong-repo read is detectable.
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -17614,13 +17644,16 @@ impl WorkspaceApi for Services {
     }
 
     // ------------------------------------------------------------------------
-    // pr.* write/action surface (PROTOCOL §5.7). Same active-PR enforcement as
-    // the read methods; validation/poll glue lives in `pr_ops`.
+    // pr.* write/action surface (PROTOCOL §5.7). Same explicit `repo` +
+    // `pr_number` addressing as the read methods; validation/poll glue lives
+    // in `pr_ops`.
     // ------------------------------------------------------------------------
 
     fn pr_merge(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
@@ -17639,9 +17672,9 @@ impl WorkspaceApi for Services {
                 move || async move {
                     let store = op_store;
                     let method = pr_ops::validate_merge_method(merge_method)?;
-                    let ws = load_ws_for_pr(&store, &workspace_id).await?;
-                    let (owner, repo) = pr_ops::repo_of(&ws)?;
-                    let number = pr_ops::active_pr_number(&ws)?;
+                    store.get_workspace(&workspace_id).await?;
+                    let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
+                    let number = pr_number;
                     let sc = pr_ops::resolve_source_control(injected).await?;
                     let caps = sc.capabilities();
                     match method {
@@ -17653,7 +17686,6 @@ impl WorkspaceApi for Services {
                         }
                         intent_sourcecontrol::MergeMethod::Merge => {}
                     }
-                    let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
                     let pr = sc
                         .get_pr(&repo_ref, number)
                         .await
@@ -17696,6 +17728,7 @@ impl WorkspaceApi for Services {
                         )));
                     }
                     Ok(serde_json::json!({
+                        "repo": repo_slug,
                         "merged": true,
                         "sha": outcome.sha,
                         "mergeMethod": pr_ops::merge_method_word(method),
@@ -17711,31 +17744,42 @@ impl WorkspaceApi for Services {
     fn pr_update_branch(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc.update_branch(&repo_ref, number).await {
-                // URL revisit (§7.6): the forge `update_branch` returns no URL,
-                // so mirror the TS `result.url ?? null` by surfacing the PR URL
-                // now persisted on the workspace (`null` when not yet linked).
-                Ok(()) => Ok(serde_json::json!({
-                    "method": "merge",
-                    "alreadyUpToDate": false,
-                    "message": "PR branch updated from the base branch.",
-                    "url": ws.pr_url.clone(),
-                })),
+            match sc.update_branch(&repo_ref, pr_number).await {
+                // The forge `update_branch` returns no URL, so surface the
+                // addressed PR's URL when it can be fetched (`null` on any
+                // lookup failure — the update itself already succeeded).
+                Ok(()) => {
+                    let url = sc
+                        .get_pr(&repo_ref, pr_number)
+                        .await
+                        .map(|pr| serde_json::Value::String(pr.url))
+                        .unwrap_or(serde_json::Value::Null);
+                    Ok(serde_json::json!({
+                        "repo": repo_slug,
+                        "prNumber": pr_number,
+                        "method": "merge",
+                        "alreadyUpToDate": false,
+                        "message": "PR branch updated from the base branch.",
+                        "url": url,
+                    }))
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     let lower = msg.to_lowercase();
                     if lower.contains("already up-to-date") || lower.contains("already up to date")
                     {
                         Ok(serde_json::json!({
+                            "repo": repo_slug,
+                            "prNumber": pr_number,
                             "method": "merge",
                             "alreadyUpToDate": true,
                             "message": "PR branch is already up-to-date with the base branch.",
@@ -17759,21 +17803,23 @@ impl WorkspaceApi for Services {
     fn pr_post_comment(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let comment = sc
-                .add_comment(&repo_ref, number, &body, None)
+                .add_comment(&repo_ref, pr_number, &body, None)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "id": comment.id,
                 "htmlUrl": comment.url,
             }))
@@ -17783,22 +17829,24 @@ impl WorkspaceApi for Services {
     fn pr_reply_to_review_comment(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         comment_id: u64,
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let reply = sc
-                .reply_to_review_comment(&repo_ref, number, comment_id, &body)
+                .reply_to_review_comment(&repo_ref, pr_number, comment_id, &body)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "id": reply.id,
                 "htmlUrl": reply.url,
             }))
@@ -17808,6 +17856,8 @@ impl WorkspaceApi for Services {
     fn pr_resolve_thread(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         thread_id: String,
         action: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -17815,11 +17865,10 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let action = pr_ops::validate_resolve_action(action)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Active-PR enforcement (TS `requirePrContext`) even though the
-            // forge call keys off the thread id alone.
-            let _ = pr_ops::repo_of(&ws)?;
-            let _ = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            // The forge call keys off the thread id alone; `repo`/`pr_number`
+            // are still validated + echoed so the addressing stays uniform.
+            let (_repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let success = if action == "unresolve" {
                 sc.unresolve_thread(&thread_id).await
@@ -17834,6 +17883,8 @@ impl WorkspaceApi for Services {
             }
             Ok(serde_json::json!({
                 "ok": true,
+                "repo": repo_slug,
+                "prNumber": pr_number,
                 "threadId": thread_id,
                 "action": action,
             }))
@@ -17843,6 +17894,8 @@ impl WorkspaceApi for Services {
     fn pr_create_review(
         &self,
         workspace_id: WorkspaceId,
+        repo: String,
+        pr_number: u64,
         verdict: String,
         body: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -17850,9 +17903,8 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let verdict = pr_ops::validate_review_verdict(&verdict)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
+            store.get_workspace(&workspace_id).await?;
+            let (repo_ref, repo_slug) = pr_ops::repo_ref_from_slug(&repo)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             if verdict == intent_sourcecontrol::ReviewVerdict::RequestChanges {
                 pr_ops::require_capability(
@@ -17860,12 +17912,15 @@ impl WorkspaceApi for Services {
                     "request-changes review",
                 )?;
             }
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let review = sc
-                .submit_review(&repo_ref, number, verdict, body)
+                .submit_review(&repo_ref, pr_number, verdict, body)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({ "review": review }))
+            Ok(serde_json::json!({
+                "repo": repo_slug,
+                "prNumber": pr_number,
+                "review": review,
+            }))
         })
     }
 
@@ -21134,9 +21189,10 @@ fn empty_changes_result() -> serde_json::Value {
     serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
 }
 
-/// Load a workspace for a `pr.*` call, mapping a missing workspace onto the
-/// "No active PR" error (→ `-32603`) so an unknown/unlinked workspace surfaces
-/// like the TS `requirePrContext` guard (PROTOCOL §5.7).
+/// Load a workspace for the `pr_active_context` router-compat shim, mapping a
+/// missing workspace onto the "No active PR" error (→ `-32603`) so an
+/// unknown/unlinked workspace surfaces the same §5.7 guard as one without
+/// PR linkage.
 async fn load_ws_for_pr(store: &Store, workspace_id: &WorkspaceId) -> Result<Workspace> {
     store
         .get_workspace(workspace_id)

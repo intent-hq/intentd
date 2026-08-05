@@ -6893,31 +6893,37 @@ mod wsapi6_bindings_tests {
 
     use crate::WorkspaceMcpServer;
 
-    /// `(mergeMethod, commitTitle, commitMessage, idempotencyKey)`.
+    /// `(repo, prNumber, mergeMethod, commitTitle, commitMessage, idempotencyKey)`.
     type PrMergeCall = (
+        String,
+        u64,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
     );
-    type PrReviewCommentsCall = (Option<String>, Option<String>);
-    type PrSnapshotCall = (u64, Option<String>);
-    type PrResolveThreadCall = (String, Option<String>);
-    type PrReplyCall = (u64, String);
+    /// `(repo, prNumber, path, status)`.
+    type PrReviewCommentsCall = (String, u64, Option<String>, Option<String>);
+    /// `(repo, prNumber)`.
+    type PrSnapshotCall = (String, u64);
+    /// `(repo, prNumber, threadId, action)`.
+    type PrResolveThreadCall = (String, u64, String, Option<String>);
+    /// `(repo, prNumber, commentId, body)`.
+    type PrReplyCall = (String, u64, u64, String);
     type CrossReadCall = (String, String);
     type BrowserExecCall = (Vec<Value>, Option<String>, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
-        pr_status_calls: Mutex<u32>,
+        pr_status_calls: Mutex<Vec<PrSnapshotCall>>,
         pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
         pr_merge_calls: Mutex<Vec<PrMergeCall>>,
-        pr_update_branch_calls: Mutex<u32>,
+        pr_update_branch_calls: Mutex<Vec<PrSnapshotCall>>,
         pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
         pr_reply_calls: Mutex<Vec<PrReplyCall>>,
         pr_resolve_thread_calls: Mutex<Vec<PrResolveThreadCall>>,
-        pr_list_comments_calls: Mutex<Vec<Option<i64>>>,
-        pr_post_comment_calls: Mutex<Vec<String>>,
+        pr_list_comments_calls: Mutex<Vec<(String, u64, Option<i64>)>>,
+        pr_post_comment_calls: Mutex<Vec<(String, u64, String)>>,
         cross_list_siblings_calls: Mutex<u32>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
@@ -6944,8 +6950,16 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn pr_status(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
-            *self.pr_status_calls.lock().unwrap() += 1;
+        fn pr_status(
+            &self,
+            _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_status_calls
+                .lock()
+                .unwrap()
+                .push((repo.clone(), pr_number));
             let result = self.pr_status_result.lock().unwrap().clone();
             let error = self.pr_status_error.lock().unwrap().clone();
             Box::pin(async move {
@@ -6954,7 +6968,8 @@ mod wsapi6_bindings_tests {
                 }
                 Ok(result.unwrap_or_else(|| {
                     json!({
-                        "prNumber": 42,
+                        "repo": repo,
+                        "prNumber": pr_number,
                         "title": "T",
                         "url": "https://example.com/pr/42",
                         "state": "open",
@@ -6973,16 +6988,16 @@ mod wsapi6_bindings_tests {
         fn pr_state(
             &self,
             _ws: WorkspaceId,
+            repo: String,
             pr_number: u64,
-            repo: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.pr_snapshot_calls
                 .lock()
                 .unwrap()
-                .push((pr_number, repo.clone()));
+                .push((repo.clone(), pr_number));
             Box::pin(async move {
                 Ok(json!({
-                    "repo": repo.unwrap_or_else(|| "o/r".to_string()),
+                    "repo": repo,
                     "prNumber": pr_number,
                     "state": "open",
                     "isMerged": false,
@@ -6994,15 +7009,20 @@ mod wsapi6_bindings_tests {
             })
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn pr_merge(
             &self,
             _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
             merge_method: Option<String>,
             commit_title: Option<String>,
             commit_message: Option<String>,
             idempotency_key: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.pr_merge_calls.lock().unwrap().push((
+                repo.clone(),
+                pr_number,
                 merge_method.clone(),
                 commit_title,
                 commit_message,
@@ -7010,19 +7030,30 @@ mod wsapi6_bindings_tests {
             ));
             Box::pin(async move {
                 Ok(json!({
+                    "repo": repo,
                     "merged": true,
                     "sha": "deadbeef",
                     "mergeMethod": merge_method.unwrap_or_else(|| "merge".to_string()),
                     "message": "ok",
-                    "prNumber": 42,
+                    "prNumber": pr_number,
                 }))
             })
         }
 
-        fn pr_update_branch(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
-            *self.pr_update_branch_calls.lock().unwrap() += 1;
-            Box::pin(async {
+        fn pr_update_branch(
+            &self,
+            _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_update_branch_calls
+                .lock()
+                .unwrap()
+                .push((repo.clone(), pr_number));
+            Box::pin(async move {
                 Ok(json!({
+                    "repo": repo,
+                    "prNumber": pr_number,
                     "method": "merge",
                     "alreadyUpToDate": false,
                     "message": "PR branch updated.",
@@ -7034,13 +7065,15 @@ mod wsapi6_bindings_tests {
         fn pr_list_review_comments(
             &self,
             _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
             path: Option<String>,
             status: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.pr_list_review_comments_calls
                 .lock()
                 .unwrap()
-                .push((path, status));
+                .push((repo, pr_number, path, status));
             Box::pin(async {
                 Ok(json!({
                     "threads": [],
@@ -7056,23 +7089,32 @@ mod wsapi6_bindings_tests {
         fn pr_reply_to_review_comment(
             &self,
             _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
             comment_id: u64,
             body: String,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_reply_calls.lock().unwrap().push((comment_id, body));
+            self.pr_reply_calls
+                .lock()
+                .unwrap()
+                .push((repo, pr_number, comment_id, body));
             Box::pin(async { Ok(json!({ "id": 999, "htmlUrl": "https://example.com/c/999" })) })
         }
 
         fn pr_resolve_thread(
             &self,
             _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
             thread_id: String,
             action: Option<String>,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_resolve_thread_calls
-                .lock()
-                .unwrap()
-                .push((thread_id.clone(), action.clone()));
+            self.pr_resolve_thread_calls.lock().unwrap().push((
+                repo,
+                pr_number,
+                thread_id.clone(),
+                action.clone(),
+            ));
             Box::pin(async move {
                 Ok(json!({
                     "ok": true,
@@ -7085,14 +7127,28 @@ mod wsapi6_bindings_tests {
         fn pr_list_comments(
             &self,
             _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
             count: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_list_comments_calls.lock().unwrap().push(count);
+            self.pr_list_comments_calls
+                .lock()
+                .unwrap()
+                .push((repo, pr_number, count));
             Box::pin(async { Ok(json!({ "count": 0, "comments": [] })) })
         }
 
-        fn pr_post_comment(&self, _ws: WorkspaceId, body: String) -> BoxFuture<'_, Result<Value>> {
-            self.pr_post_comment_calls.lock().unwrap().push(body);
+        fn pr_post_comment(
+            &self,
+            _ws: WorkspaceId,
+            repo: String,
+            pr_number: u64,
+            body: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.pr_post_comment_calls
+                .lock()
+                .unwrap()
+                .push((repo, pr_number, body));
             Box::pin(async { Ok(json!({ "id": 1234, "htmlUrl": "https://example.com/c/1234" })) })
         }
 
@@ -7290,85 +7346,89 @@ mod wsapi6_bindings_tests {
     // ================================================================
 
     #[tokio::test]
-    async fn pr_status_returns_shape_from_trait() {
+    async fn pr_status_forwards_repo_and_pr_number() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.status();").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["prNumber"], json!(42));
-        assert_eq!(v["state"], json!("open"));
-        assert_eq!(*api.pr_status_calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn pr_status_surfaces_no_active_pr_error() {
-        let (srv, api) = server();
-        // Simulate the daemon's "No active PR" error surface — parity with
-        // `requirePrContext()` in `ws-pr-api.ts`.
-        *api.pr_status_error.lock().unwrap() = Some("No active PR".to_string());
-        let resp = call(&srv, "return await ws.pr.status();").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("No active PR"));
-    }
-
-    #[tokio::test]
-    async fn pr_snapshot_forwards_pr_number_and_returns_shape() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
+        let resp = call(&srv, "return await ws.pr.status('o/r', 42);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
         assert_eq!(v["repo"], json!("o/r"));
         assert_eq!(v["prNumber"], json!(42));
-        assert_eq!(v["isMerged"], json!(false));
-        assert_eq!(v["mergeBlockedReason"], json!(null));
-        assert_eq!(*api.pr_snapshot_calls.lock().unwrap(), vec![(42u64, None)]);
-    }
-
-    #[tokio::test]
-    async fn pr_snapshot_forwards_cross_repo_arg_and_echoes_repo() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.snapshot(7, { repo: 'acme/widgets' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["repo"], json!("acme/widgets"));
-        assert_eq!(v["prNumber"], json!(7));
+        assert_eq!(v["state"], json!("open"));
         assert_eq!(
-            *api.pr_snapshot_calls.lock().unwrap(),
-            vec![(7u64, Some("acme/widgets".to_string()))]
+            *api.pr_status_calls.lock().unwrap(),
+            vec![("o/r".to_string(), 42u64)]
         );
     }
 
     #[tokio::test]
-    async fn pr_snapshot_rejects_non_string_repo() {
-        // A present-but-non-string `repo` fails fast instead of silently
-        // falling back to the workspace repo.
+    async fn pr_status_surfaces_trait_error() {
         let (srv, api) = server();
-        for code in [
-            "return await ws.pr.snapshot(7, { repo: 123 });",
-            "return await ws.pr.snapshot(7, { repo: { owner: 'a', name: 'b' } });",
-        ] {
-            let resp = call(&srv, code).await;
-            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
-            assert!(text(&resp).contains("repo must be an \"owner/name\" string"));
-        }
-        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
+        *api.pr_status_error.lock().unwrap() = Some("PR #42 not found in o/r".to_string());
+        let resp = call(&srv, "return await ws.pr.status('o/r', 42);").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("PR #42 not found in o/r"));
     }
 
     #[tokio::test]
-    async fn pr_snapshot_requires_numeric_pr_number() {
-        // Missing, non-positive, and non-numeric prNumber all surface the
-        // same validation error before the trait method is called — parity
-        // with the `replyToReviewComment` commentId pattern.
+    async fn pr_snapshot_forwards_repo_and_pr_number_and_returns_shape() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.pr.snapshot('acme/widgets', 7);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["repo"], json!("acme/widgets"));
+        assert_eq!(v["prNumber"], json!(7));
+        assert_eq!(v["isMerged"], json!(false));
+        assert_eq!(v["mergeBlockedReason"], json!(null));
+        assert_eq!(
+            *api.pr_snapshot_calls.lock().unwrap(),
+            vec![("acme/widgets".to_string(), 7u64)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_methods_require_repo() {
+        // Missing, null, blank, and non-string `repo` all surface the same
+        // validation error before the trait method is called — on every
+        // ws.pr.* method, since explicit addressing has no fallback.
         let (srv, api) = server();
         for code in [
             "return await ws.pr.snapshot();",
-            "return await ws.pr.snapshot(0);",
-            "return await ws.pr.snapshot(-1);",
-            "return await ws.pr.snapshot('abc');",
+            "return await ws.pr.snapshot(null, 7);",
+            "return await ws.pr.snapshot('', 7);",
+            "return await ws.pr.snapshot(123, 7);",
+            "return await ws.pr.status();",
+            "return await ws.pr.merge();",
+            "return await ws.pr.updateBranch();",
+            "return await ws.pr.listReviewComments();",
+            "return await ws.pr.replyToReviewComment();",
+            "return await ws.pr.resolveThread();",
+            "return await ws.pr.listComments();",
+            "return await ws.pr.postComment();",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
+            assert!(
+                text(&resp).contains("repo is required and must be an \"owner/name\" string"),
+                "code: {code}"
+            );
+        }
+        assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
+        assert!(api.pr_status_calls.lock().unwrap().is_empty());
+        assert!(api.pr_merge_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_methods_require_numeric_pr_number() {
+        // Missing, non-positive, and non-numeric prNumber all surface the
+        // same validation error before the trait method is called.
+        let (srv, api) = server();
+        for code in [
+            "return await ws.pr.snapshot('o/r');",
+            "return await ws.pr.snapshot('o/r', 0);",
+            "return await ws.pr.snapshot('o/r', -1);",
+            "return await ws.pr.snapshot('o/r', 'abc');",
+            "return await ws.pr.status('o/r');",
+            "return await ws.pr.merge('o/r');",
         ] {
             let resp = call(&srv, code).await;
             assert_eq!(resp["result"]["isError"], json!(true), "code: {code}");
@@ -7378,6 +7438,8 @@ mod wsapi6_bindings_tests {
             );
         }
         assert!(api.pr_snapshot_calls.lock().unwrap().is_empty());
+        assert!(api.pr_status_calls.lock().unwrap().is_empty());
+        assert!(api.pr_merge_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -7385,7 +7447,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "return await ws.pr.merge({ commitTitle: 'ct', commitMessage: 'cm' });",
+            "return await ws.pr.merge('o/r', 42, { commitTitle: 'ct', commitMessage: 'cm' });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7394,11 +7456,13 @@ mod wsapi6_bindings_tests {
         assert_eq!(v["mergeMethod"], json!("merge"));
         let calls = api.pr_merge_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, None);
-        assert_eq!(calls[0].1.as_deref(), Some("ct"));
-        assert_eq!(calls[0].2.as_deref(), Some("cm"));
+        assert_eq!(calls[0].0, "o/r");
+        assert_eq!(calls[0].1, 42);
+        assert_eq!(calls[0].2, None);
+        assert_eq!(calls[0].3.as_deref(), Some("ct"));
+        assert_eq!(calls[0].4.as_deref(), Some("cm"));
         let key = calls[0]
-            .3
+            .5
             .as_deref()
             .expect("pr.merge must mint an idempotencyKey");
         assert!(
@@ -7415,13 +7479,13 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "return await ws.pr.merge({ idempotencyKey: 'key-from-caller' });",
+            "return await ws.pr.merge('o/r', 42, { idempotencyKey: 'key-from-caller' });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.pr_merge_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].3.as_deref(), Some("key-from-caller"));
+        assert_eq!(calls[0].5.as_deref(), Some("key-from-caller"));
     }
 
     #[tokio::test]
@@ -7430,12 +7494,16 @@ mod wsapi6_bindings_tests {
         // collapse dedupe across unrelated requests — parity with
         // `comment.add`. The binding mints a fresh UUID instead.
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.merge({ idempotencyKey: '   ' });").await;
+        let resp = call(
+            &srv,
+            "return await ws.pr.merge('o/r', 42, { idempotencyKey: '   ' });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.pr_merge_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let key = calls[0]
-            .3
+            .5
             .as_deref()
             .expect("pr.merge must mint an idempotencyKey");
         assert!(
@@ -7447,18 +7515,25 @@ mod wsapi6_bindings_tests {
     #[tokio::test]
     async fn pr_merge_rejects_invalid_merge_method() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.merge({ mergeMethod: 'bogus' });").await;
+        let resp = call(
+            &srv,
+            "return await ws.pr.merge('o/r', 42, { mergeMethod: 'bogus' });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("mergeMethod must be one of"));
         assert!(api.pr_merge_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn pr_update_branch_calls_trait() {
+    async fn pr_update_branch_forwards_repo_and_pr_number() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.updateBranch();").await;
+        let resp = call(&srv, "return await ws.pr.updateBranch('o/r', 42);").await;
         assert_eq!(resp["result"]["isError"], json!(false));
-        assert_eq!(*api.pr_update_branch_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *api.pr_update_branch_calls.lock().unwrap(),
+            vec![("o/r".to_string(), 42u64)]
+        );
     }
 
     #[tokio::test]
@@ -7466,7 +7541,7 @@ mod wsapi6_bindings_tests {
         let (srv, _api) = server();
         let resp = call(
             &srv,
-            "return await ws.pr.listReviewComments({ status: 'bogus' });",
+            "return await ws.pr.listReviewComments('o/r', 42, { status: 'bogus' });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(true));
@@ -7478,14 +7553,19 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "return await ws.pr.listReviewComments({ path: 'src/x.rs', status: 'resolved' });",
+            "return await ws.pr.listReviewComments('o/r', 42, { path: 'src/x.rs', status: 'resolved' });",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.pr_list_review_comments_calls.lock().unwrap();
         assert_eq!(
             calls[0],
-            (Some("src/x.rs".to_string()), Some("resolved".to_string()))
+            (
+                "o/r".to_string(),
+                42u64,
+                Some("src/x.rs".to_string()),
+                Some("resolved".to_string())
+            )
         );
     }
 
@@ -7494,7 +7574,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            "return await ws.pr.replyToReviewComment(123, 'thanks');",
+            "return await ws.pr.replyToReviewComment('o/r', 42, 123, 'thanks');",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7502,17 +7582,21 @@ mod wsapi6_bindings_tests {
         assert_eq!(v["id"], json!(999));
         assert_eq!(
             *api.pr_reply_calls.lock().unwrap(),
-            vec![(123u64, "thanks".to_string())]
+            vec![("o/r".to_string(), 42u64, 123u64, "thanks".to_string())]
         );
     }
 
     #[tokio::test]
     async fn pr_resolve_thread_defaults_action_and_validates() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.resolveThread('th-1');").await;
+        let resp = call(&srv, "return await ws.pr.resolveThread('o/r', 42, 'th-1');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         // Invalid action surfaces before the trait method is called.
-        let bad = call(&srv, "return await ws.pr.resolveThread('th-1', 'bogus');").await;
+        let bad = call(
+            &srv,
+            "return await ws.pr.resolveThread('o/r', 42, 'th-1', 'bogus');",
+        )
+        .await;
         assert_eq!(bad["result"]["isError"], json!(true));
         assert!(text(&bad).contains("action must be one of"));
         // The valid call was recorded; the invalid one was not.
@@ -7522,15 +7606,22 @@ mod wsapi6_bindings_tests {
     #[tokio::test]
     async fn pr_list_comments_forwards_count() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.listComments({ count: 5 });").await;
+        let resp = call(
+            &srv,
+            "return await ws.pr.listComments('o/r', 42, { count: 5 });",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
-        assert_eq!(*api.pr_list_comments_calls.lock().unwrap(), vec![Some(5)]);
+        assert_eq!(
+            *api.pr_list_comments_calls.lock().unwrap(),
+            vec![("o/r".to_string(), 42u64, Some(5))]
+        );
     }
 
     #[tokio::test]
     async fn pr_post_comment_rejects_empty_body() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.postComment('');").await;
+        let resp = call(&srv, "return await ws.pr.postComment('o/r', 42, '');").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(api.pr_post_comment_calls.lock().unwrap().is_empty());
     }
@@ -7538,11 +7629,15 @@ mod wsapi6_bindings_tests {
     #[tokio::test]
     async fn pr_post_comment_forwards_body() {
         let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.postComment('hi there');").await;
+        let resp = call(
+            &srv,
+            "return await ws.pr.postComment('o/r', 42, 'hi there');",
+        )
+        .await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(
             *api.pr_post_comment_calls.lock().unwrap(),
-            vec!["hi there".to_string()]
+            vec![("o/r".to_string(), 42u64, "hi there".to_string())]
         );
     }
 

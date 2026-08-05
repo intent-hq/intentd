@@ -2022,9 +2022,20 @@ async fn dispatch(
             let r = api.pr_capabilities(ws).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // The FE-facing pr.* arms stay workspace-addressed (PROTOCOL §5.7):
+        // each arm resolves the workspace's linked repo/PR via the
+        // `pr_active_context` shim (the §5.7 "No active PR" surface), then
+        // calls the explicit-parameter service method.
         "pr.status" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
+            let r = api
+                .pr_status(ws, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "pr.refresh" => {
@@ -2035,8 +2046,12 @@ async fn dispatch(
         "pr.listComments" => {
             let ws = require_ws_note(params)?;
             let count = opt_int(params, "count");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_list_comments(ws, count)
+                .pr_list_comments(ws, repo, number, count)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2045,17 +2060,26 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let path = opt_str(params, "path");
             let status = opt_str(params, "status");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_list_review_comments(ws, path, status)
+                .pr_list_review_comments(ws, repo, number, path, status)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "pr.getReviews" => {
             let ws = require_ws_note(params)?;
+            // Wire compat: an explicit `prNumber` wins, else the linked PR.
             let pr_number = opt_int(params, "prNumber").and_then(|n| u64::try_from(n).ok());
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), pr_number)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_get_reviews(ws, pr_number)
+                .pr_get_reviews(ws, repo, number)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2063,8 +2087,12 @@ async fn dispatch(
         "pr.listCheckRuns" => {
             let ws = require_ws_note(params)?;
             let git_ref = opt_str(params, "ref");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_list_check_runs(ws, git_ref)
+                .pr_list_check_runs(ws, repo, number, git_ref)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2075,9 +2103,15 @@ async fn dispatch(
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
             let idempotency_key = opt_str(params, "idempotencyKey");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
                 .pr_merge(
                     ws,
+                    repo,
+                    number,
                     merge_method,
                     commit_title,
                     commit_message,
@@ -2089,13 +2123,27 @@ async fn dispatch(
         }
         "pr.updateBranch" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_update_branch(ws).await.map_err(domain_to_rpc)?;
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
+            let r = api
+                .pr_update_branch(ws, repo, number)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "pr.postComment" => {
             let ws = require_ws_note(params)?;
             let body = require_str_param(params, "body")?;
-            let r = api.pr_post_comment(ws, body).await.map_err(domain_to_rpc)?;
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
+            let r = api
+                .pr_post_comment(ws, repo, number, body)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "pr.replyToReviewComment" => {
@@ -2105,8 +2153,12 @@ async fn dispatch(
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid_params("Missing required parameter: commentId"))?;
             let body = require_str_param(params, "body")?;
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_reply_to_review_comment(ws, comment_id, body)
+                .pr_reply_to_review_comment(ws, repo, number, comment_id, body)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2115,8 +2167,12 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let thread_id = require_str_param(params, "threadId")?;
             let action = opt_str(params, "action");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_resolve_thread(ws, thread_id, action)
+                .pr_resolve_thread(ws, repo, number, thread_id, action)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2125,8 +2181,12 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let verdict = require_str_param(params, "verdict")?;
             let body = opt_str(params, "body");
+            let (repo, number) = api
+                .pr_active_context(ws.clone(), None)
+                .await
+                .map_err(domain_to_rpc)?;
             let r = api
-                .pr_create_review(ws, verdict, body)
+                .pr_create_review(ws, repo, number, verdict, body)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
