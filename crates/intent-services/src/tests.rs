@@ -5121,9 +5121,10 @@ mod change_event_parity {
     /// Regression (intent-hq/monorepo#1481): the attention paths must scope
     /// their write to the attention column (plus `updated_at` where intended)
     /// — never a full-row replace — so a concurrent row mutation landing
-    /// between the path's workspace read and its write survives. Parks
-    /// `mark_seen` inside that window, mutates `title`/`updated_at`
-    /// concurrently, and asserts the mutation is not clobbered.
+    /// just before the attention write (the former read-modify-write window)
+    /// survives. Parks `mark_seen` immediately before its scoped write,
+    /// mutates `title`/`updated_at` concurrently, and asserts the mutation
+    /// is not clobbered.
     #[tokio::test]
     async fn mark_seen_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};

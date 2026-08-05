@@ -234,11 +234,12 @@ impl Store {
     /// and [`Self::set_workspace_branch_auto_generated`]).
     ///
     /// `expected = Some(from)` writes only when the current attention equals
-    /// `from` (markSeen's clear-only-when-unread; pass a value different
-    /// from `attention` or the write degenerates to a same-value rewrite);
-    /// `None` writes whenever the current attention differs from
-    /// `attention`. Returns whether a row was written (`true` ⇒ the value
-    /// actually changed); `NotFound` when the workspace does not exist.
+    /// `from` (markSeen's clear-only-when-unread; must differ from
+    /// `attention` — debug-asserted — or the write degenerates to a
+    /// same-value rewrite reported as a change); `None` writes whenever the
+    /// current attention differs from `attention`. Returns whether a row was
+    /// written (`true` ⇒ the value actually changed); `NotFound` when the
+    /// workspace does not exist.
     pub async fn set_workspace_attention(
         &self,
         id: &WorkspaceId,
@@ -246,6 +247,11 @@ impl Store {
         updated_at: Option<&str>,
         expected: Option<WorkspaceAttention>,
     ) -> Result<bool> {
+        debug_assert!(
+            expected.as_ref() != Some(&attention),
+            "expected == attention degenerates to a same-value rewrite that \
+             reports `changed = true`"
+        );
         let target = enum_to_db(&attention)?;
         let guard = match &expected {
             Some(from) => enum_to_db(from)?,

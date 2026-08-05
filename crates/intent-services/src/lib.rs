@@ -339,11 +339,11 @@ pub struct Services {
     /// `with_script_start_registration_park`.
     script_parks: script_ops::ScriptParks,
     /// Test park seam (monorepo#1481) for the attention mutation race window
-    /// — parks `raise_attention` / `mark_seen` / `dismiss_attention` between
-    /// their workspace read and their attention write so tests can
-    /// deterministically interleave a concurrent row mutation. `None` in
-    /// production wiring; tests inject via the `#[cfg(test)]`-only
-    /// `with_attention_write_park`.
+    /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
+    /// immediately before their scoped attention write (the site of the
+    /// former read-modify-write window) so tests can deterministically
+    /// interleave a concurrent row mutation. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
     attention_write_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
@@ -995,10 +995,10 @@ impl Services {
     }
 
     /// Test seam (monorepo#1481): park the attention mutation paths
-    /// (`raise_attention` / `mark_seen` / `dismiss_attention`) between their
-    /// workspace read and their attention write so read-modify-write races
-    /// against concurrent row mutations are deterministic. Production wiring
-    /// keeps `None` (no parking).
+    /// (`raise_attention` / `mark_seen` / `dismiss_attention`) immediately
+    /// before their scoped attention write — the site of the former
+    /// read-modify-write window — so races against concurrent row mutations
+    /// are deterministic. Production wiring keeps `None` (no parking).
     #[cfg(test)]
     pub(crate) fn with_attention_write_park(
         mut self,
@@ -1008,8 +1008,8 @@ impl Services {
         self
     }
 
-    /// Park inside the attention read→write window when the test seam is
-    /// armed (no-op in production wiring).
+    /// Park immediately before the scoped attention write when the test seam
+    /// is armed (no-op in production wiring).
     async fn park_attention_write(&self) {
         if let Some(park) = &self.attention_write_park {
             park.entered.notify_one();
