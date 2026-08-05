@@ -3464,6 +3464,88 @@ async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
     );
 }
 
+/// Every interruption persists the marker row, even with ZERO streamed
+/// output: a hard `stop()` landing while the live-turn slot is open but
+/// empty (turn started, nothing streamed) persists the EMPTY interrupted
+/// row stamped `agent_stopped`, with no sender attribution.
+#[tokio::test]
+async fn stop_with_empty_live_turn_persists_empty_interrupted_row() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-empty"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .set_live_turn(&id, "msg-stop-empty", Vec::new());
+
+    assert!(mgr.stop(&id).await, "stop finds the live agent");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "empty marker row persisted: {messages:?}"
+    );
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-stop-empty");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(Vec::new()));
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["interruptReason"], "agent_stopped");
+    assert!(
+        metadata.get("interruptedBy").is_none(),
+        "no sender attribution outside message preemption"
+    );
+}
+
+/// Shutdown-capture companion: a graceful daemon shutdown landing while the
+/// live-turn slot is open but EMPTY persists the empty interrupted row
+/// stamped `daemon_shutdown` (every interruption leaves a marker row).
+#[tokio::test]
+async fn shutdown_with_empty_live_turn_persists_empty_interrupted_row() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-shutdown-empty"),
+        AgentId::from("a-shutdown-empty"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .set_live_turn(&id, "msg-shutdown-empty", Vec::new());
+
+    mgr.shutdown().await;
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "empty marker row persisted: {messages:?}"
+    );
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-shutdown-empty");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(Vec::new()));
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["interruptReason"], "daemon_shutdown");
+    assert!(
+        metadata.get("interruptedBy").is_none(),
+        "no sender attribution outside message preemption"
+    );
+}
+
 /// `agent.sendQueuedMessageNow` on an IDLE agent: the entry is atomically
 /// dequeued, the REST of the queue is preserved, the user row persists under
 /// the ENTRY id (the RPC result's `messageId`), and the turn starts
@@ -3931,6 +4013,127 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
         first_pos < urgent_pos,
         "preempted message precedes the interrupt message: {prompt_text:?}"
     );
+}
+
+/// Race guard on the STAB-114 combined-delivery progress check: the marker
+/// row exclusion applies ONLY while the flushed row is actually empty. The
+/// zero-output snapshot in `preempt_busy_turn` is taken several awaits before
+/// `interrupt_inner` re-reads the live-turn slot, so a first block streaming
+/// in that window lands in the flushed row — a NON-empty marker row must
+/// count as progress (blocking combined re-delivery), while an empty one
+/// must not.
+#[test]
+fn turn_progress_check_excludes_only_empty_marker_row() {
+    fn msg(id: &str, role: &str, content: Value) -> intent_core::AgentMessage {
+        intent_core::AgentMessage {
+            id: id.into(),
+            agent_id: AgentId::from("a-progress"),
+            seq: 0,
+            role: role.into(),
+            content,
+            metadata: None,
+            app_message_id: None,
+            created_at: now_iso(),
+        }
+    }
+    let user = msg("u1", "user", json!([{ "type": "text", "text": "first" }]));
+    let marker_id = "marker".to_string();
+
+    // Empty marker row → excluded → no progress (combined delivery fires).
+    let empty_marker = msg("marker", "assistant", json!([]));
+    assert!(!super::turn_progressed_after(
+        &[user.clone(), empty_marker],
+        0,
+        Some(&marker_id)
+    ));
+
+    // NON-empty marker row (a block streamed between the snapshot and the
+    // flush) → counts as progress despite the id match.
+    let raced_marker = msg(
+        "marker",
+        "assistant",
+        json!([{ "type": "text", "text": "raced-in block" }]),
+    );
+    assert!(super::turn_progressed_after(
+        &[user.clone(), raced_marker],
+        0,
+        Some(&marker_id)
+    ));
+
+    // Nothing after the user row → no progress.
+    assert!(!super::turn_progressed_after(&[user], 0, None));
+    // Any OTHER non-user row after the last user message is progress, even
+    // an empty one whose id does not match the marker.
+    let other = msg("a1", "assistant", json!([]));
+    assert!(super::turn_progressed_after(
+        &[msg("u1", "user", json!([])), other],
+        0,
+        Some(&marker_id)
+    ));
+}
+
+/// Agent-sender attribution with an ABSENT name: `fromAgentId` without
+/// `fromAgentName` stamps `{ kind: "agent", agentId }` with NO `name` key on
+/// row metadata and `stream:end` (benign wire deviation — FE handles it).
+#[tokio::test]
+async fn preemption_by_agent_sender_without_name_omits_name_field() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-noname"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-noname")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-int-noname:0", "text": "partial…" })];
+    mgr.services.set_live_turn(&id, "msg-int-noname", blocks);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent nameless".to_string(),
+            None,
+            super::TurnOptions {
+                message_metadata: Some(json!({ "fromAgentId": "agent-sender-2" })),
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+
+    let expected_by = json!({ "kind": "agent", "agentId": "agent-sender-2" });
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let marker = messages
+        .iter()
+        .find(|m| m.id == "msg-int-noname")
+        .expect("interrupted row persisted");
+    let metadata = marker.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interruptedBy"], expected_by);
+    assert!(
+        metadata["interruptedBy"].get("name").is_none(),
+        "no name key when the sender name is unknown: {metadata}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("stream:end event");
+    assert_eq!(end.data["interruptedBy"], expected_by);
 }
 
 /// Regression: interrupt-WITH-message preemption must NOT emit the STAB-28

@@ -426,6 +426,11 @@ pub(crate) struct LiveTurn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptReason {
     /// Plain `agent.stop` keep-alive interrupt (user clicked Stop).
+    ///
+    /// NOT exhaustive per-trigger: a user stop that lands with no live
+    /// connection or no `acpSessionId` falls back to the hard kill path and
+    /// surfaces as [`AgentStopped`](InterruptReason::AgentStopped) — clients
+    /// must not assume every user-initiated stop carries `user_stop`.
     UserStop,
     /// Preempted by an interrupt-priority message (user or agent sender —
     /// see [`InterruptedBy`]).
@@ -971,8 +976,13 @@ impl Services {
             "status": "interrupted",
             "interruptReason": reason.as_str(),
         });
-        if let Some(by) = interrupted_by {
-            metadata["interruptedBy"] = by.to_json();
+        // `interruptedBy` is defined ONLY for message preemption (wire
+        // contract): the reason gate keeps a misusing caller from leaking
+        // attribution onto other interruption reasons.
+        if reason == InterruptReason::PreemptedByMessage {
+            if let Some(by) = interrupted_by {
+                metadata["interruptedBy"] = by.to_json();
+            }
         }
         match self
             .store

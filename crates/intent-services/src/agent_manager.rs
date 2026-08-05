@@ -2832,8 +2832,12 @@ impl AgentManager {
                 "stopReason": "interrupted",
                 "interruptReason": reason.as_str(),
             });
-            if let Some(ref by) = interrupted_by {
-                end_data["interruptedBy"] = by.to_json();
+            // Same reason gate as the persisted row: `interruptedBy` is
+            // defined only for message preemption.
+            if reason == InterruptReason::PreemptedByMessage {
+                if let Some(ref by) = interrupted_by {
+                    end_data["interruptedBy"] = by.to_json();
+                }
             }
             if let Some(ref message_id) = interrupted_message_id {
                 end_data["messageId"] = json!(message_id);
@@ -4257,9 +4261,14 @@ impl AgentManager {
             // messages (assistant/tool/system) exist after the last
             // user message, the turn has already progressed and we
             // should NOT re-deliver (avoids duplicate tool calls or
-            // re-running side effects). The empty interrupted marker row
+            // re-running side effects). The EMPTY interrupted marker row
             // the preemption itself just appended is NOT progress —
-            // exclude it by id.
+            // exclude it by id, but ONLY while it is actually empty:
+            // `has_output` above is snapshotted several awaits before
+            // `interrupt_inner` re-reads the slot, so a first block
+            // streaming in that window lands in the flushed row — a
+            // NON-empty marker row IS progress and must keep blocking
+            // the combined re-delivery.
             if let Ok(messages) = self
                 .services
                 .store
@@ -4271,10 +4280,11 @@ impl AgentManager {
                         .iter()
                         .rposition(|m| m.id == last_user_msg.id)
                         .unwrap();
-                    let has_non_user_after = messages
-                        .iter()
-                        .skip(last_user_idx + 1)
-                        .any(|m| m.role != "user" && Some(&m.id) != interrupted_row_id.as_ref());
+                    let has_non_user_after = turn_progressed_after(
+                        &messages,
+                        last_user_idx,
+                        interrupted_row_id.as_ref(),
+                    );
 
                     if !has_non_user_after {
                         // Extract text from content blocks (JSON array).
@@ -5491,6 +5501,27 @@ mod kill_sweep_tests {
 /// One `text` ACP prompt content block for a user message.
 fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
+}
+
+/// STAB-114 combined-delivery progress check (`preempt_busy_turn`): has the
+/// turn progressed past the last user message? Any non-user row after it is
+/// progress, EXCEPT the interrupted marker row the preemption itself just
+/// appended — and that exclusion applies ONLY while the marker row is
+/// actually empty. The caller's zero-output snapshot is taken several awaits
+/// before `interrupt_inner` re-reads the live-turn slot, so a first block
+/// streaming in that window lands in the flushed row: a NON-empty marker row
+/// IS progress and must keep blocking the combined re-delivery (duplicate
+/// tool-call / re-run-side-effect hazard).
+fn turn_progressed_after(
+    messages: &[intent_core::AgentMessage],
+    last_user_idx: usize,
+    interrupted_row_id: Option<&String>,
+) -> bool {
+    messages.iter().skip(last_user_idx + 1).any(|m| {
+        m.role != "user"
+            && !(Some(&m.id) == interrupted_row_id
+                && m.content.as_array().is_some_and(Vec::is_empty))
+    })
 }
 
 /// Port of the FE `contextReferences` → `stdinContext` builder
