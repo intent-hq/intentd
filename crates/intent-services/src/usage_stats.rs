@@ -267,7 +267,7 @@ pub async fn record_session_started(
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider);
+    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider, None);
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
     let model = stats_model_key(raw_model, None, Some(&provider_id));
@@ -313,8 +313,11 @@ pub async fn record_lines_changed(
         .await
     {
         Ok((model, resolved, provider, _)) => {
-            let provider_id =
-                crate::agent_session::resolve_provider_id(model.as_deref(), provider.as_deref());
+            let provider_id = crate::agent_session::resolve_provider_id(
+                model.as_deref(),
+                provider.as_deref(),
+                None,
+            );
             (model, resolved, Some(provider_id))
         }
         Err(e) => {
