@@ -1932,6 +1932,14 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
+/// Metadata key under which the per-conversation seen marker is persisted on
+/// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
+/// transcript message the user has seen, advanced monotonically by
+/// `agent.markSeen`. No schema migration — the marker rides the existing
+/// free-form `metadata` column and survives daemon restarts. Read back by
+/// [`AgentSession::last_seen_message_id`].
+pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
+
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
 /// user-originated entry point — which always delivers immediately (a user
@@ -2130,6 +2138,19 @@ impl AgentSession {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
     }
+
+    /// The per-conversation seen marker persisted under
+    /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
+    /// `Some` only when the metadata is an object carrying a non-empty string
+    /// under that key. Clients position the "New messages" divider right
+    /// after this message on conversation entry.
+    pub fn last_seen_message_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(LAST_SEEN_MESSAGE_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -2182,6 +2203,12 @@ pub struct AgentMetadata {
     /// reload). Omitted when nothing was dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_questions_message_id: Option<String>,
+    /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
+    /// transcript message the user has seen, advanced monotonically by
+    /// `agent.markSeen`. Clients position the "New messages" divider right
+    /// after it on conversation entry. Omitted when nothing was marked seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_message_id: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -2325,6 +2352,7 @@ impl AgentLite {
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
+        let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -2341,6 +2369,7 @@ impl AgentLite {
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
+            last_seen_message_id,
         };
         Self {
             id: session.id,
@@ -3633,6 +3662,7 @@ mod tests {
             is_background: true,
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
+                LAST_SEEN_MESSAGE_ID_KEY: "msg-seen",
             })),
             stop_reason: None,
             stop_reason_timestamp: None,
@@ -3656,6 +3686,8 @@ mod tests {
         // The question-dismissal marker is lifted out of the free-form session
         // metadata into the AgentLite metadata projection.
         assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
+        // The per-conversation seen marker is lifted the same way.
+        assert_eq!(v["metadata"]["lastSeenMessageId"], "msg-seen");
         // The persisted session value is served, not a hard-coded `false`
         // (G-A1/P3-1.2c).
         assert_eq!(v["metadata"]["isBackground"], true);

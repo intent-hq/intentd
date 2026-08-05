@@ -7741,6 +7741,7 @@ mod wsapi4_bindings_tests {
                 sandbox_path: None,
                 sandbox_branch: None,
                 dismissed_questions_message_id: None,
+                last_seen_message_id: None,
             },
         }
     }
