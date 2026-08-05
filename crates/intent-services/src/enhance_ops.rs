@@ -262,8 +262,11 @@ impl Services {
     /// the mode-specific result. `mode` is pre-validated by the router
     /// (`"enhance"` or `"layout"`). Gated on auggie being the effective
     /// provider per spec Decision 5 — the settings-derived default (provider
-    /// of `model.default`, else `providers.active`, else the first
-    /// registered provider) must be auggie.
+    /// of `model.default`, else `providers.active`) must be auggie.
+    /// Unset/undecidable settings resolve the gate CLOSED (unavailable):
+    /// falling through to the first registered provider would always be
+    /// auggie and functionally reinstate the removed hardcoded default
+    /// (matches FE #759, where unset resolves disabled).
     pub(crate) async fn agent_enhance_prompt_op(
         &self,
         prompt: String,
@@ -273,12 +276,13 @@ impl Services {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         // Provider neutrality gate: enhance-prompt is an auggie-specific capability.
-        // When the effective provider is not auggie, return a typed unavailable
-        // response so the FE can hide the affordance gracefully without an error crash.
+        // When the effective provider is not auggie — including unset/undecidable
+        // settings, which resolve the gate closed rather than falling through to
+        // the first registered provider — return a typed unavailable response so
+        // the FE can hide the affordance gracefully without an error crash.
         let effective_provider =
-            crate::agent_session::derived_default_provider(&self.effective_settings())
-                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-        if effective_provider != "auggie" {
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if effective_provider.as_deref() != Some("auggie") {
             return Ok(json!({
                 "available": false,
                 "reason": "enhance-prompt requires auggie as the effective default provider"
@@ -415,10 +419,23 @@ mod tests {
         }
     }
 
+    /// Services with a fake CLI and `providers.active = "auggie"` so the
+    /// provider gate is open: unset settings resolve the gate CLOSED
+    /// (see `enhance_op_unavailable_when_settings_unset`), so op-level
+    /// tests must opt in to an auggie-active registry to reach the CLI.
     async fn services_with_bin(bin: PathBuf) -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store).with_auggie_bin(bin);
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+            .expect("set providers.active");
+        let services = Services::new(store)
+            .with_auggie_bin(bin)
+            .with_settings_registry(registry);
         (tmp, services)
     }
 
@@ -443,6 +460,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn enhance_op_unavailable_when_settings_unset() {
+        // Unset/undecidable provider settings resolve the gate CLOSED: falling
+        // through to the first registered provider would always be auggie and
+        // functionally reinstate the removed hardcoded default (coordinator
+        // ruling; matches FE #759 where unset resolves disabled). No registry
+        // wired → schema defaults → both `model.default` and
+        // `providers.active` unset.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services =
+            Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+        let v = services
+            .agent_enhance_prompt_op("improve me".into(), "enhance".into(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "available": false,
+                "reason": "enhance-prompt requires auggie as the effective default provider"
+            }),
+            "unset provider settings must close the gate, not fall back to the first registered provider"
+        );
     }
 
     #[cfg(unix)]

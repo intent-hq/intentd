@@ -2834,6 +2834,38 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
+    // Gate closed on unset settings: with neither `model.default` nor
+    // `providers.active` configured, the derived default is undecidable and
+    // the gate must resolve CLOSED — falling through to the first registered
+    // provider would always be auggie and functionally reinstate the removed
+    // hardcoded default (coordinator ruling; matches FE #759 where unset
+    // resolves disabled).
+    let (_auggie_dir, bin) = fake_auggie_script(
+        "unset-enhance",
+        "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":40,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 40);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "enhance-prompt requires auggie as the effective default provider"
+        }),
+        "unset provider settings resolve the gate closed, not open via the positional fallback"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
     // Gate precedence: the effective provider derives from the `model.default`
     // compound prefix FIRST, then `providers.active`. Both directions:
@@ -3020,6 +3052,30 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
             "available": false,
             "reason": "completeOnce requires auggie as the effective default provider"
         })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_unavailable_when_settings_unset() {
+    // Gate closed on unset settings — mirror of the enhance-prompt test.
+    let (_auggie_dir, bin) = fake_auggie_script("unset-complete", "printf '🤖\\nnever-runs\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":47,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 47);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires auggie as the effective default provider"
+        }),
+        "unset provider settings resolve the gate closed, not open via the positional fallback"
     );
     srv.ws.stop().await;
 }
