@@ -194,7 +194,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     // One overall budget: unrelated frames (events, pings) consume the same
@@ -255,7 +255,9 @@ async fn host_detection_services_over_wss() {
     // host.findBinary requires a `name` — missing ⇒ -32602 (PROTOCOL §9).
     {
         let frame = json!({ "jsonrpc": "2.0", "id": 2, "method": "host.findBinary", "params": {} });
-        ws.send(Message::Text(frame.to_string())).await.unwrap();
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
         let err = loop {
             let next = timeout(Duration::from_secs(15), ws.next())
                 .await
@@ -348,7 +350,9 @@ async fn host_app_detection_services_over_wss() {
     // host.findApp requires a `name` — missing ⇒ -32602 (PROTOCOL §9).
     {
         let frame = json!({ "jsonrpc": "2.0", "id": 100, "method": "host.findApp", "params": {} });
-        ws.send(Message::Text(frame.to_string())).await.unwrap();
+        ws.send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
         let err = loop {
             let next = timeout(Duration::from_secs(15), ws.next())
                 .await
@@ -497,7 +501,9 @@ async fn host_provider_auth_status_over_wss() {
         "method": "host.providerAuthStatus",
         "params": { "providerId": "not-a-provider" }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 302).await;
     assert_eq!(
         err["error"]["code"], -32602,
@@ -661,7 +667,9 @@ async fn host_exec_over_wss() {
             "timeoutMs": 5000,
         }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 202).await;
     assert_eq!(err["error"]["code"], -32603, "cwd outside ⇒ -32603: {err}");
     assert!(
@@ -688,7 +696,9 @@ async fn host_exec_over_wss() {
 
     // 5) Missing `command` ⇒ -32602 (PROTOCOL §9).
     let frame = json!({ "jsonrpc": "2.0", "id": 204, "method": "host.exec", "params": {} });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 204).await;
     assert_eq!(
         err["error"]["code"], -32602,
@@ -924,7 +934,9 @@ async fn host_exec_stream_over_wss() {
     // ── -32602 arms ────────────────────────────────────────────────────────
     // Missing `command` on the stream request ⇒ -32602 (PROTOCOL §9).
     let frame = json!({ "jsonrpc": "2.0", "id": 320, "method": "host.execStream", "params": {} });
-    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    rpc.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut rpc, 320).await;
     assert_eq!(
         err["error"]["code"], -32602,
@@ -934,14 +946,18 @@ async fn host_exec_stream_over_wss() {
     let frame = json!({
         "jsonrpc": "2.0", "id": 321, "method": "host.execStream.write", "params": {}
     });
-    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    rpc.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut rpc, 321).await;
     assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
 
     let frame = json!({
         "jsonrpc": "2.0", "id": 322, "method": "host.execStream.cancel", "params": {}
     });
-    rpc.send(Message::Text(frame.to_string())).await.unwrap();
+    rpc.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut rpc, 322).await;
     assert_eq!(err["error"]["code"], -32602, "missing requestId ⇒ -32602");
 }
@@ -1540,7 +1556,9 @@ async fn host_create_directory_over_wss() {
         "jsonrpc": "2.0", "id": 500, "method": "host.createDirectory",
         "params": { "path": target.to_str().unwrap() }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let resp = wss_expect_error(&mut ws, 500).await;
     assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
     assert_eq!(resp["id"], 500, "envelope: {resp}");
@@ -1586,7 +1604,9 @@ async fn host_create_directory_over_wss() {
     // 4) Missing `path` ⇒ -32602 (PROTOCOL §9), same as the sibling arms.
     let frame =
         json!({ "jsonrpc": "2.0", "id": 503, "method": "host.createDirectory", "params": {} });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 503).await;
     assert_eq!(err["error"]["code"], -32602, "missing path ⇒ -32602: {err}");
 
@@ -1595,7 +1615,9 @@ async fn host_create_directory_over_wss() {
         "jsonrpc": "2.0", "id": 504, "method": "host.createDirectory",
         "params": { "path": "" }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 504).await;
     assert_eq!(err["error"]["code"], -32602, "empty path ⇒ -32602: {err}");
 
@@ -1606,7 +1628,9 @@ async fn host_create_directory_over_wss() {
         "jsonrpc": "2.0", "id": 505, "method": "host.createDirectory",
         "params": { "path": file.to_str().unwrap() }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let err = wss_expect_error(&mut ws, 505).await;
     assert_eq!(
         err["error"]["code"], -32603,

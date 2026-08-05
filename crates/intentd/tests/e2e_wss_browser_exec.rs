@@ -204,7 +204,9 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": "browser.exec", "params": params });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
 
     // Read frames until we have both the reverse-RPC request (from the daemon)
     // and the caller-side response (matching our id). Frames can arrive in
@@ -222,7 +224,9 @@ where
             for (k, val) in fe_result.as_object().unwrap() {
                 obj.insert(k.clone(), val.clone());
             }
-            ws.send(Message::Text(reply.to_string())).await.unwrap();
+            ws.send(Message::Text(reply.to_string().into()))
+                .await
+                .unwrap();
         } else if v["id"] == json!(id) {
             caller_response = Some(v);
         }
@@ -306,7 +310,9 @@ async fn browser_exec_missing_actions_is_invalid_params() {
     let mut ws = connect_ws(port, cfg).await;
 
     let frame = json!({ "jsonrpc": "2.0", "id": 20, "method": "browser.exec", "params": {} });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     // Validation short-circuits before the reverse hop; the only frame we get
     // back is the caller-side error.
     let v = read_text(&mut ws).await;
@@ -324,7 +330,9 @@ async fn browser_exec_empty_actions_is_invalid_params() {
         "jsonrpc": "2.0", "id": 21, "method": "browser.exec",
         "params": { "actions": [] }
     });
-    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
     let v = read_text(&mut ws).await;
     assert_eq!(v["id"], json!(21));
     assert_eq!(v["error"]["code"], -32602, "empty actions ⇒ -32602: {v}");

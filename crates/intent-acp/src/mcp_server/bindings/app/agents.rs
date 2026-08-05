@@ -549,6 +549,7 @@ mod tests {
                 sandbox_branch: None,
                 sandbox_path: None,
                 dismissed_questions_message_id: None,
+                last_seen_message_id: None,
             },
         }
     }

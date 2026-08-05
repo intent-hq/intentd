@@ -4286,6 +4286,46 @@ async fn derive_agent_type_falls_back_to_default_without_agent_type() {
     assert!(get_tool_denylist_for_agent_type(DEFAULT_AGENT_TYPE).is_empty());
 }
 
+#[tokio::test]
+async fn specialist_model_options_lists_only_visible_specialists_with_options() {
+    let dir = TempSpecialistsDir::new();
+    // Carries options (with and without hints) → listed in order.
+    dir.write(
+        "chooser",
+        "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
+    );
+    // No options → omitted.
+    dir.write(
+        "plain",
+        "---\nname: \"Plain\"\ndescription: \"No options\"\n---\n\nbody",
+    );
+    // Hidden → omitted even though it carries options.
+    dir.write(
+        "ghost",
+        "---\nname: \"Ghost\"\ndescription: \"Hidden\"\nhidden: true\nmodelOptions: [{\"model\":\"grok:grok-5\",\"hint\":\"fast\"}]\n---\n\nbody",
+    );
+    let (_tmp, services) = services_with_specialists(&dir).await;
+
+    let listed = services.specialist_model_options(None);
+    let chooser = listed
+        .iter()
+        .find(|s| s.specialist == "chooser")
+        .expect("chooser listed");
+    assert_eq!(chooser.options.len(), 2);
+    assert_eq!(chooser.options[0].model, "opencode:kimi-k3");
+    assert_eq!(chooser.options[0].hint, "cheap");
+    assert_eq!(chooser.options[1].model, "auggie:opus");
+    assert_eq!(chooser.options[1].hint, "");
+    assert!(
+        !listed.iter().any(|s| s.specialist == "plain"),
+        "specialists without options are omitted"
+    );
+    assert!(
+        !listed.iter().any(|s| s.specialist == "ghost"),
+        "hidden specialists are omitted"
+    );
+}
+
 /// Build a normalized prompt for `session_id` keyed by `request_id`.
 fn prompt(request_id: &str, session_id: &str) -> PermissionRequestData {
     PermissionRequestData {
@@ -4597,6 +4637,208 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         .await
         .expect("list on recreated ws");
     assert!(sessions.is_empty(), "recreated workspace shows no ghosts");
+}
+
+/// `workspace.archive` gracefully interrupts every in-flight turn in the
+/// workspace (the `agent.stop` keep-alive semantics of
+/// `AgentManager::interrupt`): the draining worker is aborted and the terminal
+/// `agent:stream:end` (`stopReason: "interrupted"`) is emitted — but NOTHING
+/// is deleted. The tracked handle (provider child), registry entry, and
+/// session row all survive so unarchive can resume the same session, and no
+/// `agent:deleted` fires; `workspace:updated` still carries the archive delta.
+#[tokio::test]
+async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive");
+    let id = AgentId::from("a-archive-busy");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // An `acpSessionId` is required for the keep-alive interrupt (otherwise
+    // `interrupt` falls back to the hard `stop` kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-archive")
+        .await
+        .unwrap();
+    // Simulate a mid-turn worker: claim the in-flight slot AND register a
+    // JoinHandle in the workers map (the interrupt must abort it).
+    assert!(mgr.try_begin(&id, &ws).await);
+    let worker = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    mgr.workers.lock().unwrap().insert(id.clone(), worker);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+    assert!(archived.archived, "workspace archived");
+
+    // Drain the published events within a bounded window.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap_or_else(|| panic!("archive interrupt emits terminal stream:end (got {types:?})"));
+    assert_eq!(
+        end.data["stopReason"], "interrupted",
+        "archive interrupt terminal carries stopReason (got {:?})",
+        end.data
+    );
+    assert!(
+        !types.contains(&"agent:deleted"),
+        "archive deletes nothing (got {types:?})"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "workspace:updated"
+                && e.data["changes"]["archived"] == json!(true)),
+        "workspace:updated carries the archive delta (got {types:?})"
+    );
+
+    // Keep-alive: the handle + registry entry survive (child stays alive for
+    // resume), the in-flight slot and worker are released, and the persisted
+    // session row is untouched.
+    assert!(mgr.contains(&id), "tracked handle survives archive");
+    assert!(
+        mgr.registry().is_registered(&id),
+        "process stays registered (idle, reapable)"
+    );
+    assert!(!mgr.is_busy(&id), "in-flight slot released");
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "turn worker aborted"
+    );
+    mgr.services
+        .store
+        .get_agent_session(&id)
+        .await
+        .expect("session row preserved");
+}
+
+/// Pending queued messages survive `workspace.archive` untouched and are NOT
+/// drained into a new turn while the workspace is archived (the archived gate
+/// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
+/// delivers the parked queue — no organic follow-up kick required.
+#[tokio::test]
+async fn archive_workspace_parks_queue_until_unarchive() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-queue");
+    let id = AgentId::from("a-archive-queued");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-archive-q")
+        .await
+        .unwrap();
+    // Busy agent with a pending queued message (the queue kick inside
+    // `agent_queue_message_op` is a no-op while the slot is held).
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .await
+        .expect("queue message");
+    assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+
+    // The interrupt released the slot but the queue is intact and undrained.
+    assert!(!mgr.is_busy(&id), "interrupt released the slot");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "queue survives archive"
+    );
+
+    // An explicit drain kick while archived parks (archived gate): no slot
+    // claim, no dequeue.
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    assert!(!mgr.is_busy(&id), "no queue-drain respawn while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "queue stays parked while archived"
+    );
+
+    // Unarchive itself kicks the drain — the parked queue delivers without
+    // any organic follow-up kick.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick delivers the parked queue"
+    );
+}
+
+/// Wake deliveries (`deliver_wake_message` — hook wakes, completion-watch
+/// wakes, `agent.wakeOrCreate` context messages) must not start a turn while
+/// the workspace is archived: the archived gate parks them in the queue
+/// instead of claiming the slot, and unarchive's own drain kick delivers
+/// the parked wake.
+#[tokio::test]
+async fn archive_workspace_parks_wake_deliveries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-wake");
+    let id = AgentId::from("a-archive-wake");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+        .await
+        .expect("archive workspace");
+
+    // Idle agent + archived workspace: the wake queues instead of spawning
+    // a turn.
+    let out = services
+        .deliver_wake_message(&ws, &id, "[Background hook \"w\"] cancelled", None)
+        .await
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert!(!mgr.is_busy(&id), "no turn spawned while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "wake queued behind the archived gate"
+    );
+
+    // Unarchive itself kicks the drain and delivers the parked wake.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick delivers the parked wake"
+    );
 }
 
 /// `stop` drops any pending `recreated` flag so a stale resend bit cannot
@@ -7872,10 +8114,14 @@ mod merge_user_mcp_servers_tests {
 
     /// The opencode env config carries the same `workspace-mcp` bridge entry
     /// (in OpenCode `mcp` block shape) that the auggie `--mcp-config` path
-    /// generates, pointing at the same bridge endpoint.
+    /// generates, pointing at the same bridge endpoint. The bridge exe is
+    /// pinned to a space-free absolute path so the expectation does not
+    /// depend on whether the host checkout path contains whitespace
+    /// (monorepo#1367).
     #[tokio::test]
     async fn opencode_env_mcp_config_includes_bridge_server() {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/usr/local/bin/intentd");
         let json = mgr
             .opencode_env_mcp_config("127.0.0.1:9999".to_string())
             .await
@@ -7892,9 +8138,43 @@ mod merge_user_mcp_servers_tests {
             "bridge args must match the auggie --mcp-config path"
         );
         assert_eq!(
-            command[0],
-            mgr.mcp_bridge_exe.to_string_lossy(),
-            "bridge command must be the daemon's mcp-bridge executable"
+            command[0], "/usr/local/bin/intentd",
+            "space-free bridge exe stays absolute in the opencode command"
+        );
+    }
+
+    /// monorepo#1367 — the opencode env config applies the same monorepo#1049
+    /// normalization as `normalized_mcp_servers`: a whitespace-containing
+    /// bridge path collapses to the executable basename and the entry's
+    /// environment carries a PATH that prepends the parent dir to the
+    /// inherited PATH.
+    #[tokio::test]
+    async fn opencode_env_mcp_config_normalizes_spaced_bridge_path() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/opt/App Support/bin/intentd");
+        let json = mgr
+            .opencode_env_mcp_config("127.0.0.1:9999".to_string())
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let bridge = &parsed["workspace-mcp"];
+        let command: Vec<String> =
+            serde_json::from_value(bridge["command"].clone()).expect("command array");
+        assert_eq!(
+            command[0], "intentd",
+            "spaced path collapses to the basename"
+        );
+        assert_eq!(&command[1..], ["mcp-bridge", "--connect", "127.0.0.1:9999"]);
+        let inherited = std::env::var("PATH").expect("test process has PATH");
+        let expected = std::env::join_paths(
+            std::iter::once(std::path::PathBuf::from("/opt/App Support/bin"))
+                .chain(std::env::split_paths(&inherited)),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge["environment"]["PATH"],
+            serde_json::json!(expected.to_string_lossy()),
+            "entry PATH prepends the parent dir to the inherited PATH"
         );
     }
 
@@ -10503,7 +10783,7 @@ mod flush_queued_messages_tests {
                 .expect("load registry"),
         );
         registry
-            .apply(&[("agents.flushQueuedMessages".to_string(), json!(false))])
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
             .expect("disable flush");
         let services = Services::new(store)
             .with_event_bus(bus.clone())
@@ -10562,6 +10842,169 @@ mod flush_queued_messages_tests {
                 .iter()
                 .all(|t| !t.contains("queued messages while you were working")),
             "no combined header on the single-entry path: {prompts:?}"
+        );
+    }
+
+    /// `systemOnly` mode: with ≥2 ready system-origin entries interleaved
+    /// with a user-origin entry, the system entries batch into ONE combined
+    /// turn while the user-origin entry stays queued and drains solo
+    /// afterward (its own single-entry FIFO turn).
+    #[tokio::test]
+    async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
+        let script = mock_agent_script();
+        let prompt_log =
+            std::env::temp_dir().join(format!("itd-flush-systemonly-{}.log", uuid::Uuid::new_v4()));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        // A manager whose settings registry has the flush setting `systemOnly`.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "agents.flushQueuedMessages".to_string(),
+                json!("systemOnly"),
+            )])
+            .expect("set flush mode to systemOnly");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-systemonly"),
+            AgentId::from("a-flush-systemonly"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services
+            .enqueue_message(&id, "sys-1".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message_with_origin(
+            &id,
+            "user-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        mgr.services
+            .enqueue_message(&id, "sys-2".to_string(), None, None, None, None, false);
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both the combined system turn and the solo user turn complete");
+
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(
+            prompts.len(),
+            2,
+            "one combined system turn + one solo user turn: {prompts:?}"
+        );
+        let combined = &prompts[0];
+        assert!(
+            combined.contains("2 queued messages while you were working"),
+            "first turn combines the two system entries: {combined}"
+        );
+        let s1 = combined.find("sys-1").expect("sys-1 in combined turn");
+        let s2 = combined.find("sys-2").expect("sys-2 in combined turn");
+        assert!(s1 < s2, "system entries in relative order: {combined}");
+        assert!(
+            !combined.contains("user-1"),
+            "user entry excluded from the system-only batch: {combined}"
+        );
+        let solo = &prompts[1];
+        assert!(
+            solo.contains("user-1") && !solo.contains("queued messages while you were working"),
+            "second turn is the solo FIFO drain of the user entry: {solo}"
+        );
+    }
+
+    /// `systemOnly` mode with only ONE ready system entry (no batching
+    /// partner) drains it solo via the single-entry FIFO path — no combined
+    /// header.
+    #[tokio::test]
+    async fn system_only_single_system_entry_drains_solo() {
+        let script = mock_agent_script();
+        let prompt_log = std::env::temp_dir().join(format!(
+            "itd-flush-systemonly-solo-{}.log",
+            uuid::Uuid::new_v4()
+        ));
+        let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ]);
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "agents.flushQueuedMessages".to_string(),
+                json!("systemOnly"),
+            )])
+            .expect("set flush mode to systemOnly");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-flush-systemonly-solo"),
+            AgentId::from("a-flush-systemonly-solo"),
+        );
+        seed_mock_agent(&mgr, &ws, &id).await;
+
+        mgr.services
+            .enqueue_message(&id, "sys-only".to_string(), None, None, None, None, false);
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("solo turn completes");
+
+        let prompts = read_prompt_log(&prompt_log);
+        let _ = std::fs::remove_file(&prompt_log);
+        assert_eq!(prompts.len(), 1, "single solo turn: {prompts:?}");
+        assert!(
+            !prompts[0].contains("queued messages while you were working"),
+            "no combined header for a lone system entry: {prompts:?}"
         );
     }
 

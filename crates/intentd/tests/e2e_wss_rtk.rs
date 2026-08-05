@@ -176,7 +176,9 @@ async fn wss_rpc(
     params: Value,
 ) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.expect("send");
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .expect("send");
 
     // Loop until we receive the response matching our request id, skipping Ping/Pong
     loop {

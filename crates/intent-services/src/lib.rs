@@ -103,6 +103,7 @@ mod shell;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
+mod voice_ops;
 mod workspace_aggregates;
 
 #[cfg(test)]
@@ -113,7 +114,7 @@ pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
     cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
-    migrate_cow_isolation_to_sandbox, InMemorySecretStore, SecretStore,
+    migrate_cow_isolation_to_sandbox, migrate_default_vocabulary, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -249,6 +250,16 @@ pub struct Services {
     /// wake. Cleared by any non-interim completion delivery. In-memory only,
     /// like the other live delivery state.
     interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
+    /// Message ids whose questions-dismissed notice has already been claimed
+    /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
+    /// dismissal marker is single-slot (most recent id only), so this set is
+    /// what makes the no-duplicate-notice guarantee hold across concurrent
+    /// dismissals of the same id (both read the marker before either writes)
+    /// and interleaved dismissals (A → B → A). In-memory only: after a
+    /// daemon restart only the single-slot marker guards, so a re-dismissal
+    /// of an OLDER id could re-notify — fail-soft, a duplicate advisory
+    /// notice at worst.
+    dismissal_notices_sent: Arc<Mutex<HashMap<AgentId, HashSet<String>>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -271,6 +282,12 @@ pub struct Services {
     /// `SENTRY_ORG` / `SENTRY_API_TOKEN` / keychain), surfacing a graceful
     /// "not configured" `Internal` error when no pair is available.
     sentry_engine: Option<Arc<dyn intent_sentry::SentryEngine>>,
+    /// Active voice engine for `voice.transcribe`. `None` until wired by a
+    /// test; when unset, the handler builds the provider engine per call from
+    /// the `voice.provider` setting (key from the secrets store /
+    /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
+    /// "not configured" `Internal` error when no key is available.
+    voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -323,6 +340,13 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_supervise_park` /
     /// `with_script_start_registration_park`.
     script_parks: script_ops::ScriptParks,
+    /// Test park seam (monorepo#1481) for the attention mutation race window
+    /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
+    /// immediately before their scoped attention write (the site of the
+    /// former read-modify-write window) so tests can deterministically
+    /// interleave a concurrent row mutation. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
+    attention_write_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -561,10 +585,12 @@ impl Services {
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
+            voice_engine: None,
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
@@ -575,6 +601,7 @@ impl Services {
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
+            attention_write_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -711,10 +738,9 @@ impl Services {
             .unwrap_or_default()
     }
 
-    /// Whether queue drains should deliver the whole queued-message backlog
-    /// in one batched turn (`agents.flushQueuedMessages`, default on). Read
+    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_enabled(&self) -> bool {
+    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 
@@ -776,6 +802,70 @@ impl Services {
     ) -> Option<String> {
         self.specialists_service()
             .resolve_agent_type(specialist_id, workspace_path)
+    }
+
+    /// Resolve every non-hidden specialist's delegation `modelOptions`
+    /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
+    /// per-agent `workspace_api` tool description at bridge creation.
+    /// Specialists without options (the default) are omitted; resolution
+    /// failure yields an empty list — spawning never fails on this.
+    pub(crate) fn specialist_model_options(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        use serde_json::Value;
+        let Ok(listed) = self.specialists_service().list(workspace_path) else {
+            return Vec::new();
+        };
+        let Some(specs) = listed.get("specialists").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        specs
+            .iter()
+            .filter(|def| !def.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|def| {
+                let id = def.get("id").and_then(Value::as_str)?;
+                let options: Vec<intent_acp::SpecialistModelOption> = def
+                    .get("modelOptions")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(|o| {
+                        Some(intent_acp::SpecialistModelOption {
+                            model: o.get("model").and_then(Value::as_str)?.to_string(),
+                            hint: o
+                                .get("hint")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect();
+                if options.is_empty() {
+                    return None;
+                }
+                Some(intent_acp::SpecialistModelOptions {
+                    specialist: id.to_string(),
+                    options,
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::specialist_model_options`] with the project tier derived from
+    /// the stored workspace record (worktree path, else repository path) —
+    /// the same security-motivated derivation the spawn-time model resolution
+    /// uses. Lookup failure degrades to the user/bundled tiers only.
+    pub(crate) async fn specialist_model_options_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        let wp = self
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        self.specialist_model_options(wp.as_deref())
     }
 
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
@@ -904,6 +994,29 @@ impl Services {
     ) -> Self {
         self.script_parks.start_registration = Some(park);
         self
+    }
+
+    /// Test seam (monorepo#1481): park the attention mutation paths
+    /// (`raise_attention` / `mark_seen` / `dismiss_attention`) immediately
+    /// before their scoped attention write — the site of the former
+    /// read-modify-write window — so races against concurrent row mutations
+    /// are deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_attention_write_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.attention_write_park = Some(park);
+        self
+    }
+
+    /// Park immediately before the scoped attention write when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_attention_write(&self) {
+        if let Some(park) = &self.attention_write_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Test seam: observe/park the underlying `git.diffs` walk on the
@@ -1155,7 +1268,8 @@ impl Services {
             let display_status = compute_display_status(
                 self.workspace_needs_attention(&ws.id).await,
                 ws.activity == WorkspaceActivity::AgentRunning
-                    || self.workspace_has_active_hooks(&ws.id).await,
+                    || self.workspace_has_active_hooks(&ws.id).await
+                    || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                 ws.active_pull_request.as_ref(),
                 ws.pull_requests.as_deref().unwrap_or_default(),
                 ws.pr_status,
@@ -1208,7 +1322,10 @@ impl Services {
         let status = compute_display_status(
             needs_attention,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(workspace_id).await,
+                || self.workspace_has_active_hooks(workspace_id).await
+                || self
+                    .workspace_has_waiting_agent_subscriptions(workspace_id)
+                    .await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -1728,16 +1845,22 @@ impl Services {
         workspace_id: &WorkspaceId,
         level: WorkspaceAttention,
     ) -> Result<()> {
-        let mut ws = self.store.get_workspace(workspace_id).await?;
-        if ws.attention == level {
+        self.park_attention_write().await;
+        // Scoped, conditional write (monorepo#1481): set attention + bump
+        // `updated_at` (raising IS activity) in one guarded UPDATE — never a
+        // full-row replace, so a concurrent row mutation is never clobbered —
+        // and let the write's row count decide "changed", so the
+        // emit-only-on-change choice is atomic rather than read-based.
+        let changed = self
+            .store
+            .set_workspace_attention(workspace_id, level, Some(&now_iso()), None)
+            .await?;
+        if !changed {
             return Ok(());
         }
-        ws.attention = level;
-        ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
         publish_event(
             &self.event_bus,
-            attention_changed_event(&ws.id, ws.attention),
+            attention_changed_event(workspace_id, level),
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -1774,6 +1897,15 @@ impl Services {
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
     ) -> Self {
         self.sentry_engine = Some(sentry_engine);
+        self
+    }
+
+    /// Wire the active voice engine used by `voice.transcribe`. Tests inject
+    /// a stub so the handler never touches the network; production leaves it
+    /// unset and the handler builds the provider engine per call from the
+    /// `voice.provider` setting.
+    pub fn with_voice_engine(mut self, voice_engine: Arc<dyn intent_voice::VoiceEngine>) -> Self {
+        self.voice_engine = Some(voice_engine);
         self
     }
 
@@ -2647,7 +2779,7 @@ impl Services {
             }
         }
 
-        let interim_idle = self.deliver_completion_to_watches(&child, event).await;
+        let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
@@ -2662,8 +2794,30 @@ impl Services {
         // seals there). The classification is the snapshot
         // `deliver_completion_to_watches` returned, so the seal path and the
         // watch-delivery path always agree on interim vs. real.
-        if event.event_type == AGENT_IDLE && !interim_idle {
+        //
+        // monorepo#1483: the seal gates on the QUEUE/BUSY classification
+        // alone. A hook-waiting idle (the agent owns active background
+        // hooks, monorepo#1336) defers only the agent's own settlement AS A
+        // CHILD — watch delivery and grouped recording — but its delegating
+        // turn is still over (a hook wake redrives a NEW turn). Gating the
+        // seal on `hook_waiting` too would starve a hook-chaining
+        // coordinator's group forever.
+        if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
+                if classification.hook_waiting {
+                    // On the canonical hook-waiting-only idle the group was
+                    // already sealed by the inline redelivery's hook guard
+                    // (delivery's tail re-check runs it first), so this
+                    // branch is the backstop for the races where that
+                    // redelivery early-returns without sealing (e.g. an
+                    // enqueue drained into a busy turn between the entry
+                    // snapshot and the redelivery's live busy probe).
+                    tracing::debug!(
+                        parent = %child.0,
+                        group = %gid,
+                        "sealed after_all group at a hook-waiting queue-idle (monorepo#1483)"
+                    );
+                }
                 self.try_fire_group(&gid).await;
             }
         }
@@ -2886,7 +3040,18 @@ impl Services {
         // the busy guard) so the hook's own terminal transition (dispatch /
         // eviction / expiry wake → turn-end idle, or the external-cancel
         // call into this function) synthesizes the completion later.
+        //
+        // monorepo#1483: hook deferral is scoped to the agent's settlement
+        // AS A CHILD (the synthesized watch delivery below); the agent is
+        // queue-idle here (empty queue, no worker in flight), so its
+        // delegating turn is over — seal its open after_all group NOW
+        // rather than starving the seal until the hooks resolve. Box::pin
+        // mirrors the seal below (try_fire_group → deliver_parent_wake →
+        // send_message → try_drain_queue → this function).
         if !self.active_hooks_for_agent(child_id).await.is_empty() {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
             return;
         }
         // Consume the marker only after the guards pass; losing this take to
@@ -2947,18 +3112,19 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        let classification = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
         // Real completion: seal the agent's open after_all group and try to
-        // fire it, mirroring `handle_completion_event`'s non-interim idle
-        // path (monorepo#1281). Gated on the delivery pass's own interim
-        // classification: an enqueue landing between this function's
+        // fire it, mirroring `handle_completion_event`'s non-queue-interim
+        // idle path (monorepo#1281). Gated on the delivery pass's own
+        // QUEUE/BUSY classification (monorepo#1483: `hook_waiting` never
+        // gates the seal): an enqueue landing between this function's
         // `has_ready_to_send` guard and the delivery re-classifies the
         // synthesized idle as interim (marker re-recorded, so a later
         // mutation/drain retries), and the seal must agree with that
         // snapshot. Box::pin breaks the async-recursion cycle this edge
         // closes (try_drain_queue → redeliver → try_fire_group →
         // deliver_parent_wake → send_message → try_drain_queue).
-        if !interim {
+        if !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
@@ -3003,6 +3169,9 @@ impl Services {
     /// yields the pre-deferral early wake). `agent:failed` /
     /// `agent:deleted` — and the attention / reportToParent immediate
     /// wakes, which run on their own paths — are never hook-deferred.
+    /// Hook deferral is scoped to the agent's settlement AS A CHILD: the
+    /// idling agent's own parent-side after_all seal gates on the
+    /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -3021,14 +3190,17 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     ///
-    /// Returns whether the event was classified as an interim idle, so the
-    /// caller's group-seal decision (`handle_completion_event`) shares this
-    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    /// Returns the pass's idle-classification snapshot, so the callers'
+    /// group-seal decisions (`handle_completion_event`,
+    /// `redeliver_completion_after_queue_mutation`) share it instead of
+    /// re-probing the queue (monorepo#1281) — and gate on `queue_interim`
+    /// alone, because `hook_waiting` must not block the parent-side seal
+    /// (monorepo#1483).
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
         event: &Event,
-    ) -> bool {
+    ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
         // worker is already busy in a new turn (monorepo#1297: an enqueue that
@@ -3059,9 +3231,12 @@ impl Services {
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle (or, for a
         // hook-deferred idle, the last active hook's terminal transition)
-        // can synthesize the real completion (redelivering any skipped
-        // watches AND sealing a watchless coordinator's open after_all
-        // group).
+        // can synthesize the real completion, redelivering any skipped
+        // watches. For a queue-interim coordinator the synthesized idle
+        // also seals its (watchless) open after_all group; a purely
+        // hook-deferred coordinator already seals at THIS idle
+        // (monorepo#1483: `hook_waiting` does not gate the seal), so the
+        // redelivery's seal is a no-op backstop for it.
         if interim_idle {
             self.mark_interim_skipped_idle(child_id);
         }
@@ -3312,7 +3487,10 @@ impl Services {
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
-        interim_idle
+        CompletionIdleClassification {
+            queue_interim,
+            hook_waiting,
+        }
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
@@ -7240,6 +7418,24 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .or_else(|| event.actor.id.clone())
 }
 
+/// Snapshot classification one [`Services::deliver_completion_to_watches`]
+/// pass took for an `agent:idle` event (both flags are always `false` for
+/// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
+/// delivery pass's probes instead of re-probing (monorepo#1281).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompletionIdleClassification {
+    /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
+    /// or a worker turn is in flight — the agent's delegating turn is not
+    /// over yet, so the parent-side after_all seal must wait for the real
+    /// completion.
+    pub(crate) queue_interim: bool,
+    /// Hook-waiting (monorepo#1336): the agent owns active background hooks —
+    /// its settlement AS A CHILD (ungrouped watch delivery, grouped
+    /// recording) defers until the hooks resolve, but this alone must NOT
+    /// gate the parent-side after_all seal (monorepo#1483).
+    pub(crate) hook_waiting: bool,
+}
+
 /// STAB-129: the group members whose recorded terminal event was
 /// `agent:failed` and that were not deleted — the candidates whose grouped
 /// watch is retained (as an ungrouped watch) across settlement because the
@@ -9729,7 +9925,8 @@ impl WorkspaceApi for Services {
                     let display_status = compute_display_status(
                         this.workspace_needs_attention(&ws.id).await,
                         ws.activity == WorkspaceActivity::AgentRunning
-                            || this.workspace_has_active_hooks(&ws.id).await,
+                            || this.workspace_has_active_hooks(&ws.id).await
+                            || this.workspace_has_waiting_agent_subscriptions(&ws.id).await,
                         ws.active_pull_request.as_ref(),
                         ws.pull_requests.as_deref().unwrap_or_default(),
                         ws.pr_status,
@@ -11422,6 +11619,10 @@ impl WorkspaceApi for Services {
             // emits no further events) and the row is pruned by the next
             // startup heal's workspace-existence check.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree
@@ -11650,6 +11851,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the sweep and still archives.
+        let manager = self.agent_manager();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -11664,6 +11869,43 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // Gracefully interrupt every in-flight turn in the workspace —
+            // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+            // turn cancelled over the wire, draining worker aborted, terminal
+            // `agent:stream:end` emitted, provider child + ACP session kept
+            // alive. Unlike `delete_workspace` nothing is deleted: session
+            // rows, transcripts, completion watches, and pending message
+            // queues all survive so unarchive can resume work. Runs AFTER the
+            // archived row is persisted so any concurrent queue-drain kick
+            // observes the archived flag and parks instead of respawning a
+            // turn (see the archived gate in `try_drain_queue`).
+            //
+            // Residual race (deliberate trade-off): a drain that read the
+            // workspace row BEFORE the persist above can still claim the
+            // in-flight slot after the `list_busy` snapshot below, spawning
+            // one stray turn in the freshly archived workspace that this
+            // sweep misses. The window is a few statements wide and the
+            // failure is benign — that turn runs to completion once and every
+            // subsequent drain/wake parks behind the archived gates — so the
+            // sweep accepts it rather than adding a post-claim re-check to
+            // the hot drain path.
+            if let Some(manager) = manager {
+                for (agent_id, agent_ws) in manager.list_busy() {
+                    if agent_ws == id {
+                        manager.interrupt(&agent_id).await;
+                    }
+                }
+            }
+            // Cancel every active background hook in the workspace: task
+            // aborted, state persisted to `cancelled`, `hook:cancelled`
+            // emitted, owner woken with a notice. Unarchive does NOT
+            // resurrect cancelled hooks — the notice tells the owner to
+            // reschedule if the condition still matters. Runs AFTER the
+            // archived row is persisted so the cancel wakes park behind the
+            // archived gate in `deliver_wake_message` (queued at most, no
+            // turn spawned) — the same reason the interrupt sweep above
+            // runs post-persist.
+            this.cancel_workspace_hooks(&id).await;
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
@@ -11696,6 +11938,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        let manager = self.agent_manager();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -11706,6 +11949,36 @@ impl WorkspaceApi for Services {
             ws.archived_at = None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Re-engage queues parked by the archived gates
+            // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
+            // background agent's drain organically, so without this a queue
+            // parked during archive — including the hook-cancel wake notices
+            // — would stay stranded until someone happened to message the
+            // agent. Kick the drain for every workspace agent with
+            // ready-to-send work (cheap summary read, no message hydration);
+            // `try_drain_queue` re-checks its own gates (busy, question
+            // hold, Error park). Best-effort: a listing failure is logged
+            // and unarchive still succeeds — parked queues then drain on the
+            // next explicit kick.
+            if let Some(manager) = manager {
+                match store.list_agent_session_summaries(&id).await {
+                    Ok(sessions) => {
+                        for session in sessions {
+                            if this.has_ready_to_send(&session.id) {
+                                manager
+                                    .clone()
+                                    .try_drain_queue(session.id, id.clone())
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "unarchive: agent session listing failed; parked queues drain on next kick"
+                    ),
+                }
+            }
             this.derive_last_activity(&mut ws).await;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
@@ -12370,22 +12643,29 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
+            this.park_attention_write().await;
+            // Dismissing attention merely acknowledges it — not "activity" —
+            // so never touch `updated_at` (which feeds the derived
+            // `lastActivity`) (intent-hq/monorepo#1466). Scoped, conditional
+            // write (monorepo#1481): one guarded UPDATE touching only the
+            // attention column — a concurrent mutation of any other column is
+            // never clobbered — whose row count decides "changed", so the
+            // no-op skip and the emit decision are atomic rather than
+            // read-based.
+            let changed = store
+                .set_workspace_attention(&id, WorkspaceAttention::None, None, None)
+                .await?;
+            if changed {
+                // Self-sufficient `workspace:attention-changed` so every client
+                // clears the blue dot together (PROTOCOL §6.5); emit only on an
+                // actual change.
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+            }
             let mut ws = store.get_workspace(&id).await?;
-            let changed = ws.attention != WorkspaceAttention::None;
-            ws.attention = WorkspaceAttention::None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
-            // Self-sufficient `workspace:attention-changed` so every client clears
-            // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
-            if changed {
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
-            }
             Ok(ws)
         })
     }
@@ -12398,16 +12678,28 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            let mut ws = store.get_workspace(&id).await?;
+            this.park_attention_write().await;
             // "Seen" clears the unread flag; review-required attention persists.
-            if ws.attention == WorkspaceAttention::Unread {
-                ws.attention = WorkspaceAttention::None;
-                ws.updated_at = now_iso();
-                store.update_workspace(&ws).await?;
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
+            // Merely looking at a workspace is not "activity", so `updated_at`
+            // (which feeds the derived `lastActivity`) stays untouched
+            // (intent-hq/monorepo#1466). Scoped, conditional write
+            // (monorepo#1481): one UPDATE guarded on `attention = unread`
+            // touching only the attention column — a concurrent mutation of
+            // any other column is never clobbered — whose row count decides
+            // "changed", so the clear-only-when-unread rule and the emit
+            // decision are atomic rather than read-based.
+            let changed = store
+                .set_workspace_attention(
+                    &id,
+                    WorkspaceAttention::None,
+                    None,
+                    Some(WorkspaceAttention::Unread),
+                )
+                .await?;
+            if changed {
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
             }
+            let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
@@ -16782,6 +17074,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_mark_seen_op(workspace_id, agent_id, message_id)
+                .await
+        })
+    }
+
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,
@@ -17785,18 +18089,26 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
+        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
+            // workspace repo; either way the resolved repo is echoed in the
+            // result so a wrong-repo read is detectable.
+            let (owner, repo) = match repo {
+                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+                None => pr_ops::repo_of(&ws)?,
+            };
+            let repo_slug = format!("{owner}/{repo}");
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
-                    "PR #{pr_number} not found in the workspace repository"
-                )),
+                intent_sourcecontrol::Error::NotFound(_) => {
+                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
+                }
                 other => pr_ops::map_sc_err(other),
             })?;
             let state = pr_ops::derive_status_state(&pr);
@@ -17865,6 +18177,7 @@ impl WorkspaceApi for Services {
                 pr_ops::count_thread_comments(&threads);
 
             Ok(serde_json::json!({
+                "repo": repo_slug,
                 "prNumber": pr_number,
                 "title": pr.title,
                 "url": pr.url,
@@ -18803,6 +19116,9 @@ impl WorkspaceApi for Services {
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+            // gh CLI sync only makes sense against the production login host
+            // (see `github_auth_ops::is_production_login_host`).
+            let sync_gh = github_auth_ops::is_production_login_host(&base_uri);
             tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
@@ -18810,6 +19126,7 @@ impl WorkspaceApi for Services {
                 flow_id,
                 flow,
                 deadline,
+                sync_gh,
             ));
             let new_slot = github_auth_ops::FlowSlot {
                 flow_id,
@@ -18852,17 +19169,49 @@ impl WorkspaceApi for Services {
         // the resolution chain) and orphan any in-flight flow (its poll task
         // exits cooperatively and reconciles a raced authorize by deleting
         // the just-persisted token). Env / `gh` CLI fallbacks are untouched —
-        // authStatus reflects them on next probe.
+        // authStatus reflects them on next probe. When gh's active login IS
+        // the token being revoked (the login the authorize-side sync
+        // created), gh is best-effort logged out too — same production-host
+        // gate as the login sync, so mock-host tests never touch a real `gh`.
         let state = self.github_auth_flow.clone();
         let secrets = self.secrets.clone();
         let bus = self.event_bus.clone();
+        let logout_gh = github_auth_ops::is_production_login_host(
+            &github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref()),
+        );
         Box::pin(async move {
+            // Capture the stored token BEFORE it is deleted so the detached
+            // logout can match it against gh's active login. Fail-soft: a
+            // load failure only skips the logout, never the revoke. 🔒 The
+            // token stays in memory — never logged or embedded in errors.
+            let revoked_token = if logout_gh {
+                secrets
+                    .load(github_auth_ops::SECRET_ACCOUNT)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(
+                            error = %e,
+                            "could not read stored github token before revoke; \
+                             skipping gh CLI logout"
+                        );
+                        None
+                    })
+            } else {
+                None
+            };
             {
                 let mut slot = state.lock().await;
                 *slot = None;
             }
             github_auth_ops::delete_stored_token(&secrets).await?;
             publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
+            if logout_gh {
+                // Detached + fail-soft (same pattern as the login sync): a
+                // logout failure can never fail or delay the revoke.
+                tokio::spawn(intent_sourcecontrol::gh_sync::logout_gh_after_revoke(
+                    revoked_token,
+                ));
+            }
             Ok(serde_json::json!({ "ok": true }))
         })
     }
@@ -19209,6 +19558,73 @@ impl WorkspaceApi for Services {
                 .map_err(sentry_ops::map_sentry_err)?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+        })
+    }
+
+    // ========================================================================
+    // voice.transcribe — daemon-side speech-to-text. Maps onto the
+    // `VoiceEngine` trait; the engine resolves the API key (secrets store /
+    // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
+    // provider. A missing/invalid key → `VoiceNotConfigured` ("not
+    // configured", graceful). Validation/context-merging glue lives in
+    // `voice_ops`. The API keys are never logged or returned over the wire.
+    // ========================================================================
+
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.voice_engine.clone();
+        Box::pin(async move {
+            let parsed = voice_ops::parse_request(&params)?;
+            // Provider: per-call override, else the `voice.provider` setting.
+            let setting = self
+                .settings_service()
+                .get("voice.provider")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let provider = voice_ops::select_provider(setting.as_deref(), parsed.provider_override);
+            // Vocabulary: the `voice.vocabulary` setting (defaults from the
+            // catalog); a malformed stored value degrades to an empty list.
+            let vocabulary_value = self
+                .settings_service()
+                .get("voice.vocabulary")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").cloned());
+            let vocabulary = voice_ops::parse_vocabulary_setting(vocabulary_value.as_ref());
+            // OpenAI model: the `voice.openai.model` setting (catalog default
+            // applies when unset). Ignored by other providers.
+            let openai_model = self
+                .settings_service()
+                .get("voice.openai.model")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            // Language: per-call hint, else the `voice.language` setting,
+            // else none (provider auto-detection).
+            let language_setting = self
+                .settings_service()
+                .get("voice.language")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let language = voice_ops::resolve_language(
+                parsed.language.as_deref(),
+                language_setting.as_deref(),
+            );
+            let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
+            let transcript = engine
+                .transcribe(request)
+                .await
+                .map_err(voice_ops::map_voice_err)?;
+            Ok(serde_json::json!({
+                "text": transcript.text,
+                "provider": engine.provider_name(),
+                "durationMs": transcript.duration_ms,
+            }))
         })
     }
 

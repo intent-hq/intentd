@@ -14,19 +14,28 @@
 //! 4.1 adds `agent.listActive` (additive; §5.5, monorepo#1395). Version 4.2
 //! adds `workspace.diskUsage` and stops populating `Workspace.diskUsage` on
 //! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
-//! was optional, so row shapes remain valid for existing clients.
-//! Version 4.3 adds the execution-environment profile surface (additive;
+//! was optional, so row shapes remain valid for existing clients. Version 4.3
+//! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
+//! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
+//! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
+//! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
+//! same `-32603` / "Internal error" envelope, no method-catalog change.
+//! Version 4.5 adds `agent.markSeen` (additive; §5.5): the per-conversation
+//! seen marker (`lastSeenMessageId` in session metadata, monotonic advance,
+//! `agent:updated` emit, served on the `AgentLite` metadata projection) —
+//! 279 router methods, 316 total.
+//! Version 4.6 adds the execution-environment profile surface (additive;
 //! §5.35): the `sandbox.profiles.list` / `sandbox.profiles.update` /
-//! `sandbox.options` router methods (280 router methods, 317 dispatchable
+//! `sandbox.options` router methods (282 router methods, 319 dispatchable
 //! names) and the `system.capabilities.microvmSupported` field (§5.7).
-//! Version 4.4 adds execution-environment selection at workspace creation
+//! Version 4.7 adds execution-environment selection at workspace creation
 //! (additive; §5.1): the `workspace.create` `executionEnvironment` param, the
 //! persisted `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
 //! error payloads (§9) — no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.4";
+pub const PROTOCOL_VERSION: &str = "4.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

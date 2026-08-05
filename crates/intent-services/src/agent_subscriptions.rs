@@ -466,6 +466,58 @@ impl Services {
             .collect()
     }
 
+    /// Whether any TOP-LEVEL agent homed in `workspace_id` holds at least
+    /// one active completion watch (ungrouped or grouped) — the third
+    /// `displayStatus` in-progress promotion signal alongside a running
+    /// agent and active hooks: an idle parent still waiting on delegated
+    /// children reads as active work. Watches anchor in the parent's HOME
+    /// workspace (`parent_workspace_id`) — where the wake will be delivered
+    /// — never the child's. The top-level filter matches
+    /// [`Services::workspace_needs_attention`] (no `parent_agent_id`, not
+    /// background, not deleted), so watches held by child/background agents
+    /// never promote. The in-memory registry is consulted first, so the
+    /// common no-watch case costs no store read; otherwise this is one
+    /// message-free session-summaries read. Best-effort: a store read
+    /// failure is logged and fails open to `false` (mirrors
+    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// never wedged and activity is never fabricated.
+    pub(crate) async fn workspace_has_waiting_agent_subscriptions(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        let parents: Vec<AgentId> = {
+            let guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            guard
+                .subscriptions
+                .iter()
+                .filter(|s| &s.parent_workspace_id == workspace_id)
+                .map(|s| s.parent_agent_id.clone())
+                .collect()
+        };
+        if parents.is_empty() {
+            return false;
+        }
+        match self.store.list_agent_session_summaries(workspace_id).await {
+            Ok(sessions) => sessions.iter().any(|s| {
+                s.parent_agent_id.is_none()
+                    && !s.is_background
+                    && s.status != intent_core::AgentStatus::Deleted
+                    && parents.contains(&s.id)
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "waiting-subscriptions displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
     /// Remove a single watch by subscription id; returns whether one was found.
     pub(crate) fn remove_watch(&self, subscription_id: &str) -> bool {
         let removed = {
@@ -1828,4 +1880,289 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
         event_summaries: p.event_summaries.clone(),
         raw_events,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use intent_core::{
+        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+        WorkspaceDisplayStatus, WorkspaceStatus,
+    };
+    use intent_store::Store;
+
+    use super::*;
+
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("intentd-subs-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+            }
+        }
+    }
+
+    fn workspace(id: &WorkspaceId) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+            display_status: None,
+            checkout_mode: None,
+            disk_usage: None,
+            execution_environment: None,
+        }
+    }
+
+    fn agent(ws: &WorkspaceId, id: &str, parent: Option<&str>, background: bool) -> AgentSession {
+        AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: parent.map(AgentId::from),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: background,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// Store + Services + workspace with a top-level parent (`agent-parent`)
+    /// and its delegated child (`agent-child`). The temp workspaces root
+    /// keeps the cowSupported probe hermetic (mirrors the hook_manager test
+    /// setup).
+    async fn setup() -> (TempDb, tempfile::TempDir, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        store
+            .insert_agent_session(&agent(&ws, "agent-parent", None, false))
+            .await
+            .expect("parent");
+        store
+            .insert_agent_session(&agent(&ws, "agent-child", Some("agent-parent"), false))
+            .await
+            .expect("child");
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        (tmp, root, services, ws)
+    }
+
+    async fn enriched_display_status(svc: &Services, ws: &WorkspaceId) -> WorkspaceDisplayStatus {
+        let mut row = svc.store().get_workspace(ws).await.expect("get ws");
+        svc.enrich_workspace_aggregates(&mut row).await;
+        row.display_status.expect("display_status computed")
+    }
+
+    /// An armed completion watch held by an idle top-level parent promotes
+    /// the derived `displayStatus` to `in_progress` on the list/get
+    /// enrichment path — for ungrouped and grouped (`after_all`) watches
+    /// alike.
+    #[tokio::test]
+    async fn armed_watch_promotes_display_status_to_in_progress() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle
+        );
+        let ungrouped = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "agent-parent".to_string(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .expect("register");
+        assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::InProgress,
+            "idle parent with an armed watch must read in_progress"
+        );
+        // A grouped (`after_all`) watch promotes through the same registry.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            AgentId::from("agent-parent"),
+            "agent-parent".to_string(),
+            AgentId::from("agent-child-2"),
+            Some("group-1".to_string()),
+        )
+        .expect("register grouped");
+        assert!(svc.remove_watch(&ungrouped));
+        assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::InProgress,
+            "a grouped watch promotes too"
+        );
+    }
+
+    /// Retiring the last watch demotes the workspace back to the base
+    /// rollup (`idle`).
+    #[tokio::test]
+    async fn retired_watch_demotes_display_status() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "agent-parent".to_string(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .expect("register");
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert!(svc.remove_watch(&id));
+        assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle,
+            "retired watches never promote"
+        );
+    }
+
+    /// Watches held by child or background agents never promote — only
+    /// top-level sessions count (same filter as `workspace_needs_attention`).
+    #[tokio::test]
+    async fn child_or_background_held_watch_does_not_promote() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        svc.store()
+            .insert_agent_session(&agent(&ws, "agent-bg", None, true))
+            .await
+            .expect("background agent");
+        // The mid-level child delegates its own grandchild…
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            AgentId::from("agent-child"),
+            "agent-child".to_string(),
+            AgentId::from("agent-grandchild"),
+            None,
+        )
+        .expect("register child-held");
+        // …and a background session watches one too.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            AgentId::from("agent-bg"),
+            "agent-bg".to_string(),
+            AgentId::from("agent-bg-child"),
+            None,
+        )
+        .expect("register background-held");
+        assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle,
+            "child/background-held watches must not promote"
+        );
+    }
+
+    /// A watch anchors in the parent's HOME workspace: a chief-workspace
+    /// parent watching a child in `ws` promotes chief, never `ws`.
+    #[tokio::test]
+    async fn watch_anchors_in_parents_home_workspace() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        svc.register_completion_watch(
+            &WorkspaceId::chief(),
+            &ws,
+            AgentId::from("agent-chief"),
+            "agent-chief".to_string(),
+            AgentId::from("agent-child"),
+            None,
+        )
+        .expect("register cross-workspace");
+        assert!(
+            !svc.workspace_has_waiting_agent_subscriptions(&ws).await,
+            "the child's workspace must not read the chief-anchored watch"
+        );
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle
+        );
+    }
 }

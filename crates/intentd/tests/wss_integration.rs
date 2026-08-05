@@ -299,7 +299,7 @@ async fn connect_ws(
 /// text response parsed as JSON.
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     let mut ws = connect_ws(port, cfg).await;
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send");
     loop {
@@ -317,7 +317,7 @@ async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> 
     let mut ws = connect_ws(port, cfg).await;
     let mut out = Vec::new();
     for frame in frames {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -364,7 +364,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "4.4",
+        sess[0]["result"]["protocolVersion"], "4.7",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -443,7 +443,7 @@ async fn wss_workspace_auto_commit_round_trip() {
         frame: String,
         id: i64,
     ) -> Value {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -694,7 +694,7 @@ async fn wss_oversized_message_terminates_connection() {
     // only termination is asserted here.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
-    let _ = ws.send(Message::Text(oversized)).await;
+    let _ = ws.send(Message::Text(oversized.into())).await;
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match ws.next().await {
@@ -1487,6 +1487,179 @@ async fn wss_agent_create_widened_params_round_trip() {
         minimal["result"]["agent"]["metadata"]["isBackground"], false,
         "omitting isBackground defaults to foreground: {minimal}",
     );
+
+    srv.ws.stop().await;
+}
+
+/// `agent.markSeen` (PROTOCOL §5.5, v4.5 seen marker) over the real WSS
+/// transport: persists `lastSeenMessageId` in session metadata, emits
+/// `agent:updated { agentId, lastSeenMessageId }`, serves the marker on the
+/// `agent.get` metadata projection, applies the monotonic no-op when naming
+/// an older message, and rejects missing params with `-32602`.
+#[tokio::test]
+async fn wss_agent_mark_seen_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Seen"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Seed an agent with two persisted transcript rows.
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Seen Agent"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let append = |id: i64, text: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    };
+    let appended = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![append(3, "first"), append(4, "second")],
+    )
+    .await;
+    let first_id = appended[0]["result"]["message"]["id"]
+        .as_str()
+        .expect("first message id")
+        .to_string();
+    let second_id = appended[1]["result"]["message"]["id"]
+        .as_str()
+        .expect("second message id")
+        .to_string();
+
+    // One persistent connection: subscribe first so the `agent:updated`
+    // notification from the markSeen below is delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    let sub = send_and_wait(
+        &mut ws,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"events.subscribe","params":{{"eventTypes":["agent:updated"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // Mark the second (newest) message seen: `{ success, lastSeenMessageId }`.
+    let marked = send_and_wait(
+        &mut ws,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.markSeen","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","messageId":"{second_id}"}}}}"#
+        ),
+        6,
+    )
+    .await;
+    assert_eq!(marked["result"]["success"], true, "markSeen: {marked}");
+    assert_eq!(marked["result"]["lastSeenMessageId"], second_id.as_str());
+
+    // The `agent:updated` event carries the marker (self-sufficient, §6.5).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "agent:updated"
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for agent:updated");
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(evt["data"]["agentId"], agent_id.as_str());
+    assert_eq!(evt["data"]["lastSeenMessageId"], second_id.as_str());
+
+    // Served on the `agent.get` metadata projection.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["metadata"]["lastSeenMessageId"],
+        second_id.as_str(),
+        "marker served on the AgentLite metadata projection: {got}"
+    );
+
+    // Monotonic: naming the OLDER message is a no-op returning the current
+    // marker.
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.markSeen","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","messageId":"{first_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(older["result"]["success"], true);
+    assert_eq!(
+        older["result"]["lastSeenMessageId"],
+        second_id.as_str(),
+        "older markSeen must return the unchanged current marker: {older}"
+    );
+
+    // Missing `messageId` → -32602.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.markSeen","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "missing messageId: {bad}");
 
     srv.ws.stop().await;
 }
@@ -3038,7 +3211,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
         .await
         .expect("plain ws handshake");
     sock.send(Message::Text(
-        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#.into(),
     ))
     .await
     .expect("send");
@@ -3399,7 +3572,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         frame: String,
         id: i64,
     ) -> Value {
-        ws.send(Message::Text(frame)).await.expect("send");
+        ws.send(Message::Text(frame.into())).await.expect("send");
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -4883,7 +5056,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
 
     let call = r#"{"jsonrpc":"2.0","id":1,"method":"host.openInEditor","params":{"editorId":"vscode","path":"/repo/src/main.rs","line":12,"column":3}}"#;
-    ws.send(Message::Text(call.to_string()))
+    ws.send(Message::Text(call.to_string().into()))
         .await
         .expect("send");
 
@@ -4903,7 +5076,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
                     let reply = serde_json::json!({
                         "jsonrpc": "2.0", "id": id, "result": { "ok": true }
                     });
-                    ws.send(Message::Text(reply.to_string()))
+                    ws.send(Message::Text(reply.to_string().into()))
                         .await
                         .expect("send reverse reply");
                 } else if v["id"] == 1 {
@@ -5468,9 +5641,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
     // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
-    sub.send(Message::Text(format!(
-        r#"{{"jsonrpc":"2.0","id":21,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
-    )))
+    sub.send(Message::Text(
+        format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+        )
+        .into(),
+    ))
     .await
     .expect("send subscribe");
     let mut sub_resp: Option<Value> = None;
@@ -5592,7 +5768,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
 /// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
 /// persisted user/assistant messages. Covers the reworked contract — global
 /// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,
-/// `preferWorkspaceId` as a soft ranking boost, the enriched match shape
+/// `preferWorkspaceId` as a soft ranking boost, the archived-workspace soft
+/// ranking penalty (equally-relevant matches tier preferred → other active →
+/// archived), the enriched match shape
 /// (`workspaceId`/`agentName`/`role`/`timestamp`/`score`), and that raw FTS5
 /// operator syntax in the query never surfaces as an error.
 #[tokio::test]
@@ -5601,12 +5779,14 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
 
     let srv = start(WsOptions::default()).await;
 
-    // Two workspaces, one agent each, both holding an identically-worded
-    // message (equal bm25 rank) so ordering under `preferWorkspaceId` is
-    // decided by the boost alone. The FTS index rows come from the 0074
-    // insert trigger — no manual rebuild.
+    // Three workspaces (two active, one archived), one agent each, all
+    // holding an identically-worded message (equal bm25 rank) so ordering is
+    // decided by the `preferWorkspaceId` boost and the archived penalty
+    // alone. The FTS index rows come from the 0074 insert trigger — no
+    // manual rebuild.
     let ws_a = WorkspaceId::new();
     let ws_b = WorkspaceId::new();
+    let ws_c = WorkspaceId::new();
     let ts = now_iso();
     let seed = |id: &str, ws: &WorkspaceId, name: &str| AgentSession {
         id: AgentId(id.to_string()),
@@ -5659,8 +5839,20 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
             .await
             .expect("insert session");
     }
+    let mut archived_ws = fixture_workspace(&ws_c);
+    archived_ws.archived = true;
+    archived_ws.archived_at = Some(ts.clone());
+    srv.store
+        .insert_workspace(&archived_ws)
+        .await
+        .expect("insert archived workspace");
+    srv.store
+        .insert_agent_session(&seed("agent-fts-c", &ws_c, "Gamma Agent"))
+        .await
+        .expect("insert archived-workspace session");
     // ws-a: plain-string user message. ws-b: content-block assistant message
     // with the same words (block extraction must index it identically).
+    // ws-c (archived): the same words again, so only the penalty separates it.
     srv.store
         .append_agent_message(
             &AgentId("agent-fts-a".into()),
@@ -5679,8 +5871,18 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         )
         .await
         .expect("append ws-b message");
+    srv.store
+        .append_agent_message(
+            &AgentId("agent-fts-c".into()),
+            "user",
+            &serde_json::json!("deploy pipeline status check"),
+            &ts,
+        )
+        .await
+        .expect("append ws-c message");
 
-    // Global search (no workspaceId): both workspaces' matches, enriched shape.
+    // Global search (no workspaceId): every workspace's match, enriched
+    // shape, archived-workspace match tiered last by the soft penalty.
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5692,12 +5894,21 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["requestId"], "srch-g");
     let matches = resp["result"]["matches"].as_array().expect("matches");
-    assert_eq!(matches.len(), 2, "global search spans workspaces: {resp}");
+    assert_eq!(matches.len(), 3, "global search spans workspaces: {resp}");
     let ws_ids: Vec<&str> = matches
         .iter()
         .map(|m| m["workspaceId"].as_str().expect("workspaceId"))
         .collect();
-    assert!(ws_ids.contains(&ws_a.0.as_str()) && ws_ids.contains(&ws_b.0.as_str()));
+    assert!(
+        ws_ids.contains(&ws_a.0.as_str())
+            && ws_ids.contains(&ws_b.0.as_str())
+            && ws_ids.contains(&ws_c.0.as_str())
+    );
+    assert_eq!(
+        matches[2]["workspaceId"],
+        ws_c.0.as_str(),
+        "archived-workspace match ranks below equally-relevant active ones: {resp}"
+    );
     let a = matches
         .iter()
         .find(|m| m["workspaceId"] == ws_a.0.as_str())
@@ -5711,7 +5922,8 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     assert!(a["preview"].as_str().unwrap().contains("deploy"));
 
     // preferWorkspaceId lifts the preferred workspace's (equally-relevant)
-    // match to the top — in both directions.
+    // match to the top — in both directions — while the archived workspace's
+    // match stays tiered last: preferred → other active → archived.
     for (prefer, expect_first) in [(&ws_b, &ws_b), (&ws_a, &ws_a)] {
         let frame = format!(
             r#"{{"jsonrpc":"2.0","id":31,"method":"search.messages","params":{{"query":"deploy pipeline","preferWorkspaceId":"{}"}}}}"#,
@@ -5719,23 +5931,31 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         );
         let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
         let matches = resp["result"]["matches"].as_array().expect("matches");
-        assert_eq!(matches.len(), 2, "boost never excludes: {resp}");
+        assert_eq!(matches.len(), 3, "boost never excludes: {resp}");
         assert_eq!(
             matches[0]["workspaceId"],
             expect_first.0.as_str(),
             "preferred workspace ranks first: {resp}"
         );
+        assert_eq!(
+            matches[2]["workspaceId"],
+            ws_c.0.as_str(),
+            "archived workspace ranks last: {resp}"
+        );
     }
 
-    // workspaceId is a hard scope filter.
-    let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":32,"method":"search.messages","params":{{"query":"deploy pipeline","workspaceId":"{}"}}}}"#,
-        ws_a.0
-    );
-    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
-    let matches = resp["result"]["matches"].as_array().expect("matches");
-    assert_eq!(matches.len(), 1, "{resp}");
-    assert_eq!(matches[0]["workspaceId"], ws_a.0.as_str());
+    // workspaceId is a hard scope filter — and scoping to the archived
+    // workspace still returns its match (the penalty never excludes).
+    for ws in [&ws_a, &ws_c] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":32,"method":"search.messages","params":{{"query":"deploy pipeline","workspaceId":"{}"}}}}"#,
+            ws.0
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        let matches = resp["result"]["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1, "{resp}");
+        assert_eq!(matches[0]["workspaceId"], ws.0.as_str());
+    }
 
     // Raw FTS5 operator/quote punctuation is sanitized (treated as token
     // separators), never a wire error; a query with no searchable tokens
@@ -5749,7 +5969,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(
         resp["result"]["matches"].as_array().expect("matches").len(),
-        2
+        3
     );
     let resp = wss_call(
         srv.port,

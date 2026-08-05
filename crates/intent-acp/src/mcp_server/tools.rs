@@ -34,6 +34,25 @@ pub struct ToolDef {
     pub params: &'static [Param],
 }
 
+/// One delegation model option a specialist declares (PROTOCOL §5.11
+/// `modelOptions`): the internal compound model id plus the author's hint.
+pub struct SpecialistModelOption {
+    /// Internal compound model id (e.g. `opencode:kimi-k3`), passed verbatim
+    /// as the `model` param of `ws.agent.delegate` / `ws.agent.create`.
+    pub model: String,
+    /// Free-text hint for choosing this option; empty when the author gave none.
+    pub hint: String,
+}
+
+/// One specialist's resolved `modelOptions` list, injected into the
+/// `workspace_api` tool description so delegating agents can pick a model.
+pub struct SpecialistModelOptions {
+    /// Specialist id (the `specialist` param of delegate/create).
+    pub specialist: String,
+    /// Ordered options as authored in the winning tier's frontmatter.
+    pub options: Vec<SpecialistModelOption>,
+}
+
 impl ToolDef {
     /// Synthesize the MCP `inputSchema` (`type: object` + properties + required).
     pub fn schema(&self) -> Value {
@@ -83,10 +102,18 @@ pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
 ///   "not yet available in this daemon port" error rather than pretending to
 ///   support them, so they are omitted from the advertised API.
 ///
+/// A compact `Namespaces` index sits directly after the Rules/Parameters
+/// block — well before any plausible client-side truncation point — so MCP
+/// clients that truncate long tool descriptions still surface the full
+/// `ws.*` capability map. Index lines share the `  ws.<ns>.` indent-2 shape
+/// of method doc lines, so [`workspace_api_description`] prunes a gated
+/// namespace's index line together with its doc lines.
+///
 /// The `#[test] description_only_names_bound_methods` below verifies every
 /// `ws.<ns>.<method>(` mention here maps to a real dispatch arm in the
 /// matching `bindings/<ns>.rs`, preventing silent drift when the description
-/// or the bindings change.
+/// or the bindings change; `namespace_index_matches_documented_surface`
+/// keeps the index in lockstep with the API sections.
 pub const WORKSPACE_API_DESCRIPTION: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
 Rules:
@@ -101,7 +128,29 @@ Parameters:
   code (required): JavaScript code to execute.
   summary (required): Short description of what this call does, shown in the UI.
 
+Namespaces (index — full signatures in API below):
+  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.workspace.* — workspace info, title, status message
+  ws.app.question.* — ask the user structured questions
+  ws.note.* — notes; the spec is note id "spec"
+  ws.comment.* — comment threads on notes
+  ws.task.* — task notes + checkbox statuses
+  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.agent.* — create/delegate/message/watch agents
+  ws.git.* — working-tree status, stage, commit helpers
+  ws.event.* — activity queries + event subscriptions
+  ws.script.* — saved build/test/service scripts
+  ws.host.* — host.exec = one-shot host command exec
+  ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
+  ws.browser.* — Chrome DevTools browser automation
+  ws.terminal.* — read workspace terminal output
+  ws.crossWorkspace.* — read sibling-workspace notes
+  ws.file.* — read/write workspace project files
+  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+
 API:
+  ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
+
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
@@ -207,7 +256,7 @@ API:
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
   ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
-    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
   ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
@@ -234,7 +283,7 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
-  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
@@ -282,7 +331,29 @@ Parameters:
   code (required): JavaScript code to execute.
   summary (required): Short description of what this call does, shown in the UI.
 
+Namespaces (index — full signatures in API below):
+  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.workspace.* — workspace info, title, status message
+  ws.app.* — chief app surface: agents, proposal, settings, specialists, ui, workspaces
+  ws.app.question.* — ask the user structured questions
+  ws.note.* — notes; the spec is note id "spec"
+  ws.comment.* — comment threads on notes
+  ws.task.* — task notes + checkbox statuses
+  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.agent.* — create/delegate/message/watch agents
+  ws.git.* — working-tree status, stage, commit helpers
+  ws.event.* — activity queries + event subscriptions
+  ws.script.* — saved build/test/service scripts
+  ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
+  ws.browser.* — Chrome DevTools browser automation
+  ws.terminal.* — read workspace terminal output
+  ws.crossWorkspace.* — read sibling-workspace notes
+  ws.file.* — read/write workspace project files
+  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+
 API:
+  ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
+
   ws.workspace.info() → { id, path }  // Current workspace ID + absolute path.
   ws.workspace.details() → { id, title, hasTitle, status, statusMessage, statusImageAssetId, branch, repositoryName, tags }  // Workspace metadata; `status` is the lifecycle enum and `statusMessage` is the user-facing work summary.
   ws.workspace.setTitle(title) → { ok, title, branch, skipped? }  // Set a short 1-5 word workspace title. May rename the branch if it is still auto-generated; returns `skipped` if the workspace already has a custom title.
@@ -407,7 +478,7 @@ API:
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
   ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
-    The script runs with this same `ws.*` API available and a 60s budget per run. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
   ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
@@ -434,7 +505,7 @@ API:
 
   ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
   ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
-  ws.pr.snapshot(prNumber) → { prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber` in the workspace repo. `prNumber` is required — no active-PR fallback.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
   ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
   ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
@@ -542,6 +613,15 @@ const SANDBOX_LIST_FIELDS_XREF: &str =
 const SANDBOX_STATUS_FIELDS_XREF: &str =
     " Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).";
 
+/// The base variant's cross-references to `ws.host.exec` inside the
+/// `ws.hook.*` docs (the Namespaces index hint and the `ws.hook.schedule`
+/// continuation line), scrubbed from the assembled description when
+/// `agentFeatures.hostExec` is off so the surviving hook docs don't advertise
+/// a pruned method. The chief variant never names `ws.host.exec`, so the
+/// scrub is a no-op there (unit tests guard both needles).
+const HOOK_HOST_EXEC_INDEX_XREF: &str = " and host.exec";
+const HOOK_HOST_EXEC_DOC_XREF: &str = " and `ws.host.exec`";
+
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
 /// method is not feature-gated or its toggle is on. The dispatch-deny layer
@@ -638,14 +718,200 @@ pub fn workspace_api_description(
         out = out.replacen(SANDBOX_LIST_FIELDS_XREF, "", 1);
         out = out.replacen(SANDBOX_STATUS_FIELDS_XREF, "", 1);
     }
+    // Cross-reference scrub for `hostExec`: the surviving `ws.hook.*` index
+    // hint and `ws.hook.schedule` doc line name `ws.host.exec` as callable
+    // from hook code, so drop those mentions when the namespace is pruned.
+    if !features.host_exec {
+        out =
+            out.replacen(HOOK_HOST_EXEC_INDEX_XREF, "", 1)
+                .replacen(HOOK_HOST_EXEC_DOC_XREF, "", 1);
+    }
     Cow::Owned(out)
+}
+
+/// `ws.help()` — the runtime docs index. Returns the `Namespaces` block of
+/// the assembled description (header + entries), so chief-ness and
+/// `[agentFeatures]` gating apply exactly as they do to the advertised tool
+/// description, plus a hint on how to fetch one namespace's full docs.
+pub(super) fn help_index(is_chief: bool, features: &AgentFeaturesSettings) -> String {
+    // `ws.help` renders the capable (full) docs: the CoW-capability gate is
+    // an advisory description-only scrub and the host dispatch path does not
+    // carry the per-bridge capability; dispatch accepts and ignores
+    // `mergeOnTurnEnd` either way.
+    let desc = workspace_api_description(is_chief, features, true);
+    let block: Vec<&str> = desc
+        .lines()
+        .skip_while(|l| !l.starts_with("Namespaces"))
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    let mut out = block.join("\n");
+    out.push_str("\n\nCall ws.help(\"<namespace>\") for one namespace's full signatures.");
+    out
+}
+
+/// `ws.help("<namespace>")` — one namespace's full doc lines, cut verbatim
+/// from the assembled description (every indent-2 `ws.<ns>.` method line plus
+/// its indented continuation lines). Accepts forgiving spellings: `"pr"`,
+/// `"ws.pr"`, `"pr.*"`, and nested names like `"app.question"`; `"help"`
+/// resolves to the `ws.help(...)` entry itself. Errors name the disabling
+/// `[agentFeatures]` toggle for gated-off namespaces and list the available
+/// namespaces for unknown ones.
+pub(super) fn help_namespace(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    namespace: &str,
+) -> Result<String, String> {
+    let ns = namespace
+        .trim()
+        .trim_start_matches("ws.")
+        .trim_end_matches('*')
+        .trim_end_matches('.');
+    let desc = workspace_api_description(is_chief, features, true);
+    if !ns.is_empty() {
+        // Direct calls like `ws.help(...)` are documented without a trailing
+        // dot, so match both the `ws.<ns>.` and `ws.<ns>(` spellings.
+        let dot_prefix = format!("ws.{ns}.");
+        let call_prefix = format!("ws.{ns}(");
+        let mut lines: Vec<&str> = Vec::new();
+        let mut in_segment = false;
+        for line in desc.lines().skip_while(|l| !l.starts_with("API:")) {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if indent == 2 && trimmed.starts_with("ws.") {
+                in_segment = trimmed.starts_with(&dot_prefix) || trimmed.starts_with(&call_prefix);
+            } else if indent < 4 || trimmed.is_empty() {
+                in_segment = false;
+            }
+            if in_segment {
+                lines.push(line);
+            }
+        }
+        if !lines.is_empty() {
+            return Ok(lines.join("\n"));
+        }
+        let gate = format!("ws.{ns}.");
+        if let Some((_, feature)) = gated_prefixes(features)
+            .into_iter()
+            .find(|(prefix, _)| gate.starts_with(prefix) || prefix.starts_with(&gate))
+        {
+            return Err(format!(
+                "namespace `{ns}` is disabled in settings ({feature} = false)"
+            ));
+        }
+    }
+    let available: Vec<String> = desc
+        .lines()
+        .skip_while(|l| !l.starts_with("Namespaces"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let rest = l.trim_start().strip_prefix("ws.")?;
+            if let Some((name, _)) = rest.split_once(".*") {
+                Some(name.to_string())
+            } else {
+                // The index's `ws.help(namespace?)` entry has no `.*`.
+                rest.starts_with("help(").then(|| "help".to_string())
+            }
+        })
+        .collect();
+    Err(format!(
+        "unknown namespace `{namespace}` — available: {}",
+        available.join(", ")
+    ))
+}
+
+/// [`workspace_api_description`] plus the per-specialist delegation model
+/// options (PROTOCOL §5.11 `modelOptions`), injected as continuation lines of
+/// the `ws.agent.delegate` doc entry so delegating agents see which models a
+/// specialist's author suggests. `model_options` lists only specialists that
+/// carry options; when it is empty — the all-defaults case — the assembled
+/// text is returned unchanged, so the default description stays
+/// byte-identical by construction.
+pub fn workspace_api_description_with_model_options(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    cow_capable: bool,
+    model_options: &[SpecialistModelOptions],
+) -> Cow<'static, str> {
+    let base = workspace_api_description(is_chief, features, cow_capable);
+    if model_options.is_empty() {
+        return base;
+    }
+    // Anchor on the `ws.agent.delegate` doc line (indent 2) and append the
+    // options block after its indented continuation lines, so the injected
+    // text reads as part of the delegate/create docs. No anchor (the line
+    // can never be feature-pruned today, but stay safe) → unchanged.
+    let mut out = String::with_capacity(base.len() + 256);
+    let mut in_delegate = false;
+    let mut inserted = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_continuation = indent >= 4 && !trimmed.is_empty();
+        if in_delegate && !is_continuation && !inserted {
+            out.push_str(&model_options_block(model_options));
+            inserted = true;
+        }
+        if indent == 2 && trimmed.starts_with("ws.") {
+            in_delegate = trimmed.starts_with("ws.agent.delegate(");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_delegate && !inserted {
+        out.push_str(&model_options_block(model_options));
+        inserted = true;
+    }
+    if !inserted {
+        return base;
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    Cow::Owned(out)
+}
+
+/// Render the injected continuation block: one header line plus one line per
+/// specialist listing its options as `` `<compound id>` (<hint>) `` entries
+/// (the hint parenthetical is omitted when empty). All lines are indented ≥4
+/// so the `[agentFeatures]` pruning treats them as continuation lines of the
+/// `ws.agent.delegate` entry. Author-supplied text is flattened onto one line
+/// so a multi-line hint cannot break the description's line structure.
+fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
+    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    let mut block = String::from(
+        "    Specialist model options (pass the compound id as `model` to \
+         `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
+         specialist's default):\n",
+    );
+    for spec in model_options {
+        block.push_str("      ");
+        block.push_str(&flat(&spec.specialist));
+        block.push_str(": ");
+        let entries: Vec<String> = spec
+            .options
+            .iter()
+            .map(|o| {
+                if o.hint.is_empty() {
+                    format!("`{}`", flat(&o.model))
+                } else {
+                    format!("`{}` ({})", flat(&o.model), flat(&o.hint))
+                }
+            })
+            .collect();
+        block.push_str(&entries.join(", "));
+        block.push('\n');
+    }
+    block
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        denied_feature, workspace_api_description, AgentFeaturesSettings, Cow,
-        REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
+        denied_feature, help_index, help_namespace, workspace_api_description,
+        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
+        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
+        HOOK_HOST_EXEC_INDEX_XREF, REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
         WORKSPACE_API_DESCRIPTION_CHIEF,
     };
     use std::collections::HashSet;
@@ -913,6 +1179,241 @@ mod tests {
         }
     }
 
+    // Parse the `Namespaces` index block near the top of a description into
+    // the set of namespaces it names (each entry is `  ws.<ns>.* — hint`).
+    // The `ws.help(` entry is a callable, not a namespace — it has its own
+    // parity tests below and is skipped here.
+    fn index_namespaces(desc: &str) -> HashSet<String> {
+        desc.lines()
+            .skip_while(|l| !l.starts_with("Namespaces"))
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .filter(|l| !l.trim_start().starts_with("ws.help("))
+            .map(|l| {
+                l.trim_start()
+                    .strip_prefix("ws.")
+                    .and_then(|rest| rest.split_once(".*"))
+                    .map(|(ns, _)| ns.to_string())
+                    .expect("index entries are `  ws.<ns>.* — hint` lines")
+            })
+            .collect()
+    }
+
+    // The `Namespaces` index — inserted so MCP clients that truncate long
+    // tool descriptions still surface the full ws.* capability map — must
+    // stay in lockstep with the API sections: every documented method's
+    // namespace is covered by an index entry (directly or via its top-level
+    // segment, e.g. `app` covering `app.settings`), and every index entry
+    // names a namespace with at least one documented method.
+    #[test]
+    fn namespace_index_matches_documented_surface() {
+        for (variant, desc) in [
+            ("base", WORKSPACE_API_DESCRIPTION),
+            ("chief", WORKSPACE_API_DESCRIPTION_CHIEF),
+        ] {
+            let index = index_namespaces(desc);
+            assert!(
+                !index.is_empty(),
+                "{variant} description has no Namespaces index block"
+            );
+            let documented: HashSet<String> = extract_ws_methods(desc)
+                .into_iter()
+                .map(|(ns, _)| ns)
+                .collect();
+            for ns in &documented {
+                let top = ns.split('.').next().unwrap();
+                assert!(
+                    index.contains(ns) || index.contains(top),
+                    "{variant}: namespace `{ns}` is documented in the API section \
+                     but missing from the Namespaces index"
+                );
+            }
+            for ns in &index {
+                let prefix = format!("{ns}.");
+                assert!(
+                    documented.iter().any(|d| d == ns || d.starts_with(&prefix)),
+                    "{variant}: Namespaces index entry `{ns}` has no documented methods"
+                );
+            }
+        }
+    }
+
+    // Regression guard for upstream Claude Code bug
+    // https://github.com/anthropics/claude-code/issues/53933 ("Tool
+    // descriptions silently truncated without user notification or retrieval
+    // mechanism"): Claude Code cuts tool descriptions at ~2k chars with no
+    // indication anything was lost, so the `Namespaces` capability index MUST
+    // fit entirely within the first ~2k chars or truncating clients silently
+    // lose the ws.* capability map (the whole reason the index sits above the
+    // API sections). This pins the prefix — start of the description through
+    // the END of the index block — to a conservative 2000-char budget, for
+    // both variants and every `[agentFeatures]` gating combination that
+    // matters. All-defaults is the longest prefix (gating only removes index
+    // lines), but the single-feature and all-off combinations are swept too
+    // so a scrub regression cannot reorder or grow the prefix unnoticed.
+    // Future doc additions above or inside the index that push it past the
+    // cutoff fail here instead of silently breaking truncating clients.
+    #[test]
+    fn namespace_index_fits_within_truncation_budget() {
+        const BUDGET: usize = 2000;
+        let mut feature_sets: Vec<(String, AgentFeaturesSettings)> =
+            vec![("all-defaults".into(), AgentFeaturesSettings::default())];
+        for (i, (prefixes, disable)) in feature_cases().into_iter().enumerate() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push((format!("case-{i}-{prefixes:?}"), features));
+        }
+        feature_sets.push((
+            "all-off".into(),
+            AgentFeaturesSettings {
+                background_hooks: false,
+                host_exec: false,
+                scripts: false,
+                terminal_access: false,
+                browser_automation: false,
+                rich_chat_blocks: false,
+                structured_questions: false,
+                attention_requests: false,
+            },
+        ));
+        for is_chief in [false, true] {
+            for (label, features) in &feature_sets {
+                let desc = workspace_api_description(is_chief, features, true);
+                let start = desc
+                    .find("Namespaces")
+                    .unwrap_or_else(|| panic!("chief={is_chief} {label}: no Namespaces index"));
+                // The index block ends at the first blank line after its header.
+                let end = desc[start..]
+                    .find("\n\n")
+                    .map(|i| start + i)
+                    .unwrap_or(desc.len());
+                assert!(
+                    end <= BUDGET,
+                    "chief={is_chief} {label}: description prefix through the end of the \
+                     Namespaces index is {end} chars, over the {BUDGET}-char truncation \
+                     budget (Claude Code cuts descriptions at ~2k chars — see \
+                     https://github.com/anthropics/claude-code/issues/53933); move or \
+                     shrink text above/inside the index"
+                );
+            }
+        }
+    }
+
+    // ---- ws.help() runtime docs tests --------------------------------------
+
+    // The `ws.help` index entry and API doc line appear verbatim in BOTH
+    // description variants — same drift guard as `ws.app.question.ask`.
+    #[test]
+    fn help_doc_lines_are_identical_in_both_variants() {
+        for needle in ["ws.help(namespace?) —", "ws.help(namespace?) →"] {
+            let line_in = |desc: &str| -> String {
+                desc.lines()
+                    .find(|l| l.trim_start().starts_with(needle))
+                    .unwrap_or_else(|| panic!("description advertises `{needle}`"))
+                    .to_string()
+            };
+            assert_eq!(
+                line_in(WORKSPACE_API_DESCRIPTION),
+                line_in(WORKSPACE_API_DESCRIPTION_CHIEF),
+                "the ws.help doc line drifted between the base and chief descriptions"
+            );
+        }
+    }
+
+    // help_index returns the description's own Namespaces block: every index
+    // namespace appears, and gated-off namespaces are omitted.
+    #[test]
+    fn help_index_mirrors_namespace_index() {
+        for (is_chief, desc) in [
+            (false, WORKSPACE_API_DESCRIPTION),
+            (true, WORKSPACE_API_DESCRIPTION_CHIEF),
+        ] {
+            let index = help_index(is_chief, &AgentFeaturesSettings::default());
+            assert!(index.starts_with("Namespaces"));
+            for ns in index_namespaces(desc) {
+                assert!(
+                    index.contains(&format!("ws.{ns}.*")),
+                    "chief={is_chief}: help_index is missing `ws.{ns}.*`"
+                );
+            }
+        }
+        let features = AgentFeaturesSettings {
+            host_exec: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let gated = help_index(false, &features);
+        assert!(!gated.contains("ws.host."));
+        assert!(gated.contains("ws.note.*"));
+    }
+
+    // help_namespace returns every namespace's doc segment verbatim from the
+    // assembled description, for every index namespace in both variants.
+    #[test]
+    fn help_namespace_returns_verbatim_doc_segments() {
+        let features = AgentFeaturesSettings::default();
+        for (is_chief, desc) in [
+            (false, WORKSPACE_API_DESCRIPTION),
+            (true, WORKSPACE_API_DESCRIPTION_CHIEF),
+        ] {
+            for ns in index_namespaces(desc) {
+                let docs = help_namespace(is_chief, &features, &ns)
+                    .unwrap_or_else(|e| panic!("chief={is_chief}: help({ns}) errored: {e}"));
+                assert!(
+                    docs.lines()
+                        .next()
+                        .is_some_and(|l| l.trim_start().starts_with(&format!("ws.{ns}."))),
+                    "chief={is_chief}: help({ns}) does not start with a ws.{ns}. line"
+                );
+                assert!(
+                    desc.contains(&docs),
+                    "chief={is_chief}: help({ns}) is not a verbatim description segment"
+                );
+            }
+        }
+        // Forgiving spellings resolve to the same segment.
+        let plain = help_namespace(false, &features, "pr").unwrap();
+        for alias in ["ws.pr", "pr.*", " pr. "] {
+            assert_eq!(help_namespace(false, &features, alias).unwrap(), plain);
+        }
+        // `help` resolves to the ws.help entry itself (documented as a call,
+        // not a dotted namespace).
+        let help_docs = help_namespace(false, &features, "help").unwrap();
+        assert!(
+            help_docs.trim_start().starts_with("ws.help(namespace?)"),
+            "help(help) should return the ws.help entry, got: {help_docs}"
+        );
+    }
+
+    // Gated-off namespaces error naming the disabling toggle; unknown
+    // namespaces error listing what is available.
+    #[test]
+    fn help_namespace_errors_are_actionable() {
+        let features = AgentFeaturesSettings {
+            host_exec: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let err = help_namespace(false, &features, "host").unwrap_err();
+        assert!(
+            err.contains("agentFeatures.hostExec"),
+            "gated error must name the toggle: {err}"
+        );
+        let err = help_namespace(false, &AgentFeaturesSettings::default(), "nope").unwrap_err();
+        assert!(err.contains("unknown namespace `nope`"), "{err}");
+        assert!(
+            err.contains("note"),
+            "unknown error lists namespaces: {err}"
+        );
+        assert!(
+            err.contains("help"),
+            "unknown error lists `help` as available: {err}"
+        );
+        // Chief-only namespaces are unknown to base workspaces.
+        assert!(
+            help_namespace(false, &AgentFeaturesSettings::default(), "app.workspaces").is_err()
+        );
+        assert!(help_namespace(true, &AgentFeaturesSettings::default(), "app.workspaces").is_ok());
+    }
+
     // ---- [agentFeatures] segment-assembly tests ----------------------------
 
     // The gated `ws.` doc prefixes paired with the mutator that flips their
@@ -1147,6 +1648,46 @@ mod tests {
         }
     }
 
+    // Guard: the hook-docs cross-references to `ws.host.exec` scrubbed by the
+    // `hostExec` gate still match the base variant verbatim (and stay out of
+    // the chief variant, which has no `ws.host.*` surface), so the `replacen`
+    // scrubs cannot silently become no-ops.
+    #[test]
+    fn hook_host_exec_xrefs_match_base_variant_only() {
+        assert!(WORKSPACE_API_DESCRIPTION.contains(HOOK_HOST_EXEC_INDEX_XREF));
+        assert!(WORKSPACE_API_DESCRIPTION.contains(HOOK_HOST_EXEC_DOC_XREF));
+        assert!(!WORKSPACE_API_DESCRIPTION_CHIEF.contains("host.exec"));
+    }
+
+    // `hostExec` off: no textual mention of `host.exec` survives anywhere in
+    // the assembled description, while the hook docs — including their
+    // `ws.pr.snapshot` self-checking guidance — stay intact.
+    #[test]
+    fn host_exec_off_scrubs_hook_cross_references() {
+        let features = AgentFeaturesSettings {
+            host_exec: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features, true);
+            assert!(
+                !pruned.contains("host.exec"),
+                "chief={is_chief}: a `host.exec` mention survived disabling hostExec"
+            );
+            for kept in [
+                "ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot",
+                "ws.hook.schedule(",
+                "including `ws.pr.snapshot`",
+                "ws.pr.snapshot(prNumber, { repo? }?)",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
     // `attentionRequests` is method-level: other `ws.agent.*` docs — most
     // importantly `reportToParent`, minus its cross-reference to the pruned
     // pair — must survive it, and no textual mention of the pruned methods
@@ -1249,6 +1790,148 @@ mod tests {
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
             None
+        );
+    }
+
+    // ---- specialist modelOptions injection ---------------------------------
+
+    fn sample_options() -> Vec<SpecialistModelOptions> {
+        vec![
+            SpecialistModelOptions {
+                specialist: "implementor".to_string(),
+                options: vec![
+                    SpecialistModelOption {
+                        model: "opencode:kimi-k3".to_string(),
+                        hint: "cheap".to_string(),
+                    },
+                    SpecialistModelOption {
+                        model: "auggie:opus".to_string(),
+                        hint: String::new(),
+                    },
+                ],
+            },
+            SpecialistModelOptions {
+                specialist: "verifier".to_string(),
+                options: vec![SpecialistModelOption {
+                    model: "grok:grok-5".to_string(),
+                    hint: "fast reviews".to_string(),
+                }],
+            },
+        ]
+    }
+
+    // Hard requirement: with no specialist carrying options (the default),
+    // the injected description IS the plain assembly — byte-identical, and
+    // still `Cow::Borrowed` in the all-defaults case.
+    #[test]
+    fn no_model_options_keeps_description_byte_identical() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let got = workspace_api_description_with_model_options(is_chief, &features, true, &[]);
+            assert!(
+                matches!(got, Cow::Borrowed(_)),
+                "no options must not reassemble"
+            );
+            assert_eq!(
+                &*got,
+                &*workspace_api_description(is_chief, &features, true),
+                "chief={is_chief}: empty options changed the description"
+            );
+        }
+    }
+
+    // Options are injected as continuation lines directly under the
+    // `ws.agent.delegate` doc entry: compound id + hint per specialist, the
+    // hint parenthetical omitted when empty, and the next method line
+    // (`ws.agent.send`) still follows.
+    #[test]
+    fn model_options_injected_into_delegate_docs() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                true,
+                &sample_options(),
+            );
+            assert!(
+                got.contains("Specialist model options"),
+                "chief={is_chief}: header missing"
+            );
+            assert!(
+                got.contains("implementor: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+                "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
+            );
+            assert!(
+                got.contains("verifier: `grok:grok-5` (fast reviews)"),
+                "chief={is_chief}: verifier options line missing"
+            );
+            // The block sits between the delegate entry and the next method
+            // line, i.e. inside the delegate docs.
+            let delegate_idx = got.find("ws.agent.delegate(").expect("delegate line");
+            let block_idx = got.find("Specialist model options").expect("block");
+            let send_idx = got[delegate_idx..]
+                .find("ws.agent.send(")
+                .map(|i| i + delegate_idx)
+                .expect("send line after delegate");
+            assert!(
+                delegate_idx < block_idx && block_idx < send_idx,
+                "chief={is_chief}: block not inside the delegate docs \
+                 (delegate={delegate_idx}, block={block_idx}, send={send_idx})"
+            );
+            // Injected lines are continuation-indented (≥4 spaces) so the
+            // feature-gating pruner treats them as part of the entry.
+            for line in got.lines().filter(|l| {
+                l.contains("Specialist model options")
+                    || l.trim_start().starts_with("implementor:")
+                    || l.trim_start().starts_with("verifier:")
+            }) {
+                assert!(
+                    line.starts_with("    "),
+                    "injected line not continuation-indented: {line:?}"
+                );
+            }
+        }
+    }
+
+    // The injection composes with feature pruning: a bridge with a disabled
+    // toggle still gets the options block, and the pruned namespace stays
+    // gone.
+    #[test]
+    fn model_options_compose_with_feature_pruning() {
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let got =
+            workspace_api_description_with_model_options(false, &features, true, &sample_options());
+        assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
+        assert!(
+            got.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            "options block missing on a pruned description"
+        );
+    }
+
+    // Multi-line author text cannot break the description's line structure:
+    // newlines in hints (and ids) are flattened to spaces.
+    #[test]
+    fn model_options_flatten_multiline_hints() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            options: vec![SpecialistModelOption {
+                model: "opencode:kimi-k3".to_string(),
+                hint: "line one\nline two".to_string(),
+            }],
+        }];
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &options,
+        );
+        assert!(
+            got.contains("`opencode:kimi-k3` (line one line two)"),
+            "multi-line hint not flattened:\n{got}"
         );
     }
 }

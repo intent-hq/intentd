@@ -1439,6 +1439,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.markSeen`: persist the per-conversation seen marker
+    /// (`message_id` — the newest transcript message the user has seen) on
+    /// the agent session and emit `agent:updated` (PROTOCOL §5.5). Monotonic:
+    /// naming a message OLDER than the current marker is a no-op returning
+    /// the current marker. Idempotent: re-marking the same message succeeds.
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_mark_seen not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.editAndRegenerate`: edit a past user message and regenerate from
     /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
     /// transcript to just before `message_id` (which must reference an existing
@@ -3147,16 +3166,20 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
-    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` in the
-    /// workspace's repo — state, mergeability + blocked reason, check-run
-    /// tally, review decision, and comment counts — for hook-based PR
-    /// monitoring. `pr_number` is REQUIRED; there is no active-PR fallback.
+    /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
+    /// mergeability + blocked reason, check-run tally, review decision, and
+    /// comment counts — for hook-based PR monitoring. Scoped to the
+    /// workspace's repo unless `repo` (an `"owner/name"` slug) overrides it;
+    /// the result always echoes the resolved repo as `repo` so a wrong-repo
+    /// read is detectable. `pr_number` is REQUIRED; there is no active-PR
+    /// fallback.
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
+        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number);
+        let _ = (workspace_id, pr_number, repo);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_state not implemented".to_string(),
@@ -3924,6 +3947,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `voice.transcribe`: speech-to-text over a pluggable provider
+    /// (ElevenLabs Scribe | OpenAI). `params` carries `audio` (required,
+    /// base64), optional `mimeType`, `language`, `provider` override, and
+    /// `context { prompt?, keyterms? }`; returns `{ text, provider,
+    /// durationMs? }`. Missing/oversized/invalid audio → `InvalidParams`
+    /// (-32602); a missing API key or provider failure → `Internal` (-32603).
+    /// The provider API keys never cross the wire.
+    fn voice_transcribe(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::voice_transcribe not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.getChanges`: the filtered tracked-change list
     /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
     fn file_tracking_get_changes(
@@ -4642,7 +4684,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// user/assistant agent messages. `workspace_id` `None` → global across
     /// all workspaces; `Some` → hard scope filter. `prefer_workspace_id` is a
     /// soft ranking boost: results stay global but matches from that workspace
-    /// outrank equally-relevant matches elsewhere. Returns
+    /// outrank equally-relevant matches elsewhere. Archived-workspace matches
+    /// carry a soft ranking penalty, so equally-relevant matches tier
+    /// preferred → other active → archived. Returns
     /// `{ requestId, matches: MessageMatch[] }` inline, or
     /// `{ requestId, matches: [] }` (a prompt ack) when the result set is
     /// streamed via `search:result`/`search:done` (PROTOCOL §5.15 / §6.5).

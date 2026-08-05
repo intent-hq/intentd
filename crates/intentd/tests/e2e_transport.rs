@@ -287,7 +287,7 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send");
     loop {

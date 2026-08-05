@@ -20,7 +20,7 @@ mod bindings;
 mod dispatch;
 mod tools;
 
-pub use tools::ToolDef;
+pub use tools::{SpecialistModelOption, SpecialistModelOptions, ToolDef};
 
 // Static description const, exposed for the segment-assembly parity tests
 // in `crate::tests` (the assembled all-defaults description must be
@@ -90,6 +90,12 @@ pub struct WorkspaceMcpServer {
     /// capable). Defaults to `true` (FE front door, tests) so the
     /// all-defaults description stays byte-identical to the static const.
     cow_capable: bool,
+    /// Per-specialist delegation model options (PROTOCOL §5.11
+    /// `modelOptions`), captured at bridge creation like `agent_features` and
+    /// injected into the `workspace_api` description's `ws.agent.delegate`
+    /// docs. Only specialists that carry options appear; empty — the default
+    /// — leaves the description byte-identical.
+    specialist_model_options: Vec<tools::SpecialistModelOptions>,
 }
 
 impl WorkspaceMcpServer {
@@ -108,6 +114,7 @@ impl WorkspaceMcpServer {
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
             cow_capable: true,
+            specialist_model_options: Vec::new(),
         }
     }
 
@@ -172,6 +179,18 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Set the per-specialist delegation model options advertised in the
+    /// `workspace_api` description (the spawn-time wiring point — resolved
+    /// once at bridge creation, like `agent_features`). Pass only specialists
+    /// that carry options; an empty list keeps the default description.
+    pub fn with_specialist_model_options(
+        mut self,
+        options: Vec<tools::SpecialistModelOptions>,
+    ) -> Self {
+        self.specialist_model_options = options;
+        self
+    }
+
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds.
@@ -228,13 +247,15 @@ impl WorkspaceMcpServer {
             .map(|t| {
                 // `workspace_api` gets its description assembled per-bridge so
                 // `[agentFeatures]` toggles captured at creation prune the
-                // disabled surface; with all defaults on the assembled text is
-                // the static const unchanged.
+                // disabled surface and specialist `modelOptions` extend the
+                // delegate docs; with all defaults on (and no options) the
+                // assembled text is the static const unchanged.
                 let description = if t.name == "workspace_api" {
-                    tools::workspace_api_description(
+                    tools::workspace_api_description_with_model_options(
                         self.is_chief,
                         &self.agent_features,
                         self.cow_capable,
+                        &self.specialist_model_options,
                     )
                     .into_owned()
                 } else {

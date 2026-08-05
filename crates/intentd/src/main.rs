@@ -747,6 +747,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     if let Err(e) = intent_services::migrate_cow_isolation_to_sandbox(&settings_registry) {
         tracing::warn!(error = %e, "cowIsolation → sandbox settings migration failed; continuing");
     }
+    // One-time migration for the trimmed `voice.vocabulary` default: a stored
+    // row that only ever persisted the retired 17-term seed default is
+    // deleted so the new `["Intent"]` default applies; user-modified lists
+    // are never touched.
+    intent_services::migrate_default_vocabulary(&store)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An

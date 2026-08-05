@@ -1,8 +1,6 @@
 use std::time::{Duration, Instant};
 
-use rquickjs::{
-    async_with, function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise,
-};
+use rquickjs::{function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise};
 
 use crate::{EvalOptions, HostFn, JsError, OUTER_SAFETY_MARGIN};
 
@@ -80,13 +78,15 @@ pub async fn eval(
 
     let inner: Result<Result<serde_json::Value, RunErr>, ()> =
         tokio::time::timeout(opts.timeout.saturating_add(OUTER_SAFETY_MARGIN), async {
-            let out: Result<serde_json::Value, RunErr> = async_with!(ctx => |ctx| {
-                if let Some(h) = host_for_bind {
-                    bind_host(ctx.clone(), h).map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
-                }
-                run_user_code(ctx, &code_owned).await
-            })
-            .await;
+            let out: Result<serde_json::Value, RunErr> = ctx
+                .async_with(async |ctx| {
+                    if let Some(h) = host_for_bind {
+                        bind_host(ctx.clone(), h)
+                            .map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
+                    }
+                    run_user_code(ctx, &code_owned).await
+                })
+                .await;
             rt.idle().await;
             out
         })

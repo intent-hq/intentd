@@ -80,6 +80,20 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
     }
 }
 
+/// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
+/// with exactly one `/` and both halves non-empty.
+pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
+    let trimmed = slug.trim();
+    if let Some((owner, name)) = trimmed.split_once('/') {
+        if !owner.is_empty() && !name.is_empty() && !name.contains('/') {
+            return Ok((owner.to_string(), name.to_string()));
+        }
+    }
+    Err(Error::InvalidParams(format!(
+        "repo must be an \"owner/name\" slug, got `{slug}`"
+    )))
+}
+
 /// Background-sweep activity window (§7.6/§7.7): workspaces whose
 /// `updatedAt`/`lastActivity` is within this many minutes are refreshed on
 /// every sweep tick; colder workspaces only refresh on every
@@ -785,6 +799,29 @@ mod tests {
             verdict,
             body: None,
             submitted_at: at.into(),
+        }
+    }
+
+    #[test]
+    fn parse_repo_slug_accepts_owner_name_and_trims() {
+        assert_eq!(
+            parse_repo_slug("acme/widgets").unwrap(),
+            ("acme".to_string(), "widgets".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug("  acme/widgets  ").unwrap(),
+            ("acme".to_string(), "widgets".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_slug_rejects_malformed_slugs() {
+        for bad in ["", " ", "acme", "acme/", "/widgets", "a/b/c"] {
+            let err = parse_repo_slug(bad).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
+                "slug `{bad}` should be rejected, got {err:?}"
+            );
         }
     }
 

@@ -50,6 +50,7 @@ pub use ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID
 pub use model::extract_spec_task_ids;
 pub use model::MessageOrigin;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
+pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{chief_workspace, is_chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
@@ -86,7 +87,8 @@ pub use model::{
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use settings_file::{
-    LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
+    FlushQueuedMessagesMode, LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
+    LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{

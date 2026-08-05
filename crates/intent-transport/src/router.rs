@@ -107,6 +107,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": category.as_str(), "detail": detail })),
         },
+        // Missing voice provider API key: same -32603 code and "Internal
+        // error" message as before (deliberately not the variant's Display,
+        // which carries the detail), plus machine-readable `data.code` with
+        // the descriptive text preserved in `data.detail` (monorepo#1448).
+        ref e @ Error::VoiceNotConfigured { ref detail } => RpcErr {
+            code: e.code(),
+            message: "Internal error".to_string(),
+            data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -1243,6 +1252,16 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .agent_dismiss_questions(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.markSeen" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_mark_seen(ws, agent_id, message_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -2695,6 +2714,19 @@ async fn dispatch(
             let r = api.unsloth_stop().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "voice.transcribe" => {
+            // Daemon-owned and global: no `workspaceId`. `audio` (base64) is
+            // required; the service layer validates shape/size and selects
+            // the provider (per-call override else the `voice.provider`
+            // setting). Missing/oversized/invalid audio → -32602.
+            require_str_param(params, "audio")?;
+            let request = Value::Object(params.clone());
+            match api.voice_transcribe(request).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api
@@ -2777,7 +2809,10 @@ async fn dispatch(
         }
         "search.messages" => {
             // `workspaceId` is optional (absent → global search across all
-            // workspaces); `preferWorkspaceId` is a soft ranking boost.
+            // workspaces); `preferWorkspaceId` is a soft ranking boost, and
+            // archived-workspace matches get a soft penalty on the same
+            // bm25-unit scale, yielding the default tier order preferred →
+            // other active → archived.
             let ws = opt_workspace_id(params);
             let query = require_str_param(params, "query")?;
             let agent_id = opt_str(params, "agentId");

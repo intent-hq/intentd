@@ -73,6 +73,15 @@ pub enum Error {
     /// §5.1/§9).
     #[error("execution environment '{environment}' is not implemented yet")]
     ExecutionEnvironmentNotImplemented { environment: String },
+
+    /// The `voice.transcribe` provider API key is missing. Surfaces as
+    /// `-32603` with the same "Internal error" message as the plain
+    /// `Internal` shape plus machine-readable
+    /// `error.data = { code: "voice-no-api-key", detail }` so clients stop
+    /// matching on prose (monorepo#1448). `detail` carries the descriptive
+    /// text unchanged from the pre-structured shape.
+    #[error("internal error: {detail}")]
+    VoiceNotConfigured { detail: String },
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -139,7 +148,7 @@ impl Error {
                 | CloneErrorCategory::Network
                 | CloneErrorCategory::Other => -32603,
             },
-            Error::Internal(_) => -32603,
+            Error::Internal(_) | Error::VoiceNotConfigured { .. } => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
             Error::ExecutionEnvironmentUnavailable { .. } => -32602,

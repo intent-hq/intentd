@@ -1471,6 +1471,81 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically set ONE key in `agent_session.metadata` in SQL (`json_set`),
+    /// preserving every sibling key — unlike
+    /// [`Store::update_agent_session_metadata`], whose whole-column replacement
+    /// loses keys written concurrently by another metadata writer (e.g.
+    /// `agent.dismissQuestions` racing `agent.markSeen`). A NULL column starts
+    /// from `{}`; a non-object value (should one ever land there) is preserved
+    /// under `priorNonObjectMetadata` (monorepo#751 review), matching the
+    /// service-side defensive shape. `key` must be a trusted compile-time
+    /// constant (it is spliced into the JSON path). `expected` is a three-way
+    /// compare-and-set guard on the key's CURRENT value (same encoding as
+    /// `stop_reason` on [`Store::set_agent_session_status`]): `None` writes
+    /// unconditionally, `Some(None)` writes only when the key is absent,
+    /// `Some(Some(v))` only when it currently equals `v`. Returns `Ok(false)`
+    /// when the guard failed (the session exists but the key's value moved —
+    /// callers re-read and retry); `NotFound` when the session is absent or
+    /// the workspace does not match. `updated_at` is refreshed on a successful
+    /// write only.
+    pub async fn set_agent_session_metadata_key(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        key: &str,
+        value: &str,
+        expected: Option<Option<&str>>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let guarded = expected.is_some();
+        let expected_value = expected.flatten();
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, ?), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ? \
+               AND (? = 0 OR json_extract(metadata, '$.' || ?) IS ?)",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(guarded as i64)
+        .bind(key)
+        .bind(expected_value)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session metadata key failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            if guarded {
+                // Distinguish a CAS-guard miss (session exists, marker moved)
+                // from a missing / workspace-mismatched session.
+                let exists =
+                    sqlx::query("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
+                        .bind(&id.0)
+                        .bind(&workspace_id.0)
+                        .fetch_optional(self.read_pool())
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("agent session existence check failed: {e}"))
+                        })?;
+                if exists.is_some() {
+                    return Ok(false);
+                }
+            }
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(true)
+    }
+
     /// Persist the runtime `status` + `is_active` transition for `agent_session`
     /// without touching the write-once `acp_session_id` / immutable `provider`
     /// (the broader [`Store::update_agent_session`] enforces those invariants).
@@ -1997,6 +2072,14 @@ const MESSAGE_FTS_TEXT_SQL: &str = "CASE \
 /// enough that a decisively better match from another workspace still wins.
 const PREFER_WORKSPACE_BOOST: f64 = 1.0;
 
+/// `search.messages` archived-workspace ranking penalty, in bm25 units,
+/// added to the bm25 rank (lower = better) of matches owned by an archived
+/// workspace. Mirrors [`PREFER_WORKSPACE_BOOST`] so equally-relevant matches
+/// tier as preferred workspace → other active workspaces → archived
+/// workspaces, while a decisively better match from an archived workspace
+/// still wins.
+const ARCHIVED_WORKSPACE_PENALTY: f64 = 1.0;
+
 /// One `search.messages` hit from [`Store::search_agent_messages_fts`]: the
 /// message/agent ids and result-row context (owning workspace, agent display
 /// name, role, decoded content, timestamp) plus the adjusted bm25 rank
@@ -2061,9 +2144,13 @@ impl Store {
     /// `prefer_workspace_id` is a soft ranking boost: matches from that
     /// workspace get [`PREFER_WORKSPACE_BOOST`] subtracted from their bm25
     /// rank (lower = better), so they outrank equally-relevant matches from
-    /// other workspaces without excluding anyone. Rows order by adjusted rank,
-    /// then newest-first, one row per matching message. `limit` `None` → no
-    /// cap.
+    /// other workspaces without excluding anyone. Matches owned by an
+    /// archived workspace get [`ARCHIVED_WORKSPACE_PENALTY`] added to their
+    /// rank regardless of `prefer_workspace_id`, tiering equally-relevant
+    /// matches preferred → other active → archived — both adjustments are
+    /// soft, so a decisively better bm25 match still wins. Rows order by
+    /// adjusted rank, then newest-first, one row per matching message.
+    /// `limit` `None` → no cap.
     pub async fn search_agent_messages_fts(
         &self,
         match_expr: &str,
@@ -2077,10 +2164,12 @@ impl Store {
             "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
                     s.workspace_id, s.name AS agent_name, \
                     bm25(agent_message_fts) \
-                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) AS adjusted_rank \
+                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
+                      + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
              FROM agent_message_fts \
              JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
              JOIN agent_session s ON s.id = m.agent_id \
+             JOIN workspace w ON w.id = s.workspace_id \
              WHERE agent_message_fts MATCH ? \
                AND (? IS NULL OR s.workspace_id = ?) \
                AND (? IS NULL OR m.agent_id = ?) \
@@ -2090,6 +2179,7 @@ impl Store {
         )
         .bind(prefer_workspace_id.map(|w| w.0.as_str()))
         .bind(PREFER_WORKSPACE_BOOST)
+        .bind(ARCHIVED_WORKSPACE_PENALTY)
         .bind(match_expr)
         .bind(workspace_id.map(|w| w.0.as_str()))
         .bind(workspace_id.map(|w| w.0.as_str()))
@@ -4747,6 +4837,179 @@ mod tests {
         }
     }
 
+    /// `set_agent_session_metadata_key` writes exactly one key in SQL:
+    /// sibling keys survive (no whole-column clobber), a NULL column starts
+    /// from `{}`, a non-object column is preserved under
+    /// `priorNonObjectMetadata`, `system_prompt` is untouched, the CAS guard
+    /// enforces expected-absent / expected-value semantics (guard miss →
+    /// `Ok(false)`, no write), and missing/mismatched sessions are NotFound.
+    #[tokio::test]
+    async fn set_agent_session_metadata_key_atomic_and_guarded() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-meta-key".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep this prompt".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // NULL column + expected-absent guard: writes, starting from {}.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-1",
+                Some(None),
+                &now_iso(),
+            )
+            .await
+            .expect("first write");
+        assert!(wrote, "expected-absent guard must pass on a NULL column");
+
+        // Sibling key written unconditionally: both keys coexist.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "dismissedQuestionsMessageId",
+                "msg-q",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("sibling write");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
+        assert_eq!(
+            metadata["dismissedQuestionsMessageId"],
+            serde_json::json!("msg-q")
+        );
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("keep this prompt"),
+            "single-key metadata write must not touch system_prompt"
+        );
+
+        // CAS guard miss: expected value no longer current → Ok(false), no write.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-stale",
+                Some(Some("msg-0")),
+                &now_iso(),
+            )
+            .await
+            .expect("guard miss is not an error");
+        assert!(!wrote, "stale expected value must not write");
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(
+            after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
+            serde_json::json!("msg-1"),
+            "guard miss must leave the key untouched"
+        );
+
+        // CAS guard hit: expected current value → writes.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-2",
+                Some(Some("msg-1")),
+                &now_iso(),
+            )
+            .await
+            .expect("guard hit");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-2"));
+        assert_eq!(
+            metadata["dismissedQuestionsMessageId"],
+            serde_json::json!("msg-q"),
+            "sibling key must survive the guarded write"
+        );
+
+        // Non-object column: preserved under `priorNonObjectMetadata`.
+        let legacy = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut legacy_session = baseline_test_session(&legacy, &ws_id, &ts, None);
+        legacy_session.metadata = Some(serde_json::json!("legacy-string"));
+        store
+            .insert_agent_session(&legacy_session)
+            .await
+            .expect("insert legacy session");
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &legacy,
+                "lastSeenMessageId",
+                "msg-1",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("legacy write");
+        assert!(wrote);
+        let after = store.get_agent_session(&legacy).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
+        assert_eq!(
+            metadata["priorNonObjectMetadata"],
+            serde_json::json!("legacy-string"),
+            "prior non-object metadata must be preserved, not dropped"
+        );
+
+        // Workspace mismatch / unknown id: NotFound (guarded and unguarded).
+        let other_ws = WorkspaceId("ws-meta-key-other".to_string());
+        for expected in [None, Some(Some("msg-2"))] {
+            match store
+                .set_agent_session_metadata_key(
+                    &other_ws,
+                    &agent_id,
+                    "lastSeenMessageId",
+                    "msg-3",
+                    expected,
+                    &now_iso(),
+                )
+                .await
+            {
+                Err(Error::NotFound(_)) => {}
+                other => panic!("expected NotFound on workspace mismatch, got {other:?}"),
+            }
+        }
+        let missing = AgentId("agent-meta-key-missing".to_string());
+        match store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &missing,
+                "lastSeenMessageId",
+                "msg-3",
+                Some(None),
+                &now_iso(),
+            )
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on unknown id, got {other:?}"),
+        }
+    }
+
     /// `get_agent_session_message_projections` returns one entry per session
     /// (zero-message sessions included) with the correct count and the
     /// highest-`seq` user/assistant rows, scoped to the workspace, without
@@ -6645,5 +6908,165 @@ mod tests {
             fts_match_ids(&store, "postvacuumterm").await,
             vec![after.id]
         );
+    }
+
+    /// `search.messages` workspace tiering: with equally-relevant matches in
+    /// a preferred active workspace, another active workspace, and an
+    /// archived workspace, adjusted ranks order preferred → other active →
+    /// archived. The [`ARCHIVED_WORKSPACE_PENALTY`] applies with or without
+    /// `prefer_workspace_id`, and hard workspace scoping still returns
+    /// archived rows (the penalty is a ranking adjustment, never a filter).
+    #[tokio::test]
+    async fn search_messages_fts_tiers_active_above_archived() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_pref = WorkspaceId("ws-tier-pref".to_string());
+        let ws_active = WorkspaceId("ws-tier-active".to_string());
+        let ws_arch = WorkspaceId("ws-tier-arch".to_string());
+        for ws in [&ws_pref, &ws_active] {
+            store
+                .insert_workspace(&baseline_test_workspace(ws, &ts))
+                .await
+                .expect("insert workspace");
+        }
+        let mut archived_ws = baseline_test_workspace(&ws_arch, &ts);
+        archived_ws.archived = true;
+        archived_ws.archived_at = Some(ts.clone());
+        store
+            .insert_workspace(&archived_ws)
+            .await
+            .expect("insert archived workspace");
+        for (agent, ws) in [
+            ("agent-tier-pref", &ws_pref),
+            ("agent-tier-active", &ws_active),
+            ("agent-tier-arch", &ws_arch),
+        ] {
+            let agent = AgentId(agent.to_string());
+            store
+                .insert_agent_session(&baseline_test_session(&agent, ws, &ts, None))
+                .await
+                .expect("insert session");
+            store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!("tierterm equally relevant"),
+                    &ts,
+                )
+                .await
+                .expect("append message");
+        }
+        let ws_of = |hits: &[MessageFtsMatch]| {
+            hits.iter()
+                .map(|h| h.workspace_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // preferred → other active → archived under prefer_workspace_id.
+        let hits = store
+            .search_agent_messages_fts("tierterm", None, None, None, Some(&ws_pref), None)
+            .await
+            .expect("tiered search");
+        assert_eq!(
+            ws_of(&hits),
+            vec![ws_pref.0.clone(), ws_active.0.clone(), ws_arch.0.clone()]
+        );
+
+        // No prefer_workspace_id: the archived penalty still applies, by
+        // exactly ARCHIVED_WORKSPACE_PENALTY bm25 units on equal content.
+        let hits = store
+            .search_agent_messages_fts("tierterm", None, None, None, None, None)
+            .await
+            .expect("unpreferred search");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[2].workspace_id, ws_arch.0, "archived match ranks last");
+        assert!((hits[2].rank - hits[0].rank - ARCHIVED_WORKSPACE_PENALTY).abs() < 1e-9);
+
+        // Hard workspace scoping to the archived workspace still matches.
+        let hits = store
+            .search_agent_messages_fts("tierterm", Some(&ws_arch), None, None, None, None)
+            .await
+            .expect("scoped search");
+        assert_eq!(ws_of(&hits), vec![ws_arch.0.clone()]);
+    }
+
+    /// The archived-workspace penalty is a soft boost, not strict tiering: a
+    /// decisively better bm25 match from an archived workspace (short
+    /// document dense in the query term) still outranks a weak match from an
+    /// active workspace (single occurrence in a long document).
+    #[tokio::test]
+    async fn search_messages_fts_archived_penalty_is_soft() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_active = WorkspaceId("ws-soft-active".to_string());
+        let ws_arch = WorkspaceId("ws-soft-arch".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_active, &ts))
+            .await
+            .expect("insert workspace");
+        let mut archived_ws = baseline_test_workspace(&ws_arch, &ts);
+        archived_ws.archived = true;
+        archived_ws.archived_at = Some(ts.clone());
+        store
+            .insert_workspace(&archived_ws)
+            .await
+            .expect("insert archived workspace");
+        let active_agent = AgentId("agent-soft-active".to_string());
+        let arch_agent = AgentId("agent-soft-arch".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&active_agent, &ws_active, &ts, None))
+            .await
+            .expect("insert active session");
+        store
+            .insert_agent_session(&baseline_test_session(&arch_agent, &ws_arch, &ts, None))
+            .await
+            .expect("insert archived session");
+        // Filler documents keep the query term rare in the corpus (IDF up).
+        for _ in 0..8 {
+            store
+                .append_agent_message(
+                    &active_agent,
+                    "user",
+                    &serde_json::json!("padword ".repeat(8).trim()),
+                    &ts,
+                )
+                .await
+                .expect("append filler");
+        }
+        // Weak active match: one occurrence buried in a long document.
+        store
+            .append_agent_message(
+                &active_agent,
+                "user",
+                &serde_json::json!(format!("needleterm {}", "padword ".repeat(60).trim())),
+                &ts,
+            )
+            .await
+            .expect("append weak match");
+        // Decisively better archived match: short and dense in the term.
+        store
+            .append_agent_message(
+                &arch_agent,
+                "user",
+                &serde_json::json!("needleterm ".repeat(8).trim()),
+                &ts,
+            )
+            .await
+            .expect("append strong match");
+
+        let hits = store
+            .search_agent_messages_fts("needleterm", None, None, None, None, None)
+            .await
+            .expect("soft-boost search");
+        assert_eq!(hits.len(), 2, "penalty never excludes archived matches");
+        assert_eq!(
+            hits[0].workspace_id, ws_arch.0,
+            "decisively better archived match overcomes the penalty: {hits:?}"
+        );
+        assert_eq!(hits[1].workspace_id, ws_active.0);
     }
 }
