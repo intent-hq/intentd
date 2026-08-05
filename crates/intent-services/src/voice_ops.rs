@@ -69,11 +69,20 @@ pub(crate) struct ParsedRequest {
     pub keyterms: Vec<String>,
 }
 
-/// Map a voice engine/registry error onto the domain `Internal` error
-/// (→ `-32603`): a missing key (`NotConfigured`) and any other provider
-/// failure both surface as `Internal` with a descriptive message (§9).
+/// Map a voice engine/registry error onto a domain error (→ `-32603`): a
+/// missing key (`NotConfigured` — exclusively the registry's no-key case;
+/// provider failures such as OpenAI model-unavailable use distinct variants)
+/// surfaces as `VoiceNotConfigured` so the wire carries
+/// `error.data.code = "voice-no-api-key"` (monorepo#1448); any other
+/// provider failure surfaces as `Internal` with a descriptive message (§9).
+/// The descriptive text is identical in both shapes.
 pub(crate) fn map_voice_err(e: intent_voice::Error) -> Error {
-    Error::Internal(e.to_string())
+    match e {
+        intent_voice::Error::NotConfigured(_) => Error::VoiceNotConfigured {
+            detail: e.to_string(),
+        },
+        other => Error::Internal(other.to_string()),
+    }
 }
 
 /// Parse/validate the wire params: `audio` (required, base64), optional
@@ -211,7 +220,7 @@ pub(crate) fn build_engine_request(
 /// Resolve the active [`VoiceEngine`] for `provider`: the injected handle
 /// (tests / explicit wiring) else the registry-built engine (key from the
 /// secrets store / `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`). A missing key
-/// yields `Internal` (graceful "not configured"), never a panic. Async
+/// yields `VoiceNotConfigured` (graceful "not configured"), never a panic. Async
 /// because the secrets lookup runs on the blocking pool with a bounded
 /// timeout so a wedged backing store never blocks the async runtime.
 pub(crate) async fn resolve_engine(
@@ -441,8 +450,32 @@ mod tests {
     }
 
     #[test]
-    fn maps_not_configured_to_internal() {
+    fn maps_not_configured_to_voice_not_configured() {
         let mapped = map_voice_err(intent_voice::Error::NotConfigured("no key".into()));
-        assert!(matches!(mapped, Error::Internal(_)));
+        match mapped {
+            Error::VoiceNotConfigured { detail } => {
+                assert_eq!(
+                    detail, "voice not configured: no key",
+                    "detail carries the descriptive text unchanged"
+                );
+            }
+            other => panic!("expected VoiceNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_other_voice_errors_to_internal() {
+        for e in [
+            intent_voice::Error::Auth("401 Unauthorized".into()),
+            intent_voice::Error::Api("500: Internal Server Error".into()),
+            intent_voice::Error::ModelUnavailable("openai returned 404: model not found".into()),
+        ] {
+            let expected = e.to_string();
+            let mapped = map_voice_err(e);
+            assert!(
+                matches!(mapped, Error::Internal(m) if m == expected),
+                "non-NotConfigured errors keep mapping to Internal"
+            );
+        }
     }
 }
