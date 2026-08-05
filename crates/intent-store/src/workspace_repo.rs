@@ -225,6 +225,74 @@ impl Store {
             .await
     }
 
+    /// Scoped, conditional attention write (monorepo#1481): set ONLY the
+    /// `attention` column — plus `updated_at` when the caller intends an
+    /// activity bump — guarded on the current value, so the write and the
+    /// "did it change" decision are a single atomic statement and a
+    /// concurrent mutation of any other column is never clobbered (same
+    /// scoped-update discipline as [`Self::update_workspace_token_usage`]
+    /// and [`Self::set_workspace_branch_auto_generated`]).
+    ///
+    /// `expected = Some(from)` writes only when the current attention equals
+    /// `from` (markSeen's clear-only-when-unread; must differ from
+    /// `attention` — debug-asserted — or the write degenerates to a
+    /// same-value rewrite reported as a change); `None` writes whenever the
+    /// current attention differs from `attention`. Returns whether a row was
+    /// written (`true` ⇒ the value actually changed); `NotFound` when the
+    /// workspace does not exist.
+    pub async fn set_workspace_attention(
+        &self,
+        id: &WorkspaceId,
+        attention: WorkspaceAttention,
+        updated_at: Option<&str>,
+        expected: Option<WorkspaceAttention>,
+    ) -> Result<bool> {
+        debug_assert!(
+            expected.as_ref() != Some(&attention),
+            "expected == attention degenerates to a same-value rewrite that \
+             reports `changed = true`"
+        );
+        let target = enum_to_db(&attention)?;
+        let guard = match &expected {
+            Some(from) => enum_to_db(from)?,
+            None => target.clone(),
+        };
+        let sql = match (updated_at.is_some(), expected.is_some()) {
+            (true, true) => {
+                "UPDATE workspace SET attention=?, updated_at=? WHERE id=? AND attention = ?"
+            }
+            (true, false) => {
+                "UPDATE workspace SET attention=?, updated_at=? WHERE id=? AND attention <> ?"
+            }
+            (false, true) => "UPDATE workspace SET attention=? WHERE id=? AND attention = ?",
+            (false, false) => "UPDATE workspace SET attention=? WHERE id=? AND attention <> ?",
+        };
+        let mut query = sqlx::query(sql).bind(&target);
+        if let Some(ts) = updated_at {
+            query = query.bind(ts);
+        }
+        let res = query
+            .bind(&id.0)
+            .bind(&guard)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set attention failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Zero rows: either the guard declined (no change) or the workspace
+        // is missing — distinguish so callers keep NotFound semantics.
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
+            .bind(&id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set attention presence check failed: {e}")))?;
+        if col::<i64>(&row, "present")? == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in
     /// `deleted_workspace_id` (same transaction as the row delete) so
     /// `workspace.create` never recycles the id for a later workspace (FE

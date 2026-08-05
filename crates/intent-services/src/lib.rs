@@ -338,6 +338,13 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_supervise_park` /
     /// `with_script_start_registration_park`.
     script_parks: script_ops::ScriptParks,
+    /// Test park seam (monorepo#1481) for the attention mutation race window
+    /// — parks `raise_attention` / `mark_seen` / `dismiss_attention`
+    /// immediately before their scoped attention write (the site of the
+    /// former read-modify-write window) so tests can deterministically
+    /// interleave a concurrent row mutation. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
+    attention_write_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -592,6 +599,7 @@ impl Services {
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
+            attention_write_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -984,6 +992,29 @@ impl Services {
     ) -> Self {
         self.script_parks.start_registration = Some(park);
         self
+    }
+
+    /// Test seam (monorepo#1481): park the attention mutation paths
+    /// (`raise_attention` / `mark_seen` / `dismiss_attention`) immediately
+    /// before their scoped attention write — the site of the former
+    /// read-modify-write window — so races against concurrent row mutations
+    /// are deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_attention_write_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.attention_write_park = Some(park);
+        self
+    }
+
+    /// Park immediately before the scoped attention write when the test seam
+    /// is armed (no-op in production wiring).
+    async fn park_attention_write(&self) {
+        if let Some(park) = &self.attention_write_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Test seam: observe/park the underlying `git.diffs` walk on the
@@ -1779,16 +1810,22 @@ impl Services {
         workspace_id: &WorkspaceId,
         level: WorkspaceAttention,
     ) -> Result<()> {
-        let mut ws = self.store.get_workspace(workspace_id).await?;
-        if ws.attention == level {
+        self.park_attention_write().await;
+        // Scoped, conditional write (monorepo#1481): set attention + bump
+        // `updated_at` (raising IS activity) in one guarded UPDATE — never a
+        // full-row replace, so a concurrent row mutation is never clobbered —
+        // and let the write's row count decide "changed", so the
+        // emit-only-on-change choice is atomic rather than read-based.
+        let changed = self
+            .store
+            .set_workspace_attention(workspace_id, level, Some(&now_iso()), None)
+            .await?;
+        if !changed {
             return Ok(());
         }
-        ws.attention = level;
-        ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
         publish_event(
             &self.event_bus,
-            attention_changed_event(&ws.id, ws.attention),
+            attention_changed_event(workspace_id, level),
         )
         .await;
         // Schedule debounced lastActivity event (§10.1).
@@ -12141,19 +12178,25 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            let mut ws = store.get_workspace(&id).await?;
+            this.park_attention_write().await;
             // Dismissing attention merely acknowledges it — not "activity" —
             // so never touch `updated_at` (which feeds the derived
-            // `lastActivity`), and skip the row write entirely when attention
-            // is already clear (intent-hq/monorepo#1466).
-            if ws.attention != WorkspaceAttention::None {
-                ws.attention = WorkspaceAttention::None;
-                store.update_workspace(&ws).await?;
+            // `lastActivity`) (intent-hq/monorepo#1466). Scoped, conditional
+            // write (monorepo#1481): one guarded UPDATE touching only the
+            // attention column — a concurrent mutation of any other column is
+            // never clobbered — whose row count decides "changed", so the
+            // no-op skip and the emit decision are atomic rather than
+            // read-based.
+            let changed = store
+                .set_workspace_attention(&id, WorkspaceAttention::None, None, None)
+                .await?;
+            if changed {
                 // Self-sufficient `workspace:attention-changed` so every client
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
             }
+            let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
@@ -12170,16 +12213,28 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            let mut ws = store.get_workspace(&id).await?;
+            this.park_attention_write().await;
             // "Seen" clears the unread flag; review-required attention persists.
             // Merely looking at a workspace is not "activity", so `updated_at`
             // (which feeds the derived `lastActivity`) stays untouched
-            // (intent-hq/monorepo#1466).
-            if ws.attention == WorkspaceAttention::Unread {
-                ws.attention = WorkspaceAttention::None;
-                store.update_workspace(&ws).await?;
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            // (intent-hq/monorepo#1466). Scoped, conditional write
+            // (monorepo#1481): one UPDATE guarded on `attention = unread`
+            // touching only the attention column — a concurrent mutation of
+            // any other column is never clobbered — whose row count decides
+            // "changed", so the clear-only-when-unread rule and the emit
+            // decision are atomic rather than read-based.
+            let changed = store
+                .set_workspace_attention(
+                    &id,
+                    WorkspaceAttention::None,
+                    None,
+                    Some(WorkspaceAttention::Unread),
+                )
+                .await?;
+            if changed {
+                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
             }
+            let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
