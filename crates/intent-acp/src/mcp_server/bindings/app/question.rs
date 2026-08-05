@@ -33,7 +33,8 @@ pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.question = {
-        ask: (question) => host({ method: 'app.question.ask', args: { question } }),
+        // spec: { question, header, options: [{ label, description? }], explanation?, multiSelect? }
+        ask: (spec) => host({ method: 'app.question.ask', args: { question: spec } }),
     };
 "#;
 
