@@ -621,6 +621,17 @@ async fn dedupe_within_window_emits_one_event_per_path() {
 // and then a non-ignored *control* file: the control event arriving proves the
 // watcher processed the batch (and that non-ignored untracked files still
 // emit), while any event for a suppressed path fails the assertion.
+//
+// Host dependency: whenever the temp dir is a git repo, the watcher loads the
+// *host's* global excludes (`core.excludesFile` / `~/.config/git/ignore`) via
+// `Gitignore::global()`. That lookup reads process-wide env (`HOME`,
+// `XDG_CONFIG_HOME`, git config) at rebuild time, and env mutation races
+// parallel tests in the same process, so we can't hermetically neutralize it
+// here (cf. the host-independence fix in intentd#899, which had a
+// subprocess boundary to scope env to). These tests therefore assume the
+// host has no pathological global excludes — i.e. no pattern or `!` negation
+// matching `.gitignore`, the suppressed fixtures, or the `*control*`/
+// `*.secret`/`dist*` filenames used below.
 // ---------------------------------------------------------------------------
 
 /// `git init` the temp dir (plus user config) so the watcher sees a real repo.

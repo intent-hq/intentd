@@ -302,9 +302,20 @@ impl GitignoreMatcher {
     /// Mark the matcher dirty when a raw event touches an ignore-rule file:
     /// a `.gitignore` at any depth or the repo's `info/exclude`. Rebuilding is
     /// deferred to the next [`Self::verdict`] call.
-    fn note_raw_change(&mut self, abs: &Path) {
+    ///
+    /// `.gitignore` files under [`IGNORED_DIRS`] (e.g. `target/.gitignore`
+    /// written by cargo, or files shipped inside `vendor/`) are skipped by the
+    /// discovery walk in [`Self::rebuild`], so a rebuild for them would be a
+    /// no-op — don't mark dirty for those (checked via `rel`, the
+    /// workspace-relative path). The `exclude_path` comparison stays on the
+    /// absolute path: `info/exclude` intentionally lives under `.git`.
+    fn note_raw_change(&mut self, abs: &Path, rel: Option<&str>) {
+        if self.exclude_path.as_deref() == Some(abs) {
+            self.dirty = true;
+            return;
+        }
         if abs.file_name().is_some_and(|n| n == ".gitignore")
-            || self.exclude_path.as_deref() == Some(abs)
+            && rel.is_some_and(|r| !should_ignore(Path::new(r)))
         {
             self.dirty = true;
         }
@@ -403,9 +414,19 @@ impl GitignoreMatcher {
             self.exclude_path = Some(std::fs::canonicalize(&exclude_path).unwrap_or(exclude_path));
 
             let mut files: Vec<PathBuf> = Vec::new();
+            // Keep discovery deterministic for a given tree: don't consult
+            // parent-of-root ignore rules, `.ignore` files, host global
+            // excludes, or `.git/info/exclude` during the walk — the sources
+            // we honor are added to the matcher chain explicitly above.
+            // In-tree `.gitignore` awareness stays on so ignored subtrees are
+            // pruned from the walk itself.
             let walker = WalkBuilder::new(&self.root)
                 .hidden(false)
                 .follow_links(false)
+                .parents(false)
+                .ignore(false)
+                .git_global(false)
+                .git_exclude(false)
                 .filter_entry(|entry| {
                     !entry.file_type().is_some_and(|t| t.is_dir())
                         || !entry
@@ -596,8 +617,9 @@ fn ingest(
     for abs in &event.paths {
         // Observe ignore-rule edits before any filtering: info/exclude lives
         // under `.git`, which the IGNORED_DIRS prefilter drops.
-        matcher.note_raw_change(abs);
-        let Some(rel) = relative_path(root, abs) else {
+        let rel = relative_path(root, abs);
+        matcher.note_raw_change(abs, rel.as_deref());
+        let Some(rel) = rel else {
             continue;
         };
         if rel.is_empty() {
