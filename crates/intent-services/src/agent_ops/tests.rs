@@ -16311,6 +16311,7 @@ async fn fake_provisioned_sandbox(
         branch: format!("sb/{}", aid.0),
         base_commit_sha: "abc123".to_string(),
         snapshot_commit_sha: None,
+        last_merged_commit_sha: None,
         status: intent_store::SandboxStatus::Created,
         retry_count: 0,
         created_at: now_iso(),
@@ -16414,6 +16415,34 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     assert!(
         session.sandbox_id.is_none() && session.sandbox_path.is_none(),
         "soft-deleted session must not gain sandbox fields"
+    );
+}
+
+#[tokio::test]
+async fn agent_delete_discards_persistent_sandbox() {
+    // Sandboxes persist across merges for the agent's lifetime; that lifetime
+    // ends at agent.delete — the directory and record must both go, before
+    // the FK cascade makes the path unreachable.
+    let (_t, svc, ws) = setup().await;
+    let aid = create_agent(&svc, &ws, "Sandboxed").await;
+    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    assert!(dir.exists(), "sandbox directory exists before delete");
+
+    svc.agent_delete_op(aid.clone(), None)
+        .await
+        .expect("agent delete");
+
+    assert!(
+        !dir.exists(),
+        "sandbox directory must be removed on agent delete"
+    );
+    assert!(
+        svc.store()
+            .get_sandbox(&ws, &aid)
+            .await
+            .expect("get sandbox")
+            .is_none(),
+        "sandbox record must be removed on agent delete"
     );
 }
 

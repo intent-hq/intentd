@@ -18,7 +18,7 @@
 //!   `sandbox:cow:created` event and session sandbox fields report the settled
 //!   outcome), and completion merges the sandbox back into the workspace
 //!   checkout (`sandbox:cow:merged` event, filesystem changes land, sandbox dir
-//!   discarded).
+//!   persists for the agent's next turn).
 //! - SLOW sandbox provisioning (test seam) never blocks `agent.delegate` —
 //!   the RPC returns promptly with `effectiveIsolation: "pending"` and the
 //!   gated child still spawns in the settled sandbox (monorepo#871).
@@ -697,8 +697,8 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
 /// reports the settled outcome), and when the
 /// child completes its turn the daemon auto-merges the sandbox back into the
 /// workspace checkout (`sandbox:cow:merged` event, the file written inside the
-/// sandbox lands in the checkout as a commit, and the sandbox directory is
-/// discarded).
+/// sandbox lands in the checkout as a commit, and the sandbox directory
+/// persists for the agent's next turn).
 #[tokio::test]
 async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     const TEST: &str = "agent.delegate CoW sandbox WSS e2e";
@@ -858,16 +858,11 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
         "merge advanced the canonical HEAD past the base"
     );
 
-    // Clean merge discards the sandbox directory.
-    for _ in 0..50 {
-        if !sandbox_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // Persistent lifecycle: a clean merge keeps the sandbox directory for
+    // the agent's next turn (discard happens on agent/workspace deletion).
     assert!(
-        !sandbox_path.exists(),
-        "sandbox directory discarded after a clean merge"
+        sandbox_path.exists(),
+        "sandbox directory persists after a clean merge"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1015,11 +1010,9 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     );
 
     // The child's first spawn was gated on settlement: its actual working
-    // directory is the fully-provisioned sandbox (mock `echoCwd` stamp). The
-    // sandbox dir may already be merged + discarded by the time the stamp is
-    // read (the mock turn completes fast), so compare against the
-    // symlink-resolved root (`/tmp` → `/private/tmp` on macOS) rather than
-    // canonicalizing the sandbox path itself.
+    // directory is the fully-provisioned sandbox (mock `echoCwd` stamp).
+    // Compare against the symlink-resolved root (`/tmp` → `/private/tmp` on
+    // macOS) rather than canonicalizing the sandbox path itself.
     let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
     let expected = std::fs::canonicalize(&root)
         .expect("scratch root exists")

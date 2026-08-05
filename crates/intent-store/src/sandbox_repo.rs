@@ -15,7 +15,8 @@ pub enum SandboxStatus {
     Created,
     /// Merge-back is in progress
     Merging,
-    /// Successfully merged to canonical and discarded
+    /// Successfully merged to canonical (sandbox persists for the agent's
+    /// lifetime; `last_merged_commit_sha` marks the merged tip)
     Merged,
     /// Discarded without merging
     Discarded,
@@ -65,6 +66,10 @@ pub struct Sandbox {
     pub branch: String,
     pub base_commit_sha: String,
     pub snapshot_commit_sha: Option<String>,
+    /// Tip of the last successfully merged range. Sandboxes persist across
+    /// turns (merge-on-completion no longer discards them), so repeat merges
+    /// start the next cherry-pick range here instead of base/snapshot.
+    pub last_merged_commit_sha: Option<String>,
     pub status: SandboxStatus,
     pub retry_count: i64,
     pub created_at: String,
@@ -72,13 +77,13 @@ pub struct Sandbox {
 }
 
 const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha, \
-    snapshot_commit_sha, status, retry_count, created_at, updated_at";
+    snapshot_commit_sha, last_merged_commit_sha, status, retry_count, created_at, updated_at";
 
 impl Store {
     /// Insert a new sandbox record.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
         let sql =
-            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id.0)
@@ -87,6 +92,7 @@ impl Store {
             .bind(&s.branch)
             .bind(&s.base_commit_sha)
             .bind(&s.snapshot_commit_sha)
+            .bind(&s.last_merged_commit_sha)
             .bind(s.status.to_db())
             .bind(s.retry_count)
             .bind(&s.created_at)
@@ -131,6 +137,32 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Record the tip of the last successfully merged range for a sandbox.
+    /// Persistent sandboxes merge repeatedly; the next merge cherry-picks
+    /// only commits after this SHA.
+    pub async fn set_sandbox_last_merged_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        last_merged_commit_sha: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sandbox SET last_merged_commit_sha = ?, updated_at = ? \
+             WHERE workspace_id = ? AND agent_id = ?",
+        )
+        .bind(last_merged_commit_sha)
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("set sandbox last merged commit failed: {e}"))
+        })?;
         Ok(())
     }
 
@@ -297,6 +329,11 @@ fn sandbox_from_row(row: &SqliteRow) -> Result<Sandbox> {
         })?,
         snapshot_commit_sha: row
             .try_get::<Option<String>, _>("snapshot_commit_sha")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty()),
+        last_merged_commit_sha: row
+            .try_get::<Option<String>, _>("last_merged_commit_sha")
             .ok()
             .flatten()
             .filter(|s| !s.is_empty()),

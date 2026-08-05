@@ -2293,6 +2293,20 @@ impl Services {
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
+            // Sandboxes persist for the agent's lifetime; that lifetime ends
+            // here. Discard BEFORE the session delete: the FK cascade removes
+            // the sandbox row with the session, and the directory path is
+            // only reachable through the record. Best-effort — a leaked
+            // directory must not fail the idempotent delete.
+            if let Err(e) =
+                crate::sandbox_ops::discard_sandbox(&self.store, session_ws, &agent_id).await
+            {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "failed to discard sandbox during agent delete"
+                );
+            }
             self.store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;

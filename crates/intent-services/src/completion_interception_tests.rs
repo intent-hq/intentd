@@ -330,16 +330,26 @@ mod tests {
         assert_eq!(merged_batch.len(), 1);
         assert_eq!(merged_batch[0].event_type, "sandbox:cow:merged");
 
-        // Assert: sandbox status is Merged
+        // Assert: sandbox persists (agent-lifetime lifecycle) with status
+        // Merged and the merged tip recorded for the next incremental merge.
         let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap();
-        assert!(sandbox.is_none(), "Sandbox should be discarded after merge");
+        let sandbox = sandbox.expect("Sandbox must persist after merge");
+        assert_eq!(sandbox.status, SandboxStatus::Merged);
+        assert!(
+            sandbox.last_merged_commit_sha.is_some(),
+            "Merged tip must be recorded for incremental repeat merges"
+        );
+        assert!(
+            sandbox_path.exists(),
+            "Sandbox directory must persist after merge"
+        );
 
-        // Assert: session sandbox linkage cleared with the discard — a later
-        // spawn must re-provision instead of reusing the deleted path.
+        // Assert: session sandbox linkage kept — the agent's next turn reuses
+        // the same sandbox.
         let session = store.get_agent_session(&child_id).await.unwrap();
         assert!(
-            session.sandbox_path.is_none() && session.sandbox_branch.is_none(),
-            "Session sandbox fields must be cleared after merge+discard"
+            session.sandbox_path.is_some() && session.sandbox_branch.is_some(),
+            "Session sandbox fields must persist after merge"
         );
 
         // Assert: agent commits are in canonical
@@ -892,9 +902,10 @@ mod tests {
         assert_eq!(summary.errors, 0);
         assert_eq!(summary.conflicts, 0);
 
-        // Sandbox discarded, commit landed in canonical, event emitted
+        // Sandbox persists as merged, commit landed in canonical, event emitted
         let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
-        assert!(sandbox.is_none(), "Sandbox should be discarded after merge");
+        let sandbox = sandbox.expect("Sandbox must persist after merge");
+        assert_eq!(sandbox.status, SandboxStatus::Merged);
         assert!(
             repo_path.join("swept.txt").exists(),
             "Swept commit should land in canonical"

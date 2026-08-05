@@ -3452,9 +3452,11 @@ impl Services {
             MergeOutcome::Merged {
                 commit_range,
                 canonical_head,
+                ..
             } => {
-                // Success! Shared bookkeeping: mark merged, discard sandbox,
-                // emit sandbox:cow:merged, clear retry count.
+                // Success! Shared bookkeeping: mark merged, emit
+                // sandbox:cow:merged, clear retry count. The sandbox
+                // persists for the agent's next turn.
                 self.finalize_sandbox_merged(
                     workspace_id,
                     agent_id,
@@ -3676,10 +3678,12 @@ impl Services {
 
     /// Shared success bookkeeping for a merged sandbox, used by every
     /// merge-back caller (completion interception, the `sandbox.cow.merge` RPC,
-    /// and the background retry sweep): mark the record `merged`, discard
-    /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
-    /// retry count. All store failures are logged and swallowed — the merge
-    /// itself already landed in canonical.
+    /// and the background retry sweep): mark the record `merged`, emit
+    /// `sandbox:cow:merged`, and clear the retry count. The sandbox directory
+    /// and record are NOT discarded — sandboxes are persistent for the agent's
+    /// lifetime (the agent keeps working in the same sandbox across turns;
+    /// cleanup happens on agent/workspace deletion). All store failures are
+    /// logged and swallowed — the merge itself already landed in canonical.
     pub(crate) async fn finalize_sandbox_merged(
         &self,
         workspace_id: &WorkspaceId,
@@ -3693,16 +3697,6 @@ impl Services {
             .store
             .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merged, &now_iso())
             .await;
-
-        if let Err(e) =
-            crate::sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
-        {
-            tracing::warn!(
-                agent = %agent_id.0,
-                error = %e,
-                "failed to discard sandbox after successful merge"
-            );
-        }
 
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -3909,6 +3903,7 @@ impl Services {
                 Ok(MergeOutcome::Merged {
                     commit_range,
                     canonical_head,
+                    ..
                 }) => {
                     self.finalize_sandbox_merged(
                         &workspace_id,
@@ -17400,9 +17395,11 @@ impl WorkspaceApi for Services {
                 MergeOutcome::Merged {
                     commit_range,
                     canonical_head,
+                    ..
                 } => {
-                    // Shared bookkeeping: mark merged, discard sandbox, emit
-                    // sandbox:cow:merged, clear retry count.
+                    // Shared bookkeeping: mark merged, emit
+                    // sandbox:cow:merged, clear retry count. The sandbox
+                    // persists (agent-lifetime lifecycle).
                     self.finalize_sandbox_merged(
                         &workspace_id,
                         &sandbox_id,
