@@ -6,6 +6,22 @@
 //! instead — PowerShell first (`pwsh`, then `powershell`), then `%COMSPEC%`,
 //! then `cmd.exe` — so daemon-spawned shells never point at `/bin/sh`.
 
+/// Inherited launcher environment variables removed from daemon-spawned PTY children.
+/// `npm_config_prefix` is set by the app launcher and makes nvm abort shell
+/// initialization. Explicit environment overlay keys are preserved so user input wins.
+pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
+
+/// Build an environment-removal list for [`intent_pty::SpawnSpec`], excluding
+/// keys present in the explicit environment overlay.
+pub(crate) fn scrubbed_env_vars_except(overlay: &[(String, String)]) -> Vec<String> {
+    SCRUBBED_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| !overlay.iter().any(|(key, _)| key.as_str() == *name))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The default shell for daemon-spawned terminals and scripts, resolved from
 /// the host platform and environment.
 pub(crate) fn default_shell() -> String {
@@ -83,6 +99,21 @@ mod tests {
         assert_eq!(
             default_shell_for(true, Some("/bin/zsh"), None, never),
             "cmd.exe"
+        );
+    }
+
+    #[test]
+    fn scrubbed_env_removes_only_inherited_launcher_values() {
+        assert_eq!(
+            scrubbed_env_vars_except(&[]),
+            ["npm_config_prefix"],
+            "an omitted overlay still scrubs inherited launcher state"
+        );
+
+        let overlay = vec![("npm_config_prefix".to_string(), "/custom".to_string())];
+        assert!(
+            scrubbed_env_vars_except(&overlay).is_empty(),
+            "an explicit overlay value must win"
         );
     }
 }
