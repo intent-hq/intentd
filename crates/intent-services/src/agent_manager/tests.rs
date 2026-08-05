@@ -7962,10 +7962,14 @@ mod merge_user_mcp_servers_tests {
 
     /// The opencode env config carries the same `workspace-mcp` bridge entry
     /// (in OpenCode `mcp` block shape) that the auggie `--mcp-config` path
-    /// generates, pointing at the same bridge endpoint.
+    /// generates, pointing at the same bridge endpoint. The bridge exe is
+    /// pinned to a space-free absolute path so the expectation does not
+    /// depend on whether the host checkout path contains whitespace
+    /// (monorepo#1367).
     #[tokio::test]
     async fn opencode_env_mcp_config_includes_bridge_server() {
         let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/usr/local/bin/intentd");
         let json = mgr
             .opencode_env_mcp_config("127.0.0.1:9999".to_string())
             .await
@@ -7982,9 +7986,43 @@ mod merge_user_mcp_servers_tests {
             "bridge args must match the auggie --mcp-config path"
         );
         assert_eq!(
-            command[0],
-            mgr.mcp_bridge_exe.to_string_lossy(),
-            "bridge command must be the daemon's mcp-bridge executable"
+            command[0], "/usr/local/bin/intentd",
+            "space-free bridge exe stays absolute in the opencode command"
+        );
+    }
+
+    /// monorepo#1367 — the opencode env config applies the same monorepo#1049
+    /// normalization as `normalized_mcp_servers`: a whitespace-containing
+    /// bridge path collapses to the executable basename and the entry's
+    /// environment carries a PATH that prepends the parent dir to the
+    /// inherited PATH.
+    #[tokio::test]
+    async fn opencode_env_mcp_config_normalizes_spaced_bridge_path() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let mgr = mgr.with_mcp_bridge_exe("/opt/App Support/bin/intentd");
+        let json = mgr
+            .opencode_env_mcp_config("127.0.0.1:9999".to_string())
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let bridge = &parsed["workspace-mcp"];
+        let command: Vec<String> =
+            serde_json::from_value(bridge["command"].clone()).expect("command array");
+        assert_eq!(
+            command[0], "intentd",
+            "spaced path collapses to the basename"
+        );
+        assert_eq!(&command[1..], ["mcp-bridge", "--connect", "127.0.0.1:9999"]);
+        let inherited = std::env::var("PATH").expect("test process has PATH");
+        let expected = std::env::join_paths(
+            std::iter::once(std::path::PathBuf::from("/opt/App Support/bin"))
+                .chain(std::env::split_paths(&inherited)),
+        )
+        .unwrap();
+        assert_eq!(
+            bridge["environment"]["PATH"],
+            serde_json::json!(expected.to_string_lossy()),
+            "entry PATH prepends the parent dir to the inherited PATH"
         );
     }
 
