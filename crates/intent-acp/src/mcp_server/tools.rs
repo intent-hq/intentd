@@ -216,6 +216,7 @@ API:
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars). Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
+  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, commitRange?, canonicalHead?, conflictingPaths?, reason?, overlappingPaths?, dirtyPaths? }  // Manually merge a sandboxed agent's work back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). `status`: `"merged"` (with `commitRange`), `"conflict"` (with `conflictingPaths`), `"blocked"` (with `reason` + `overlappingPaths`), or `"dirty"` (uncommitted sandbox changes with workspace auto-commit off; `dirtyPaths`). Errors if the agent has no sandbox or a merge is already in progress.
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
@@ -442,6 +443,7 @@ API:
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
+  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, commitRange?, canonicalHead?, conflictingPaths?, reason?, overlappingPaths?, dirtyPaths? }  // Manually merge a sandboxed agent's work back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). `status`: `"merged"` (with `commitRange`), `"conflict"` (with `conflictingPaths`), `"blocked"` (with `reason` + `overlappingPaths`), or `"dirty"` (uncommitted sandbox changes with workspace auto-commit off; `dirtyPaths`). Errors if the agent has no sandbox or a merge is already in progress.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
@@ -612,6 +614,7 @@ const SANDBOX_LIST_FIELDS_XREF: &str =
     " Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.";
 const SANDBOX_STATUS_FIELDS_XREF: &str =
     " Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).";
+const SANDBOX_MERGE_SANDBOX_DOC_LINE: &str = "  ws.agent.mergeSandbox(agentId) → { ok, agentId, status, commitRange?, canonicalHead?, conflictingPaths?, reason?, overlappingPaths?, dirtyPaths? }  // Manually merge a sandboxed agent's work back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). `status`: `\"merged\"` (with `commitRange`), `\"conflict\"` (with `conflictingPaths`), `\"blocked\"` (with `reason` + `overlappingPaths`), or `\"dirty\"` (uncommitted sandbox changes with workspace auto-commit off; `dirtyPaths`). Errors if the agent has no sandbox or a merge is already in progress.\n";
 
 /// The base variant's cross-references to `ws.host.exec` inside the
 /// `ws.hook.*` docs (the Namespaces index hint and the `ws.hook.schedule`
@@ -717,6 +720,7 @@ pub fn workspace_api_description(
         out = out.replacen(SANDBOX_DELEGATE_MERGE_ARG, "", 1);
         out = out.replacen(SANDBOX_LIST_FIELDS_XREF, "", 1);
         out = out.replacen(SANDBOX_STATUS_FIELDS_XREF, "", 1);
+        out = out.replacen(SANDBOX_MERGE_SANDBOX_DOC_LINE, "", 1);
     }
     // Cross-reference scrub for `hostExec`: the surviving `ws.hook.*` index
     // hint and `ws.hook.schedule` doc line name `ws.host.exec` as callable
@@ -1611,6 +1615,7 @@ mod tests {
             assert!(desc.contains(super::SANDBOX_DELEGATE_MERGE_ARG));
             assert!(desc.contains(super::SANDBOX_LIST_FIELDS_XREF));
             assert!(desc.contains(super::SANDBOX_STATUS_FIELDS_XREF));
+            assert!(desc.contains(super::SANDBOX_MERGE_SANDBOX_DOC_LINE));
         }
     }
 
@@ -1633,6 +1638,10 @@ mod tests {
             assert!(
                 !pruned.contains("sandboxStatus") && !pruned.contains("sandboxId"),
                 "chief={is_chief}: sandbox field docs must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("ws.agent.mergeSandbox"),
+                "chief={is_chief}: mergeSandbox doc line must be scrubbed when not CoW-capable"
             );
             for kept in [
                 "ws.agent.create(",

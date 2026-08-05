@@ -1,7 +1,7 @@
 //! Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
 //! CoW-checkout workspaces).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
@@ -90,6 +90,25 @@ pub enum MergeOutcome {
         reason: String,
         overlapping_paths: Vec<String>,
     },
+    /// The sandbox worktree has uncommitted changes and the caller's policy
+    /// forbids auto-committing them ([`DirtyHandling::Bounce`] — workspace
+    /// auto-commit is off on an automatic merge path): nothing was committed
+    /// or merged, and the sandbox is untouched.
+    Dirty { dirty_paths: Vec<String> },
+}
+
+/// How [`merge_sandbox`] treats uncommitted changes in the sandbox worktree.
+/// Callers resolve this against the workspace's effective auto-commit policy
+/// (see `Services::sandbox_dirty_handling`).
+#[derive(Debug, Clone)]
+pub enum DirtyHandling {
+    /// Commit the dirty state before merging, using the given message when
+    /// present (LLM-assisted) or the deterministic
+    /// `Auto-commit dirty state for <agentId>` default.
+    Commit(Option<String>),
+    /// Refuse to merge a dirty sandbox: return [`MergeOutcome::Dirty`]
+    /// without committing or merging anything.
+    Bounce,
 }
 
 /// Configuration for sandbox provisioning.
@@ -469,9 +488,25 @@ pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Merge sandbox commits back to the canonical repository, auto-committing
+/// any dirty sandbox state with the deterministic default message. See
+/// [`merge_sandbox_with`] for the policy-aware variant (all production
+/// callers thread the workspace's auto-commit policy through it; this
+/// shorthand serves the unit tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn merge_sandbox(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<MergeOutcome> {
+    merge_sandbox_with(store, workspace_id, agent_id, DirtyHandling::Commit(None)).await
+}
+
 /// Merge sandbox commits back to the canonical repository.
 ///
-/// 1. Auto-commit any dirty sandbox state (if present).
+/// 1. Handle dirty sandbox state per `dirty_handling`: commit it (with the
+///    provided message or the deterministic default), or return
+///    [`MergeOutcome::Dirty`] without touching anything (`Bounce`).
 /// 2. Check canonical repository for dirty state overlapping with sandbox changes.
 /// 3. Fetch sandbox branch into canonical.
 /// 4. Apply commits after the snapshot (or base if no snapshot) via cherry-pick.
@@ -480,10 +515,11 @@ pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
 /// 7. On success: return Merged with the applied range.
 ///
 /// The canonical repository is never left mid-merge/cherry-pick (always abort on failure).
-pub async fn merge_sandbox(
+pub async fn merge_sandbox_with(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
+    dirty_handling: DirtyHandling,
 ) -> Result<MergeOutcome> {
     // Load sandbox record
     let sandbox = store
@@ -505,8 +541,20 @@ pub async fn merge_sandbox(
         let sandbox_repo = git2::Repository::open(&sandbox_path)
             .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
 
-        // Auto-commit any dirty sandbox state (preserving agent attribution)
+        // Handle dirty sandbox state per the caller's policy: commit it
+        // (preserving agent attribution) or refuse the merge outright.
         if is_dirty(&sandbox_repo)? {
+            let message = match &dirty_handling {
+                DirtyHandling::Bounce => {
+                    return Ok(MergeOutcome::Dirty {
+                        dirty_paths: get_changed_files(&sandbox_repo)?,
+                    });
+                }
+                DirtyHandling::Commit(Some(msg)) => msg.clone(),
+                DirtyHandling::Commit(None) => {
+                    format!("Auto-commit dirty state for {}", agent_id.0)
+                }
+            };
             let sig = sandbox_repo
                 .signature()
                 .map_err(|e| Error::Internal(format!("get sandbox signature failed: {e}")))?;
@@ -532,14 +580,7 @@ pub async fn merge_sandbox(
                 .peel_to_commit()
                 .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
             sandbox_repo
-                .commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &format!("Auto-commit dirty state for {}", agent_id.0),
-                    &tree,
-                    &[&parent],
-                )
+                .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
                 .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
         }
 
@@ -985,6 +1026,15 @@ fn restore_missing_tracked_files(
     repo.checkout_index(None, Some(&mut opts))
         .map_err(|e| Error::Internal(format!("restore missing tracked files failed: {e}")))?;
     Ok(())
+}
+
+/// Check if the repository at `path` has uncommitted changes (staged,
+/// unstaged, or untracked). Path-based wrapper over [`is_dirty`] for callers
+/// outside this module (the completion path's dirty-state pre-check).
+pub fn worktree_is_dirty(path: &Path) -> Result<bool> {
+    let repo = git2::Repository::open(path)
+        .map_err(|e| Error::Internal(format!("open repo failed: {e}")))?;
+    is_dirty(&repo)
 }
 
 /// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).

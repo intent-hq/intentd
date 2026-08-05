@@ -318,6 +318,17 @@ mod tests {
             !parent_user_messages.is_empty(),
             "Parent should have received a wake message on clean merge"
         );
+        assert!(
+            parent_user_messages.iter().any(|m| m
+                .content
+                .to_string()
+                .contains("Sandbox merged into the workspace repo")),
+            "Wake must carry the merged-sandbox annotation: {:?}",
+            parent_user_messages
+                .iter()
+                .map(|m| m.content.to_string())
+                .collect::<Vec<_>>()
+        );
 
         // Assert: sandbox:cow:merged event was emitted
         let merged_event =
@@ -1212,11 +1223,22 @@ mod tests {
         let event = completion_event(&ws.id, &child_id);
         services.handle_completion_event(&event).await;
 
-        // Completion propagated to the parent.
+        // Completion propagated to the parent, annotated with the unmerged
+        // sandbox outcome (status + path).
         let parent_messages = store.get_agent_messages(&parent_id, None).await.unwrap();
         assert!(
             parent_messages.iter().any(|m| m.role == "user"),
             "Parent should have received a wake message despite the skipped merge"
+        );
+        assert!(
+            parent_messages
+                .iter()
+                .filter(|m| m.role == "user")
+                .any(|m| {
+                    let text = m.content.to_string();
+                    text.contains("Sandbox left unmerged") && text.contains("ws.agent.mergeSandbox")
+                }),
+            "Wake must carry the unmerged-sandbox annotation"
         );
 
         // No merge happened: canonical untouched, sandbox intact & Created.
@@ -1356,6 +1378,267 @@ mod tests {
         let summary = services.sweep_merge_pending_sandboxes().await;
         assert_eq!(summary.merged, 1, "Recovered sandbox merges on next sweep");
         assert!(repo_path.join("swept.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    /// Provision a sandbox whose worktree is left DIRTY (an uncommitted
+    /// file), with a parent watching the child. `providers.active` is pinned
+    /// off-auggie so the LLM commit-message generation short-circuits and
+    /// the deterministic fallback subject is used.
+    async fn setup_dirty_sandbox(
+        store: &Store,
+        name: &str,
+        child_id: &AgentId,
+        parent_id: &AgentId,
+    ) -> Option<(
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        intent_core::Workspace,
+        Services,
+        EventBus,
+    )> {
+        let (test_root, repo_path) = temp_repo_in_target(name);
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return None;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        store
+            .set_setting("providers.active", "\"claude\"")
+            .await
+            .unwrap();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        create_agent_session(store, &ws.id, child_id, Some(parent_id), None).await;
+        let outcome = provision_sandbox(store, &ws.id, child_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(child_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", child_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        create_agent_session(store, &ws.id, parent_id, None, None).await;
+
+        // Leave the sandbox worktree DIRTY: an uncommitted file.
+        fs::write(sandbox_path.join("dirty.txt"), "uncommitted work").unwrap();
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root);
+
+        Some((test_root, repo_path, sandbox_path, ws, services, bus))
+    }
+
+    #[tokio::test]
+    async fn test_dirty_sandbox_auto_commit_on_commits_and_merges() {
+        // Auto-commit ON (default): a dirty sandbox at turn end is committed
+        // (fallback subject; LLM unavailable) and merged — completion
+        // propagates with the merged annotation and canonical has the file.
+
+        let (store, _db) = temp_store().await;
+        let child_id = AgentId::from("agent-dirty-on");
+        let parent_id = AgentId::from("agent-parent");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, bus)) =
+            setup_dirty_sandbox(&store, "dirty-ac-on", &child_id, &parent_id).await
+        else {
+            return;
+        };
+
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                None,
+            )
+            .expect("register watch");
+        let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
+
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+
+        // Merged: canonical has the previously-uncommitted file.
+        assert!(
+            repo_path.join("dirty.txt").exists(),
+            "Dirty sandbox state must be committed and merged when auto-commit is on"
+        );
+        let merged_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
+        assert!(merged_event.is_ok(), "sandbox:cow:merged must be emitted");
+
+        // Completion propagated with the merged annotation.
+        let parent_messages = store.get_agent_messages(&parent_id, None).await.unwrap();
+        assert!(
+            parent_messages
+                .iter()
+                .filter(|m| m.role == "user")
+                .any(|m| m.content.to_string().contains("Sandbox merged")),
+            "Parent wake must carry the merged annotation"
+        );
+
+        // No bounce message to the child.
+        let messages = store.get_agent_messages(&child_id, None).await.unwrap();
+        assert!(
+            !messages.iter().any(|m| m.role == "user"),
+            "No bounce message on a successful dirty-commit merge"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_dirty_sandbox_auto_commit_off_bounces_agent() {
+        // Auto-commit OFF + dirty sandbox at turn end: no snapshot, no merge,
+        // and the turn must NOT complete — the child is bounced with commit
+        // instructions, the parent hears nothing, canonical stays untouched.
+
+        let (store, _db) = temp_store().await;
+        let child_id = AgentId::from("agent-dirty-off");
+        let parent_id = AgentId::from("agent-parent");
+        let Some((test_root, repo_path, sandbox_path, ws, services, bus)) =
+            setup_dirty_sandbox(&store, "dirty-ac-off", &child_id, &parent_id).await
+        else {
+            return;
+        };
+        store
+            .set_workspace_auto_commit(&ws.id, false)
+            .await
+            .unwrap();
+
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                None,
+            )
+            .expect("register watch");
+        let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
+
+        let sandbox_before = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+
+        // Nothing was committed or merged.
+        assert!(
+            !repo_path.join("dirty.txt").exists(),
+            "Canonical must stay untouched when auto-commit is off"
+        );
+        assert!(
+            sandbox_path.join("dirty.txt").exists(),
+            "Dirty file must remain uncommitted in the sandbox"
+        );
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        let head_message = sandbox_repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .message()
+            .unwrap()
+            .to_string();
+        assert!(
+            !head_message.contains("Auto-commit"),
+            "No snapshot commit may be created when auto-commit is off"
+        );
+        let merged_event =
+            tokio::time::timeout(std::time::Duration::from_millis(300), merged_sub.recv()).await;
+        assert!(merged_event.is_err(), "No sandbox:cow:merged event");
+
+        // Completion suppressed: parent got nothing.
+        let parent_messages = store.get_agent_messages(&parent_id, None).await.unwrap();
+        assert!(
+            !parent_messages.iter().any(|m| m.role == "user"),
+            "Completion must NOT propagate while the sandbox is dirty"
+        );
+
+        // The child was bounced with commit instructions.
+        let messages = store.get_agent_messages(&child_id, None).await.unwrap();
+        let user_messages: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_messages.len(), 1, "Exactly one bounce message");
+        let text = user_messages[0].content.to_string();
+        assert!(
+            text.contains("uncommitted changes") && text.contains("dirty.txt"),
+            "Bounce must name the dirty paths: {text}"
+        );
+
+        // Sandbox returned to its pre-claim status; no conflict retry consumed.
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status, sandbox_before.status,
+            "Sandbox must return to its pre-claim status after a dirty bounce"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_manual_merge_reports_dirty_when_auto_commit_off() {
+        // The manual sandbox.cow.merge RPC (ws.agent.mergeSandbox) on a dirty
+        // sandbox with auto-commit off: status "dirty" with the paths; nothing
+        // committed or merged.
+
+        use intent_core::WorkspaceApi;
+
+        let (store, _db) = temp_store().await;
+        let child_id = AgentId::from("agent-dirty-rpc");
+        let parent_id = AgentId::from("agent-parent");
+        let Some((test_root, repo_path, sandbox_path, ws, services, _bus)) =
+            setup_dirty_sandbox(&store, "dirty-rpc", &child_id, &parent_id).await
+        else {
+            return;
+        };
+        store
+            .set_workspace_auto_commit(&ws.id, false)
+            .await
+            .unwrap();
+
+        let sandbox_before = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        let result = services
+            .sandbox_merge(ws.id.clone(), child_id.clone())
+            .await
+            .expect("dirty merge must be a typed result, not an error");
+        assert_eq!(result["status"], json!("dirty"));
+        assert!(
+            result["dirtyPaths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str().unwrap().contains("dirty.txt")),
+            "dirtyPaths must name the uncommitted file: {result}"
+        );
+
+        assert!(!repo_path.join("dirty.txt").exists());
+        assert!(sandbox_path.join("dirty.txt").exists());
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status, sandbox_before.status,
+            "Sandbox must return to its pre-claim status"
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }

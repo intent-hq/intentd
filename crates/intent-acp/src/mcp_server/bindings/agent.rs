@@ -48,6 +48,7 @@ pub(crate) const PRELUDE: &str = r#"
         list: (includeCompleted) =>
             host({ method: 'agent.list', args: { includeCompleted } }),
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
+        mergeSandbox: (agentId) => host({ method: 'agent.mergeSandbox', args: { agentId } }),
         getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
         removeQueuedMessage: (agentId, messageId) =>
             host({ method: 'agent.removeQueuedMessage', args: { agentId, messageId } }),
@@ -104,6 +105,7 @@ pub(crate) async fn dispatch(
         "unwatch" => unwatch(api, ws, caller, args).await,
         "list" => list(api, ws).await,
         "status" => status(api, ws, args).await,
+        "mergeSandbox" => merge_sandbox(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
         "diagnostics" => diagnostics(api, ws, args).await,
@@ -526,6 +528,40 @@ async fn status(
                 }
             }
         }
+    }
+    Ok(out)
+}
+
+/// `ws.agent.mergeSandbox(agentId)`: manually trigger a sandbox merge-back
+/// for a sandboxed agent — the MCP face of the `sandbox.cow.merge` RPC. The
+/// primary consumer is a parent that delegated with `mergeOnTurnEnd: false`
+/// and now wants the child's work in the workspace repo. The result carries
+/// `status`: `"merged"` (with `commitRange` + `canonicalHead`), `"conflict"`
+/// (with `conflictingPaths`), `"blocked"` (with `reason` +
+/// `overlappingPaths`), or `"dirty"` (uncommitted sandbox changes with
+/// workspace auto-commit off; `dirtyPaths`). Errors surface for a missing
+/// sandbox or a merge already in progress.
+async fn merge_sandbox(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    // Workspace scoping: the target must resolve inside the caller's
+    // workspace before any merge is attempted (same defense-in-depth as
+    // getQueue/removeQueuedMessage).
+    let _ = api
+        .agent_get(agent_id.clone(), Some(ws.clone()))
+        .await
+        .map_err(map_err)?;
+    let v = api
+        .sandbox_merge(ws.clone(), agent_id)
+        .await
+        .map_err(map_err)?;
+    let mut out = merge_ok(v);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("agentId".to_string(), json!(agent_id_str));
     }
     Ok(out)
 }

@@ -2761,23 +2761,49 @@ impl Services {
         let child = AgentId::from(child_id.as_str());
 
         // BEFORE waking the coordinator: if this is a sandboxed agent completion,
-        // attempt the merge-back. On clean merge, proceed normally. On conflict,
-        // suppress completion propagation and bounce the agent. On blocked or
-        // retry-exhausted, propagate with merge-pending status.
+        // attempt the merge-back. On clean merge, proceed normally. On conflict
+        // (or an uncommitted sandbox with auto-commit off), suppress completion
+        // propagation and bounce the agent. On blocked or retry-exhausted,
+        // propagate with merge-pending status. Propagated completions carry the
+        // merge outcome on the event data (`sandboxMergeStatus` + `sandboxPath`
+        // + `sandboxCommitRange`) so the parent's wake names where the work is.
+        let mut sandbox_annotated: Option<Event> = None;
         if event.event_type == AGENT_IDLE {
             if let Ok(session) = self.store.get_agent_session(&child).await {
                 if session.sandbox_path.is_some() {
-                    let should_propagate = self
+                    let disposition = self
                         .handle_sandbox_merge_on_completion(&event.workspace_id, &child, &session)
                         .await;
-                    if !should_propagate {
-                        // Conflict bounce: agent was woken with instructions; do NOT
+                    if !disposition.propagate {
+                        // Bounce: agent was woken with instructions; do NOT
                         // wake coordinator yet. The agent's next completion will retry.
                         return;
+                    }
+                    if disposition.merge_status.is_some() {
+                        let mut e = event.clone();
+                        if let Some(obj) = e.data.as_object_mut() {
+                            if let Some(status) = disposition.merge_status {
+                                obj.insert(
+                                    "sandboxMergeStatus".to_string(),
+                                    serde_json::json!(status),
+                                );
+                            }
+                            if let Some(path) = &session.sandbox_path {
+                                obj.insert("sandboxPath".to_string(), serde_json::json!(path));
+                            }
+                            if let Some(range) = &disposition.commit_range {
+                                obj.insert(
+                                    "sandboxCommitRange".to_string(),
+                                    serde_json::json!(range),
+                                );
+                            }
+                        }
+                        sandbox_annotated = Some(e);
                     }
                 }
             }
         }
+        let event = sandbox_annotated.as_ref().unwrap_or(event);
 
         let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
@@ -3545,16 +3571,21 @@ impl Services {
             .await;
     }
 
-    /// Handle sandbox merge-back on agent completion.
-    /// Returns `true` if completion should propagate normally (clean merge or blocked/retry-exhausted).
-    /// Returns `false` if completion was suppressed (conflict bounce).
+    /// Handle sandbox merge-back on agent completion (see
+    /// [`SandboxMergeDisposition`]). The returned
+    /// disposition says whether the completion should propagate
+    /// (`propagate: false` = the agent was bounced — conflict, or an
+    /// uncommitted sandbox with auto-commit off) and, when it does, which
+    /// merge outcome to annotate onto the completion event
+    /// (`sandboxMergeStatus`: `"merged"` / `"merge_pending"` / `"unmerged"`,
+    /// plus `sandboxCommitRange` on a clean merge).
     async fn handle_sandbox_merge_on_completion(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         session: &AgentSession,
-    ) -> bool {
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+    ) -> SandboxMergeDisposition {
+        use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
         use intent_store::SandboxStatus;
 
         // Load sandbox record
@@ -3565,7 +3596,7 @@ impl Services {
                     agent = %agent_id.0,
                     "agent has sandbox_path but no sandbox record; skipping merge"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
             Err(e) => {
                 tracing::error!(
@@ -3573,22 +3604,24 @@ impl Services {
                     error = %e,
                     "failed to load sandbox record; propagating completion"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
         };
 
         // Parent opted out of turn-end merges (`mergeOnTurnEnd: false`):
         // skip the merge entirely — no status transition, no bounce — and
         // propagate completion normally. The sandbox stays live in its
-        // current status; the manual `sandbox.cow.merge` RPC is the way to
-        // merge later, and the retry sweep skips these sandboxes too.
+        // current status; `ws.agent.mergeSandbox` / the `sandbox.cow.merge`
+        // RPC is the way to merge later, and the retry sweep skips these
+        // sandboxes too. The parent still learns the work is unmerged from
+        // the completion annotation.
         if !sandbox.merge_on_turn_end {
             tracing::info!(
                 agent = %agent_id.0,
                 sandbox = %sandbox.id,
                 "sandbox has mergeOnTurnEnd=false; skipping turn-end merge"
             );
-            return true;
+            return SandboxMergeDisposition::propagate_with("unmerged");
         }
 
         // Check retry count (cap at 2 bounces)
@@ -3605,7 +3638,7 @@ impl Services {
                 agent = %agent_id.0,
                 "sandbox merge already in progress; propagating completion without merging"
             );
-            return true;
+            return SandboxMergeDisposition::propagate_silent();
         }
         match self
             .store
@@ -3624,7 +3657,7 @@ impl Services {
                     agent = %agent_id.0,
                     "sandbox claimed by another merge path; propagating completion without merging"
                 );
-                return true;
+                return SandboxMergeDisposition::propagate_silent();
             }
             Err(e) => {
                 tracing::error!(
@@ -3635,28 +3668,42 @@ impl Services {
             }
         }
 
-        // Attempt merge
-        let outcome = match merge_sandbox(&self.store, workspace_id, agent_id).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::error!(
-                    agent = %agent_id.0,
-                    error = %e,
-                    "sandbox merge failed with error; marking merge-pending"
-                );
-                let _ = self
-                    .store
-                    .update_sandbox_status(
-                        workspace_id,
-                        agent_id,
-                        SandboxStatus::MergePending,
-                        &now_iso(),
-                    )
-                    .await;
-                // Propagate completion with error status
-                return true;
-            }
+        // Turn-end dirty-state policy: with the workspace's effective
+        // auto-commit ON, generate an LLM-assisted commit message for the
+        // uncommitted sandbox state (deterministic fallback inside); with it
+        // OFF, refuse to commit — `DirtyHandling::Bounce` makes the merge
+        // return `Dirty` without snapshotting or merging anything.
+        let auto_commit = self.effective_auto_commit(workspace_id).await;
+        let dirty_handling = if auto_commit {
+            let message = self.sandbox_dirty_commit_message(agent_id, session).await;
+            DirtyHandling::Commit(message)
+        } else {
+            DirtyHandling::Bounce
         };
+
+        // Attempt merge
+        let outcome =
+            match merge_sandbox_with(&self.store, workspace_id, agent_id, dirty_handling).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "sandbox merge failed with error; marking merge-pending"
+                    );
+                    let _ = self
+                        .store
+                        .update_sandbox_status(
+                            workspace_id,
+                            agent_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    // Propagate completion with error status
+                    return SandboxMergeDisposition::propagate_with("merge_pending");
+                }
+            };
 
         match outcome {
             MergeOutcome::Merged {
@@ -3676,7 +3723,11 @@ impl Services {
                 .await;
 
                 // Propagate completion normally
-                true
+                SandboxMergeDisposition {
+                    propagate: true,
+                    merge_status: Some("merged"),
+                    commit_range: Some(commit_range),
+                }
             }
             MergeOutcome::Conflict {
                 conflicting_paths,
@@ -3702,7 +3753,7 @@ impl Services {
                     );
 
                     self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-                    return true;
+                    return SandboxMergeDisposition::propagate_with("merge_pending");
                 }
 
                 // Bounce: update status, increment retry, fetch canonical, wake agent
@@ -3743,7 +3794,7 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
-                    return true;
+                    return SandboxMergeDisposition::propagate_with("merge_pending");
                 }
 
                 // Wake agent with conflict instructions
@@ -3791,7 +3842,7 @@ impl Services {
                 );
 
                 // Suppress completion propagation
-                false
+                SandboxMergeDisposition::bounce()
             }
             MergeOutcome::Blocked {
                 reason,
@@ -3818,8 +3869,96 @@ impl Services {
                 self.clear_sandbox_retry_count(workspace_id, agent_id).await;
 
                 // Propagate completion (coordinator/user will see merge-pending status)
-                true
+                SandboxMergeDisposition::propagate_with("merge_pending")
             }
+            MergeOutcome::Dirty { dirty_paths } => {
+                // Auto-commit is OFF and the sandbox worktree has uncommitted
+                // changes: nothing was committed or merged. Return the
+                // sandbox to its pre-claim status and bounce the agent — the
+                // turn must NOT complete while the work is neither committed
+                // nor merged. The bounce does not consume a conflict retry
+                // (nothing conflicted); the agent commits and re-completes.
+                let _ = self
+                    .store
+                    .update_sandbox_status(workspace_id, agent_id, sandbox.status, &now_iso())
+                    .await;
+
+                let message = format!(
+                    "⚠️ Your sandbox has uncommitted changes and this workspace has auto-commit \
+                     disabled, so your work cannot be merged back automatically.\n\n\
+                     **Uncommitted paths:**\n- {}\n\n\
+                     **Instructions:**\n\
+                     1. Commit your work in the sandbox: `git add <files> && git commit`\n\
+                     2. Use scoped, meaningful commits — auto-commit is off because commits are curated here\n\
+                     3. End your turn when done - the system will retry the merge\n\n\
+                     You are working in an isolated sandbox at: `{}`",
+                    dirty_paths.join("\n- "),
+                    session.sandbox_path.as_deref().unwrap_or("<unknown>"),
+                );
+
+                if let Err(e) = self
+                    .agent_send_message_op(
+                        agent_id.clone(),
+                        message,
+                        None, // messageId
+                        None, // imageBlocks
+                        None, // fileBlocks
+                        None, // messageMetadata
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "failed to send dirty-sandbox bounce message to agent"
+                    );
+                }
+
+                tracing::info!(
+                    agent = %agent_id.0,
+                    paths = ?dirty_paths,
+                    "dirty sandbox with auto-commit off; agent bounced to commit its work"
+                );
+
+                SandboxMergeDisposition::bounce()
+            }
+        }
+    }
+
+    /// Best-effort LLM-assisted commit message for a dirty sandbox worktree
+    /// at turn-end merge time (auto-commit ON). Reuses the LNI-1 generation
+    /// pipeline pointed at the SANDBOX path (diff, recent subjects, AGENTS.md,
+    /// task/agent hints). `None` falls through to `merge_sandbox_with`'s
+    /// deterministic default message.
+    async fn sandbox_dirty_commit_message(
+        &self,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) -> Option<String> {
+        let sandbox_path = std::path::PathBuf::from(session.sandbox_path.as_deref()?);
+        // Cheap pre-check: skip generation (an LLM round-trip) when clean.
+        match crate::sandbox_ops::worktree_is_dirty(&sandbox_path) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "sandbox dirty pre-check failed; skipping message generation"
+                );
+                return None;
+            }
+        }
+        let linked_note_id = session.task_note_id.clone();
+        match self
+            .generate_auto_commit_message(&sandbox_path, session, &linked_note_id)
+            .await
+        {
+            Some(msg) => Some(msg),
+            None => Some(
+                self.build_auto_commit_subject(session, &linked_note_id)
+                    .await,
+            ),
         }
     }
 
@@ -4024,7 +4163,7 @@ impl Services {
     /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
     ///   returned to `merge_pending`.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+        use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
         use intent_store::SandboxStatus;
 
         let mut summary = MergeSweepSummary::default();
@@ -4124,7 +4263,17 @@ impl Services {
                 }
             }
 
-            match merge_sandbox(&self.store, &workspace_id, &agent_id).await {
+            // Same dirty-state policy as the completion path: with the
+            // workspace's auto-commit OFF the sweep must not commit the
+            // agent's uncommitted work — `Dirty` is handled like `Blocked`
+            // below (back to merge_pending, no retry consumed; the state
+            // resolves externally when the agent commits).
+            let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
+                DirtyHandling::Commit(None)
+            } else {
+                DirtyHandling::Bounce
+            };
+            match merge_sandbox_with(&self.store, &workspace_id, &agent_id, dirty_handling).await {
                 Ok(MergeOutcome::Merged {
                     commit_range,
                     canonical_head,
@@ -4160,6 +4309,25 @@ impl Services {
                         reason = %reason,
                         paths = ?overlapping_paths,
                         "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
+                    );
+                }
+                Ok(MergeOutcome::Dirty { dirty_paths }) => {
+                    let _ = self
+                        .store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &agent_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    summary.blocked += 1;
+                    tracing::info!(
+                        sandbox = %sandbox.id,
+                        agent = %agent_id.0,
+                        workspace = %workspace_id.0,
+                        paths = ?dirty_paths,
+                        "merge retry sweep: sandbox dirty with auto-commit off; will retry next sweep (retry cap not consumed)"
                     );
                 }
                 Ok(MergeOutcome::Conflict {
@@ -7298,6 +7466,52 @@ fn search_done_event(
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
 pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
+/// What [`Services::handle_sandbox_merge_on_completion`] decided about a
+/// sandboxed agent's completion: whether it propagates to the coordinator
+/// (`false` = the agent was bounced and will re-complete) and, when it does,
+/// the merge outcome annotated onto the completion event so the parent's
+/// wake names where the child's work landed.
+struct SandboxMergeDisposition {
+    /// Whether the completion should propagate to watches/groups.
+    propagate: bool,
+    /// The `sandboxMergeStatus` value stamped onto the event data
+    /// (`"merged"` / `"merge_pending"` / `"unmerged"`); `None` propagates
+    /// without annotation (no-record / claim-race / lookup-failure paths).
+    merge_status: Option<&'static str>,
+    /// The applied commit range on a clean merge (`sandboxCommitRange`).
+    commit_range: Option<String>,
+}
+
+impl SandboxMergeDisposition {
+    /// Propagate without annotating the event (degenerate paths where no
+    /// merge decision was made: missing record, claim race, store errors).
+    fn propagate_silent() -> Self {
+        Self {
+            propagate: true,
+            merge_status: None,
+            commit_range: None,
+        }
+    }
+
+    /// Propagate with the given `sandboxMergeStatus` annotation.
+    fn propagate_with(status: &'static str) -> Self {
+        Self {
+            propagate: true,
+            merge_status: Some(status),
+            commit_range: None,
+        }
+    }
+
+    /// Suppress propagation (the agent was bounced with instructions).
+    fn bounce() -> Self {
+        Self {
+            propagate: false,
+            merge_status: None,
+            commit_range: None,
+        }
+    }
+}
+
 /// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
 /// used by the daemon's periodic loop for logging and by unit tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -7647,10 +7861,50 @@ fn format_completion_wake(
             msg.push_str(&format!(" Error: {err}"));
         }
     }
+    if let Some(sandbox) = format_sandbox_outcome_suffix(&event.data) {
+        msg.push_str(&sandbox);
+    }
     if let Some(stall) = stall {
         msg.push_str(&stall.annotation_suffix());
     }
     msg
+}
+
+/// The wake-text suffix describing a sandboxed child's turn-end merge
+/// outcome, rendered from the `sandboxMergeStatus` / `sandboxPath` /
+/// `sandboxCommitRange` fields the completion-interception path stamped onto
+/// the `agent:idle` event data. `None` for non-sandboxed completions (no
+/// `sandboxMergeStatus` on the event).
+fn format_sandbox_outcome_suffix(data: &serde_json::Value) -> Option<String> {
+    let status = data
+        .get("sandboxMergeStatus")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let path = data
+        .get("sandboxPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    Some(match status {
+        "merged" => {
+            let range = data
+                .get("sandboxCommitRange")
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            format!(" Sandbox merged into the workspace repo{range}.")
+        }
+        "merge_pending" => format!(
+            " Sandbox merge is PENDING — the work is NOT in the workspace repo yet; it lives in \
+             the sandbox at `{path}`. Resolve via ws.agent.mergeSandbox(agentId) once the \
+             blocker clears."
+        ),
+        "unmerged" => format!(
+            " Sandbox left unmerged (mergeOnTurnEnd: false) — the work lives in the sandbox at \
+             `{path}`. Merge it with ws.agent.mergeSandbox(agentId) when ready."
+        ),
+        other => format!(" Sandbox merge status: {other} (sandbox at `{path}`)."),
+    })
 }
 
 /// Build one per-child summary line for a delegation group's aggregated wake.
@@ -7704,6 +7958,9 @@ pub(crate) fn format_group_child_line(
         if !err.is_empty() {
             line.push_str(&format!(" Error: {err}"));
         }
+    }
+    if let Some(sandbox) = format_sandbox_outcome_suffix(&event.data) {
+        line.push_str(&sandbox);
     }
     // Pending attention request (agent:attention-requested): the child's
     // immediate parent wake already fired at raise time (the alert); the
@@ -17708,7 +17965,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+            use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
             use intent_store::SandboxStatus;
 
             // Claim the merge atomically (current status → merging) so the RPC
@@ -17739,10 +17996,35 @@ impl WorkspaceApi for Services {
                 ));
             }
 
+            // Same dirty-state policy as the automatic paths: with the
+            // workspace's auto-commit ON, commit uncommitted sandbox state
+            // (LLM-assisted message when generatable); OFF, refuse — the
+            // caller sees `status: "dirty"` and the agent must commit its
+            // own work first.
+            let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
+                let message = match store.get_agent_session(&sandbox_id).await {
+                    Ok(session) => {
+                        self.sandbox_dirty_commit_message(&sandbox_id, &session)
+                            .await
+                    }
+                    Err(_) => None,
+                };
+                DirtyHandling::Commit(message)
+            } else {
+                DirtyHandling::Bounce
+            };
+
             // Attempt merge. On a hard error return the sandbox to
             // merge_pending so it stays visible to the retry sweep and
             // retryable via this RPC rather than stranded `merging`.
-            let outcome = match merge_sandbox(&store, &workspace_id, &sandbox_id).await {
+            let outcome = match merge_sandbox_with(
+                &store,
+                &workspace_id,
+                &sandbox_id,
+                dirty_handling,
+            )
+            .await
+            {
                 Ok(outcome) => outcome,
                 Err(e) => {
                     let _ = store
@@ -17819,6 +18101,25 @@ impl WorkspaceApi for Services {
                         "status": "blocked",
                         "reason": reason,
                         "overlappingPaths": overlapping_paths,
+                    }))
+                }
+                MergeOutcome::Dirty { dirty_paths } => {
+                    // Nothing was committed or merged; restore the pre-claim
+                    // status so the sandbox stays where it was.
+                    let _ = store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &sandbox_id,
+                            sandbox.status,
+                            &now_iso(),
+                        )
+                        .await;
+
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "status": "dirty",
+                        "reason": "sandbox has uncommitted changes and workspace auto-commit is disabled; the agent must commit its work first",
+                        "dirtyPaths": dirty_paths,
                     }))
                 }
             }
