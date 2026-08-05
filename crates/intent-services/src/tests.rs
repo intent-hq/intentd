@@ -7508,7 +7508,11 @@ mod pr {
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());
         crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
             .expect("seed token");
-        let svc = svc.with_secret_store(mem.clone());
+        // Mock login host: the production-host gate must skip the gh CLI
+        // logout side effect, so this test never spawns a real `gh`.
+        let svc = svc
+            .with_secret_store(mem.clone())
+            .with_github_login_base_uri("http://127.0.0.1:0");
         {
             let mut slot = svc.github_auth_flow.lock().await;
             *slot = Some(crate::github_auth_ops::FlowSlot {

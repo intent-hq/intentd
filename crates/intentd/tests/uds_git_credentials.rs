@@ -221,6 +221,10 @@ fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // Mock login host: the production-host gate must skip the gh CLI
+        // logout side effect of `github.revoke`, so this e2e never touches
+        // a real `gh` on the host.
+        .env("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:0")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
