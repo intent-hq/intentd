@@ -85,12 +85,18 @@ pub trait GhCli: Send + Sync {
     /// Run `gh auth login --with-token --hostname github.com`, piping the
     /// token via stdin. True on success.
     fn login_with_token(&self, gh: &Path, token: &SecretString) -> bool;
-    /// The token `gh auth token --hostname github.com` resolves, or `None`
-    /// when gh has no github.com login. 🔒 Held in memory only — must never
-    /// reach logs, errors, or argv.
-    fn active_token(&self, gh: &Path) -> Option<SecretString>;
-    /// Run `gh auth logout --hostname github.com`. True on success.
-    fn logout(&self, gh: &Path) -> bool;
+    /// The github.com login gh reports as its active account, or `None` when
+    /// it cannot be determined (gh < 2.40, no login, parse failure). Used to
+    /// pin the token read and the logout to one named account.
+    fn active_login(&self, gh: &Path) -> Option<String>;
+    /// The token `gh auth token --hostname github.com` resolves — pinned via
+    /// `--user` when `user` is known — or `None` when gh has no matching
+    /// github.com login. 🔒 Held in memory only — must never reach logs,
+    /// errors, or argv.
+    fn active_token(&self, gh: &Path, user: Option<&str>) -> Option<SecretString>;
+    /// Run `gh auth logout --hostname github.com`, pinned via `--user` when
+    /// `user` is known. True on success.
+    fn logout(&self, gh: &Path, user: Option<&str>) -> bool;
 }
 
 /// The sync decision ladder: no token → gh missing → existing login →
@@ -117,6 +123,18 @@ fn sync_with(cli: &dyn GhCli, token: Option<SecretString>) -> GhSyncOutcome {
 /// login whose active token is not exactly the revoked one was not created by
 /// [`sync_with`], so it is never logged out. Pure over the [`GhCli`] seam so
 /// every arm is unit-testable. 🔒 The compare happens in memory only.
+///
+/// The whole sequence is pinned to one named account when gh reports it
+/// (gh ≥ 2.40, the multi-account versions): the token is read with
+/// `--user <login>` and the logout names the same login, so (a) multi-account
+/// setups log out non-interactively instead of erroring ("unable to determine
+/// which account to log out of"), and (b) a concurrent `gh auth switch`
+/// between the check and the logout cannot redirect either step to a
+/// different account. Residual race: the *named* account re-logging in with
+/// a different token inside that window cannot be excluded — the gh CLI has
+/// no atomic compare-and-logout — which is accepted for this best-effort,
+/// fail-soft cleanup. When no login can be resolved (gh < 2.40 predates both
+/// multi-account and `--user`), the unpinned single-account path applies.
 fn logout_with(cli: &dyn GhCli, revoked: Option<SecretString>) -> GhLogoutOutcome {
     let Some(revoked) = revoked else {
         return GhLogoutOutcome::NoToken;
@@ -124,13 +142,14 @@ fn logout_with(cli: &dyn GhCli, revoked: Option<SecretString>) -> GhLogoutOutcom
     let Some(gh) = cli.locate() else {
         return GhLogoutOutcome::GhNotInstalled;
     };
-    let Some(active) = cli.active_token(&gh) else {
+    let user = cli.active_login(&gh);
+    let Some(active) = cli.active_token(&gh, user.as_deref()) else {
         return GhLogoutOutcome::NotLoggedIn;
     };
     if active.expose_secret() != revoked.expose_secret() {
         return GhLogoutOutcome::TokenMismatch;
     }
-    if cli.logout(&gh) {
+    if cli.logout(&gh, user.as_deref()) {
         GhLogoutOutcome::LoggedOut
     } else {
         GhLogoutOutcome::LogoutFailed
@@ -266,11 +285,32 @@ impl GhCli for SystemGhCli {
         child.wait().map(|s| s.success()).unwrap_or(false)
     }
 
-    fn active_token(&self, gh: &Path) -> Option<SecretString> {
+    fn active_login(&self, gh: &Path) -> Option<String> {
+        // 🔒 `gh auth status` output carries (masked) token material: it is
+        // parsed in memory only and never logged. Checked on both streams —
+        // gh has printed status to stderr historically and stdout since 2.40.
+        let out = Command::new(gh)
+            .args(["auth", "status", "--hostname", "github.com"])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_active_login(&String::from_utf8_lossy(&out.stdout))
+            .or_else(|| parse_active_login(&String::from_utf8_lossy(&out.stderr)))
+    }
+
+    fn active_token(&self, gh: &Path, user: Option<&str>) -> Option<SecretString> {
         // 🔒 stdout IS the token: captured in memory only, wrapped in a
         // `SecretString` immediately, never logged. stderr is discarded.
-        let out = Command::new(gh)
-            .args(["auth", "token", "--hostname", "github.com"])
+        // The login name is not a secret, so `--user` via argv is fine.
+        let mut cmd = Command::new(gh);
+        cmd.args(["auth", "token", "--hostname", "github.com"]);
+        if let Some(user) = user {
+            cmd.args(["--user", user]);
+        }
+        let out = cmd
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -283,18 +323,43 @@ impl GhCli for SystemGhCli {
         (!trimmed.is_empty()).then(|| SecretString::from(trimmed.to_string()))
     }
 
-    fn logout(&self, gh: &Path) -> bool {
+    fn logout(&self, gh: &Path, user: Option<&str>) -> bool {
         // Output is discarded: only the exit code matters, so no error path
         // can echo credential material.
-        Command::new(gh)
-            .args(["auth", "logout", "--hostname", "github.com"])
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(gh);
+        cmd.args(["auth", "logout", "--hostname", "github.com"]);
+        if let Some(user) = user {
+            cmd.args(["--user", user]);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
     }
+}
+
+/// Extract the active github.com login from `gh auth status` output: the
+/// account named by a "Logged in to github.com account <login>" line whose
+/// block carries "Active account: true". Both markers exist only on gh ≥ 2.40
+/// (older gh says "as <login>" and has no active-account concept), exactly
+/// the versions whose `auth token` / `auth logout` accept `--user` — so a
+/// `None` here self-gates the pinning to the gh versions that support it.
+/// 🔒 The input carries (masked) token material — callers must never log it.
+fn parse_active_login(status: &str) -> Option<String> {
+    let mut candidate: Option<&str> = None;
+    for line in status.lines() {
+        if let Some(rest) = line.split("Logged in to github.com account ").nth(1) {
+            candidate = rest.split_whitespace().next();
+        }
+        if line.contains("Active account: true") {
+            if let Some(login) = candidate {
+                return Some(login.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// `which`-style lookup: first executable `name` (plus `.exe` on Windows)
@@ -337,6 +402,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -347,9 +413,12 @@ mod tests {
         authenticated: bool,
         login_succeeds: bool,
         login_attempted: AtomicBool,
+        active_login: Option<&'static str>,
         active_token: Option<&'static str>,
         logout_succeeds: bool,
         logout_attempted: AtomicBool,
+        token_user_seen: Mutex<Option<Option<String>>>,
+        logout_user_seen: Mutex<Option<Option<String>>>,
     }
 
     impl MockGhCli {
@@ -359,9 +428,12 @@ mod tests {
                 authenticated,
                 login_succeeds,
                 login_attempted: AtomicBool::new(false),
+                active_login: None,
                 active_token: None,
                 logout_succeeds: false,
                 logout_attempted: AtomicBool::new(false),
+                token_user_seen: Mutex::new(None),
+                logout_user_seen: Mutex::new(None),
             }
         }
 
@@ -375,10 +447,18 @@ mod tests {
                 authenticated: active_token.is_some(),
                 login_succeeds: false,
                 login_attempted: AtomicBool::new(false),
+                active_login: None,
                 active_token,
                 logout_succeeds,
                 logout_attempted: AtomicBool::new(false),
+                token_user_seen: Mutex::new(None),
+                logout_user_seen: Mutex::new(None),
             }
+        }
+
+        fn with_login(mut self, login: &'static str) -> Self {
+            self.active_login = Some(login);
+            self
         }
     }
 
@@ -396,11 +476,17 @@ mod tests {
             self.login_succeeds
         }
 
-        fn active_token(&self, _gh: &Path) -> Option<SecretString> {
+        fn active_login(&self, _gh: &Path) -> Option<String> {
+            self.active_login.map(str::to_string)
+        }
+
+        fn active_token(&self, _gh: &Path, user: Option<&str>) -> Option<SecretString> {
+            *self.token_user_seen.lock().unwrap() = Some(user.map(str::to_string));
             self.active_token.map(SecretString::from)
         }
 
-        fn logout(&self, _gh: &Path) -> bool {
+        fn logout(&self, _gh: &Path, user: Option<&str>) -> bool {
+            *self.logout_user_seen.lock().unwrap() = Some(user.map(str::to_string));
             self.logout_attempted.store(true, Ordering::SeqCst);
             self.logout_succeeds
         }
@@ -519,6 +605,59 @@ mod tests {
         let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), false);
         assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::LogoutFailed);
         assert!(cli.logout_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn logout_pins_token_read_and_logout_to_the_active_login() {
+        // gh ≥ 2.40 reports the active login: both the token read and the
+        // logout must name it via --user, so multi-account setups log out
+        // non-interactively and a concurrent account switch cannot redirect
+        // either step.
+        let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), true).with_login("octocat");
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::LoggedOut);
+        assert_eq!(
+            *cli.token_user_seen.lock().unwrap(),
+            Some(Some("octocat".to_string()))
+        );
+        assert_eq!(
+            *cli.logout_user_seen.lock().unwrap(),
+            Some(Some("octocat".to_string()))
+        );
+    }
+
+    #[test]
+    fn logout_stays_unpinned_when_no_login_is_reported() {
+        // gh < 2.40 (single-account, no --user support) reports no login:
+        // both steps run unpinned, matching the old single-account behavior.
+        let cli = MockGhCli::for_logout(true, Some("gho_test_revoked"), true);
+        assert_eq!(logout_with(&cli, revoked()), GhLogoutOutcome::LoggedOut);
+        assert_eq!(*cli.token_user_seen.lock().unwrap(), Some(None));
+        assert_eq!(*cli.logout_user_seen.lock().unwrap(), Some(None));
+    }
+
+    #[test]
+    fn parses_the_active_login_from_gh_auth_status() {
+        // Multi-account gh ≥ 2.40 shape: only the block with
+        // "Active account: true" names the login to pin.
+        let status = "github.com\n\
+             ✓ Logged in to github.com account inactive-user (keyring)\n\
+             - Active account: false\n\
+             - Git operations protocol: https\n\
+             ✓ Logged in to github.com account octocat (keyring)\n\
+             - Active account: true\n\
+             - Token: gho_************************************\n";
+        assert_eq!(parse_active_login(status), Some("octocat".to_string()));
+    }
+
+    #[test]
+    fn active_login_is_none_for_pre_multi_account_gh_output() {
+        // gh < 2.40 prints "as <login>" and has no active-account marker —
+        // None keeps the sequence unpinned, which those versions accept.
+        let status = "github.com\n\
+             ✓ Logged in to github.com as octocat (keyring)\n\
+             ✓ Token: gho_************************************\n";
+        assert_eq!(parse_active_login(status), None);
+        assert_eq!(parse_active_login(""), None);
     }
 
     #[test]
