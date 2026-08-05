@@ -794,6 +794,70 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
+    /// Resolve every non-hidden specialist's delegation `modelOptions`
+    /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
+    /// per-agent `workspace_api` tool description at bridge creation.
+    /// Specialists without options (the default) are omitted; resolution
+    /// failure yields an empty list — spawning never fails on this.
+    pub(crate) fn specialist_model_options(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        use serde_json::Value;
+        let Ok(listed) = self.specialists_service().list(workspace_path) else {
+            return Vec::new();
+        };
+        let Some(specs) = listed.get("specialists").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        specs
+            .iter()
+            .filter(|def| !def.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|def| {
+                let id = def.get("id").and_then(Value::as_str)?;
+                let options: Vec<intent_acp::SpecialistModelOption> = def
+                    .get("modelOptions")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(|o| {
+                        Some(intent_acp::SpecialistModelOption {
+                            model: o.get("model").and_then(Value::as_str)?.to_string(),
+                            hint: o
+                                .get("hint")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect();
+                if options.is_empty() {
+                    return None;
+                }
+                Some(intent_acp::SpecialistModelOptions {
+                    specialist: id.to_string(),
+                    options,
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::specialist_model_options`] with the project tier derived from
+    /// the stored workspace record (worktree path, else repository path) —
+    /// the same security-motivated derivation the spawn-time model resolution
+    /// uses. Lookup failure degrades to the user/bundled tiers only.
+    pub(crate) async fn specialist_model_options_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        let wp = self
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        self.specialist_model_options(wp.as_deref())
+    }
+
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
     /// prepend to a specialist agent's next turn, or `None` when the agent has no
     /// specialist or its specialist yields no reminder (port of acp-provider.ts
@@ -16422,6 +16486,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
+                .await
+        })
+    }
+
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_mark_seen_op(workspace_id, agent_id, message_id)
                 .await
         })
     }

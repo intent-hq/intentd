@@ -1448,6 +1448,81 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically set ONE key in `agent_session.metadata` in SQL (`json_set`),
+    /// preserving every sibling key — unlike
+    /// [`Store::update_agent_session_metadata`], whose whole-column replacement
+    /// loses keys written concurrently by another metadata writer (e.g.
+    /// `agent.dismissQuestions` racing `agent.markSeen`). A NULL column starts
+    /// from `{}`; a non-object value (should one ever land there) is preserved
+    /// under `priorNonObjectMetadata` (monorepo#751 review), matching the
+    /// service-side defensive shape. `key` must be a trusted compile-time
+    /// constant (it is spliced into the JSON path). `expected` is a three-way
+    /// compare-and-set guard on the key's CURRENT value (same encoding as
+    /// `stop_reason` on [`Store::set_agent_session_status`]): `None` writes
+    /// unconditionally, `Some(None)` writes only when the key is absent,
+    /// `Some(Some(v))` only when it currently equals `v`. Returns `Ok(false)`
+    /// when the guard failed (the session exists but the key's value moved —
+    /// callers re-read and retry); `NotFound` when the session is absent or
+    /// the workspace does not match. `updated_at` is refreshed on a successful
+    /// write only.
+    pub async fn set_agent_session_metadata_key(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        key: &str,
+        value: &str,
+        expected: Option<Option<&str>>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let guarded = expected.is_some();
+        let expected_value = expected.flatten();
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, ?), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ? \
+               AND (? = 0 OR json_extract(metadata, '$.' || ?) IS ?)",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(guarded as i64)
+        .bind(key)
+        .bind(expected_value)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session metadata key failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            if guarded {
+                // Distinguish a CAS-guard miss (session exists, marker moved)
+                // from a missing / workspace-mismatched session.
+                let exists =
+                    sqlx::query("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
+                        .bind(&id.0)
+                        .bind(&workspace_id.0)
+                        .fetch_optional(self.read_pool())
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("agent session existence check failed: {e}"))
+                        })?;
+                if exists.is_some() {
+                    return Ok(false);
+                }
+            }
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(true)
+    }
+
     /// Persist the runtime `status` + `is_active` transition for `agent_session`
     /// without touching the write-once `acp_session_id` / immutable `provider`
     /// (the broader [`Store::update_agent_session`] enforces those invariants).
@@ -4709,6 +4784,179 @@ mod tests {
         let missing = AgentId("agent-meta-missing".to_string());
         match store
             .update_agent_session_metadata(&ws_id, &missing, Some(&metadata), &later)
+            .await
+        {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound on unknown id, got {other:?}"),
+        }
+    }
+
+    /// `set_agent_session_metadata_key` writes exactly one key in SQL:
+    /// sibling keys survive (no whole-column clobber), a NULL column starts
+    /// from `{}`, a non-object column is preserved under
+    /// `priorNonObjectMetadata`, `system_prompt` is untouched, the CAS guard
+    /// enforces expected-absent / expected-value semantics (guard miss →
+    /// `Ok(false)`, no write), and missing/mismatched sessions are NotFound.
+    #[tokio::test]
+    async fn set_agent_session_metadata_key_atomic_and_guarded() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-meta-key".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep this prompt".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // NULL column + expected-absent guard: writes, starting from {}.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-1",
+                Some(None),
+                &now_iso(),
+            )
+            .await
+            .expect("first write");
+        assert!(wrote, "expected-absent guard must pass on a NULL column");
+
+        // Sibling key written unconditionally: both keys coexist.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "dismissedQuestionsMessageId",
+                "msg-q",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("sibling write");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
+        assert_eq!(
+            metadata["dismissedQuestionsMessageId"],
+            serde_json::json!("msg-q")
+        );
+        assert_eq!(
+            after.system_prompt.as_deref(),
+            Some("keep this prompt"),
+            "single-key metadata write must not touch system_prompt"
+        );
+
+        // CAS guard miss: expected value no longer current → Ok(false), no write.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-stale",
+                Some(Some("msg-0")),
+                &now_iso(),
+            )
+            .await
+            .expect("guard miss is not an error");
+        assert!(!wrote, "stale expected value must not write");
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(
+            after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
+            serde_json::json!("msg-1"),
+            "guard miss must leave the key untouched"
+        );
+
+        // CAS guard hit: expected current value → writes.
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &agent_id,
+                "lastSeenMessageId",
+                "msg-2",
+                Some(Some("msg-1")),
+                &now_iso(),
+            )
+            .await
+            .expect("guard hit");
+        assert!(wrote);
+        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-2"));
+        assert_eq!(
+            metadata["dismissedQuestionsMessageId"],
+            serde_json::json!("msg-q"),
+            "sibling key must survive the guarded write"
+        );
+
+        // Non-object column: preserved under `priorNonObjectMetadata`.
+        let legacy = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut legacy_session = baseline_test_session(&legacy, &ws_id, &ts, None);
+        legacy_session.metadata = Some(serde_json::json!("legacy-string"));
+        store
+            .insert_agent_session(&legacy_session)
+            .await
+            .expect("insert legacy session");
+        let wrote = store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &legacy,
+                "lastSeenMessageId",
+                "msg-1",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("legacy write");
+        assert!(wrote);
+        let after = store.get_agent_session(&legacy).await.expect("get");
+        let metadata = after.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
+        assert_eq!(
+            metadata["priorNonObjectMetadata"],
+            serde_json::json!("legacy-string"),
+            "prior non-object metadata must be preserved, not dropped"
+        );
+
+        // Workspace mismatch / unknown id: NotFound (guarded and unguarded).
+        let other_ws = WorkspaceId("ws-meta-key-other".to_string());
+        for expected in [None, Some(Some("msg-2"))] {
+            match store
+                .set_agent_session_metadata_key(
+                    &other_ws,
+                    &agent_id,
+                    "lastSeenMessageId",
+                    "msg-3",
+                    expected,
+                    &now_iso(),
+                )
+                .await
+            {
+                Err(Error::NotFound(_)) => {}
+                other => panic!("expected NotFound on workspace mismatch, got {other:?}"),
+            }
+        }
+        let missing = AgentId("agent-meta-key-missing".to_string());
+        match store
+            .set_agent_session_metadata_key(
+                &ws_id,
+                &missing,
+                "lastSeenMessageId",
+                "msg-3",
+                Some(None),
+                &now_iso(),
+            )
             .await
         {
             Err(Error::NotFound(_)) => {}
