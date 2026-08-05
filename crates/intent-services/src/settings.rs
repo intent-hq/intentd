@@ -1076,6 +1076,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             &["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
             "gpt-4o-transcribe",
         ),
+        number(
+            "voice.workspaceVocabulary.maxTerms",
+            "Workspace vocabulary max terms",
+            "Cap on the auto-derived workspace vocabulary injected into voice.transcribe calls with a workspaceId and served by voice.getWorkspaceVocabulary (0 disables)",
+            "voice",
+            Some(0.0),
+            Some(100.0),
+            50.0,
+        ),
         object(
             "voice.vocabulary",
             "Voice vocabulary",
@@ -2657,6 +2666,84 @@ mod tests {
         assert_eq!(reset["value"], serde_json::Value::Null);
         let got = svc.get(path).await.expect("get after reset");
         assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `voice.workspaceVocabulary.maxTerms` is a TOML-backed bounded number
+    /// (default 50, min 0, max 100 — 0 disables derivation and injection;
+    /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
+    /// config.toml (never SQLite) and rejects out-of-range values.
+    #[tokio::test]
+    async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
+        let path = "voice.workspaceVocabulary.maxTerms";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(min),
+                max: Some(max)
+            } if min == 0.0 && max == 100.0
+        ));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "voice");
+        assert_eq!(def.default_value, Some(json!(50.0)));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-voicewsvocab-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-voicewsvocab-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], json!(50.0));
+        assert_eq!(got["origin"], json!("default"));
+
+        // An updated cap persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect("update to 0 (disable)");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!(0.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("maxTerms = 0"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Out-of-range and wrong-type values are rejected.
+        svc.update(&json!([{ "path": path, "value": 101 }]))
+            .await
+            .expect_err("over max must be rejected");
+        svc.update(&json!([{ "path": path, "value": -1 }]))
+            .await
+            .expect_err("under min must be rejected");
+        svc.update(&json!([{ "path": path, "value": "fifty" }]))
+            .await
+            .expect_err("non-number must be rejected");
+
+        // Reset restores the default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], json!(50.0));
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], json!(50.0));
         assert_eq!(got["origin"], json!("default"));
 
         let _ = std::fs::remove_file(&config_path);

@@ -103,6 +103,7 @@ pub mod tool_block;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+pub mod workspace_vocabulary;
 
 #[cfg(test)]
 mod tests;
@@ -299,6 +300,11 @@ pub struct Services {
     /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
     /// "not configured" `Internal` error when no key is available.
     voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
+    /// Per-workspace auto-derived vocabulary cache (PROTOCOL §5.41, v4.6)
+    /// backing the `voice.transcribe` workspace-vocabulary injection and
+    /// `voice.getWorkspaceVocabulary`. Shared across clones so repeated calls
+    /// hit the same content-hash cache.
+    workspace_vocabulary: Arc<workspace_vocabulary::WorkspaceVocabularyCache>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -610,6 +616,7 @@ impl Services {
             linear_engine: None,
             sentry_engine: None,
             voice_engine: None,
+            workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
@@ -961,6 +968,19 @@ impl Services {
             &self.secrets,
             self.settings_registry.as_deref(),
         )
+    }
+
+    /// Effective `voice.workspaceVocabulary.maxTerms` cap (PROTOCOL §5.12,
+    /// v4.6): the TOML-backed catalog entry via the settings service; a read
+    /// failure or malformed value degrades to the default — never an error.
+    async fn voice_workspace_vocabulary_max_terms(&self) -> usize {
+        let value = self
+            .settings_service()
+            .get(workspace_vocabulary::MAX_TERMS_SETTING_PATH)
+            .await
+            .ok()
+            .and_then(|v| v.get("value").cloned());
+        workspace_vocabulary::parse_max_terms_value(value.as_ref())
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -18895,6 +18915,7 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.voice_engine.clone();
+        let vocab_cache = self.workspace_vocabulary.clone();
         Box::pin(async move {
             let parsed = voice_ops::parse_request(&params)?;
             // Provider: per-call override, else the `voice.provider` setting.
@@ -18934,8 +18955,26 @@ impl WorkspaceApi for Services {
                 parsed.language.as_deref(),
                 language_setting.as_deref(),
             );
+            // Workspace vocabulary (PROTOCOL §5.41, v4.6): a present
+            // `workspaceId` opts into auto-derived term injection. Tolerant
+            // by design — an unknown or stale id yields no terms (the cache
+            // degrades to empty), never an error.
+            let workspace_terms = match &parsed.workspace_id {
+                Some(ws_id) => {
+                    let max_terms = self.voice_workspace_vocabulary_max_terms().await;
+                    vocab_cache
+                        .vocabulary_with_max_terms(
+                            &self.store,
+                            &WorkspaceId::from(ws_id.as_str()),
+                            max_terms,
+                        )
+                        .await
+                }
+                None => Vec::new(),
+            };
             let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
-            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
+            let request =
+                voice_ops::build_engine_request(&parsed, &vocabulary, &workspace_terms, language);
             let transcript = engine
                 .transcribe(request)
                 .await
@@ -18945,6 +18984,24 @@ impl WorkspaceApi for Services {
                 "provider": engine.provider_name(),
                 "durationMs": transcript.duration_ms,
             }))
+        })
+    }
+
+    fn voice_get_workspace_vocabulary(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let vocab_cache = self.workspace_vocabulary.clone();
+        Box::pin(async move {
+            // Unlike the tolerant `workspaceId?` on `voice.transcribe`, the
+            // param here is required and validated: an unknown workspace is
+            // the standard not-found error (PROTOCOL §5.41, v4.6).
+            self.store.get_workspace(&workspace_id).await?;
+            let max_terms = self.voice_workspace_vocabulary_max_terms().await;
+            let terms = vocab_cache
+                .vocabulary_with_max_terms(&self.store, &workspace_id, max_terms)
+                .await;
+            Ok(serde_json::json!({ "terms": terms }))
         })
     }
 

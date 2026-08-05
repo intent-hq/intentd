@@ -3725,6 +3725,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `voice.getWorkspaceVocabulary`: the auto-derived workspace vocabulary
+    /// — derived terms only, the user's `voice.vocabulary` is not merged in —
+    /// as `{ terms: string[] }` (PROTOCOL §5.41, v4.6). Served from the same
+    /// content-hash cache the `voice.transcribe` injection uses, capped by
+    /// `voice.workspaceVocabulary.maxTerms` (`{ terms: [] }` when the setting
+    /// is `0` or nothing derives). An unknown `workspaceId` → `NotFound`
+    /// (-32602 with `error.data.code: "not-found"` on the wire).
+    fn voice_get_workspace_vocabulary(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::voice_get_workspace_vocabulary not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.getChanges`: the filtered tracked-change list
     /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
     fn file_tracking_get_changes(

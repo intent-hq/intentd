@@ -376,6 +376,8 @@ pub struct VoiceSettings {
     pub language: Option<String>,
     /// `[voice.openai]` — OpenAI provider tuning.
     pub openai: VoiceOpenAiSettings,
+    /// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary.
+    pub workspace_vocabulary: VoiceWorkspaceVocabularySettings,
 }
 
 /// `voice.provider` values.
@@ -406,6 +408,29 @@ pub enum VoiceOpenAiModel {
     Gpt4oMiniTranscribe,
     #[serde(rename = "whisper-1")]
     Whisper1,
+}
+
+/// Default `voice.workspaceVocabulary.maxTerms`.
+pub const DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS: u32 = 50;
+
+/// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary tuning
+/// (`voice.workspaceVocabulary.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceWorkspaceVocabularySettings {
+    /// `voice.workspaceVocabulary.maxTerms` — cap on the auto-derived
+    /// workspace vocabulary injected into `voice.transcribe` calls carrying a
+    /// `workspaceId` and served by `voice.getWorkspaceVocabulary` (0 disables
+    /// derivation and injection entirely; max 100).
+    pub max_terms: u32,
+}
+
+impl Default for VoiceWorkspaceVocabularySettings {
+    fn default() -> Self {
+        Self {
+            max_terms: DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS,
+        }
+    }
 }
 
 /// `[context]` — context engine (`context.*`).
@@ -791,6 +816,13 @@ impl SettingsFile {
                 format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
+        let terms = self.voice.workspace_vocabulary.max_terms;
+        if terms > 100 {
+            return Err(bad(
+                "voice.workspaceVocabulary.maxTerms",
+                format!("must be between 0 and 100, got {terms}"),
+            ));
+        }
         Ok(())
     }
 
@@ -993,6 +1025,13 @@ provider = "elevenlabs"
 # "gpt-4o-mini-transcribe", or "whisper-1".
 model = "gpt-4o-transcribe"
 
+[voice.workspaceVocabulary]
+# Workspace vocabulary max terms -- cap on the auto-derived workspace
+# vocabulary injected into voice.transcribe calls carrying a workspaceId and
+# served by voice.getWorkspaceVocabulary (0 disables derivation and injection
+# entirely; max 100).
+maxTerms = 50
+
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -1134,6 +1173,10 @@ mod tests {
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);
         assert_eq!(d.voice.openai.model, VoiceOpenAiModel::Gpt4oTranscribe);
+        assert_eq!(
+            d.voice.workspace_vocabulary.max_terms,
+            DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS
+        );
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);

@@ -2563,15 +2563,30 @@ async fn dispatch(
             Ok(r)
         }
         "voice.transcribe" => {
-            // Daemon-owned and global: no `workspaceId`. `audio` (base64) is
-            // required; the service layer validates shape/size and selects
-            // the provider (per-call override else the `voice.provider`
-            // setting). Missing/oversized/invalid audio → -32602.
+            // Daemon-owned and global: no required `workspaceId`. `audio`
+            // (base64) is required; the service layer validates shape/size,
+            // selects the provider (per-call override else the
+            // `voice.provider` setting), and handles the optional
+            // `workspaceId?` vocabulary injection (§5.41, v4.6 — an unknown
+            // or stale id is tolerated, only a non-string value errors).
+            // Missing/oversized/invalid audio → -32602.
             require_str_param(params, "audio")?;
             let request = Value::Object(params.clone());
             match api.voice_transcribe(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "voice.getWorkspaceVocabulary" => {
+            // The auto-derived workspace vocabulary — derived terms only —
+            // for client-side (OS-engine) transcription and Settings
+            // previews (§5.41, v4.6). Unlike the tolerant `workspaceId?` on
+            // `voice.transcribe`, the param here is required and validated.
+            let ws = require_workspace_id(params)?;
+            match api.voice_get_workspace_vocabulary(ws).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(not_found("Workspace not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
