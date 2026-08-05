@@ -34,6 +34,25 @@ pub struct ToolDef {
     pub params: &'static [Param],
 }
 
+/// One delegation model option a specialist declares (PROTOCOL §5.11
+/// `modelOptions`): the internal compound model id plus the author's hint.
+pub struct SpecialistModelOption {
+    /// Internal compound model id (e.g. `opencode:kimi-k3`), passed verbatim
+    /// as the `model` param of `ws.agent.delegate` / `ws.agent.create`.
+    pub model: String,
+    /// Free-text hint for choosing this option; empty when the author gave none.
+    pub hint: String,
+}
+
+/// One specialist's resolved `modelOptions` list, injected into the
+/// `workspace_api` tool description so delegating agents can pick a model.
+pub struct SpecialistModelOptions {
+    /// Specialist id (the `specialist` param of delegate/create).
+    pub specialist: String,
+    /// Ordered options as authored in the winning tier's frontmatter.
+    pub options: Vec<SpecialistModelOption>,
+}
+
 impl ToolDef {
     /// Synthesize the MCP `inputSchema` (`type: object` + properties + required).
     pub fn schema(&self) -> Value {
@@ -608,10 +627,95 @@ pub fn workspace_api_description(
     Cow::Owned(out)
 }
 
+/// [`workspace_api_description`] plus the per-specialist delegation model
+/// options (PROTOCOL §5.11 `modelOptions`), injected as continuation lines of
+/// the `ws.agent.delegate` doc entry so delegating agents see which models a
+/// specialist's author suggests. `model_options` lists only specialists that
+/// carry options; when it is empty — the all-defaults case — the assembled
+/// text is returned unchanged, so the default description stays
+/// byte-identical by construction.
+pub fn workspace_api_description_with_model_options(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    model_options: &[SpecialistModelOptions],
+) -> Cow<'static, str> {
+    let base = workspace_api_description(is_chief, features);
+    if model_options.is_empty() {
+        return base;
+    }
+    // Anchor on the `ws.agent.delegate` doc line (indent 2) and append the
+    // options block after its indented continuation lines, so the injected
+    // text reads as part of the delegate/create docs. No anchor (the line
+    // can never be feature-pruned today, but stay safe) → unchanged.
+    let mut out = String::with_capacity(base.len() + 256);
+    let mut in_delegate = false;
+    let mut inserted = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_continuation = indent >= 4 && !trimmed.is_empty();
+        if in_delegate && !is_continuation && !inserted {
+            out.push_str(&model_options_block(model_options));
+            inserted = true;
+        }
+        if indent == 2 && trimmed.starts_with("ws.") {
+            in_delegate = trimmed.starts_with("ws.agent.delegate(");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_delegate && !inserted {
+        out.push_str(&model_options_block(model_options));
+        inserted = true;
+    }
+    if !inserted {
+        return base;
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    Cow::Owned(out)
+}
+
+/// Render the injected continuation block: one header line plus one line per
+/// specialist listing its options as `` `<compound id>` (<hint>) `` entries
+/// (the hint parenthetical is omitted when empty). All lines are indented ≥4
+/// so the `[agentFeatures]` pruning treats them as continuation lines of the
+/// `ws.agent.delegate` entry. Author-supplied text is flattened onto one line
+/// so a multi-line hint cannot break the description's line structure.
+fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
+    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    let mut block = String::from(
+        "    Specialist model options (pass the compound id as `model` to \
+         `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
+         specialist's default):\n",
+    );
+    for spec in model_options {
+        block.push_str("      ");
+        block.push_str(&flat(&spec.specialist));
+        block.push_str(": ");
+        let entries: Vec<String> = spec
+            .options
+            .iter()
+            .map(|o| {
+                if o.hint.is_empty() {
+                    format!("`{}`", flat(&o.model))
+                } else {
+                    format!("`{}` ({})", flat(&o.model), flat(&o.hint))
+                }
+            })
+            .collect();
+        block.push_str(&entries.join(", "));
+        block.push('\n');
+    }
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        denied_feature, workspace_api_description, AgentFeaturesSettings, Cow,
+        denied_feature, workspace_api_description, workspace_api_description_with_model_options,
+        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
         REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
         WORKSPACE_API_DESCRIPTION_CHIEF,
     };
@@ -1163,6 +1267,145 @@ mod tests {
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
             None
+        );
+    }
+
+    // ---- specialist modelOptions injection ---------------------------------
+
+    fn sample_options() -> Vec<SpecialistModelOptions> {
+        vec![
+            SpecialistModelOptions {
+                specialist: "implementor".to_string(),
+                options: vec![
+                    SpecialistModelOption {
+                        model: "opencode:kimi-k3".to_string(),
+                        hint: "cheap".to_string(),
+                    },
+                    SpecialistModelOption {
+                        model: "auggie:opus".to_string(),
+                        hint: String::new(),
+                    },
+                ],
+            },
+            SpecialistModelOptions {
+                specialist: "verifier".to_string(),
+                options: vec![SpecialistModelOption {
+                    model: "grok:grok-5".to_string(),
+                    hint: "fast reviews".to_string(),
+                }],
+            },
+        ]
+    }
+
+    // Hard requirement: with no specialist carrying options (the default),
+    // the injected description IS the plain assembly — byte-identical, and
+    // still `Cow::Borrowed` in the all-defaults case.
+    #[test]
+    fn no_model_options_keeps_description_byte_identical() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let got = workspace_api_description_with_model_options(is_chief, &features, &[]);
+            assert!(
+                matches!(got, Cow::Borrowed(_)),
+                "no options must not reassemble"
+            );
+            assert_eq!(
+                &*got,
+                &*workspace_api_description(is_chief, &features),
+                "chief={is_chief}: empty options changed the description"
+            );
+        }
+    }
+
+    // Options are injected as continuation lines directly under the
+    // `ws.agent.delegate` doc entry: compound id + hint per specialist, the
+    // hint parenthetical omitted when empty, and the next method line
+    // (`ws.agent.send`) still follows.
+    #[test]
+    fn model_options_injected_into_delegate_docs() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                &sample_options(),
+            );
+            assert!(
+                got.contains("Specialist model options"),
+                "chief={is_chief}: header missing"
+            );
+            assert!(
+                got.contains("implementor: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+                "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
+            );
+            assert!(
+                got.contains("verifier: `grok:grok-5` (fast reviews)"),
+                "chief={is_chief}: verifier options line missing"
+            );
+            // The block sits between the delegate entry and the next method
+            // line, i.e. inside the delegate docs.
+            let delegate_idx = got.find("ws.agent.delegate(").expect("delegate line");
+            let block_idx = got.find("Specialist model options").expect("block");
+            let send_idx = got[delegate_idx..]
+                .find("ws.agent.send(")
+                .map(|i| i + delegate_idx)
+                .expect("send line after delegate");
+            assert!(
+                delegate_idx < block_idx && block_idx < send_idx,
+                "chief={is_chief}: block not inside the delegate docs \
+                 (delegate={delegate_idx}, block={block_idx}, send={send_idx})"
+            );
+            // Injected lines are continuation-indented (≥4 spaces) so the
+            // feature-gating pruner treats them as part of the entry.
+            for line in got.lines().filter(|l| {
+                l.contains("Specialist model options")
+                    || l.trim_start().starts_with("implementor:")
+                    || l.trim_start().starts_with("verifier:")
+            }) {
+                assert!(
+                    line.starts_with("    "),
+                    "injected line not continuation-indented: {line:?}"
+                );
+            }
+        }
+    }
+
+    // The injection composes with feature pruning: a bridge with a disabled
+    // toggle still gets the options block, and the pruned namespace stays
+    // gone.
+    #[test]
+    fn model_options_compose_with_feature_pruning() {
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let got = workspace_api_description_with_model_options(false, &features, &sample_options());
+        assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
+        assert!(
+            got.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            "options block missing on a pruned description"
+        );
+    }
+
+    // Multi-line author text cannot break the description's line structure:
+    // newlines in hints (and ids) are flattened to spaces.
+    #[test]
+    fn model_options_flatten_multiline_hints() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            options: vec![SpecialistModelOption {
+                model: "opencode:kimi-k3".to_string(),
+                hint: "line one\nline two".to_string(),
+            }],
+        }];
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            &options,
+        );
+        assert!(
+            got.contains("`opencode:kimi-k3` (line one line two)"),
+            "multi-line hint not flattened:\n{got}"
         );
     }
 }
