@@ -111,7 +111,7 @@ impl OpenAiEngine {
             return Err(match status.as_u16() {
                 401 | 403 => Error::Auth(format!("openai returned {status}: {detail}")),
                 429 => Error::RateLimited(format!("openai returned {status}: {detail}")),
-                404 => Error::NotConfigured(format!("openai returned {status}: {detail}")),
+                404 => Error::ModelUnavailable(format!("openai returned {status}: {detail}")),
                 _ => Error::Api(format!("openai returned {status}: {detail}")),
             });
         }
@@ -136,7 +136,7 @@ impl VoiceEngine for OpenAiEngine {
             Ok(t) => Ok(t),
             // Model unavailable on this account → retry once with whisper-1
             // (unless whisper-1 was the selected model).
-            Err(Error::NotConfigured(_)) if self.model != FALLBACK_MODEL => {
+            Err(Error::ModelUnavailable(_)) if self.model != FALLBACK_MODEL => {
                 self.attempt(&request, FALLBACK_MODEL).await
             }
             Err(e) => Err(e),

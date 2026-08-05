@@ -70,10 +70,12 @@ pub(crate) struct ParsedRequest {
 }
 
 /// Map a voice engine/registry error onto a domain error (→ `-32603`): a
-/// missing key (`NotConfigured`) surfaces as `VoiceNotConfigured` so the
-/// wire carries `error.data.code = "voice-no-api-key"` (monorepo#1448); any
-/// other provider failure surfaces as `Internal` with a descriptive
-/// message (§9). The descriptive text is identical in both shapes.
+/// missing key (`NotConfigured` — exclusively the registry's no-key case;
+/// provider failures such as OpenAI model-unavailable use distinct variants)
+/// surfaces as `VoiceNotConfigured` so the wire carries
+/// `error.data.code = "voice-no-api-key"` (monorepo#1448); any other
+/// provider failure surfaces as `Internal` with a descriptive message (§9).
+/// The descriptive text is identical in both shapes.
 pub(crate) fn map_voice_err(e: intent_voice::Error) -> Error {
     match e {
         intent_voice::Error::NotConfigured(_) => Error::VoiceNotConfigured {
@@ -466,6 +468,7 @@ mod tests {
         for e in [
             intent_voice::Error::Auth("401 Unauthorized".into()),
             intent_voice::Error::Api("500: Internal Server Error".into()),
+            intent_voice::Error::ModelUnavailable("openai returned 404: model not found".into()),
         ] {
             let expected = e.to_string();
             let mapped = map_voice_err(e);

@@ -108,10 +108,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             data: Some(json!({ "code": category.as_str(), "detail": detail })),
         },
         // Missing voice provider API key: same -32603 code and "Internal
-        // error" message as before, plus machine-readable `data.code` with
+        // error" message as before (deliberately not the variant's Display,
+        // which carries the detail), plus machine-readable `data.code` with
         // the descriptive text preserved in `data.detail` (monorepo#1448).
-        Error::VoiceNotConfigured { detail } => RpcErr {
-            code: -32603,
+        ref e @ Error::VoiceNotConfigured { ref detail } => RpcErr {
+            code: e.code(),
             message: "Internal error".to_string(),
             data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
         },
