@@ -79,7 +79,11 @@ pub fn staging_catalog(home: &Path) -> Vec<StagedAuthFile> {
 }
 
 /// Copy one staged file into the guest home with a 0600 atomic temp+rename
-/// (the rotation watcher reuses this for pushes into running VMs).
+/// (the rotation watcher reuses this for pushes into running VMs). Returns
+/// `false` without writing when the host file is absent OR the destination
+/// already holds identical bytes — refreshers rewrite credential files on a
+/// timer without changing them, and re-pushing those would spam the rotation
+/// log and guest I/O for nothing.
 pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, MicrovmError> {
     if !entry.host.is_file() {
         return Ok(false);
@@ -91,6 +95,9 @@ pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, Mic
     }
     let bytes = std::fs::read(&entry.host)
         .map_err(|e| MicrovmError::AuthStage(format!("read {}: {e}", entry.host.display())))?;
+    if matches!(std::fs::read(&dst), Ok(existing) if existing == bytes) {
+        return Ok(false);
+    }
     let tmp = dst.with_extension("intentd-staging");
     std::fs::write(&tmp, &bytes)
         .map_err(|e| MicrovmError::AuthStage(format!("write {}: {e}", tmp.display())))?;
@@ -105,11 +112,15 @@ pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, Mic
 }
 
 /// Stage the full catalog into `guest_home`, returning the entries that were
-/// actually staged (host file present).
+/// actually staged (host file present). Presence — not `stage_file`'s
+/// "wrote bytes" bool — decides membership, so an entry whose destination
+/// already matched still gets rotation-watched.
 pub fn stage_all(home: &Path, guest_home: &Path) -> Result<Vec<StagedAuthFile>, MicrovmError> {
     let mut staged = Vec::new();
     for entry in staging_catalog(home) {
-        if stage_file(&entry, guest_home)? {
+        let host_present = entry.host.is_file();
+        stage_file(&entry, guest_home)?;
+        if host_present {
             staged.push(entry);
         }
     }
@@ -263,6 +274,53 @@ mod tests {
         // and claude-code rides CLAUDE_CODE_OAUTH_TOKEN — none are staged.
         assert!(!rels.iter().any(|r| r.contains("opencode")));
         assert!(!rels.iter().any(|r| r.contains("claude")));
+    }
+
+    #[test]
+    fn stage_file_skips_unchanged_content_and_pushes_changed() {
+        let host_home = tempfile::tempdir().unwrap();
+        let guest_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_home.path().join(".augment")).unwrap();
+        let host_file = host_home.path().join(".augment/session.json");
+        std::fs::write(&host_file, b"{\"t\":1}").unwrap();
+        let entry = StagedAuthFile {
+            host: host_file.clone(),
+            guest_rel: ".augment/session.json",
+            provider: "auggie",
+        };
+
+        // First push writes.
+        assert!(stage_file(&entry, guest_home.path()).unwrap());
+        // Identical-content rewrite (refresher touch) is skipped.
+        std::fs::write(&host_file, b"{\"t\":1}").unwrap();
+        assert!(!stage_file(&entry, guest_home.path()).unwrap());
+        // Real rotation pushes again.
+        std::fs::write(&host_file, b"{\"t\":2}").unwrap();
+        assert!(stage_file(&entry, guest_home.path()).unwrap());
+        assert_eq!(
+            std::fs::read(guest_home.path().join(".augment/session.json")).unwrap(),
+            b"{\"t\":2}"
+        );
+    }
+
+    #[test]
+    fn stage_all_includes_already_matching_entries() {
+        // A destination that already matches must still be returned (so the
+        // rotation watcher covers it) even though no bytes were written.
+        let host_home = tempfile::tempdir().unwrap();
+        let guest_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_home.path().join(".augment")).unwrap();
+        std::fs::write(host_home.path().join(".augment/session.json"), b"{\"t\":1}").unwrap();
+        std::fs::create_dir_all(guest_home.path().join(".augment")).unwrap();
+        std::fs::write(
+            guest_home.path().join(".augment/session.json"),
+            b"{\"t\":1}",
+        )
+        .unwrap();
+
+        let staged = stage_all(host_home.path(), guest_home.path()).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].guest_rel, ".augment/session.json");
     }
 
     #[test]
