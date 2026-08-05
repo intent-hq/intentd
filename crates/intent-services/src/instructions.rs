@@ -134,11 +134,20 @@ fn remove_section(text: &str, heading: &str) -> String {
     }
 }
 
+/// The "Cross-repo PRs" bullet in common.md's "Waiting on External
+/// Conditions" section: its `ws.host.exec` recipe only works when
+/// `agentFeatures.hostExec` is on, so it is scrubbed when the toggle is off
+/// (a unit test guards that this line still matches the bundled body
+/// verbatim).
+const WAITING_HOST_EXEC_BULLET: &str = "- **Cross-repo PRs**: `ws.pr.*` is scoped to the workspace's own repo. For a PR in a different repo (e.g. a submodule PR), have the hook run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` and diff the fields you care about against `hookState`.\n";
+
 /// The `common` body with feature-gated sections omitted (spec audit rows 1,
 /// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
-/// "Raising Attention". With all defaults on this borrows the bundled body
-/// untouched (byte-identical prompts).
+/// "Raising Attention". When `hostExec` is off but the Waiting section
+/// survives, its `ws.host.exec` cross-reference bullet is scrubbed. With all
+/// defaults on this borrows the bundled body untouched (byte-identical
+/// prompts).
 fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     let mut body = Cow::Borrowed(COMMON);
     if !features.attention_requests {
@@ -146,6 +155,8 @@ fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     }
     if !features.background_hooks {
         body = Cow::Owned(remove_section(&body, "Waiting on External Conditions"));
+    } else if !features.host_exec {
+        body = Cow::Owned(body.replacen(WAITING_HOST_EXEC_BULLET, "", 1));
     }
     if !features.rich_chat_blocks {
         body = Cow::Owned(remove_section(&body, "Rich Chat Rendering"));
@@ -326,6 +337,25 @@ mod tests {
         assert!(out.contains("## Raising Attention"));
         assert!(out.contains("progressing work.\n\n## Response Organization"));
         assert!(out.contains("## Rich Chat Rendering"));
+    }
+
+    #[test]
+    fn host_exec_off_scrubs_cross_repo_bullet_from_waiting_section() {
+        // Guard: the gated bullet text still matches the bundled body.
+        assert!(COMMON.contains(WAITING_HOST_EXEC_BULLET));
+        let features = AgentFeaturesSettings {
+            host_exec: false,
+            ..defaults()
+        };
+        let common = gated_common(&features);
+        assert!(common.contains("## Waiting on External Conditions"));
+        assert!(!common.contains("ws.host.exec"));
+        assert!(!common.contains("**Cross-repo PRs**"));
+        // Neighboring bullets survive intact, with clean list separation.
+        assert!(common.contains("ws.pr.snapshot(prNumber)"));
+        assert!(common.contains(
+            "against `hookState`, and dispatches only on meaningful change.\n- **Hygiene**"
+        ));
     }
 
     #[test]
