@@ -703,31 +703,111 @@ impl Services {
                 hook_id.0
             )));
         }
-        self.abort_hook_task(hook_id);
+        // FE-cancel (by_owner = false) wakes the owner with a notice;
+        // owner-side cancel delivers no wake.
+        let notice = (!by_owner).then_some("This hook was cancelled from the app.");
+        let hook = self.cancel_active_hook(hook, notice).await?;
+        Ok(json!({ "ok": true, "hook": hook }))
+    }
+
+    /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
+    /// archive sweep ([`Services::cancel_workspace_hooks`]): abort the
+    /// scheduler task, persist `cancelled`, clear `nextRunAt`, and emit
+    /// `hook:cancelled`. With a `wake_notice` the owner is woken (the wake
+    /// runs the deferral backstop itself, inside `wake_hook_owner`, after
+    /// the delivery attempt); without one, no wake is delivered — a deferred
+    /// completion watch on the (idle) owner would otherwise never settle
+    /// when this was its last active hook, so the backstop runs directly.
+    /// The caller must have verified the hook is ACTIVE.
+    async fn cancel_active_hook(&self, mut hook: Hook, wake_notice: Option<&str>) -> Result<Hook> {
+        self.abort_hook_task(&hook.hook_id);
         self.store
-            .update_hook_state(hook_id, HookState::Cancelled)
+            .update_hook_state(&hook.hook_id, HookState::Cancelled)
             .await?;
-        self.store.update_hook_next_run(hook_id, None).await?;
-        let mut hook = hook;
+        self.store.update_hook_next_run(&hook.hook_id, None).await?;
         hook.state = HookState::Cancelled;
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
-        if !by_owner {
-            // The FE-cancel wake runs the deferral backstop itself (inside
-            // `wake_hook_owner`, after the delivery attempt).
-            self.wake_hook_owner(&hook, "This hook was cancelled from the app.", "cancelled")
-                .await;
-        } else {
-            // Owner-side cancel delivers no wake, so a deferred completion
-            // watch on the (idle) owner would otherwise never settle when
-            // this was its last active hook — run the backstop directly.
-            self.resettle_owner_after_hook_terminal(&hook).await;
+        match wake_notice {
+            Some(notice) => self.wake_hook_owner(&hook, notice, "cancelled").await,
+            None => self.resettle_owner_after_hook_terminal(&hook).await,
         }
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) — best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
-        Ok(json!({ "ok": true, "hook": hook }))
+        Ok(hook)
+    }
+
+    /// Archive sweep (`workspace.archive`): cancel every ACTIVE
+    /// (`scheduled`/`running`) hook in the workspace through the
+    /// `hook.cancel` machinery — task aborted, state persisted to
+    /// `cancelled`, `hook:cancelled` emitted — plus an owner-wake notice so
+    /// the agent learns why its watch stopped. Runs AFTER the archived row
+    /// is persisted: the wake rides the archived gate in
+    /// [`Services::deliver_wake_message`], so it parks in the queue (at
+    /// most) and never starts a turn while the workspace is archived.
+    /// Terminal hooks (`dispatched`/`evicted`/`cancelled`/`expired`) are
+    /// untouched. Best-effort per hook: a store failure is logged and the
+    /// sweep moves on — archiving must not fail because one hook row would
+    /// not update.
+    pub(crate) async fn cancel_workspace_hooks(&self, workspace_id: &WorkspaceId) {
+        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+            Ok(hooks) => hooks,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "archive hook sweep: hook list failed; skipping"
+                );
+                return;
+            }
+        };
+        for hook in hooks {
+            if !matches!(hook.state, HookState::Scheduled | HookState::Running) {
+                continue;
+            }
+            let hook_id = hook.hook_id.clone();
+            if let Err(e) = self
+                .cancel_active_hook(
+                    hook,
+                    Some("This hook was cancelled because its workspace was archived."),
+                )
+                .await
+            {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    hook = %hook_id.0,
+                    error = %e,
+                    "archive hook sweep: cancel failed; continuing"
+                );
+            }
+        }
+    }
+
+    /// Delete teardown (`workspace.delete`): eagerly abort every live hook
+    /// scheduler task owned by the workspace. The store cascade drops the
+    /// hook rows themselves, but without this sweep a live task would only
+    /// exit lazily at its next tick (the pre-run re-read finds the row
+    /// gone) — until then it lingers in `hook_tasks` holding its timer.
+    /// Must run BEFORE the cascade so the rows are still listable.
+    /// Best-effort: a list failure is logged and skipped (the lazy
+    /// next-tick exit still applies).
+    pub(crate) async fn abort_workspace_hook_tasks(&self, workspace_id: &WorkspaceId) {
+        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+            Ok(hooks) => hooks,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "delete hook sweep: hook list failed; tasks will exit lazily"
+                );
+                return;
+            }
+        };
+        for hook in hooks {
+            self.abort_hook_task(&hook.hook_id);
+        }
     }
 
     /// `hook.runNow`: signal an active hook's task to run immediately (the
@@ -1882,6 +1962,94 @@ mod tests {
             session.messages.is_empty(),
             "owner-initiated cancel must not wake the owner"
         );
+    }
+
+    /// `workspace.archive` cancels every ACTIVE hook in the workspace per
+    /// the existing cancel semantics — state persisted to `cancelled`, task
+    /// aborted, `hook:cancelled` emitted, owner told why — while terminal
+    /// hooks are untouched.
+    #[tokio::test]
+    async fn archive_cancels_active_hooks_and_leaves_terminal_hooks_untouched() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // A terminal hook first: an immediate dispatch short-circuits the
+        // schedule, leaving a `dispatched` row with no live task.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "already-done",
+                    "code": "return { dispatch: true, message: 'done' };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule dispatched");
+        let dispatched: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(dispatched.state, HookState::Dispatched);
+        // And one active hook with a live scheduler task.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+
+        let archived = svc.archive_workspace(ws.clone()).await.expect("archive");
+        assert!(archived.archived, "workspace archived");
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        assert!(stored.next_run_at.is_none());
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
+        // Terminal hooks are untouched by the sweep.
+        let stored = svc.store().get_hook(&dispatched.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Dispatched);
+        // The owner learns why its watch stopped (store-only wake here: no
+        // manager attached, so nothing can spawn a turn).
+        let text = wait_for_wake(&svc, &owner, "workspace was archived").await;
+        assert!(text.contains("cancelled"), "{text}");
+    }
+
+    /// `workspace.delete` aborts the workspace's live hook scheduler tasks
+    /// EAGERLY — the task is gone the moment delete returns, not lazily at
+    /// its next tick — and the store cascade drops the row.
+    #[tokio::test]
+    async fn delete_aborts_live_hook_tasks_eagerly() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "doomed",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+
+        svc.delete_workspace(ws.clone()).await.expect("delete");
+
+        assert!(
+            !svc.hook_task_alive(&hook.hook_id),
+            "hook task aborted eagerly, not at its next tick"
+        );
+        let err = svc.store().get_hook(&hook.hook_id).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err}");
     }
 
     /// Persisted `workspace:displayStatus-changed` payload statuses for a

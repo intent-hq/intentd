@@ -3525,6 +3525,35 @@ impl AgentManager {
         if !self.services.has_ready_to_send(&agent_id) {
             return;
         }
+        // Archived-workspace gate: the archive sweep interrupts in-flight
+        // turns but KEEPS pending queues persisted, so the automatic drain
+        // must not respawn a turn while the workspace is archived — messages
+        // park until unarchive, which kicks this drain for every parked
+        // queue (see `unarchive_workspace`). Chief is virtual and never
+        // archived, so skip the row read. Fail open on a lookup error: the
+        // gate only parks affirmatively-archived workspaces; a transient
+        // store error must not strand the queue.
+        if !workspace_id.is_chief() {
+            match self.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "skipping queue drain: workspace is archived"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "queue drain: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
         // parked while the agent's last assistant message carries
         // un-dismissed question blocks — draining one would append a user
@@ -3583,15 +3612,19 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
-        // Batch flush (`agents.flushQueuedMessages`, default on): with the
-        // setting on and MORE THAN ONE ready-to-send entry waiting (under an
+        // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
+        // batching mode and MORE THAN ONE eligible entry waiting (under an
         // active hold: user-origin entries only — the hold contract is
         // unchanged), drain them all into ONE combined provider turn while
-        // persisting each entry as its own transcript row. A single ready
-        // entry (or the setting off) falls through to the existing
+        // persisting each entry as its own transcript row. A single eligible
+        // entry (or the `off` mode) falls through to the existing
         // single-entry path unchanged.
-        if self.services.flush_queued_messages_enabled() {
-            if let Some(batch) = self.services.dequeue_ready_batch(&agent_id, hold_drain, 2) {
+        {
+            let mode = self.services.flush_queued_messages_mode();
+            if let Some(batch) = self
+                .services
+                .dequeue_flush_batch(&agent_id, mode, hold_drain, 2)
+            {
                 match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn { content, options } => {
                         self.spawn_worker(agent_id, workspace_id, content, *options, true);
@@ -6256,11 +6289,15 @@ async fn run_message_worker(
         // kick `try_drain_queue`.
         let hold_active = mgr.services.question_hold_active(&agent_id).await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
-        // `try_drain_queue` flush arm — ≥2 ready entries (user-origin only
+        // `try_drain_queue` flush arm — ≥2 eligible entries (user-origin only
         // under an active hold) drain into one combined provider turn;
         // otherwise the single-entry arm below runs unchanged.
-        if mgr.services.flush_queued_messages_enabled() {
-            if let Some(batch) = mgr.services.dequeue_ready_batch(&agent_id, hold_active, 2) {
+        {
+            let mode = mgr.services.flush_queued_messages_mode();
+            if let Some(batch) = mgr
+                .services
+                .dequeue_flush_batch(&agent_id, mode, hold_active, 2)
+            {
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
                     FlushPrep::Turn {
                         content: c,
@@ -6398,32 +6435,48 @@ async fn run_message_worker(
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
             // Batch flush (`agents.flushQueuedMessages`): `next` was popped
-            // before the slot re-claim, so fold any FURTHER ready entries in
-            // behind it (min 1 more ⇒ ≥2 total, matching the other flush
-            // arms; user-origin only under an active hold) and run them as
-            // one combined turn. With no extra entry (or the setting off)
-            // the single-entry path below runs unchanged.
-            if mgr.services.flush_queued_messages_enabled() {
-                let hold = mgr.services.question_hold_active(&agent_id).await;
-                if let Some(mut batch) = mgr.services.dequeue_ready_batch(&agent_id, hold, 1) {
-                    batch.insert(0, next);
-                    match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
-                        FlushPrep::Turn {
-                            content: c,
-                            options: o,
-                        } => {
-                            content = c;
-                            options = *o;
-                            user_persisted = true;
-                            // New messages → fresh silent-redrive budget
-                            // (monorepo#764).
-                            silent_redrive_used = false;
-                            continue 'outer;
-                        }
-                        FlushPrep::Parked => {
-                            mgr.release_in_flight_slot(&agent_id).await;
-                            break 'outer;
-                        }
+            // before the slot re-claim, so fold any FURTHER eligible entries
+            // in behind it and run them as one combined turn. Mode `all`:
+            // any further ready entry (min 1 more ⇒ ≥2 total, user-origin
+            // only under an active hold, matching the other flush arms).
+            // Mode `systemOnly`: only when `next` is ITSELF system-origin
+            // (and no hold is active) — a user-origin `next` never batches
+            // under `systemOnly`, so it falls through to the single-entry
+            // path below unchanged. With no extra entry (or the `off` mode)
+            // the single-entry path below also runs unchanged.
+            let mode = mgr.services.flush_queued_messages_mode();
+            let hold = mgr.services.question_hold_active(&agent_id).await;
+            let extra_batch = match mode {
+                intent_core::FlushQueuedMessagesMode::All => {
+                    mgr.services.dequeue_ready_batch(&agent_id, hold, 1)
+                }
+                intent_core::FlushQueuedMessagesMode::SystemOnly => {
+                    if hold || next.user_origin {
+                        None
+                    } else {
+                        mgr.services.dequeue_system_only_batch(&agent_id, 1)
+                    }
+                }
+                intent_core::FlushQueuedMessagesMode::Off => None,
+            };
+            if let Some(mut batch) = extra_batch {
+                batch.insert(0, next);
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
                     }
                 }
             }

@@ -728,10 +728,9 @@ impl Services {
             .unwrap_or_default()
     }
 
-    /// Whether queue drains should deliver the whole queued-message backlog
-    /// in one batched turn (`agents.flushQueuedMessages`, default on). Read
+    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_enabled(&self) -> bool {
+    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 
@@ -10991,6 +10990,10 @@ impl WorkspaceApi for Services {
             // emits no further events) and the row is pruned by the next
             // startup heal's workspace-existence check.
             services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree
@@ -11219,6 +11222,10 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        // Graceful-interrupt capability: `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the sweep and still archives.
+        let manager = self.agent_manager();
         Box::pin(async move {
             // Chief cannot be archived: it is a fixed virtual workspace, so
             // return the synthesized shape unchanged rather than mutating the
@@ -11233,6 +11240,43 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
+            // Gracefully interrupt every in-flight turn in the workspace —
+            // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+            // turn cancelled over the wire, draining worker aborted, terminal
+            // `agent:stream:end` emitted, provider child + ACP session kept
+            // alive. Unlike `delete_workspace` nothing is deleted: session
+            // rows, transcripts, completion watches, and pending message
+            // queues all survive so unarchive can resume work. Runs AFTER the
+            // archived row is persisted so any concurrent queue-drain kick
+            // observes the archived flag and parks instead of respawning a
+            // turn (see the archived gate in `try_drain_queue`).
+            //
+            // Residual race (deliberate trade-off): a drain that read the
+            // workspace row BEFORE the persist above can still claim the
+            // in-flight slot after the `list_busy` snapshot below, spawning
+            // one stray turn in the freshly archived workspace that this
+            // sweep misses. The window is a few statements wide and the
+            // failure is benign — that turn runs to completion once and every
+            // subsequent drain/wake parks behind the archived gates — so the
+            // sweep accepts it rather than adding a post-claim re-check to
+            // the hot drain path.
+            if let Some(manager) = manager {
+                for (agent_id, agent_ws) in manager.list_busy() {
+                    if agent_ws == id {
+                        manager.interrupt(&agent_id).await;
+                    }
+                }
+            }
+            // Cancel every active background hook in the workspace: task
+            // aborted, state persisted to `cancelled`, `hook:cancelled`
+            // emitted, owner woken with a notice. Unarchive does NOT
+            // resurrect cancelled hooks — the notice tells the owner to
+            // reschedule if the condition still matters. Runs AFTER the
+            // archived row is persisted so the cancel wakes park behind the
+            // archived gate in `deliver_wake_message` (queued at most, no
+            // turn spawned) — the same reason the interrupt sweep above
+            // runs post-persist.
+            this.cancel_workspace_hooks(&id).await;
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
@@ -11265,6 +11309,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
+        let manager = self.agent_manager();
         Box::pin(async move {
             if id.is_chief() {
                 return Ok(chief_workspace());
@@ -11275,6 +11320,36 @@ impl WorkspaceApi for Services {
             ws.archived_at = None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Re-engage queues parked by the archived gates
+            // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
+            // background agent's drain organically, so without this a queue
+            // parked during archive — including the hook-cancel wake notices
+            // — would stay stranded until someone happened to message the
+            // agent. Kick the drain for every workspace agent with
+            // ready-to-send work (cheap summary read, no message hydration);
+            // `try_drain_queue` re-checks its own gates (busy, question
+            // hold, Error park). Best-effort: a listing failure is logged
+            // and unarchive still succeeds — parked queues then drain on the
+            // next explicit kick.
+            if let Some(manager) = manager {
+                match store.list_agent_session_summaries(&id).await {
+                    Ok(sessions) => {
+                        for session in sessions {
+                            if this.has_ready_to_send(&session.id) {
+                                manager
+                                    .clone()
+                                    .try_drain_queue(session.id, id.clone())
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "unarchive: agent session listing failed; parked queues drain on next kick"
+                    ),
+                }
+            }
             this.derive_last_activity(&mut ws).await;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
