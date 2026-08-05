@@ -1429,7 +1429,16 @@ impl AgentManager {
                 // `[agentFeatures]` toggles are captured here, at bridge
                 // creation, so they apply to new sessions only — a settings
                 // change never mutates a live agent's surface.
-                .with_agent_features(self.services.effective_settings().agent_features),
+                .with_agent_features(self.services.effective_settings().agent_features)
+                // Specialist `modelOptions` (PROTOCOL §5.11) resolved once
+                // at bridge creation, same snapshot semantics as the
+                // feature toggles: the delegate docs in this agent's
+                // `workspace_api` description list them per specialist.
+                .with_specialist_model_options(
+                    self.services
+                        .specialist_model_options_for_workspace(&workspace_id)
+                        .await,
+                ),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await

@@ -794,6 +794,70 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
+    /// Resolve every non-hidden specialist's delegation `modelOptions`
+    /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
+    /// per-agent `workspace_api` tool description at bridge creation.
+    /// Specialists without options (the default) are omitted; resolution
+    /// failure yields an empty list — spawning never fails on this.
+    pub(crate) fn specialist_model_options(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        use serde_json::Value;
+        let Ok(listed) = self.specialists_service().list(workspace_path) else {
+            return Vec::new();
+        };
+        let Some(specs) = listed.get("specialists").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        specs
+            .iter()
+            .filter(|def| !def.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|def| {
+                let id = def.get("id").and_then(Value::as_str)?;
+                let options: Vec<intent_acp::SpecialistModelOption> = def
+                    .get("modelOptions")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(|o| {
+                        Some(intent_acp::SpecialistModelOption {
+                            model: o.get("model").and_then(Value::as_str)?.to_string(),
+                            hint: o
+                                .get("hint")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect();
+                if options.is_empty() {
+                    return None;
+                }
+                Some(intent_acp::SpecialistModelOptions {
+                    specialist: id.to_string(),
+                    options,
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::specialist_model_options`] with the project tier derived from
+    /// the stored workspace record (worktree path, else repository path) —
+    /// the same security-motivated derivation the spawn-time model resolution
+    /// uses. Lookup failure degrades to the user/bundled tiers only.
+    pub(crate) async fn specialist_model_options_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        let wp = self
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        self.specialist_model_options(wp.as_deref())
+    }
+
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
     /// prepend to a specialist agent's next turn, or `None` when the agent has no
     /// specialist or its specialist yields no reminder (port of acp-provider.ts
@@ -12014,21 +12078,22 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
-            let changed = ws.attention != WorkspaceAttention::None;
-            ws.attention = WorkspaceAttention::None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
+            // Dismissing attention merely acknowledges it — not "activity" —
+            // so never touch `updated_at` (which feeds the derived
+            // `lastActivity`), and skip the row write entirely when attention
+            // is already clear (intent-hq/monorepo#1466).
+            if ws.attention != WorkspaceAttention::None {
+                ws.attention = WorkspaceAttention::None;
+                store.update_workspace(&ws).await?;
+                // Self-sufficient `workspace:attention-changed` so every client
+                // clears the blue dot together (PROTOCOL §6.5); emit only on an
+                // actual change.
+                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
+            }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
-            // Self-sufficient `workspace:attention-changed` so every client clears
-            // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
-            if changed {
-                publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
-            }
             Ok(ws)
         })
     }
@@ -12043,13 +12108,13 @@ impl WorkspaceApi for Services {
             }
             let mut ws = store.get_workspace(&id).await?;
             // "Seen" clears the unread flag; review-required attention persists.
+            // Merely looking at a workspace is not "activity", so `updated_at`
+            // (which feeds the derived `lastActivity`) stays untouched
+            // (intent-hq/monorepo#1466).
             if ws.attention == WorkspaceAttention::Unread {
                 ws.attention = WorkspaceAttention::None;
-                ws.updated_at = now_iso();
                 store.update_workspace(&ws).await?;
                 publish_event(&bus, attention_changed_event(&ws.id, ws.attention)).await;
-                // Schedule debounced lastActivity event (§10.1).
-                this.schedule_last_activity_event(id.clone());
             }
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
@@ -18890,8 +18955,20 @@ impl WorkspaceApi for Services {
                 .await
                 .ok()
                 .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            // Language: per-call hint, else the `voice.language` setting,
+            // else none (provider auto-detection).
+            let language_setting = self
+                .settings_service()
+                .get("voice.language")
+                .await
+                .ok()
+                .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string));
+            let language = voice_ops::resolve_language(
+                parsed.language.as_deref(),
+                language_setting.as_deref(),
+            );
             let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
-            let request = voice_ops::build_engine_request(&parsed, &vocabulary);
+            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
             let transcript = engine
                 .transcribe(request)
                 .await

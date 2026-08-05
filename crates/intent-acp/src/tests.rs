@@ -5315,6 +5315,37 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
+    async fn tools_list_description_advertises_specialist_model_options() {
+        // A bridge wired with specialist `modelOptions` advertises them in
+        // the delegate docs; the wiring composes with feature pruning on the
+        // same server. (The no-options byte-parity case is covered by
+        // `tools_list_description_prunes_disabled_feature` above.)
+        use crate::mcp_server::{SpecialistModelOption, SpecialistModelOptions};
+        let srv = server("amber-forest", None)
+            .with_agent_features(no_hooks_features())
+            .with_specialist_model_options(vec![SpecialistModelOptions {
+                specialist: "implementor".to_string(),
+                options: vec![SpecialistModelOption {
+                    model: "opencode:kimi-k3".to_string(),
+                    hint: "cheap".to_string(),
+                }],
+            }]);
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            "delegate docs must list the specialist's model options"
+        );
+        assert!(
+            !desc.contains("ws.hook."),
+            "feature pruning must still apply alongside the options injection"
+        );
+    }
+
+    #[tokio::test]
     async fn disabled_namespace_is_absent_from_prelude() {
         // Layer (b): with the toggle off, `ws.hook` is not installed, so
         // touching it fails with the clear namespace-missing TypeError.
