@@ -2733,6 +2733,13 @@ impl Services {
         if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
                 if classification.hook_waiting {
+                    // On the canonical hook-waiting-only idle the group was
+                    // already sealed by the inline redelivery's hook guard
+                    // (delivery's tail re-check runs it first), so this
+                    // branch is the backstop for the races where that
+                    // redelivery early-returns without sealing (e.g. an
+                    // enqueue drained into a busy turn between the entry
+                    // snapshot and the redelivery's live busy probe).
                     tracing::debug!(
                         parent = %child.0,
                         group = %gid,
