@@ -8070,7 +8070,7 @@ impl Services {
                     self.register_completion_watch(
                         &parent_home_ws,
                         &workspace_id,
-                        parent,
+                        parent.clone(),
                         parent_name,
                         agent_id.clone(),
                         Some(gid),
@@ -8089,7 +8089,7 @@ impl Services {
                             .register_completion_watch(
                                 &parent_home_ws,
                                 &workspace_id,
-                                parent,
+                                parent.clone(),
                                 parent_name,
                                 agent_id.clone(),
                                 None,
@@ -8097,14 +8097,24 @@ impl Services {
                             .map(|_| ()),
                     }
                 };
-                if let Err(e) = registered {
-                    // Scope-gate rejection is non-fatal on resume: the agent
-                    // still continues; only the parent wake path is lost.
-                    tracing::warn!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "resume: completion-watch re-registration rejected"
-                    );
+                match registered {
+                    // The re-armed watch changed (or refreshed) the parent's
+                    // watch set: publish the subscriptions snapshot like every
+                    // other watch-lifecycle site (monorepo#1449) — the publish
+                    // also recomputes the anchor workspace's displayStatus.
+                    Ok(()) => {
+                        self.publish_subscriptions_changed(&parent_home_ws, &parent)
+                            .await;
+                    }
+                    Err(e) => {
+                        // Scope-gate rejection is non-fatal on resume: the agent
+                        // still continues; only the parent wake path is lost.
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            error = %e,
+                            "resume: completion-watch re-registration rejected"
+                        );
+                    }
                 }
             }
         }
