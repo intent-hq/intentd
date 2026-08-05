@@ -11236,6 +11236,127 @@ async fn queue_retraction_synthesized_idle_seals_group() {
     assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
+/// monorepo#1483 regression: a coordinator that owns an ACTIVE background
+/// hook still seals its open after_all group when it goes queue-idle — the
+/// hook-waiting classification defers only the agent's own settlement as a
+/// child, never the parent-side seal. Once every child settles, the
+/// aggregated wake is claimed and delivered and the group is removed.
+#[tokio::test]
+async fn hook_owning_parent_idle_seals_group_and_wake_delivers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    seed_active_hook(&svc, &ws, &parent, "ci-watch").await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    // The hook-owning parent idles: its delegating turn is over, so the
+    // group seals despite the active hook (previously the hook-waiting
+    // classification starved the seal forever).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group awaits its child");
+    assert!(
+        group.sealed,
+        "queue-idle seals the group despite the parent's active hook"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The child settles: the sealed + complete group fires exactly one
+    // aggregated wake and is removed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake delivered despite the parent's active hook"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "delivered group removed"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1483 guard (monorepo#1336 unchanged): a grouped CHILD going idle
+/// while owning an active hook is still NOT recorded as settled — the seal
+/// gating change is scoped to the parent's own idle, and the sealed group
+/// keeps waiting for the hook-waiting child's genuine completion.
+#[tokio::test]
+async fn hook_waiting_child_settlement_still_deferred_after_seal() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
+
+    // Parent idles: seals the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert!(
+        svc.delegation_group_for_parent(&parent)
+            .expect("group open")
+            .sealed
+    );
+
+    // Child idles while its hook is active: deferred — not recorded, no fire.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("sealed group still waits for the hook-waiting child");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "hook-waiting idle is not recorded as settlement"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The hook dispatches; the child's next idle is its real completion —
+    // the group records it and fires exactly one aggregated wake.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
 /// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
 /// refreshed waiting flags: `true` + the child id on registration (delegate),
 /// `false` + empty after the aggregated wake clears the group watches.
@@ -17948,6 +18069,313 @@ async fn dismiss_questions_fails_closed() {
     let oversized = "m".repeat(crate::agent_ops::MAX_MESSAGE_ID_LEN + 1);
     assert!(matches!(
         svc.agent_dismiss_questions_op(ws, id, oversized).await,
+        Err(Error::InvalidParams(_))
+    ));
+}
+
+// -------------------------------------------------------------------------
+// `agent.markSeen` (PROTOCOL §5.5): per-conversation seen marker.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mark_seen_persists_marker_and_emits_agent_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let seen = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append message");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), seen.id.clone())
+        .await
+        .expect("mark seen");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["lastSeenMessageId"], json!(seen.id));
+
+    // Marker persisted on the session row (survives reload) and lifted into
+    // the AgentLite metadata projection.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    assert_eq!(
+        lite.metadata.last_seen_message_id.as_deref(),
+        Some(seen.id.as_str())
+    );
+
+    // `agent:updated` emitted, scoped to the workspace, carrying the marker.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(
+        batch[0].data["lastSeenMessageId"].as_str(),
+        Some(seen.id.as_str())
+    );
+}
+
+/// Monotonicity: marking a message OLDER than the current marker is a no-op
+/// returning the current marker (no write, no event); re-marking the same
+/// message is idempotent (no duplicate event); marking a NEWER message
+/// advances the marker.
+#[tokio::test]
+async fn mark_seen_is_monotonic_and_idempotent() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let first = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "one" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append first");
+    let second = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "two" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append second");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), second.id.clone())
+        .await
+        .expect("mark second");
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+
+    // Older message: no-op returning the CURRENT marker, no write, no event.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), first.id.clone())
+        .await
+        .expect("mark older");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(second.id.as_str()));
+
+    // Same message again: idempotent success, still no event.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), second.id.clone())
+        .await
+        .expect("re-mark");
+    assert_eq!(r["lastSeenMessageId"], json!(second.id));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no agent:updated for the older-message no-op or the idempotent re-mark"
+    );
+
+    // A newer message advances the marker (and emits again).
+    let third = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "three" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append third");
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), third.id.clone())
+        .await
+        .expect("mark third");
+    assert_eq!(r["lastSeenMessageId"], json!(third.id));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(
+        batch[0].data["lastSeenMessageId"].as_str(),
+        Some(third.id.as_str())
+    );
+}
+
+/// Dangling ids are tolerated (same laxity as `agent.dismissQuestions`): an
+/// unknown NEW id writes through, and a dangling CURRENT marker (e.g. the row
+/// was truncated by `agent.editAndRegenerate`) never blocks an advance.
+#[tokio::test]
+async fn mark_seen_tolerates_dangling_ids() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let real = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append message");
+
+    // Unknown id: marker write allowed (dangling semantics).
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), "msg-unknown".to_string())
+        .await
+        .expect("mark unknown");
+    assert_eq!(r["lastSeenMessageId"], json!("msg-unknown"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some("msg-unknown"));
+
+    // Dangling current marker: a real message still advances it — the
+    // monotonicity gate only holds when BOTH sides resolve.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), real.id.clone())
+        .await
+        .expect("mark real");
+    assert_eq!(r["lastSeenMessageId"], json!(real.id));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(real.id.as_str()));
+
+    // Unknown NEW id over a resolvable current marker: the write-through is
+    // promised (PROTOCOL §5.5) — the gate only holds when BOTH sides resolve.
+    let r = svc
+        .agent_mark_seen_op(ws.clone(), id.clone(), "msg-unknown-2".to_string())
+        .await
+        .expect("mark unknown over real");
+    assert_eq!(r["lastSeenMessageId"], json!("msg-unknown-2"));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some("msg-unknown-2"));
+}
+
+/// A non-object `agent_session.metadata` value is preserved under
+/// `priorNonObjectMetadata` when markSeen adds its marker (same defensive
+/// shape as `agent.dismissQuestions`, monorepo#751 review).
+#[tokio::test]
+async fn mark_seen_preserves_non_object_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    // Force the session's metadata column into a non-object shape — not
+    // reachable through the normal `agent.*` API, but defensively possible
+    // if the column is ever written to by another code path.
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!("legacy-string-metadata"));
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("force non-object metadata");
+
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("mark seen");
+
+    let after = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(after.last_seen_message_id(), Some("msg-1"));
+    assert_eq!(
+        after
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("priorNonObjectMetadata")),
+        Some(&json!("legacy-string-metadata")),
+        "prior non-object metadata must be preserved, not dropped"
+    );
+}
+
+/// The seen marker coexists with existing session metadata (including the
+/// dismissal marker) and the targeted write preserves the stored
+/// `system_prompt`.
+#[tokio::test]
+async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!({ "source": "test-suite" }));
+    session.system_prompt = Some("You are a careful reviewer.".to_string());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("seed metadata + prompt");
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-q1".to_string())
+        .await
+        .expect("dismiss");
+
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("mark seen");
+
+    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let metadata = after.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["source"], json!("test-suite"));
+    assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-q1"));
+    assert_eq!(metadata["lastSeenMessageId"], json!("msg-1"));
+    assert_eq!(
+        after.system_prompt.as_deref(),
+        Some("You are a careful reviewer."),
+        "markSeen must never clear the stored system_prompt"
+    );
+}
+
+#[tokio::test]
+async fn mark_seen_fails_closed() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+
+    // Unknown agent → NotFound.
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws.clone(), missing, "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Workspace mismatch → NotFound (defense-in-depth), no marker persisted.
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    assert!(matches!(
+        svc.agent_mark_seen_op(other_ws, id.clone(), "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), None);
+
+    // Blank messageId → InvalidParams.
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws.clone(), id.clone(), "  ".to_string())
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+
+    // Oversized messageId → InvalidParams.
+    let oversized = "m".repeat(crate::agent_ops::MAX_MESSAGE_ID_LEN + 1);
+    assert!(matches!(
+        svc.agent_mark_seen_op(ws, id, oversized).await,
         Err(Error::InvalidParams(_))
     ));
 }

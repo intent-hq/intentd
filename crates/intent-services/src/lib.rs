@@ -794,6 +794,70 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
+    /// Resolve every non-hidden specialist's delegation `modelOptions`
+    /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
+    /// per-agent `workspace_api` tool description at bridge creation.
+    /// Specialists without options (the default) are omitted; resolution
+    /// failure yields an empty list — spawning never fails on this.
+    pub(crate) fn specialist_model_options(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        use serde_json::Value;
+        let Ok(listed) = self.specialists_service().list(workspace_path) else {
+            return Vec::new();
+        };
+        let Some(specs) = listed.get("specialists").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        specs
+            .iter()
+            .filter(|def| !def.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|def| {
+                let id = def.get("id").and_then(Value::as_str)?;
+                let options: Vec<intent_acp::SpecialistModelOption> = def
+                    .get("modelOptions")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(|o| {
+                        Some(intent_acp::SpecialistModelOption {
+                            model: o.get("model").and_then(Value::as_str)?.to_string(),
+                            hint: o
+                                .get("hint")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect();
+                if options.is_empty() {
+                    return None;
+                }
+                Some(intent_acp::SpecialistModelOptions {
+                    specialist: id.to_string(),
+                    options,
+                })
+            })
+            .collect()
+    }
+
+    /// [`Self::specialist_model_options`] with the project tier derived from
+    /// the stored workspace record (worktree path, else repository path) —
+    /// the same security-motivated derivation the spawn-time model resolution
+    /// uses. Lookup failure degrades to the user/bundled tiers only.
+    pub(crate) async fn specialist_model_options_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<intent_acp::SpecialistModelOptions> {
+        let wp = self
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        self.specialist_model_options(wp.as_deref())
+    }
+
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
     /// prepend to a specialist agent's next turn, or `None` when the agent has no
     /// specialist or its specialist yields no reminder (port of acp-provider.ts
@@ -2643,7 +2707,7 @@ impl Services {
             }
         }
 
-        let interim_idle = self.deliver_completion_to_watches(&child, event).await;
+        let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
@@ -2658,8 +2722,30 @@ impl Services {
         // seals there). The classification is the snapshot
         // `deliver_completion_to_watches` returned, so the seal path and the
         // watch-delivery path always agree on interim vs. real.
-        if event.event_type == AGENT_IDLE && !interim_idle {
+        //
+        // monorepo#1483: the seal gates on the QUEUE/BUSY classification
+        // alone. A hook-waiting idle (the agent owns active background
+        // hooks, monorepo#1336) defers only the agent's own settlement AS A
+        // CHILD — watch delivery and grouped recording — but its delegating
+        // turn is still over (a hook wake redrives a NEW turn). Gating the
+        // seal on `hook_waiting` too would starve a hook-chaining
+        // coordinator's group forever.
+        if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
+                if classification.hook_waiting {
+                    // On the canonical hook-waiting-only idle the group was
+                    // already sealed by the inline redelivery's hook guard
+                    // (delivery's tail re-check runs it first), so this
+                    // branch is the backstop for the races where that
+                    // redelivery early-returns without sealing (e.g. an
+                    // enqueue drained into a busy turn between the entry
+                    // snapshot and the redelivery's live busy probe).
+                    tracing::debug!(
+                        parent = %child.0,
+                        group = %gid,
+                        "sealed after_all group at a hook-waiting queue-idle (monorepo#1483)"
+                    );
+                }
                 self.try_fire_group(&gid).await;
             }
         }
@@ -2882,7 +2968,18 @@ impl Services {
         // the busy guard) so the hook's own terminal transition (dispatch /
         // eviction / expiry wake → turn-end idle, or the external-cancel
         // call into this function) synthesizes the completion later.
+        //
+        // monorepo#1483: hook deferral is scoped to the agent's settlement
+        // AS A CHILD (the synthesized watch delivery below); the agent is
+        // queue-idle here (empty queue, no worker in flight), so its
+        // delegating turn is over — seal its open after_all group NOW
+        // rather than starving the seal until the hooks resolve. Box::pin
+        // mirrors the seal below (try_fire_group → deliver_parent_wake →
+        // send_message → try_drain_queue → this function).
         if !self.active_hooks_for_agent(child_id).await.is_empty() {
+            if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                Box::pin(self.try_fire_group(&gid)).await;
+            }
             return;
         }
         // Consume the marker only after the guards pass; losing this take to
@@ -2943,18 +3040,19 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        let interim = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
+        let classification = Box::pin(self.deliver_completion_to_watches(child_id, &event)).await;
         // Real completion: seal the agent's open after_all group and try to
-        // fire it, mirroring `handle_completion_event`'s non-interim idle
-        // path (monorepo#1281). Gated on the delivery pass's own interim
-        // classification: an enqueue landing between this function's
+        // fire it, mirroring `handle_completion_event`'s non-queue-interim
+        // idle path (monorepo#1281). Gated on the delivery pass's own
+        // QUEUE/BUSY classification (monorepo#1483: `hook_waiting` never
+        // gates the seal): an enqueue landing between this function's
         // `has_ready_to_send` guard and the delivery re-classifies the
         // synthesized idle as interim (marker re-recorded, so a later
         // mutation/drain retries), and the seal must agree with that
         // snapshot. Box::pin breaks the async-recursion cycle this edge
         // closes (try_drain_queue → redeliver → try_fire_group →
         // deliver_parent_wake → send_message → try_drain_queue).
-        if !interim {
+        if !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
@@ -2999,6 +3097,9 @@ impl Services {
     /// yields the pre-deferral early wake). `agent:failed` /
     /// `agent:deleted` — and the attention / reportToParent immediate
     /// wakes, which run on their own paths — are never hook-deferred.
+    /// Hook deferral is scoped to the agent's settlement AS A CHILD: the
+    /// idling agent's own parent-side after_all seal gates on the
+    /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -3017,14 +3118,17 @@ impl Services {
     /// completions clear the child's dedup records, and registering a new
     /// watch clears its own (parent, child) pair.
     ///
-    /// Returns whether the event was classified as an interim idle, so the
-    /// caller's group-seal decision (`handle_completion_event`) shares this
-    /// pass's snapshot instead of re-probing the queue (monorepo#1281).
+    /// Returns the pass's idle-classification snapshot, so the callers'
+    /// group-seal decisions (`handle_completion_event`,
+    /// `redeliver_completion_after_queue_mutation`) share it instead of
+    /// re-probing the queue (monorepo#1281) — and gate on `queue_interim`
+    /// alone, because `hook_waiting` must not block the parent-side seal
+    /// (monorepo#1483).
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
         event: &Event,
-    ) -> bool {
+    ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
         // worker is already busy in a new turn (monorepo#1297: an enqueue that
@@ -3055,9 +3159,12 @@ impl Services {
         // no ungrouped watch matches — so a later queue retraction/edit that
         // empties the ready-to-send queue while the agent is idle (or, for a
         // hook-deferred idle, the last active hook's terminal transition)
-        // can synthesize the real completion (redelivering any skipped
-        // watches AND sealing a watchless coordinator's open after_all
-        // group).
+        // can synthesize the real completion, redelivering any skipped
+        // watches. For a queue-interim coordinator the synthesized idle
+        // also seals its (watchless) open after_all group; a purely
+        // hook-deferred coordinator already seals at THIS idle
+        // (monorepo#1483: `hook_waiting` does not gate the seal), so the
+        // redelivery's seal is a no-op backstop for it.
         if interim_idle {
             self.mark_interim_skipped_idle(child_id);
         }
@@ -3308,7 +3415,10 @@ impl Services {
         if interim_idle && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
-        interim_idle
+        CompletionIdleClassification {
+            queue_interim,
+            hook_waiting,
+        }
     }
 
     /// Fire a delegation group's single aggregated wake if it is ready (sealed,
@@ -7125,6 +7235,24 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| event.actor.id.clone())
+}
+
+/// Snapshot classification one [`Services::deliver_completion_to_watches`]
+/// pass took for an `agent:idle` event (both flags are always `false` for
+/// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
+/// delivery pass's probes instead of re-probing (monorepo#1281).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompletionIdleClassification {
+    /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
+    /// or a worker turn is in flight — the agent's delegating turn is not
+    /// over yet, so the parent-side after_all seal must wait for the real
+    /// completion.
+    pub(crate) queue_interim: bool,
+    /// Hook-waiting (monorepo#1336): the agent owns active background hooks —
+    /// its settlement AS A CHILD (ungrouped watch delivery, grouped
+    /// recording) defers until the hooks resolve, but this alone must NOT
+    /// gate the parent-side after_all seal (monorepo#1483).
+    pub(crate) hook_waiting: bool,
 }
 
 /// STAB-129: the group members whose recorded terminal event was
@@ -16426,6 +16554,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_mark_seen(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_mark_seen_op(workspace_id, agent_id, message_id)
+                .await
+        })
+    }
+
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,
@@ -17414,18 +17554,26 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
+        repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
+            // workspace repo; either way the resolved repo is echoed in the
+            // result so a wrong-repo read is detectable.
+            let (owner, repo) = match repo {
+                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+                None => pr_ops::repo_of(&ws)?,
+            };
+            let repo_slug = format!("{owner}/{repo}");
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
-                intent_sourcecontrol::Error::NotFound(_) => Error::Internal(format!(
-                    "PR #{pr_number} not found in the workspace repository"
-                )),
+                intent_sourcecontrol::Error::NotFound(_) => {
+                    Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
+                }
                 other => pr_ops::map_sc_err(other),
             })?;
             let state = pr_ops::derive_status_state(&pr);
@@ -17494,6 +17642,7 @@ impl WorkspaceApi for Services {
                 pr_ops::count_thread_comments(&threads);
 
             Ok(serde_json::json!({
+                "repo": repo_slug,
                 "prNumber": pr_number,
                 "title": pr.title,
                 "url": pr.url,
