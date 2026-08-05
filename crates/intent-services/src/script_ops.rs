@@ -28,7 +28,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::events::EventBus;
-use crate::shell::default_shell;
+use crate::shell::{default_shell, scrubbed_env_vars_except};
 use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
@@ -1101,24 +1101,19 @@ impl ScriptManager {
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
     /// scope, and the FORCE_COLOR/TERM + enhanced-PATH + script env overlay,
-    /// with `npm_config_prefix` scrubbed so nvm's login-shell init succeeds.
+    /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
+    /// succeeds. An explicit script env value is preserved.
     fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
         spec.cwd = cwd.clone();
         spec.env = spawn_env_overlay(def.env.as_ref());
-        spec.env_remove = SCRUBBED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
         spec
     }
 }
-
-/// Environment variables removed from daemon-spawned shells. `npm_config_prefix`
-/// (set by the app's launcher) makes nvm abort its `~/.zshrc` init, which breaks
-/// the wrapped git/node tools agents rely on; the overlay can only add keys, so
-/// this is applied via `SpawnSpec::env_remove` at the PTY spawn site.
-const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
 
 /// Build the env overlay for a spawned script/agent shell: FORCE_COLOR/TERM, an
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
@@ -1503,11 +1498,17 @@ mod tests {
     }
 
     #[test]
-    fn spawn_overlay_strips_npm_config_prefix_and_enhances_path() {
-        // npm_config_prefix is scrubbed via env_remove, not present as an overlay key.
-        assert!(SCRUBBED_ENV_VARS.contains(&"npm_config_prefix"));
+    fn spawn_overlay_scrubs_only_inherited_npm_config_prefix_and_enhances_path() {
         let env = spawn_env_overlay(None);
+        assert!(scrubbed_env_vars_except(&env)
+            .iter()
+            .any(|name| name == "npm_config_prefix"));
         assert!(!env.iter().any(|(k, _)| k == "npm_config_prefix"));
+
+        let mut def_env = std::collections::BTreeMap::new();
+        def_env.insert("npm_config_prefix".to_string(), "/custom".to_string());
+        let explicit_env = spawn_env_overlay(Some(&def_env));
+        assert!(scrubbed_env_vars_except(&explicit_env).is_empty());
 
         // The enhanced PATH overlay includes the essential system dirs + homebrew.
         let path = env
