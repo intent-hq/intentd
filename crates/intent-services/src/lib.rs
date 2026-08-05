@@ -18844,9 +18844,9 @@ impl WorkspaceApi for Services {
     // voice.transcribe — daemon-side speech-to-text. Maps onto the
     // `VoiceEngine` trait; the engine resolves the API key (secrets store /
     // `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`) and posts the audio to the
-    // provider. A missing/invalid key → `Internal` ("not configured",
-    // graceful). Validation/context-merging glue lives in `voice_ops`. The
-    // API keys are never logged or returned over the wire.
+    // provider. A missing/invalid key → `VoiceNotConfigured` ("not
+    // configured", graceful). Validation/context-merging glue lives in
+    // `voice_ops`. The API keys are never logged or returned over the wire.
     // ========================================================================
 
     fn voice_transcribe(

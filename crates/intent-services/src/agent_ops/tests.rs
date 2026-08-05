@@ -15568,6 +15568,208 @@ async fn resume_interrupted_marker_is_idempotent_on_retry() {
     );
 }
 
+async fn delegate_immediate(svc: &Services, ws: &WorkspaceId, parent: &AgentId) -> AgentId {
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput::default(),
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate immediate");
+    AgentId::from(resp["agentId"].as_str().expect("agentId"))
+}
+
+/// Subscribe to only `agent:subscriptions-changed`.
+fn subscribe_subscriptions_changed(bus: &EventBus) -> crate::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    })
+}
+
+/// Regression (monorepo#1449): `resume_interrupted_agent` re-arms the
+/// parent's completion watch after a daemon restart, and the re-registration
+/// must publish exactly one `agent:subscriptions-changed` for the parent's
+/// home workspace (like every other watch-lifecycle site), whose recompute
+/// also promotes a previously-idle workspace's `displayStatus` to
+/// `in_progress`.
+#[tokio::test]
+async fn resume_watch_reregistration_publishes_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_immediate(&svc, &ws, &parent).await;
+
+    // Simulate a daemon restart: the in-memory watch registry is empty.
+    svc.agent_subscriptions
+        .lock()
+        .unwrap()
+        .subscriptions
+        .clear();
+    // Re-baseline the displayStatus cache post-"restart" so the resume-time
+    // recompute observes the idle → in_progress transition.
+    svc.maybe_emit_display_status_changed(&ws).await;
+
+    svc.store
+        .insert_interrupted_agent(&child, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    let mut sub = subscribe_subscriptions_changed(&bus);
+    let mut status_sub = subscribe_display_status(&bus, &ws);
+
+    svc.resume_interrupted_agent(&child).await.expect("resume");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after resume re-registration")
+        .expect("batch");
+    assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
+    assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
+    assert_eq!(
+        batch[0].workspace_id, ws,
+        "anchored in the parent's home ws"
+    );
+    assert_eq!(batch[0].data["agentId"], json!(parent.0));
+    assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
+    assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "resume must publish subscriptions-changed exactly once"
+    );
+
+    // The re-armed watch is the promotion trigger: the previously-idle
+    // workspace transitions to in_progress via the publish's recompute.
+    let ev = recv_display_status(&mut status_sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
+    );
+}
+
+/// monorepo#1449 (grouped branch): a resumed child still expected by an
+/// `after_all` delegation group re-arms the GROUPED watch — that path must
+/// publish `agent:subscriptions-changed` too.
+#[tokio::test]
+async fn resume_grouped_watch_reregistration_publishes_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+
+    // Simulate a restart that lost the watches but kept the delegation group
+    // (rehydration is idempotent against the in-memory group).
+    svc.agent_subscriptions
+        .lock()
+        .unwrap()
+        .subscriptions
+        .clear();
+
+    svc.store
+        .insert_interrupted_agent(&child, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    let mut sub = subscribe_subscriptions_changed(&bus);
+
+    svc.resume_interrupted_agent(&child).await.expect("resume");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after grouped re-registration")
+        .expect("batch");
+    assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
+    assert_eq!(batch[0].data["agentId"], json!(parent.0));
+    assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
+    assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        watches[0].group_id.is_some(),
+        "re-armed watch stays grouped"
+    );
+}
+
+/// monorepo#1449 (ungrouped-refresh branch): when the parent's watch still
+/// exists, resume reuses it via `find_and_refresh_ungrouped_watch` — the
+/// snapshot event is still published, but the displayStatus recompute is a
+/// no-op (already promoted) and stays silent.
+#[tokio::test]
+async fn resume_existing_watch_refresh_publishes_snapshot_without_display_status() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_immediate(&svc, &ws, &parent).await;
+    // Settle the displayStatus baseline (already in_progress from delegate).
+    svc.maybe_emit_display_status_changed(&ws).await;
+
+    svc.store
+        .insert_interrupted_agent(&child, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    let mut sub = subscribe_subscriptions_changed(&bus);
+    let mut status_sub = subscribe_display_status(&bus, &ws);
+
+    svc.resume_interrupted_agent(&child).await.expect("resume");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after watch refresh")
+        .expect("batch");
+    assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
+    assert_eq!(batch[0].data["agentId"], json!(parent.0));
+    assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
+    assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
+    assert_display_status_silent(&mut status_sub).await;
+}
+
+/// monorepo#1449 (rejection branch): when the scope gate rejects the
+/// re-registration (non-chief parent homed in a different workspace than the
+/// child), resume keeps its existing warn-only behavior and publishes NO
+/// `agent:subscriptions-changed`.
+#[tokio::test]
+async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws_b");
+    let parent = create_agent(&svc, &ws_b, "Parent").await;
+    // Child in a DIFFERENT workspace with a non-chief parent: the scope gate
+    // rejects the watch re-registration on resume.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    svc.store
+        .insert_interrupted_agent(&child, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    let mut sub = subscribe_subscriptions_changed(&bus);
+
+    svc.resume_interrupted_agent(&child)
+        .await
+        .expect("resume succeeds despite the rejected watch");
+
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "rejected re-registration must not publish subscriptions-changed"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
 /// monorepo#840 classifier: provider safety blocks and imperative "start a
 /// new session" directives are session-fatal; ordinary/transient errors —
 /// including failures to START a session and echoed model text that merely

@@ -109,7 +109,9 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
         "method": method,
         "params": params,
     });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
     let deadline = Instant::now() + common::rpc_read_timeout();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -197,7 +199,9 @@ async fn answer_reverse(ws: &mut PlainWs, dur: Duration, result: Value) -> Value
         "id": rev_id,
         "result": result,
     });
-    ws.send(Message::Text(reply.to_string())).await.unwrap();
+    ws.send(Message::Text(reply.to_string().into()))
+        .await
+        .unwrap();
     frame
 }
 

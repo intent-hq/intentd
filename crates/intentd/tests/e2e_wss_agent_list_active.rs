@@ -217,7 +217,9 @@ async fn seed_workspace(data_dir: &Path) -> String {
 
 async fn rpc_envelope(ws: &mut common::TlsWs, id: i64, method: &str, params: Value) -> Value {
     ws.send(Message::Text(
-        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string(),
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+            .into(),
     ))
     .await
     .expect("send RPC");

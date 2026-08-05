@@ -159,6 +159,28 @@ impl VoiceEngine for RecordingEngine {
     }
 }
 
+/// Stub engine whose `transcribe` fails with the registry's no-API-key error
+/// shape. The real no-key path fails in `VoiceRegistry::from_settings` (which
+/// reads the user's secrets store / env, so it cannot be forced hermetically
+/// in an e2e); both surfaces route through the same `map_voice_err` →
+/// `VoiceNotConfigured` mapping, so this drives the identical wire path.
+struct NoKeyEngine;
+
+#[async_trait]
+impl VoiceEngine for NoKeyEngine {
+    async fn transcribe(&self, _request: TranscribeRequest) -> VoiceResult<Transcript> {
+        Err(intent_voice::Error::NotConfigured(
+            "voice: no API key found for elevenlabs \
+             (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)"
+                .to_string(),
+        ))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "elevenlabs"
+    }
+}
+
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
@@ -167,9 +189,10 @@ struct Fixture {
     _dir: TempDir,
 }
 
-/// Boot a TLS + bearer-auth WSS listener whose services carry the recording
-/// stub engine.
-async fn boot() -> Fixture {
+/// Boot a TLS + bearer-auth WSS listener whose services carry `engine`.
+async fn boot_with_engine(
+    engine: Arc<dyn VoiceEngine>,
+) -> (WsApiServer, u16, Arc<ClientConfig>, TempDir) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-voice-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -178,12 +201,11 @@ async fn boot() -> Fixture {
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
-    let engine = Arc::new(RecordingEngine::default());
     let services = Arc::new(
         Services::new(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
-            .with_voice_engine(engine.clone()),
+            .with_voice_engine(engine),
     );
     let api: Arc<dyn WorkspaceApi> = services;
     let tls = ensure_tls_certificate(&dir).expect("cert");
@@ -198,12 +220,20 @@ async fn boot() -> Fixture {
     let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
+    (ws_srv, port, cfg, TempDir(dir))
+}
+
+/// Boot a TLS + bearer-auth WSS listener whose services carry the recording
+/// stub engine.
+async fn boot() -> Fixture {
+    let engine = Arc::new(RecordingEngine::default());
+    let (ws_srv, port, cfg, dir) = boot_with_engine(engine.clone()).await;
     Fixture {
         _ws: ws_srv,
         port,
         cfg,
         engine,
-        _dir: TempDir(dir),
+        _dir: dir,
     }
 }
 
@@ -217,7 +247,9 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// Send one JSON-RPC request and return the full response envelope.
 async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .unwrap();
     timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
@@ -410,4 +442,31 @@ async fn provider_override_still_uses_injected_engine() {
     assert!(resp.get("error").is_none(), "unexpected error: {resp}");
     assert_eq!(resp["result"]["provider"], "elevenlabs");
     assert_eq!(fx.engine.calls.lock().unwrap().len(), 1);
+}
+
+/// The missing-API-key failure surfaces on the wire as `-32603` with the
+/// generic `"Internal error"` message plus machine-readable
+/// `error.data = { code: "voice-no-api-key", detail }`, the detail text
+/// unchanged from the pre-structured shape (PROTOCOL §5.41, monorepo#1448).
+#[tokio::test]
+async fn missing_api_key_surfaces_structured_error_data() {
+    let (_srv, port, cfg, _dir) = boot_with_engine(Arc::new(NoKeyEngine)).await;
+    let mut ws = connect(port, cfg).await;
+
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.transcribe",
+        json!({ "audio": b64(b"pcm") }),
+    )
+    .await;
+    let err = &resp["error"];
+    assert_eq!(err["code"], -32603, "{resp}");
+    assert_eq!(err["message"], "Internal error");
+    assert_eq!(err["data"]["code"], "voice-no-api-key");
+    assert_eq!(
+        err["data"]["detail"],
+        "voice not configured: voice: no API key found for elevenlabs \
+         (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)"
+    );
 }
