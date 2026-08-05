@@ -18948,6 +18948,80 @@ async fn delegate_stamps_merge_on_turn_end_metadata() {
     );
 }
 
+/// `vmResources` is bounds-validated at delegate time (errors immediately,
+/// never at VM boot) and stamped onto the child's persisted metadata (the
+/// hand-off point the microVM spawn path reads at boot/respawn); omitted
+/// when not supplied.
+#[tokio::test]
+async fn delegate_validates_and_stamps_vm_resources_metadata() {
+    let (_t, svc, ws) = setup().await;
+
+    // Out-of-range → InvalidParams naming the field, no agent created.
+    let note_id = seed_task(&svc, &ws, "BadVm").await;
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                vm_resources: Some(intent_core::VmResources {
+                    vcpus: Some(17),
+                    mem_mib: None,
+                }),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect_err("out-of-range vcpus must be rejected at delegate time");
+    assert!(
+        err.to_string().contains("vmResources.vcpus"),
+        "error names the field: {err}"
+    );
+
+    // Valid partial override → persisted verbatim on metadata.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                vm_resources: Some(intent_core::VmResources {
+                    vcpus: None,
+                    mem_mib: Some(4096),
+                }),
+                ..delegate_input(&note_id, None)
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert_eq!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("vmResources"))
+            .cloned(),
+        Some(serde_json::json!({ "memMib": 4096 })),
+        "child metadata must persist the partial vmResources override"
+    );
+
+    // Not supplied → omitted.
+    let note_id2 = seed_task(&svc, &ws, "DefaultVm").await;
+    let resp = svc
+        .agent_delegate_op(ws.clone(), delegate_input(&note_id2, None), None)
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc.store.get_agent_session(&child).await.expect("session");
+    assert!(
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("vmResources"))
+            .is_none(),
+        "metadata omits vmResources when not supplied"
+    );
+}
+
 /// Occupied task (live assigned agent) → second delegate is rejected with
 /// `-32602` naming the existing agent; `force: true` allows it.
 #[tokio::test]

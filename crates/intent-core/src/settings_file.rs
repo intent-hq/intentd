@@ -230,7 +230,7 @@ pub struct SandboxCowSettings {
 }
 
 /// `[sandbox.microvm]` — microVM environment (`sandbox.microvm.*`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxMicrovmSettings {
     /// `sandbox.microvm.enabled` — offer the microVM environment (requires
@@ -240,7 +240,37 @@ pub struct SandboxMicrovmSettings {
     /// (`{ manifestUrl, sha256 }`); `None` uses the built-in image pin.
     /// Resolution order: repo `.intent/config.json` → this override → pin.
     pub image: Option<MicrovmImageOverride>,
+    /// `sandbox.microvm.vcpus` — default vCPU count for spawned agent VMs
+    /// (1–16, mirroring the helper's `MAX_VCPUS`). Per-agent `vmResources`
+    /// overrides beat this; absent both, agents get this value.
+    pub vcpus: u8,
+    /// `sandbox.microvm.memMib` — default guest memory in MiB for spawned
+    /// agent VMs (>= 128, mirroring the helper's `MIN_MEM_MIB`). Per-agent
+    /// `vmResources` overrides beat this.
+    pub mem_mib: u32,
 }
+
+impl Default for SandboxMicrovmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: None,
+            vcpus: DEFAULT_MICROVM_VCPUS,
+            mem_mib: DEFAULT_MICROVM_MEM_MIB,
+        }
+    }
+}
+
+/// Built-in default vCPU count for microVM agent sandboxes.
+pub const DEFAULT_MICROVM_VCPUS: u8 = 2;
+/// Built-in default guest memory (MiB) for microVM agent sandboxes.
+pub const DEFAULT_MICROVM_MEM_MIB: u32 = 2048;
+/// Upper bound on `sandbox.microvm.vcpus` / per-agent `vmResources.vcpus`
+/// (mirrors `MAX_VCPUS` in intentd-microvm-helper).
+pub const MAX_MICROVM_VCPUS: u8 = 16;
+/// Lower bound on `sandbox.microvm.memMib` / per-agent `vmResources.memMib`
+/// (mirrors `MIN_MEM_MIB` in intentd-microvm-helper).
+pub const MIN_MICROVM_MEM_MIB: u32 = 128;
 
 /// `sandbox.microvm.image` value — a pinned guest-image manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -911,6 +941,20 @@ impl SettingsFile {
                 ),
             ));
         }
+        let vcpus = self.sandbox.microvm.vcpus;
+        if vcpus == 0 || vcpus > MAX_MICROVM_VCPUS {
+            return Err(bad(
+                "sandbox.microvm.vcpus",
+                format!("must be between 1 and {MAX_MICROVM_VCPUS}, got {vcpus}"),
+            ));
+        }
+        let mem = self.sandbox.microvm.mem_mib;
+        if mem < MIN_MICROVM_MEM_MIB {
+            return Err(bad(
+                "sandbox.microvm.memMib",
+                format!("must be >= {MIN_MICROVM_MEM_MIB}, got {mem}"),
+            ));
+        }
         Ok(())
     }
 
@@ -1055,6 +1099,10 @@ enabled = false
 # microVM image override -- optional default guest-image override; unset uses
 # the built-in image pin.
 # image = { manifestUrl = "https://example.com/manifest.json", sha256 = "..." }
+# microVM vCPUs -- default vCPU count for spawned agent VMs (1-16).
+vcpus = 2
+# microVM memory -- default guest memory in MiB for spawned agent VMs (>= 128).
+memMib = 2048
 
 [mcp]
 # Enable user MCP servers -- start user-scoped MCP servers.
@@ -1252,6 +1300,8 @@ mod tests {
         assert!(!d.sandbox.cow.enabled);
         assert!(!d.sandbox.microvm.enabled);
         assert_eq!(d.sandbox.microvm.image, None);
+        assert_eq!(d.sandbox.microvm.vcpus, DEFAULT_MICROVM_VCPUS);
+        assert_eq!(d.sandbox.microvm.mem_mib, DEFAULT_MICROVM_MEM_MIB);
         assert!(d.mcp.enable_user_servers);
         assert!(d.mcp.disabled_servers.is_empty());
         assert!(d.notifications.enabled);
@@ -1498,6 +1548,25 @@ mod tests {
         // A disabled built-in default is equally rejected.
         let err = SettingsFile::parse_str("[sandbox.worktree]\nenabled = false\n").unwrap_err();
         assert!(err.to_string().contains("sandbox.defaultType"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_microvm_sizing_parses_and_range_validates() {
+        let parsed =
+            SettingsFile::parse_str("[sandbox.microvm]\nvcpus = 8\nmemMib = 4096\n").unwrap();
+        assert_eq!(parsed.sandbox.microvm.vcpus, 8);
+        assert_eq!(parsed.sandbox.microvm.mem_mib, 4096);
+        for (body, key) in [
+            ("[sandbox.microvm]\nvcpus = 0\n", "sandbox.microvm.vcpus"),
+            ("[sandbox.microvm]\nvcpus = 17\n", "sandbox.microvm.vcpus"),
+            ("[sandbox.microvm]\nmemMib = 64\n", "sandbox.microvm.memMib"),
+        ] {
+            let err = SettingsFile::parse_str(body).unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "{body:?} should fail naming `{key}`: {err}"
+            );
+        }
     }
 
     #[test]

@@ -78,11 +78,11 @@ pub use model::{
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
-    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    TokenUsageTotals, TopChangedFile, VmResources, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
+    WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;

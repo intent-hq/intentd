@@ -168,6 +168,15 @@ async fn create(
     if let Some(m) = opt_bool(args, "mergeOnTurnEnd") {
         metadata.insert("mergeOnTurnEnd".to_string(), Value::Bool(m));
     }
+    // Per-agent microVM sizing (advisory on non-microVM workspaces, like
+    // mergeOnTurnEnd): validated here so invalid input errors at create
+    // time, then persisted on metadata for the spawn path to resolve.
+    if let Some(vm) = parse_vm_resources(args)? {
+        metadata.insert(
+            "vmResources".to_string(),
+            serde_json::to_value(vm).unwrap_or(Value::Null),
+        );
+    }
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
         is_background: Some(is_background),
@@ -285,6 +294,9 @@ async fn delegate(
         // Advisory when the workspace is not CoW-capable: accepted and
         // ignored (no sandbox exists to honor it), never an error.
         merge_on_turn_end: opt_bool(args, "mergeOnTurnEnd"),
+        // Per-agent microVM sizing (advisory on non-microVM workspaces);
+        // parse errors surface here, bounds are validated by the op.
+        vm_resources: parse_vm_resources(args)?,
         force: opt_bool(args, "force"),
     };
     let v = api
@@ -292,6 +304,21 @@ async fn delegate(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// Parse and bounds-validate the optional `vmResources: { vcpus?, memMib? }`
+/// arg shared by `ws.agent.create` and `ws.agent.delegate`. `None` when the
+/// key is absent or null; a malformed shape or out-of-range value errors at
+/// call time (never at VM boot).
+fn parse_vm_resources(args: &Value) -> Result<Option<intent_core::VmResources>, String> {
+    let raw = match args.get("vmResources") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let vm: intent_core::VmResources = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("vmResources: expected {{ vcpus?, memMib? }}: {e}"))?;
+    vm.validate().map_err(|e| e.to_string())?;
+    Ok(Some(vm))
 }
 
 /// `ws.agent.send`. Guarded by the single-pending-message rule: when the

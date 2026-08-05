@@ -64,6 +64,8 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sandbox.cow.enabled",
     "sandbox.microvm.enabled",
     "sandbox.microvm.image",
+    "sandbox.microvm.vcpus",
+    "sandbox.microvm.memMib",
     "mcp.enableUserServers",
     "mcp.disabledServers",
     "notifications.enabled",

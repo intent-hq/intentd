@@ -5670,6 +5670,8 @@ fn sandbox_profiles_json(
                     .as_ref()
                     .and_then(|i| serde_json::to_value(i).ok())
                     .unwrap_or(serde_json::Value::Null);
+                row["vcpus"] = serde_json::json!(sandbox.microvm.vcpus);
+                row["memMib"] = serde_json::json!(sandbox.microvm.mem_mib);
             }
             row
         })
@@ -8875,6 +8877,24 @@ impl WorkspaceApi for Services {
                                     "image" => {
                                         return Err(Error::InvalidParams(format!(
                                             "profiles.{ty}.image: image override is only \
+                                             supported on the microvm type"
+                                        )))
+                                    }
+                                    "vcpus" if ty == "microvm" => {
+                                        enables.push(serde_json::json!({
+                                            "path": "sandbox.microvm.vcpus",
+                                            "value": field_value,
+                                        }));
+                                    }
+                                    "memMib" if ty == "microvm" => {
+                                        enables.push(serde_json::json!({
+                                            "path": "sandbox.microvm.memMib",
+                                            "value": field_value,
+                                        }));
+                                    }
+                                    "vcpus" | "memMib" => {
+                                        return Err(Error::InvalidParams(format!(
+                                            "profiles.{ty}.{field}: VM sizing is only \
                                              supported on the microvm type"
                                         )))
                                     }

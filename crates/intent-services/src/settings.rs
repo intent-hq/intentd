@@ -899,6 +899,24 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sandbox",
             None,
         ),
+        number(
+            "sandbox.microvm.vcpus",
+            "microVM vCPUs",
+            "Default vCPU count for spawned agent VMs (per-agent vmResources overrides beat this)",
+            "sandbox",
+            Some(1.0),
+            Some(16.0), // MAX_VCPUS in intentd-microvm-helper
+            2.0,
+        ),
+        number(
+            "sandbox.microvm.memMib",
+            "microVM memory (MiB)",
+            "Default guest memory in MiB for spawned agent VMs (per-agent vmResources overrides beat this)",
+            "sandbox",
+            Some(128.0), // MIN_MEM_MIB in intentd-microvm-helper
+            None,
+            2048.0,
+        ),
         // --- Group A: MCP ----------------------------------------------------
         boolean(
             "mcp.enableUserServers",

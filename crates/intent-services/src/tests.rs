@@ -15591,8 +15591,9 @@ mod worktree_provisioning {
 
     /// `sandbox.profiles.list` (§5.35): the default settings yield one row
     /// per type in catalog order — direct/worktree enabled, cow/microvm
-    /// disabled, `defaultType: "worktree"`, and a `null` microvm image.
-    /// Registry-less wiring serves schema defaults (no error).
+    /// disabled, `defaultType: "worktree"`, a `null` microvm image, and the
+    /// default microvm VM sizing. Registry-less wiring serves schema
+    /// defaults (no error).
     #[tokio::test]
     async fn sandbox_profiles_list_serves_defaults() {
         use intent_core::WorkspaceApi;
@@ -15609,7 +15610,8 @@ mod worktree_provisioning {
                     { "type": "direct", "enabled": true },
                     { "type": "worktree", "enabled": true },
                     { "type": "cow", "enabled": false },
-                    { "type": "microvm", "enabled": false, "image": null },
+                    { "type": "microvm", "enabled": false, "image": null,
+                      "vcpus": 2, "memMib": 2048 },
                 ],
             })
         );
@@ -15702,6 +15704,49 @@ mod worktree_provisioning {
             .expect_err("disabling the default type rejected");
         let msg = err.to_string();
         assert!(msg.contains("sandbox.defaultType"), "{msg}");
+
+        // VM sizing rides the microvm row: persisted and echoed.
+        let result = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "vcpus": 4, "memMib": 4096 } },
+            }))
+            .await
+            .expect("update sizing");
+        assert_eq!(result["profiles"][3]["vcpus"], 4);
+        assert_eq!(result["profiles"][3]["memMib"], 4096);
+        assert_eq!(
+            registry.get("sandbox.microvm.vcpus"),
+            Some(serde_json::json!(4))
+        );
+        assert_eq!(
+            registry.get("sandbox.microvm.memMib"),
+            Some(serde_json::json!(4096))
+        );
+
+        // Out-of-range sizing → InvalidParams (catalog min/max).
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "vcpus": 17 } },
+            }))
+            .await
+            .expect_err("out-of-range vcpus rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "microvm": { "memMib": 64 } },
+            }))
+            .await
+            .expect_err("out-of-range memMib rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
+
+        // Sizing on a non-microvm type → InvalidParams.
+        let err = svc
+            .sandbox_profiles_update(serde_json::json!({
+                "profiles": { "cow": { "vcpus": 4 } },
+            }))
+            .await
+            .expect_err("vcpus on cow rejected");
+        assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
     }
 
     /// `sandbox.options` (§5.35): joins the settings intent with host

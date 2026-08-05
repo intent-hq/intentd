@@ -20,7 +20,7 @@ mod bindings;
 mod dispatch;
 mod tools;
 
-pub use tools::{SpecialistModelOption, SpecialistModelOptions, ToolDef};
+pub use tools::{MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, ToolDef};
 
 // Static description const, exposed for the segment-assembly parity tests
 // in `crate::tests` (the assembled all-defaults description must be
@@ -96,6 +96,11 @@ pub struct WorkspaceMcpServer {
     /// docs. Only specialists that carry options appear; empty — the default
     /// — leaves the description byte-identical.
     specialist_model_options: Vec<tools::SpecialistModelOptions>,
+    /// Live microVM spawn facts (guest image, settings-resolved default VM
+    /// size) injected into the delegate/create docs — `Some` only for
+    /// microVM-workspace bridges, captured at bridge creation like
+    /// `agent_features` (a settings change applies to new sessions only).
+    microvm_hints: Option<tools::MicrovmSpawnHints>,
 }
 
 impl WorkspaceMcpServer {
@@ -115,6 +120,7 @@ impl WorkspaceMcpServer {
             agent_features: AgentFeaturesSettings::default(),
             cow_capable: true,
             specialist_model_options: Vec::new(),
+            microvm_hints: None,
         }
     }
 
@@ -191,6 +197,16 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Set the live microVM spawn hints (guest image, default VM size)
+    /// advertised in the `workspace_api` description — the spawn-time wiring
+    /// point, like `with_cow_capable`. Pass `Some` only for
+    /// microVM-workspace bridges; `None` (the default) keeps the description
+    /// unchanged.
+    pub fn with_microvm_hints(mut self, hints: Option<tools::MicrovmSpawnHints>) -> Self {
+        self.microvm_hints = hints;
+        self
+    }
+
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds.
@@ -256,6 +272,7 @@ impl WorkspaceMcpServer {
                         &self.agent_features,
                         self.cow_capable,
                         &self.specialist_model_options,
+                        self.microvm_hints.as_ref(),
                     )
                     .into_owned()
                 } else {

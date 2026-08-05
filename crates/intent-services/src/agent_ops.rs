@@ -4377,6 +4377,12 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         let wait_mode = input.wait_mode.clone();
+        // Per-agent microVM sizing: validate at delegate time so invalid
+        // input errors here, not at VM boot (accepted-and-ignored on
+        // non-microVM workspaces, like mergeOnTurnEnd).
+        if let Some(vm) = &input.vm_resources {
+            vm.validate()?;
+        }
         // Persist the task linkage + skipAutoCommit on the session so the
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
         // and honor the opt-out without a reverse lookup on every idle event.
@@ -4587,6 +4593,13 @@ impl Services {
         // and the synchronous microVM path — surviving respawn/restart.
         if let Some(merge) = input.merge_on_turn_end {
             extra_metadata.insert("mergeOnTurnEnd".to_string(), json!(merge));
+        }
+        // Per-agent microVM sizing (advisory on non-microVM workspaces):
+        // persisted on the child's metadata so `ensure_started` — which can
+        // boot the VM long after delegate, and again on respawn — resolves
+        // the same size every time.
+        if let Some(vm) = &input.vm_resources {
+            extra_metadata.insert("vmResources".to_string(), json!(vm));
         }
         let extra = AgentCreateExtra {
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),

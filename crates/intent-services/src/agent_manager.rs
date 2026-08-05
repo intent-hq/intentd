@@ -1478,6 +1478,49 @@ impl AgentManager {
         // `mergeOnTurnEnd` either way.
         let cow_capable = microvm_ws.is_some() || self.services.cow_capable_hint().await;
 
+        // Live spawn facts for microVM-workspace bridges: the guest image a
+        // spawn would resolve (repo `.intent/config.json` → settings override
+        // → built-in pin — the same order `spawn_in_microvm` uses) and the
+        // settings-resolved default VM size. Built from already-loaded
+        // config only — a non-pin image is labeled by its manifest URL, never
+        // by fetching the manifest. Captured at bridge creation like
+        // `agent_features`: settings changes apply to new sessions only.
+        let microvm_hints = if let Some(ws) = &microvm_ws {
+            let settings = self.services.effective_settings();
+            let repo_config = match ws.repository_path.as_deref() {
+                Some(p) if !p.is_empty() => {
+                    crate::repo_config::read_repo_config(Path::new(p)).await
+                }
+                _ => intent_core::RepoConfig::default(),
+            };
+            let profile_default =
+                settings
+                    .sandbox
+                    .microvm
+                    .image
+                    .as_ref()
+                    .map(|o| intent_core::GuestImageRef {
+                        manifest_url: o.manifest_url.clone(),
+                        sha256: Some(o.sha256.clone()),
+                    });
+            let (image_ref, source) =
+                crate::sandbox_image::resolve_image_ref(&repo_config, profile_default.as_ref());
+            let image_label = match source {
+                crate::sandbox_image::ImageSource::BuiltinPin => format!(
+                    "`intentd-guest-base` v{} (built-in pin)",
+                    crate::sandbox_image::BUILTIN_IMAGE_VERSION
+                ),
+                other => format!("`{}` ({})", image_ref.manifest_url, other.as_str()),
+            };
+            Some(intent_acp::mcp_server::MicrovmSpawnHints {
+                image_label,
+                vcpus: settings.sandbox.microvm.vcpus,
+                mem_mib: settings.sandbox.microvm.mem_mib,
+            })
+        } else {
+            None
+        };
+
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
@@ -1502,7 +1545,11 @@ impl AgentManager {
                     self.services
                         .specialist_model_options_for_workspace(&workspace_id)
                         .await,
-                ),
+                )
+                // Live microVM spawn facts (guest image + default VM size),
+                // Some only for microVM-workspace bridges. Same snapshot
+                // semantics as the toggles above.
+                .with_microvm_hints(microvm_hints),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await
@@ -1935,6 +1982,36 @@ impl AgentManager {
         let host_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| Error::Internal("HOME not set; cannot stage credentials".to_string()))?;
+        // VM sizing: per-agent override (session metadata `vmResources`,
+        // stamped by delegate/create) > sandbox.microvm.vcpus/memMib settings
+        // > built-in defaults. Resolved here — at boot, which can be long
+        // after delegate and re-runs on respawn — so the same size applies
+        // every time.
+        let session_vm_resources: Option<intent_core::VmResources> = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok()
+            .and_then(|s| {
+                s.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("vmResources"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            });
+        let vcpus = session_vm_resources
+            .and_then(|vm| vm.vcpus)
+            .unwrap_or(settings.sandbox.microvm.vcpus);
+        let mem_mib = session_vm_resources
+            .and_then(|vm| vm.mem_mib)
+            .unwrap_or(settings.sandbox.microvm.mem_mib);
+        tracing::info!(
+            agent_id = %agent_id,
+            vcpus,
+            mem_mib,
+            override_present = session_vm_resources.is_some(),
+            "microVM spawn: resolved VM size"
+        );
         let spec = MicrovmSpawnSpec {
             vm_dir: microvm::vm_dir(&data_dir, agent_id.as_str()),
             helper_exe,
@@ -1942,8 +2019,8 @@ impl AgentManager {
             workspace_dir: cwd.to_path_buf(),
             host_home,
             stage_claude_onboarding: claude_token.is_some(),
-            vcpus: 2,
-            mem_mib: 2048,
+            vcpus,
+            mem_mib,
         };
         let boot = async {
             let vm = MicrovmVm::boot(&spec).await?;

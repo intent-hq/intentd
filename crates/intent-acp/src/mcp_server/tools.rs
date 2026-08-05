@@ -205,9 +205,11 @@ API:
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` or `behaviorPrompt`.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -432,9 +434,11 @@ API:
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model` or `behaviorPrompt`.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
+    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -610,6 +614,8 @@ const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need i
 /// verbatim so the `replacen` scrubs cannot silently become no-ops.
 const SANDBOX_MERGE_ON_TURN_END_DOC_LINE: &str = "    Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.\n";
 const SANDBOX_DELEGATE_MERGE_ARG: &str = ", mergeOnTurnEnd?";
+const SANDBOX_VM_RESOURCES_DOC_LINE: &str = "    Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.\n";
+const SANDBOX_DELEGATE_VM_RESOURCES_ARG: &str = ", vmResources?";
 const SANDBOX_LIST_FIELDS_XREF: &str =
     " Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.";
 const SANDBOX_STATUS_FIELDS_XREF: &str =
@@ -721,6 +727,8 @@ pub fn workspace_api_description(
         out = out.replacen(SANDBOX_LIST_FIELDS_XREF, "", 1);
         out = out.replacen(SANDBOX_STATUS_FIELDS_XREF, "", 1);
         out = out.replacen(SANDBOX_MERGE_SANDBOX_DOC_LINE, "", 1);
+        out = out.replacen(SANDBOX_VM_RESOURCES_DOC_LINE, "", 2);
+        out = out.replacen(SANDBOX_DELEGATE_VM_RESOURCES_ARG, "", 1);
     }
     // Cross-reference scrub for `hostExec`: the surviving `ws.hook.*` index
     // hint and `ws.hook.schedule` doc line name `ws.host.exec` as callable
@@ -824,27 +832,55 @@ pub(super) fn help_namespace(
     ))
 }
 
+/// Live microVM spawn facts injected into the `workspace_api` description of
+/// microVM-workspace bridges (alongside the `vmResources`/`mergeOnTurnEnd`
+/// clauses): the guest image spawns will use and the settings-resolved
+/// default VM size. Built at bridge creation from already-loaded settings and
+/// the statically-known image resolution — never from a manifest fetch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicrovmSpawnHints {
+    /// Human-readable label of the resolved guest image: the built-in pin's
+    /// version when no override applies, else the override's manifest URL
+    /// (the id/version live inside the manifest, which must not be fetched
+    /// at description-build time).
+    pub image_label: String,
+    /// Settings-resolved default vCPU count (`sandbox.microvm.vcpus`).
+    pub vcpus: u8,
+    /// Settings-resolved default guest memory MiB (`sandbox.microvm.memMib`).
+    pub mem_mib: u32,
+}
+
 /// [`workspace_api_description`] plus the per-specialist delegation model
-/// options (PROTOCOL §5.11 `modelOptions`), injected as continuation lines of
-/// the `ws.agent.delegate` doc entry so delegating agents see which models a
-/// specialist's author suggests. `model_options` lists only specialists that
-/// carry options; when it is empty — the all-defaults case — the assembled
-/// text is returned unchanged, so the default description stays
-/// byte-identical by construction.
+/// options (PROTOCOL §5.11 `modelOptions`) and the microVM spawn hints, both
+/// injected as continuation lines of the `ws.agent.delegate` doc entry so
+/// delegating agents see which models a specialist's author suggests and
+/// what a spawned agent gets (guest image, default VM size). `model_options`
+/// lists only specialists that carry options and `microvm_hints` is `Some`
+/// only for microVM-capable workspaces; with neither — the all-defaults case
+/// — the assembled text is returned unchanged, so the default description
+/// stays byte-identical by construction.
 pub fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     cow_capable: bool,
     model_options: &[SpecialistModelOptions],
+    microvm_hints: Option<&MicrovmSpawnHints>,
 ) -> Cow<'static, str> {
     let base = workspace_api_description(is_chief, features, cow_capable);
-    if model_options.is_empty() {
+    let mut block = String::new();
+    if let Some(hints) = microvm_hints {
+        block.push_str(&microvm_hints_block(hints));
+    }
+    if !model_options.is_empty() {
+        block.push_str(&model_options_block(model_options));
+    }
+    if block.is_empty() {
         return base;
     }
     // Anchor on the `ws.agent.delegate` doc line (indent 2) and append the
-    // options block after its indented continuation lines, so the injected
-    // text reads as part of the delegate/create docs. No anchor (the line
-    // can never be feature-pruned today, but stay safe) → unchanged.
+    // block after its indented continuation lines, so the injected text
+    // reads as part of the delegate/create docs. No anchor (the line can
+    // never be feature-pruned today, but stay safe) → unchanged.
     let mut out = String::with_capacity(base.len() + 256);
     let mut in_delegate = false;
     let mut inserted = false;
@@ -853,7 +889,7 @@ pub fn workspace_api_description_with_model_options(
         let indent = line.len() - trimmed.len();
         let is_continuation = indent >= 4 && !trimmed.is_empty();
         if in_delegate && !is_continuation && !inserted {
-            out.push_str(&model_options_block(model_options));
+            out.push_str(&block);
             inserted = true;
         }
         if indent == 2 && trimmed.starts_with("ws.") {
@@ -863,7 +899,7 @@ pub fn workspace_api_description_with_model_options(
         out.push('\n');
     }
     if in_delegate && !inserted {
-        out.push_str(&model_options_block(model_options));
+        out.push_str(&block);
         inserted = true;
     }
     if !inserted {
@@ -873,6 +909,20 @@ pub fn workspace_api_description_with_model_options(
         out.pop();
     }
     Cow::Owned(out)
+}
+
+/// Render the microVM spawn-hints continuation line (indent ≥4 so the
+/// `[agentFeatures]` pruning treats it as part of the `ws.agent.delegate`
+/// entry). Values are flattened onto one line so a pathological image URL
+/// cannot break the description's line structure.
+fn microvm_hints_block(hints: &MicrovmSpawnHints) -> String {
+    let flat = |s: &str| s.replace(['\n', '\r'], " ");
+    format!(
+        "    microVM spawns here get guest image {} and a default VM size of {} vCPUs / {} MiB unless `vmResources` overrides.\n",
+        flat(&hints.image_label),
+        hints.vcpus,
+        hints.mem_mib,
+    )
 }
 
 /// Render the injected continuation block: one header line plus one line per
@@ -914,7 +964,7 @@ mod tests {
     use super::{
         denied_feature, help_index, help_namespace, workspace_api_description,
         workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
+        MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
         HOOK_HOST_EXEC_INDEX_XREF, REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
         WORKSPACE_API_DESCRIPTION_CHIEF,
     };
@@ -1616,6 +1666,12 @@ mod tests {
             assert!(desc.contains(super::SANDBOX_LIST_FIELDS_XREF));
             assert!(desc.contains(super::SANDBOX_STATUS_FIELDS_XREF));
             assert!(desc.contains(super::SANDBOX_MERGE_SANDBOX_DOC_LINE));
+            assert_eq!(
+                desc.matches(super::SANDBOX_VM_RESOURCES_DOC_LINE).count(),
+                2,
+                "vmResources doc line must appear under both create and delegate"
+            );
+            assert!(desc.contains(super::SANDBOX_DELEGATE_VM_RESOURCES_ARG));
         }
     }
 
@@ -1642,6 +1698,10 @@ mod tests {
             assert!(
                 !pruned.contains("ws.agent.mergeSandbox"),
                 "chief={is_chief}: mergeSandbox doc line must be scrubbed when not CoW-capable"
+            );
+            assert!(
+                !pruned.contains("vmResources"),
+                "chief={is_chief}: vmResources clauses must be scrubbed when not CoW-capable"
             );
             for kept in [
                 "ws.agent.create(",
@@ -1836,7 +1896,8 @@ mod tests {
     fn no_model_options_keeps_description_byte_identical() {
         let features = AgentFeaturesSettings::default();
         for is_chief in [false, true] {
-            let got = workspace_api_description_with_model_options(is_chief, &features, true, &[]);
+            let got =
+                workspace_api_description_with_model_options(is_chief, &features, true, &[], None);
             assert!(
                 matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
@@ -1862,6 +1923,7 @@ mod tests {
                 &features,
                 true,
                 &sample_options(),
+                None,
             );
             assert!(
                 got.contains("Specialist model options"),
@@ -1912,8 +1974,13 @@ mod tests {
             background_hooks: false,
             ..AgentFeaturesSettings::default()
         };
-        let got =
-            workspace_api_description_with_model_options(false, &features, true, &sample_options());
+        let got = workspace_api_description_with_model_options(
+            false,
+            &features,
+            true,
+            &sample_options(),
+            None,
+        );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
             got.contains("implementor: `opencode:kimi-k3` (cheap)"),
@@ -1937,10 +2004,123 @@ mod tests {
             &AgentFeaturesSettings::default(),
             true,
             &options,
+            None,
         );
         assert!(
             got.contains("`opencode:kimi-k3` (line one line two)"),
             "multi-line hint not flattened:\n{got}"
+        );
+    }
+
+    // ---- microVM spawn hints injection --------------------------------------
+
+    fn sample_hints() -> MicrovmSpawnHints {
+        MicrovmSpawnHints {
+            image_label: "`intentd-guest-base` v0.1.0 (built-in pin)".to_string(),
+            vcpus: 4,
+            mem_mib: 4096,
+        }
+    }
+
+    // `None` hints (non-microVM bridges — the default) keep the description
+    // byte-identical to the plain assembly.
+    #[test]
+    fn no_microvm_hints_keeps_description_byte_identical() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let got =
+                workspace_api_description_with_model_options(is_chief, &features, true, &[], None);
+            assert!(
+                matches!(got, Cow::Borrowed(_)),
+                "no hints must not reassemble"
+            );
+        }
+    }
+
+    // `Some` hints inject a continuation line under the delegate docs naming
+    // the live guest image and the settings-resolved default VM size.
+    #[test]
+    fn microvm_hints_injected_into_delegate_docs() {
+        let features = AgentFeaturesSettings::default();
+        for is_chief in [false, true] {
+            let hints = sample_hints();
+            let got = workspace_api_description_with_model_options(
+                is_chief,
+                &features,
+                true,
+                &[],
+                Some(&hints),
+            );
+            assert!(
+                got.contains(
+                    "microVM spawns here get guest image `intentd-guest-base` v0.1.0 \
+                     (built-in pin) and a default VM size of 4 vCPUs / 4096 MiB unless \
+                     `vmResources` overrides."
+                ),
+                "chief={is_chief}: hint line missing/miswritten:\n{got}"
+            );
+            // Inside the delegate docs, before the next method line.
+            let delegate_idx = got.find("ws.agent.delegate(").expect("delegate line");
+            let hint_idx = got.find("microVM spawns here").expect("hint line");
+            let send_idx = got[delegate_idx..]
+                .find("ws.agent.send(")
+                .map(|i| i + delegate_idx)
+                .expect("send line after delegate");
+            assert!(
+                delegate_idx < hint_idx && hint_idx < send_idx,
+                "chief={is_chief}: hint not inside the delegate docs"
+            );
+            // Continuation-indented so feature pruning keeps it attached.
+            let line = got
+                .lines()
+                .find(|l| l.contains("microVM spawns here"))
+                .unwrap();
+            assert!(
+                line.starts_with("    "),
+                "hint line not continuation-indented: {line:?}"
+            );
+        }
+    }
+
+    // Hints and model options compose: both blocks land under the delegate
+    // docs, hints first.
+    #[test]
+    fn microvm_hints_compose_with_model_options() {
+        let hints = sample_hints();
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &sample_options(),
+            Some(&hints),
+        );
+        let hint_idx = got.find("microVM spawns here").expect("hint line");
+        let options_idx = got.find("Specialist model options").expect("options block");
+        assert!(
+            hint_idx < options_idx,
+            "hints must precede the model options block"
+        );
+    }
+
+    // A pathological image label cannot break the description's line
+    // structure: newlines are flattened to spaces.
+    #[test]
+    fn microvm_hints_flatten_multiline_image_label() {
+        let hints = MicrovmSpawnHints {
+            image_label: "`https://example.com/a`\n(repo-config)".to_string(),
+            vcpus: 2,
+            mem_mib: 2048,
+        };
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &[],
+            Some(&hints),
+        );
+        assert!(
+            got.contains("guest image `https://example.com/a` (repo-config) and"),
+            "multi-line image label not flattened:\n{got}"
         );
     }
 }

@@ -2519,10 +2519,55 @@ pub struct AgentDelegateInput {
     /// sandbox live at turn end so the parent can inspect it and merge later
     /// via `sandbox.cow.merge`. Advisory when the agent has no sandbox.
     pub merge_on_turn_end: Option<bool>,
+    /// Per-agent microVM sizing override (`vmResources: { vcpus?, memMib? }`).
+    /// Missing fields fall back to the `sandbox.microvm.vcpus`/`memMib`
+    /// settings, then the built-in defaults. Accepted-and-ignored on
+    /// non-microVM workspaces (advisory, like `merge_on_turn_end`).
+    pub vm_resources: Option<VmResources>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+}
+
+/// Per-agent microVM sizing override (`vmResources` on `agent.delegate` /
+/// `agent.create`): both fields optional — a missing field falls back to the
+/// corresponding `sandbox.microvm.*` setting, then the built-in default
+/// (2 vCPUs / 2048 MiB). Bounds mirror the microVM helper: vcpus 1–16,
+/// memMib >= 128; validated at delegate/create time so bad input errors
+/// before the VM boots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VmResources {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u32>,
+}
+
+impl VmResources {
+    /// Validate the override against the microVM helper's bounds
+    /// (`vcpus` 1–16, `memMib` >= 128). Called at delegate/create time so
+    /// invalid sizing errors immediately instead of at VM boot.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(v) = self.vcpus {
+            if v == 0 || v > crate::settings_file::MAX_MICROVM_VCPUS {
+                return Err(crate::Error::InvalidParams(format!(
+                    "vmResources.vcpus: must be between 1 and {}, got {v}",
+                    crate::settings_file::MAX_MICROVM_VCPUS
+                )));
+            }
+        }
+        if let Some(m) = self.mem_mib {
+            if m < crate::settings_file::MIN_MICROVM_MEM_MIB {
+                return Err(crate::Error::InvalidParams(format!(
+                    "vmResources.memMib: must be >= {}, got {m}",
+                    crate::settings_file::MIN_MICROVM_MEM_MIB
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -4020,5 +4065,68 @@ mod tests {
         let update: WorkspaceUpdate =
             serde_json::from_value(json!({ "skipWorktree": false })).unwrap();
         assert_eq!(update.skip_isolation, Some(false));
+    }
+
+    #[test]
+    fn vm_resources_validate_enforces_helper_bounds() {
+        // In-range and partial overrides pass (missing fields fall back
+        // later, at spawn resolution).
+        for vm in [
+            VmResources {
+                vcpus: Some(1),
+                mem_mib: Some(128),
+            },
+            VmResources {
+                vcpus: Some(16),
+                mem_mib: None,
+            },
+            VmResources {
+                vcpus: None,
+                mem_mib: Some(8192),
+            },
+            VmResources::default(),
+        ] {
+            vm.validate().unwrap_or_else(|e| panic!("{vm:?}: {e}"));
+        }
+        // Out-of-range values error naming the offending field.
+        for (vm, field) in [
+            (
+                VmResources {
+                    vcpus: Some(0),
+                    mem_mib: None,
+                },
+                "vmResources.vcpus",
+            ),
+            (
+                VmResources {
+                    vcpus: Some(17),
+                    mem_mib: None,
+                },
+                "vmResources.vcpus",
+            ),
+            (
+                VmResources {
+                    vcpus: None,
+                    mem_mib: Some(64),
+                },
+                "vmResources.memMib",
+            ),
+        ] {
+            let err = vm.validate().unwrap_err();
+            assert!(err.to_string().contains(field), "{vm:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn vm_resources_wire_shape_is_camel_case_and_partial() {
+        let vm: VmResources = serde_json::from_value(json!({ "memMib": 4096 })).unwrap();
+        assert_eq!(vm.vcpus, None);
+        assert_eq!(vm.mem_mib, Some(4096));
+        let v = serde_json::to_value(VmResources {
+            vcpus: Some(4),
+            mem_mib: Some(4096),
+        })
+        .unwrap();
+        assert_eq!(v, json!({ "vcpus": 4, "memMib": 4096 }));
     }
 }
