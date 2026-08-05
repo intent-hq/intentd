@@ -1,9 +1,10 @@
 //! Per-agent VM lifecycle: boot, guest setup, provider exec, teardown
 //! (monorepo#1120, EE-5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use intent_core::{AgentId, WorkspaceId};
@@ -117,11 +118,70 @@ pub fn resolve_helper_exe() -> Result<PathBuf, MicrovmError> {
     }
 }
 
+/// In-flight teardown scrubs keyed by `vm_dir` (see [`schedule_scrub`]).
+/// `MicrovmVm::boot` joins the entry for its `vm_dir` before provisioning, so
+/// a re-spawn of the same agent id can never race a prior VM's detached
+/// deletion — without the join, the stale `remove_dir_all` traversal deletes
+/// entries out of the freshly cloned rootfs and the VM boots on a gutted
+/// tree (guest exec of intent-init fails with 127). Entries are removed when
+/// joined; a finished-but-unjoined handle per agent is a bounded, tiny leak.
+static PENDING_SCRUBS: LazyLock<Mutex<HashMap<PathBuf, std::thread::JoinHandle<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Spawn the detached teardown scrub for a VM's state (exec socket + vm dir)
+/// and register it in [`PENDING_SCRUBS`] so the next boot of the same agent
+/// can await it. Called from [`MicrovmVm`]'s `Drop` (which cannot be async,
+/// and the tree can be large).
+fn schedule_scrub(dir: PathBuf, sock: PathBuf) {
+    schedule_scrub_with(dir, sock, || ());
+}
+
+/// [`schedule_scrub`] with a pre-deletion hook, letting tests simulate a slow
+/// in-flight deletion deterministically.
+fn schedule_scrub_with(dir: PathBuf, sock: PathBuf, pre: impl FnOnce() + Send + 'static) {
+    let prev = PENDING_SCRUBS.lock().unwrap().remove(&dir);
+    let key = dir.clone();
+    let handle = std::thread::spawn(move || {
+        // Chain any earlier scrub of the same path so joining the newest
+        // handle always covers every in-flight deletion.
+        if let Some(prev) = prev {
+            let _ = prev.join();
+        }
+        pre();
+        if let Err(e) = std::fs::remove_file(&sock) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(sock = %sock.display(), error = %e, "exec socket scrub failed");
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(dir = %dir.display(), error = %e, "microVM scrub failed");
+            }
+        }
+    });
+    PENDING_SCRUBS.lock().unwrap().insert(key, handle);
+}
+
+/// Await any in-flight teardown scrub of `dir`. Best-effort: a panicked
+/// scrub thread is absorbed — `boot`'s own stale-dir scrub runs right after
+/// and cleans up whatever the scrub left behind.
+async fn await_pending_scrub(dir: &Path) {
+    let handle = PENDING_SCRUBS.lock().unwrap().remove(dir);
+    if let Some(handle) = handle {
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+    }
+}
+
 impl MicrovmVm {
     /// Boot a VM per `spec`: materialize the per-VM rootfs (CoW clone of the
     /// extracted image tree), stage credentials + spawn material into it,
     /// spawn the helper, and wait for the guest exec agent to answer.
     pub async fn boot(spec: &MicrovmSpawnSpec) -> Result<Self, MicrovmError> {
+        // A prior VM for this agent may still be scrubbing this very path on
+        // a detached thread (e.g. the silent-redrive teardown immediately
+        // followed by a re-spawn). Join it first — provisioning over a live
+        // deletion loses the race and boots on a gutted rootfs.
+        await_pending_scrub(&spec.vm_dir).await;
         // Fresh per-VM state dir: any leftover from a crashed prior VM is
         // scrubbed first (also deletes previously staged credentials).
         if tokio::fs::try_exists(&spec.vm_dir).await.unwrap_or(false) {
@@ -368,27 +428,15 @@ impl MicrovmVm {
 /// any still-owned helper child dies via `kill_on_drop`, and the per-VM
 /// directory — rootfs clone with every staged credential inside it, console
 /// log — plus the temp-dir exec socket are removed on a detached thread
-/// (Drop cannot be async, and the tree can be large). Every handle-teardown
-/// path drops the VM after killing the helper's process group, so the scrub
-/// is universal; a daemon crash instead scrubs lazily at the next boot for
-/// the same agent (`MicrovmVm::boot` removes a stale vm dir and exec socket
-/// first).
+/// (Drop cannot be async, and the tree can be large). The thread is
+/// registered in [`PENDING_SCRUBS`] so a re-boot of the same agent id joins
+/// it instead of racing it. Every handle-teardown path drops the VM after
+/// killing the helper's process group, so the scrub is universal; a daemon
+/// crash instead scrubs lazily at the next boot for the same agent
+/// (`MicrovmVm::boot` removes a stale vm dir and exec socket first).
 impl Drop for MicrovmVm {
     fn drop(&mut self) {
-        let dir = self.vm_dir.clone();
-        let sock = self.exec_sock.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = std::fs::remove_file(&sock) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(sock = %sock.display(), error = %e, "exec socket scrub failed");
-                }
-            }
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(dir = %dir.display(), error = %e, "microVM scrub failed");
-                }
-            }
-        });
+        schedule_scrub(self.vm_dir.clone(), self.exec_sock.clone());
         // Best-effort `sandbox:vm:stopped` — only when a runtime is live
         // (Drop may run during runtime shutdown, where publishing is moot).
         if let Some((bus, workspace_id, agent_id)) = self.stop_event.take() {
@@ -540,6 +588,65 @@ mod tests {
         let err = resolve_helper_exe().unwrap_err();
         std::env::remove_var(HELPER_EXE_ENV);
         assert!(matches!(err, MicrovmError::HelperMissing(_)));
+    }
+
+    /// Regression: re-provisioning the same agent id while a prior VM's
+    /// detached teardown scrub is still in flight must not race it — the
+    /// stale deletion used to gut the freshly cloned rootfs (guest exec of
+    /// intent-init then failed with 127). Boot's `await_pending_scrub` joins
+    /// the registered scrub thread before touching the path.
+    #[tokio::test]
+    async fn reprovision_awaits_inflight_teardown_scrub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm_dir = tmp.path().join("agent-race");
+        let sock = tmp.path().join("agent-race.sock");
+        // Prior VM's state: rootfs tree + exec socket.
+        std::fs::create_dir_all(vm_dir.join("rootfs/usr/local/bin")).unwrap();
+        std::fs::write(vm_dir.join("rootfs/usr/local/bin/intent-init"), b"old").unwrap();
+        std::fs::write(&sock, b"").unwrap();
+
+        // Teardown (what Drop does), with the deletion held back so it is
+        // provably still in flight when the re-provision starts.
+        schedule_scrub_with(vm_dir.clone(), sock.clone(), || {
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        // Re-provision of the same agent id: boot joins the scrub first.
+        await_pending_scrub(&vm_dir).await;
+        assert!(
+            !vm_dir.exists(),
+            "scrub must complete before re-provisioning"
+        );
+        assert!(!sock.exists(), "exec socket scrub must complete too");
+
+        // Fresh clone for the new boot: nothing may delete it afterwards.
+        std::fs::create_dir_all(vm_dir.join("rootfs/usr/local/bin")).unwrap();
+        std::fs::write(vm_dir.join("rootfs/usr/local/bin/intent-init"), b"new").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            std::fs::read(vm_dir.join("rootfs/usr/local/bin/intent-init")).unwrap(),
+            b"new",
+            "stale detached deletion gutted the fresh rootfs"
+        );
+        // A second await with nothing pending is a no-op.
+        await_pending_scrub(&vm_dir).await;
+        assert!(vm_dir.exists());
+    }
+
+    /// Back-to-back scrubs of the same path chain: joining the newest handle
+    /// covers the earlier in-flight deletion as well.
+    #[tokio::test]
+    async fn chained_scrubs_join_previous_inflight_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm_dir = tmp.path().join("agent-chain");
+        let sock = tmp.path().join("agent-chain.sock");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        schedule_scrub_with(vm_dir.clone(), sock.clone(), || {
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        schedule_scrub(vm_dir.clone(), sock.clone());
+        await_pending_scrub(&vm_dir).await;
+        assert!(!vm_dir.exists());
     }
 
     #[test]
