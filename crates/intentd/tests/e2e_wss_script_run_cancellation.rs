@@ -164,7 +164,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// in-flight `script.run` whose client is about to vanish).
 async fn wss_send(ws: &mut TlsWs, id: i64, method: &str, params: Value) {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
+    ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
 }
