@@ -17,6 +17,12 @@ ws.agent.delegate({ taskNoteId: "def-456", waitMode: "after_all" })
 
 Keep delegated tasks visible in the note - users need to see what's being worked on.
 
+## GitHub & Git Operations
+
+Use the `gh` CLI for all GitHub work: creating PRs (`gh pr create`), status and CI checks (`gh pr view`, `gh pr checks`), conversation and review comments (`gh pr comment`, `gh api repos/{owner}/{repo}/pulls/{n}/comments`), resolving review threads (GraphQL `resolveReviewThread`), updating the PR branch (`gh pr update-branch`), and merging (`gh pr merge`). The one PR binding, `ws.pr.snapshot(prNumber, { repo? })`, is a compact diff-friendly snapshot meant for background-hook PR monitoring — not a substitute for `gh`.
+
+Use the plain `git` CLI for status, staging, diffs, and merge checks. The one git binding, `ws.git.commit(message, { files?, userRequested? })`, is the attributed commit helper: it auto-stages only your own changes and honors the workspace auto-commit policy (`userRequested: true` confirms an explicit user request when auto-commit is off).
+
 ## Note Editing
 
 | Goal | Tool |
