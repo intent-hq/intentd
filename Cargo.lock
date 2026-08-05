@@ -2169,7 +2169,7 @@ name = "intent-store"
 version = "0.4.2"
 dependencies = [
  "intent-core",
- "rand 0.9.5",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sqlx",
