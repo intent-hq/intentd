@@ -1096,16 +1096,14 @@ impl Services {
         self.script_manager().hydrate().await
     }
 
-    /// Clean daemon shutdown (monorepo#1526): stop every managed script with
-    /// user-stop semantics (so no auto-restart races the teardown), then kill
-    /// every remaining PTY session (terminals and scripts) via the group-kill
-    /// escalation. Both sweeps tear their victims down concurrently, so the
-    /// whole call is bounded by one SIGTERM grace per phase. Returns
+    /// Clean daemon shutdown (monorepo#1526): flag every managed script with
+    /// user-stop semantics (so no auto-restart races the teardown), kill every
+    /// PTY session the host tracks — scripts and terminals alike — in one
+    /// concurrent group-kill sweep bounded by a single SIGTERM grace, then
+    /// await the supervisor settles under a bounded backstop. Returns
     /// `(scripts_stopped, ptys_killed)`.
     pub async fn shutdown_pty_sessions(&self) -> (usize, usize) {
-        let scripts = self.script_manager().stop_all().await;
-        let ptys = self.pty.kill_all().await;
-        (scripts, ptys)
+        self.script_manager().stop_all().await
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live

@@ -590,7 +590,11 @@ impl PtyHost {
         for session in victims {
             teardowns.spawn(async move { teardown(&session).await });
         }
-        while teardowns.join_next().await.is_some() {}
+        while let Some(res) = teardowns.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "pty teardown task failed during kill_all");
+            }
+        }
         count
     }
 

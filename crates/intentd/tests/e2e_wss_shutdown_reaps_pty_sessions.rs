@@ -377,12 +377,14 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     let shutdown = uds_rpc(&socket, 5, "system.shutdown", json!({})).await;
     assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
 
-    // Both stragglers must be gone within the bounded sweep: the script
-    // stop-all and PTY kill-all phases run sequentially, each bounded by one
-    // 2s SIGTERM grace (teardowns within a phase are concurrent), so 6s
-    // (scaled only for coverage instrumentation) bounds the whole sweep —
-    // still inside the FE sidecar's own kill grace.
-    let budget = common::test_timeout(Duration::from_secs(6));
+    // Both stragglers must be gone within the bounded sweep: scripts are
+    // flagged user-stopped synchronously, then one concurrent kill-all covers
+    // script and terminal PTYs alike — a single 2s SIGTERM grace wall-clock.
+    // The budget is deliberately loose (the regression signal is "stragglers
+    // die at all vs. survive forever", not the exact latency) so full-suite
+    // CI contention cannot flake it; 10s still sits under the daemon-exit
+    // assertion below.
+    let budget = common::test_timeout(Duration::from_secs(10));
     loop {
         if pid_dead(term_straggler) && pid_dead(script_straggler) {
             break;

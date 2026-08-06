@@ -42,6 +42,11 @@ const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 pub(crate) const TOO_FAST_MS: u128 = 2000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
+/// Backstop on awaiting supervisor settles during shutdown `stop_all`
+/// (monorepo#1526): their PTYs are already dead, so they normally settle in
+/// milliseconds — this bound only guards a wedged supervisor from stalling
+/// daemon shutdown past the FE sidecar's kill grace.
+const SHUTDOWN_SETTLE_GRACE: Duration = Duration::from_secs(2);
 
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
@@ -646,40 +651,89 @@ impl ScriptManager {
     }
 
     /// Clean daemon shutdown (monorepo#1526): stop every managed script across
-    /// all workspaces with the same user-stop semantics as `script.stop`, so
-    /// no auto-restart supervisor respawns a PTY while the daemon tears down.
-    /// Every entry is flagged `stopped_by_user` under one lock acquisition
-    /// BEFORE any PTY is killed; the per-script teardowns (kill the recorded
-    /// PTY, await the supervisor) then run concurrently so the wall-clock cost
-    /// of the sweep is one SIGTERM grace, not one per script. Returns the
-    /// number of scripts that had a live PTY or supervisor.
-    pub(crate) async fn stop_all(&self) -> usize {
-        let victims: Vec<(Option<tokio::task::JoinHandle<()>>, Option<PtyId>)> = {
+    /// all workspaces with the same user-stop semantics as `script.stop` (so
+    /// no auto-restart supervisor respawns a PTY while the daemon tears down),
+    /// then kill every PTY the host still tracks — scripts and terminals alike
+    /// — in one concurrent group-kill sweep. Returns
+    /// `(scripts_stopped, ptys_killed)`.
+    ///
+    /// Three phases, bounded by a single SIGTERM grace overall:
+    /// 1. Flag every entry `stopped_by_user` and take the supervisor handles
+    ///    under one lock acquisition, before any PTY dies — no await points,
+    ///    so no supervisor can observe a half-flagged registry.
+    /// 2. `PtyHost::kill_all` reaps every tracked session concurrently (one
+    ///    TERM grace wall-clock) and latches the host closed, so a spawn
+    ///    racing the sweep is refused and reaped in place.
+    /// 3. Await the taken supervisor handles — their PTYs are already dead
+    ///    (or their respawn registration refuses on the stop flag), so they
+    ///    settle promptly; the await is time-bounded as a backstop so a
+    ///    wedged supervisor can never stall daemon shutdown.
+    ///
+    /// The settled supervisors persisted `was_running = false` on their way
+    /// out (`mark_exited`), but a *graceful* daemon shutdown should leave the
+    /// same relaunch affordance as a daemon death (monorepo#932): the marker
+    /// is re-persisted for every service that was running when the sweep
+    /// began, so the FE can offer to resurrect it on next boot.
+    pub(crate) async fn stop_all(&self) -> (usize, usize) {
+        struct Stopped {
+            ws: WorkspaceId,
+            id: String,
+            handle: Option<tokio::task::JoinHandle<()>>,
+            running_service: bool,
+        }
+        let victims: Vec<Stopped> = {
             let mut guard = self.scripts.lock().unwrap();
             guard
-                .values_mut()
-                .map(|m| {
+                .iter_mut()
+                .map(|((ws, id), m)| {
                     m.stopped_by_user = true;
-                    (m.supervisor.take(), m.pty_id)
+                    Stopped {
+                        ws: ws.clone(),
+                        id: id.clone(),
+                        handle: m.supervisor.take(),
+                        running_service: m.def.mode == ScriptMode::Service
+                            && m.state.status == ScriptStatus::Running,
+                    }
                 })
-                .filter(|(handle, pty_id)| handle.is_some() || pty_id.is_some())
+                .filter(|s| s.handle.is_some())
                 .collect()
         };
-        let count = victims.len();
-        let mut teardowns = tokio::task::JoinSet::new();
-        for (handle, pty_id) in victims {
-            let pty = self.pty.clone();
-            teardowns.spawn(async move {
-                if let Some(pty_id) = pty_id {
-                    pty.kill(pty_id).await;
-                }
-                if let Some(handle) = handle {
-                    let _ = handle.await;
-                }
-            });
+        let scripts = victims.len();
+        let ptys = self.pty.kill_all().await;
+        let mut settles = tokio::task::JoinSet::new();
+        let mut markers = Vec::new();
+        for v in victims {
+            if v.running_service {
+                markers.push((v.ws, v.id.clone()));
+            }
+            if let Some(handle) = v.handle {
+                let id = v.id;
+                settles.spawn(async move {
+                    if let Err(e) = handle.await {
+                        tracing::warn!(script = %id, error = %e, "script supervisor join failed during shutdown stop-all");
+                    }
+                });
+            }
         }
-        while teardowns.join_next().await.is_some() {}
-        count
+        let drain = async {
+            while let Some(res) = settles.join_next().await {
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "shutdown stop-all settle task failed");
+                }
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_SETTLE_GRACE, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "shutdown stop-all: supervisors still settling after {SHUTDOWN_SETTLE_GRACE:?}; proceeding"
+            );
+        }
+        for (ws, id) in markers {
+            self.persist_was_running(&ws, &id, true).await;
+        }
+        (scripts, ptys)
     }
 
     /// `script.restart`: stop, reset the restart counter, then start. Scoped to
@@ -2809,11 +2863,14 @@ mod tests {
         assert_ne!(st["status"], "running", "status reflects the dead group");
     }
 
-    /// Clean daemon shutdown (monorepo#1526): `shutdown_pty_sessions` stops a
+    /// Clean daemon shutdown (monorepo#1526): `shutdown_pty_sessions` flags a
     /// running service with user-stop semantics — the TERM+HUP-trapping
-    /// straggler dies, the supervisor does not auto-restart it — and then
-    /// kills every remaining PTY (a plain terminal-style session), leaving the
-    /// host empty.
+    /// straggler dies, the supervisor does not auto-restart it — and kills
+    /// every PTY the host tracks (the script's and a plain terminal-style
+    /// session) in one sweep, leaving the host empty and closed. The durable
+    /// `was_running` marker survives the graceful shutdown so the next boot
+    /// still offers the relaunch affordance (monorepo#932 parity with daemon
+    /// death).
     #[tokio::test]
     async fn shutdown_pty_sessions_stops_scripts_and_kills_all_ptys() {
         let h = harness().await;
@@ -2838,7 +2895,7 @@ mod tests {
 
         let (scripts, ptys) = h.services.shutdown_pty_sessions().await;
         assert_eq!(scripts, 1, "one running script stopped");
-        assert_eq!(ptys, 1, "the remaining terminal PTY killed");
+        assert_eq!(ptys, 2, "the script and terminal PTYs killed in one sweep");
 
         await_pid_dead(straggler, "TERM+HUP-trapping straggler").await;
         assert_eq!(h.services.pty().count(), 0, "host empty after shutdown");
@@ -2847,11 +2904,24 @@ mod tests {
         // respawning, so the script settles non-running with no new PTY.
         let st = h
             .services
-            .script_status(h.ws.clone(), id)
+            .script_status(h.ws.clone(), id.clone())
             .await
             .expect("status");
         assert_ne!(st["status"], "running", "no auto-restart after stop-all");
         assert_eq!(h.services.pty().count(), 0, "no respawned PTY");
+
+        // Graceful shutdown preserves the relaunch affordance: the service
+        // was running when the sweep began, so `was_running` stays set.
+        let markers = h
+            .services
+            .store()
+            .list_was_running_script_ids()
+            .await
+            .expect("list markers");
+        assert!(
+            markers.contains(&(h.ws.as_str().to_string(), id.clone())),
+            "was_running marker survives graceful shutdown: {markers:?}"
+        );
     }
 
     /// A stop-all racing an auto-restart respawn (monorepo#1526): the
