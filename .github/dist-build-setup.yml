@@ -20,12 +20,14 @@
 # /etc/apt/apt.conf.d/90assumeyes; tinybox doesn't have it, so apt prompts,
 # reads EOF, and aborts. Mirror the hosted-image config and export
 # DEBIAN_FRONTEND=noninteractive for the later steps.
-# Also set DPkg::Lock::Timeout system-wide so every later apt-get call —
-# including the generated "Install dependencies" step, which can't be edited
-# — waits up to 300s for the apt/dpkg locks instead of failing instantly
-# when a co-tenant job on the shared self-hosted runner holds them
-# (monorepo#1515: v0.5.0 aarch64-musl leg lost the lock race in
-# `sudo apt-get update`).
+# Also set DPkg::Lock::Timeout system-wide so every later `apt-get install`
+# — including the one in the generated "Install dependencies" step, which
+# can't be edited — waits up to 300s for the dpkg/frontend/archives locks
+# instead of failing instantly when a concurrent job on the shared
+# self-hosted runner holds them (monorepo#1515). Note this option does NOT
+# cover /var/lib/apt/lists/lock, which `apt-get update` takes (Debian bug
+# #1069167, unimplemented as of apt 2.4 on tinybox) — the shim step below
+# handles that.
 - name: Make apt-get non-interactive and lock-tolerant (Linux)
   if: runner.os == 'Linux'
   shell: bash
@@ -33,6 +35,42 @@
     echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
     echo 'DPkg::Lock::Timeout "300";' | sudo tee /etc/apt/apt.conf.d/90lock-timeout >/dev/null
     echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
+# The generated "Install dependencies" step starts with `sudo apt-get
+# update`, whose lists lock has no wait option (Debian bug #1069167), and
+# both musl legs run that step concurrently on tinybox — exactly the race
+# that failed the v0.5.0 aarch64-musl leg (monorepo#1515). The step's
+# content is plan-time matrix output (`matrix.packages_install`), so it
+# can't be wrapped in a retry here. Instead, shim apt-get via
+# /usr/local/bin — ahead of /usr/bin on sudo's secure_path — to retry with
+# backoff when apt fails on lock contention. Idempotent rewrite on every
+# run; only ever lands on the self-hosted Linux runners (the v-release
+# Linux legs all run on tinybox).
+- name: Install retrying apt-get shim (Linux)
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    sudo tee /usr/local/bin/apt-get >/dev/null <<'EOF'
+    #!/bin/sh
+    # Installed by intent-hq/intentd CI (dist-build-setup.yml, monorepo#1515).
+    # Retries /usr/bin/apt-get on apt/dpkg lock contention: DPkg::Lock::Timeout
+    # does not cover the lists lock taken by `apt-get update` (Debian #1069167).
+    attempt=1
+    while :; do
+      err=$(mktemp)
+      /usr/bin/apt-get "$@" 2>"$err"
+      rc=$?
+      cat "$err" >&2
+      if [ "$rc" -eq 0 ] || [ "$attempt" -ge 3 ] || ! grep -qE 'Could not get lock|Unable to lock|Unable to acquire' "$err"; then
+        rm -f "$err"
+        exit "$rc"
+      fi
+      rm -f "$err"
+      echo "apt-get lock contention (attempt $attempt/3); retrying in $((attempt * 15))s..." >&2
+      sleep $((attempt * 15))
+      attempt=$((attempt + 1))
+    done
+    EOF
+    sudo chmod 0755 /usr/local/bin/apt-get
 - name: Provision Rust toolchain and matrix targets (self-hosted runners)
   shell: bash
   run: |

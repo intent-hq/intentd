@@ -158,13 +158,19 @@ jobs:
           fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
       # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
-      # relies on the runner user's passwordless sudo. DPkg::Lock::Timeout
-      # makes apt wait for the apt/dpkg locks instead of failing instantly
-      # when a co-tenant job on the shared runner holds them (monorepo#1515).
+      # relies on the runner user's passwordless sudo. Co-tenant jobs on the
+      # shared runner race for the apt locks (monorepo#1515):
+      # DPkg::Lock::Timeout makes `install` wait for the dpkg locks, and the
+      # retry loop covers `update`, whose lists lock has no wait option
+      # (Debian bug #1069167).
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
@@ -436,7 +442,11 @@ jobs:
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Per-job persistent target dir outside the work dir (see the `check`
@@ -586,7 +596,11 @@ jobs:
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Raise the per-user inotify instance ceiling. The instrumented full

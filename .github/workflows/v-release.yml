@@ -138,6 +138,32 @@ jobs:
           echo 'DPkg::Lock::Timeout "300";' | sudo tee /etc/apt/apt.conf.d/90lock-timeout >/dev/null
           echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
         shell: "bash"
+      - name: "Install retrying apt-get shim (Linux)"
+        if: "runner.os == 'Linux'"
+        run: |
+          sudo tee /usr/local/bin/apt-get >/dev/null <<'EOF'
+          #!/bin/sh
+          # Installed by intent-hq/intentd CI (dist-build-setup.yml, monorepo#1515).
+          # Retries /usr/bin/apt-get on apt/dpkg lock contention: DPkg::Lock::Timeout
+          # does not cover the lists lock taken by `apt-get update` (Debian #1069167).
+          attempt=1
+          while :; do
+            err=$(mktemp)
+            /usr/bin/apt-get "$@" 2>"$err"
+            rc=$?
+            cat "$err" >&2
+            if [ "$rc" -eq 0 ] || [ "$attempt" -ge 3 ] || ! grep -qE 'Could not get lock|Unable to lock|Unable to acquire' "$err"; then
+              rm -f "$err"
+              exit "$rc"
+            fi
+            rm -f "$err"
+            echo "apt-get lock contention (attempt $attempt/3); retrying in $((attempt * 15))s..." >&2
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          EOF
+          sudo chmod 0755 /usr/local/bin/apt-get
+        shell: "bash"
       - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"
         run: |
           if ! command -v rustup >/dev/null 2>&1; then

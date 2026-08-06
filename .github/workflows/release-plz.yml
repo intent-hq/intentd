@@ -124,12 +124,18 @@ jobs:
       # a no-op — kept as an idempotent guard (ci.yml's guard, extended to
       # also cover a missing pkg-config; relies on the runner user's
       # passwordless sudo, same as ci.yml's self-hosted jobs).
-      # DPkg::Lock::Timeout makes apt wait for the apt/dpkg locks instead of
-      # failing instantly when a co-tenant job holds them (monorepo#1515).
+      # Co-tenant jobs on the shared runner race for the apt locks
+      # (monorepo#1515): DPkg::Lock::Timeout makes `install` wait for the
+      # dpkg locks, and the retry loop covers `update`, whose lists lock has
+      # no wait option (Debian bug #1069167).
       - name: Install pkg-config/libssl-dev if missing
         run: |
           if ! command -v pkg-config >/dev/null || ! pkg-config --exists openssl; then
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq pkg-config libssl-dev
           fi
       - name: Resolve pinned Rust channel
