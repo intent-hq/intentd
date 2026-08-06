@@ -33,7 +33,7 @@ pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.question = {
-        // spec: { question, header, options: [{ label, description? }], explanation?, multiSelect? }
+        // spec: { header, question, options: [{ label, description? }], explanation?, multiSelect? }
         ask: (spec) => host({ method: 'app.question.ask', args: { question: spec } }),
     };
 "#;
@@ -108,7 +108,7 @@ fn ask(
 fn validate_question(question: &Value) -> Result<Map<String, Value>, String> {
     let Some(q) = question.as_object() else {
         return Err(
-            "`question` is required and must be an object: { question, header, options, \
+            "`question` is required and must be an object: { header, question, options, \
              explanation?, multiSelect? }"
                 .to_string(),
         );
