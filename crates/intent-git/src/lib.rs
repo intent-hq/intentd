@@ -31,6 +31,7 @@ pub mod push;
 pub mod rebase;
 pub mod refs;
 pub mod remote;
+pub mod repo_cache;
 pub mod reset;
 pub mod show;
 pub mod squash;
