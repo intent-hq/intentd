@@ -26,6 +26,18 @@ pub use skills_watcher::SkillsWatcher;
 pub use specialists_watcher::SpecialistsWatcher;
 pub use watcher::FileWatcher;
 
+/// Serializes every test that starts a real filesystem watcher (the
+/// `notify`-backed `RootWatch` / `FileWatcher` / `ConfigWatcher` probes across
+/// `events/*` and `config_watcher`). Under full-suite parallel load, ~26
+/// concurrent real watchers starve each other's OS-level startup and event
+/// delivery, flaking the timing-sensitive tests (in isolation each passes).
+/// Holding this guard for a test's whole duration keeps only one real watcher
+/// live at a time. Mirrors the `CHILD_SPAWN_SERIAL` pattern in
+/// `provider_models`. `unwrap_or_else(into_inner)` recovers from a poisoned
+/// lock so one panicking test does not cascade.
+#[cfg(test)]
+pub(crate) static WATCHER_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod bus_tests;
 

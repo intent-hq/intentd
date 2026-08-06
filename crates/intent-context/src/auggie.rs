@@ -291,6 +291,22 @@ mod tests {
         dir
     }
 
+    /// Serializes the tests that exec a real fake-auggie child against one
+    /// another. `cargo test` runs the tests within this binary in parallel, and
+    /// `run_auggie_timeout_group_kills_grandchildren` depends on its child being
+    /// scheduled promptly — it must fork its `sleep 30` grandchild and write the
+    /// pidfile before the timeout reaps the group. Under full-suite parallel
+    /// load, a second concurrent fake-binary spawn can starve it past that
+    /// budget, so the pidfile is never written and the test flakes (the timeout
+    /// budget itself is now widened to 5s for runner-agnostic headroom, but this
+    /// guard keeps only one such spawn running at a time). Holding this
+    /// guard for each child-spawning test's duration keeps only one such spawn
+    /// running at a time. Mirrors the `CHILD_SPAWN_SERIAL` (provider_models) and
+    /// `WATCHER_TEST_SERIAL` (events/mod.rs) precedents. `unwrap_or_else(
+    /// into_inner)` recovers from a poisoned lock so one panicking test does not
+    /// cascade into the rest.
+    static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn classify_available_parses_version() {
         let a = classify_availability("auggie v1.12.3", "", true);
@@ -351,6 +367,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn availability_available_via_fake_binary() {
+        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("avail");
         let bin = dir.path().join("auggie");
@@ -374,6 +391,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_auggie_timeout_group_kills_grandchildren() {
+        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("groupkill");
         let bin = dir.path().join("auggie");
@@ -388,13 +406,13 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let result = futures_block_on(run_auggie(
-            &bin,
-            &[],
-            None,
-            None,
-            Duration::from_millis(1000),
-        ));
+        // Budget deliberately generous (5s, not the ~1s that used to flake): the
+        // child must fork its `sleep 30` grandchild and write the pidfile before
+        // the timeout reaps the group, and under nextest's oversubscribed
+        // parallelism a tighter budget starves that startup past the deadline —
+        // failing BOTH retry attempts. The behavior under test (group-kill on
+        // timeout) is unchanged; only the headroom before the timeout fires.
+        let result = futures_block_on(run_auggie(&bin, &[], None, None, Duration::from_secs(5)));
         assert!(matches!(result, Err(ContextError::Timeout)));
 
         let grandchild_pid: i32 = std::fs::read_to_string(&pidfile)

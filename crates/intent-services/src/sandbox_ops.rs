@@ -401,9 +401,7 @@ pub async fn merge_sandbox(
 
     // Auto-commit any dirty sandbox state (preserving agent attribution)
     if is_dirty(&sandbox_repo)? {
-        let sig = sandbox_repo
-            .signature()
-            .map_err(|e| Error::Internal(format!("get sandbox signature failed: {e}")))?;
+        let sig = resolve_signature(&sandbox_repo)?;
         let mut index = sandbox_repo
             .index()
             .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
@@ -847,6 +845,37 @@ fn restore_missing_tracked_files(
     Ok(())
 }
 
+/// Resolve a git signature for authoring commits, falling back to a stable
+/// default identity when the user has no `user.name`/`user.email` configured.
+///
+/// When git identity IS configured, the real signature is used unchanged. The
+/// fallback to a fixed `Intent <intent@localhost>` identity is narrowed to the
+/// missing-identity error class (`git2::ErrorCode::NotFound`, i.e. "config
+/// value 'user.name' was not found"), so sandbox snapshot/auto-commit still
+/// succeeds on machines/CI without a git identity. Any other
+/// `repo.signature()` failure (e.g. corrupt/unreadable config) is propagated
+/// instead of being masked by the default identity.
+fn resolve_signature(repo: &git2::Repository) -> Result<git2::Signature<'static>> {
+    signature_or_fallback(repo.signature())
+}
+
+/// Error-classification half of [`resolve_signature`], split out so the
+/// fallback narrowing is unit-testable with constructed `git2::Error`s.
+fn signature_or_fallback(
+    sig: std::result::Result<git2::Signature<'static>, git2::Error>,
+) -> Result<git2::Signature<'static>> {
+    match sig {
+        Ok(sig) => Ok(sig),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            git2::Signature::now("Intent", "intent@localhost")
+                .map_err(|e| Error::Internal(format!("construct fallback signature failed: {e}")))
+        }
+        Err(e) => Err(Error::Internal(format!(
+            "resolve git signature failed: {e}"
+        ))),
+    }
+}
+
 /// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).
 fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
@@ -891,9 +920,7 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
         .and_then(|h| h.target())
         .and_then(|oid| repo.find_commit(oid).ok());
 
-    let sig = repo
-        .signature()
-        .map_err(|e| Error::Internal(format!("get signature failed: {e}")))?;
+    let sig = resolve_signature(repo)?;
 
     let message = format!("WIP snapshot for {}", agent_id.0);
     let parents: Vec<&git2::Commit> = parent.iter().collect();
@@ -3039,6 +3066,50 @@ mod tests {
         assert_eq!(diverged, vec!["rogue".to_string()]);
 
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn resolve_signature_uses_configured_identity() {
+        let (_dir, repo_path) = temp_repo("sig-configured");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Configured User").unwrap();
+        cfg.set_str("user.email", "configured@example.com").unwrap();
+
+        let sig = resolve_signature(&repo).unwrap();
+        assert_eq!(sig.name().unwrap(), "Configured User");
+        assert_eq!(sig.email().unwrap(), "configured@example.com");
+    }
+
+    #[test]
+    fn signature_fallback_defaults_on_missing_identity() {
+        // Missing user.name/user.email surfaces as ErrorCode::NotFound.
+        let err = git2::Error::new(
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Config,
+            "config value 'user.name' was not found",
+        );
+        let sig = signature_or_fallback(Err(err)).unwrap();
+        assert_eq!(sig.name().unwrap(), "Intent");
+        assert_eq!(sig.email().unwrap(), "intent@localhost");
+    }
+
+    #[test]
+    fn signature_fallback_propagates_other_errors() {
+        let err = git2::Error::new(
+            git2::ErrorCode::GenericError,
+            git2::ErrorClass::Config,
+            "failed to parse config file",
+        );
+        let msg = match signature_or_fallback(Err(err)) {
+            Ok(_) => panic!("expected non-NotFound signature error to propagate"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("resolve git signature failed"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("failed to parse config file"));
     }
 
     // P0-2: Completion-interception tests — BLOCKER IDENTIFIED
