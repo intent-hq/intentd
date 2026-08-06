@@ -1343,9 +1343,10 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// when it matches its catalog definition (overwriting any existing row —
 /// the file value is the user's most recent intent) or discarded with a
 /// warning when it does not (all current legacy keys — `[ai]`,
-/// `server.listenMode`, `model.workspaceOverrides` — are retired without a
-/// catalog entry, so they are discarded), and the keys are then stripped from
-/// the file with a comment-preserving rewrite. Nothing is stripped when a
+/// `server.listenMode`, `model.workspaceOverrides`, `workspace.autoFetch` —
+/// are retired without a catalog entry, so they are discarded), and the keys
+/// are then stripped from the file with a comment-preserving rewrite.
+/// Nothing is stripped when a
 /// SQLite write fails, so the next boot retries the import. The strip itself
 /// is best-effort: once the values are safely in SQLite, a failed file
 /// rewrite (read-only file, perms, full disk) is logged and startup continues
