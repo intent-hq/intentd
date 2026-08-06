@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -280,6 +280,11 @@ fn retry_transient<T, E: std::fmt::Display>(
 pub struct PtyHost {
     sessions: Mutex<HashMap<PtyId, Arc<PtySession>>>,
     next_id: AtomicU64,
+    /// Latched by [`kill_all`](Self::kill_all) (clean daemon shutdown): once
+    /// set, `spawn` refuses new sessions so a request already in flight when
+    /// the shutdown sweep drains the map cannot register a PTY afterwards and
+    /// leak its process group past daemon exit (monorepo#1526).
+    closed: AtomicBool,
 }
 
 impl PtyHost {
@@ -365,7 +370,19 @@ impl PtyHost {
         *session.watcher.lock().unwrap() = Some(watcher);
 
         let id = PtyId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.sessions.lock().unwrap().insert(id, session);
+        // Registration checks the shutdown latch under the same sessions lock
+        // that `kill_all` drains: either this insert lands before the drain
+        // (the sweep reaps it) or it observes `closed` and self-reaps here —
+        // a spawn racing daemon shutdown can never leave an untracked group.
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                drop(sessions);
+                reap_refused_spawn(&session);
+                return Err(internal("pty host is shut down"));
+            }
+            sessions.insert(id, session);
+        }
         Ok(id)
     }
 
@@ -557,7 +574,13 @@ impl PtyHost {
     /// the sweep stays one SIGTERM grace, not one per session, keeping the
     /// whole shutdown inside the FE sidecar's own kill grace. Returns the
     /// number reaped. No process-group orphans are left behind.
+    ///
+    /// Permanently closes the host: a `spawn` racing the sweep (e.g. a
+    /// `terminal.create` already in flight on an accepted connection when the
+    /// listener stops) either registers before the drain and is reaped by it,
+    /// or observes the latch and is refused with its child reaped in place.
     pub async fn kill_all(&self) -> usize {
+        self.closed.store(true, Ordering::SeqCst);
         let victims: Vec<Arc<PtySession>> = {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.drain().map(|(_, session)| session).collect()
@@ -700,6 +723,37 @@ async fn teardown(session: &PtySession) {
     // Release the held slave and the master fd so the reader observes EOF,
     // then join the reader and exit-watcher threads (the watcher exits on its
     // own once it sees the slave released).
+    session.slave.lock().unwrap().take();
+    session.master.lock().unwrap().take();
+    if let Some(handle) = session.reader.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+    if let Some(handle) = session.watcher.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+}
+
+/// Reap a session whose registration was refused by the shutdown latch
+/// (monorepo#1526): the child is milliseconds old and the daemon is exiting,
+/// so SIGKILL its group immediately — no TERM grace — reap the direct child
+/// (no zombie), then release the fds and join the session threads, exactly
+/// as `teardown` would. Synchronous because `spawn` is.
+fn reap_refused_spawn(session: &PtySession) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = session.pid {
+            let _ = kill_group(pid, PtySignal::Kill);
+        } else {
+            let _ = session.killer.lock().unwrap().kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session.killer.lock().unwrap().kill();
+    }
+    // Blocking reap is fine: the child was just SIGKILLed, so `wait` returns
+    // promptly, and this path only runs during daemon shutdown.
+    let _ = session.child.lock().unwrap().wait();
     session.slave.lock().unwrap().take();
     session.master.lock().unwrap().take();
     if let Some(handle) = session.reader.lock().unwrap().take() {
@@ -1319,6 +1373,46 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A `spawn` racing `kill_all` (monorepo#1526): a request already in
+    /// flight when the shutdown sweep drains the map must not register a PTY
+    /// afterwards — the latched host refuses the spawn and the just-forked
+    /// child is reaped in place, so no process group outlives the sweep.
+    #[tokio::test]
+    async fn spawn_after_kill_all_is_refused_and_reaped() {
+        let host = PtyHost::new();
+        assert_eq!(host.kill_all().await, 0);
+
+        // The shell records its pid before exec'ing the long sleep; the
+        // refused-spawn reap SIGKILLs the group and waits on the direct
+        // child, so by the time `spawn` errors, any recorded pid is dead.
+        let pidfile = std::env::temp_dir().join(format!(
+            "intent-pty-late-pid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut spec = SpawnSpec::new("scope-late", "sh");
+        spec.args = vec![
+            "-c".into(),
+            format!("echo $$ > \"{}\"; exec sleep 300", pidfile.display()),
+        ];
+        let err = host.spawn(spec).expect_err("spawn refused after kill_all");
+        assert!(
+            err.to_string().contains("shut down"),
+            "refusal names the shutdown: {err}"
+        );
+        assert_eq!(host.count(), 0, "nothing registered by the refused spawn");
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            assert!(!pid_alive(pid), "refused spawn's child {pid} was reaped");
+        }
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     /// After the direct child exits on its own, `reap_group_stragglers`

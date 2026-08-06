@@ -794,7 +794,10 @@ impl ScriptManager {
             // create-upsert) between the reservation and here: the entry is
             // gone or carries a new generation, so reap the fresh PTY
             // ourselves — mirrors `supervise()`.
-            if !mgr.mark_running(&ws_task, &sid, generation, pty_id).await {
+            if !mgr
+                .mark_running(&ws_task, &sid, generation, pty_id, false)
+                .await
+            {
                 mgr.pty.kill(pty_id).await;
                 return (None, false);
             }
@@ -876,7 +879,14 @@ impl ScriptManager {
                 park.release.notified().await;
             }
             let started = Instant::now();
-            if !self.mark_running(&ws, &script_id, generation, pty_id).await {
+            // `refuse_if_stopped`: a stop/stop-all that flagged the script
+            // between the loop's stopped check and this registration must not
+            // have its flag outrun by the respawn (monorepo#1526) — the
+            // refusal lands here and the fresh PTY is reaped below.
+            if !self
+                .mark_running(&ws, &script_id, generation, pty_id, true)
+                .await
+            {
                 self.pty.kill(pty_id).await;
                 return;
             }
@@ -1034,6 +1044,14 @@ impl ScriptManager {
     /// the script was removed — or removed and recreated under a new
     /// generation (monorepo#1194) — concurrently (caller should reap the PTY).
     ///
+    /// With `refuse_if_stopped` (the supervisor's respawn path), a
+    /// `stopped_by_user` flag set concurrently — a `stop`/`stop_all` landing
+    /// between the supervisor's post-backoff stopped check and this
+    /// registration (monorepo#1526) — also refuses: the stop keyed its PTY
+    /// kill on the *previous* pty_id, so letting this registration through
+    /// would leave the fresh PTY running unstopped. `run()`'s completion path
+    /// keeps `false`: its reservation flow owns the stop interaction.
+    ///
     /// Stored-on-write: a service-mode start durably sets the `was_running`
     /// marker (and drops any hydrated `previouslyRunning`), so a daemon that
     /// dies while the service runs hydrates it as previously running.
@@ -1044,6 +1062,7 @@ impl ScriptManager {
         script_id: &str,
         generation: u64,
         pty_id: PtyId,
+        refuse_if_stopped: bool,
     ) -> bool {
         let pid = self.pty.pid(pty_id);
         let (state, is_service) = {
@@ -1051,6 +1070,7 @@ impl ScriptManager {
             let Some(m) = guard
                 .get_mut(&(ws.clone(), script_id.to_string()))
                 .filter(|m| m.generation == generation)
+                .filter(|m| !(refuse_if_stopped && m.stopped_by_user))
             else {
                 return false;
             };
@@ -2832,6 +2852,85 @@ mod tests {
             .expect("status");
         assert_ne!(st["status"], "running", "no auto-restart after stop-all");
         assert_eq!(h.services.pty().count(), 0, "no respawned PTY");
+    }
+
+    /// A stop-all racing an auto-restart respawn (monorepo#1526): the
+    /// supervisor passed its post-backoff stopped check and spawned a fresh
+    /// PTY, but has not yet registered it when `stop_all` flags the script
+    /// and awaits the handle. The respawn's `mark_running` must refuse on the
+    /// concurrent `stopped_by_user` — the supervisor reaps the fresh PTY and
+    /// returns — so the shutdown sweep neither hangs on the supervisor nor
+    /// lets the replacement group survive. Pre-fix, `mark_running` ignored
+    /// the flag: the fresh PTY was adopted after `stop_all`'s snapshot and
+    /// its group outlived the daemon.
+    #[tokio::test]
+    async fn stop_all_during_respawn_window_refuses_registration_and_reaps() {
+        let mut h = harness().await;
+        h.services = h.services.with_script_too_fast_ms(0);
+        let park = Arc::new(SupervisePark::default());
+        let services = h.services.clone().with_script_supervise_park(park.clone());
+        let mut sub = subscribe(&h);
+        let flag = std::env::temp_dir().join(format!(
+            "intentd-scriptops-flag-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _flag = PidFile(flag.clone());
+        let pidfile = std::env::temp_dir().join(format!(
+            "intentd-scriptops-pid-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let _pidfile = PidFile(pidfile.clone());
+        // First run: create the flag and exit (commits an auto-restart with
+        // the too-fast floor at 0). Second run: record the pid, sleep.
+        let cmd = format!(
+            "if [ -e \"{f}\" ]; then echo $$ > \"{p}\"; exec sleep 3600; else : > \"{f}\"; fi",
+            f = flag.display(),
+            p = pidfile.display()
+        );
+        let id = create_simple(&h, "race", &cmd, ScriptMode::Service).await;
+        services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first spawn parked");
+        park.release.notify_one();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "restarting").await;
+        // The respawn parks pre-`mark_running`: the replacement PTY exists
+        // (its shell has written the pidfile) but is not yet registered.
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("respawn parked");
+        let fresh = read_pid(&pidfile).await;
+        let _guard = KillOnDrop(fresh);
+        assert!(
+            pid_alive(fresh),
+            "replacement shell alive inside the window"
+        );
+
+        // stop_all flags the script and awaits the parked supervisor. Let the
+        // sweep task run its synchronous flag phase (everything up to the
+        // teardown awaits) before releasing the park, so the respawn's
+        // registration deterministically observes the concurrent stop.
+        let sweep_services = h.services.clone();
+        let sweep = tokio::spawn(async move { sweep_services.shutdown_pty_sessions().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        park.release.notify_one();
+        let (scripts, _ptys) = tokio::time::timeout(LIVENESS, sweep)
+            .await
+            .expect("shutdown sweep returned before deadline")
+            .expect("join");
+        assert_eq!(scripts, 1, "the racing script was in the stop-all sweep");
+
+        await_pid_dead(fresh, "replacement spawned inside the window").await;
+        assert_eq!(h.services.pty().count(), 0, "host empty after the sweep");
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "running", "refused registration never ran");
     }
 
     /// Regression (monorepo#1300): when the shell exits on its own but a
