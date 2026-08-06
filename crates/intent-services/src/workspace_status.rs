@@ -116,13 +116,12 @@ impl Services {
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
     /// the derivation (task/note status updates, task-note deletion, PR
     /// link/status changes, agent activity begin/debounced end, hook
-    /// lifecycle transitions) — never from
-    /// a polling loop. The first
+    /// lifecycle transitions) — never from a polling loop. The first
     /// observation for a workspace seeds the cache without emitting (no
-    /// baseline to transition from); a read
-    /// failure skips the recompute entirely so a transient store error can
-    /// never fake a transition. Best-effort: errors are swallowed, the
-    /// mutation's own result is the contract. Concurrent callers (e.g. the
+    /// baseline to transition from); a read failure skips the recompute
+    /// entirely so a transient store error can never fake a transition.
+    /// Best-effort: errors are swallowed, the mutation's own result is the
+    /// contract. Concurrent callers (e.g. the
     /// debounced idle demotion racing an `agent_activity_begin` promotion)
     /// can in principle invert: the compute-then-insert is not atomic, so a
     /// stale compute inserted second would emit outdated and leave the
