@@ -200,6 +200,63 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
+/// A minimal committed git repo for `workspace.create` (the store row is what
+/// `script.*` needs; `skipWorktree` keeps provisioning out of the test).
+fn create_test_repo() -> PathBuf {
+    let repo_path = std::env::temp_dir().join(format!("scr-persist-repo-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo_path)
+            .stdout(Stdio::null())
+            .status()
+            .expect("git spawn");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial commit"]);
+    repo_path
+}
+
+/// Poll `script.status` until `pred` holds (pure-liveness deadline).
+async fn await_status<S, F>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    script_id: &str,
+    mut pred: F,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnMut(&Value) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut id = id_base;
+    loop {
+        let st = wss_rpc(
+            ws,
+            id,
+            "script.status",
+            json!({ "workspaceId": ws_id, "scriptId": script_id }),
+        )
+        .await;
+        if pred(&st) {
+            return st;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out awaiting script status, last: {st}"
+        );
+        id += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// `script.create` persists the definition; a daemon restart on the same data
 /// dir hydrates it back into `script.list` (fresh idle runtime), and
 /// `script.remove` unpersists it across yet another restart.
@@ -254,6 +311,10 @@ async fn scripts_survive_daemon_restart_over_wss() {
     assert_eq!(entry["autoStart"], true);
     assert_eq!(entry["source"], "user");
     assert_eq!(entry["runtime"]["status"], "idle");
+    assert!(
+        entry["runtime"].get("previouslyRunning").is_none(),
+        "never-started script hydrates without previouslyRunning: {entry}"
+    );
 
     // Remove it, restart again: it stays gone.
     let removed = wss_rpc(
@@ -283,5 +344,138 @@ async fn scripts_survive_daemon_restart_over_wss() {
     );
     drop(ws);
     stop(child);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// A service running when the daemon is killed hydrates on the next boot as
+/// `idle` with `previouslyRunning: true` (the stored-on-write `was_running`
+/// marker, PROTOCOL §5.8) on both `script.list` and `script.status`; the
+/// marker survives a second restart, and `script.stop` on the non-running
+/// hydrated script (the FE dismiss affordance) returns ok and durably clears
+/// it across yet another restart.
+#[tokio::test]
+async fn was_running_marker_survives_daemon_kill_over_wss() {
+    let data_dir = scratch_dir("marker");
+    let repo_path = create_test_repo();
+
+    // Boot #1: create a workspace + service script, start it, and kill the
+    // daemon while the service is running (no stop).
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut ws,
+        1,
+        "workspace.create",
+        json!({
+            "title": "script-marker",
+            "repositoryPath": repo_path.to_string_lossy(),
+            "skipWorktree": true,
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let script = wss_rpc(
+        &mut ws,
+        2,
+        "script.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "svc",
+            "command": "sleep 3600",
+            "mode": "service",
+            "scriptId": "marker-1",
+        }),
+    )
+    .await;
+    assert_eq!(script["id"], "marker-1");
+    let started = wss_rpc(
+        &mut ws,
+        3,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(started["ok"], json!(true));
+    await_status(&mut ws, 10, &ws_id, "marker-1", |st| {
+        st["status"] == json!("running")
+    })
+    .await;
+    drop(ws);
+    stop(child); // SIGKILL — the running service never sees a stop.
+
+    // Boot #2: hydrated idle with previouslyRunning on status and list.
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let st = wss_rpc(
+        &mut ws,
+        4,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(st["status"], "idle", "hydrates idle: {st}");
+    assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
+    let listed = wss_rpc(&mut ws, 5, "script.list", json!({ "workspaceId": ws_id })).await;
+    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
+    assert_eq!(entry["runtime"]["previouslyRunning"], true, "on list too");
+    drop(ws);
+    stop(child); // Kill again without touching the script.
+
+    // Boot #3: the marker persists across repeated restarts; dismissing via
+    // script.stop on the non-running script returns ok and clears it.
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let st = wss_rpc(
+        &mut ws,
+        6,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(st["previouslyRunning"], true, "marker persists: {st}");
+    let stopped = wss_rpc(
+        &mut ws,
+        7,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(stopped["ok"], json!(true), "dismiss is ok, not an error");
+    let st = wss_rpc(
+        &mut ws,
+        8,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(st["status"], "idle");
+    assert!(
+        st.get("previouslyRunning").is_none(),
+        "dismiss drops the marker: {st}"
+    );
+    drop(ws);
+    stop(child);
+
+    // Boot #4: the clear was durable.
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut ws = connect_ws(port, cfg).await;
+    let st = wss_rpc(
+        &mut ws,
+        9,
+        "script.status",
+        json!({ "workspaceId": ws_id, "scriptId": "marker-1" }),
+    )
+    .await;
+    assert_eq!(st["status"], "idle");
+    assert!(
+        st.get("previouslyRunning").is_none(),
+        "cleared marker stays cleared across restart: {st}"
+    );
+    drop(ws);
+    stop(child);
+    let _ = std::fs::remove_dir_all(&repo_path);
     let _ = std::fs::remove_dir_all(&data_dir);
 }
