@@ -1072,6 +1072,14 @@ impl Services {
     /// value (`None` matches NULL), so it loses benignly to a concurrent
     /// `agent.setModel`.
     ///
+    /// Dropped guarantee (intentional): the old rewrite persisted the
+    /// compound `{provider_id}:{effective}`, which as a side effect pinned
+    /// the provider for legacy rows with a NULL `model` AND an empty
+    /// `provider`. Such rows now fall through to the configured default /
+    /// first-registered provider on every resolution — a reversion to
+    /// pre-D13 behavior; current creation paths pin `model` at creation, so
+    /// no new rows enter that population.
+    ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
     /// instead: its display identity is resolved against the same option
     /// list via [`resolve_explicit_display_model`] and persisted to the same

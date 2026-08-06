@@ -2457,6 +2457,7 @@ impl Services {
             }
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
+        let prior_model = session.model.clone();
         let allowed = [
             "status",
             "isActive",
@@ -2601,6 +2602,19 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // The stored model changed, so any persisted display resolution now
+        // names the wrong model — clear it, same anti-staleness contract as
+        // `agent.setModel` (the next session open re-resolves). Best-effort:
+        // the update itself already landed.
+        if obj.contains_key("model") && session.model != prior_model {
+            if let Err(e) = self
+                .store
+                .clear_agent_session_resolved_model(&workspace_id, &agent_id)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
+            }
+        }
         let event_type = if mutated_only_name {
             intent_core::events::AGENT_RENAMED
         } else {
