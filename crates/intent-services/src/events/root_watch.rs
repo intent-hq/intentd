@@ -8,6 +8,12 @@
 //! This avoids parking recursive watches on broad ancestors (workspace root,
 //! or even `$HOME`).
 //!
+//! Watch registration itself never runs on the caller's thread: the OS-level
+//! `notify` call can block indefinitely (macOS FSEvents,
+//! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
+//! socket was bound. Every registration is therefore performed from a spawned
+//! task on the blocking pool; failures are logged rather than returned.
+//!
 //! Event filtering also lives here: an event is forwarded when any of its
 //! paths falls under the canonical root and either matches the caller's
 //! filename filter or is directory-level (the root itself, an existing
@@ -54,38 +60,98 @@ impl RootWatch {
         let inner = self.inner.lock().unwrap();
         inner.watched_path.clone().map(|p| (p, inner.recursive))
     }
+
+    /// Await the deferred registration landing. Tests that mutate the
+    /// filesystem must wait for this instead of a fixed warm-up sleep, since
+    /// registration no longer completes before [`watch_root`] returns.
+    #[cfg(test)]
+    pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.watched().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
 }
 
 /// Start watching `root`, invoking `on_change` for matching events.
 /// `filename_matches` is the per-watcher file filter (e.g. `SKILL.md`,
 /// `*.md`).
+///
+/// Registration is always deferred to a spawned task, so a `notify` backend
+/// that blocks on registration (macOS FSEvents, intent-hq/monorepo#1572)
+/// cannot stall the caller. A registration failure is logged, not returned.
 pub(super) fn watch_root(
     root: PathBuf,
     filename_matches: fn(&Path) -> bool,
     on_change: impl Fn() + Send + Sync + 'static,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
     let inner = Arc::new(Mutex::new(Inner::default()));
-
-    if root.exists() {
-        let watcher = recursive_watcher(&root, filename_matches, on_change)?;
-        store(&inner, watcher, root, true);
-        return Ok(RootWatch { inner, task: None });
-    }
-
-    let task = tokio::spawn(promote_loop(
+    let task = tokio::spawn(watch_loop(
         root,
         filename_matches,
         on_change,
         Arc::clone(&inner),
     ));
-    Ok(RootWatch {
+    RootWatch {
         inner,
         task: Some(task),
-    })
+    }
+}
+
+/// Establish the watch off the caller's thread: an existing root gets its
+/// recursive watch directly, a missing one enters the ancestor/promotion
+/// supervision loop.
+async fn watch_loop(
+    root: PathBuf,
+    filename_matches: fn(&Path) -> bool,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+    inner: Arc<Mutex<Inner>>,
+) {
+    if root.exists() {
+        match spawn_recursive_watcher(root.clone(), filename_matches, on_change).await {
+            Some(Ok(watcher)) => store(&inner, watcher, root, true),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "recursive watch failed; changes under this root will not be detected"
+                );
+            }
+            None => {}
+        }
+        return;
+    }
+    promote_loop(root, filename_matches, on_change, inner).await;
+}
+
+/// Run [`recursive_watcher`] on the blocking pool. `None` means the blocking
+/// task itself failed (runtime shutdown), which is already logged.
+async fn spawn_recursive_watcher(
+    root: PathBuf,
+    filename_matches: fn(&Path) -> bool,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+) -> Option<notify::Result<RecommendedWatcher>> {
+    let handle =
+        tokio::task::spawn_blocking(move || recursive_watcher(&root, filename_matches, on_change));
+    join_watcher_task(handle).await
+}
+
+/// Await a watcher-registration blocking task, logging a join failure.
+async fn join_watcher_task(
+    handle: JoinHandle<notify::Result<RecommendedWatcher>>,
+) -> Option<notify::Result<RecommendedWatcher>> {
+    match handle.await {
+        Ok(result) => Some(result),
+        Err(e) => {
+            tracing::warn!(error = %e, "watch registration task did not complete");
+            None
+        }
+    }
 }
 
 /// Build a recursive watcher on an existing `root` with the event filter.
+/// Blocking: `notify`'s registration can park indefinitely on some backends.
 fn recursive_watcher(
     root: &Path,
     filename_matches: fn(&Path) -> bool,
@@ -127,15 +193,18 @@ async fn promote_loop(
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
     loop {
         if root.exists() {
-            match recursive_watcher(&root, filename_matches, Arc::clone(&on_change)) {
-                Ok(watcher) => store(&inner, watcher, root.clone(), true),
-                Err(e) => {
+            match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change))
+                .await
+            {
+                Some(Ok(watcher)) => store(&inner, watcher, root.clone(), true),
+                Some(Err(e)) => {
                     tracing::warn!(
                         root = %root.display(),
                         error = %e,
                         "recursive watch on newly created root failed; leaving stale ancestor watch"
                     );
                 }
+                None => return,
             }
             // Files may have landed inside the root before the recursive
             // watch was established (mkdir -p + immediate writes, or a whole
@@ -147,39 +216,36 @@ async fn promote_loop(
 
         let ancestor = find_existing_ancestor(&root);
         let tx = wake_tx.clone();
-        let watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(_) => {
-                    let _ = tx.send(());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ancestor watcher callback error; root creation may go undetected"
-                    );
-                }
-            });
-        let mut watcher = match watcher {
-            Ok(w) => w,
-            Err(e) => {
+        let watch_target = ancestor.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                    Ok(_) => {
+                        let _ = tx.send(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ancestor watcher callback error; root creation may go undetected"
+                        );
+                    }
+                })?;
+            watcher.watch(&watch_target, RecursiveMode::NonRecursive)?;
+            Ok(watcher)
+        });
+        match join_watcher_task(handle).await {
+            Some(Ok(watcher)) => store(&inner, watcher, ancestor.clone(), false),
+            Some(Err(e)) => {
                 tracing::warn!(
                     root = %root.display(),
+                    ancestor = %ancestor.display(),
                     error = %e,
-                    "ancestor watcher creation failed; root creation will not be detected"
+                    "ancestor watch failed; root creation will not be detected"
                 );
                 return;
             }
-        };
-        if let Err(e) = watcher.watch(&ancestor, RecursiveMode::NonRecursive) {
-            tracing::warn!(
-                root = %root.display(),
-                ancestor = %ancestor.display(),
-                error = %e,
-                "ancestor watch failed; root creation will not be detected"
-            );
-            return;
+            None => return,
         }
-        store(&inner, watcher, ancestor.clone(), false);
 
         // Wait until the root or a nearer ancestor appears. Re-check after
         // the watch is established to close the create-before-watch race.
@@ -343,7 +409,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new("miss");
         let root = dir.path.join(".intent").join("specialists");
-        let watch = watch_root(root, md_only, || {}).expect("watch root");
+        let watch = watch_root(root, md_only, || {});
 
         assert!(
             wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
@@ -369,8 +435,7 @@ mod tests {
         let h = Arc::clone(&hits);
         let watch = watch_root(root.clone(), md_only, move || {
             h.fetch_add(1, Ordering::SeqCst);
-        })
-        .expect("watch root");
+        });
 
         assert!(
             wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
@@ -420,10 +485,17 @@ mod tests {
         std::fs::create_dir_all(root.join("nested")).expect("mk root + nested dir");
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
-        let _watch = watch_root(root.clone(), md_only, move || {
+        let watch = watch_root(root.clone(), md_only, move || {
             h.fetch_add(1, Ordering::SeqCst);
-        })
-        .expect("watch root");
+        });
+        assert!(
+            wait_for(
+                || watch.watched() == Some((root.clone(), true)),
+                Duration::from_secs(5)
+            )
+            .await,
+            "recursive watch must establish"
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // No `.md` file ever exists: `rm -rf` surfaces only directory-level
@@ -432,6 +504,41 @@ mod tests {
         assert!(
             wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
             "tier-directory deletion must forward an event"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1572): OS watch registration can park
+    /// indefinitely (macOS FSEvents), so `watch_root` must return without
+    /// performing it — the watch is established from a spawned task instead.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn existing_root_registration_does_not_block_the_caller() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("nonblocking");
+        let root = dir.path.join("specialists");
+        std::fs::create_dir_all(&root).expect("mk root");
+
+        let start = std::time::Instant::now();
+        let watch = watch_root(root.clone(), md_only, || {});
+        let elapsed = start.elapsed();
+        assert!(
+            watch.watched().is_none(),
+            "registration must be deferred, not performed on the caller's thread"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "watch_root must return immediately, took {elapsed:?}"
+        );
+
+        assert!(
+            wait_for(
+                || watch.watched() == Some((root.clone(), true)),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the watch must still establish in the background"
         );
     }
 }
