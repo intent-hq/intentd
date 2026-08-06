@@ -19243,6 +19243,62 @@ async fn edit_truncate_reconciles_pending_marker() {
     assert!(!svc.question_hold_active(&id).await);
 }
 
+/// Re-derivation answer matching: a tag naming a row still present in the
+/// post-swap transcript is a LIVE foreign reference — it answers that other
+/// question set, so it must not release the newer pending one. A tag naming a
+/// row the swap dropped/re-minted is dangling and does resolve the question
+/// above it (ids are re-minted by every swap, so equality alone would never
+/// match).
+#[tokio::test]
+async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "assistant", "contentBlocks": question_blocks() },
+            { "role": "assistant", "contentBlocks": question_blocks() },
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "Q: x\nA: y" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let (q0, q1) = (messages[0].id.clone(), messages[1].id.clone());
+
+    // Live foreign reference (answers Q0 while Q1 is newer) → hold stays.
+    let mut rows = messages.clone();
+    rows[2].metadata = Some(answer_metadata(&q0));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(q1.as_str()),
+        "an answer naming a still-present OTHER question set must not release the newer one"
+    );
+    assert!(svc.question_hold_active(&id).await);
+
+    // Dangling reference (the swap re-minted ids) → resolves Q1.
+    rows[2].metadata = Some(answer_metadata("dropped-by-the-swap"));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
+    assert!(!svc.question_hold_active(&id).await);
+
+    // Exact match → resolves Q1 too.
+    rows[2].metadata = Some(answer_metadata(&q1));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
+}
+
 // -------------------------------------------------------------------------
 // `agent.markSeen` (PROTOCOL §5.5): per-conversation seen marker.
 // -------------------------------------------------------------------------

@@ -2943,15 +2943,12 @@ impl Services {
         .await;
         // The swap re-mints row ids, so any surviving pending-questions marker
         // is dangling: re-derive it from the new transcript (same contract as
-        // the `agent.editAndRegenerate` truncation) before the displayStatus
-        // recompute below reads the hold.
+        // the `agent.editAndRegenerate` truncation). The swapped transcript can
+        // move the question-hold derivation in either direction, so the
+        // re-derivation also recomputes the workspace's needs_attention
+        // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
+        // for entries a now-released hold parked.
         self.reconcile_pending_questions_marker(&session.workspace_id, &agent_id, &inserted)
-            .await;
-        // The swapped transcript can move the question-hold derivation in
-        // either direction, flipping the workspace's needs_attention
-        // displayStatus (§6.5 step 0): recompute-and-compare
-        // (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
         Ok(json!({ "success": true, "messages": inserted }))
     }
@@ -3033,8 +3030,10 @@ impl Services {
         // — and since the hold derivation never checks that the marked row
         // still exists, a dangling marker would wedge the hold forever. The
         // marker is therefore explicitly RE-DERIVED from the post-truncation
-        // transcript (never tolerated as dangling). The dismissal marker keeps
-        // its existing dangling-tolerant laxity.
+        // transcript (never tolerated as dangling), which also recomputes the
+        // needs_attention displayStatus and kicks the drain when the
+        // truncation released the hold. The dismissal marker keeps its
+        // existing dangling-tolerant laxity.
         self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
             .await;
         self.publish_agent_mutation_event(
@@ -3768,20 +3767,47 @@ impl Services {
     /// `agent.replaceMessages`), where any surviving marker is by construction
     /// dangling. `messages` is the post-swap transcript in order: the marker
     /// becomes the id of the newest question-bearing assistant row that is not
-    /// followed by a `question_answers`-tagged user row, and clears when there
-    /// is none. Bounded — the caller already holds the (post-swap) rows.
+    /// followed by a user row answering it, and clears when there is none.
+    ///
+    /// Answer matching cannot be pure id equality the way
+    /// [`Services::resolve_pending_questions_for_answer`] does it: the swap
+    /// re-mints ids, so a carried-over `answeredQuestionsMessageId` names a row
+    /// that no longer exists even when it DOES answer the question directly
+    /// above it. So a `question_answers`-tagged user row resolves the pending
+    /// row unless its tag names a DIFFERENT row that is still present in the
+    /// post-swap transcript — a live reference to another question set, which
+    /// must not release this one (mirroring the exact-match rule wherever ids
+    /// are meaningful). Bounded — the caller already holds the (post-swap)
+    /// rows.
+    ///
+    /// A swap can move the hold in either direction, so this also performs the
+    /// two follow-ups every other hold-transition path performs: recompute the
+    /// workspace's `needs_attention` displayStatus (transition-only, §6.5 step
+    /// 0) and — when the re-derivation leaves no hold — kick the queue drain
+    /// for the automatic entries the hold parked (these paths start no turn of
+    /// their own, so without the kick those entries sit on an idle agent).
     pub(crate) async fn reconcile_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         messages: &[intent_core::AgentMessage],
     ) {
+        let resolves = |answered: &str, marked: &str| {
+            answered == marked || !messages.iter().any(|m| m.id == answered)
+        };
         let mut pending: Option<&str> = None;
         for msg in messages {
             match msg.role.as_str() {
                 "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
-                "user" if answered_questions_message_id(msg.metadata.as_ref()).is_some() => {
-                    pending = None
+                "user" => {
+                    if let (Some(answered), Some(marked)) = (
+                        answered_questions_message_id(msg.metadata.as_ref()),
+                        pending,
+                    ) {
+                        if resolves(answered, marked) {
+                            pending = None;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -3794,9 +3820,15 @@ impl Services {
             }
             None => {
                 self.clear_pending_questions_marker(workspace_id, agent_id)
-                    .await
+                    .await;
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
             }
         }
+        self.maybe_emit_display_status_changed(workspace_id).await;
     }
 
     /// Resolve a just-persisted user row against the pending-questions marker:
