@@ -43,6 +43,9 @@ pub struct NewEvent {
 pub struct EventQuery {
     pub workspace_id: Option<WorkspaceId>,
     pub event_types: Vec<String>,
+    /// Prefix match over `event_type` (e.g. `"note:"` for the note category),
+    /// compiled to `event_type LIKE '<prefix>%'` with LIKE metachars escaped.
+    pub event_type_prefix: Option<String>,
     pub actor_type: Option<ActorType>,
     pub actor_id: Option<String>,
     pub session_id: Option<String>,
@@ -206,6 +209,12 @@ impl Store {
                 }
                 qb.push(")");
             }
+        }
+        if let Some(prefix) = &q.event_type_prefix {
+            let pat = format!("{}%", escape_like(prefix));
+            qb.push(" AND event_type LIKE ")
+                .push_bind(pat)
+                .push(" ESCAPE '\\'");
         }
         if let Some(at) = &q.actor_type {
             qb.push(" AND json_extract(actor, '$.type') = ")
@@ -617,6 +626,57 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(queried.len(), 3, "all 3 events should be in store");
+    }
+
+    /// monorepo#1538: `event_type_prefix` compiles to a LIKE prefix match over
+    /// `event_type`, with LIKE metachars in the prefix escaped so they stay
+    /// literal (`no_e:` must not match `note:`, `no%e:` must not match all).
+    #[tokio::test]
+    async fn query_events_event_type_prefix_matches_category() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        for t in [
+            "note:updated",
+            "note:deleted",
+            "workspace:updated",
+            "no_e:x",
+            "no%e:y",
+        ] {
+            store
+                .insert_event(&new_event(t, json!({})))
+                .await
+                .expect("insert");
+        }
+
+        let types_for = |prefix: &str| {
+            let store = store.clone();
+            let prefix = prefix.to_string();
+            async move {
+                let mut types: Vec<String> = store
+                    .query_events(&EventQuery {
+                        workspace_id: Some(WorkspaceId::from("ws-test")),
+                        event_type_prefix: Some(prefix),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("query")
+                    .into_iter()
+                    .map(|e| e.event_type)
+                    .collect();
+                types.sort();
+                types
+            }
+        };
+
+        // `note:` matches only the note-category events.
+        assert_eq!(
+            types_for("note:").await,
+            vec!["note:deleted", "note:updated"]
+        );
+        // `_` in the prefix is literal, not a single-char wildcard.
+        assert_eq!(types_for("no_e:").await, vec!["no_e:x"]);
+        // `%` in the prefix is literal, not a multi-char wildcard.
+        assert_eq!(types_for("no%e:").await, vec!["no%e:y"]);
     }
 
     #[tokio::test]

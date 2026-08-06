@@ -14756,7 +14756,18 @@ impl WorkspaceApi for Services {
                 ..Default::default()
             };
             if let Some(t) = params.event_type.filter(|s| !s.is_empty()) {
-                q.event_types = vec![t];
+                // Subscribe-parity glob (monorepo#1538), mirroring
+                // `event_type_matches` in events/filter.rs: bare `*` means no
+                // type filter; `prefix:*` compiles to a SQL prefix match;
+                // anything else (including `note*` without a colon) stays an
+                // exact match.
+                if t == "*" {
+                    // No type filter.
+                } else if let Some(stem) = t.strip_suffix(":*") {
+                    q.event_type_prefix = Some(format!("{stem}:"));
+                } else {
+                    q.event_types = vec![t];
+                }
             }
             if let Some(at) = params.actor_type.filter(|s| !s.is_empty()) {
                 // An unrecognized actorType matches nothing (TS equals filter).
