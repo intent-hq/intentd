@@ -827,13 +827,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
         ),
         boolean(
-            "workspace.autoFetch",
-            "Auto-fetch",
-            "Periodically fetch from the remote",
-            "workspace",
-            false,
-        ),
-        boolean(
             "git.autoCommit",
             "Auto-commit",
             "Allow agents to commit without explicit user request",
