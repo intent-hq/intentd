@@ -7,8 +7,10 @@
 //! append-only transcript (publish/accumulate live in `intent-services`, which
 //! owns the store + bus; the mapping stays side-effect free here). Variants
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
-//! (plan/mode/thought/commands/usage/…) map to `None`: emitting invented event
-//! strings would break wire parity with the live iOS client.
+//! (plan/mode/thought/commands/…) map to `None`: emitting invented event
+//! strings would break wire parity with the live iOS client. `usage_update`
+//! emits no event either, but its cumulative `cost` is mapped so the service
+//! layer can fold it into the workspace `TokenUsage` tally (§5.23).
 //!
 //! ## Session lifetime semantics
 //!
@@ -310,6 +312,20 @@ pub enum MappedUpdate {
     },
     /// `tool_call` / `tool_call_update` → `agent:tool:call`.
     ToolCall(MappedToolCall),
+    /// `usage_update` → no canonical `WorkspaceEvent`, but its cumulative
+    /// per-ACP-session `cost` feeds the workspace `TokenUsage` tally (§5.23).
+    /// Mapped only when the notification actually carries a cost object; the
+    /// context-window fields (`used`/`size`) are not consumed here.
+    UsageCost(MappedUsageCost),
+}
+
+/// The cumulative session cost carried by an ACP `usage_update` (§5.23).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappedUsageCost {
+    /// Cumulative spend for the ACP session so far.
+    pub amount: f64,
+    /// ISO 4217 currency code (e.g. `"USD"`).
+    pub currency: String,
 }
 
 /// A tool call mapped to the `agent:tool:call` event payload taxonomy (§6.6).
@@ -333,7 +349,9 @@ pub struct MappedToolCall {
 }
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
-/// no canonical `WorkspaceEvent` (plan/mode/thought/commands/usage/…) (§6.6).
+/// no canonical `WorkspaceEvent` and nothing else to accumulate
+/// (plan/mode/thought/commands/…) (§6.6). `usage_update` maps only when it
+/// carries a `cost` object (§5.23).
 pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -346,6 +364,12 @@ pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
         SessionUpdate::ToolCallUpdate(update) => {
             Some(MappedUpdate::ToolCall(map_tool_call_update(update)))
         }
+        SessionUpdate::UsageUpdate(usage) => usage.cost.as_ref().map(|cost| {
+            MappedUpdate::UsageCost(MappedUsageCost {
+                amount: cost.amount,
+                currency: cost.currency.clone(),
+            })
+        }),
         _ => None,
     }
 }

@@ -9,7 +9,7 @@
 
 use intent_core::{
     AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    WorkspaceId,
+    UsageCost, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -38,7 +38,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
 /// `message_contents` is non-empty only for sessions whose decoded snapshot
-/// AND baseline are both absent (the per-message fallback path — see
+/// and baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]).
 pub type AgentUsageRow = (
     String,
@@ -52,7 +52,9 @@ pub type AgentUsageRow = (
 /// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
 /// the transactional recompute in `workspace_repo.rs` (write transaction,
 /// monorepo#738) share one implementation. Message contents are hydrated only
-/// when both the decoded snapshot and baseline are absent; a malformed
+/// when neither the decoded snapshot nor the baseline carries a token report
+/// ([`intent_core::token_usage_reported`], which also treats the all-zero
+/// counters of a cost-only persist as "no report"); a malformed
 /// snapshot/baseline decodes to `None` and still hydrates.
 pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
@@ -80,29 +82,31 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        // Message contents feed the tally only when BOTH snapshot and
-        // baseline are absent (`agent_token_tally`'s fallback rule), so the
-        // per-session content fetch is skipped otherwise (monorepo#738).
-        let contents: Vec<serde_json::Value> = if snapshot.is_none() && baseline.is_none() {
-            let message_sql =
-                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
-            let message_rows = sqlx::query(message_sql)
-                .bind(&agent_id)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("get agent messages for usage failed: {e}"))
-                })?;
-            message_rows
-                .iter()
-                .map(|row| {
-                    let content_str: String = row.get("content");
-                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Message contents feed the tally only when neither snapshot nor
+        // baseline carries a token report (`agent_token_tally`'s fallback
+        // rule), so the per-session content fetch is skipped otherwise
+        // (monorepo#738).
+        let contents: Vec<serde_json::Value> =
+            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                let message_sql =
+                    "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+                let message_rows = sqlx::query(message_sql)
+                    .bind(&agent_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("get agent messages for usage failed: {e}"))
+                    })?;
+                message_rows
+                    .iter()
+                    .map(|row| {
+                        let content_str: String = row.get("content");
+                        serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         result.push((agent_id, model, snapshot, baseline, contents));
     }
@@ -1907,6 +1911,9 @@ impl Store {
                         cache_creation_tokens: b
                             .cache_creation_tokens
                             .saturating_add(s.cache_creation_tokens),
+                        // Cost is cumulative per ACP session exactly like the
+                        // counters, so the fold banks it the same way (§5.23).
+                        cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
                     })
                 }
             };
@@ -2986,6 +2993,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &first)
@@ -2996,6 +3004,7 @@ mod tests {
             output_tokens: 80,
             cache_read_tokens: 45,
             cache_creation_tokens: 6,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &second)
@@ -3153,6 +3162,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 5,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap1)
@@ -3185,6 +3195,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_creation_tokens: 40,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap2)
@@ -3207,6 +3218,7 @@ mod tests {
                 output_tokens: 60,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 45,
+                cost: None,
             }),
             "second recreate accumulates onto the baseline"
         );
@@ -3259,6 +3271,7 @@ mod tests {
             output_tokens: 8,
             cache_read_tokens: 9,
             cache_creation_tokens: 10,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3299,6 +3312,7 @@ mod tests {
             output_tokens: 4,
             cache_read_tokens: 5,
             cache_creation_tokens: 6,
+            cost: None,
         };
 
         // Write-once first set: snapshot and baseline stay untouched.
@@ -3374,6 +3388,7 @@ mod tests {
             output_tokens: 22,
             cache_read_tokens: 33,
             cache_creation_tokens: 44,
+            cost: None,
         };
 
         // Malformed snapshot + valid baseline: the fold treats the snapshot
@@ -3483,6 +3498,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3537,6 +3553,7 @@ mod tests {
             output_tokens: 6,
             cache_read_tokens: 7,
             cache_creation_tokens: 8,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3613,6 +3630,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             };
             store
                 .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3646,6 +3664,7 @@ mod tests {
                 output_tokens: 120,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             }),
             "every fold landed exactly once"
         );
@@ -3668,6 +3687,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         {
             let store = Store::open(&tmp).await.expect("create test store");
@@ -3729,6 +3749,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
 
         // Each session gets one message with usage metadata; only the
@@ -3822,6 +3843,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)

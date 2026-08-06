@@ -19523,7 +19523,7 @@ mod turn_token_usage {
 
         // Turn 1: cumulative snapshot 70/50 (+30 cached read, +4 cached write).
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(70, 50, 30, 4))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 30, 4)), None)
             .await;
         let ev1 = recv_usage_event(&mut sub).await;
         assert_eq!(ev1["type"], WORKSPACE_TOKEN_USAGE_CHANGED);
@@ -19537,7 +19537,7 @@ mod turn_token_usage {
         // Turn 2: cumulative snapshot grows to 100/80. REPLACES turn 1 — the
         // tally is 100/80, NOT 170/130.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 45, 6))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 45, 6)), None)
             .await;
         let ev2 = recv_usage_event(&mut sub).await;
         assert_eq!(ev2["data"]["tokenUsage"]["totals"]["inputTokens"], 100);
@@ -19567,13 +19567,13 @@ mod turn_token_usage {
         let mut sub = subscribe_usage(&h);
 
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         recv_usage_event(&mut sub).await;
 
         // Same cumulative snapshot again (e.g. a zero-cost turn).
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         assert!(
             timeout(Duration::from_millis(100), sub.recv())
@@ -19613,7 +19613,7 @@ mod turn_token_usage {
 
         // Only the first session reports end-of-turn usage.
         h.services
-            .persist_turn_token_usage(&with_snapshot, &h.ws, &acp_usage(70, 50, 0, 0))
+            .persist_turn_token_usage(&with_snapshot, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
             .await;
 
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -19758,7 +19758,7 @@ mod turn_token_usage {
         let h = harness().await;
         let mut sub = subscribe_usage(&h);
         h.services
-            .persist_turn_token_usage(&AgentId::new(), &h.ws, &acp_usage(1, 1, 0, 0))
+            .persist_turn_token_usage(&AgentId::new(), &h.ws, Some(&acp_usage(1, 1, 0, 0)), None)
             .await;
         assert!(
             timeout(Duration::from_millis(100), sub.recv())
@@ -19789,7 +19789,7 @@ mod turn_token_usage {
 
         // Session reports cumulative 100/80 before the recreate.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         assert_eq!(ws.token_usage.unwrap().totals.input_tokens, 100);
@@ -19804,7 +19804,7 @@ mod turn_token_usage {
         // The recreated ACP session restarts its cumulative counts: its first
         // turn reports 5/3. The tally must be 105/83, not 5/3.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(5, 3, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), None)
             .await;
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         let usage = ws.token_usage.expect("usage persisted");
@@ -19845,7 +19845,7 @@ mod turn_token_usage {
             .await
             .expect("append message");
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         h.store
             .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
@@ -19894,7 +19894,7 @@ mod turn_token_usage {
             .await
             .expect("set acp id");
         h.services
-            .persist_turn_token_usage(&recreated, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&recreated, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         h.store
             .replace_acp_session_id(&h.ws, &recreated, "acp-1", "acp-2")
@@ -19902,7 +19902,7 @@ mod turn_token_usage {
             .expect("CAS swap");
         // Normal agent: live cumulative snapshot 70/50.
         h.services
-            .persist_turn_token_usage(&normal, &h.ws, &acp_usage(70, 50, 0, 0))
+            .persist_turn_token_usage(&normal, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
             .await;
         // Fallback agent: never reported end-of-turn usage; message sums only.
         h.store
@@ -19963,6 +19963,213 @@ mod turn_token_usage {
         assert_eq!(scanned.by_model, live.by_model);
     }
 
+    /// ACP `usage_update` cost (§5.23) persists on the session snapshot and
+    /// surfaces on every `TokenUsage` bucket. Cost is cumulative per ACP
+    /// session, so the latest report REPLACES the previous one, and a turn
+    /// that reports only tokens keeps the last cost (never drops it).
+    #[tokio::test]
+    async fn turn_end_persists_and_aggregates_usage_cost() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), cost(0.5))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(0.5));
+        assert_eq!(usage.by_agent_id[&agent.0].cost, cost(0.5));
+        assert_eq!(usage.by_model["opus-4.8"].cost, cost(0.5));
+
+        // Cumulative: the next report REPLACES (1.25, not 1.75).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), cost(1.25))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 2")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(1.25));
+
+        // A token-only turn keeps the last reported cost.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(120, 90, 0, 0)), None)
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 3")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 120);
+        assert_eq!(usage.totals.cost, cost(1.25), "cost is not dropped");
+    }
+
+    /// A cost-only report (no end-of-turn token usage — e.g. a harness-wake
+    /// burst) persists the cost without zeroing the session's counters.
+    #[tokio::test]
+    async fn cost_only_report_preserves_token_counters() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(
+                &agent,
+                &h.ws,
+                None,
+                Some(intent_core::UsageCost {
+                    amount: 2.0,
+                    currency: "USD".to_string(),
+                }),
+            )
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 70, "counters preserved");
+        assert_eq!(usage.totals.output_tokens, 50);
+        assert_eq!(usage.totals.cost.as_ref().map(|c| c.amount), Some(2.0));
+    }
+
+    /// A cost-only report for an agent whose provider never sends the
+    /// end-of-turn token report must not switch the tally off the per-message
+    /// fallback: the zero-counter snapshot it writes carries the cost only,
+    /// and the message sums keep driving the counters.
+    #[tokio::test]
+    async fn cost_only_report_keeps_message_sum_fallback() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "sonnet-5"))
+            .await
+            .expect("insert session");
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+        h.services
+            .persist_turn_token_usage(
+                &agent,
+                &h.ws,
+                None,
+                Some(intent_core::UsageCost {
+                    amount: 0.4,
+                    currency: "USD".to_string(),
+                }),
+            )
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(
+            usage.by_agent_id[&agent.0].input_tokens, 7,
+            "message-sum fallback survives the cost-only persist"
+        );
+        assert_eq!(usage.by_agent_id[&agent.0].output_tokens, 3);
+        assert_eq!(
+            usage.by_agent_id[&agent.0].cost.as_ref().map(|c| c.amount),
+            Some(0.4)
+        );
+        assert_eq!(usage.totals.input_tokens, 7);
+    }
+
+    /// Session recreate folds the outgoing session's cost into the baseline
+    /// exactly like the token counters: the pre-recreate cost is neither lost
+    /// nor double-counted once the fresh session reports again.
+    #[tokio::test]
+    async fn recreate_folds_cost_into_baseline() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), cost(3.0))
+            .await;
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // Recreated session, no report yet: the banked baseline cost carries.
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(3.0), "baseline cost survives");
+
+        // Fresh session reports its own cumulative cost from zero: the
+        // effective total is baseline + snapshot.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), cost(1.5))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 2")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(4.5));
+        assert_eq!(usage.totals.input_tokens, 105);
+    }
+
     /// Clobber regression (monorepo#738): the recompute persists via a scoped
     /// `token_usage` + `updated_at` write inside one transaction, so a
     /// recompute racing a workspace title update can never revert the title
@@ -19988,6 +20195,7 @@ mod turn_token_usage {
                         output_tokens: i + 1,
                         cache_read_tokens: 0,
                         cache_creation_tokens: 0,
+                        cost: None,
                     },
                 )
                 .await
@@ -20035,7 +20243,12 @@ mod turn_token_usage {
             let agent = agent.clone();
             handles.push(tokio::spawn(async move {
                 services
-                    .persist_turn_token_usage(&agent, &ws, &acp_usage(input, input / 10, 0, 0))
+                    .persist_turn_token_usage(
+                        &agent,
+                        &ws,
+                        Some(&acp_usage(input, input / 10, 0, 0)),
+                        None,
+                    )
                     .await;
             }));
         }

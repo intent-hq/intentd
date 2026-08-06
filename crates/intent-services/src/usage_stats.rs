@@ -74,6 +74,9 @@ pub fn turn_token_delta(
         cache_creation_tokens: next
             .cache_creation_tokens
             .saturating_sub(prev.cache_creation_tokens),
+        // Usage stats (§5.36) track token counters only — cost has no bucket
+        // there, so the delta carries none.
+        cost: None,
     }
 }
 
@@ -399,6 +402,7 @@ mod tests {
             output_tokens: o,
             cache_read_tokens: cr,
             cache_creation_tokens: cc,
+            cost: None,
         }
     }
 
