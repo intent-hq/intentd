@@ -65,10 +65,20 @@ impl RootWatch {
     /// Await the deferred registration landing. Tests that mutate the
     /// filesystem must wait for this instead of a fixed warm-up sleep, since
     /// registration no longer completes before [`watch_root`] returns.
+    ///
+    /// "Established" means *some* watch is in place: for a missing root that
+    /// is the ancestor watch (the correct sync point for creation detection),
+    /// not the recursive watch on the intended root, which only exists after
+    /// promotion. Panics on timeout so a wedged registration is diagnosed
+    /// here rather than as a downstream "no event" failure.
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
-        while self.watched().is_none() && tokio::time::Instant::now() < deadline {
+        while self.watched().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watch registration did not establish within {timeout:?}"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
@@ -110,18 +120,31 @@ async fn watch_loop(
     inner: Arc<Mutex<Inner>>,
 ) {
     if root.exists() {
-        match spawn_recursive_watcher(root.clone(), filename_matches, on_change).await {
-            Some(Ok(watcher)) => store(&inner, watcher, root, true),
+        match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change)).await
+        {
+            Some(Ok(watcher)) => {
+                store(&inner, watcher, root, true);
+                // Registration is deferred, so changes can land between
+                // `watch_root` returning and the watch existing — and callers
+                // prime their fingerprint before that. Flush once so such a
+                // change is not absorbed as pre-existing; the fingerprint
+                // check suppresses the no-op case.
+                on_change();
+                return;
+            }
             Some(Err(e)) => {
+                // Includes the root being deleted between the `exists` check
+                // and registration landing. Fall through to the supervision
+                // loop: it watches the ancestor and re-promotes on
+                // recreation, or retries once if the root is still there.
                 tracing::warn!(
                     root = %root.display(),
                     error = %e,
-                    "recursive watch failed; changes under this root will not be detected"
+                    "recursive watch failed; falling back to ancestor supervision"
                 );
             }
-            None => {}
+            None => return,
         }
-        return;
     }
     promote_loop(root, filename_matches, on_change, inner).await;
 }
@@ -542,6 +565,12 @@ mod tests {
         let start = std::time::Instant::now();
         let watch = watch_root(root.clone(), md_only, || {});
         let elapsed = start.elapsed();
+        // Deterministic only under the current-thread runtime `#[tokio::test]`
+        // defaults to: the spawned `watch_loop` cannot be polled before this
+        // test's first `.await`. Under `flavor = "multi_thread"` a worker
+        // could land registration first and this would flake in the passing
+        // direction of the bug — the `elapsed` bound below is the
+        // flavor-independent part of the assertion.
         assert!(
             watch.watched().is_none(),
             "registration must be deferred, not performed on the caller's thread"
@@ -558,6 +587,39 @@ mod tests {
             )
             .await,
             "the watch must still establish in the background"
+        );
+    }
+
+    /// Deferred registration opens a window between `watch_root` returning
+    /// and the watch existing. Callers prime their fingerprint before that,
+    /// so a change landing in the window must still be flushed once the
+    /// watch is established — otherwise it is absorbed as pre-existing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn existing_root_flushes_changes_that_land_before_registration() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("catchup");
+        let root = dir.path.join("specialists");
+        std::fs::create_dir_all(&root).expect("mk root");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let watch = watch_root(root.clone(), md_only, move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        // Written while registration is still pending: no OS event for it can
+        // ever be delivered, so only the catch-up flush can surface it.
+        assert!(
+            watch.watched().is_none(),
+            "registration must still be pending"
+        );
+        std::fs::write(root.join("a.md"), "x").expect("write file");
+
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
+            "a change landing before registration must still trigger a flush"
         );
     }
 }
