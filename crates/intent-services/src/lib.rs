@@ -1176,6 +1176,10 @@ impl Services {
     /// previously known value. Rapid calls for the same workspace coalesce into at most
     /// one event per `LAST_ACTIVITY_DEBOUNCE_MS` window, carrying the latest derived
     /// value. Cancels any pending timer for the workspace before scheduling a new one.
+    /// The derived value is also persisted (scoped, monotonic column write) so the cheap
+    /// read paths that do not derive — `list_workspaces_lite` and the
+    /// `workspace.subscribe` seq-0 snapshot — serve a fresh `lastActivity` after a daemon
+    /// restart (monorepo#1580).
     /// Best-effort: store/emit failures are logged but do not surface to the caller.
     pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
         // Cancel any pending debounce timer for this workspace and increment generation.
@@ -1224,6 +1228,28 @@ impl Services {
             // Emit only when the derived value changed.
             if old_activity != new_activity {
                 if let Some(new_val) = &new_activity {
+                    // Persist the derived value (monorepo#1580). Without this
+                    // the column keeps whatever the last full-row write left
+                    // behind, so cheap read paths that do not derive
+                    // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+                    // snapshot) serve a stale `lastActivity` after a restart.
+                    // Scoped + monotonic: only this column moves, and an
+                    // out-of-order late timer can never walk the value back.
+                    // A declined bump (a concurrent writer already persisted
+                    // something newer) still emits below — the event is a
+                    // change signal, and the concurrent task's own event
+                    // carries the newer value.
+                    if let Err(e) = this
+                        .store
+                        .bump_workspace_last_activity(&ws_id, new_val)
+                        .await
+                    {
+                        tracing::warn!(
+                            workspace = %ws_id.as_str(),
+                            error = %e,
+                            "schedule_last_activity_event: persist lastActivity failed"
+                        );
+                    }
                     publish_event(
                         &this.event_bus,
                         workspace_updated_event(
