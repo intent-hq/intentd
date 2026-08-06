@@ -17,9 +17,10 @@
 //!     `hook.runNow` again — the run throws, `hook:evicted` carries
 //!     `lastError`, and the owner is woken with the eviction notice
 //!     (asserted via `agent.getConversation`).
-//!  4. Agent turn 3 schedules a third hook; the FE cancels it — the response
-//!     carries the cancelled hook, `hook:cancelled` fires, and the owner is
-//!     woken with the cancellation notice.
+//!  4. Agent turn 3 schedules a third hook (with a 50-char human-readable
+//!     name, the maximum); the FE cancels it — the response carries the
+//!     cancelled hook with the name intact, `hook:cancelled` fires, and the
+//!     owner is woken with the cancellation notice.
 //!  5. Error arms: unknown `hookId` → -32602 on cancel/runNow; `runNow` on a
 //!     cancelled hook → -32602; missing params → -32602.
 //!  6. State carry-over: agent turn 4 schedules a counter hook that threads
@@ -468,8 +469,13 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: 'watcher', code: {}, delayMs: 60000 }});",
         json!(watcher_inner)
     );
+    // Maximum-length (50-char) human-readable hook name, scheduled through
+    // the production MCP `ws.hook.schedule` route and asserted to round-trip
+    // through the wire events and the `hook.cancel` response below.
+    let cancel_hook_name = "watch cancelled hook with a fifty character name!!";
+    assert_eq!(cancel_hook_name.chars().count(), 50, "name is 50 chars");
     let schedule_cancel_js = format!(
-        "return await ws.hook.schedule({{ name: 'cancelme', code: {}, delayMs: 60000 }});",
+        "return await ws.hook.schedule({{ name: '{cancel_hook_name}', code: {}, delayMs: 60000 }});",
         json!("return { dispatch: false };")
     );
     let counter_inner = "const n = (hookState === null) ? 0 : hookState.n; \
@@ -814,7 +820,9 @@ async fn hook_lifecycle_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("cancelme")).await;
+    // The 50-char (maximum) name is accepted by the MCP schedule route and
+    // round-trips through the `hook:scheduled` event.
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some(cancel_hook_name)).await;
     let cancel_id = scheduled["data"]["hookId"]
         .as_str()
         .expect("cancelme hookId")
@@ -830,7 +838,12 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(cancelled["ok"], json!(true), "{cancelled}");
     assert_eq!(cancelled["hook"]["state"], "cancelled", "{cancelled}");
     assert_eq!(cancelled["hook"]["hookId"], json!(cancel_id));
-    let ev = next_hook_event(&mut sub, "hook:cancelled", Some("cancelme")).await;
+    assert_eq!(
+        cancelled["hook"]["name"],
+        json!(cancel_hook_name),
+        "50-char name persists and round-trips: {cancelled}"
+    );
+    let ev = next_hook_event(&mut sub, "hook:cancelled", Some(cancel_hook_name)).await;
     assert_eq!(ev["data"]["hookId"], json!(cancel_id));
     // FE cancel (`by_owner = false`) wakes the owner with the notice.
     await_conversation_contains(
