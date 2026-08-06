@@ -3756,8 +3756,9 @@ impl Services {
 
     /// Deliver the questions-dismissed system notice (`agent.dismissQuestions`,
     /// PROTOCOL §5.5): a system-origin message telling the agent the user
-    /// dismissed its N pending questions without answering, so it proceeds on
-    /// its own judgment instead of waiting for answers that will never come.
+    /// dismissed its N pending questions without answering. The notice is
+    /// informative only: the agent must not re-ask and must not proceed with
+    /// any work — it ends its turn and waits for the user's next message.
     /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
     /// an idle agent gets the notice as an immediate turn; when it lands in
     /// the queue instead (busy turn, store-append fallback, or a NEWER pending
@@ -3786,8 +3787,9 @@ impl Services {
             n => format!("{n} questions"),
         };
         let content = format!(
-            "User dismissed your {noun} without answering. Do not re-ask; \
-             continue with your best judgment."
+            "User dismissed your {noun} without answering. This is an informative \
+             notice only — do not re-ask and do not proceed with any work; end \
+             your turn and wait for the user's next message."
         );
         let metadata = json!({
             "type": QUESTIONS_DISMISSED_METADATA_TYPE,
