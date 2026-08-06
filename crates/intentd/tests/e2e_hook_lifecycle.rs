@@ -639,6 +639,13 @@ async fn hook_lifecycle_over_wss() {
             .contains("[Background hook \"dispatcher\"] CI is red"),
         "wake content carries the dispatch message: {wake}"
     );
+    assert!(
+        wake["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("has now fired and is retired"),
+        "dispatch wake carries the terminal-state note: {wake}"
+    );
 
     // After the turn ends the queue drains: the wake lands in the transcript.
     await_conversation_contains(
@@ -647,6 +654,15 @@ async fn hook_lifecycle_over_wss() {
         &ws_id,
         &agent_id,
         "[Background hook \\\"dispatcher\\\"] CI is red",
+    )
+    .await;
+    // The terminal-state note survives the queue/conversation delivery path.
+    await_conversation_contains(
+        &mut rpc,
+        101,
+        &ws_id,
+        &agent_id,
+        "has now fired and is retired",
     )
     .await;
 
@@ -801,7 +817,8 @@ async fn hook_lifecycle_over_wss() {
             .contains("EVICT marker found"),
         "hook:evicted carries lastError: {evicted}"
     );
-    // The owner is woken with the eviction notice.
+    // The owner is woken with the eviction notice, ending with the
+    // terminal-state note.
     await_conversation_contains(
         &mut rpc,
         310,
@@ -810,6 +827,7 @@ async fn hook_lifecycle_over_wss() {
         "was evicted after a failed run",
     )
     .await;
+    await_conversation_contains(&mut rpc, 311, &ws_id, &agent_id, "will not run again").await;
 
     // ── 4. FE cancel: hook:cancelled + owner woken with the notice ───────
     let sent = wss_rpc(
