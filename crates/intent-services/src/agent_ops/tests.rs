@@ -26,10 +26,10 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    fetch_auggie_models, fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows,
-    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
-    parse_model_list_json, parse_model_list_output, parse_session_stats_output,
-    resolve_auggie_bin_with,
+    ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
+    fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
+    live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
+    parse_session_stats_output, resolve_auggie_bin_with,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -6365,6 +6365,42 @@ fn parse_model_list_output_extracts_rows() {
     assert_eq!(rows[0].2.as_deref(), Some("Balanced general model"));
     assert_eq!(rows[1].0, "haiku4.5");
     assert_eq!(rows[1].2, None);
+}
+
+#[test]
+fn effort_guard_rejects_only_against_cached_evidence() {
+    let cache = crate::model_catalog::ModelCatalogCache::new(None);
+    cache.store_for_test(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                    "effortLevels": ["low", "high"] }),
+            json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie" }),
+        ],
+    );
+    // Evidence present and the level is listed (case-insensitively) → pass.
+    assert!(
+        ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "high").is_ok()
+    );
+    assert!(
+        ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "HIGH").is_ok()
+    );
+    // Evidence present and the level is absent → -32602 naming valid values.
+    let err = ensure_effort_supported_by_model("agent.delegate", &cache, Some("fable-5"), "xhigh")
+        .expect_err("unsupported level rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("xhigh") && msg.contains("low, high"), "{msg}");
+    // No evidence (row without levels, unknown model, no model) → pass through.
+    assert!(
+        ensure_effort_supported_by_model("agent.delegate", &cache, Some("sonnet5"), "xhigh")
+            .is_ok()
+    );
+    assert!(
+        ensure_effort_supported_by_model("agent.delegate", &cache, Some("unknown"), "xhigh")
+            .is_ok()
+    );
+    assert!(ensure_effort_supported_by_model("agent.delegate", &cache, None, "xhigh").is_ok());
 }
 
 #[test]

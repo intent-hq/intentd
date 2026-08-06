@@ -864,6 +864,11 @@ impl Services {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string(),
+                            reasoning_effort: o
+                                .get("reasoningEffort")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                         })
                     })
                     .collect();

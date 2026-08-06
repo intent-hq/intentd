@@ -5328,6 +5328,7 @@ mod workspace_api_tool_tests {
                 options: vec![SpecialistModelOption {
                     model: "opencode:kimi-k3".to_string(),
                     hint: "cheap".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             }]);
         let resp = srv

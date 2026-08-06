@@ -2472,6 +2472,11 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
+    /// Wins over the chosen model option's `reasoningEffort` and the
+    /// specialist's frontmatter scalar; validated against the cached model
+    /// catalog's `effortLevels` evidence when the resolved model has any.
+    pub reasoning_effort: Option<String>,
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
@@ -2501,6 +2506,10 @@ pub struct AgentWakeCreateOptions {
     pub provider: Option<String>,
     pub agent_type: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the created child (PROTOCOL §5.5/§5.11),
+    /// used only on the create branch. Overridden by the wake-level
+    /// [`AgentWakeOrCreateInput::reasoning_effort`] when both are present.
+    pub reasoning_effort: Option<String>,
     pub context_references: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub skip_auto_commit: Option<bool>,
@@ -2518,6 +2527,9 @@ pub struct AgentWakeCreateOptions {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentWakeOrCreateInput {
     pub model: Option<String>,
+    /// Reasoning-effort override for the create branch (PROTOCOL §5.5/§5.11);
+    /// wins over `create.reasoningEffort` and the specialist frontmatter.
+    pub reasoning_effort: Option<String>,
     pub caller_agent_id: Option<AgentId>,
     pub delegation_depth: Option<i64>,
     pub message_metadata: Option<serde_json::Value>,

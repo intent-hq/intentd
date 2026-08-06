@@ -317,6 +317,56 @@ fn ensure_bare_model_matches_provider(
     Ok(())
 }
 
+/// Reject a `reasoningEffort` level the resolved model provably does not
+/// support with `-32602` (InvalidParams), naming the valid values. Evidence is
+/// the cached model catalog's `effortLevels` for `model_id`
+/// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
+/// same probe-free, read-only rule as the bare-model ownership guard: with no
+/// evidence (no model, no cached row, or a row declaring no levels) the value
+/// passes through unvalidated, since providers own the effort vocabulary
+/// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
+/// caller's spelling.
+fn ensure_effort_supported_by_model(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogCache,
+    model_id: Option<&str>,
+    effort: &str,
+) -> Result<()> {
+    let Some(levels) = model_id.and_then(|m| cache.cached_effort_levels(m)) else {
+        return Ok(());
+    };
+    if levels.iter().any(|l| l.eq_ignore_ascii_case(effort)) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "{method}: reasoningEffort {effort} is not supported by model {} (valid values: {})",
+        model_id.unwrap_or_default(),
+        levels.join(", ")
+    )))
+}
+
+/// Resolve the effective `reasoningEffort` for a delegated/woken child
+/// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
+/// the chosen model option's declared effort, then the specialist's
+/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
+/// params collapse to unset without falling through — an explicit clear.
+fn resolve_delegate_reasoning_effort(
+    services: &Services,
+    param: Option<&str>,
+    specialist: Option<&str>,
+    model: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Option<String> {
+    if let Some(param) = param {
+        return (!param.trim().is_empty()).then(|| param.to_string());
+    }
+    let spec_id = specialist?;
+    let specialists_svc = services.specialists_service();
+    model
+        .and_then(|m| specialists_svc.resolve_model_option_effort(spec_id, workspace_path, m))
+        .or_else(|| specialists_svc.resolve_reasoning_effort(spec_id, workspace_path))
+}
+
 /// Resolve the provider `agent.delegate` should spawn on when the caller
 /// supplies no explicit `model` (spec Decision D2). The wire has no
 /// `provider` param, so the daemon must derive one itself instead of leaving
@@ -4643,20 +4693,46 @@ impl Services {
         // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
         // provider via `agent_create_op`'s existing derivation, so D2 is
         // skipped in that case.
+        // SECURITY: derive workspace_path from the stored workspace record,
+        // never a client-supplied value (same rationale as
+        // `agent_create_op`'s model resolution).
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
         let delegate_provider = if input.model.is_none() {
-            // SECURITY: derive workspace_path from the stored workspace
-            // record, never a client-supplied value (same rationale as
-            // `agent_create_op`'s model resolution).
-            let wp = self
-                .store
-                .get_workspace(&workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w));
-            resolve_delegate_provider(self, input.specialist.as_deref(), wp.as_deref())?
+            resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
             None
         };
+        // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
+        // effort > specialist frontmatter > unset, validated against the
+        // cached catalog's `effortLevels` for the effective model (the
+        // explicit `model`, else the specialist's own pin). Runs BEFORE the
+        // child is created so a `-32602` rejection is side-effect free.
+        let effective_model = input.model.clone().or_else(|| {
+            input.specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input.reasoning_effort.as_deref(),
+            input.specialist.as_deref(),
+            effective_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.delegate",
+                &self.models_catalog,
+                effective_model.as_deref(),
+                effort,
+            )?;
+        }
         let mut extra_metadata = serde_json::Map::new();
         if let Some(depth) = delegation_depth {
             extra_metadata.insert("delegationDepth".to_string(), json!(depth));
@@ -4669,6 +4745,7 @@ impl Services {
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
             provider: delegate_provider,
+            reasoning_effort,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable
             // by the child's opening-turn `ws.workspace.setAgentName`
@@ -6724,6 +6801,42 @@ impl Services {
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
+        // Reasoning effort (PROTOCOL §5.11), create branch only: the
+        // wake-level param wins over `create.reasoningEffort`, then the chosen
+        // model option's effort, then the specialist frontmatter. Validated
+        // against the cached catalog's `effortLevels` for the resolved model
+        // before the child is created, so a `-32602` leaves no orphan.
+        // SECURITY: the project tier comes from the stored workspace record.
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        let effort_model = model.clone().or_else(|| {
+            specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input
+                .reasoning_effort
+                .as_deref()
+                .or(create_opts.reasoning_effort.as_deref()),
+            specialist.as_deref(),
+            effort_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.wakeOrCreate",
+                &self.models_catalog,
+                effort_model.as_deref(),
+                effort,
+            )?;
+        }
 
         // B5: rich create payload (`name` default `Task: {title}`,
         // `contextReferences` + provenance metadata folded into the persisted
@@ -6750,7 +6863,7 @@ impl Services {
         );
         let extra = AgentCreateExtra {
             provider,
-            reasoning_effort: None,
+            reasoning_effort,
             agent_type,
             metadata,
             workspace_path: None,

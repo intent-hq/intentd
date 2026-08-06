@@ -42,6 +42,9 @@ pub struct SpecialistModelOption {
     pub model: String,
     /// Free-text hint for choosing this option; empty when the author gave none.
     pub hint: String,
+    /// Reasoning-effort level this option implies, passed as `reasoningEffort`
+    /// when the option is chosen; empty when the author declared none.
+    pub reasoning_effort: String,
 }
 
 /// One specialist's resolved `modelOptions` list, injected into the
@@ -203,9 +206,10 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -217,7 +221,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -417,9 +421,10 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -429,7 +434,7 @@ API:
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -815,16 +820,19 @@ pub fn workspace_api_description_with_model_options(
 
 /// Render the injected continuation block: one header line plus one line per
 /// specialist listing its options as `` `<compound id>` (<hint>) `` entries
-/// (the hint parenthetical is omitted when empty). All lines are indented ≥4
-/// so the `[agentFeatures]` pruning treats them as continuation lines of the
-/// `ws.agent.delegate` entry. Author-supplied text is flattened onto one line
-/// so a multi-line hint cannot break the description's line structure.
+/// (the hint parenthetical is omitted when empty, and an option's declared
+/// reasoning effort is appended to it as `effort: <level>`). All lines are
+/// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
+/// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
+/// onto one line so a multi-line hint cannot break the description's line
+/// structure.
 fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (pass the compound id as `model` to \
          `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
-         specialist's default):\n",
+         specialist's default; an option's `effort` is applied automatically \
+         unless you pass an explicit `reasoningEffort`):\n",
     );
     for spec in model_options {
         block.push_str("      ");
@@ -834,10 +842,17 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             .options
             .iter()
             .map(|o| {
-                if o.hint.is_empty() {
+                let mut paren: Vec<String> = Vec::new();
+                if !o.hint.is_empty() {
+                    paren.push(flat(&o.hint));
+                }
+                if !o.reasoning_effort.is_empty() {
+                    paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
+                }
+                if paren.is_empty() {
                     format!("`{}`", flat(&o.model))
                 } else {
-                    format!("`{}` ({})", flat(&o.model), flat(&o.hint))
+                    format!("`{}` ({})", flat(&o.model), paren.join("; "))
                 }
             })
             .collect();
@@ -1692,10 +1707,12 @@ mod tests {
                     SpecialistModelOption {
                         model: "opencode:kimi-k3".to_string(),
                         hint: "cheap".to_string(),
+                        reasoning_effort: String::new(),
                     },
                     SpecialistModelOption {
                         model: "auggie:opus".to_string(),
                         hint: String::new(),
+                        reasoning_effort: String::new(),
                     },
                 ],
             },
@@ -1704,6 +1721,7 @@ mod tests {
                 options: vec![SpecialistModelOption {
                     model: "grok:grok-5".to_string(),
                     hint: "fast reviews".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             },
         ]
@@ -1782,6 +1800,39 @@ mod tests {
         }
     }
 
+    // A declared per-option `reasoningEffort` is rendered inside the option's
+    // parenthetical as `effort: <level>` — appended after a hint when both are
+    // present, and standing alone when the author gave no hint.
+    #[test]
+    fn model_options_block_renders_per_option_effort() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            options: vec![
+                SpecialistModelOption {
+                    model: "fable-5".to_string(),
+                    hint: "hard tasks".to_string(),
+                    reasoning_effort: "high".to_string(),
+                },
+                SpecialistModelOption {
+                    model: "sonnet5".to_string(),
+                    hint: String::new(),
+                    reasoning_effort: "low".to_string(),
+                },
+            ],
+        }];
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            &options,
+        );
+        assert!(
+            got.contains(
+                "implementor: `fable-5` (hard tasks; effort: high), `sonnet5` (effort: low)"
+            ),
+            "per-option effort not rendered:\n{got}"
+        );
+    }
+
     // The injection composes with feature pruning: a bridge with a disabled
     // toggle still gets the options block, and the pruned namespace stays
     // gone.
@@ -1808,6 +1859,7 @@ mod tests {
             options: vec![SpecialistModelOption {
                 model: "opencode:kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),
+                reasoning_effort: String::new(),
             }],
         }];
         let got = workspace_api_description_with_model_options(
