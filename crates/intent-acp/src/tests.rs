@@ -7571,8 +7571,8 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result,
-        WorkspaceApi, WorkspaceId,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result, WorkspaceApi,
+        WorkspaceId,
     };
     use serde_json::{json, Value};
 

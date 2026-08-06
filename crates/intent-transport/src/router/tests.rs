@@ -3,8 +3,8 @@
 use intent_core::{
     AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentLocation,
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
-    CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
-    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileStatus,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
     GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
