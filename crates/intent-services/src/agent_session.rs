@@ -92,6 +92,34 @@ pub struct AcpSessionOpened {
     /// recreate won the CAS (the modes we captured belong to the wrong
     /// session).
     pub modes: Option<SessionModeState>,
+    /// The provider's reasoning-effort selector discovered in the same
+    /// response's `configOptions` (PROTOCOL §5.5), if it advertised one. The
+    /// manager applies the session's `reasoningEffort` through it and keeps it
+    /// on the live handle so a mid-session change can be re-applied before the
+    /// next prompt. `None` when the provider advertises no such option or when
+    /// a concurrent recreate won the CAS (see `modes`).
+    pub thought_level: Option<ThoughtLevelOption>,
+}
+
+/// A provider's reasoning-effort selector: the `thought_level`-category select
+/// of a `session/new` / `session/load` response's `configOptions` (PROTOCOL
+/// §5.5). Adapters name it differently (`effort` for claude-agent-acp,
+/// `reasoning_effort` for codex-acp), so discovery keys on the CATEGORY and
+/// carries the adapter's own id for the `session/set_config_option` call.
+#[derive(Debug, Clone)]
+pub struct ThoughtLevelOption {
+    /// The adapter's config id, sent as `configId`.
+    pub config_id: String,
+    /// The value the adapter reported as current at session open — the
+    /// provider's own default, restored when the session's `reasoningEffort`
+    /// is cleared.
+    pub initial_value: String,
+    /// The value the adapter is currently on (tracked across applications so
+    /// an unchanged effort is never re-sent).
+    pub current_value: String,
+    /// The values the select accepts (flattened across groups). Used to skip
+    /// an effort the adapter would reject.
+    pub values: Vec<String>,
 }
 
 /// Accumulates streamed assistant content into one transcript message per turn,
@@ -749,6 +777,44 @@ fn model_select(options: &[SessionConfigOption]) -> Option<&session::SessionConf
         .or_else(|| select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model))))
 }
 
+/// Discover the provider's reasoning-effort selector in a `session/new` /
+/// `session/load` response's `configOptions` (PROTOCOL §5.5): the first
+/// SELECT whose `category` is `thought_level`. Adapters pick their own ids
+/// (`effort` for claude-agent-acp, `reasoning_effort` for codex-acp), so the
+/// category is the only portable key; the discovered id is what the
+/// subsequent `session/set_config_option` must carry. `None` when the
+/// provider advertises no such option (every non-supporting provider, which
+/// then silently ignores the session's `reasoningEffort`).
+fn discover_thought_level(
+    config_options: Option<&[SessionConfigOption]>,
+) -> Option<ThoughtLevelOption> {
+    let (option, select) = config_options?.iter().find_map(|o| match &o.kind {
+        SessionConfigKind::Select(s)
+            if matches!(o.category, Some(SessionConfigOptionCategory::ThoughtLevel)) =>
+        {
+            Some((o, s))
+        }
+        _ => None,
+    })?;
+    let values = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(opts) => {
+            opts.iter().map(|e| e.value.0.to_string()).collect()
+        }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter())
+            .map(|e| e.value.0.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(ThoughtLevelOption {
+        config_id: option.id.0.to_string(),
+        initial_value: select.current_value.0.to_string(),
+        current_value: select.current_value.0.to_string(),
+        values,
+    })
+}
+
 /// Find a select's option entry by `value`, looking through groups when the
 /// options are grouped.
 fn select_entry<'a>(
@@ -1236,6 +1302,7 @@ impl Services {
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            thought_level: discover_thought_level(resp.config_options.as_deref()),
         })
     }
 
@@ -1288,8 +1355,9 @@ impl Services {
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model resolution is skipped for the same reason.
-        let modes = if canonical == new_acp_session_id {
+        // The effective-model and thought-level resolutions are skipped for
+        // the same reason.
+        let (modes, thought_level) = if canonical == new_acp_session_id {
             self.persist_effective_model(
                 &workspace_id,
                 agent_id,
@@ -1297,13 +1365,15 @@ impl Services {
                 resp.config_options.as_deref(),
             )
             .await;
-            resp.modes
+            let thought_level = discover_thought_level(resp.config_options.as_deref());
+            (resp.modes, thought_level)
         } else {
-            None
+            (None, None)
         };
         Ok(AcpSessionOpened {
             session_id: canonical,
             modes,
+            thought_level,
         })
     }
 
@@ -1395,6 +1465,7 @@ impl Services {
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            thought_level: discover_thought_level(resp.config_options.as_deref()),
         }))
     }
 
