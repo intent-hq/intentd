@@ -44,7 +44,10 @@ pub struct EventQuery {
     pub workspace_id: Option<WorkspaceId>,
     pub event_types: Vec<String>,
     /// Prefix match over `event_type` (e.g. `"note:"` for the note category),
-    /// compiled to `event_type LIKE '<prefix>%'` with LIKE metachars escaped.
+    /// compiled to a case-sensitive half-open range scan
+    /// (`event_type >= '<prefix>' AND event_type < '<upper>'`) served by the
+    /// BINARY-collated `idx_event_type_time` index — same pattern as the
+    /// retention path's [`Store::delete_type_prefix_before`].
     pub event_type_prefix: Option<String>,
     pub actor_type: Option<ActorType>,
     pub actor_id: Option<String>,
@@ -211,10 +214,29 @@ impl Store {
             }
         }
         if let Some(prefix) = &q.event_type_prefix {
-            let pat = format!("{}%", escape_like(prefix));
-            qb.push(" AND event_type LIKE ")
-                .push_bind(pat)
-                .push(" ESCAPE '\\'");
+            // Half-open range instead of LIKE: default LIKE is ASCII
+            // case-insensitive (subscribe's `event_type_matches` is
+            // case-sensitive `starts_with`) and cannot be served by the
+            // BINARY-collated `idx_event_type_time` index (see
+            // `delete_type_prefix_before`).
+            match prefix_upper_bound(prefix) {
+                Some(upper) => {
+                    qb.push(" AND event_type >= ")
+                        .push_bind(prefix.clone())
+                        .push(" AND event_type < ")
+                        .push_bind(upper);
+                }
+                None => {
+                    // No computable upper bound (non-ASCII or 0x7F-terminated
+                    // prefix — unreachable via `event.query`, whose prefixes
+                    // always end in `:`): fall back to a case-sensitive
+                    // substr comparison, correct but not index-served.
+                    qb.push(" AND substr(event_type, 1, ")
+                        .push_bind(prefix.chars().count() as i64)
+                        .push(") = ")
+                        .push_bind(prefix.clone());
+                }
+            }
         }
         if let Some(at) = &q.actor_type {
             qb.push(" AND json_extract(actor, '$.type') = ")
@@ -354,7 +376,7 @@ impl Store {
     /// serves the predicate (SQLite's default case-insensitive LIKE cannot use
     /// a BINARY index).
     async fn delete_type_prefix_before(&self, prefix: &str, cutoff: &str) -> Result<u64> {
-        let upper = prefix_upper_bound(prefix);
+        let upper = prefix_upper_bound(prefix).expect("ascii retention prefix");
         self.delete_events_by_type_range_before(prefix, Some(&upper), cutoff)
             .await
     }
@@ -483,12 +505,20 @@ impl Store {
 
 /// Smallest string strictly greater than every string starting with `prefix`,
 /// for half-open `[prefix, upper)` index ranges over `event_type`. Increments
-/// the final byte; valid because event-type prefixes are ASCII.
-fn prefix_upper_bound(prefix: &str) -> String {
-    debug_assert!(prefix.is_ascii() && !prefix.is_empty());
+/// the final byte. Returns `None` when no valid bound exists — empty or
+/// non-ASCII prefixes, or a final byte of 0x7F (incrementing would leave
+/// ASCII) — so callers with arbitrary input can fall back safely.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() || !prefix.is_ascii() {
+        return None;
+    }
     let mut bytes = prefix.as_bytes().to_vec();
-    *bytes.last_mut().expect("non-empty prefix") += 1;
-    String::from_utf8(bytes).expect("ascii prefix")
+    let last = bytes.last_mut().expect("non-empty prefix");
+    if *last >= 0x7F {
+        return None;
+    }
+    *last += 1;
+    Some(String::from_utf8(bytes).expect("ascii prefix"))
 }
 
 /// Escape LIKE wildcards so a prefix is matched literally (paired with
@@ -628,9 +658,11 @@ mod tests {
         assert_eq!(queried.len(), 3, "all 3 events should be in store");
     }
 
-    /// monorepo#1538: `event_type_prefix` compiles to a LIKE prefix match over
-    /// `event_type`, with LIKE metachars in the prefix escaped so they stay
-    /// literal (`no_e:` must not match `note:`, `no%e:` must not match all).
+    /// monorepo#1538: `event_type_prefix` compiles to a case-sensitive
+    /// half-open range scan over `event_type` (not LIKE), so it matches
+    /// subscribe's `starts_with` semantics exactly: `NOTE:updated` is NOT
+    /// matched by prefix `note:`, and `%`/`_` are plain literal bytes
+    /// (`no_e:` must not match `note:`, `no%e:` must not match all).
     #[tokio::test]
     async fn query_events_event_type_prefix_matches_category() {
         let tmp = TempDb::new();
@@ -638,9 +670,11 @@ mod tests {
         for t in [
             "note:updated",
             "note:deleted",
+            "NOTE:updated",
             "workspace:updated",
             "no_e:x",
             "no%e:y",
+            "émoji:added",
         ] {
             store
                 .insert_event(&new_event(t, json!({})))
@@ -668,15 +702,22 @@ mod tests {
             }
         };
 
-        // `note:` matches only the note-category events.
+        // `note:` matches only the note-category events — case-sensitively:
+        // the stored `NOTE:updated` must NOT match (LIKE would have matched
+        // it; subscribe's `starts_with` does not).
         assert_eq!(
             types_for("note:").await,
             vec!["note:deleted", "note:updated"]
         );
-        // `_` in the prefix is literal, not a single-char wildcard.
+        // The uppercase prefix matches only the uppercase event.
+        assert_eq!(types_for("NOTE:").await, vec!["NOTE:updated"]);
+        // `_` in the prefix is a literal byte, not a single-char wildcard.
         assert_eq!(types_for("no_e:").await, vec!["no_e:x"]);
-        // `%` in the prefix is literal, not a multi-char wildcard.
+        // `%` in the prefix is a literal byte, not a multi-char wildcard.
         assert_eq!(types_for("no%e:").await, vec!["no%e:y"]);
+        // Non-ASCII prefix (no computable upper bound) takes the substr
+        // fallback and still matches correctly.
+        assert_eq!(types_for("émoji:").await, vec!["émoji:added"]);
     }
 
     #[tokio::test]
