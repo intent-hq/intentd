@@ -95,6 +95,29 @@ impl SkillsWatcher {
         }
         let _ = self.raw_tx.send(SkillsMsg::Remove(workspace_id.clone()));
     }
+
+    /// Suspend a workspace (archive): identical teardown to
+    /// [`Self::remove_workspace`] — the skill set baseline lives in the
+    /// path-keyed discovery cache, not in this watcher, so nothing extra has
+    /// to be retained for the later [`Self::resume_workspace`] catch-up.
+    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+        self.remove_workspace(workspace_id);
+    }
+
+    /// Resume a suspended workspace (unarchive): re-watch the project tier and
+    /// schedule one catch-up flush so edits made while suspended are not lost.
+    /// `check_skills_changed` compares against the cached set, so an unchanged
+    /// tree emits nothing.
+    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self.raw_tx.send(SkillsMsg::Resume(
+            workspace_id.clone(),
+            workspace_path.clone(),
+        ));
+        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watchers);
+        }
+    }
 }
 
 /// Watch the project-tier skill roots of one workspace.
@@ -122,6 +145,9 @@ enum SkillsMsg {
     Add(WorkspaceId, PathBuf),
     /// Workspace deregistered; its pending flush is dropped.
     Remove(WorkspaceId),
+    /// Workspace re-registered after a suspension (unarchive): like `Add`,
+    /// plus a due-now flush so changes missed while suspended are picked up.
+    Resume(WorkspaceId, PathBuf),
 }
 
 /// Watch a single root, forwarding `SKILL.md` and directory-level events.
@@ -205,6 +231,12 @@ async fn debounce_loop(
                 Some(SkillsMsg::Remove(ws_id)) => {
                     workspace_paths.remove(&ws_id);
                     pending.remove(&ws_id);
+                }
+                Some(SkillsMsg::Resume(ws_id, path)) => {
+                    workspace_paths.insert(ws_id.clone(), path);
+                    // Catch-up: flush after the normal debounce so the
+                    // re-registered watches' own events coalesce into it.
+                    pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
                 }
                 None => {
                     // All senders dropped: flush and exit

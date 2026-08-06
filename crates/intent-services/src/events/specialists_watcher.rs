@@ -114,6 +114,33 @@ impl SpecialistsWatcher {
             .raw_tx
             .send(SpecialistsMsg::Remove(workspace_id.clone()));
     }
+
+    /// Suspend a workspace (archive): tear down its project-tier watch but
+    /// KEEP the fingerprint, so the [`Self::resume_workspace`] catch-up can
+    /// tell whether the set changed while the workspace was unwatched.
+    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.remove(workspace_id);
+        }
+        let _ = self
+            .raw_tx
+            .send(SpecialistsMsg::Pause(workspace_id.clone()));
+    }
+
+    /// Resume a suspended workspace (unarchive): re-watch the project tier and
+    /// schedule one catch-up flush against the retained fingerprint, so edits
+    /// made while suspended emit exactly one `specialists:changed` and an
+    /// untouched tree emits nothing.
+    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self.raw_tx.send(SpecialistsMsg::Resume(
+            workspace_id.clone(),
+            workspace_path.clone(),
+        ));
+        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watchers);
+        }
+    }
 }
 
 /// Watch the project-tier specialists root of one workspace.
@@ -139,6 +166,12 @@ enum SpecialistsMsg {
     Add(WorkspaceId, PathBuf),
     /// Workspace deregistered; its pending flush is dropped.
     Remove(WorkspaceId),
+    /// Workspace suspended (archive): stops emitting like `Remove`, but the
+    /// fingerprint is retained for the later `Resume` catch-up.
+    Pause(WorkspaceId),
+    /// Workspace resumed (unarchive): re-registers the path WITHOUT re-priming
+    /// the fingerprint, plus a flush so changes missed while suspended emit.
+    Resume(WorkspaceId, PathBuf),
 }
 
 /// Watch a single root, forwarding `*.md` and directory-level events.
@@ -238,6 +271,18 @@ async fn debounce_loop(
                     workspace_paths.remove(&ws_id);
                     fingerprints.remove(&ws_id);
                     pending.remove(&ws_id);
+                }
+                Some(SpecialistsMsg::Pause(ws_id)) => {
+                    // Path drop stops emission (user-tier fan-out and flushes
+                    // both key on `workspace_paths`); the fingerprint stays.
+                    workspace_paths.remove(&ws_id);
+                    pending.remove(&ws_id);
+                }
+                Some(SpecialistsMsg::Resume(ws_id, path)) => {
+                    workspace_paths.insert(ws_id.clone(), path);
+                    // Catch-up: flush after the normal debounce so the
+                    // re-registered watch's own events coalesce into it.
+                    pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
                 }
                 None => {
                     // All senders dropped: flush and exit
