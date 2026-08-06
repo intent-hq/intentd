@@ -10827,6 +10827,12 @@ impl WorkspaceApi for Services {
         }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            // Captured before the `if let` arms below move the fields out.
+            let pr_fields_changed = update.pr_number.is_some()
+                || update.pr_url.is_some()
+                || update.pr_status.is_some()
+                || update.active_pull_request.is_some()
+                || update.pull_requests.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -10958,6 +10964,13 @@ impl WorkspaceApi for Services {
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
             publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+            // PR link/status changes feed the derived displayStatus (the
+            // `pr_*` rungs sit between activity and taskStats): recompute-
+            // and-compare after the persist so the transition emits (§6.5).
+            // Chief is skipped — virtual, never listed, nothing derives.
+            if !ws.id.is_chief() && pr_fields_changed {
+                this.maybe_emit_display_status_changed(&ws.id).await;
+            }
             Ok(ws)
         })
     }
@@ -11182,6 +11195,10 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             }
+            // Evict the deleted workspace's last-observed displayStatus
+            // baseline so the in-memory map does not leak for the daemon's
+            // lifetime (and a same-id recreate seeds fresh).
+            services.evict_display_status_baseline(&id);
             // Fast-ack: the client receives `{ success: true }` here while the
             // worktree and workspace-directory cleanup proceeds asynchronously
             // in the background. Bounded latency regardless of checkout size
@@ -12778,6 +12795,13 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            if content_changed {
+                services
+                    .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                    .await;
+            }
             Ok(note)
         })
     }
@@ -12836,6 +12860,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             let total_length = final_content.chars().count();
             Ok(NoteAddResult {
                 ok: true,
@@ -12906,6 +12935,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteEditResult {
                 ok: true,
                 note_id: note.id,
@@ -12976,6 +13010,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteEditLinesResult {
                 ok: true,
                 note_id: note.id,
@@ -13068,6 +13107,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteSetContentResult {
                 ok: true,
                 title: note.title,
@@ -13332,6 +13376,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // Restoring an older spec body can move taskStats (link-gated
+            // rollup); non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             // Re-read so the returned note carries the post-update `rev`.
             let note = fetch_note(&store, &workspace_id, &note_id).await?;
 
@@ -13565,6 +13614,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec checkbox-line rewrite can add/remove task links and
+            // move taskStats; non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,
@@ -13765,6 +13819,14 @@ impl WorkspaceApi for Services {
                     None,
                 )
                 .await?;
+            // A fresh spec-child task can move the derived rollup (§6.5),
+            // e.g. a completed workspace gaining a new open task. Non-spec
+            // dependents never count into taskStats — skip the probe.
+            if dependent_note_id.as_str() == "spec" {
+                services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
             Ok(TaskCreatePrerequisiteResult {
                 ok: true,
                 prerequisite_note_id: child.id,
