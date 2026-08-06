@@ -299,23 +299,26 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
                 Ok(()) => {
                     // The full-row update deliberately excludes the
                     // attention_request_* columns (narrow-writer contract);
-                    // restore imported attention state explicitly.
-                    let attn = match (
-                        &session.attention_request_kind,
-                        &session.attention_request_reason,
-                        &session.attention_request_timestamp,
-                    ) {
-                        (Some(kind), Some(reason), Some(ts)) => store
+                    // restore imported attention state explicitly. The hold
+                    // is keyed on `kind` alone (`workspace_needs_attention`),
+                    // so a partial snapshot still restores: missing `reason`
+                    // defaults to "" and missing `timestamp` to the session's
+                    // `updatedAt`. Only a kind-less session clears.
+                    let attn = match &session.attention_request_kind {
+                        Some(kind) => store
                             .set_attention_request(
                                 &session.workspace_id,
                                 &session.id,
                                 kind,
-                                reason,
-                                ts,
+                                session.attention_request_reason.as_deref().unwrap_or(""),
+                                session
+                                    .attention_request_timestamp
+                                    .as_deref()
+                                    .unwrap_or(&session.updated_at),
                             )
                             .await
                             .map(|_| ()),
-                        _ => store
+                        None => store
                             .clear_attention_request(
                                 &session.workspace_id,
                                 &session.id,
@@ -584,6 +587,55 @@ mod tests {
                 .len(),
             2,
         );
+    }
+
+    /// A partial attention request (`attentionRequestKind` alone, no reason or
+    /// timestamp) must survive a re-import: `workspace_needs_attention` treats
+    /// the kind alone as a hold, so the update path must restore it rather
+    /// than clear it (PR #928 review). Missing fields default (`reason` → "",
+    /// `timestamp` → the session's `updatedAt`).
+    #[tokio::test]
+    async fn reimport_preserves_partial_attention_request() {
+        let source = write_fixture();
+        let ws_dir = source
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join(".workspace");
+        std::fs::write(
+            ws_dir.join("agents").join("a2.json"),
+            json!({
+                "id": "agent-2", "workspaceId": "ws-1", "name": "Held",
+                "status": "idle", "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-03T00:00:00Z",
+                "attentionRequestKind": "blocker",
+                "messages": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (store, _db_dir) = open_store().await;
+        run(&store, source.path()).await.expect("first import");
+        // Second run exercises the update path (full-row update excludes the
+        // attention columns; the explicit restore must handle partial fields).
+        run(&store, source.path()).await.expect("second import");
+
+        let held = store
+            .get_agent_session(&AgentId::from("agent-2"))
+            .await
+            .expect("reload held session");
+        assert_eq!(held.attention_request_kind.as_deref(), Some("blocker"));
+        assert_eq!(held.attention_request_reason.as_deref(), Some(""));
+        assert_eq!(
+            held.attention_request_timestamp.as_deref(),
+            Some("2026-01-03T00:00:00Z"),
+        );
+        // A session with no attention fields still round-trips cleared.
+        let plain = store
+            .get_agent_session(&AgentId::from("agent-1"))
+            .await
+            .expect("reload plain session");
+        assert_eq!(plain.attention_request_kind, None);
     }
 
     #[tokio::test]

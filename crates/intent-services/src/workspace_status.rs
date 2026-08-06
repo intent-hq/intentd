@@ -39,41 +39,87 @@ use crate::{compute_task_stats, publish_event, system_actor, Services};
 /// touch. Shared across clones (behind `Arc`) so every service handle
 /// compares against the same last-emitted value. The map is private to this
 /// module: outside code can neither read nor write the baseline.
+///
+/// Evict-vs-in-flight-compute race: a recompute/enrichment reads the store,
+/// awaits, then writes the cache — a `workspace.delete` eviction can land in
+/// between, and the late write would resurrect a baseline for the deleted id
+/// (a leaked entry, and a stale comparison for an importer re-insert of the
+/// same id). Guard: `evictions` counts evictions under the same lock; writers
+/// snapshot it via [`DisplayStatusCache::generation`] *before* their store
+/// reads and their write is dropped when the counter moved and no entry
+/// survived for the id (an entry that still exists was not evicted — or was
+/// legitimately re-seeded — so the write proceeds). A dropped write is always
+/// safe: the next transition recomputes from fresh state.
 #[derive(Default)]
-pub(crate) struct DisplayStatusCache(Mutex<HashMap<WorkspaceId, WorkspaceDisplayStatus>>);
+pub(crate) struct DisplayStatusCache(Mutex<CacheInner>);
+
+#[derive(Default)]
+struct CacheInner {
+    map: HashMap<WorkspaceId, WorkspaceDisplayStatus>,
+    /// Total evictions since startup; see the eviction-race guard above.
+    evictions: u64,
+}
 
 impl DisplayStatusCache {
+    /// Snapshot the eviction generation. Writers capture this *before* their
+    /// store reads and pass it back to [`seed`](Self::seed) /
+    /// [`record`](Self::record), which drop the write when an eviction
+    /// intervened. A poisoned lock returns `u64::MAX` (never matches a live
+    /// generation, and the write path bails on the poisoned lock anyway).
+    fn generation(&self) -> u64 {
+        self.0.lock().map(|g| g.evictions).unwrap_or(u64::MAX)
+    }
+
     /// Seed the baseline when absent (read paths): records the first
     /// observation without reporting a transition, so the first post-read
-    /// mutation compares against it. Best-effort — a poisoned lock is
-    /// ignored.
-    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus) {
-        if let Ok(mut map) = self.0.lock() {
-            map.entry(workspace_id.clone()).or_insert(status);
+    /// mutation compares against it. `generation` is the pre-read snapshot;
+    /// a stale seed for an id with no surviving entry is dropped (eviction
+    /// race, see the type docs). Best-effort — a poisoned lock is ignored.
+    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus, generation: u64) {
+        if let Ok(mut inner) = self.0.lock() {
+            if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
+                return;
+            }
+            inner.map.entry(workspace_id.clone()).or_insert(status);
         }
     }
 
     /// Record `status` and report whether it transitioned since the last
     /// observation: `Some(false)` on a first observation (a seed has no
-    /// baseline to transition from), `None` on a poisoned lock (the caller
-    /// skips emission).
-    fn record(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus) -> Option<bool> {
+    /// baseline to transition from), `None` on a poisoned lock or when the
+    /// write was dropped by the eviction-race guard (the caller skips
+    /// emission). `generation` is the pre-read snapshot from
+    /// [`generation`](Self::generation).
+    fn record(
+        &self,
+        workspace_id: &WorkspaceId,
+        status: WorkspaceDisplayStatus,
+        generation: u64,
+    ) -> Option<bool> {
         match self.0.lock() {
-            Ok(mut map) => Some(match map.insert(workspace_id.clone(), status) {
-                Some(previous) => previous != status,
-                None => false,
-            }),
+            Ok(mut inner) => {
+                if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
+                    return None;
+                }
+                Some(match inner.map.insert(workspace_id.clone(), status) {
+                    Some(previous) => previous != status,
+                    None => false,
+                })
+            }
             Err(_) => None,
         }
     }
 
     /// Drop the baseline for a deleted workspace so the entry does not leak
-    /// for the daemon's lifetime (and a same-id recreate starts from a fresh
-    /// seed instead of a stale baseline). Best-effort — a poisoned lock is
-    /// ignored.
+    /// for the daemon's lifetime (and an importer re-insert of the same id
+    /// starts from a fresh seed instead of a stale baseline). Bumps the
+    /// eviction generation so in-flight computes that read the store before
+    /// the delete cascade cannot write a baseline back for the deleted id.
+    /// Best-effort — a poisoned lock is ignored.
     fn evict(&self, workspace_id: &WorkspaceId) {
-        if let Ok(mut map) = self.0.lock() {
-            map.remove(workspace_id);
+        if let Ok(mut inner) = self.0.lock() {
+            inner.map.remove(workspace_id);
+            inner.evictions += 1;
         }
     }
 
@@ -83,6 +129,7 @@ impl DisplayStatusCache {
         self.0
             .lock()
             .expect("lock cache")
+            .map
             .contains_key(workspace_id)
     }
 }
@@ -102,6 +149,9 @@ impl Services {
         if ws.task_stats.is_none() {
             return;
         }
+        // Pre-read generation snapshot: a `workspace.delete` eviction racing
+        // the awaits below must not have this seed resurrect the baseline.
+        let generation = self.last_display_statuses.generation();
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`.
@@ -117,7 +167,8 @@ impl Services {
             ws.pr_status,
             ws.task_stats.as_ref(),
         );
-        self.last_display_statuses.seed(&ws.id, display_status);
+        self.last_display_statuses
+            .seed(&ws.id, display_status, generation);
         ws.display_status = Some(display_status);
     }
 
@@ -139,6 +190,11 @@ impl Services {
     /// insert have no await between them, so the window is negligible and
     /// self-heals on the next transition.
     pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
+        // Pre-read generation snapshot: an eviction (workspace.delete)
+        // landing between the store reads below and the cache write must
+        // drop this compute rather than re-insert a baseline for the
+        // deleted id (see the `DisplayStatusCache` docs).
+        let generation = self.last_display_statuses.generation();
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
         };
@@ -159,7 +215,10 @@ impl Services {
             ws.pr_status,
             Some(&task_stats),
         );
-        let Some(transitioned) = self.last_display_statuses.record(workspace_id, status) else {
+        let Some(transitioned) =
+            self.last_display_statuses
+                .record(workspace_id, status, generation)
+        else {
             return;
         };
         if transitioned {
@@ -173,7 +232,12 @@ impl Services {
 
     /// Evict a deleted workspace's last-observed baseline (G7): called from
     /// `workspace.delete` after the store cascade so the in-memory map does
-    /// not leak entries for the daemon's lifetime.
+    /// not leak entries for the daemon's lifetime. Bumps the cache's eviction
+    /// generation, so a recompute that read the workspace before the cascade
+    /// drops its late write instead of resurrecting the baseline. Workspace
+    /// ids are never recycled by `workspace.create` (tombstoned via
+    /// `deleted_workspace_id`), so a stale-baseline collision could only
+    /// come from such a late write — which the generation guard prevents.
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
     }
@@ -1010,11 +1074,12 @@ mod display_status_events {
 
     use intent_core::{
         now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata, TaskStatus,
-        WorkspaceApi, WorkspaceId,
+        WorkspaceApi, WorkspaceDisplayStatus, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::{json, Value};
 
+    use super::DisplayStatusCache;
     use crate::tests::{workspace, DebounceEnvGuard, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
@@ -1689,6 +1754,55 @@ mod display_status_events {
         assert!(
             !services.last_display_statuses.contains(&h.ws),
             "deleted workspace's baseline must be evicted"
+        );
+    }
+
+    /// Eviction-race guard (PR #928 review): a compute whose generation
+    /// snapshot predates an eviction must drop its cache write — neither
+    /// `record` nor `seed` may resurrect a baseline for the deleted id.
+    #[tokio::test]
+    async fn stale_compute_after_eviction_drops_write() {
+        let cache = DisplayStatusCache::default();
+        let ws = WorkspaceId::new();
+
+        // In-flight recompute snapshots the generation, then the delete's
+        // eviction lands before its write.
+        let generation = cache.generation();
+        cache.record(&ws, WorkspaceDisplayStatus::InProgress, generation);
+        assert!(cache.contains(&ws));
+        cache.evict(&ws);
+        let stale = cache.record(&ws, WorkspaceDisplayStatus::Idle, generation);
+        assert_eq!(stale, None, "stale record must be dropped, not compared");
+        assert!(
+            !cache.contains(&ws),
+            "stale record must not resurrect the evicted baseline"
+        );
+
+        // Same for the read-path seed.
+        cache.seed(&ws, WorkspaceDisplayStatus::Idle, generation);
+        assert!(
+            !cache.contains(&ws),
+            "stale seed must not resurrect the evicted baseline"
+        );
+
+        // A fresh snapshot taken after the eviction writes normally (the
+        // importer re-insert / post-delete read path seeds fresh).
+        let fresh = cache.generation();
+        assert_eq!(
+            cache.record(&ws, WorkspaceDisplayStatus::Idle, fresh),
+            Some(false),
+            "fresh compute seeds without emitting"
+        );
+        assert!(cache.contains(&ws));
+
+        // An unrelated eviction does not drop writes for ids whose entry
+        // survives: the guard only bites when the id's own entry is gone.
+        let generation = cache.generation();
+        cache.evict(&WorkspaceId::new());
+        assert_eq!(
+            cache.record(&ws, WorkspaceDisplayStatus::Complete, generation),
+            Some(true),
+            "surviving entry still records a transition"
         );
     }
 
