@@ -100,8 +100,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     cmd.spawn().expect("spawn intentd serve")
 }
 
-async fn await_uds(socket: &Path) -> bool {
-    timeout(common::daemon_startup_timeout(), async {
+async fn await_uds(socket: &Path, deadline: tokio::time::Instant) -> bool {
+    tokio::time::timeout_at(deadline, async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
@@ -233,8 +233,11 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
+    // One deadline for the whole round-trip, not per frame: heartbeat `Ping`s
+    // and unrelated notifications must not extend the bound (monorepo#1562).
+    let deadline = tokio::time::Instant::now() + rpc_read_budget();
     loop {
-        let next = timeout(rpc_read_budget(), ws.next())
+        let next = tokio::time::timeout_at(deadline, ws.next())
             .await
             .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
         match next {
@@ -362,7 +365,12 @@ struct Setup {
     rpc: TlsWs,
 }
 
-async fn boot_daemon(script: &str, behavior: &str, sub_event_types: Value) -> Setup {
+async fn boot_daemon(
+    script: &str,
+    behavior: &str,
+    sub_event_types: Value,
+    budget: Budget,
+) -> Setup {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env: [(&str, &str); 4] = [
@@ -377,8 +385,17 @@ async fn boot_daemon(script: &str, behavior: &str, sub_event_types: Value) -> Se
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
-    assert!(await_uds(&socket).await, "daemon did not start");
-    let status = common::await_wss_status(&socket).await;
+    // Startup is clamped to the same whole-test budget: the shared
+    // `daemon_startup_timeout` / `await_wss_status` bounds are 60s each and
+    // scale with the multiplier, so unclamped they can span the whole nextest
+    // kill window on their own (monorepo#1562).
+    assert!(
+        await_uds(&socket, budget.step(60)).await,
+        "daemon did not start"
+    );
+    let status = tokio::time::timeout_at(budget.step(60), common::await_wss_status(&socket))
+        .await
+        .expect("daemon wss status not ready within budget");
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
@@ -620,7 +637,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
         ],
     })
     .to_string();
-    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
 
     let watcher = create_agent(&mut setup.rpc, 10, &ws_id, "Watcher").await;
@@ -842,7 +859,13 @@ struct WatchLifecycle {
 }
 
 async fn boot_watch_lifecycle(script: &str, budget: Budget) -> WatchLifecycle {
-    let mut setup = boot_daemon(script, &watch_lifecycle_behavior(), json!(["agent:*"])).await;
+    let mut setup = boot_daemon(
+        script,
+        &watch_lifecycle_behavior(),
+        json!(["agent:*"]),
+        budget,
+    )
+    .await;
     let ws_id = setup.ws_id.clone();
 
     // Target FIRST (so the watcher's ws.agent.list lookup finds it), then the
@@ -1201,7 +1224,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         ],
     })
     .to_string();
-    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
 
     // Watch targets FIRST so the watchers' ws.agent.list lookups find them.
@@ -1377,7 +1400,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         ],
     })
     .to_string();
-    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
     let ws_id = setup.ws_id.clone();
 
     let leaf = create_agent(&mut setup.rpc, 10, &ws_id, "RearmLeaf").await;
