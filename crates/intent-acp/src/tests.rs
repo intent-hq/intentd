@@ -4744,9 +4744,18 @@ mod mcp_bridge_tests {
             sleep(Duration::from_millis(50)).await;
 
             // A request during the reconnect gap gets the retryable error.
+            // Tolerate one -32002 in case the request still raced the
+            // not-yet-noticed dead socket (safe at-most-once direction); the
+            // follow-up request is then guaranteed to hit the gap path.
             bridge.send_request(2).await;
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 2);
+            if resp["error"]["code"] == json!(BRIDGE_OUTCOME_UNKNOWN_CODE) {
+                bridge.send_request(3).await;
+                let resp = bridge.read_response().await;
+                assert_disconnected_error(&resp, 3);
+            } else {
+                assert_disconnected_error(&resp, 2);
+            }
 
             // Once the reconnect window is exhausted the bridge exits cleanly.
             let result = timeout(Duration::from_secs(5), bridge.handle)

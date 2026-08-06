@@ -626,14 +626,18 @@ where
                         if line.trim().is_empty() {
                             continue;
                         }
-                        let key = request_id(&line).map(|id| {
-                            let key = id.to_string();
-                            pending.insert(key.clone(), PendingRequest {
+                        // Two-phase transition: register the request as
+                        // undelivered, then mark it delivered only once its
+                        // line was written to the socket.
+                        let mut key = None;
+                        if let Some(id) = request_id(&line) {
+                            let k = id.to_string();
+                            pending.insert(k.clone(), PendingRequest {
                                 id,
                                 delivered: false,
                             });
-                            key
-                        });
+                            key = Some(k);
+                        }
                         if write_line(&mut tcp_write, &line).await.is_err() {
                             break SessionEnd::TcpDropped;
                         }
