@@ -2088,6 +2088,12 @@ pub struct AgentSession {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level requested for this session (PROTOCOL §5.5,
+    /// Option B). Stored as-is (providers interpret the vocabulary; the
+    /// daemon never normalizes it) and applied on the next prompt send.
+    /// `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2320,6 +2326,10 @@ pub struct AgentLite {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level for the session (PROTOCOL §5.5, Option B);
+    /// mirrors [`AgentSession::reasoning_effort`]. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub status: AgentStatus,
@@ -2466,6 +2476,7 @@ impl AgentLite {
             name: session.name,
             name_explicitly_set: session.name_explicitly_set,
             model: session.model,
+            reasoning_effort: session.reasoning_effort,
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
@@ -2514,6 +2525,10 @@ impl AgentLite {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
     pub provider: Option<String>,
+    /// Reasoning-effort level persisted on the created session (PROTOCOL
+    /// §5.5, Option B). Stored as-is when a non-empty string; empty /
+    /// whitespace-only values collapse to `None` at the boundary.
+    pub reasoning_effort: Option<String>,
     pub agent_type: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub workspace_path: Option<String>,
@@ -2543,6 +2558,11 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
+    /// Wins over the chosen model option's `reasoningEffort` and the
+    /// specialist's frontmatter scalar; validated against the cached model
+    /// catalog's `effortLevels` evidence when the resolved model has any.
+    pub reasoning_effort: Option<String>,
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
@@ -2572,6 +2592,10 @@ pub struct AgentWakeCreateOptions {
     pub provider: Option<String>,
     pub agent_type: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the created child (PROTOCOL §5.5/§5.11),
+    /// used only on the create branch. Overridden by the wake-level
+    /// [`AgentWakeOrCreateInput::reasoning_effort`] when both are present.
+    pub reasoning_effort: Option<String>,
     pub context_references: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub skip_auto_commit: Option<bool>,
@@ -2589,6 +2613,9 @@ pub struct AgentWakeCreateOptions {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentWakeOrCreateInput {
     pub model: Option<String>,
+    /// Reasoning-effort override for the create branch (PROTOCOL §5.5/§5.11);
+    /// wins over `create.reasoningEffort` and the specialist frontmatter.
+    pub reasoning_effort: Option<String>,
     pub caller_agent_id: Option<AgentId>,
     pub delegation_depth: Option<i64>,
     pub message_metadata: Option<serde_json::Value>,
@@ -3820,6 +3847,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".to_string()),
@@ -3898,6 +3926,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: Some("opus".to_string()),
+            reasoning_effort: None,
             provider: Some("auggie".to_string()),
             system_prompt: None,
             specialist: None,
