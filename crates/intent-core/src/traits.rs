@@ -12,9 +12,9 @@ use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
     ContextItem, Draft, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
-    FileActivity, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitMergeConflicts,
+    GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData, MessageOrigin,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
@@ -2347,20 +2347,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `event.recentFiles`: most-recently changed files (PROTOCOL §5.10).
-    fn event_recent_files(
-        &self,
-        workspace_id: WorkspaceId,
-        limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        let _ = (workspace_id, limit);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::event_recent_files not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `event.agentActivity`: per-agent files (with `agentId`) or aggregated
     /// agent activity (without). The union result is returned as raw JSON
     /// (`FileActivity[]` or `AgentActivity[]`) (PROTOCOL §5.10).
@@ -2388,21 +2374,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::event_workspace_summary not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `event.directoryChanges`: recent `file:changed` under a prefix (§5.10).
-    fn event_directory_changes(
-        &self,
-        workspace_id: WorkspaceId,
-        dir: String,
-        limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        let _ = (workspace_id, dir, limit);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::event_directory_changes not implemented".to_string(),
             ))
         })
     }

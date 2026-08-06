@@ -3,7 +3,7 @@
 use intent_core::{
     AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentLocation,
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
-    CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileActivity,
+    CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
     FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
     GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
@@ -623,24 +623,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn event_recent_files(
-        &self,
-        _workspace_id: WorkspaceId,
-        limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        Box::pin(async move {
-            Ok(vec![FileActivity {
-                path: format!("limit={}", limit.unwrap_or(-1)),
-                relative_path: "r".to_string(),
-                action: "modify".to_string(),
-                timestamp: "t0".to_string(),
-                actor: Some("agent:x".to_string()),
-                additions: None,
-                deletions: None,
-            }])
-        })
-    }
-
     fn event_agent_activity(
         &self,
         _workspace_id: WorkspaceId,
@@ -664,25 +646,6 @@ impl WorkspaceApi for FakeApi {
                 event_rate: minutes_ago.unwrap_or(-1) as f64,
                 top_changed_files: vec![],
             })
-        })
-    }
-
-    fn event_directory_changes(
-        &self,
-        _workspace_id: WorkspaceId,
-        dir: String,
-        _limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        Box::pin(async move {
-            Ok(vec![FileActivity {
-                path: dir,
-                relative_path: "r".to_string(),
-                action: "modify".to_string(),
-                timestamp: "t0".to_string(),
-                actor: Some("agent:x".to_string()),
-                additions: None,
-                deletions: None,
-            }])
         })
     }
 
@@ -2992,14 +2955,6 @@ async fn task_remove_agent_from_all_tasks_param_validation_and_routing() {
 
 #[tokio::test]
 async fn event_query_methods_route_and_pass_params() {
-    // recentFiles passes `limit` through.
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"event.recentFiles","params":{"workspaceId":"ws-1","limit":7}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"][0]["path"], serde_json::json!("limit=7"));
-
     // agentActivity echoes agentId + minutesAgo.
     let v = call(
         r#"{"jsonrpc":"2.0","id":2,"method":"event.agentActivity","params":{"workspaceId":"ws-1","agentId":"a1","minutesAgo":15}}"#,
@@ -3017,14 +2972,6 @@ async fn event_query_methods_route_and_pass_params() {
     .unwrap();
     assert_eq!(v["result"]["eventRate"], serde_json::json!(42.0));
 
-    // directoryChanges requires `dir` and echoes it back.
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":4,"method":"event.directoryChanges","params":{"workspaceId":"ws-1","dir":"src/"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"][0]["path"], serde_json::json!("src/"));
-
     // query passes EventQueryParams (eventType echoed into the result event).
     let v = call(
         r#"{"jsonrpc":"2.0","id":5,"method":"event.query","params":{"workspaceId":"ws-1","eventType":"file:changed"}}"#,
@@ -3034,18 +2981,18 @@ async fn event_query_methods_route_and_pass_params() {
     assert_eq!(v["result"][0]["type"], serde_json::json!("file:changed"));
 }
 
+/// `event.recentFiles` / `event.directoryChanges` were removed end-to-end: the
+/// router arms and catalog entries are gone, so the dispatcher answers `-32601`.
 #[tokio::test]
-async fn event_directory_changes_requires_dir() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"event.directoryChanges","params":{"workspaceId":"ws-1"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Missing required parameter: dir")
-    );
+async fn removed_event_file_methods_are_not_routable() {
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"event.recentFiles","params":{"workspaceId":"ws-1","limit":7}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"event.directoryChanges","params":{"workspaceId":"ws-1","dir":"src/"}}"#,
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32601);
+        assert_eq!(v["error"]["message"], serde_json::json!("Method not found"));
+    }
 }
 
 /// Audit A F3: the singular `event.subscribe` / `event.unsubscribe` router

@@ -3542,49 +3542,6 @@ async fn event_setup() -> (TempDb, Services, WorkspaceId) {
 }
 
 #[tokio::test]
-async fn recent_files_limits_and_orders_newest_first() {
-    let (_tmp, svc, ws) = event_setup().await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:01Z",
-        "a.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Tool,
-        None,
-        "2026-01-01T00:00:02Z",
-        "b.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::User,
-        Some("u"),
-        "2026-01-01T00:00:03Z",
-        "c.rs",
-    )
-    .await;
-
-    let files = svc
-        .event_recent_files(ws.clone(), Some(2))
-        .await
-        .expect("recent");
-    assert_eq!(files.len(), 2);
-    // Newest first; combined "type:name" actor (absent name → undefined).
-    assert_eq!(files[0].path, "c.rs");
-    assert_eq!(files[0].actor.as_deref(), Some("user:name-u"));
-    assert_eq!(files[1].path, "b.rs");
-    assert_eq!(files[1].actor.as_deref(), Some("tool:undefined"));
-}
-
-#[tokio::test]
 async fn agent_activity_files_branch_vs_aggregate_branch() {
     let (_tmp, svc, ws) = event_setup().await;
     let ts = intent_core::now_iso();
@@ -3633,42 +3590,6 @@ async fn workspace_summary_aggregates_recent_window() {
     assert_eq!(summary.active_agents[0].agent_id, "a1");
     assert_eq!(summary.top_changed_files[0].path, "a.rs");
     assert_eq!(summary.top_changed_files[0].change_count, 2);
-}
-
-#[tokio::test]
-async fn directory_changes_filters_by_prefix_and_requires_dir() {
-    let (_tmp, svc, ws) = event_setup().await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:01Z",
-        "src/a.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:02Z",
-        "docs/b.md",
-    )
-    .await;
-
-    let changes = svc
-        .event_directory_changes(ws.clone(), "src/".to_string(), None)
-        .await
-        .expect("dir");
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].path, "src/a.rs");
-
-    let err = svc
-        .event_directory_changes(ws.clone(), String::new(), None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Internal(m) if m == "Directory path is required"));
 }
 
 #[tokio::test]

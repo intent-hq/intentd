@@ -7571,7 +7571,7 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result,
         WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
@@ -7584,7 +7584,6 @@ mod wsapi4_bindings_tests {
     type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
     type DelegateCall = (Option<String>, Option<String>);
     type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
-    type DirCall = (String, Option<i64>);
     type AttentionCall = (String, String, Option<String>);
 
     #[derive(Default)]
@@ -7601,9 +7600,7 @@ mod wsapi4_bindings_tests {
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
         request_attention_calls: Mutex<Vec<AttentionCall>>,
-        event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
-        event_dir_calls: Mutex<Vec<DirCall>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
@@ -7905,25 +7902,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        fn event_recent_files(
-            &self,
-            _ws: WorkspaceId,
-            limit: Option<i64>,
-        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-            self.event_recent_files_calls.lock().unwrap().push(limit);
-            Box::pin(async move {
-                Ok(vec![FileActivity {
-                    path: "/tmp/foo.rs".to_string(),
-                    relative_path: "foo.rs".to_string(),
-                    action: "modified".to_string(),
-                    timestamp: "2026-01-01T00:00:00Z".to_string(),
-                    actor: Some("agent:test".to_string()),
-                    additions: None,
-                    deletions: None,
-                }])
-            })
-        }
-
         fn event_query(
             &self,
             _ws: WorkspaceId,
@@ -7931,16 +7909,6 @@ mod wsapi4_bindings_tests {
         ) -> BoxFuture<'_, Result<Value>> {
             self.event_query_calls.lock().unwrap().push(params);
             Box::pin(async move { Ok(json!([])) })
-        }
-
-        fn event_directory_changes(
-            &self,
-            _ws: WorkspaceId,
-            dir: String,
-            limit: Option<i64>,
-        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-            self.event_dir_calls.lock().unwrap().push((dir, limit));
-            Box::pin(async move { Ok(vec![]) })
         }
 
         fn event_subscribe(
@@ -8609,23 +8577,19 @@ mod wsapi4_bindings_tests {
     // event.*
     // ================================================================
 
+    /// `ws.event.recentFiles` / `ws.event.directoryChanges` were removed
+    /// end-to-end: the prelude no longer defines them, so calling either fails.
     #[tokio::test]
-    async fn event_recent_files_forwards_limit() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.event.recentFiles(5);").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr[0]["relativePath"], json!("foo.rs"));
-        assert_eq!(api.event_recent_files_calls.lock().unwrap()[0], Some(5));
-    }
-
-    #[tokio::test]
-    async fn event_directory_changes_requires_dir() {
+    async fn removed_event_file_bindings_are_absent() {
         let (srv, _api) = server();
-        let resp = call(&srv, "return await ws.event.directoryChanges();").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("Directory path is required"));
+        for js in [
+            "return await ws.event.recentFiles(5);",
+            "return await ws.event.directoryChanges('src/');",
+        ] {
+            let resp = call(&srv, js).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{js}");
+            assert!(text(&resp).contains("not a function"), "{js}");
+        }
     }
 
     #[tokio::test]

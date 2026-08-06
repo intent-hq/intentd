@@ -12,6 +12,10 @@
 // and both `modify` and `rename` → `file:changed`. `data.action` always carries
 // the raw `create|modify|delete|rename` verb. `file:renamed` is part of the
 // taxonomy but stays reserved-but-unused (no emitter), matching the TS source.
+// The shared prefix of the file family. Used by the event bus to apply hybrid
+// persistence: only agent-attributed `file:*` events are persisted, the rest are
+// broadcast-only.
+pub const FILE_PREFIX: &str = "file:";
 pub const FILE_CHANGED: &str = "file:changed";
 pub const FILE_CREATED: &str = "file:created";
 pub const FILE_DELETED: &str = "file:deleted";

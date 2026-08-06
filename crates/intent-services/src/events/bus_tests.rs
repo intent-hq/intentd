@@ -93,6 +93,85 @@ async fn publish_appends_to_store_and_broadcasts() {
     assert_eq!(rows[0].id, stored.id);
 }
 
+/// Hybrid `file:*` persistence: non-agent file events broadcast but are never
+/// written to SQLite, while agent-attributed ones stay durable.
+#[tokio::test]
+async fn non_agent_file_events_broadcast_without_persisting() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["file:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    for (event_type, actor) in [
+        ("file:changed", ActorType::System),
+        ("file:created", ActorType::User),
+        ("file:deleted", ActorType::System),
+    ] {
+        let ev = bus
+            .publish(&new_event(event_type, Some("system"), actor))
+            .await
+            .expect("publish");
+        // The returned event still carries a minted id, as for persisted events.
+        assert!(!ev.id.is_empty());
+    }
+    // Agent-attributed file event: persisted.
+    let agent_ev = bus
+        .publish(&new_event(
+            "file:changed",
+            Some("agent-1"),
+            ActorType::Agent,
+        ))
+        .await
+        .expect("publish agent file event");
+
+    // Broadcast leg: all four events reached the subscriber.
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        seen.extend(batch);
+    }
+    assert_eq!(seen.len(), 4);
+
+    // Store leg: only the agent-attributed event is durable.
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1, "only agent file:* events persist: {rows:?}");
+    assert_eq!(rows[0].id, agent_ev.id);
+    assert_eq!(rows[0].actor.actor_type, ActorType::Agent);
+}
+
+/// The transient downgrade is scoped to `file:*` — non-agent events in other
+/// categories keep persisting.
+#[tokio::test]
+async fn non_agent_non_file_events_still_persist() {
+    let (_tmp, bus) = bus().await;
+    bus.publish(&new_event("note:created", Some("u"), ActorType::User))
+        .await
+        .expect("publish note");
+    bus.publish(&new_event("git:commit", Some("system"), ActorType::System))
+        .await
+        .expect("publish git");
+
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 2);
+}
+
 #[tokio::test]
 async fn type_glob_and_exclude_self() {
     let (_tmp, bus) = bus().await;
