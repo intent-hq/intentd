@@ -2411,7 +2411,7 @@ impl Services {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
-                    workspace_id,
+                    workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
                     event_type: intent_core::events::AGENT_DELETED.to_string(),
                     actor: crate::system_actor(),
@@ -2423,6 +2423,11 @@ impl Services {
                 },
             )
             .await;
+            // Deleting a session can retire a needs_attention hold (a pending
+            // attention request or unanswered question dies with the row):
+            // recompute-and-compare (§6.5 step 0); the dedup cache suppresses
+            // the no-op when nothing derived from this session.
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -2620,6 +2625,13 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // `status` / `isBackground` feed the needs_attention derivation (a
+        // deleted or background session's pending request/question no longer
+        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
+        // probe entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") {
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }

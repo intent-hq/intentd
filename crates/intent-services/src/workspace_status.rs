@@ -1339,6 +1339,67 @@ mod display_status_events {
         );
     }
 
+    /// G1: `agent.delete` recomputes the derived rollup — deleting the
+    /// top-level agent whose pending attention request drives
+    /// `needs_attention` emits the demotion.
+    #[tokio::test]
+    async fn agent_delete_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-del");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "blocker", "stuck", &now_iso())
+            .await
+            .expect("set attention");
+        // Seed: baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_delete_op(session.id.clone(), Some(h.ws.clone()))
+            .await
+            .expect("delete agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G2: `agent.update` recomputes when a status-relevant field changes —
+    /// flipping the attention-holding agent to `isBackground: true` removes
+    /// it from the needs_attention derivation and emits the demotion.
+    #[tokio::test]
+    async fn agent_update_is_background_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-bg");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "discussion", "input", &now_iso())
+            .await
+            .expect("set attention");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "isBackground": true }))
+            .await
+            .expect("update agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the question hold and emits the
     /// needs_attention → idle demotion.
