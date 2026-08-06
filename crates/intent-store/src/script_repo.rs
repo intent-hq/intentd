@@ -68,26 +68,39 @@ impl Store {
 
     /// Set or clear the service was-running marker (stored-on-write): set on a
     /// service-mode script's successful start, cleared on user `script.stop`
-    /// and natural exit (`script.remove` deletes the row). Unknown ids are a
-    /// no-op, not an error.
-    pub async fn set_script_was_running(&self, id: &str, was_running: bool) -> Result<()> {
-        sqlx::query("UPDATE script SET was_running = ? WHERE id = ?")
+    /// and natural exit (`script.remove` deletes the row). Scoped to
+    /// `workspace_id` — the runtime registry permits the same client-supplied
+    /// id in separate workspaces, so an id-only write could mark a row owned
+    /// by another workspace. Unknown ids are a no-op, not an error.
+    pub async fn set_script_was_running(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        was_running: bool,
+    ) -> Result<()> {
+        sqlx::query("UPDATE script SET was_running = ? WHERE id = ? AND workspace_id = ?")
             .bind(was_running as i64)
             .bind(id)
+            .bind(workspace_id)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set script was_running failed: {e}")))?;
         Ok(())
     }
 
-    /// Ids of scripts still carrying the was-running marker — the boot-time
-    /// hydration read behind the `previouslyRunning` runtime field.
-    pub async fn list_was_running_script_ids(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT id FROM script WHERE was_running = 1")
+    /// `(workspace_id, id)` pairs of scripts still carrying the was-running
+    /// marker — the boot-time hydration read behind the `previouslyRunning`
+    /// runtime field. Workspace-qualified because the same client-supplied id
+    /// may exist in separate workspaces.
+    pub async fn list_was_running_script_ids(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT workspace_id, id FROM script WHERE was_running = 1")
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list was-running scripts failed: {e}")))?;
-        Ok(rows.iter().map(|r| r.get("id")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("workspace_id"), r.get("id")))
+            .collect())
     }
 }
 

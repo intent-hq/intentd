@@ -4352,9 +4352,9 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
 
-    let script = |id: &str| intent_core::Script {
+    let script = |ws: &str, id: &str| intent_core::Script {
         id: id.to_string(),
-        workspace_id: "ws-1".to_string(),
+        workspace_id: ws.to_string(),
         name: "dev".to_string(),
         command: "npm run dev".to_string(),
         cwd: None,
@@ -4366,8 +4366,14 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
         created_at: now_iso(),
         updated_at: None,
     };
-    store.upsert_script(&script("s-1")).await.expect("insert");
-    store.upsert_script(&script("s-2")).await.expect("insert");
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("insert");
+    store
+        .upsert_script(&script("ws-1", "s-2"))
+        .await
+        .expect("insert");
 
     // Fresh rows carry no marker.
     assert!(store
@@ -4376,24 +4382,41 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
         .expect("list")
         .is_empty());
 
-    // Set is scoped to the targeted id and survives repeated reads.
+    // Set is scoped to the targeted (workspace, id) and survives repeated
+    // reads.
     store
-        .set_script_was_running("s-1", true)
+        .set_script_was_running("ws-1", "s-1", true)
         .await
         .expect("set");
     assert_eq!(
         store.list_was_running_script_ids().await.expect("list"),
-        vec!["s-1".to_string()]
+        vec![("ws-1".to_string(), "s-1".to_string())]
     );
     assert_eq!(
         store.list_was_running_script_ids().await.expect("list"),
-        vec!["s-1".to_string()],
+        vec![("ws-1".to_string(), "s-1".to_string())],
         "marker persists until explicitly cleared"
+    );
+
+    // A write against the same id in a different workspace must not touch
+    // the row owned by ws-1 (the runtime registry permits the same
+    // client-supplied id in separate workspaces).
+    store
+        .set_script_was_running("ws-2", "s-1", false)
+        .await
+        .expect("cross-workspace no-op");
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())],
+        "cross-workspace write is a no-op"
     );
 
     // An upsert (INSERT OR REPLACE) resets the marker — a replaced
     // definition starts a fresh runtime life.
-    store.upsert_script(&script("s-1")).await.expect("replace");
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("replace");
     assert!(store
         .list_was_running_script_ids()
         .await
@@ -4402,15 +4425,15 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
 
     // Clear is durable; an unknown id is a no-op, not an error.
     store
-        .set_script_was_running("s-2", true)
+        .set_script_was_running("ws-1", "s-2", true)
         .await
         .expect("set");
     store
-        .set_script_was_running("s-2", false)
+        .set_script_was_running("ws-1", "s-2", false)
         .await
         .expect("clear");
     store
-        .set_script_was_running("missing", true)
+        .set_script_was_running("ws-1", "missing", true)
         .await
         .expect("unknown id no-op");
     assert!(store
@@ -4421,7 +4444,7 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
 
     // Remove deletes the row (marker gone with it).
     store
-        .set_script_was_running("s-2", true)
+        .set_script_was_running("ws-1", "s-2", true)
         .await
         .expect("set");
     assert!(store.remove_script("s-2").await.expect("remove"));

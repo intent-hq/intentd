@@ -289,7 +289,7 @@ impl ScriptManager {
     /// Returns the number loaded.
     pub(crate) async fn hydrate(&self) -> Result<usize> {
         let defs = self.store.list_all_scripts().await?;
-        let was_running: HashSet<String> = self
+        let was_running: HashSet<(String, String)> = self
             .store
             .list_was_running_script_ids()
             .await?
@@ -302,7 +302,9 @@ impl ScriptManager {
             guard.entry(key).or_insert_with(|| {
                 loaded += 1;
                 let state = ScriptRuntimeState {
-                    previously_running: was_running.contains(&def.id).then_some(true),
+                    previously_running: was_running
+                        .contains(&(def.workspace_id.clone(), def.id.clone()))
+                        .then_some(true),
                     ..Default::default()
                 };
                 ManagedScript {
@@ -635,7 +637,8 @@ impl ScriptManager {
                 }
             };
             if let Some(state) = dismissed_state {
-                self.persist_was_running(script_id, false).await;
+                self.persist_was_running(workspace_id, script_id, false)
+                    .await;
                 self.emit_state(workspace_id, script_id, &state).await;
             }
         }
@@ -1026,7 +1029,7 @@ impl ScriptManager {
             (m.state.clone(), m.def.mode == ScriptMode::Service)
         };
         if is_service {
-            self.persist_was_running(script_id, true).await;
+            self.persist_was_running(ws, script_id, true).await;
         }
         self.emit_state(ws, script_id, &state).await;
         true
@@ -1063,7 +1066,7 @@ impl ScriptManager {
             )
         };
         if is_service {
-            self.persist_was_running(script_id, false).await;
+            self.persist_was_running(ws, script_id, false).await;
         }
         self.emit_state(ws, script_id, &state).await;
         Some(flags)
@@ -1072,10 +1075,10 @@ impl ScriptManager {
     /// Best-effort stored-on-write update of the `was_running` marker: a
     /// store failure is logged, never propagated — the runtime transition
     /// (and its `script:state` event) must not fail over a bookkeeping write.
-    async fn persist_was_running(&self, script_id: &str, was_running: bool) {
+    async fn persist_was_running(&self, ws: &WorkspaceId, script_id: &str, was_running: bool) {
         if let Err(e) = self
             .store
-            .set_script_was_running(script_id, was_running)
+            .set_script_was_running(ws.as_str(), script_id, was_running)
             .await
         {
             tracing::warn!(script = %script_id, error = %e, "persist script was_running marker failed");
@@ -2153,7 +2156,7 @@ mod tests {
         await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         assert_eq!(
             store.list_was_running_script_ids().await.expect("list"),
-            vec![id.clone()],
+            vec![(h.ws.as_str().to_string(), id.clone())],
             "service start sets the marker"
         );
         // `mark_exited` clears the marker strictly before emitting `exited`.
