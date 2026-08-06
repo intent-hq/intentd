@@ -19529,48 +19529,36 @@ mod last_activity_events {
     }
 
     /// The persisted `lastActivity` never walks backwards (monorepo#1580).
-    /// Two layers hold it: `derive_last_activity` folds the stored value into
-    /// its max, so the debounce task short-circuits rather than emitting an
-    /// older timestamp; and the store's monotonic column write is the backstop
-    /// for the narrow race where a late timer's read predates a concurrent
-    /// bump. Both are asserted here on a live services store.
+    /// Two layers hold it: the store's monotonic column write declines a stale
+    /// timestamp — the shape a late debounce timer takes when its
+    /// `get_workspace` read predated a concurrent bump — and, above it,
+    /// `derive_last_activity` folds the stored value into its max so an
+    /// ordinary derivation short-circuits before it can emit an older value.
+    /// Both are asserted here against a live services store.
     #[tokio::test]
     async fn persisted_last_activity_is_monotonic() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
 
-        // Seed a far-future stored value; the derivation (which sees only the
-        // much older updated_at) must not regress it.
-        let future = "2999-01-01T00:00:00Z";
-        assert!(h
-            .store
-            .bump_workspace_last_activity(&h.ws, future)
-            .await
-            .expect("seed future lastActivity"));
-
+        // Let the debounce derive and persist first, so the guard below runs
+        // against a column the services layer actually wrote.
         h.services
             .raise_attention(&h.ws, WorkspaceAttention::Unread)
             .await
             .expect("raise");
         tokio::time::sleep(Duration::from_millis(300)).await;
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity
+            .expect("debounce persisted a lastActivity");
 
-        assert_eq!(
-            h.store
-                .get_workspace(&h.ws)
-                .await
-                .expect("reload")
-                .last_activity
-                .as_deref(),
-            Some(future),
-            "a stale derivation must not walk lastActivity backwards"
-        );
-
-        // Backstop: an older timestamp reaching the column write directly —
-        // the shape a late timer takes when its read predated a concurrent
-        // bump — is declined, and the lite read still serves the newer value.
+        // Store guard: a stale write is declined and the column holds.
         assert!(!h
             .store
-            .bump_workspace_last_activity(&h.ws, "2026-01-01T00:00:00Z")
+            .bump_workspace_last_activity(&h.ws, "2020-01-01T00:00:00Z")
             .await
             .expect("stale bump"));
         let lite = h
@@ -19582,7 +19570,35 @@ mod last_activity_events {
             .iter()
             .find(|w| w.id == h.ws)
             .expect("workspace in lite list");
-        assert_eq!(row.last_activity.as_deref(), Some(future));
+        assert_eq!(
+            row.last_activity.as_deref(),
+            Some(persisted.as_str()),
+            "a stale write must not walk the persisted lastActivity backwards"
+        );
+
+        // Derivation layer: with a far-future value stored, a fresh derivation
+        // (which sees only the much older updated_at) must not regress it.
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("seed future lastActivity"));
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::ReviewRequired)
+            .await
+            .expect("raise again");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "a stale derivation must not walk lastActivity backwards"
+        );
     }
 
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
