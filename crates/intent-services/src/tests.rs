@@ -15795,6 +15795,49 @@ mod worktree_provisioning {
         assert_eq!(persisted.checkout_mode, dup.checkout_mode);
     }
 
+    /// monorepo#1560: when provisioning the standalone duplicate's checkout
+    /// fails, the worktree-less row must not keep the `repositoryPath` copied
+    /// from the source — for a standalone source that is the SOURCE's checkout
+    /// directory, which dangles once the source workspace is deleted.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_clears_repository_path_when_provisioning_fails() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        // A checkout-shaped directory with a `.git` DIRECTORY that is not a
+        // valid repository: it passes the `.git` existence gate and the CoW
+        // probe, but the clone cannot be opened as a repo, so provisioning
+        // fails after the standalone path was chosen.
+        let broken = unique_dir("intentd-dupfail-src");
+        std::fs::create_dir_all(broken.0.join(".git")).expect("create .git dir");
+        std::fs::write(broken.0.join("a.txt"), "one\n").expect("write file");
+        let root = unique_dir("intentd-dupfail-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-fail-src",
+            &broken.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate row is still created");
+
+        assert!(
+            dup.worktree_path.is_none(),
+            "provisioning was expected to fail; got {:?}",
+            dup.worktree_path
+        );
+        assert_eq!(
+            dup.repository_path, None,
+            "a failed standalone duplicate must not reference the source's checkout"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(persisted.repository_path, None);
+    }
+
     /// monorepo#1560 regression: the duplicate of a standalone source keeps
     /// working after the source workspace's checkout directory is deleted —
     /// no live filesystem reference back into it.

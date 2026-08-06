@@ -5909,6 +5909,31 @@ fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
 }
 
+/// Drop the `repositoryPath` a `workspace.duplicate` of a **standalone**
+/// source copied from the source row, after checkout provisioning failed
+/// (intent-hq/monorepo#1560).
+///
+/// On success the duplicate's `repositoryPath` is repointed at its own
+/// checkout, because for a standalone source that value is the *source's*
+/// checkout directory. Without a checkout there is nothing to repoint it at,
+/// and leaving the copied value would have the worktree-less duplicate row
+/// reference a directory that dangles once the source workspace is deleted —
+/// the metadata echo of the live-reference bug. `repositoryName` is kept so
+/// the row still identifies its repo; the FE's "continue without worktree"
+/// path treats the missing path as "not provisioned yet".
+fn clear_standalone_repository_path(ws: &mut Workspace, source_standalone: bool) {
+    if !source_standalone {
+        return;
+    }
+    if let Some(stale) = ws.repository_path.take() {
+        tracing::warn!(
+            workspace = %ws.id.as_str(),
+            stale_repository_path = %stale,
+            "workspace.duplicate: cleared repositoryPath inherited from a standalone source after provisioning failed"
+        );
+    }
+}
+
 /// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
 /// checkout that [`cleanup_workspace_worktree_locked`] renamed to a trash
 /// path. Runs after the per-repo lock is released so a multi-GB
@@ -12451,6 +12476,7 @@ impl WorkspaceApi for Services {
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree returned Err").await;
                             }
+                            clear_standalone_repository_path(&mut ws, source_standalone);
                             if cow_isolation || source_standalone {
                                 // The CoW probe pre-created `<root>/<wsId>`
                                 // (both for a CoW checkout and for the
@@ -12470,6 +12496,7 @@ impl WorkspaceApi for Services {
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree task JoinError").await;
                             }
+                            clear_standalone_repository_path(&mut ws, source_standalone);
                             if cow_isolation || source_standalone {
                                 remove_workspace_dir_if_empty(&ws_dir);
                             }
