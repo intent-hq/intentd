@@ -2043,6 +2043,103 @@ async fn wss_agent_delegate_persists_reasoning_effort() {
     srv.ws.stop().await;
 }
 
+/// `agent.create` validates `reasoningEffort` against the resolved model's
+/// cached `effortLevels` over the real WSS wire (PROTOCOL §5.5), with the same
+/// `-32602` valid-values contract as `agent.delegate`/`agent.wakeOrCreate`: an
+/// unsupported level is rejected naming the valid values and persists no
+/// session row, a supported level matches case-insensitively, and a model with
+/// no `effortLevels` evidence passes through unvalidated.
+#[tokio::test]
+async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_levels() {
+    let dir = test_tempdir("intentd-wss-create-effort-");
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] },
+                    { "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie" }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Create Effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","model":"fable-5","reasoningEffort":"xhigh"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "unsupported effort must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.create: reasoningEffort xhigh is not supported by model fable-5"),
+        "error must name the level and model: {rejected}"
+    );
+    assert!(
+        msg.contains("low, high"),
+        "error must name the valid values: {rejected}"
+    );
+
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejection: {listed}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good","model":"fable-5","reasoningEffort":"HIGH"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["reasoningEffort"],
+        Value::from("HIGH"),
+        "supported level matches case-insensitively and persists as written: {created}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"NoEvidence","model":"sonnet5","reasoningEffort":"xhigh"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["reasoningEffort"],
+        Value::from("xhigh"),
+        "model without effortLevels evidence passes through: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
 /// `cowSupported` mirrors the cached workspaces-root CoW probe that fills

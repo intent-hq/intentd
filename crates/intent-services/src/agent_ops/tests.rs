@@ -6403,6 +6403,94 @@ fn effort_guard_rejects_only_against_cached_evidence() {
     assert!(ensure_effort_supported_by_model("agent.delegate", &cache, None, "xhigh").is_ok());
 }
 
+/// `agent.create` applies the same effort guard as `agent.delegate` /
+/// `agent.wakeOrCreate` (PROTOCOL §5.5): a level the resolved model provably
+/// does not support is `-32602` naming the valid values and creates nothing,
+/// while a supported level (case-insensitively) and an evidence-free model
+/// both pass through and persist the caller's spelling.
+#[tokio::test]
+async fn create_validates_reasoning_effort_against_cached_effort_levels() {
+    let (_t, svc, ws) = setup().await;
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                    "effortLevels": ["low", "high"] }),
+            json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie" }),
+        ],
+        crate::model_catalog::ModelCatalogCache::now_ms(),
+    );
+    let with_effort = |effort: &str| intent_core::AgentCreateExtra {
+        reasoning_effort: Some(effort.to_string()),
+        ..Default::default()
+    };
+    let before = svc.agent_list_op(ws.clone()).await.expect("list");
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad effort".into()),
+            Some("fable-5".into()),
+            None,
+            None,
+            None,
+            false,
+            with_effort("xhigh"),
+        )
+        .await
+        .expect_err("unsupported level must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.create: reasoningEffort xhigh is not supported by model fable-5"),
+        "unexpected err: {msg}"
+    );
+    assert!(msg.contains("low, high"), "valid values named: {msg}");
+    let after = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "rejection is side-effect free: no session persisted"
+    );
+
+    // Supported level, matched case-insensitively, persists as written.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Good effort".into()),
+            Some("fable-5".into()),
+            None,
+            None,
+            None,
+            false,
+            with_effort("HIGH"),
+        )
+        .await
+        .expect("supported level accepted");
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc.agent_get_session_op(id).await.expect("get session");
+    assert_eq!(session.reasoning_effort.as_deref(), Some("HIGH"));
+
+    // No `effortLevels` evidence on the row → pass through unvalidated.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("No evidence".into()),
+            Some("sonnet5".into()),
+            None,
+            None,
+            None,
+            false,
+            with_effort("xhigh"),
+        )
+        .await
+        .expect("evidence-free model passes through");
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc.agent_get_session_op(id).await.expect("get session");
+    assert_eq!(session.reasoning_effort.as_deref(), Some("xhigh"));
+}
+
 #[test]
 fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
     let out = r#"{ "models": [

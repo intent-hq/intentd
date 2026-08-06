@@ -2071,8 +2071,9 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // Stored as-is when non-empty (providers interpret the vocabulary —
-        // no daemon-side validation); empty/whitespace collapses to None.
+        // Empty/whitespace collapses to None (an explicit clear); a non-empty
+        // level is validated against the resolved model below, once the model
+        // resolution has settled.
         let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -2200,6 +2201,20 @@ impl Services {
                     }
                 }
             }
+        }
+        // Reasoning effort (PROTOCOL §5.5): validate the requested level
+        // against the *resolved* model's cached `effortLevels`, with the same
+        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
+        // no evidence means the value passes through, since providers own the
+        // vocabulary. Runs before the session is persisted so a `-32602`
+        // rejection is side-effect free.
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.create",
+                &self.models_catalog,
+                resolved_model.as_deref(),
+                effort,
+            )?;
         }
         let session = AgentSession {
             id,
