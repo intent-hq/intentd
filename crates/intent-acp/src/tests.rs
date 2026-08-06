@@ -4048,25 +4048,32 @@ mod mcp_bridge_tests {
 
     /// Stdio-bridge resilience (monorepo#871, monorepo#908): initial-connect
     /// retry with stdin buffering, mid-session reconnect, and synthesized
-    /// retryable errors while disconnected mid-session. `run_bridge` is driven
+    /// errors while disconnected mid-session — retryable for ids never
+    /// written to the socket, non-retryable outcome-unknown for ids already
+    /// delivered to the listener (monorepo#1530). `run_bridge` is driven
     /// with in-memory duplex streams in place of stdin/stdout and shrunk retry
     /// knobs so tests stay fast.
     mod stdio_bridge_resilience {
         use std::net::SocketAddr;
+        use std::pin::Pin;
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::task::{Context, Poll};
         use std::time::Duration;
 
         use serde_json::{json, Value};
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+        use tokio::io::{
+            AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+        };
         use tokio::net::{TcpListener, TcpStream};
         use tokio::sync::Notify;
         use tokio::task::JoinHandle;
         use tokio::time::{sleep, timeout};
 
         use crate::mcp_bridge::{
-            run_bridge, run_bridge_with, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE,
-            BRIDGE_DISCONNECTED_MESSAGE, INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
+            pump_session, run_bridge, run_bridge_with, BridgeRetryConfig, SessionEnd,
+            BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE, BRIDGE_OUTCOME_UNKNOWN_CODE,
+            BRIDGE_OUTCOME_UNKNOWN_MESSAGE, INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
         };
 
         fn fast_cfg() -> BridgeRetryConfig {
@@ -4144,6 +4151,16 @@ mod mcp_bridge_tests {
             assert_eq!(resp["error"]["code"], json!(BRIDGE_DISCONNECTED_CODE));
             assert_eq!(resp["error"]["message"], json!(BRIDGE_DISCONNECTED_MESSAGE));
             assert_eq!(resp["error"]["data"]["retryable"], json!(true));
+        }
+
+        fn assert_outcome_unknown_error(resp: &Value, id: i64) {
+            assert_eq!(resp["id"], json!(id));
+            assert_eq!(resp["error"]["code"], json!(BRIDGE_OUTCOME_UNKNOWN_CODE));
+            assert_eq!(
+                resp["error"]["message"],
+                json!(BRIDGE_OUTCOME_UNKNOWN_MESSAGE)
+            );
+            assert_eq!(resp["error"]["data"]["retryable"], json!(false));
         }
 
         /// Answer every request line on `stream` with `{"ok":true}`.
@@ -4294,10 +4311,12 @@ mod mcp_bridge_tests {
         }
 
         /// Buffered lines participate in `pending` tracking once flushed: a
-        /// TCP drop right after the flush still synthesizes the retryable
-        /// error for the buffered id (monorepo#908).
+        /// TCP drop right after the flush still synthesizes an error for the
+        /// buffered id (monorepo#908) — and since the line was delivered to
+        /// the listener, it is the non-retryable outcome-unknown error
+        /// (monorepo#1530).
         #[tokio::test]
-        async fn buffered_request_gets_retryable_error_if_tcp_drops_after_flush() {
+        async fn buffered_request_gets_outcome_unknown_error_if_tcp_drops_after_flush() {
             let addr = reserve_free_addr().await;
             let mut bridge = spawn_bridge(addr, fast_cfg());
             bridge.send_request(9).await;
@@ -4321,7 +4340,7 @@ mod mcp_bridge_tests {
             drop(write);
             drop(lines);
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 9);
+            assert_outcome_unknown_error(&resp, 9);
         }
 
         #[tokio::test]
@@ -4545,8 +4564,12 @@ mod mcp_bridge_tests {
             assert_disconnected_error(&resp, 2);
         }
 
+        /// An in-flight id delivered to the listener before the drop is
+        /// answered with the non-retryable outcome-unknown error — the
+        /// listener may have executed it, so a blind retry could double-apply
+        /// a non-idempotent call (monorepo#1530).
         #[tokio::test]
-        async fn in_flight_ids_get_retryable_error_when_connection_drops() {
+        async fn delivered_in_flight_ids_get_outcome_unknown_error_when_connection_drops() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let mut bridge = spawn_bridge(addr, fast_cfg());
@@ -4569,7 +4592,131 @@ mod mcp_bridge_tests {
             drop(lines1);
 
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 9);
+            assert_outcome_unknown_error(&resp, 9);
+        }
+
+        /// An `AsyncWrite` that forwards the first `remaining` `poll_write`
+        /// calls to `inner` and then fails, injecting a deterministic
+        /// mid-flush TCP drop. `write_line` issues two writes per line
+        /// (payload + newline), so `remaining = 2 * n` delivers exactly `n`
+        /// lines before the drop.
+        struct FailAfterWrites<W> {
+            inner: W,
+            remaining: usize,
+        }
+
+        impl<W: AsyncWrite + Unpin> AsyncWrite for FailAfterWrites<W> {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.remaining == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected tcp drop",
+                    )));
+                }
+                self.remaining -= 1;
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        /// A TCP drop *mid-flush* classifies the buffered batch precisely:
+        /// the prefix already written to the socket gets the non-retryable
+        /// outcome-unknown error, the never-written suffix keeps the
+        /// retryable disconnected error (monorepo#1530).
+        #[tokio::test]
+        async fn partial_flush_splits_outcome_unknown_from_retryable() {
+            let (tcp_write, _tcp_sink) = tokio::io::duplex(4096);
+            // Two writes per line: line 1 is delivered, line 2 hits the drop.
+            let tcp_write = FailAfterWrites {
+                inner: tcp_write,
+                remaining: 2,
+            };
+            let (_stdin_write, stdin_read) = tokio::io::duplex(4096);
+            let mut input = BufReader::new(stdin_read).lines();
+            let (mut out_write, out_read) = tokio::io::duplex(4096);
+            let buffered = vec![
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}).to_string(),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}).to_string(),
+            ];
+            let end = timeout(
+                Duration::from_secs(5),
+                pump_session(
+                    tokio::io::empty(),
+                    tcp_write,
+                    buffered,
+                    &mut input,
+                    &mut out_write,
+                ),
+            )
+            .await
+            .expect("pump_session hung")
+            .unwrap();
+            assert!(matches!(end, SessionEnd::TcpDropped));
+            drop(out_write);
+            let mut out_lines = BufReader::new(out_read).lines();
+            let mut by_id = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let line = out_lines.next_line().await.unwrap().unwrap();
+                let resp: Value = serde_json::from_str(&line).unwrap();
+                by_id.insert(resp["id"].as_i64().unwrap(), resp);
+            }
+            assert_outcome_unknown_error(&by_id[&1], 1);
+            assert_disconnected_error(&by_id[&2], 2);
+            assert_eq!(out_lines.next_line().await.unwrap(), None);
+        }
+
+        /// Notifications carry no `id` and get no synthesized response on a
+        /// drop: after a delivered notification and a delivered request, only
+        /// the request is answered.
+        #[tokio::test]
+        async fn notification_gets_no_synthesized_response_on_drop() {
+            let (tcp_write, _tcp_sink) = tokio::io::duplex(4096);
+            let (_stdin_write, stdin_read) = tokio::io::duplex(4096);
+            let mut input = BufReader::new(stdin_read).lines();
+            let (mut out_write, out_read) = tokio::io::duplex(4096);
+            let buffered = vec![
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/call"}).to_string(),
+            ];
+            // The empty TCP read side yields EOF right after the flush, so
+            // the session ends as TcpDropped with both lines delivered.
+            let end = timeout(
+                Duration::from_secs(5),
+                pump_session(
+                    tokio::io::empty(),
+                    tcp_write,
+                    buffered,
+                    &mut input,
+                    &mut out_write,
+                ),
+            )
+            .await
+            .expect("pump_session hung")
+            .unwrap();
+            assert!(matches!(end, SessionEnd::TcpDropped));
+            drop(out_write);
+            let mut out_lines = BufReader::new(out_read).lines();
+            let line = out_lines.next_line().await.unwrap().unwrap();
+            let resp: Value = serde_json::from_str(&line).unwrap();
+            assert_outcome_unknown_error(&resp, 5);
+            assert_eq!(out_lines.next_line().await.unwrap(), None);
         }
 
         #[tokio::test]
@@ -4589,6 +4736,12 @@ mod mcp_bridge_tests {
             // Kill the connection and the listener: the daemon is gone for good.
             drop(conn1);
             drop(listener);
+
+            // Let the bridge observe the drop before sending: a line racing
+            // the not-yet-noticed drop can be written to the dead socket and
+            // classified delivered (-32002) instead of exercising the gap
+            // path this test is about.
+            sleep(Duration::from_millis(50)).await;
 
             // A request during the reconnect gap gets the retryable error.
             bridge.send_request(2).await;
