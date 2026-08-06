@@ -193,8 +193,15 @@ jobs:
         if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-user-static
+          # apt lock hardening (monorepo#1515): DPkg::Lock::Timeout makes
+          # `install` wait for the dpkg locks; the retry loop covers `update`,
+          # whose lists lock has no wait option (Debian bug #1069167).
+          for i in 1 2 3; do
+            if sudo apt-get -o DPkg::Lock::Timeout=300 update -q; then break; fi
+            if [ "$i" -eq 3 ]; then exit 1; fi
+            sleep $((i * 15))
+          done
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q qemu-user-static
           qemu-aarch64-static "./staging/intentd-$TARGET/intentd" --sitter-version
       - name: Smoke test (windows)
         if: ${{ runner.os == 'Windows' }}
