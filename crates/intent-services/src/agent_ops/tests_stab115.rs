@@ -284,15 +284,31 @@ async fn agent_create_unknown_provider_falls_through_to_global() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
-/// monorepo#607 refinement: a *settings-derived* bare default that belongs to
-/// another provider's static tiers must not hard-fail `agent.create` — the
-/// caller never sent the model. It falls back to the CLI default
-/// (`session.model = None`) instead; only a client-supplied mismatch rejects.
+/// monorepo#607 refinement: a *settings-derived* bare default whose ownership
+/// by the requested provider is disproven by cached catalogs must not
+/// hard-fail `agent.create` — the caller never sent the model. It falls back
+/// to the CLI default (`session.model = None`) instead; only a
+/// client-supplied mismatch rejects.
 #[tokio::test]
 async fn agent_create_mismatched_settings_default_falls_back_to_cli_default() {
     let (_t, svc, ws, _cfg) = setup().await;
 
-    // Global default is a bare auggie static-tier model.
+    // Warm caches: auggie claims sonnet4.5, grok's catalog lacks it.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![serde_json::json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![serde_json::json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+
+    // Global default is a bare auggie model.
     set(&svc, "model.default", json!("sonnet4.5"));
 
     // Explicit grok provider, no model param: creation succeeds and the

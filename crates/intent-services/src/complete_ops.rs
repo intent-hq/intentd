@@ -25,9 +25,13 @@ impl Services {
     /// Composes an optional `system_prompt` with `prompt` in the same shape as
     /// `agent.enhancePrompt` (§5.31) and returns the cleaned CLI reply
     /// verbatim under `text`. The router pre-validates `prompt` is non-empty
-    /// and `timeout_ms` is positive. Gated on auggie being the active provider
-    /// per spec Decision 5 — when the active provider is not auggie, returns
-    /// a typed "unavailable" capability response (no error crash).
+    /// and `timeout_ms` is positive. Gated on auggie being the effective
+    /// provider per spec Decision 5 — the settings-derived default (provider
+    /// of `model.default`, else `providers.active`) must be auggie.
+    /// Unset/undecidable settings resolve the gate CLOSED (unavailable):
+    /// falling through to the first registered provider would always be
+    /// auggie and functionally reinstate the removed hardcoded default
+    /// (matches FE #759, where unset resolves disabled).
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -37,20 +41,16 @@ impl Services {
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
         // Provider neutrality gate: completion is an auggie-specific capability.
-        // When the active provider is not auggie, return a typed unavailable response
-        // so callers can degrade gracefully without an error crash.
-        let active_provider = match self.store.get_setting("providers.active").await? {
-            Some(json_str) => serde_json::from_str::<serde_json::Value>(&json_str)
-                .ok()
-                .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "auggie".to_string()),
-            None => "auggie".to_string(), // Default to auggie when setting is unset
-        };
-        if active_provider != "auggie" {
+        // When the effective provider is not auggie — including unset/undecidable
+        // settings, which resolve the gate closed rather than falling through to
+        // the first registered provider — return a typed unavailable response so
+        // callers can degrade gracefully without an error crash.
+        let effective_provider =
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if effective_provider.as_deref() != Some("auggie") {
             return Ok(json!({
                 "available": false,
-                "reason": "completeOnce requires auggie as the active provider"
+                "reason": "completeOnce requires auggie as the effective default provider"
             }));
         }
 
@@ -141,10 +141,23 @@ mod tests {
         }
     }
 
+    /// Services with a fake CLI and `providers.active = "auggie"` so the
+    /// provider gate is open: unset settings resolve the gate CLOSED
+    /// (see `complete_once_unavailable_when_settings_unset`), so op-level
+    /// tests must opt in to an auggie-active registry to reach the CLI.
     async fn services_with_bin(bin: PathBuf) -> (TempDb, Services) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let services = Services::new(store).with_auggie_bin(bin);
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+            .expect("set providers.active");
+        let services = Services::new(store)
+            .with_auggie_bin(bin)
+            .with_settings_registry(registry);
         (tmp, services)
     }
 
@@ -169,6 +182,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_once_unavailable_when_settings_unset() {
+        // Unset/undecidable provider settings resolve the gate CLOSED: falling
+        // through to the first registered provider would always be auggie and
+        // functionally reinstate the removed hardcoded default (coordinator
+        // ruling; matches FE #759 where unset resolves disabled). No registry
+        // wired → schema defaults → both `model.default` and
+        // `providers.active` unset.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services =
+            Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "available": false,
+                "reason": "completeOnce requires auggie as the effective default provider"
+            }),
+            "unset provider settings must close the gate, not fall back to the first registered provider"
+        );
     }
 
     #[cfg(unix)]
@@ -227,6 +266,10 @@ mod tests {
             crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
+        // Keep the provider gate open (unset settings resolve it closed).
+        registry
+            .apply(&[("providers.active".to_string(), json!("auggie"))])
+            .expect("set providers.active");
 
         // Case 1: context.auggiePath set and valid → use it exclusively
         registry

@@ -82,6 +82,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "voice.provider",
     "voice.language",
     "voice.openai.model",
+    "voice.workspaceVocabulary.maxTerms",
     "context.enabled",
     "context.auggiePath",
     "context.allowIndexing",

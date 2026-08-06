@@ -4,9 +4,11 @@
 use super::*;
 
 #[test]
-fn registry_default_and_lookups() {
-    assert_eq!(default_provider_id(), "auggie");
-    assert!(default_provider_config().is_default);
+fn registry_first_provider_and_lookups() {
+    // The first registered provider is a neutral positional last resort —
+    // no provider carries a privileged default designation.
+    assert_eq!(first_provider_id(), ACP_PROVIDERS[0].id);
+    assert_eq!(first_provider_config().id, first_provider_id());
     assert_eq!(
         all_provider_ids(),
         vec![
@@ -23,20 +25,20 @@ fn registry_default_and_lookups() {
         ]
     );
     assert!(find_provider("nope").is_none());
-    // Unknown ids fall back to the default provider.
-    assert_eq!(provider_config("nope").id, "auggie");
+    // Unknown ids fall back to the first registered provider.
+    assert_eq!(provider_config("nope").id, first_provider_id());
     assert_eq!(find_provider("codex").unwrap().command, "codex-acp");
 }
 
-/// Unknown provider ids still resolve to the default config (behavior
-/// unchanged), and the warn gate fires only for genuinely unknown ids —
-/// not for empty ids or legacy default aliases.
+/// Unknown provider ids still resolve to the first registered provider
+/// (behavior unchanged), and the warn gate fires only for genuinely unknown
+/// ids — not for empty ids or legacy default aliases.
 #[test]
 fn unknown_provider_fallback_warn_gate() {
     // Fallback behavior is preserved for every suppressed alias and for
     // genuinely unknown ids.
     for id in ["", "default", "acp", "augment", "nope"] {
-        assert_eq!(provider_config(id).id, default_provider_id());
+        assert_eq!(provider_config(id).id, first_provider_id());
     }
     // Genuinely unknown ids warn.
     assert!(config::warns_on_unknown_provider("nope"));
@@ -733,57 +735,7 @@ fn compound_model_id_round_trip() {
 }
 
 #[test]
-fn providers_claiming_model_matches_static_tiers_exactly() {
-    assert_eq!(providers_claiming_model("opus4.7"), vec!["auggie"]);
-    assert_eq!(providers_claiming_model("haiku"), vec!["claude-code"]);
-    assert_eq!(
-        providers_claiming_model("claude-sonnet-4-5"),
-        vec!["cortex"]
-    );
-    // Exact match only — no fuzzy/prefix matching.
-    assert!(providers_claiming_model("opus").is_empty());
-    // Unknown / dynamic-only ids claim no provider.
-    assert!(providers_claiming_model("grok-4-fast").is_empty());
-    assert!(providers_claiming_model("").is_empty());
-    // Documented caveat: claude-code's smart tier is the literal "default"
-    // sentinel, so it *is* claimed here — callers using claims as ownership
-    // proofs must special-case it.
-    assert_eq!(providers_claiming_model("default"), vec!["claude-code"]);
-}
-
-#[test]
-fn tier_table_and_resolution() {
-    assert_eq!(tiers_for("auggie").unwrap().smart, "opus4.7");
-    // Dynamic-model providers are intentionally absent.
-    assert!(tiers_for("opencode").is_none() && tiers_for("droid").is_none());
-    assert!(tiers_for("grok").is_none());
-    // Strict per-provider resolution: providers without mappings resolve to
-    // None — never another provider's model (no auggie fallback).
-    assert_eq!(
-        default_model_for_provider("opencode", ModelTier::Fast),
-        None
-    );
-    assert_eq!(
-        default_model_for_provider("codex", ModelTier::Smart),
-        Some("gpt-5.3-codex/xhigh")
-    );
-    // Tier names parse from their wire/frontmatter form; anything else is None.
-    assert_eq!(ModelTier::from_wire("smart"), Some(ModelTier::Smart));
-    assert_eq!(ModelTier::from_wire("balanced"), Some(ModelTier::Balanced));
-    assert_eq!(ModelTier::from_wire("fast"), Some(ModelTier::Fast));
-    assert_eq!(ModelTier::from_wire("high"), None);
-    assert_eq!(ModelTier::from_wire(""), None);
-
-    assert_eq!(
-        model_tier_from_model("sonnet4.5", None),
-        Some(ModelTier::Balanced)
-    );
-    assert_eq!(
-        model_tier_from_model("opus4.7", Some("auggie")),
-        Some(ModelTier::Smart)
-    );
-    assert_eq!(model_tier_from_model("nonexistent", None), None);
-
+fn model_validity_follows_compound_prefix() {
     assert!(is_model_valid_for_provider(
         "codex:gpt-5.3-codex/high",
         "codex"
@@ -797,24 +749,6 @@ fn tier_table_and_resolution() {
 
 #[test]
 fn fuzzy_and_override_resolution() {
-    // Longest normalized-prefix wins: 'sonnet' -> 'sonnet4.5' (not 'haiku4.5').
-    assert_eq!(
-        normalize_model_override("sonnet", "auggie").as_deref(),
-        Some("auggie:sonnet4.5")
-    );
-    // claude- brand prefix is stripped for normalized-exact matching.
-    assert_eq!(
-        normalize_model_override("claude-sonnet-4-5", "cortex").as_deref(),
-        Some("cortex:claude-sonnet-4-5")
-    );
-    // Already-qualified candidates pass through unchanged.
-    assert_eq!(
-        normalize_model_override("codex:foo", "auggie").as_deref(),
-        Some("codex:foo")
-    );
-    // Dynamic-model providers have no tier pool.
-    assert_eq!(normalize_model_override("sonnet", "opencode"), None);
-
     let pool = ["sonnet4.5", "sonnet4.6", "haiku4.5"];
     assert_eq!(
         fuzzy_match_model_in_pool("sonnet", &pool).as_deref(),
@@ -999,15 +933,13 @@ fn auth_error_message_remote_falls_back_to_command_login() {
     assert!(msg.contains("claude-agent-acp login"));
     assert!(msg.contains("on the remote server"));
 
-    // Unknown provider ids resolve to the default provider's message.
+    // Unknown provider ids resolve to the first registered provider's message.
     let unknown = auth_error_message("not-a-real-provider", false);
-    assert_eq!(unknown, auth_error_message("auggie", false));
+    assert_eq!(unknown, auth_error_message(first_provider_id(), false));
 }
 
 #[test]
 fn registry_invariants() {
-    // Exactly one provider is the default.
-    assert_eq!(ACP_PROVIDERS.iter().filter(|p| p.is_default).count(), 1);
     // ids are unique.
     let ids = all_provider_ids();
     let mut sorted = ids.clone();

@@ -520,9 +520,9 @@ pub(crate) async fn assemble_system_prompt(
             "## Commit Policy\n\n\
              Do not commit on your own initiative — your changes are committed \
              automatically by the system when your turn ends. When the user \
-             explicitly asks for a checkpoint commit, use `agent_commit_changes`; \
+             explicitly asks for a checkpoint commit, use `ws.git.commit`; \
              only run `git commit` yourself when the user explicitly asks for a \
-             git workflow that `agent_commit_changes` cannot express (e.g. \
+             git workflow that `ws.git.commit` cannot express (e.g. \
              multiple scoped commits on a branch)."
                 .to_string(),
         );
@@ -531,7 +531,7 @@ pub(crate) async fn assemble_system_prompt(
             "## Commit Policy\n\n\
              Auto-commit is OFF. Do not commit (including shell `git commit`) \
              unless the user explicitly asks. User-requested commits go through \
-             `agent_commit_changes` with `userRequested: true`."
+             `ws.git.commit` with `userRequested: true`."
                 .to_string(),
         );
     }
@@ -1139,8 +1139,8 @@ This is a test skill.
             "OFF-state clause should forbid commits including shell git commit"
         );
         assert!(
-            prompt.contains("`agent_commit_changes` with `userRequested: true`"),
-            "OFF-state clause should route user-requested commits through agent_commit_changes"
+            prompt.contains("`ws.git.commit` with `userRequested: true`"),
+            "OFF-state clause should route user-requested commits through ws.git.commit"
         );
         assert!(
             !prompt.contains("committed automatically by the system"),

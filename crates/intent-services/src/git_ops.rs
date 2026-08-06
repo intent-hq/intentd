@@ -31,7 +31,7 @@ const NO_DISCARD_PATHS_MSG: &str =
 
 /// TS `assertAgentCommitAllowed` rejection message (auto-commit disabled).
 const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace. \
-Use agent_commit_changes with userRequested: true if the user asked you to commit.";
+Use ws.git.commit with userRequested: true if the user asked you to commit.";
 
 /// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
 /// auto-commit is disabled, unless `user_requested` bypasses it. The gate

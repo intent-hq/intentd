@@ -103,6 +103,7 @@ pub mod tool_block;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+pub mod workspace_vocabulary;
 
 #[cfg(test)]
 mod tests;
@@ -299,6 +300,11 @@ pub struct Services {
     /// `ELEVENLABS_API_KEY` / `OPENAI_API_KEY`), surfacing a graceful
     /// "not configured" `Internal` error when no key is available.
     voice_engine: Option<Arc<dyn intent_voice::VoiceEngine>>,
+    /// Per-workspace auto-derived vocabulary cache (PROTOCOL §5.41, v4.6)
+    /// backing the `voice.transcribe` workspace-vocabulary injection and
+    /// `voice.getWorkspaceVocabulary`. Shared across clones so repeated calls
+    /// hit the same content-hash cache.
+    workspace_vocabulary: Arc<workspace_vocabulary::WorkspaceVocabularyCache>,
     /// Per-worktree async locks (`withGitWorktreeLock` parity, §9.5) so the
     /// `accept-changes.execute` commit/push path never races concurrent agents
     /// or operations on the same worktree.
@@ -610,6 +616,7 @@ impl Services {
             linear_engine: None,
             sentry_engine: None,
             voice_engine: None,
+            workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
             search_cancels: intent_search::CancelRegistry::new(),
@@ -961,6 +968,19 @@ impl Services {
             &self.secrets,
             self.settings_registry.as_deref(),
         )
+    }
+
+    /// Effective `voice.workspaceVocabulary.maxTerms` cap (PROTOCOL §5.12,
+    /// v4.6): the TOML-backed catalog entry via the settings service; a read
+    /// failure or malformed value degrades to the default — never an error.
+    async fn voice_workspace_vocabulary_max_terms(&self) -> usize {
+        let value = self
+            .settings_service()
+            .get(workspace_vocabulary::MAX_TERMS_SETTING_PATH)
+            .await
+            .ok()
+            .and_then(|v| v.get("value").cloned());
+        workspace_vocabulary::parse_max_terms_value(value.as_ref())
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -5085,8 +5105,9 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
 /// Resolve the specialist preview provider context (`specialist.get`/`.list`
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
-/// daemon's default provider.
-fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
+/// settings-derived default provider (provider of `model.default`, else
+/// `providers.active`), bottoming out at the first registered provider.
+fn specialist_preview_provider(services: &Services, provider: Option<String>) -> Result<String> {
     match nonempty_owned(provider) {
         Some(p) => {
             if intent_providers::find_provider(&p).is_none() {
@@ -5094,7 +5115,10 @@ fn specialist_preview_provider(provider: Option<String>) -> Result<String> {
             }
             Ok(p)
         }
-        None => Ok(intent_providers::default_provider_id().to_string()),
+        None => Ok(
+            agent_session::derived_default_provider(&services.effective_settings())
+                .unwrap_or_else(|| intent_providers::first_provider_id().to_string()),
+        ),
     }
 }
 
@@ -8729,7 +8753,7 @@ impl WorkspaceApi for Services {
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let provider = specialist_preview_provider(provider)?;
+            let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().list(ws_path)?;
             if let Some(specs) = result
@@ -8751,7 +8775,7 @@ impl WorkspaceApi for Services {
         provider: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let provider = specialist_preview_provider(provider)?;
+            let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().get(&id, ws_path)?;
             if let Some(def) = result.get_mut("specialist") {
@@ -17598,29 +17622,9 @@ impl WorkspaceApi for Services {
 
     // ========================================================================
     // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
-    // `SourceControl` trait (§7.5); every method requires an active PR on the
+    // `SourceControl` trait (§7.5); `pr.status` requires an active PR on the
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
-
-    fn pr_capabilities(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            // Requires a resolvable provider but NOT an active PR — the FE
-            // gates UI on the flags before any PR exists (§5.7 extension).
-            // Workspace existence is still validated so a bogus id fails like
-            // every other workspace-scoped method.
-            store.get_workspace(&workspace_id).await?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            Ok(serde_json::json!({
-                "provider": sc.provider_id(),
-                "capabilities": sc.capabilities(),
-            }))
-        })
-    }
 
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
@@ -17673,173 +17677,6 @@ impl WorkspaceApi for Services {
                 // Always an array on the wire — never null — matching the
                 // `pr:*` event payloads (§6.5).
                 "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
-            }))
-        })
-    }
-
-    fn pr_list_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        count: Option<i64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let comments = sc
-                .list_comments(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            let limit = pr_ops::clamp_count(count);
-            let comments: Vec<_> = comments.into_iter().take(limit).collect();
-            Ok(serde_json::json!({ "count": comments.len(), "comments": comments }))
-        })
-    }
-
-    fn pr_list_review_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        path: Option<String>,
-        status: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let status = pr_ops::validate_review_comment_status(status)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, number, p)).await {
-                Ok((mut threads, pages_fetched, has_more)) => {
-                    let total = threads.len() as i64;
-                    if status == "resolved" {
-                        threads.retain(|t| t.is_resolved);
-                    } else if status == "unresolved" {
-                        threads.retain(|t| !t.is_resolved);
-                    }
-                    if let Some(p) = &path {
-                        pr_ops::retain_path(&mut threads, p);
-                    }
-                    let json_threads = pr_ops::thread_list_json(&threads);
-                    Ok(serde_json::json!({
-                        "threads": json_threads,
-                        "threadCount": threads.len(),
-                        "usingFallback": false,
-                        "pagination": { "totalCount": total, "pagesFetched": pages_fetched, "hasMore": has_more },
-                        "filter": { "path": path, "status": status },
-                        "note": serde_json::Value::Null,
-                    }))
-                }
-                Err(_) => {
-                    let (comments, pages_fetched, has_more) =
-                        pr_ops::fetch_all_pages(|p| sc.list_review_comments(&repo_ref, number, p))
-                            .await
-                            .map_err(pr_ops::map_sc_err)?;
-                    let total_fetched = comments.len() as i64;
-                    let mut threads = pr_ops::fallback_threads(comments);
-                    if let Some(p) = &path {
-                        pr_ops::retain_path(&mut threads, p);
-                    }
-                    let json_threads = pr_ops::thread_list_json(&threads);
-                    let note = if status != "all" {
-                        serde_json::Value::String(
-                            "Resolved status is unavailable with REST fallback; returning all \
-                             threads regardless of the status filter."
-                                .to_string(),
-                        )
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    Ok(serde_json::json!({
-                        "threads": json_threads,
-                        "threadCount": threads.len(),
-                        "usingFallback": true,
-                        "pagination": { "totalFetched": total_fetched, "pagesFetched": pages_fetched, "hasMore": has_more },
-                        "filter": { "path": path, "status": status },
-                        "note": note,
-                    }))
-                }
-            }
-        })
-    }
-
-    fn pr_get_reviews(
-        &self,
-        workspace_id: WorkspaceId,
-        pr_number: Option<u64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = match pr_number {
-                Some(n) => n,
-                None => pr_ops::active_pr_number(&ws)?,
-            };
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let reviews = sc
-                .list_reviews(&repo_ref, number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            let agg = pr_ops::aggregate_reviews(&reviews);
-            Ok(serde_json::json!({
-                "reviewDecision": agg.review_decision,
-                "approvalCount": agg.approval_count,
-                "changesRequestedCount": agg.changes_requested_count,
-                "approvedBy": agg.approved_by,
-                "reviews": reviews,
-            }))
-        })
-    }
-
-    fn pr_list_check_runs(
-        &self,
-        workspace_id: WorkspaceId,
-        git_ref: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            pr_ops::require_capability(sc.capabilities().check_runs, "check runs")?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let git_ref = match git_ref {
-                Some(r) => r,
-                None => {
-                    let pr = sc
-                        .get_pr(&repo_ref, number)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                    pr.head_sha
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| Some(pr.source_branch).filter(|s| !s.is_empty()))
-                        .ok_or_else(|| {
-                            Error::Internal("Could not determine PR head commit".to_string())
-                        })?
-                }
-            };
-            let runs = sc
-                .check_runs(&repo_ref, &git_ref)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            let s = pr_ops::summarize_check_runs(&runs);
-            Ok(serde_json::json!({
-                "total": s.total,
-                "passed": s.passed,
-                "failed": s.failed,
-                "pending": s.pending,
-                "runs": runs,
             }))
         })
     }
@@ -17968,262 +17805,6 @@ impl WorkspaceApi for Services {
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))
-        })
-    }
-
-    // ------------------------------------------------------------------------
-    // pr.* write/action surface (PROTOCOL §5.7). Same active-PR enforcement as
-    // the read methods; validation/poll glue lives in `pr_ops`.
-    // ------------------------------------------------------------------------
-
-    fn pr_merge(
-        &self,
-        workspace_id: WorkspaceId,
-        merge_method: Option<String>,
-        commit_title: Option<String>,
-        commit_message: Option<String>,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws_scope = workspace_id.0.clone();
-            let op_store = store.clone();
-            with_idempotency(
-                &store,
-                &ws_scope,
-                idempotency_key,
-                "pr.merge",
-                move || async move {
-                    let store = op_store;
-                    let method = pr_ops::validate_merge_method(merge_method)?;
-                    let ws = load_ws_for_pr(&store, &workspace_id).await?;
-                    let (owner, repo) = pr_ops::repo_of(&ws)?;
-                    let number = pr_ops::active_pr_number(&ws)?;
-                    let sc = pr_ops::resolve_source_control(injected).await?;
-                    let caps = sc.capabilities();
-                    match method {
-                        intent_sourcecontrol::MergeMethod::Squash => {
-                            pr_ops::require_capability(caps.squash_merge, "squash merge")?
-                        }
-                        intent_sourcecontrol::MergeMethod::Rebase => {
-                            pr_ops::require_capability(caps.rebase_merge, "rebase merge")?
-                        }
-                        intent_sourcecontrol::MergeMethod::Merge => {}
-                    }
-                    let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-                    let pr = sc
-                        .get_pr(&repo_ref, number)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                    let state = pr_ops::derive_status_state(&pr);
-                    if state == "draft" {
-                        return Err(Error::Internal(format!(
-                    "PR #{number} is a draft and cannot be merged. GitHub blocks merging draft \
-                     PRs. Mark the PR as \"Ready for review\" first using the GitHub UI or API."
-                )));
-                    }
-                    if state != "open" {
-                        return Err(Error::Internal(format!(
-                            "PR #{number} is {state} and cannot be merged."
-                        )));
-                    }
-                    if pr.mergeable == Some(false) {
-                        return Err(Error::Internal(format!(
-                    "PR #{number} is not mergeable. This could be due to merge conflicts, failing \
-                     required checks, or missing required reviews. Please resolve the issues \
-                     before attempting to merge."
-                )));
-                    }
-                    let outcome = sc
-                        .merge_pr(
-                            &repo_ref,
-                            number,
-                            method,
-                            intent_sourcecontrol::MergeOptions {
-                                commit_title,
-                                commit_message,
-                            },
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                    if !outcome.merged {
-                        return Err(Error::Internal(format!(
-                            "Failed to merge PR #{number}: {}",
-                            outcome.message
-                        )));
-                    }
-                    Ok(serde_json::json!({
-                        "merged": true,
-                        "sha": outcome.sha,
-                        "mergeMethod": pr_ops::merge_method_word(method),
-                        "message": outcome.message,
-                        "prNumber": number,
-                    }))
-                },
-            )
-            .await
-        })
-    }
-
-    fn pr_update_branch(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc.update_branch(&repo_ref, number).await {
-                // URL revisit (§7.6): the forge `update_branch` returns no URL,
-                // so mirror the TS `result.url ?? null` by surfacing the PR URL
-                // now persisted on the workspace (`null` when not yet linked).
-                Ok(()) => Ok(serde_json::json!({
-                    "method": "merge",
-                    "alreadyUpToDate": false,
-                    "message": "PR branch updated from the base branch.",
-                    "url": ws.pr_url.clone(),
-                })),
-                Err(e) => {
-                    let msg = e.to_string();
-                    let lower = msg.to_lowercase();
-                    if lower.contains("already up-to-date") || lower.contains("already up to date")
-                    {
-                        Ok(serde_json::json!({
-                            "method": "merge",
-                            "alreadyUpToDate": true,
-                            "message": "PR branch is already up-to-date with the base branch.",
-                            "url": serde_json::Value::Null,
-                        }))
-                    } else if lower.contains("merge conflict") {
-                        Err(Error::Internal(format!(
-                            "Cannot update PR branch: merge conflicts detected. The conflicts must \
-                             be resolved manually.\n{msg}"
-                        )))
-                    } else {
-                        Err(Error::Internal(format!(
-                            "Failed to update PR branch: {msg}"
-                        )))
-                    }
-                }
-            }
-        })
-    }
-
-    fn pr_post_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let comment = sc
-                .add_comment(&repo_ref, number, &body, None)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({
-                "id": comment.id,
-                "htmlUrl": comment.url,
-            }))
-        })
-    }
-
-    fn pr_reply_to_review_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        comment_id: u64,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let reply = sc
-                .reply_to_review_comment(&repo_ref, number, comment_id, &body)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({
-                "id": reply.id,
-                "htmlUrl": reply.url,
-            }))
-        })
-    }
-
-    fn pr_resolve_thread(
-        &self,
-        workspace_id: WorkspaceId,
-        thread_id: String,
-        action: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let action = pr_ops::validate_resolve_action(action)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Active-PR enforcement (TS `requirePrContext`) even though the
-            // forge call keys off the thread id alone.
-            let _ = pr_ops::repo_of(&ws)?;
-            let _ = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            let success = if action == "unresolve" {
-                sc.unresolve_thread(&thread_id).await
-            } else {
-                sc.resolve_thread(&thread_id).await
-            }
-            .map_err(pr_ops::map_sc_err)?;
-            if !success {
-                return Err(Error::Internal(format!(
-                    "Failed to {action} thread. The operation may have failed silently."
-                )));
-            }
-            Ok(serde_json::json!({
-                "ok": true,
-                "threadId": thread_id,
-                "action": action,
-            }))
-        })
-    }
-
-    fn pr_create_review(
-        &self,
-        workspace_id: WorkspaceId,
-        verdict: String,
-        body: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let injected = self.source_control.clone();
-        Box::pin(async move {
-            let verdict = pr_ops::validate_review_verdict(&verdict)?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
-            let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
-            if verdict == intent_sourcecontrol::ReviewVerdict::RequestChanges {
-                pr_ops::require_capability(
-                    sc.capabilities().review_required_changes,
-                    "request-changes review",
-                )?;
-            }
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            let review = sc
-                .submit_review(&repo_ref, number, verdict, body)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            Ok(serde_json::json!({ "review": review }))
         })
     }
 
@@ -19334,6 +18915,7 @@ impl WorkspaceApi for Services {
         params: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.voice_engine.clone();
+        let vocab_cache = self.workspace_vocabulary.clone();
         Box::pin(async move {
             let parsed = voice_ops::parse_request(&params)?;
             // Provider: per-call override, else the `voice.provider` setting.
@@ -19373,8 +18955,26 @@ impl WorkspaceApi for Services {
                 parsed.language.as_deref(),
                 language_setting.as_deref(),
             );
+            // Workspace vocabulary (PROTOCOL §5.41, v4.6): a present
+            // `workspaceId` opts into auto-derived term injection. Tolerant
+            // by design — an unknown or stale id yields no terms (the cache
+            // degrades to empty), never an error.
+            let workspace_terms = match &parsed.workspace_id {
+                Some(ws_id) => {
+                    let max_terms = self.voice_workspace_vocabulary_max_terms().await;
+                    vocab_cache
+                        .vocabulary_with_max_terms(
+                            &self.store,
+                            &WorkspaceId::from(ws_id.as_str()),
+                            max_terms,
+                        )
+                        .await
+                }
+                None => Vec::new(),
+            };
             let engine = voice_ops::resolve_engine(injected, provider, openai_model).await?;
-            let request = voice_ops::build_engine_request(&parsed, &vocabulary, language);
+            let request =
+                voice_ops::build_engine_request(&parsed, &vocabulary, &workspace_terms, language);
             let transcript = engine
                 .transcribe(request)
                 .await
@@ -19384,6 +18984,24 @@ impl WorkspaceApi for Services {
                 "provider": engine.provider_name(),
                 "durationMs": transcript.duration_ms,
             }))
+        })
+    }
+
+    fn voice_get_workspace_vocabulary(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let vocab_cache = self.workspace_vocabulary.clone();
+        Box::pin(async move {
+            // Unlike the tolerant `workspaceId?` on `voice.transcribe`, the
+            // param here is required and validated: an unknown workspace is
+            // the standard not-found error (PROTOCOL §5.41, v4.6).
+            self.store.get_workspace(&workspace_id).await?;
+            let max_terms = self.voice_workspace_vocabulary_max_terms().await;
+            let terms = vocab_cache
+                .vocabulary_with_max_terms(&self.store, &workspace_id, max_terms)
+                .await;
+            Ok(serde_json::json!({ "terms": terms }))
         })
     }
 

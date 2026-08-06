@@ -137,7 +137,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — working-tree status, stage, commit helpers
+  ws.git.* — git.commit = attributed commit helper
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
@@ -146,7 +146,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -224,12 +224,9 @@ API:
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
-  ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
-  ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
-  ws.git.commit(message) → { ok, hash?, files? }  // DEPRECATED. Prefer `ws.git.agentCommit()`. This commits already-staged files and still obeys workspace auto-commit policy.
-  ws.git.agentCommit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // Preferred commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
+  ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
-  ws.git.checkMergeConflicts(targetBranch?) → { hasConflicts, conflictedFiles, targetBranch, currentBranch, ... }  // Checks whether merging into target would conflict.
+    For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
   ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
@@ -279,16 +276,9 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -339,7 +329,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — working-tree status, stage, commit helpers
+  ws.git.* — git.commit = attributed commit helper
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
@@ -347,7 +337,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -446,12 +436,9 @@ API:
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
-  ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
-  ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
-  ws.git.commit(message) → { ok, hash?, files? }  // DEPRECATED. Prefer `ws.git.agentCommit()`. This commits already-staged files and still obeys workspace auto-commit policy.
-  ws.git.agentCommit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // Preferred commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
+  ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
-  ws.git.checkMergeConflicts(targetBranch?) → { hasConflicts, conflictedFiles, targetBranch, currentBranch, ... }  // Checks whether merging into target would conflict.
+    For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
   ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
@@ -499,16 +486,9 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -1495,13 +1475,13 @@ mod tests {
             for kept in [
                 "ws.note.read(",
                 "ws.task.updateStatus(",
-                "ws.git.status(",
+                "ws.git.commit(",
                 "ws.file.read(",
                 "ws.crossWorkspace.listSiblings(",
                 "ws.agent.create(",
                 "ws.agent.reportToParent(",
                 "ws.event.subscribe(",
-                "ws.pr.status(",
+                "ws.pr.snapshot(",
             ] {
                 assert!(
                     pruned.contains(kept),

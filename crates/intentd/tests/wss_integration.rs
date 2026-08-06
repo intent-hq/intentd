@@ -159,7 +159,13 @@ fn test_tempdir(prefix: &str) -> tempfile::TempDir {
 async fn make_services(
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
-) -> (Arc<dyn WorkspaceApi>, EventBus, Store, tempfile::TempDir) {
+) -> (
+    Arc<dyn WorkspaceApi>,
+    EventBus,
+    Store,
+    Arc<intent_services::SettingsRegistry>,
+    tempfile::TempDir,
+) {
     let dir = test_tempdir("intentd-wss-");
     let store = Store::open(&dir.path().join("intentd.db"))
         .await
@@ -167,9 +173,14 @@ async fn make_services(
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
     let mut services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry.clone())
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
@@ -178,7 +189,7 @@ async fn make_services(
         services = services.with_models_cache_dir(cache_dir);
     }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
-    (api, bus, store, dir)
+    (api, bus, store, registry, dir)
 }
 
 /// A started WSS listener plus everything a test client needs (the API/bus are
@@ -190,7 +201,18 @@ struct Server {
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
     store: Store,
+    registry: Arc<intent_services::SettingsRegistry>,
     _dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// Seed a TOML-backed setting through the wired registry (the source
+    /// `Services::effective_settings` reads).
+    fn set_setting(&self, path: &str, value: Value) {
+        self.registry
+            .apply(&[(path.to_string(), value)])
+            .expect("apply setting");
+    }
 }
 
 /// Build + start a WSS listener with the given options on a free base port.
@@ -211,7 +233,7 @@ async fn start_with_auggie_and_models_cache(
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
 ) -> Server {
-    let (api, bus, store, dir) = make_services(auggie_bin, models_cache_dir).await;
+    let (api, bus, store, registry, dir) = make_services(auggie_bin, models_cache_dir).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -231,6 +253,7 @@ async fn start_with_auggie_and_models_cache(
         api,
         bus,
         store,
+        registry,
         _dir: dir,
     }
 }
@@ -356,7 +379,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "4.5",
+        sess[0]["result"]["protocolVersion"], "5.1",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1158,15 +1181,44 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     srv.ws.stop().await;
 }
 
-/// Regression for monorepo#607 over the real WSS wire: a bare model id
-/// provably owned by another provider's static tiers is rejected with the
+/// Regression for monorepo#607 over the real WSS wire: a bare model id whose
+/// ownership by the requested provider is disproven by cached catalogs
+/// (seeded through the persisted models-cache file) is rejected with the
 /// exact `-32602` JSON-RPC error envelope on both `agent.create` (explicit
 /// mismatched `provider`) and `agent.setModel` (session's effective
 /// provider), no session row / model mutation persists, and a bare id
-/// unknown to every static tier still passes (dynamic-model lists).
+/// unknown to every cached catalog still passes.
 #[tokio::test]
 async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
-    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-bare-mismatch-");
+    // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
+    // version key must match each provider's current one ("" — no pin).
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
+            },
+            "grok": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1178,8 +1230,9 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
         .expect("workspace id")
         .to_string();
 
-    // Incident-shaped create: explicit `provider: "grok"` + a bare auggie
-    // static-tier model → -32602 naming model, provider, and owner.
+    // Incident-shaped create: explicit `provider: "grok"` + a bare model
+    // claimed by auggie's cached catalog and absent from grok's → -32602
+    // naming model, provider, and owner.
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"grok","model":"sonnet4.5"}}}}"#
     );
@@ -1216,20 +1269,20 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
         "no session row may persist after the rejection: {listed}"
     );
 
-    // A bare id unknown to every static tier passes for the same provider
-    // (grok's model list is dynamic-only; ownership cannot be proven).
+    // A bare id unknown to every cached catalog passes for the same
+    // provider (ownership cannot be proven).
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good","provider":"grok","model":"grok-4-fast"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good","provider":"grok","model":"grok-9-experimental"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(
         created["result"]["agent"]["model"],
-        Value::from("grok-4-fast"),
+        Value::from("grok-9-experimental"),
         "unknown-to-all bare id must pass: {created}"
     );
 
     // An auggie session (compound-prefix derived provider) rejects a bare
-    // claude-code model via agent.setModel with the same envelope shape…
+    // grok-claimed model via agent.setModel with the same envelope shape…
     let frame = format!(
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Auggie","model":"auggie:sonnet4.5"}}}}"#
     );
@@ -1239,7 +1292,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
         .expect("agent id")
         .to_string();
     let set_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"haiku"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast"}}}}"#
     );
     let rejected = wss_call(srv.port, srv.cfg.clone(), &set_frame).await;
     assert_eq!(
@@ -1249,11 +1302,11 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     );
     let msg = rejected["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains("agent.setModel: model haiku does not belong to provider auggie"),
+        msg.contains("agent.setModel: model grok-4-fast does not belong to provider auggie"),
         "error must name the model and provider: {rejected}"
     );
     assert!(
-        msg.contains("claude-code"),
+        msg.contains("grok"),
         "error must name the owning provider: {rejected}"
     );
 
@@ -1858,9 +1911,9 @@ async fn wss_system_capabilities_reports_cow_supported() {
 /// `providers.catalog` (monorepo#928): no params, no workspaceId — the
 /// provider registry is compiled-in daemon data. Asserts the documented
 /// result shape: one row per `ACP_PROVIDERS` entry in registry order,
-/// `defaultProviderId`, daemon-evaluated `visible` with the raw gating
-/// fields passed through (cortex's feature code always gates —
-/// default-deny), and `modelTiers` only for static-tier providers.
+/// daemon-evaluated `visible` with the raw gating fields passed through
+/// (cortex's feature code always gates — default-deny), and no default
+/// designation or tier metadata anywhere in the payload.
 #[tokio::test]
 async fn wss_providers_catalog_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -1874,10 +1927,10 @@ async fn wss_providers_catalog_round_trip() {
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 1);
     let result = resp["result"].as_object().expect("result is an object");
-    assert_eq!(
-        result["defaultProviderId"].as_str(),
-        Some("auggie"),
-        "defaultProviderId mirrors the registry's is_default entry: {resp}"
+    // No privileged provider: the payload carries no defaultProviderId.
+    assert!(
+        result.get("defaultProviderId").is_none(),
+        "catalog must not carry defaultProviderId: {resp}"
     );
 
     let providers = result["providers"].as_array().expect("providers array");
@@ -1902,14 +1955,25 @@ async fn wss_providers_catalog_round_trip() {
         "one row per registry entry, registry order: {resp}"
     );
 
-    // Row shape: required fields present on every row.
+    // Row shape: required fields present on every row; no per-row default
+    // designation or tier metadata.
     for p in providers {
         for field in ["displayName", "shortName", "command"] {
             assert!(p[field].is_string(), "{field} on {}: {resp}", p["id"]);
         }
-        for field in ["isDefault", "canBeDisabled", "visible"] {
+        for field in ["canBeDisabled", "visible"] {
             assert!(p[field].is_boolean(), "{field} on {}: {resp}", p["id"]);
         }
+        assert!(
+            p.get("isDefault").is_none(),
+            "row must not carry isDefault on {}: {resp}",
+            p["id"]
+        );
+        assert!(
+            p.get("modelTiers").is_none(),
+            "row must not carry modelTiers on {}: {resp}",
+            p["id"]
+        );
     }
 
     // Gating: cortex's feature code always gates (the daemon stores no
@@ -1922,7 +1986,6 @@ async fn wss_providers_catalog_round_trip() {
     let auggie = &providers[0];
     assert_eq!(auggie["shortName"], "Auggie");
     assert_eq!(auggie["visible"], Value::Bool(true));
-    assert_eq!(auggie["isDefault"], Value::Bool(true));
 
     // mock's env-var gate passes the raw field through regardless of the
     // daemon environment.
@@ -1931,31 +1994,6 @@ async fn wss_providers_catalog_round_trip() {
         mock["requiresEnvVar"].as_str(),
         Some("MOCK_AGENT_SCRIPT_PATH")
     );
-
-    // modelTiers: present with all three tiers for static-tier providers,
-    // omitted for dynamic-model providers.
-    for idx in [0usize, 1, 2, 3] {
-        let tiers = &providers[idx]["modelTiers"];
-        assert!(
-            tiers.is_object(),
-            "modelTiers on {}: {resp}",
-            providers[idx]["id"]
-        );
-        for tier in ["fast", "balanced", "smart"] {
-            assert!(
-                tiers[tier].is_string(),
-                "modelTiers.{tier} on {}: {resp}",
-                providers[idx]["id"]
-            );
-        }
-    }
-    for idx in [4usize, 5, 6, 7, 8, 9] {
-        assert!(
-            providers[idx].get("modelTiers").is_none(),
-            "dynamic-model provider {} must omit modelTiers: {resp}",
-            providers[idx]["id"]
-        );
-    }
 
     srv.ws.stop().await;
 }
@@ -2125,9 +2163,11 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     BufReader::new(rd).read_line(&mut line).await.unwrap();
     let uds_resp: Value = serde_json::from_str(line.trim()).unwrap();
 
+    // The list may be empty when no auggie CLI is available (no static
+    // fallback catalog remains) — the parity contract is the point here.
     assert!(
-        !wss_resp["result"]["models"].as_array().unwrap().is_empty(),
-        "models must be non-empty"
+        wss_resp["result"]["models"].is_array(),
+        "models must be an array: {wss_resp}"
     );
     assert_eq!(
         wss_resp["result"], uds_resp["result"],
@@ -2143,14 +2183,14 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
 #[tokio::test]
 async fn wss_models_list_returns_catalog_with_source() {
     // models.list (§5.30): the rich FE model catalog — `{ models, source }`
-    // where `source` is "auggie" (live CLI) or "static" (tier fallback), and
-    // every row carries the id/name/provider triple; never empty.
+    // where `source` is "auggie" (live CLI) or "static" (empty fallback —
+    // no static tier catalog remains), and every row present carries the
+    // id/name/provider triple.
     let srv = start(WsOptions::default()).await;
     let frame = r#"{"jsonrpc":"2.0","id":7,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 7);
     let models = resp["result"]["models"].as_array().expect("models array");
-    assert!(!models.is_empty(), "catalog must never be empty");
     for m in models {
         assert!(m["id"].is_string(), "{m}");
         assert!(m["name"].is_string(), "{m}");
@@ -2444,9 +2484,9 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
 #[tokio::test]
 async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
-    // through the generic cache. Unknown providers degrade to the static
-    // fallback (`source: "static"` + warning, never an error); cortex is
-    // feature-code gated (empty list + warning under its own source tag).
+    // through the generic cache. Unknown providers degrade to the empty
+    // static fallback (`source: "static"` + warning, never an error); cortex
+    // is feature-code gated (empty list + warning under its own source tag).
     let srv = start(WsOptions::default()).await;
 
     let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
@@ -2511,18 +2551,16 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
 
     // Legacy path with only `forceRefresh` (no providerId): still routes and
     // keeps the legacy shape. On a fresh daemon there is no last-good cache
-    // entry, so a failed forced probe degrades straight to the static catalog
-    // — exactly `{ models, source }`, no providerId/stale/warning fields.
+    // entry, so a failed forced probe degrades straight to the empty static
+    // fallback — exactly `{ models, source }`, no providerId/stale/warning
+    // fields.
     let frame =
         r#"{"jsonrpc":"2.0","id":10,"method":"models.list","params":{"forceRefresh":true}}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 10);
     assert!(resp.get("error").is_none(), "{resp}");
-    assert!(!resp["result"]["models"]
-        .as_array()
-        .expect("models")
-        .is_empty());
+    assert!(resp["result"]["models"].is_array(), "{resp}");
     let source = resp["result"]["source"].as_str().expect("source");
     assert!(source == "auggie" || source == "static", "source: {source}");
     let mut keys: Vec<_> = resp["result"]
@@ -2610,12 +2648,13 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
             .unwrap_or(0)
     };
 
-    // Cold read: the probe runs (and fails) → static catalog, legacy shape.
+    // Cold read: the probe runs (and fails) → empty static fallback, legacy
+    // shape.
     let frame = r#"{"jsonrpc":"2.0","id":40,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 40);
     assert_eq!(resp["result"]["source"], "static");
-    assert!(!resp["result"]["models"]
+    assert!(resp["result"]["models"]
         .as_array()
         .expect("models")
         .is_empty());
@@ -2731,10 +2770,7 @@ async fn wss_agent_enhance_prompt_round_trip() {
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
     // Provider-neutrality: set auggie as active provider (these operations are auggie-specific).
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -2777,10 +2813,7 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
         "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.store
-        .set_setting("providers.active", "\"claude-code\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2793,8 +2826,105 @@ async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "enhance-prompt requires auggie as the active provider"
+            "reason": "enhance-prompt requires auggie as the effective default provider"
         })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_unavailable_when_settings_unset() {
+    // Gate closed on unset settings: with neither `model.default` nor
+    // `providers.active` configured, the derived default is undecidable and
+    // the gate must resolve CLOSED — falling through to the first registered
+    // provider would always be auggie and functionally reinstate the removed
+    // hardcoded default (coordinator ruling; matches FE #759 where unset
+    // resolves disabled).
+    let (_auggie_dir, bin) = fake_auggie_script(
+        "unset-enhance",
+        "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":40,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 40);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "enhance-prompt requires auggie as the effective default provider"
+        }),
+        "unset provider settings resolve the gate closed, not open via the positional fallback"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_enhance_prompt_model_default_prefix_outranks_active() {
+    // Gate precedence: the effective provider derives from the `model.default`
+    // compound prefix FIRST, then `providers.active`. Both directions:
+    // a non-auggie prefix closes the gate even with auggie active, and an
+    // auggie prefix opens it even with a non-auggie active provider. An
+    // unknown prefix is not trusted — it falls through to `providers.active`.
+    let (_auggie_dir, bin) = fake_auggie_script(
+        "prefix-enhance",
+        "printf '🤖\\n<augment-enhanced-prompt>Enhanced: via prefix</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    // Direction 1: claude-code prefix outranks auggie active → gate closes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":37,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 37);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "enhance-prompt requires auggie as the effective default provider"
+        }),
+        "non-auggie model.default prefix outranks auggie providers.active"
+    );
+
+    // Direction 2: auggie prefix outranks claude-code active → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":38,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 38);
+    assert_eq!(
+        resp["result"]["enhanced"], "Enhanced: via prefix",
+        "auggie model.default prefix outranks non-auggie providers.active"
+    );
+
+    // Unknown prefix: falls through to providers.active (auggie) → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("typo:foo"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":39,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 39);
+    assert_eq!(
+        resp["result"]["enhanced"], "Enhanced: via prefix",
+        "unknown model.default prefix falls through to providers.active"
     );
     srv.ws.stop().await;
 }
@@ -2806,10 +2936,7 @@ async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // the documented -32603 parse failure (§5.31).
     let (_auggie_dir, bin) = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2834,10 +2961,7 @@ async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2891,10 +3015,7 @@ async fn wss_agent_complete_once_round_trip() {
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
 
     let resp = wss_call(
         srv.port,
@@ -2916,10 +3037,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
     // result instead of an error.
     let (_auggie_dir, bin) = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.store
-        .set_setting("providers.active", "\"claude-code\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2932,8 +3050,76 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce requires auggie as the active provider"
+            "reason": "completeOnce requires auggie as the effective default provider"
         })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_unavailable_when_settings_unset() {
+    // Gate closed on unset settings — mirror of the enhance-prompt test.
+    let (_auggie_dir, bin) = fake_auggie_script("unset-complete", "printf '🤖\\nnever-runs\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":47,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 47);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires auggie as the effective default provider"
+        }),
+        "unset provider settings resolve the gate closed, not open via the positional fallback"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
+    // Gate precedence mirror of the enhance-prompt test: `model.default`
+    // compound prefix outranks `providers.active` in both directions.
+    let (_auggie_dir, bin) = fake_auggie_script("prefix-complete", "printf '🤖\\nvia-prefix\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    // Direction 1: claude-code prefix outranks auggie active → gate closes.
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":45,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 45);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires auggie as the effective default provider"
+        }),
+        "non-auggie model.default prefix outranks auggie providers.active"
+    );
+
+    // Direction 2: auggie prefix outranks claude-code active → gate passes.
+    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":46,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 46);
+    assert_eq!(
+        resp["result"]["text"], "via-prefix",
+        "auggie model.default prefix outranks non-auggie providers.active"
     );
     srv.ws.stop().await;
 }
@@ -2947,10 +3133,7 @@ async fn wss_agent_complete_once_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2971,10 +3154,7 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // failure, no session/agent state is leaked.
     let (_auggie_dir, bin) = fake_auggie_script("complete-slow", "sleep 30");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.store
-        .set_setting("providers.active", "\"auggie\"")
-        .await
-        .expect("set active provider");
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3075,7 +3255,7 @@ async fn bind_fails_fast_on_occupied_port() {
     // to avoid TOCTOU (no free_port() release-then-rebind window).
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let base = _hog.local_addr().unwrap().port();
-    let (api, bus, _store, dir) = make_services(None, None).await;
+    let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -3109,7 +3289,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // header and complete a JSON-RPC round-trip. The listener's `fingerprint()`
     // is `None` and `is_insecure()` reports `true` so `system.status` surfaces
     // the real posture.
-    let (api, bus, _store, _dir) = make_services(None, None).await;
+    let (api, bus, _store, _registry, _dir) = make_services(None, None).await;
     let opts = WsOptions {
         base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
@@ -3159,7 +3339,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
     // walking), so that exogenous contention surfaces as `AddrInUse`. Retry the
     // whole scenario on a fresh port within a bounded number of attempts
     // (monorepo#466); any non-`AddrInUse` error still fails immediately.
-    let (api, bus, _store, dir) = make_services(None, None).await;
+    let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();

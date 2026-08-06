@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
-use crate::agent_session::agent_actor;
+use crate::agent_session::{agent_actor, InterruptReason, InterruptedBy};
 use crate::events::EventBus;
 use crate::Services;
 
@@ -2369,7 +2369,8 @@ impl AgentManager {
         }
         // Spell the rename tool the way this session's provider surfaces it;
         // a failed session lookup falls back to the generic phrasing.
-        let configured_default = self.services.effective_settings().providers.active;
+        let configured_default =
+            crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let tool_ref = match self.services.store.get_agent_session(agent_id).await {
             Ok(s) => workspace_naming_tool_reference(&session_provider_id(
                 &s,
@@ -2637,7 +2638,12 @@ impl AgentManager {
         }
         if let Some(live) = partial_turn {
             self.services
-                .flush_partial_turn_on_interruption(agent_id, live, false)
+                .flush_partial_turn_on_interruption(
+                    agent_id,
+                    live,
+                    InterruptReason::AgentStopped,
+                    None,
+                )
                 .await;
         }
         // Drop any pending recreate/prepend flags: the next spawn re-decides
@@ -2668,20 +2674,36 @@ impl AgentManager {
     /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
     /// whether an agent was found.
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
-        self.interrupt_inner(agent_id, false).await
+        self.interrupt_inner(agent_id, InterruptReason::UserStop, None)
+            .await
+            .0
     }
 
-    /// Shared body of [`AgentManager::interrupt`] with one extra knob:
-    /// `suppress_idle_emit` skips the STAB-28 synthetic `agent:idle`
-    /// (reason: `interrupted`) emit. The only caller passing `true` is
-    /// [`AgentManager::interrupt_send_message`] — an interrupt that carries a
-    /// follow-up message is a preemption, not a settlement: the child is about
-    /// to run the interrupt turn, so waking completion watches here would
-    /// deliver a spurious "child settled" report to the parent. The plain
-    /// `interrupt()` / `agent.stop` keep-alive path passes `false` so STAB-28
-    /// behavior (watches fire on interrupt) is preserved. `agent:stream:end`
-    /// is emitted unconditionally in both paths.
-    async fn interrupt_inner(&self, agent_id: &AgentId, suppress_idle_emit: bool) -> bool {
+    /// Shared body of [`AgentManager::interrupt`], parameterized on the
+    /// interruption cause. `reason` (+ `interrupted_by` sender attribution for
+    /// message preemption) is stamped on the persisted interrupted row and the
+    /// terminal `agent:stream:end` payload. A `PreemptedByMessage` reason also
+    /// skips the STAB-28 synthetic `agent:idle` (reason: `interrupted`) emit —
+    /// the only caller passing it is [`AgentManager::preempt_busy_turn`]: an
+    /// interrupt that carries a follow-up message is a preemption, not a
+    /// settlement: the child is about to run the interrupt turn, so waking
+    /// completion watches here would deliver a spurious "child settled" report
+    /// to the parent. The plain `interrupt()` / `agent.stop` keep-alive path
+    /// passes `UserStop` so STAB-28 behavior (watches fire on interrupt) is
+    /// preserved. `agent:stream:end` is emitted unconditionally in both paths.
+    ///
+    /// Returns `(agent_found, interrupted_row_message_id)` — the second field
+    /// names the interrupted assistant row this call persisted (`None` when
+    /// no live-turn slot was open or the call fell back to the kill path), so
+    /// `preempt_busy_turn` can exclude that row from its combined-delivery
+    /// re-queue check.
+    async fn interrupt_inner(
+        &self,
+        agent_id: &AgentId,
+        reason: InterruptReason,
+        interrupted_by: Option<InterruptedBy>,
+    ) -> (bool, Option<String>) {
+        let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
         let conn = self
@@ -2693,7 +2715,7 @@ impl AgentManager {
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
-            return self.stop(agent_id).await;
+            return (self.stop(agent_id).await, None);
         };
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
@@ -2701,7 +2723,7 @@ impl AgentManager {
         let session = self.services.store.get_agent_session(agent_id).await.ok();
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
-            return self.stop(agent_id).await;
+            return (self.stop(agent_id).await, None);
         };
         // Snapshot the live-turn slot BEFORE aborting the worker: the abort
         // drops the worker future and with it the LiveTurnGuard, which clears
@@ -2714,15 +2736,20 @@ impl AgentManager {
             worker.abort();
         }
         // Persist the streamed-so-far assistant content as an interrupted
-        // assistant row. Runs AFTER the abort (a worker append already in
-        // flight can still land, but the `agent_message.id` PK keeps the
-        // outcome convergent — the flush absorbs the UNIQUE collision) and
-        // BEFORE the terminal `agent:stream:end` emit below so the
-        // chat-channel terminal reconcile sees the persisted row and keeps
-        // the blocks instead of removing them. Only the plain `agent.stop`
-        // path (`!suppress_idle_emit`) opts into persisting an EMPTY row for
-        // a pre-first-token stop — the STAB-114 zero-output combined delivery
-        // in `interrupt_send_message` must never see a phantom row.
+        // assistant row, stamped with the interruption reason (+ sender
+        // attribution on preemption). Runs AFTER the abort (a worker append
+        // already in flight can still land, but the `agent_message.id` PK
+        // keeps the outcome convergent — the flush absorbs the UNIQUE
+        // collision) and BEFORE the terminal `agent:stream:end` emit below so
+        // the chat-channel terminal reconcile sees the persisted row and
+        // keeps the blocks instead of removing them. The row persists even
+        // when nothing streamed yet (empty blocks) — EVERY interruption
+        // leaves a durable marker row; on the message-preemption path the
+        // empty row lands BEFORE `send_message` appends the interrupting
+        // message row, so transcript order reads correctly (this supersedes
+        // the STAB-114 phantom-row-free zero-output preemption; the
+        // combined-delivery re-queue check in `preempt_busy_turn` excludes
+        // this row by id).
         let interrupted_text_blocks = partial_turn
             .as_ref()
             .map(|live| crate::agent_session::text_block_strings(&live.blocks))
@@ -2730,7 +2757,12 @@ impl AgentManager {
         let interrupted_message_id = match partial_turn {
             Some(live) => {
                 self.services
-                    .flush_partial_turn_on_interruption(agent_id, live, !suppress_idle_emit)
+                    .flush_partial_turn_on_interruption(
+                        agent_id,
+                        live,
+                        reason,
+                        interrupted_by.as_ref(),
+                    )
                     .await
             }
             None => None,
@@ -2793,10 +2825,21 @@ impl AgentManager {
         // blocks for the event to mirror; carrying undrained entries would
         // break the byte-identical persisted↔event invariant.
         if let Some(workspace_id) = workspace_id {
+            // `interruptReason`/`interruptedBy` mirror the persisted row's
+            // metadata so clients can render the reason-specific Stopped
+            // indicator live, without refetching the transcript.
             let mut end_data = json!({
                 "agentId": agent_id.0,
                 "stopReason": "interrupted",
+                "interruptReason": reason.as_str(),
             });
+            // Same reason gate as the persisted row: `interruptedBy` is
+            // defined only for message preemption.
+            if reason == InterruptReason::PreemptedByMessage {
+                if let Some(ref by) = interrupted_by {
+                    end_data["interruptedBy"] = by.to_json();
+                }
+            }
             if let Some(ref message_id) = interrupted_message_id {
                 end_data["messageId"] = json!(message_id);
             }
@@ -2859,7 +2902,7 @@ impl AgentManager {
                     .await;
             }
         }
-        true
+        (true, interrupted_message_id)
     }
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
@@ -4170,14 +4213,43 @@ impl AgentManager {
             .map(|live| !live.blocks.is_empty())
             .unwrap_or(false);
 
+        // Sender attribution for the interrupted row / `stream:end` payload:
+        // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
+        // send carries the `messageMetadata` `fromAgentId`/`fromAgentName`
+        // sender-attribution payload (PROTOCOL §5.5). Automatic sends with
+        // no attribution stamp no `interruptedBy` (reason alone suffices).
+        let interrupted_by = if options.origin.is_user() {
+            Some(InterruptedBy::User)
+        } else {
+            options.message_metadata.as_ref().and_then(|md| {
+                md.get("fromAgentId")
+                    .and_then(Value::as_str)
+                    .map(|id| InterruptedBy::Agent {
+                        agent_id: id.to_string(),
+                        name: md
+                            .get("fromAgentName")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+            })
+        };
         // Cancel the turn IMMEDIATELY to prevent it from finishing while
         // we prepare the re-queue logic below. This releases the in-flight
         // slot and aborts the draining worker. The STAB-28 synthetic
-        // `agent:idle` is suppressed: this interrupt carries a
-        // follow-up message (the child is being preempted, not
+        // `agent:idle` is suppressed (`PreemptedByMessage`): this interrupt
+        // carries a follow-up message (the child is being preempted, not
         // settling), so completion watches must not report "child
-        // settled" to the parent here.
-        self.interrupt_inner(agent_id, true).await;
+        // settled" to the parent here. The returned row id names the
+        // interrupted marker row this preemption just persisted (empty
+        // blocks on the zero-output path), excluded from the progress
+        // check below.
+        let (_, interrupted_row_id) = self
+            .interrupt_inner(
+                agent_id,
+                InterruptReason::PreemptedByMessage,
+                interrupted_by,
+            )
+            .await;
 
         if !has_output {
             // Zero-output condition: the provider dropped the preempted
@@ -4190,7 +4262,14 @@ impl AgentManager {
             // messages (assistant/tool/system) exist after the last
             // user message, the turn has already progressed and we
             // should NOT re-deliver (avoids duplicate tool calls or
-            // re-running side effects).
+            // re-running side effects). The EMPTY interrupted marker row
+            // the preemption itself just appended is NOT progress —
+            // exclude it by id, but ONLY while it is actually empty:
+            // `has_output` above is snapshotted several awaits before
+            // `interrupt_inner` re-reads the slot, so a first block
+            // streaming in that window lands in the flushed row — a
+            // NON-empty marker row IS progress and must keep blocking
+            // the combined re-delivery.
             if let Ok(messages) = self
                 .services
                 .store
@@ -4202,10 +4281,11 @@ impl AgentManager {
                         .iter()
                         .rposition(|m| m.id == last_user_msg.id)
                         .unwrap();
-                    let has_non_user_after = messages
-                        .iter()
-                        .skip(last_user_idx + 1)
-                        .any(|m| m.role != "user");
+                    let has_non_user_after = turn_progressed_after(
+                        &messages,
+                        last_user_idx,
+                        interrupted_row_id.as_ref(),
+                    );
 
                     if !has_non_user_after {
                         // Extract text from content blocks (JSON array).
@@ -4982,7 +5062,12 @@ impl AgentManager {
             // degenerate status read/encode failure never drops the content.
             if let Some(live) = partial_turn {
                 self.services
-                    .flush_partial_turn_on_interruption(id, live, false)
+                    .flush_partial_turn_on_interruption(
+                        id,
+                        live,
+                        InterruptReason::DaemonShutdown,
+                        None,
+                    )
                     .await;
             }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
@@ -5419,6 +5504,27 @@ fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
 }
 
+/// STAB-114 combined-delivery progress check (`preempt_busy_turn`): has the
+/// turn progressed past the last user message? Any non-user row after it is
+/// progress, EXCEPT the interrupted marker row the preemption itself just
+/// appended — and that exclusion applies ONLY while the marker row is
+/// actually empty. The caller's zero-output snapshot is taken several awaits
+/// before `interrupt_inner` re-reads the live-turn slot, so a first block
+/// streaming in that window lands in the flushed row: a NON-empty marker row
+/// IS progress and must keep blocking the combined re-delivery (duplicate
+/// tool-call / re-run-side-effect hazard).
+fn turn_progressed_after(
+    messages: &[intent_core::AgentMessage],
+    last_user_idx: usize,
+    interrupted_row_id: Option<&String>,
+) -> bool {
+    messages.iter().skip(last_user_idx + 1).any(|m| {
+        m.role != "user"
+            && !(Some(&m.id) == interrupted_row_id
+                && m.content.as_array().is_some_and(Vec::is_empty))
+    })
+}
+
 /// Port of the FE `contextReferences` → `stdinContext` builder
 /// (`agent-backend-handler.service.ts` — the ~3170–3248 block). Iterates the
 /// raw JSON array in order and emits one context entry per reference,
@@ -5643,11 +5749,12 @@ fn derive_agent_type(
 /// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
 /// prefix wins over `session.provider`, because a cross-provider model switch
 /// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then `configured_default` (the daemon
-/// settings `providers.active`), then the hardcoded default provider.
+/// a fallback for bare model ids, then `configured_default` (the settings-
+/// derived default — `model.default` prefix, else `providers.active`), then
+/// the first registered provider (neutral positional last resort).
 /// Delegates to [`crate::agent_session::resolve_provider_id`], which also
 /// guards against malformed compound ids like `:sonnet` (empty prefixes fall
-/// through to the provider field / configured default / default).
+/// through to the provider field / configured default / last resort).
 fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> String {
     crate::agent_session::resolve_provider_id(
         session.model.as_deref(),
@@ -5694,7 +5801,10 @@ fn resolve_spawn(
     settings: &intent_core::settings_file::SettingsFile,
     chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
-    let provider_id = session_provider_id(session, settings.providers.active.as_deref());
+    let provider_id = session_provider_id(
+        session,
+        crate::agent_session::derived_default_provider(settings).as_deref(),
+    );
     // Whitespace-bearing bare ids are persisted effective-model display names
     // (D13, e.g. `claude-code:Opus 4.8`) — stats/attribution values, not
     // spawnable model ids. They must not reach `SpawnOptions.model` (CLI
