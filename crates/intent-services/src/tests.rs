@@ -19528,9 +19528,12 @@ mod last_activity_events {
         assert_eq!(row.last_activity.as_deref(), Some(expected.as_str()));
     }
 
-    /// The persisted `lastActivity` never walks backwards: a later derivation
-    /// carrying an older timestamp is declined by the monotonic column write
-    /// (monorepo#1580).
+    /// The persisted `lastActivity` never walks backwards (monorepo#1580).
+    /// Two layers hold it: `derive_last_activity` folds the stored value into
+    /// its max, so the debounce task short-circuits rather than emitting an
+    /// older timestamp; and the store's monotonic column write is the backstop
+    /// for the narrow race where a late timer's read predates a concurrent
+    /// bump. Both are asserted here on a live services store.
     #[tokio::test]
     async fn persisted_last_activity_is_monotonic() {
         let _guard = DebounceEnvGuard::new("100");
@@ -19561,6 +19564,25 @@ mod last_activity_events {
             Some(future),
             "a stale derivation must not walk lastActivity backwards"
         );
+
+        // Backstop: an older timestamp reaching the column write directly —
+        // the shape a late timer takes when its read predated a concurrent
+        // bump — is declined, and the lite read still serves the newer value.
+        assert!(!h
+            .store
+            .bump_workspace_last_activity(&h.ws, "2026-01-01T00:00:00Z")
+            .await
+            .expect("stale bump"));
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(future));
     }
 
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`

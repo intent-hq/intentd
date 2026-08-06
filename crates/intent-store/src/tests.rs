@@ -282,9 +282,9 @@ async fn workspace_round_trip_and_archive_filter() {
 
 /// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:
 /// it writes only `last_activity` (never `updated_at` or any other column),
-/// declines a stale or equal timestamp, fills a NULL column, tolerates
-/// differing fractional-second precision, and reports `NotFound` for a
-/// missing workspace.
+/// declines a stale or equal timestamp, fills a NULL column, overwrites a
+/// malformed stored value, tolerates differing fractional-second precision,
+/// and reports `NotFound` for a missing workspace.
 #[tokio::test]
 async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
     let tmp = TempDb::new();
@@ -350,6 +350,26 @@ async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
     assert_eq!(
         store.get_workspace(&id).await.expect("get").updated_at,
         "2020-01-01T00:00:00Z"
+    );
+
+    // A malformed STORED value parses to NULL and is treated as older, so the
+    // bump repairs a corrupted column.
+    let corrupt_id = WorkspaceId::new();
+    let mut corrupt = sample_workspace(&corrupt_id, "Corrupt WS", false);
+    corrupt.last_activity = Some("not-a-timestamp".to_string());
+    store.insert_workspace(&corrupt).await.expect("insert");
+    assert!(store
+        .bump_workspace_last_activity(&corrupt_id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump over malformed stored value"));
+    assert_eq!(
+        store
+            .get_workspace(&corrupt_id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z")
     );
 
     // Missing workspace → NotFound.

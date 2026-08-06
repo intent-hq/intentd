@@ -1235,6 +1235,10 @@ impl Services {
                     // snapshot) serve a stale `lastActivity` after a restart.
                     // Scoped + monotonic: only this column moves, and an
                     // out-of-order late timer can never walk the value back.
+                    // A declined bump (a concurrent writer already persisted
+                    // something newer) still emits below — the event is a
+                    // change signal, and the concurrent task's own event
+                    // carries the newer value.
                     if let Err(e) = this
                         .store
                         .bump_workspace_last_activity(&ws_id, new_val)
