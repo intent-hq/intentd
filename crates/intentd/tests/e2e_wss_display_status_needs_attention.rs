@@ -873,10 +873,11 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
 
 /// Scenario 5 — monorepo#1266: the transcript-mutation RPCs recompute the
 /// derived `displayStatus` over the real WSS router. A question tail raises
-/// `needs_attention` (as in scenario 3); then `agent.appendMessage` with a
-/// user row supersedes the question hold and the op's own recompute emits
-/// the retire transition; then `agent.replaceMessages` swapping back to a
-/// transcript ending on the question-bearing assistant row raises it again.
+/// `needs_attention` (as in scenario 3); then `agent.appendMessage` with the
+/// ANSWER row (tagged `question_answers` for that message) resolves the
+/// question hold and the op's own recompute emits the retire transition; then
+/// `agent.replaceMessages` swapping back to an unanswered question-bearing
+/// transcript raises it again.
 #[tokio::test]
 async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     let Some(script) = gate("WSS needs_attention transcript-mutation E2E") else {
@@ -996,7 +997,10 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
         "trailing block is the question resource: {trailing}"
     );
 
-    // ---- Retire over the wire: agent.appendMessage persists a user row ----
+    // ---- Retire over the wire: agent.appendMessage persists the ANSWER row
+    // (tagged `question_answers` for the question message — a plain user row
+    // no longer resolves a pending Q&A) ----
+    let asked_id = last["id"].as_str().expect("question row id").to_string();
     let appended = wss_rpc(
         &mut rpc,
         "agent.appendMessage",
@@ -1005,6 +1009,10 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
             "agentId": agent_id,
             "role": "user",
             "contentBlocks": [{ "type": "text", "text": "deploy to staging" }],
+            "metadata": {
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            },
         }),
     )
     .await;

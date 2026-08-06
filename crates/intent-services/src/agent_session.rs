@@ -1577,6 +1577,10 @@ impl Services {
         // count as activity for the streak accounting too.
         let idle_timeout_streamed =
             prompt_idle_timeout && (any_update_received || !blocks.is_empty());
+        // Whether this turn's persisted content carries question resource
+        // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
+        // `blocks`, used for the pending-questions marker write below.
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -1590,6 +1594,16 @@ impl Services {
                 .await?;
             self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
+        }
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
+        // hold): a question-bearing assistant tail arms the hold under this
+        // turn's message id (a newer question set overwrites an older marker
+        // — single-slot). A question-FREE turn end deliberately does NOT
+        // clear the marker: pendingness survives the agent's later turns
+        // until the user answers or dismisses.
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
         }
         // The new assistant tail moves the question-hold derivation (§6.5
         // step 0): a trailing question resource block RAISES the workspace's
@@ -1905,6 +1919,7 @@ impl Services {
         }
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -1929,6 +1944,13 @@ impl Services {
             }
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
+        }
+        // Same stored-on-write pending-questions marker as the prompt-turn
+        // persist: a question-bearing wake tail arms the hold (question-free
+        // tails leave the marker untouched).
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
         }
         // Same §6.5 step-0 recompute as the prompt-turn persist: the new
         // assistant tail moves the question-hold derivation either way.

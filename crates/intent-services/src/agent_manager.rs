@@ -3526,6 +3526,18 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
+        // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
+        // `question_answers` naming the marked assistant message resolves the
+        // pending Q&A and clears the marker (a stale/foreign
+        // `answeredQuestionsMessageId` is a no-op). Runs BEFORE the
+        // displayStatus recompute so the retired hold is reflected.
+        self.services
+            .resolve_pending_questions_for_answer(
+                &workspace_id,
+                &agent_id,
+                options.message_metadata.as_ref(),
+            )
+            .await;
         // The persisted user row supersedes a pending question tail, which
         // can retire the workspace's needs_attention displayStatus (§6.5
         // step 0): recompute-and-compare.
@@ -3957,6 +3969,15 @@ impl AgentManager {
                         &message,
                         Some(entry.turn_id.as_str()),
                     ),
+                )
+                .await;
+            // Answer intake (PROTOCOL §5.5, question hold): an answer that was
+            // queued and then explicitly sent still resolves the pending Q&A.
+            self.services
+                .resolve_pending_questions_for_answer(
+                    &workspace_id,
+                    &agent_id,
+                    entry.message_metadata.as_ref(),
                 )
                 .await;
             // The persisted user row supersedes a pending question tail,
@@ -6954,6 +6975,13 @@ async fn persist_user(
             intent_core::events::AGENT_MESSAGE,
             crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
+        .await;
+    // Answer intake (PROTOCOL §5.5, question hold): same contract as the
+    // direct-send persist — a `question_answers` tag naming the marked
+    // assistant message clears the pending-questions marker; anything else is
+    // a no-op.
+    mgr.services
+        .resolve_pending_questions_for_answer(workspace_id, agent_id, message_metadata)
         .await;
     // The persisted user row supersedes a pending question tail, which can
     // retire the workspace's needs_attention displayStatus (§6.5 step 0):

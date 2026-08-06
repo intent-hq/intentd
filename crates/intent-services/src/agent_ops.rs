@@ -1155,22 +1155,54 @@ pub(crate) fn user_message_blocks(
 /// hold detection cannot drift from the binding) in a message's content-block
 /// array. Non-array content counts zero.
 pub(crate) fn question_block_count(content: &Value) -> usize {
-    content.as_array().map_or(0, |blocks| {
-        blocks
-            .iter()
-            .filter(|b| {
-                b.get("type").and_then(Value::as_str) == Some("resource")
-                    && b.pointer("/resource/mimeType").and_then(Value::as_str)
-                        == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
-            })
-            .count()
-    })
+    content
+        .as_array()
+        .map_or(0, |blocks| question_block_count_in(blocks))
+}
+
+/// [`question_block_count`] over an already-borrowed block slice, for callers
+/// holding the blocks before they are wrapped into a `Value` (the turn-end
+/// persist).
+pub(crate) fn question_block_count_in(blocks: &[Value]) -> usize {
+    blocks
+        .iter()
+        .filter(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+        .count()
 }
 
 /// `true` iff a message's content-block array carries at least one pending
 /// question resource block.
 pub(crate) fn has_question_blocks(content: &Value) -> bool {
     question_block_count(content) > 0
+}
+
+/// `messageMetadata.type` marker the FE's question wizard stamps on the
+/// flattened Q:/A: answer message (PROTOCOL §5.5, question hold). The daemon
+/// keys the pending-questions marker clear on this structured tag plus
+/// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
+pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
+
+/// Field on a `question_answers` `messageMetadata` naming the assistant
+/// message whose questions the row answers.
+pub(crate) const ANSWERED_QUESTIONS_MESSAGE_ID_FIELD: &str = "answeredQuestionsMessageId";
+
+/// The assistant message id a user row's `messageMetadata` claims to answer:
+/// `Some` only for an object tagged `type: "question_answers"` carrying a
+/// non-empty `answeredQuestionsMessageId` string. Pure; the daemon never
+/// inspects the answer text.
+pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<&str> {
+    let md = metadata?;
+    if md.get("type").and_then(Value::as_str) != Some(QUESTION_ANSWERS_METADATA_TYPE) {
+        return None;
+    }
+    md.get(ANSWERED_QUESTIONS_MESSAGE_ID_FIELD)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -2700,11 +2732,26 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
-        // The appended row can move the question-hold derivation — a user
-        // row supersedes a pending question tail (retire), an assistant row
-        // with a trailing question block raises the hold — which flips the
-        // workspace's needs_attention displayStatus (§6.5 step 0):
-        // recompute-and-compare (monorepo#1266).
+        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
+        // as the turn-end and user-send persists: an appended assistant row
+        // bearing question blocks arms the pending marker, an appended user
+        // row tagged `question_answers` for the marked message clears it.
+        if role == "assistant" && has_question_blocks(&content) {
+            self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
+                .await;
+        } else if role == "user" {
+            self.resolve_pending_questions_for_answer(
+                &session.workspace_id,
+                &agent_id,
+                metadata.as_ref(),
+            )
+            .await;
+        }
+        // The appended row can move the question-hold derivation — an answered
+        // question set retires the hold, an assistant row with a trailing
+        // question block raises it — which flips the workspace's
+        // needs_attention displayStatus (§6.5 step 0): recompute-and-compare
+        // (monorepo#1266).
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
         Ok(json!({ "success": true, "message": message }))
@@ -2802,6 +2849,12 @@ impl Services {
             json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
         )
         .await;
+        // The swap re-mints row ids, so any surviving pending-questions marker
+        // is dangling: re-derive it from the new transcript (same contract as
+        // the `agent.editAndRegenerate` truncation) before the displayStatus
+        // recompute below reads the hold.
+        self.reconcile_pending_questions_marker(&session.workspace_id, &agent_id, &inserted)
+            .await;
         // The swapped transcript can move the question-hold derivation in
         // either direction, flipping the workspace's needs_attention
         // displayStatus (§6.5 step 0): recompute-and-compare
@@ -2882,6 +2935,16 @@ impl Services {
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
+        // Question hold (PROTOCOL §5.5): truncation drops the rows the
+        // pending-questions marker may name AND re-mints ids for the kept rows
+        // (`replace_agent_messages`), so a surviving marker would be dangling
+        // — and since the hold derivation never checks that the marked row
+        // still exists, a dangling marker would wedge the hold forever. The
+        // marker is therefore explicitly RE-DERIVED from the post-truncation
+        // transcript (never tolerated as dangling). The dismissal marker keeps
+        // its existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+            .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -3329,6 +3392,16 @@ impl Services {
                     agent_message_event_payload(&agent_id, &message, None),
                 )
                 .await;
+                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // the runtime `AgentManager::send_message` persist — a
+                // `question_answers` tag naming the marked assistant message
+                // clears the pending-questions marker.
+                self.resolve_pending_questions_for_answer(
+                    &session.workspace_id,
+                    &agent_id,
+                    message_metadata.as_ref(),
+                )
+                .await;
                 // The user row supersedes a pending question tail, which can
                 // retire the workspace's needs_attention displayStatus (§6.5
                 // step 0): recompute-and-compare.
@@ -3451,6 +3524,14 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
+        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // runtime `send_queued_message_now` persist.
+        self.resolve_pending_questions_for_answer(
+            &session.workspace_id,
+            &agent_id,
+            entry.message_metadata.as_ref(),
+        )
+        .await;
         // The user row supersedes a pending question tail, which can retire
         // the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.
@@ -3459,23 +3540,47 @@ impl Services {
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
-    /// walking back from the tail of the transcript past any trailing
-    /// `system` rows (e.g. the resume-interruption marker —
-    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
-    /// continuation), the first non-system message is an assistant message
-    /// carrying at least one `application/vnd.intent.question+json` resource
-    /// block AND its id differs from the session's persisted dismissal
-    /// marker. `system` rows are transparent to the derivation — same as the
-    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
-    /// `assistant` row — so a system marker can neither supersede nor rescue
-    /// a pending Q&A. Derived, not stored: any later user/assistant message
-    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
-    /// supersedes the questions and flips the hold false;
-    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// session's persisted pending-questions marker
+    /// ([`intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY`], written at turn end
+    /// when the assistant tail bears `application/vnd.intent.question+json`
+    /// resource blocks) is set AND differs from the dismissal marker
+    /// ([`intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY`]). Stored-on-write,
+    /// so this is a bounded single-row metadata read: pendingness survives
+    /// later user messages, later agent turns, and daemon restarts, and only
+    /// an answer (`messageMetadata.type == "question_answers"` naming the
+    /// marked message), an explicit `agent.dismissQuestions`, or a NEWER
+    /// question-bearing turn resolves it.
+    ///
+    /// Pre-upgrade sessions (marker key absent entirely — the daemon never
+    /// wrote it) fall back to the legacy transcript tail walk so a hold that
+    /// was live across the upgrade is not lost: walk back from the tail past
+    /// any trailing `system` rows (e.g. the resume-interruption marker
+    /// `resume_interrupted_agent` appends BEFORE its `Automatic`
+    /// continuation) and hold when the first non-system row is an
+    /// un-dismissed question-bearing assistant message. A marker written as
+    /// the empty string is authoritative ("nothing pending") and does NOT
+    /// fall back.
+    ///
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        if session.pending_questions_marker_written() {
+            return match session.pending_questions_message_id() {
+                Some(pending) => session.dismissed_questions_message_id() != Some(pending),
+                None => false,
+            };
+        }
+        self.question_hold_active_from_tail(agent_id).await
+    }
+
+    /// Legacy transcript tail-walk hold derivation, retained as the
+    /// pre-upgrade fallback for sessions with no persisted pending-questions
+    /// marker (see [`Services::question_hold_active`]).
+    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> bool {
         // Page back over the tail, growing the window while every fetched
         // row is `system`-role, so an arbitrarily long run of trailing
         // system markers (e.g. repeated interruption notices) can never hide
@@ -3505,6 +3610,128 @@ impl Services {
             return false;
         };
         session.dismissed_questions_message_id() != Some(last.id.as_str())
+    }
+
+    /// Persist the pending-questions marker for `message_id` — the assistant
+    /// message whose just-persisted content carries question resource blocks
+    /// (called from the turn-end persist paths). Single-slot: a newer
+    /// question-bearing turn overwrites an older marker, which is exactly the
+    /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
+    /// sibling metadata keys (`dismissedQuestionsMessageId`,
+    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
+    /// and never fails the turn (the hold simply stays as it was).
+    pub(crate) async fn record_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                message_id,
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+        }
+    }
+
+    /// Clear the pending-questions marker (written as the empty string, which
+    /// reads back as "no pending questions" while still marking the session as
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
+    /// Best-effort: a failure is logged and never fails the caller.
+    pub(crate) async fn clear_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                "",
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+        }
+    }
+
+    /// Re-derive the pending-questions marker after a transcript swap that
+    /// re-mints row ids (`agent.editAndRegenerate` truncation,
+    /// `agent.replaceMessages`), where any surviving marker is by construction
+    /// dangling. `messages` is the post-swap transcript in order: the marker
+    /// becomes the id of the newest question-bearing assistant row that is not
+    /// followed by a `question_answers`-tagged user row, and clears when there
+    /// is none. Bounded — the caller already holds the (post-swap) rows.
+    pub(crate) async fn reconcile_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        messages: &[intent_core::AgentMessage],
+    ) {
+        let mut pending: Option<&str> = None;
+        for msg in messages {
+            match msg.role.as_str() {
+                "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
+                "user" if answered_questions_message_id(msg.metadata.as_ref()).is_some() => {
+                    pending = None
+                }
+                _ => {}
+            }
+        }
+        match pending {
+            Some(id) => {
+                let id = id.to_string();
+                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                    .await;
+            }
+            None => {
+                self.clear_pending_questions_marker(workspace_id, agent_id)
+                    .await
+            }
+        }
+    }
+
+    /// Resolve a just-persisted user row against the pending-questions marker:
+    /// when the row's `messageMetadata` is a `question_answers` tag naming
+    /// EXACTLY the marked message, the questions are answered and the marker
+    /// clears (releasing the hold). A missing/foreign/stale
+    /// `answeredQuestionsMessageId` — e.g. an answer for a question set a newer
+    /// turn already superseded — is a no-op, so a late answer can neither
+    /// release a newer hold nor re-arm an old one. The daemon never inspects
+    /// the answer TEXT (spec §Decisions 3).
+    ///
+    /// Returns `true` when the marker was cleared, so callers can kick the
+    /// queue drain / recompute displayStatus.
+    pub(crate) async fn resolve_pending_questions_for_answer(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_metadata: Option<&Value>,
+    ) -> bool {
+        let Some(answered) = answered_questions_message_id(message_metadata) else {
+            return false;
+        };
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        if session.pending_questions_message_id() != Some(answered) {
+            return false;
+        }
+        self.clear_pending_questions_marker(workspace_id, agent_id)
+            .await;
+        true
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker

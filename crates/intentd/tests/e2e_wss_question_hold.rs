@@ -679,10 +679,12 @@ fn dismissal_metadata(dismissed_mid: &str) -> Value {
 ///    — spec §Decisions: interrupts are held too, no exceptions), and NO
 ///    user row reaches the asker's transcript. `agent:queue:updated` carries
 ///    the held snapshot in interrupt-first order.
-/// 3. The user answers via `agent.sendMessage` — user origin is NEVER held:
-///    the answer delivers immediately (`queued: false`), the hold flips
-///    false, and the queue drains interrupt-first: transcript order is
-///    answer → urgent → normal, queue empty at the end.
+/// 3. The user answers via `agent.sendMessage`, tagged with
+///    `messageMetadata { type: "question_answers", answeredQuestionsMessageId }`
+///    — user origin is NEVER held: the answer delivers immediately
+///    (`queued: false`), the tag clears the persisted pending-questions marker
+///    so the hold flips false, and the queue drains interrupt-first:
+///    transcript order is answer → urgent → normal, queue empty at the end.
 #[tokio::test]
 async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let Some(script) = gate("WSS question-hold user-answer E2E") else {
@@ -743,7 +745,7 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let urgent_sender_id = create_agent(&mut rpc, &ws_id, "SenderC").await;
 
     // ---- (1) The asker's question turn activates the hold ----
-    drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
+    let asked_mid = drive_question_turn(&mut rpc, &mut sub, &ws_id, &asker_id).await;
 
     // ---- (2) Automatic sends park in the queue (one sender each) ----
     let sent = wss_rpc(
@@ -858,10 +860,21 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     );
 
     // ---- (3) The user answer delivers immediately and releases the hold ----
+    // The wizard tags the answer with `messageMetadata { type:
+    // "question_answers", answeredQuestionsMessageId }` — the structured tag
+    // (never the text) is what resolves the persisted pending marker.
     let answered = wss_rpc(
         &mut rpc,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": asker_id, "content": ANSWER_TEXT }),
+        json!({
+            "workspaceId": ws_id,
+            "agentId": asker_id,
+            "content": ANSWER_TEXT,
+            "messageMetadata": {
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_mid,
+            },
+        }),
     )
     .await;
     assert_eq!(answered["success"], true, "answer ok: {answered}");
