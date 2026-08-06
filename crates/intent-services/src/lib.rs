@@ -829,9 +829,12 @@ impl Services {
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
-    /// per-agent `workspace_api` tool description at bridge creation.
-    /// Specialists without options (the default) are omitted; resolution
-    /// failure yields an empty list — spawning never fails on this.
+    /// per-agent `workspace_api` tool description at bridge creation. Each
+    /// listed specialist also carries the default a no-`model` delegate would
+    /// pin, computed by [`agent_ops::resolve_agent_default_model`] against the
+    /// same provider context as the `resolvedModel` preview (`None` = provider
+    /// CLI default). Specialists without options (the default) are omitted;
+    /// resolution failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
         &self,
         workspace_path: Option<&Path>,
@@ -843,6 +846,8 @@ impl Services {
         let Some(specs) = listed.get("specialists").and_then(Value::as_array) else {
             return Vec::new();
         };
+        let provider = agent_session::derived_default_provider(&self.effective_settings())
+            .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
         specs
             .iter()
             .filter(|def| !def.get("hidden").and_then(Value::as_bool).unwrap_or(false))
@@ -873,6 +878,13 @@ impl Services {
                 }
                 Some(intent_acp::SpecialistModelOptions {
                     specialist: id.to_string(),
+                    default_model: agent_ops::resolve_agent_default_model(
+                        self,
+                        Some(id),
+                        workspace_path,
+                        Some(&provider),
+                        false,
+                    ),
                     options,
                 })
             })

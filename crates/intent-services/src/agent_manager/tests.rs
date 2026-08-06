@@ -4547,6 +4547,15 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         "chooser",
         "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
     );
+    // Carries options plus a frontmatter `model` on the default provider →
+    // the resolved default is reported alongside them.
+    let default_provider = intent_providers::first_provider_id();
+    dir.write(
+        "pinned",
+        &format!(
+            "---\nname: \"Pinned\"\ndescription: \"Pinned default\"\nmodel: \"{default_provider}:pinned-model\"\nmodelOptions: [{{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}}]\n---\n\nbody"
+        ),
+    );
     // No options → omitted.
     dir.write(
         "plain",
@@ -4569,6 +4578,17 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
     assert_eq!(chooser.options[0].hint, "cheap");
     assert_eq!(chooser.options[1].model, "auggie:opus");
     assert_eq!(chooser.options[1].hint, "");
+    // No frontmatter model and no configured default → provider CLI default.
+    assert_eq!(chooser.default_model, None);
+    let pinned = listed
+        .iter()
+        .find(|s| s.specialist == "pinned")
+        .expect("pinned listed");
+    assert_eq!(
+        pinned.default_model.as_deref(),
+        Some(format!("{default_provider}:pinned-model").as_str()),
+        "the frontmatter default must be reported as the specialist's default"
+    );
     assert!(
         !listed.iter().any(|s| s.specialist == "plain"),
         "specialists without options are omitted"
