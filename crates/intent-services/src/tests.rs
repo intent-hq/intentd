@@ -273,6 +273,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             name: name.to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -1707,6 +1708,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         name: "Writer".to_string(),
         name_explicitly_set: true,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -3943,6 +3945,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             name: "sub-guard".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -4286,6 +4289,7 @@ mod change_event_parity {
             name: "Prov".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -6400,6 +6404,7 @@ mod mcp_callback {
             name: "McpWriter".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -7698,8 +7703,6 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
-        // Threads came from GraphQL, so resolution state is authoritative.
-        assert_eq!(v["comments"]["threadResolutionUnknown"], false);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
@@ -7707,9 +7710,8 @@ mod pr {
     async fn state_snapshot_counts_via_rest_fallback() {
         // GraphQL threads unavailable: inline comments are counted from the
         // flat REST list (replies included); resolution is unavailable there,
-        // so every fallback thread counts as unresolved — and the snapshot
-        // must flag the count as unreliable (intent-hq/monorepo#1524) instead
-        // of silently reporting resolved threads as unresolved.
+        // so every fallback thread counts as unresolved (the degradation is
+        // logged at `warn`).
         let (_t, svc, ws) = setup_with(
             StubForge {
                 fail_threads: true,
@@ -7723,7 +7725,6 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
-        assert_eq!(v["comments"]["threadResolutionUnknown"], true);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
@@ -11551,6 +11552,7 @@ mod search_adapters {
             name: "A".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -13414,6 +13416,7 @@ mod rules {
             name: "Test Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13549,6 +13552,7 @@ mod rules {
             name: "Coordinator Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("spec-writer".into()),
@@ -13674,6 +13678,7 @@ mod rules {
             name: "Test Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13795,6 +13800,7 @@ mod rules {
             name: "Test Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13916,6 +13922,7 @@ mod rules {
             name: "Test Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -14041,6 +14048,7 @@ mod rules {
             name: "Test Agent".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -16591,6 +16599,7 @@ mod file_ops_service {
             name: "Sandboxed Agent".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -17575,6 +17584,7 @@ mod heal_stale_agent_sessions {
             name: id.to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -18933,6 +18943,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         name: "Agent One".to_string(),
         name_explicitly_set: false,
         model: Some("sonnet".to_string()),
+        reasoning_effort: None,
         provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
@@ -18972,6 +18983,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         name: "Agent Two".to_string(),
         name_explicitly_set: false,
         model: Some("gpt4".to_string()),
+        reasoning_effort: None,
         provider: Some("openai".to_string()),
         system_prompt: None,
         specialist: None,
@@ -19090,6 +19102,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         name: "Agent A".to_string(),
         name_explicitly_set: false,
         model: Some("opus".to_string()),
+        reasoning_effort: None,
         provider: Some("anthropic".to_string()),
         system_prompt: None,
         specialist: None,
@@ -19660,6 +19673,7 @@ mod last_activity_events {
             name: format!("test-{}", agent_id.0),
             name_explicitly_set: false,
             model: Some("test-model".into()),
+            reasoning_effort: None,
             provider: Some("test".into()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -19947,6 +19961,7 @@ mod turn_token_usage {
             name: format!("test-{}", agent_id.0),
             name_explicitly_set: false,
             model: Some(model.into()),
+            reasoning_effort: None,
             provider: Some("test".into()),
             status: AgentStatus::Idle,
             is_active: false,

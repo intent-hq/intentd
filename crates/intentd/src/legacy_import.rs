@@ -1431,6 +1431,7 @@ fn session_from_legacy_json(
         name,
         name_explicitly_set,
         model,
+        reasoning_effort: None,
         provider,
         system_prompt,
         specialist,
