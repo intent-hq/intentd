@@ -1328,12 +1328,17 @@ impl Store {
         if current_acp_session_id.is_some() && s.acp_session_id != current_acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
+        // The attention_request_* columns are deliberately ABSENT from this
+        // full-row UPDATE: a long-lived in-memory `AgentSession` persisted
+        // here mid-race must not resurrect a request that
+        // `clear_attention_request` already NULLed (or clobber one that
+        // `set_attention_request` just wrote). Those two narrow writers are
+        // the only post-insert mutators of the attention columns.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
-             completion_report=?, completion_report_timestamp=?, attention_request_kind=?, \
-             attention_request_reason=?, attention_request_timestamp=?, delegation_depth=?, \
+             completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
              metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
              stop_reason_timestamp=? \
@@ -1355,9 +1360,6 @@ impl Store {
         .bind(s.skip_auto_commit as i64)
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
-        .bind(&s.attention_request_kind)
-        .bind(&s.attention_request_reason)
-        .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
@@ -1673,6 +1675,45 @@ impl Store {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Persist a pending attention request (`attention_request_kind` /
+    /// `..._reason` / `..._timestamp`): a narrow write of the three attention
+    /// columns plus `updated_at` (refreshed to `timestamp`). Together with
+    /// [`Store::clear_attention_request`] this is the ONLY writer of the
+    /// attention columns after insert — the full-row
+    /// [`Store::update_agent_session`] deliberately excludes them so a stale
+    /// in-memory session persisted mid-race can neither resurrect a cleared
+    /// request nor clobber a fresh one. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    pub async fn set_attention_request(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        kind: &str,
+        reason: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=?, \
+             attention_request_reason=?, attention_request_timestamp=?, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(kind)
+        .bind(reason)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set attention request failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
     }
 
     /// Clear the pending attention request (`attention_request_kind` /

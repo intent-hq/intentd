@@ -296,7 +296,40 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
                 .update_agent_session(&session.workspace_id.clone(), &session)
                 .await
             {
-                Ok(()) => summary.agents_updated += 1,
+                Ok(()) => {
+                    // The full-row update deliberately excludes the
+                    // attention_request_* columns (narrow-writer contract);
+                    // restore imported attention state explicitly.
+                    let attn = match (
+                        &session.attention_request_kind,
+                        &session.attention_request_reason,
+                        &session.attention_request_timestamp,
+                    ) {
+                        (Some(kind), Some(reason), Some(ts)) => store
+                            .set_attention_request(
+                                &session.workspace_id,
+                                &session.id,
+                                kind,
+                                reason,
+                                ts,
+                            )
+                            .await
+                            .map(|_| ()),
+                        _ => store
+                            .clear_attention_request(
+                                &session.workspace_id,
+                                &session.id,
+                                &session.updated_at,
+                            )
+                            .await
+                            .map(|_| ()),
+                    };
+                    match attn {
+                        Ok(()) => summary.agents_updated += 1,
+                        Err(e) => summary
+                            .skip(format!("agent {} attention update failed: {e}", session.id)),
+                    }
+                }
                 Err(e) => summary.skip(format!("agent {} update failed: {e}", session.id)),
             },
             Err(Error::NotFound(_)) => {
