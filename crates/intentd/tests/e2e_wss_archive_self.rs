@@ -339,11 +339,15 @@ async fn agent_archiving_its_own_workspace_completes_its_turn_over_wss() {
         "response": "archived the workspace",
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        // The `agent_running → idle` activity flip is debounced (~3s in
+        // production); shrink the window so the assertion below doesn't
+        // outlive the test.
+        ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
@@ -481,16 +485,26 @@ async fn agent_archiving_its_own_workspace_completes_its_turn_over_wss() {
         "the archiving agent settles (no phantom running agent)"
     );
 
-    let refreshed = wss_rpc(
-        &mut rpc,
-        90,
-        "workspace.get",
-        json!({ "workspaceId": ws_id }),
-    )
-    .await;
-    assert_ne!(
-        refreshed["workspace"]["activity"],
-        json!("agent_running"),
+    // The activity flip is debounced (shrunk to 50ms above), so poll rather
+    // than reading once.
+    let mut refreshed = json!(null);
+    let mut activity_cleared = false;
+    for i in 0..40 {
+        refreshed = wss_rpc(
+            &mut rpc,
+            90 + i,
+            "workspace.get",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        if refreshed["workspace"]["activity"] != json!("agent_running") {
+            activity_cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        activity_cleared,
         "workspace activity no longer reports a running agent: {refreshed}"
     );
 }
