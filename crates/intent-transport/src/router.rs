@@ -1117,6 +1117,7 @@ async fn dispatch(
             let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
+                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),

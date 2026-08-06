@@ -1440,6 +1440,7 @@ mod tests {
             name: "Owner".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,

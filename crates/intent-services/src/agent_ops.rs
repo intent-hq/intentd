@@ -2011,6 +2011,7 @@ impl Services {
         // `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
+            reasoning_effort,
             agent_type: _,
             metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
@@ -2020,6 +2021,9 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
+        // Stored as-is when non-empty (providers interpret the vocabulary —
+        // no daemon-side validation); empty/whitespace collapses to None.
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
@@ -2156,6 +2160,7 @@ impl Services {
             name,
             name_explicitly_set,
             model: resolved_model,
+            reasoning_effort,
             provider,
             system_prompt: None,
             specialist,
@@ -2465,6 +2470,7 @@ impl Services {
             "name",
             "nameExplicitlySet",
             "model",
+            "reasoningEffort",
             "provider",
             "systemPrompt",
             "specialist",
@@ -2530,6 +2536,10 @@ impl Services {
                 }
                 "model" => {
                     session.model = update_optional_string(value, "model")?;
+                }
+                "reasoningEffort" => {
+                    session.reasoning_effort = update_optional_string(value, "reasoningEffort")?
+                        .filter(|e| !e.trim().is_empty());
                 }
                 "provider" => {
                     session.provider = update_optional_string(value, "provider")?;
@@ -6740,6 +6750,7 @@ impl Services {
         );
         let extra = AgentCreateExtra {
             provider,
+            reasoning_effort: None,
             agent_type,
             metadata,
             workspace_path: None,

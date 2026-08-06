@@ -2002,6 +2002,12 @@ pub struct AgentSession {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level requested for this session (PROTOCOL §5.5,
+    /// Option B). Stored as-is (providers interpret the vocabulary; the
+    /// daemon never normalizes it) and applied on the next prompt send.
+    /// `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2234,6 +2240,10 @@ pub struct AgentLite {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level for the session (PROTOCOL §5.5, Option B);
+    /// mirrors [`AgentSession::reasoning_effort`]. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub status: AgentStatus,
@@ -2380,6 +2390,7 @@ impl AgentLite {
             name: session.name,
             name_explicitly_set: session.name_explicitly_set,
             model: session.model,
+            reasoning_effort: session.reasoning_effort,
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
@@ -2428,6 +2439,10 @@ impl AgentLite {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
     pub provider: Option<String>,
+    /// Reasoning-effort level persisted on the created session (PROTOCOL
+    /// §5.5, Option B). Stored as-is when a non-empty string; empty /
+    /// whitespace-only values collapse to `None` at the boundary.
+    pub reasoning_effort: Option<String>,
     pub agent_type: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub workspace_path: Option<String>,
@@ -3641,6 +3656,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".to_string()),
@@ -3719,6 +3735,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: Some("opus".to_string()),
+            reasoning_effort: None,
             provider: Some("auggie".to_string()),
             system_prompt: None,
             specialist: None,

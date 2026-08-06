@@ -574,6 +574,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         name: "Builder".to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,

@@ -13564,6 +13564,63 @@ async fn agent_update_name_only_emits_agent_renamed() {
     assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
 }
 
+/// `reasoningEffort` lifecycle (PROTOCOL §5.5, Option B): settable at
+/// `agent.create` (stored as-is — no vocabulary validation, unknown levels
+/// pass), patchable and clearable via `agent.update`, and served on both the
+/// `AgentSession` and `AgentLite` projections.
+#[tokio::test]
+async fn agent_reasoning_effort_create_update_read_roundtrip() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        reasoning_effort: Some("xhigh".into()),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Effort".into()),
+            Some("codex:gpt-5.3-codex".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    assert_eq!(created["agent"]["reasoningEffort"], json!("xhigh"));
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.reasoning_effort.as_deref(), Some("xhigh"));
+
+    // Patch to an unknown level: stored as-is (providers interpret it).
+    let r = svc
+        .agent_update_op(id.clone(), json!({ "reasoningEffort": "ultracode" }))
+        .await
+        .expect("update");
+    assert_eq!(r["agent"]["reasoningEffort"], json!("ultracode"));
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.reasoning_effort.as_deref(), Some("ultracode"));
+
+    // JSON null clears it; empty string collapses to unset too.
+    svc.agent_update_op(id.clone(), json!({ "reasoningEffort": null }))
+        .await
+        .expect("clear");
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.reasoning_effort, None);
+    svc.agent_update_op(id.clone(), json!({ "reasoningEffort": "high" }))
+        .await
+        .expect("set");
+    svc.agent_update_op(id.clone(), json!({ "reasoningEffort": "" }))
+        .await
+        .expect("clear via empty");
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(
+        session.reasoning_effort, None,
+        "empty string reads as unset"
+    );
+}
+
 /// Unknown fields in `changes` surface as `-32602` so callers cannot smuggle
 /// stray keys that would silently no-op.
 #[tokio::test]

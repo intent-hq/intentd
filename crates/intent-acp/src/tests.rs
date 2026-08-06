@@ -7386,6 +7386,7 @@ mod wsapi4_bindings_tests {
             name: format!("agent-{id}"),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,

@@ -379,7 +379,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "5.1",
+        sess[0]["result"]["protocolVersion"], "5.2",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1877,6 +1877,111 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
     assert_eq!(
         sess[8]["error"]["message"].as_str(),
         Some("Agent not found")
+    );
+
+    srv.ws.stop().await;
+}
+
+/// `reasoningEffort` wire contract (PROTOCOL §5.5, Option B): settable at
+/// `agent.create` (echoed on the returned `AgentLite`), patchable and
+/// nullable via `agent.update`, and served on `agent.getSession` /
+/// `agent.get` — over the real WSS transport. The daemon stores the level
+/// as-is (no vocabulary validation), so an arbitrary string passes.
+#[tokio::test]
+async fn wss_agent_reasoning_effort_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // 1) create with reasoningEffort — echoed on the AgentLite result.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Effort","model":"codex:gpt-5.3-codex","reasoningEffort":"xhigh"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        sess[0]["result"]["agent"]["reasoningEffort"].as_str(),
+        Some("xhigh"),
+        "create echoes reasoningEffort: {}",
+        sess[0]
+    );
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            // getSession serves the persisted value.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // agent.update patches it (unknown level passes — stored as-is).
+            format!(
+                r#"{{"jsonrpc":"2.0","id":11,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"reasoningEffort":"ultracode"}}}}}}"#
+            ),
+            // agent.get (AgentLite) serves the patched value.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":12,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+            // null clears it.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":13,"method":"agent.update","params":{{"agentId":"{agent_id}","changes":{{"reasoningEffort":null}}}}}}"#
+            ),
+            // Cleared → the key is omitted from the session projection.
+            format!(
+                r#"{{"jsonrpc":"2.0","id":14,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        sess[0]["result"]["session"]["reasoningEffort"].as_str(),
+        Some("xhigh"),
+        "getSession serves persisted effort: {}",
+        sess[0]
+    );
+    assert_eq!(
+        sess[1]["result"]["agent"]["reasoningEffort"].as_str(),
+        Some("ultracode"),
+        "update result echoes patched effort: {}",
+        sess[1]
+    );
+    assert_eq!(
+        sess[2]["result"]["agent"]["reasoningEffort"].as_str(),
+        Some("ultracode"),
+        "agent.get serves patched effort: {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[3]["result"]["success"],
+        Value::Bool(true),
+        "null clear succeeds: {}",
+        sess[3]
+    );
+    assert!(
+        sess[4]["result"]["session"]
+            .as_object()
+            .expect("session object")
+            .get("reasoningEffort")
+            .is_none(),
+        "cleared effort is omitted, never null: {}",
+        sess[4]
     );
 
     srv.ws.stop().await;
@@ -5890,6 +5995,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         name: name.to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         status: AgentStatus::Completed,
         is_active: false,

@@ -4971,6 +4971,7 @@ impl AgentManager {
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
+        opts.reasoning_effort = resolved.reasoning_effort.as_deref();
         opts.provider_binary = resolved.provider_binary.as_deref();
         opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
         opts.npx_fallback_package = resolved.npx_fallback_package;
@@ -5698,6 +5699,11 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
 struct ResolvedSpawn {
     provider: ProviderConfig,
     model: Option<String>,
+    /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
+    /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
+    /// keeps emitting `-c model_reasoning_effort=…` for sessions whose
+    /// compound `{base}/{effort}` model id was split by migration 0079.
+    reasoning_effort: Option<String>,
     cwd: PathBuf,
     provider_binary: Option<PathBuf>,
     extra_env: BTreeMap<String, String>,
@@ -5816,6 +5822,14 @@ fn resolve_spawn(
         .as_ref()
         .map(|m| intent_providers::parse_compound_model_id(m).1)
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
+    // Session-level reasoning effort (PROTOCOL §5.5, Option B): threaded to
+    // `SpawnOptions.reasoning_effort` so the codex spawn path applies it as
+    // `-c model_reasoning_effort=…` (an effort embedded in a compound
+    // `{base}/{effort}` model id still wins inside the codex arg builder).
+    let reasoning_effort = session
+        .reasoning_effort
+        .clone()
+        .filter(|e| !e.trim().is_empty());
     // Chief has no worktree/repo on disk, so its children spawn in the
     // dedicated, daemon-owned, empty `<data_dir>/chief-cwd` directory
     // (STAB-50): providers that index their cwd (auggie with
@@ -5896,6 +5910,7 @@ fn resolve_spawn(
         return Ok(ResolvedSpawn {
             provider,
             model: None,
+            reasoning_effort: None,
             cwd,
             provider_binary: None,
             extra_env,
@@ -5925,6 +5940,7 @@ fn resolve_spawn(
         return Ok(ResolvedSpawn {
             provider,
             model,
+            reasoning_effort,
             cwd,
             provider_binary: None,
             extra_env,
@@ -5974,6 +5990,7 @@ fn resolve_spawn(
     Ok(ResolvedSpawn {
         provider,
         model,
+        reasoning_effort,
         cwd,
         provider_binary,
         extra_env,
@@ -6029,6 +6046,7 @@ fn rebuild_spawn_opts<'a>(
 ) -> SpawnOptions<'a> {
     let mut spawn_opts = SpawnOptions::new(opts.provider);
     spawn_opts.model = opts.model;
+    spawn_opts.reasoning_effort = opts.reasoning_effort;
     spawn_opts.cwd = opts.cwd;
     spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
     spawn_opts.quiet = opts.quiet;
@@ -7772,6 +7790,7 @@ mod role_reminder_tests {
             name: "Builder".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -9253,6 +9272,7 @@ mod agent_retry_tests {
             name: "Agent".to_string(),
             name_explicitly_set: false,
             model: Some("model-1".to_string()),
+            reasoning_effort: None,
             provider: Some("provider-1".to_string()),
             system_prompt: None,
             specialist: None,
