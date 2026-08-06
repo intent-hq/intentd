@@ -6797,8 +6797,8 @@ mod pr {
         AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
         PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
-        Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
-        SourceControl, UserIdentity,
+        Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -6850,6 +6850,19 @@ mod pr {
         /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
         /// exercising the `pr_state` `mergeBlockedReason` wiring.
         dirty_pr: bool,
+        /// When true, `get_pr` reports the sample PR with
+        /// `mergeableState: "blocked"` (required checks / merge queue /
+        /// token without push access), exercising the `pr_state` decision
+        /// regression (intent-hq/monorepo#1524).
+        blocked_pr: bool,
+        /// When true, `list_reviews` returns no reviews at all.
+        no_reviews: bool,
+        /// The forge's authoritative `reviewDecision` (`None` mirrors an
+        /// unprotected base / host without the signal).
+        review_decision: Option<ReviewDecision>,
+        /// When true, `review_decision` fails, exercising the degrade-to-
+        /// aggregate path of `pr_state`.
+        fail_review_decision: bool,
     }
 
     fn sample_pr() -> PullRequest {
@@ -7022,6 +7035,10 @@ mod pr {
                 pr.mergeable = Some(false);
                 pr.mergeable_state = Some("dirty".into());
             }
+            if self.blocked_pr {
+                pr.mergeable = Some(false);
+                pr.mergeable_state = Some("blocked".into());
+            }
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
@@ -7080,7 +7097,16 @@ mod pr {
                 submitted_at: "2026-06-17T05:00:00.000Z".into(),
             })
         }
+        async fn review_decision(&self, _: &RepoRef, _: u64) -> ScResult<Option<ReviewDecision>> {
+            if self.fail_review_decision {
+                return Err(ScError::Api("graphql down".into()));
+            }
+            Ok(self.review_decision)
+        }
         async fn list_reviews(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Review>> {
+            if self.no_reviews {
+                return Ok(vec![]);
+            }
             Ok(vec![
                 Review {
                     author: "alice".into(),
@@ -7730,6 +7756,66 @@ mod pr {
         // A merged PR never reports a blocked reason, even when the forge
         // still surfaces a dirty mergeable state.
         assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_blocked_state_without_reviews_is_none_decision() {
+        // Regression (intent-hq/monorepo#1524): REST `mergeable_state:
+        // "blocked"` conflates required checks / merge queue / token access
+        // and is NOT a review-requirement signal. With no reviews and a null
+        // provider `reviewDecision` (unprotected base), the decision must be
+        // `none`, never `review_required`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                blocked_pr: true,
+                no_reviews: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["mergeableState"], "blocked");
+        assert_eq!(v["reviews"]["decision"], "none");
+        assert_eq!(v["reviews"]["approvals"], 0);
+        assert_eq!(v["reviews"]["changesRequested"], 0);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_provider_review_required_maps_directly() {
+        // A protected base reporting `REVIEW_REQUIRED` yields
+        // `review_required` even with a clean mergeable state — the decision
+        // comes from the forge's `reviewDecision`, not `mergeable_state`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                no_reviews: true,
+                review_decision: Some(ReviewDecision::ReviewRequired),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["reviews"]["decision"], "review_required");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_decision_fetch_error_degrades_to_aggregate() {
+        // A failed `reviewDecision` fetch never fails the snapshot: the
+        // decision degrades to the aggregated actionable reviews (the stub's
+        // default reviews carry one approval).
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_review_decision: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["reviews"]["decision"], "approved");
+        assert_eq!(v["reviews"]["approvals"], 1);
     }
 
     #[tokio::test]

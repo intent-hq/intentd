@@ -17548,7 +17548,15 @@ impl WorkspaceApi for Services {
                 .await
                 .map_err(pr_ops::map_sc_err)?;
             let agg = pr_ops::aggregate_reviews(&reviews);
-            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+            // The forge's authoritative review-requirement verdict (GraphQL
+            // `reviewDecision` on GitHub). A fetch error degrades to `None`
+            // (aggregate-derived decision) rather than failing the snapshot.
+            let provider_decision = sc
+                .review_decision(&repo_ref, pr_number)
+                .await
+                .ok()
+                .flatten();
+            let decision = pr_ops::snapshot_review_decision(&agg, state, provider_decision);
 
             let conversation = sc
                 .list_comments(&repo_ref, pr_number)

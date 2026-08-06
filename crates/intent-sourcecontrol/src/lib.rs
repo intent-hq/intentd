@@ -27,7 +27,7 @@ pub use model::{
     AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
     MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams,
     PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment,
-    ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, UserIdentity,
+    ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -131,6 +131,19 @@ pub trait SourceControl: Send + Sync {
 
     /// List submitted reviews for a pull request.
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>>;
+
+    /// The forge's authoritative review-requirement verdict for a pull
+    /// request (GraphQL `reviewDecision` on GitHub). `Ok(None)` means the
+    /// forge reports no review requirement (e.g. an unprotected base
+    /// branch); the default implementation returns `Ok(None)` for hosts
+    /// without the signal.
+    async fn review_decision(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+    ) -> Result<Option<ReviewDecision>> {
+        Ok(None)
+    }
 
     /// List issue/PR (conversation) comments.
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>>;
