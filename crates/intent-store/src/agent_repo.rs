@@ -1030,81 +1030,53 @@ impl Store {
         Ok(())
     }
 
-    /// Guarded write of a session's effective model resolved at session open
-    /// (D13): sets `model` only while the stored value still equals
-    /// `expected_current` (the placeholder read before the ACP call — `None`
-    /// matches NULL), so a concurrent explicit `agent.setModel` is never
-    /// overwritten. Any stale `resolved_model` is cleared in the same write
-    /// (the effective model IS the display identity — D14). Returns whether
-    /// the write landed; `false` means the guard failed (model changed
-    /// concurrently or the row is absent), which callers treat as a benign
-    /// skip. Scoped to `workspace_id` (defense-in-depth).
-    pub async fn set_agent_session_effective_model(
-        &self,
-        workspace_id: &WorkspaceId,
-        id: &AgentId,
-        expected_current: Option<&str>,
-        effective: &str,
-    ) -> Result<bool> {
-        let res = match expected_current {
-            Some(current) => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                     WHERE id=? AND workspace_id=? AND model=?",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .bind(current)
-                .execute(self.write_pool())
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                 WHERE id=? AND workspace_id=? AND model IS NULL",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .execute(self.write_pool())
-                .await
-            }
-        }
-        .map_err(|e| Error::Internal(format!("set agent session effective model failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    /// Guarded write of a session's *resolved* display model (D14): the
-    /// display identity of an EXPLICITLY selected model id, matched against
-    /// the provider's `configOptions[id="model"]` option list at session
-    /// open. Unlike [`set_agent_session_effective_model`](Store::set_agent_session_effective_model)
-    /// this never touches `model` — the raw option id keeps driving provider
-    /// configuration (spawn flags / `session/set_config_option`); the
-    /// resolution is used ONLY for usage-stats attribution. `resolved` is
-    /// written as given, `None` included — an id that no longer resolves
-    /// must overwrite (not orphan) a previously persisted resolution, or a
-    /// stale display name would keep mis-attributing stats. Writes only
-    /// while `model` still equals `expected_model` (the explicit id read
-    /// before the ACP call), so a resolution is never attached to a model a
+    /// Guarded write of a session's *resolved* display model (D13/D14): the
+    /// display identity resolved against the provider's
+    /// `configOptions[id="model"]` option list at session open — for an
+    /// explicit pick (D14) and for a placeholder/NULL model whose effective
+    /// model the provider reported (D13). This never touches `model` — the
+    /// stored id (or placeholder) keeps driving provider configuration
+    /// (spawn flags / `session/set_config_option`); the resolution is used
+    /// ONLY for usage-stats attribution. `resolved` is written as given,
+    /// `None` included — an id that no longer resolves must overwrite (not
+    /// orphan) a previously persisted resolution, or a stale display name
+    /// would keep mis-attributing stats. Writes only while `model` still
+    /// equals `expected_model` (the value read before the ACP call — `None`
+    /// matches NULL), so a resolution is never attached to a model a
     /// concurrent `agent.setModel` changed. Returns whether the write
     /// landed. Scoped to `workspace_id` (defense-in-depth).
     pub async fn set_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-        expected_model: &str,
+        expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
-        let res = sqlx::query(
-            "UPDATE agent_session SET resolved_model=? WHERE id=? AND workspace_id=? AND model=?",
-        )
-        .bind(resolved)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(expected_model)
-        .execute(self.write_pool())
-        .await
+        let res = match expected_model {
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model=?",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .bind(expected)
+                .execute(self.write_pool())
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model IS NULL",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+            }
+        }
         .map_err(|e| Error::Internal(format!("set agent session resolved model failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }

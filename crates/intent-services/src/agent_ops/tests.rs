@@ -3354,7 +3354,7 @@ async fn set_model_clears_resolved_display_model() {
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, "auggie:sonnet4.5", Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
