@@ -18720,7 +18720,8 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss: attention-changed only — no updated_at bump, so no
+        // Dismiss: attention-changed (plus the displayStatus demotion for
+        // the retired unread flag, §6.5) — no updated_at bump, so no
         // debounced workspace:updated { lastActivity } follows.
         h.services
             .dismiss_attention(h.ws.clone())
@@ -18731,12 +18732,15 @@ mod last_activity_events {
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
-            "dismiss must not emit a lastActivity workspace:updated"
-        );
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                assert_eq!(
+                    ev["type"], "workspace:displayStatus-changed",
+                    "dismiss must not emit a lastActivity workspace:updated"
+                );
+            }
+        }
 
         // Dismiss again (no-op, no events).
         h.services

@@ -4668,6 +4668,11 @@ impl AgentManager {
         // event carries stopReason: null.
         self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
             .await;
+        // Clearing the Error park retires the `failed` displayStatus rung
+        // (§6.5 step 0): recompute-and-compare so the demotion emits.
+        self.services
+            .maybe_emit_display_status_changed(workspace_id)
+            .await;
         Ok(())
     }
 
@@ -7367,6 +7372,14 @@ async fn persist_error_and_requeue(
             workspace_id,
             mgr.services.queue_snapshot(agent_id),
         )
+        .await;
+
+    // A top-level agent parked in Error drives the `failed` displayStatus
+    // rung (§6.5 step 0): recompute-and-compare so the promotion emits.
+    // Deliberately AFTER the requeue: clients key on status-changed →
+    // queue-updated ordering, and the recompute must not widen that window.
+    mgr.services
+        .maybe_emit_display_status_changed(workspace_id)
         .await;
 
     // Durable transcript record of the terminal failure: a system-role message

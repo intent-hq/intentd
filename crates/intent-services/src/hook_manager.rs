@@ -644,7 +644,7 @@ impl Services {
     /// the `displayStatus` promotion signal (§6.5): an idle agent still
     /// watching via a background hook reads as active work. Best-effort: a
     /// store read failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_needs_attention`]) so list/get emission is
+    /// [`Services::workspace_attention_signals`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
         match self.store.list_hooks_by_workspace(workspace_id).await {

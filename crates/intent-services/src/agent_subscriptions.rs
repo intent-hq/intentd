@@ -473,7 +473,7 @@ impl Services {
     /// children reads as active work. Watches anchor in the parent's HOME
     /// workspace (`parent_workspace_id`) — where the wake will be delivered
     /// — never the child's. The top-level filter matches
-    /// [`Services::workspace_needs_attention`] (no `parent_agent_id`, not
+    /// [`Services::workspace_attention_signals`] (no `parent_agent_id`, not
     /// background, not deleted), so watches held by child/background agents
     /// never promote. The in-memory registry is consulted first, so the
     /// common no-watch case costs no store read; otherwise this is one
@@ -2166,7 +2166,7 @@ mod tests {
     }
 
     /// Watches held by child or background agents never promote — only
-    /// top-level sessions count (same filter as `workspace_needs_attention`).
+    /// top-level sessions count (same filter as `workspace_attention_signals`).
     #[tokio::test]
     async fn child_or_background_held_watch_does_not_promote() {
         let (_tmp, _root, svc, ws) = setup().await;
