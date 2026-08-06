@@ -265,6 +265,30 @@ fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
     vec![stale, chunk]
 }
 
+/// A tool-ONLY prompt turn: three distinct tool calls and not a single
+/// assistant text chunk — the shape an implementor sub-agent spends most of a
+/// turn in (monorepo#1414).
+fn prompt_updates_tools_only() -> Vec<String> {
+    let tool = |id: &str, title: &str, status: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                    "title": title, "kind": "execute", "status": status,
+                    "rawInput": { "cmd": "x" } }
+            }
+        })
+        .to_string()
+    };
+    vec![
+        tool("t1", "bash: cargo test", "in_progress"),
+        tool("t2", "view: src/lib.rs", "in_progress"),
+        tool("t3", "bash: cargo fmt", "in_progress"),
+    ]
+}
+
 /// Shared crate-wide env guard (defined in `agent_manager::tests`): tests
 /// here that pin `INTENTD_PROMPT_IDLE_TIMEOUT_MS` must serialize with the
 /// worker-level tests that pin the same var.
@@ -3383,5 +3407,182 @@ async fn activity_throttle_leading_edge_window_and_reset() {
     assert!(
         services.should_emit_activity(&agent_id),
         "throttle state reset with the slot: next turn leads immediately"
+    );
+}
+
+/// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
+/// tool calls and no assistant text still emits `agent:stream:activity`, each
+/// ping carrying `lastToolUse { name, status }` for the call just recorded.
+/// The throttle still applies — the burst lands inside one 1 s window, so the
+/// leading-edge ping is the only guaranteed one.
+#[tokio::test]
+async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_tools_only());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    let activities: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+        .collect();
+    assert!(
+        !activities.is_empty(),
+        "a turn with no assistant text still emits activity from the tool arm"
+    );
+    assert!(
+        activities.len() <= 3,
+        "the shared 1s throttle keeps the tool burst from emitting per call: {}",
+        activities.len()
+    );
+    // The leading-edge ping describes the FIRST tool call and carries no
+    // preview text (nothing streamed).
+    let first = activities[0];
+    assert_eq!(first.data["agentId"], json!("agent-1"));
+    assert!(
+        first.data["messageId"].is_string(),
+        "activity carries the turn's messageId"
+    );
+    assert_eq!(
+        first.data["lastToolUse"],
+        json!({ "name": "bash", "status": "started" }),
+        "tool-arm activity carries the just-recorded call's name + status"
+    );
+    assert!(
+        first.data.get("lastAgentResponse").is_none(),
+        "no assistant text streamed → no preview field"
+    );
+    for ev in &activities {
+        assert!(
+            ev.data["lastToolUse"]["name"].is_string(),
+            "every tool-arm ping names the tool"
+        );
+        assert!(
+            ev.data.get("content").is_none(),
+            "activity payload never carries transcript content"
+        );
+    }
+}
+
+/// Both emit arms share ONE per-agent throttle window: a text chunk's ping
+/// suppresses an immediately following tool call's ping (and vice versa),
+/// while the window elapsing re-opens the gate for whichever arm comes next.
+/// Drives `route_notification` directly so the window boundaries are
+/// deterministic.
+#[tokio::test]
+async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let chunk_note = |text: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    };
+    let tool_note = |id: &str, title: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": title, "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+
+    // Leading edge on the chunk arm.
+    services
+        .route_notification(
+            &chunk_note("Hello\n"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Same window → the tool arm is suppressed.
+    services
+        .route_notification(
+            &tool_note("t1", "bash: one"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Window elapses → the tool arm emits.
+    tokio::time::sleep(super::ACTIVITY_THROTTLE + Duration::from_millis(50)).await;
+    services
+        .route_notification(
+            &tool_note("t2", "view: src/lib.rs"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Same window again → the chunk arm is now the suppressed one.
+    services
+        .route_notification(
+            &chunk_note("more\n"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let activities: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+        .collect();
+    assert_eq!(
+        activities.len(),
+        2,
+        "one ping per shared window, regardless of which arm opened it: {:?}",
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        activities[0].data.get("lastToolUse").is_none(),
+        "the chunk-arm ping carries no lastToolUse"
+    );
+    assert_eq!(
+        activities[1].data["lastToolUse"],
+        json!({ "name": "view", "status": "started" }),
+        "the second window's ping came from the tool arm"
+    );
+    assert_eq!(
+        activities[1].data["lastAgentResponse"],
+        json!("Hello"),
+        "tool-arm pings carry the same live preview fields as chunk-arm pings"
     );
 }
