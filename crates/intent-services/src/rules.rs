@@ -504,37 +504,21 @@ pub(crate) async fn assemble_system_prompt(
              Prioritize them above general guidance."
         ));
     }
-    // Commit-policy layer: agents never commit themselves. When auto-commit is
-    // on, the daemon's auto-commit-on-idle subscriber owns commits; when off,
-    // nothing commits unless the user explicitly asks. Injected for every agent
-    // (top-level and sub-agents alike) in both states so the model always has
-    // an explicit directive. Per-session effective state: a session that
-    // opted out via `skipAutoCommit` (delegation/creation while the workspace
-    // was OFF) never auto-commits, so it must get the OFF clause even when
-    // the workspace toggle is currently on — otherwise the prompt would
-    // falsely claim end-of-turn commits that the idle subscriber will skip.
-    let effective_auto_commit =
-        auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
-    if effective_auto_commit {
-        parts.push(
-            "## Commit Policy\n\n\
-             Do not commit on your own initiative — your changes are committed \
-             automatically by the system when your turn ends. When the user \
-             explicitly asks for a checkpoint commit, use `ws.git.commit`; \
-             only run `git commit` yourself when the user explicitly asks for a \
-             git workflow that `ws.git.commit` cannot express (e.g. \
-             multiple scoped commits on a branch)."
-                .to_string(),
-        );
-    } else {
-        parts.push(
-            "## Commit Policy\n\n\
-             Auto-commit is OFF. Do not commit (including shell `git commit`) \
-             unless the user explicitly asks. User-requested commits go through \
-             `ws.git.commit` with `userRequested: true`."
-                .to_string(),
-        );
-    }
+    // Commit-policy layer: one status-neutral clause, injected for every agent
+    // (top-level and sub-agents alike) regardless of the auto-commit state.
+    // The prompt no longer branches on the effective auto-commit state — the
+    // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
+    // enforce the actual behavior.
+    parts.push(
+        "## Commit Policy\n\n\
+         Commit through `ws.git.commit` — never run `git commit` yourself \
+         unless the user explicitly asks for a git workflow that \
+         `ws.git.commit` cannot express (e.g. multiple scoped commits on a \
+         branch). You may commit when it makes sense for the work; the system \
+         may also automatically commit any remaining changes when your turn \
+         ends."
+            .to_string(),
+    );
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -574,6 +558,13 @@ pub(crate) async fn assemble_system_prompt(
                     .to_string(),
             );
         }
+        // Per-session effective state for the SP-1 footer wording: a session
+        // that opted out via `skipAutoCommit` (delegation/creation while the
+        // workspace was OFF) never auto-commits, so the footer must follow the
+        // effective state even when the workspace toggle is currently on. The
+        // commit-policy clause above is deliberately status-neutral.
+        let effective_auto_commit =
+            auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
         let example_second_line = if effective_auto_commit {
             "Check the changes in the diff view."
         } else {
@@ -992,6 +983,16 @@ This is a test skill.
         );
     }
 
+    /// The exact status-neutral commit-policy clause injected for every agent
+    /// in both auto-commit states.
+    const COMMIT_POLICY_CLAUSE: &str = "## Commit Policy\n\n\
+         Commit through `ws.git.commit` — never run `git commit` yourself \
+         unless the user explicitly asks for a git workflow that \
+         `ws.git.commit` cannot express (e.g. multiple scoped commits on a \
+         branch). You may commit when it makes sense for the work; the system \
+         may also automatically commit any remaining changes when your turn \
+         ends.";
+
     #[tokio::test]
     async fn test_commit_policy_clause_when_auto_commit_on() {
         let tmp_db = TempDb::new();
@@ -1013,29 +1014,25 @@ This is a test skill.
         .unwrap();
 
         assert!(
-            prompt.contains("## Commit Policy"),
-            "Commit-policy clause should be present when auto-commit is on"
-        );
-        assert!(
-            prompt.contains("committed automatically by the system when your turn ends"),
-            "ON-state clause should describe harness-owned commits"
-        );
-        assert!(
-            prompt.contains("only run `git commit` yourself when the user explicitly asks"),
-            "ON-state clause should carve out explicit user-requested git workflows"
+            prompt.contains(COMMIT_POLICY_CLAUSE),
+            "status-neutral commit-policy clause should be present when auto-commit is on"
         );
         assert!(
             !prompt.contains("Auto-commit is OFF."),
-            "OFF-state clause should be absent when auto-commit is on"
+            "old OFF-state clause should be gone"
+        );
+        assert!(
+            !prompt.contains("Do not commit on your own initiative"),
+            "old ON-state clause should be gone"
         );
     }
 
     /// Per-session effective state: a session that opted out via
-    /// `skipAutoCommit` gets the OFF clause even when the workspace's
-    /// auto-commit is on — the idle subscriber short-circuits on the session
-    /// flag, so the ON clause would falsely claim end-of-turn commits.
+    /// `skipAutoCommit` still gets the same status-neutral commit-policy
+    /// clause, while the SP-1 suggested-prompts footer keeps following the
+    /// effective auto-commit state.
     #[tokio::test]
-    async fn test_commit_policy_off_when_session_skips_auto_commit() {
+    async fn test_commit_policy_neutral_when_session_skips_auto_commit() {
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
 
@@ -1095,12 +1092,12 @@ This is a test skill.
         .unwrap();
 
         assert!(
-            prompt.contains("Auto-commit is OFF."),
-            "session opt-out forces the OFF clause despite workspace auto-commit on"
+            prompt.contains(COMMIT_POLICY_CLAUSE),
+            "opted-out session gets the same status-neutral clause"
         );
         assert!(
-            !prompt.contains("committed automatically by the system"),
-            "ON-state clause must be absent for an opted-out session"
+            !prompt.contains("Auto-commit is OFF."),
+            "old OFF-state clause should be gone for an opted-out session"
         );
         assert!(
             !prompt.contains("Auto-commit is enabled;"),
@@ -1114,8 +1111,10 @@ This is a test skill.
         let store = Store::open(&tmp_db.path).await.unwrap();
 
         // Sub-agent gating does not apply: the clause is injected for every
-        // agent, so assert it with `is_sub_agent = true`.
-        let prompt = assemble_system_prompt(
+        // agent, so assert it with `is_sub_agent = true`. Sub-agent prompts
+        // have no auto-commit-aware footer, so the ON and OFF prompts must be
+        // byte-identical.
+        let prompt_off = assemble_system_prompt(
             &store,
             None,
             "workspace",
@@ -1129,22 +1128,28 @@ This is a test skill.
         )
         .await
         .unwrap();
+        let prompt_on = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            true,
+            true,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
-            prompt.contains("## Commit Policy"),
-            "Commit-policy clause should be present when auto-commit is off"
+            prompt_off.contains(COMMIT_POLICY_CLAUSE),
+            "status-neutral commit-policy clause should be present when auto-commit is off"
         );
-        assert!(
-            prompt.contains("Auto-commit is OFF. Do not commit (including shell `git commit`)"),
-            "OFF-state clause should forbid commits including shell git commit"
-        );
-        assert!(
-            prompt.contains("`ws.git.commit` with `userRequested: true`"),
-            "OFF-state clause should route user-requested commits through ws.git.commit"
-        );
-        assert!(
-            !prompt.contains("committed automatically by the system"),
-            "ON-state clause should be absent when auto-commit is off"
+        assert_eq!(
+            prompt_off, prompt_on,
+            "sub-agent prompt must be identical in both auto-commit states"
         );
     }
 
