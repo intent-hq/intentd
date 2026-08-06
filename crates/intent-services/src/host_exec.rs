@@ -60,7 +60,10 @@ impl ExecPolicy for AllowAllPolicy {
 
 /// Parsed `host.exec` params. `command` is required; `args`/`env` default empty;
 /// `cwd` requires `workspace_id` so the containment guard has a root to check
-/// against. `timeout_ms` capped by [`MAX_TIMEOUT_MS`].
+/// against. `timeout_ms` capped by [`MAX_TIMEOUT_MS`]. `caller_agent_id` is
+/// server-injected (never client-supplied): the `ws.host.exec` binding stamps
+/// the calling agent so cwd resolution roots at that agent's sandbox when it
+/// has one.
 #[derive(Debug)]
 pub struct HostExecArgs {
     pub command: String,
@@ -69,6 +72,7 @@ pub struct HostExecArgs {
     pub env: BTreeMap<String, String>,
     pub timeout_ms: Option<u64>,
     pub workspace_id: Option<String>,
+    pub caller_agent_id: Option<intent_core::AgentId>,
 }
 
 /// Upper bound on `timeoutMs` to keep a runaway request from wedging the daemon
@@ -163,6 +167,11 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecE
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.is_empty());
+    let caller_agent_id = params
+        .get("callerAgentId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(intent_core::AgentId::from);
     let timeout_ms = match params.get("timeoutMs") {
         None | Some(Value::Null) => None,
         Some(v) => {
@@ -184,6 +193,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecE
         env,
         timeout_ms,
         workspace_id,
+        caller_agent_id,
     })
 }
 
@@ -325,11 +335,21 @@ pub async fn run(
         .evaluate(&args.command, &args.args)
         .map_err(HostExecError::internal)?;
 
-    let cwd_resolved = match (args.cwd.as_deref(), args.workspace_id.as_deref()) {
-        (Some(cwd), Some(ws_id)) => {
-            Some(resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
-        }
-        _ => None,
+    // Resolve the working directory. An omitted `cwd` defaults to "." —
+    // the workspace root (or the calling agent's sandbox root) — instead of
+    // silently inheriting the daemon process's own cwd, which is an
+    // unrelated directory from the caller's perspective.
+    let cwd_resolved = match args.workspace_id.as_deref() {
+        Some(ws_id) => Some(
+            resolve_cwd_within_workspace(
+                api,
+                ws_id,
+                args.cwd.as_deref().unwrap_or("."),
+                args.caller_agent_id.as_ref(),
+            )
+            .await?,
+        ),
+        None => None,
     };
 
     let mut cmd = build_command(&args, cwd_resolved.as_deref());

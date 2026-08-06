@@ -16754,6 +16754,7 @@ async fn fake_provisioned_sandbox(
         status: intent_store::SandboxStatus::Created,
         retry_count: 0,
         merge_on_turn_end: true,
+        conflicting_paths: Vec::new(),
         created_at: now_iso(),
         updated_at: now_iso(),
     };

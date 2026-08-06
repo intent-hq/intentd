@@ -308,6 +308,7 @@ pub async fn provision_sandbox(
         status: SandboxStatus::Created,
         retry_count: 0,
         merge_on_turn_end,
+        conflicting_paths: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -534,6 +535,51 @@ pub async fn discard_sandbox(
     }
 
     Ok(())
+}
+
+/// Preserve a conflicted sandbox's commits in the canonical repo: fetch the
+/// sandbox branch into canonical as a local branch of the same name
+/// (`sb/<agentId>`), forced, so the agent's entire output — including its
+/// non-conflicting files — stays recoverable with normal git tooling even if
+/// the sandbox directory is later lost. Ref-only (no checkout, canonical
+/// worktree untouched). Returns the recovery branch name.
+pub async fn push_conflict_recovery_branch(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<String> {
+    let sandbox = store
+        .get_sandbox(workspace_id, agent_id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("sandbox not found for agent {}", agent_id.0)))?;
+    let workspace = store.get_workspace(workspace_id).await?;
+    let canonical_path = resolve_user_directory(&workspace)?;
+    let sandbox_path = sandbox.path.clone();
+    let branch = sandbox.branch.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        let out = std::process::Command::new("git")
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--quiet")
+            .arg(&sandbox_path)
+            .arg(&refspec)
+            .current_dir(&canonical_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| Error::Internal(format!("push recovery branch failed: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Internal(format!(
+                "push recovery branch failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(branch)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("recovery branch task failed: {e}")))?
 }
 
 /// Garbage-collect orphaned sandboxes: remove sandboxes whose agent no longer exists
@@ -2024,6 +2070,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2128,6 +2175,7 @@ mod tests {
             status: intent_store::SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -2777,6 +2825,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3114,6 +3163,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3476,6 +3526,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3561,6 +3612,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };
@@ -3611,6 +3663,7 @@ mod tests {
             status: SandboxStatus::Created,
             retry_count: 0,
             merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
             created_at: now_iso(),
             updated_at: now_iso(),
         };

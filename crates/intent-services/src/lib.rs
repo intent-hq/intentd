@@ -3769,26 +3769,28 @@ impl Services {
             } => {
                 // Conflict: check retry limit
                 if retry_count >= MAX_RETRIES {
-                    // Exhausted retries; mark merge-pending and propagate
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            workspace_id,
-                            agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
+                    // Bounce retries exhausted: conflicts are deterministic —
+                    // more automatic retries are useless. Land the TERMINAL
+                    // `conflict` status (paths persisted, work pushed to the
+                    // sb/<agentId> recovery branch in canonical, attention
+                    // raised) and propagate so the coordinator learns.
+                    self.finalize_sandbox_conflict(
+                        workspace_id,
+                        agent_id,
+                        &conflicting_paths,
+                        &canonical_head,
+                    )
+                    .await;
                     claim_guard.disarm();
 
                     tracing::warn!(
                         agent = %agent_id.0,
                         retries = retry_count,
-                        "conflict retry limit exhausted; marking merge-pending"
+                        "conflict retry limit exhausted; sandbox is in terminal conflict status"
                     );
 
                     self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-                    return SandboxMergeDisposition::propagate_with("merge_pending");
+                    return SandboxMergeDisposition::propagate_with("conflict");
                 }
 
                 // Bounce: update status, increment retry, fetch canonical, wake agent
@@ -4123,6 +4125,239 @@ impl Services {
         self.clear_sandbox_retry_count(workspace_id, agent_id).await;
     }
 
+    /// Shared terminal-conflict bookkeeping for a merge that hit deterministic
+    /// conflicts with no productive retry left (completion retry cap
+    /// exhausted, any sweep conflict, or a manual merge conflict): persist the
+    /// terminal `conflict` status WITH the conflicting paths in one write,
+    /// push the sandbox's commits to its `sb/<agentId>` branch in the
+    /// canonical repo so the work — including its non-conflicting files — is
+    /// recoverable with normal git tooling, emit `sandbox:cow:conflict`, and
+    /// raise workspace attention so the user is told. Conflicts are
+    /// deterministic (retrying without canonical changing is useless), so the
+    /// row leaves the retry queue entirely; resolution is a later manual
+    /// `sandbox.cow.merge` or `sandbox.cow.discard`. All failures inside are
+    /// logged and swallowed — the terminal status write is the anchor.
+    pub(crate) async fn finalize_sandbox_conflict(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        conflicting_paths: &[String],
+        canonical_head: &str,
+    ) {
+        // Recovery branch FIRST: fetch the sandbox branch into canonical as a
+        // local sb/<agentId> branch (ref-only, worktree untouched) so the
+        // agent's output survives even if the sandbox directory is later lost.
+        let recovery_branch = match crate::sandbox_ops::push_conflict_recovery_branch(
+            &self.store,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(branch) => Some(branch),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "failed to push conflict recovery branch; sandbox work only lives in the sandbox directory"
+                );
+                None
+            }
+        };
+
+        if let Err(e) = self
+            .store
+            .set_sandbox_conflict(workspace_id, agent_id, conflicting_paths, &now_iso())
+            .await
+        {
+            tracing::error!(
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                error = %e,
+                "failed to persist terminal conflict status"
+            );
+        }
+
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: now_iso(),
+            event_type: "sandbox:cow:conflict".to_string(),
+            actor: intent_core::EventActor {
+                actor_type: ActorType::System,
+                id: Some("intentd".to_string()),
+                name: Some("intentd".to_string()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({
+                "workspaceId": workspace_id.0,
+                "agentId": agent_id.0,
+                "conflictingPaths": conflicting_paths,
+                "canonicalHead": canonical_head,
+                "recoveryBranch": recovery_branch,
+            }),
+        };
+        crate::publish_event(&self.event_bus, event).await;
+
+        // Attention: a terminal conflict needs a human/coordinator decision.
+        if let Err(e) = self
+            .raise_attention(workspace_id, WorkspaceAttention::ReviewRequired)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace_id.0,
+                error = %e,
+                "failed to raise attention for sandbox conflict"
+            );
+        }
+
+        tracing::warn!(
+            agent = %agent_id.0,
+            workspace = %workspace_id.0,
+            paths = ?conflicting_paths,
+            recovery_branch = ?recovery_branch,
+            "sandbox merge conflict is terminal; work preserved on recovery branch — resolve via sandbox.cow.merge (after updating canonical) or sandbox.cow.discard"
+        );
+    }
+
+    /// The body of a manual `sandbox.cow.merge` after the RPC handler has
+    /// already claimed the row (`… → merging`) and acknowledged the caller
+    /// (`status: "started"`). Runs on a detached task: attempts the merge and
+    /// persists the terminal outcome — `merged` (shared bookkeeping),
+    /// `conflict` (TERMINAL: paths persisted, recovery branch, attention),
+    /// `merge_pending` (blocked / hard error), or the pre-claim status on a
+    /// dirty bounce with auto-commit off. The claim guard covers task panics.
+    pub(crate) async fn run_claimed_sandbox_merge(
+        &self,
+        workspace_id: &WorkspaceId,
+        sandbox_id: &AgentId,
+        pre_claim_status: intent_store::SandboxStatus,
+    ) {
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
+        use intent_store::SandboxStatus;
+
+        let store = &self.store;
+        let mut claim_guard =
+            MergeClaimGuard::armed(store.clone(), workspace_id.clone(), sandbox_id.clone());
+
+        // Same dirty-state policy as the automatic paths: with the
+        // workspace's auto-commit ON, commit uncommitted sandbox state
+        // (LLM-assisted message when generatable); OFF, refuse — the sandbox
+        // returns to its pre-claim status and the agent must commit its own
+        // work first.
+        let dirty_handling = if self.effective_auto_commit(workspace_id).await {
+            let message = match store.get_agent_session(sandbox_id).await {
+                Ok(session) => {
+                    self.sandbox_dirty_commit_message(sandbox_id, &session)
+                        .await
+                }
+                Err(_) => None,
+            };
+            DirtyHandling::Commit(message)
+        } else {
+            DirtyHandling::Bounce
+        };
+
+        let outcome =
+            match merge_sandbox_with(store, workspace_id, sandbox_id, dirty_handling).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // Hard error: return the sandbox to merge_pending so it
+                    // stays visible to the retry sweep and retryable via the
+                    // RPC rather than stranded `merging`.
+                    tracing::error!(
+                        agent = %sandbox_id.0,
+                        workspace = %workspace_id.0,
+                        error = %e,
+                        "manual sandbox merge failed; marking merge-pending"
+                    );
+                    let _ = store
+                        .update_sandbox_status(
+                            workspace_id,
+                            sandbox_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    claim_guard.disarm();
+                    return;
+                }
+            };
+
+        match outcome {
+            MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+                ..
+            } => {
+                self.finalize_sandbox_merged(
+                    workspace_id,
+                    sandbox_id,
+                    &commit_range,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+            }
+            MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            } => {
+                // Manual merges have no live agent turn to bounce: a conflict
+                // is deterministic, so it lands terminally right away.
+                self.finalize_sandbox_conflict(
+                    workspace_id,
+                    sandbox_id,
+                    &conflicting_paths,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+            }
+            MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            } => {
+                let _ = store
+                    .update_sandbox_status(
+                        workspace_id,
+                        sandbox_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                tracing::warn!(
+                    agent = %sandbox_id.0,
+                    workspace = %workspace_id.0,
+                    reason = %reason,
+                    paths = ?overlapping_paths,
+                    "manual sandbox merge blocked; sandbox back to merge_pending"
+                );
+            }
+            MergeOutcome::Dirty { dirty_paths } => {
+                // Nothing was committed or merged; restore the pre-claim
+                // status so the sandbox stays where it was.
+                let _ = store
+                    .update_sandbox_status(workspace_id, sandbox_id, pre_claim_status, &now_iso())
+                    .await;
+                claim_guard.disarm();
+                tracing::info!(
+                    agent = %sandbox_id.0,
+                    workspace = %workspace_id.0,
+                    paths = ?dirty_paths,
+                    "manual sandbox merge refused: dirty sandbox with auto-commit off"
+                );
+            }
+        }
+    }
+
     /// Crash-recovery for sandboxes stranded `merging`: every merge path
     /// (completion interception, `sandbox.cow.merge` RPC, retry sweep) transits
     /// through `merging`, so a daemon crash mid-merge leaves the row there —
@@ -4204,15 +4439,22 @@ impl Services {
     ///   consuming the retry cap: blocked-ness (dirty canonical overlap,
     ///   missing/unborn branch) resolves externally, and one attempt per
     ///   sweep period is not hammering;
-    /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
-    ///   returned to `merge_pending`.
+    /// - `Conflict` → TERMINAL `conflict` status right away
+    ///   ([`Services::finalize_sandbox_conflict`]): conflicts are
+    ///   deterministic — canonical did not change between sweeps, so
+    ///   retrying is useless. The row leaves the retry queue entirely
+    ///   (only `merge_pending` rows are swept), so a wedged conflict can
+    ///   never starve later sandboxes;
+    /// - hard errors → `retry_count` incremented, sandbox returned to
+    ///   `merge_pending`.
+    ///
+    /// **Merge-lane independence:** sandboxes are grouped by workspace and
+    /// each workspace's queue runs on its own concurrent task — merges into
+    /// one canonical repo must serialize (they mutate its index/worktree),
+    /// but a slow or wedged merge in one workspace must not delay another
+    /// workspace's landings.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
-        use crate::sandbox_ops::{
-            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
-        };
         use intent_store::SandboxStatus;
-
-        let mut summary = MergeSweepSummary::default();
 
         // Live watchdog for stranded `merging` rows: every merge path holds
         // the claim only for the duration of one merge attempt (well under a
@@ -4231,187 +4473,242 @@ impl Services {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "merge retry sweep: listing merge_pending sandboxes failed");
-                return summary;
+                return MergeSweepSummary::default();
             }
         };
 
+        // One lane per workspace: in-workspace order is preserved (same
+        // canonical repo), cross-workspace lanes run concurrently.
+        let mut lanes: HashMap<WorkspaceId, Vec<intent_store::Sandbox>> = HashMap::new();
         for sandbox in pending {
-            let workspace_id = sandbox.workspace_id.clone();
-            let agent_id = sandbox.agent_id.clone();
+            lanes
+                .entry(sandbox.workspace_id.clone())
+                .or_default()
+                .push(sandbox);
+        }
 
-            // `mergeOnTurnEnd: false` sandboxes only reach `merge_pending`
-            // via a failed manual `sandbox.cow.merge`; auto-retrying would
-            // undermine the parent's control over when merging happens, so
-            // leave them for another explicit merge (or discard).
-            if !sandbox.merge_on_turn_end {
-                summary.skipped_manual_merge += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    "merge retry sweep: sandbox has mergeOnTurnEnd=false; skipping (manual merge only)"
-                );
-                continue;
-            }
-
-            if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
-                summary.skipped_capped += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    retries = sandbox.retry_count,
-                    "merge retry sweep: retry cap reached; sandbox stays merge_pending for manual handling"
-                );
-                continue;
-            }
-
-            // Best-effort politeness check; not a correctness guard. If the
-            // agent starts a turn right after this check, the turn's own
-            // completion-path merge still cannot collide with the sweep: it
-            // goes through the same CAS claim below and loses to the sweep's
-            // `merging` claim.
-            if self.agent_is_busy(agent_id.clone()) {
-                summary.skipped_busy += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    "merge retry sweep: agent is mid-turn; skipping"
-                );
-                continue;
-            }
-
-            // Atomic claim: only one merge path may own the transition out of
-            // merge_pending. Losing the race means another merge is in flight.
-            match self
-                .store
-                .try_transition_sandbox_status(
-                    &workspace_id,
-                    &agent_id,
-                    SandboxStatus::MergePending,
-                    SandboxStatus::Merging,
-                    &now_iso(),
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    summary.skipped_raced += 1;
-                    tracing::debug!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        "merge retry sweep: sandbox claimed by another merge path; skipping"
-                    );
-                    continue;
+        let mut join = tokio::task::JoinSet::new();
+        for (_, lane) in lanes {
+            let services = self.clone();
+            join.spawn(async move {
+                let mut summary = MergeSweepSummary::default();
+                for sandbox in lane {
+                    services.sweep_one_sandbox(sandbox, &mut summary).await;
                 }
+                summary
+            });
+        }
+        let mut summary = MergeSweepSummary::default();
+        while let Some(res) = join.join_next().await {
+            match res {
+                Ok(lane_summary) => summary.absorb(&lane_summary),
                 Err(e) => {
                     summary.errors += 1;
-                    tracing::warn!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        error = %e,
-                        "merge retry sweep: claiming sandbox failed; skipping"
-                    );
-                    continue;
-                }
-            }
-
-            // Crash-safe claim scope: reset `merging → merge_pending` if the
-            // sweep task is aborted (daemon shutdown) or panics mid-merge.
-            let mut claim_guard =
-                MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
-
-            // Same dirty-state policy as the completion path: with the
-            // workspace's auto-commit OFF the sweep must not commit the
-            // agent's uncommitted work — `Dirty` is handled like `Blocked`
-            // below (back to merge_pending, no retry consumed; the state
-            // resolves externally when the agent commits).
-            let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
-                DirtyHandling::Commit(None)
-            } else {
-                DirtyHandling::Bounce
-            };
-            match merge_sandbox_with(&self.store, &workspace_id, &agent_id, dirty_handling).await {
-                Ok(MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                    ..
-                }) => {
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &agent_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
-                    .await;
-                    claim_guard.disarm();
-                    summary.merged += 1;
-                }
-                Ok(MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                }) => {
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-                    summary.blocked += 1;
-                    tracing::info!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        reason = %reason,
-                        paths = ?overlapping_paths,
-                        "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
-                    );
-                }
-                Ok(MergeOutcome::Dirty { dirty_paths }) => {
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-                    summary.blocked += 1;
-                    tracing::info!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        paths = ?dirty_paths,
-                        "merge retry sweep: sandbox dirty with auto-commit off; will retry next sweep (retry cap not consumed)"
-                    );
-                }
-                Ok(MergeOutcome::Conflict {
-                    conflicting_paths, ..
-                }) => {
-                    let last_error = format!("merge conflict on: {}", conflicting_paths.join(", "));
-                    self.record_sweep_merge_failure(&sandbox, &last_error).await;
-                    claim_guard.disarm();
-                    summary.conflicts += 1;
-                }
-                Err(e) => {
-                    self.record_sweep_merge_failure(&sandbox, &e.to_string())
-                        .await;
-                    claim_guard.disarm();
-                    summary.errors += 1;
+                    tracing::warn!(error = %e, "merge retry sweep: workspace lane task failed");
                 }
             }
         }
 
         summary
+    }
+
+    /// One sweep attempt for one `merge_pending` sandbox (the per-sandbox
+    /// body of [`Services::sweep_merge_pending_sandboxes`]), tallied into
+    /// `summary`. See the sweep's doc comment for the per-outcome contract.
+    async fn sweep_one_sandbox(
+        &self,
+        sandbox: intent_store::Sandbox,
+        summary: &mut MergeSweepSummary,
+    ) {
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
+        use intent_store::SandboxStatus;
+
+        let workspace_id = sandbox.workspace_id.clone();
+        let agent_id = sandbox.agent_id.clone();
+
+        // `mergeOnTurnEnd: false` sandboxes only reach `merge_pending`
+        // via a failed manual `sandbox.cow.merge`; auto-retrying would
+        // undermine the parent's control over when merging happens, so
+        // leave them for another explicit merge (or discard).
+        if !sandbox.merge_on_turn_end {
+            summary.skipped_manual_merge += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                "merge retry sweep: sandbox has mergeOnTurnEnd=false; skipping (manual merge only)"
+            );
+            return;
+        }
+
+        if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
+            summary.skipped_capped += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                retries = sandbox.retry_count,
+                "merge retry sweep: retry cap reached; sandbox stays merge_pending for manual handling"
+            );
+            return;
+        }
+
+        // Best-effort politeness check; not a correctness guard. If the
+        // agent starts a turn right after this check, the turn's own
+        // completion-path merge still cannot collide with the sweep: it
+        // goes through the same CAS claim below and loses to the sweep's
+        // `merging` claim.
+        if self.agent_is_busy(agent_id.clone()) {
+            summary.skipped_busy += 1;
+            tracing::debug!(
+                sandbox = %sandbox.id,
+                agent = %agent_id.0,
+                workspace = %workspace_id.0,
+                "merge retry sweep: agent is mid-turn; skipping"
+            );
+            return;
+        }
+
+        // Atomic claim: only one merge path may own the transition out of
+        // merge_pending. Losing the race means another merge is in flight.
+        match self
+            .store
+            .try_transition_sandbox_status(
+                &workspace_id,
+                &agent_id,
+                SandboxStatus::MergePending,
+                SandboxStatus::Merging,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                summary.skipped_raced += 1;
+                tracing::debug!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    "merge retry sweep: sandbox claimed by another merge path; skipping"
+                );
+                return;
+            }
+            Err(e) => {
+                summary.errors += 1;
+                tracing::warn!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "merge retry sweep: claiming sandbox failed; skipping"
+                );
+                return;
+            }
+        }
+
+        // Crash-safe claim scope: reset `merging → merge_pending` if the
+        // sweep task is aborted (daemon shutdown) or panics mid-merge.
+        let mut claim_guard =
+            MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
+
+        // Same dirty-state policy as the completion path: with the
+        // workspace's auto-commit OFF the sweep must not commit the
+        // agent's uncommitted work — `Dirty` is handled like `Blocked`
+        // below (back to merge_pending, no retry consumed; the state
+        // resolves externally when the agent commits).
+        let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
+            DirtyHandling::Commit(None)
+        } else {
+            DirtyHandling::Bounce
+        };
+        match merge_sandbox_with(&self.store, &workspace_id, &agent_id, dirty_handling).await {
+            Ok(MergeOutcome::Merged {
+                commit_range,
+                canonical_head,
+                ..
+            }) => {
+                self.finalize_sandbox_merged(
+                    &workspace_id,
+                    &agent_id,
+                    &commit_range,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+                summary.merged += 1;
+            }
+            Ok(MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            }) => {
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                summary.blocked += 1;
+                tracing::info!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    reason = %reason,
+                    paths = ?overlapping_paths,
+                    "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
+                );
+            }
+            Ok(MergeOutcome::Dirty { dirty_paths }) => {
+                let _ = self
+                    .store
+                    .update_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await;
+                claim_guard.disarm();
+                summary.blocked += 1;
+                tracing::info!(
+                    sandbox = %sandbox.id,
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.0,
+                    paths = ?dirty_paths,
+                    "merge retry sweep: sandbox dirty with auto-commit off; will retry next sweep (retry cap not consumed)"
+                );
+            }
+            Ok(MergeOutcome::Conflict {
+                conflicting_paths,
+                canonical_head,
+            }) => {
+                // Conflicts are deterministic: canonical did not change
+                // between sweeps, so retrying is useless. Land the
+                // terminal `conflict` status immediately (paths
+                // persisted, recovery branch pushed, attention raised)
+                // instead of burning retries cycling merge_pending.
+                self.finalize_sandbox_conflict(
+                    &workspace_id,
+                    &agent_id,
+                    &conflicting_paths,
+                    &canonical_head,
+                )
+                .await;
+                claim_guard.disarm();
+                summary.conflicts += 1;
+            }
+            Err(e) => {
+                self.record_sweep_merge_failure(&sandbox, &e.to_string())
+                    .await;
+                claim_guard.disarm();
+                summary.errors += 1;
+            }
+        }
     }
 
     /// Watchdog for rows stranded `merging` in a LIVE daemon: any sandbox
@@ -7660,7 +7957,7 @@ impl SandboxMergeDisposition {
 pub struct MergeSweepSummary {
     /// Sandboxes merged back into canonical and discarded.
     pub merged: usize,
-    /// Merge attempts that hit conflicts (retry consumed, back to `merge_pending`).
+    /// Merge attempts that hit conflicts (terminal `conflict` status landed).
     pub conflicts: usize,
     /// Merge attempts blocked externally (no retry consumed, back to `merge_pending`).
     pub blocked: usize,
@@ -7680,6 +7977,18 @@ impl MergeSweepSummary {
     /// True when the sweep did nothing at all (no pending sandboxes touched).
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Fold another summary (one workspace lane's tally) into this one.
+    pub fn absorb(&mut self, other: &Self) {
+        self.merged += other.merged;
+        self.conflicts += other.conflicts;
+        self.blocked += other.blocked;
+        self.skipped_capped += other.skipped_capped;
+        self.skipped_busy += other.skipped_busy;
+        self.skipped_raced += other.skipped_raced;
+        self.skipped_manual_merge += other.skipped_manual_merge;
+        self.errors += other.errors;
     }
 }
 
@@ -8040,6 +8349,12 @@ fn format_sandbox_outcome_suffix(data: &serde_json::Value) -> Option<String> {
             " Sandbox merge is PENDING — the work is NOT in the workspace repo yet; it lives in \
              the sandbox at `{path}`. Resolve via ws.agent.mergeSandbox(agentId) once the \
              blocker clears."
+        ),
+        "conflict" => format!(
+            " Sandbox merge hit a TERMINAL CONFLICT — the work is NOT in the workspace repo; \
+             its commits are preserved on the sandbox's `sb/…` branch in the workspace repo and \
+             in the sandbox at `{path}`. Resolve the conflict manually, then \
+             ws.agent.mergeSandbox(agentId) or discard."
         ),
         "unmerged" => format!(
             " Sandbox left unmerged (mergeOnTurnEnd: false) — the work lives in the sandbox at \
@@ -18190,10 +18505,8 @@ impl WorkspaceApi for Services {
         sandbox_id: AgentId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let services = self.clone();
         Box::pin(async move {
-            use crate::sandbox_ops::{
-                merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
-            };
             use intent_store::SandboxStatus;
 
             // Claim the merge atomically (current status → merging) so the RPC
@@ -18210,7 +18523,7 @@ impl WorkspaceApi for Services {
             let already_in_progress = serde_json::json!({
                 "ok": true,
                 "status": "in_progress",
-                "reason": "a sandbox merge is already in progress; retry after it settles",
+                "reason": "a sandbox merge is already in progress; check sandboxStatus for the outcome",
             });
             if sandbox.status == SandboxStatus::Merging {
                 return Ok(already_in_progress);
@@ -18227,144 +18540,27 @@ impl WorkspaceApi for Services {
             if !claimed {
                 return Ok(already_in_progress);
             }
-            // Crash-safe claim scope: reset `merging → merge_pending` if this
-            // future is dropped (client disconnect / eval timeout) or panics
-            // before a terminal status lands.
-            let mut claim_guard =
-                MergeClaimGuard::armed(store.clone(), workspace_id.clone(), sandbox_id.clone());
 
-            // Same dirty-state policy as the automatic paths: with the
-            // workspace's auto-commit ON, commit uncommitted sandbox state
-            // (LLM-assisted message when generatable); OFF, refuse — the
-            // caller sees `status: "dirty"` and the agent must commit its
-            // own work first.
-            let dirty_handling = if self.effective_auto_commit(&workspace_id).await {
-                let message = match store.get_agent_session(&sandbox_id).await {
-                    Ok(session) => {
-                        self.sandbox_dirty_commit_message(&sandbox_id, &session)
-                            .await
-                    }
-                    Err(_) => None,
-                };
-                DirtyHandling::Commit(message)
-            } else {
-                DirtyHandling::Bounce
-            };
-
-            // Attempt merge. On a hard error return the sandbox to
-            // merge_pending so it stays visible to the retry sweep and
-            // retryable via this RPC rather than stranded `merging`.
-            let outcome = match merge_sandbox_with(
-                &store,
-                &workspace_id,
-                &sandbox_id,
-                dirty_handling,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-                    return Err(e);
-                }
-            };
-
-            match outcome {
-                MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                    ..
-                } => {
-                    // Shared bookkeeping: mark merged, emit
-                    // sandbox:cow:merged, clear retry count. The sandbox
-                    // persists (agent-lifetime lifecycle).
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &sandbox_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
+            // ASYNC CONTRACT: a merge takes minutes on a large repo — longer
+            // than every RPC/MCP caller budget (the 30s `workspace_api` eval
+            // timeout made the old synchronous result unreachable, while an
+            // abandoned call still ran the merge daemon-side). Acknowledge
+            // immediately and run the merge on a DETACHED task; the outcome
+            // is observable via the sandbox row (`agent.status`
+            // `sandboxStatus`, `sandbox.cow.get`) and the settlement events
+            // (`sandbox:cow:merged` / `sandbox:cow:conflict`).
+            let pre_claim_status = sandbox.status;
+            tokio::spawn(async move {
+                services
+                    .run_claimed_sandbox_merge(&workspace_id, &sandbox_id, pre_claim_status)
                     .await;
-                    claim_guard.disarm();
+            });
 
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "merged",
-                        "commitRange": commit_range,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Conflict {
-                    conflicting_paths,
-                    canonical_head,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::ConflictBounced,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "conflict",
-                        "conflictingPaths": conflicting_paths,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "blocked",
-                        "reason": reason,
-                        "overlappingPaths": overlapping_paths,
-                    }))
-                }
-                MergeOutcome::Dirty { dirty_paths } => {
-                    // Nothing was committed or merged; restore the pre-claim
-                    // status so the sandbox stays where it was.
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            sandbox.status,
-                            &now_iso(),
-                        )
-                        .await;
-                    claim_guard.disarm();
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "dirty",
-                        "reason": "sandbox has uncommitted changes and workspace auto-commit is disabled; the agent must commit its work first",
-                        "dirtyPaths": dirty_paths,
-                    }))
-                }
-            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "status": "started",
+                "reason": "merge started in the background; poll sandboxStatus (merged / conflict / merge_pending / pre-merge status on a dirty bounce) or watch sandbox:cow:* events for the outcome",
+            }))
         })
     }
 

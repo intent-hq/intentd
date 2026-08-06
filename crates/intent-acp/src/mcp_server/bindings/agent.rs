@@ -553,21 +553,29 @@ async fn status(
                 if let Some(merge) = sb.get("mergeOnTurnEnd") {
                     obj.insert("mergeOnTurnEnd".to_string(), merge.clone());
                 }
+                // Terminal-conflict context: present only while the row is
+                // in the terminal `conflict` status.
+                if let Some(paths) = sb.get("conflictingPaths") {
+                    obj.insert("sandboxConflictingPaths".to_string(), paths.clone());
+                }
             }
         }
     }
     Ok(out)
 }
 
-/// `ws.agent.mergeSandbox(agentId)`: manually trigger a sandbox merge-back
-/// for a sandboxed agent — the MCP face of the `sandbox.cow.merge` RPC. The
+/// `ws.agent.mergeSandbox(agentId)`: start a sandbox merge-back for a
+/// sandboxed agent — the MCP face of the `sandbox.cow.merge` RPC. The
 /// primary consumer is a parent that delegated with `mergeOnTurnEnd: false`
-/// and now wants the child's work in the workspace repo. The result carries
-/// `status`: `"merged"` (with `commitRange` + `canonicalHead`), `"conflict"`
-/// (with `conflictingPaths`), `"blocked"` (with `reason` +
-/// `overlappingPaths`), or `"dirty"` (uncommitted sandbox changes with
-/// workspace auto-commit off; `dirtyPaths`). Errors surface for a missing
-/// sandbox or a merge already in progress.
+/// and now wants the child's work in the workspace repo. ASYNC contract: a
+/// merge can take minutes on a large repo (far beyond the 30s eval budget),
+/// so the call acknowledges immediately with `status: "started"` (merge runs
+/// on a detached daemon task) or `"in_progress"` (another merge path already
+/// owns the sandbox). The outcome is observable via
+/// `ws.agent.status(agentId).sandboxStatus` (`merged` / `conflict` /
+/// `merge_pending` / unchanged on a dirty bounce) and the
+/// `sandbox:cow:merged` / `sandbox:cow:conflict` events. Errors surface for
+/// a missing sandbox.
 async fn merge_sandbox(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,

@@ -550,9 +550,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_cap_exhausted_propagates_with_merge_pending() {
+    async fn test_retry_cap_exhausted_propagates_with_terminal_conflict() {
         // Scenario (c): Retry cap exhausted (retry_count >= 2) →
-        // completion DOES propagate with merge-pending status.
+        // completion DOES propagate, and the conflict is TERMINAL: status
+        // `conflict` with conflictingPaths persisted and the sandbox's
+        // commits preserved on its sb/<agentId> branch in canonical.
 
         let (store, _db) = temp_store().await;
         let (test_root, repo_path) = temp_repo_in_target("retry-cap");
@@ -679,9 +681,19 @@ mod tests {
             "Parent should receive wake when retry cap exhausted"
         );
 
-        // Assert: sandbox status is MergePending
+        // Assert: terminal conflict with paths persisted
         let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
-        assert_eq!(sandbox.status, SandboxStatus::MergePending);
+        assert_eq!(sandbox.status, SandboxStatus::Conflict);
+        assert_eq!(sandbox.conflicting_paths, vec!["file.txt".to_string()]);
+
+        // Assert: the sandbox's commits were preserved in canonical on the
+        // sb/<agentId> recovery branch (canonical worktree untouched).
+        let canonical_repo = Repository::open(&repo_path).unwrap();
+        let recovery_ref = canonical_repo
+            .find_reference(&format!("refs/heads/sb/{}", child_id.0))
+            .expect("recovery branch must exist in canonical");
+        let recovery_tip = recovery_ref.peel_to_commit().unwrap();
+        assert_eq!(recovery_tip.message().unwrap_or(""), "Sandbox");
 
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
@@ -932,6 +944,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sweep_wedged_sandbox_does_not_block_other_merges() {
+        // Merge-lane independence regression: sandbox X wedged (claimed
+        // `merging` with a live-looking timestamp — the watchdog must not
+        // touch it, and it never settles) must not stop sandbox Y's clean
+        // merge_pending work from landing in the same sweep pass.
+
+        let (store, _db) = temp_store().await;
+        let agent_x = AgentId::from("agent-wedged");
+        let Some((test_root, repo_path, _sandbox_x, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-lanes", &agent_x).await
+        else {
+            return;
+        };
+
+        // Wedge X: freshly-claimed `merging` (not stale) — skipped by both
+        // the watchdog and the merge_pending listing.
+        store
+            .update_sandbox_status(&ws.id, &agent_x, SandboxStatus::Merging, &now_iso())
+            .await
+            .unwrap();
+
+        // Second sandbox Y in the SAME workspace with clean, mergeable work.
+        let agent_y = AgentId::from("agent-behind");
+        let config = ProvisionConfig {
+            workspaces_root: test_root.join("workspaces"),
+        };
+        create_agent_session(&store, &ws.id, &agent_y, None, None).await;
+        let outcome = provision_sandbox(&store, &ws.id, &agent_y, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_y, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+        let mut session = store.get_agent_session(&agent_y).await.unwrap();
+        session.sandbox_path = Some(sandbox_y.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", agent_y.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        let sandbox_repo = Repository::open(&sandbox_y).unwrap();
+        fs::write(sandbox_y.join("behind.txt"), "queued work").unwrap();
+        let mut index = sandbox_repo.index().unwrap();
+        index.add_path(Path::new("behind.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+        let parent_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Behind work",
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap();
+        store
+            .update_sandbox_status(&ws.id, &agent_y, SandboxStatus::MergePending, &now_iso())
+            .await
+            .unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.merged, 1, "Y must land despite X being wedged");
+        assert!(
+            repo_path.join("behind.txt").exists(),
+            "Y's commit must reach canonical"
+        );
+        let x = store.get_sandbox(&ws.id, &agent_x).await.unwrap().unwrap();
+        assert_eq!(
+            x.status,
+            SandboxStatus::Merging,
+            "Wedged X untouched (fresh claim; watchdog must not reset it)"
+        );
+        let y = store.get_sandbox(&ws.id, &agent_y).await.unwrap().unwrap();
+        assert_eq!(y.status, SandboxStatus::Merged);
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
     async fn test_sweep_skips_sandbox_at_retry_cap() {
         // A sandbox that already burned the retry cap stays merge_pending for
         // manual sandbox.cow.merge / sandbox.cow.discard — the sweep must not touch it.
@@ -1008,10 +1104,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sweep_conflict_consumes_retry_and_returns_to_merge_pending() {
-        // A conflicting merge attempt consumes one retry and returns the
-        // sandbox to merge_pending (not conflict_bounced — there is no live
-        // agent turn to bounce).
+    async fn test_sweep_conflict_lands_terminal_conflict_status() {
+        // A conflicting sweep merge lands the TERMINAL `conflict` status
+        // immediately (no live agent turn to bounce, and conflicts are
+        // deterministic — retrying without canonical changing is useless):
+        // conflictingPaths persisted, commits preserved on the sb/<agentId>
+        // recovery branch, and the row leaves the retry queue.
 
         let (store, _db) = temp_store().await;
         let agent_id = AgentId::from("agent-conflicted");
@@ -1049,15 +1147,31 @@ mod tests {
         let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
         assert_eq!(
             sandbox.status,
-            SandboxStatus::MergePending,
-            "Conflicted sandbox returns to merge_pending"
+            SandboxStatus::Conflict,
+            "Sweep conflict is terminal"
         );
-        assert_eq!(sandbox.retry_count, 1, "Conflict consumes one retry");
+        assert_eq!(
+            sandbox.conflicting_paths,
+            vec!["swept.txt".to_string()],
+            "Conflicting paths persisted on the row"
+        );
         assert!(sandbox_path.exists(), "Sandbox must not be discarded");
         let canonical_content = fs::read_to_string(repo_path.join("swept.txt")).unwrap();
         assert_eq!(
             canonical_content, "canonical version",
             "Canonical must stay pristine on conflict"
+        );
+        // Work preserved: recovery branch in canonical carries the sandbox tip.
+        let recovery_ref = canonical_repo
+            .find_reference(&format!("refs/heads/sb/{}", agent_id.0))
+            .expect("recovery branch must exist in canonical");
+        assert!(recovery_ref.peel_to_commit().is_ok());
+
+        // Terminal rows leave the retry queue: the next sweep does not touch it.
+        let summary2 = services.sweep_merge_pending_sandboxes().await;
+        assert!(
+            summary2.is_empty(),
+            "Terminal conflict must not be re-swept: {summary2:?}"
         );
 
         let _ = fs::remove_dir_all(&test_root);
@@ -1291,18 +1405,20 @@ mod tests {
         services.handle_completion_event(&event).await;
         assert!(!repo_path.join("kept.txt").exists());
 
-        // Manual merge via the sandbox.cow.merge RPC path.
+        // Manual merge via the sandbox.cow.merge RPC path. ASYNC contract:
+        // immediate "started" ack, outcome lands on the sandbox row.
         let result = services
             .sandbox_merge(ws.id.clone(), child_id.clone())
             .await
-            .expect("manual merge should succeed");
-        assert_eq!(result["status"], json!("merged"));
+            .expect("manual merge should start");
+        assert_eq!(result["status"], json!("started"));
+        let status =
+            wait_for_sandbox_status(&store, &ws.id, &child_id, SandboxStatus::Merged).await;
+        assert_eq!(status, SandboxStatus::Merged);
         assert!(
             repo_path.join("kept.txt").exists(),
             "Manual merge must land the sandbox commit in canonical"
         );
-        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
-        assert_eq!(sandbox.status, SandboxStatus::Merged);
 
         let _ = fs::remove_dir_all(&test_root);
     }
@@ -1842,24 +1958,18 @@ mod tests {
         let result = services
             .sandbox_merge(ws.id.clone(), child_id.clone())
             .await
-            .expect("dirty merge must be a typed result, not an error");
-        assert_eq!(result["status"], json!("dirty"));
-        assert!(
-            result["dirtyPaths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|p| p.as_str().unwrap().contains("dirty.txt")),
-            "dirtyPaths must name the uncommitted file: {result}"
-        );
+            .expect("dirty merge must start, not error");
+        assert_eq!(result["status"], json!("started"));
 
-        assert!(!repo_path.join("dirty.txt").exists());
-        assert!(sandbox_path.join("dirty.txt").exists());
-        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        // Async outcome: the dirty bounce restores the pre-claim status.
+        let status =
+            wait_for_sandbox_status(&store, &ws.id, &child_id, sandbox_before.status).await;
         assert_eq!(
-            sandbox.status, sandbox_before.status,
+            status, sandbox_before.status,
             "Sandbox must return to its pre-claim status"
         );
+        assert!(!repo_path.join("dirty.txt").exists());
+        assert!(sandbox_path.join("dirty.txt").exists());
 
         let _ = fs::remove_dir_all(&test_root);
     }
