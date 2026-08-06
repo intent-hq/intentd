@@ -19151,8 +19151,9 @@ async fn dismiss_questions_notifies_agent_immediately_when_idle() {
     assert_eq!(
         last.content[0]["text"],
         json!(
-            "User dismissed your 1 question without answering. Do not re-ask; \
-             continue with your best judgment."
+            "User dismissed your 1 question without answering. This is an \
+             informative notice only — do not re-ask and do not proceed with \
+             any work; end your turn and wait for the user's next message."
         ),
         "singular wording with the derived count"
     );
