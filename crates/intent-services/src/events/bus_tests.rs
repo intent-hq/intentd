@@ -149,6 +149,46 @@ async fn non_agent_file_events_broadcast_without_persisting() {
     assert_eq!(rows[0].actor.actor_type, ActorType::Agent);
 }
 
+/// A non-agent `file:*` burst larger than the broadcast buffer must still reach a
+/// subscriber that is actively draining. Transient events are unrecoverable once
+/// dropped (nothing to re-read from the log), so unlike the persisted path — which
+/// yields on `writer_tx.send()` — the transient path must yield explicitly to let
+/// delivery tasks keep up with a non-collapsing burst such as the watcher's
+/// shutdown `flush_all`.
+#[tokio::test]
+async fn large_transient_file_burst_reaches_a_draining_subscriber() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["file:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    // Exceed BROADCAST_CAPACITY (1024) in one uninterrupted publish loop.
+    const BURST: usize = 1500;
+    let consumer = tokio::spawn(async move {
+        let mut received = 0usize;
+        while received < BURST {
+            match timeout(Duration::from_secs(5), sub.recv()).await {
+                Ok(Some(batch)) => received += batch.len(),
+                _ => break,
+            }
+        }
+        received
+    });
+
+    for _ in 0..BURST {
+        bus.publish(&new_event(
+            "file:changed",
+            Some("system"),
+            ActorType::System,
+        ))
+        .await
+        .expect("publish");
+    }
+
+    let received = consumer.await.expect("consumer task");
+    assert_eq!(received, BURST, "no transient file event may be dropped");
+}
+
 /// The transient downgrade is scoped to `file:*` — non-agent events in other
 /// categories keep persisting.
 #[tokio::test]

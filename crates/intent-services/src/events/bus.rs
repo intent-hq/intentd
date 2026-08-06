@@ -114,7 +114,16 @@ impl EventBus {
     /// callers see the same `Ok(Event)` shape either way.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
         if is_transient_file_event(ev) {
-            return Ok(self.publish_transient(ev));
+            let event = self.publish_transient(ev);
+            // The persisted path awaits `writer_tx.send()`, which yields and lets
+            // delivery tasks drain the broadcast buffer. The transient path never
+            // pends, so a non-collapsing burst (e.g. the watcher's shutdown
+            // `flush_all`) could otherwise push past BROADCAST_CAPACITY in one
+            // non-yielding loop and lag every subscriber off events that — being
+            // transient — are not recoverable from the log. Yield to keep the
+            // publish loop cooperative.
+            tokio::task::yield_now().await;
+            return Ok(event);
         }
         let (tx, rx) = oneshot::channel();
         let req = (ev.clone(), tx);

@@ -3504,6 +3504,12 @@ use intent_core::{ActorType, EventActor};
 use intent_store::NewEvent;
 
 /// Insert a `file:changed` event for `agent` at `ts` (newest inserted last).
+///
+/// Writes straight to the store, bypassing the bus: that keeps these tests
+/// focused on the read-path projections. Note that non-`Agent` actor rows seeded
+/// here can no longer arise through `EventBus::publish`, which downgrades
+/// non-agent `file:*` events to a transient broadcast — they are retained only to
+/// pin the projection's actor handling for rows already in the log.
 async fn insert_file_event(
     svc: &Services,
     ws: &WorkspaceId,
