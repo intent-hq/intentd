@@ -15725,6 +15725,199 @@ mod worktree_provisioning {
         assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
     }
 
+    /// Insert a hydrated standalone source row (monorepo#1560 fixtures): its
+    /// checkout at `worktreePath` IS its repository, exactly as
+    /// cache-hydrated `workspace.create` persists it.
+    async fn insert_standalone_source(
+        store: &Store,
+        id: &str,
+        checkout: &std::path::Path,
+        mode: intent_core::CheckoutMode,
+    ) -> WorkspaceId {
+        let src_id = WorkspaceId::from(id);
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(checkout.to_string_lossy().to_string());
+        src_ws.worktree_path = Some(checkout.to_string_lossy().to_string());
+        src_ws.checkout_mode = Some(mode);
+        store.insert_workspace(&src_ws).await.expect("insert");
+        src_id
+    }
+
+    /// monorepo#1560: a standalone (`cow`/`direct`) source never yields a
+    /// linked worktree, even with `workspace.cowIsolation` OFF — the
+    /// duplicate is a self-contained clone whose `repositoryPath` is its own
+    /// checkout, and the source checkout gains no branch.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_stays_standalone_with_isolation_off() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupstandalone-src");
+        let root = unique_dir("intentd-dupstandalone-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-standalone-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+
+        assert!(
+            matches!(
+                dup.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            ),
+            "standalone source must never yield a worktree; got {:?}",
+            dup.checkout_mode
+        );
+        let wt = dup.worktree_path.as_deref().expect("checkout provisioned");
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate is a standalone repo");
+        assert_eq!(
+            dup.repository_path.as_deref(),
+            Some(wt),
+            "standalone duplicate's repositoryPath is its own checkout"
+        );
+        let src_repo = git2::Repository::open(&checkout.0).unwrap();
+        assert!(
+            src_repo
+                .find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "standalone duplicate must not create a branch in the source checkout"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(persisted.repository_path.as_deref(), Some(wt));
+        assert_eq!(persisted.checkout_mode, dup.checkout_mode);
+    }
+
+    /// monorepo#1560 regression: the duplicate of a standalone source keeps
+    /// working after the source workspace's checkout directory is deleted —
+    /// no live filesystem reference back into it.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_survives_source_deletion() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupsurvive-src");
+        let root = unique_dir("intentd-dupsurvive-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-survive-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+        let wt = dup
+            .worktree_path
+            .as_deref()
+            .expect("checkout provisioned")
+            .to_string();
+
+        std::fs::remove_dir_all(&checkout.0).expect("delete the source workspace's checkout");
+
+        let clone =
+            git2::Repository::open(&wt).expect("duplicate still opens after source removal");
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            dup.branch.as_str()
+        );
+        clone.statuses(None).expect("git status still works");
+        // Nothing in the duplicate's git config references the source path.
+        let cfg = std::fs::read_to_string(std::path::Path::new(&wt).join(".git/config"))
+            .expect("read clone config");
+        assert!(
+            !cfg.contains(&checkout.0.to_string_lossy().to_string()),
+            "duplicate config must not reference the source checkout: {cfg}"
+        );
+    }
+
+    /// monorepo#1560: an `isNewRepo` `direct` source (no `worktreePath`; the
+    /// user's own folder IS the repository) is duplicated into a standalone
+    /// checkout under the workspaces root, leaving the user's repo free of
+    /// workspace branches and worktree registrations.
+    #[tokio::test]
+    async fn duplicate_of_new_repo_direct_source_leaves_user_repo_clean() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (user_repo, _, _) = seed_repo("intentd-dupnewrepo-src");
+        let root = unique_dir("intentd-dupnewrepo-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = WorkspaceId::from("dup-newrepo-src");
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(user_repo.0.to_string_lossy().to_string());
+        src_ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+        store.insert_workspace(&src_ws).await.expect("insert");
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+
+        let wt = dup.worktree_path.as_deref().expect("checkout provisioned");
+        assert!(
+            std::path::Path::new(wt).starts_with(&root.0),
+            "duplicate checkout lives under the workspaces root"
+        );
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate is a standalone repo");
+        assert_eq!(dup.repository_path.as_deref(), Some(wt));
+        let src_repo = git2::Repository::open(&user_repo.0).unwrap();
+        assert!(
+            src_repo
+                .find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "the user's repo must not gain the duplicate's branch"
+        );
+        assert!(
+            !user_repo.0.join(".git/worktrees").exists(),
+            "the user's repo must not gain a worktree registration"
+        );
+    }
+
+    /// monorepo#1560: with a self-contained `repositoryPath`, duplicating a
+    /// duplicate provisions its own checkout instead of silently producing a
+    /// checkout-less row.
+    #[tokio::test]
+    async fn duplicate_of_a_standalone_duplicate_provisions_its_own_checkout() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupdup-src");
+        let root = unique_dir("intentd-dupdup-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-dup-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+        let dup2 = svc
+            .duplicate_workspace(dup.id.clone(), None)
+            .await
+            .expect("duplicate of the duplicate");
+
+        let wt2 = dup2.worktree_path.as_deref().expect("checkout provisioned");
+        assert_ne!(Some(wt2), dup.worktree_path.as_deref());
+        assert_eq!(dup2.repository_path.as_deref(), Some(wt2));
+        let clone = git2::Repository::open(wt2).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate-of-duplicate is standalone");
+    }
+
     /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
     /// no checkout is provisioned, so there is no mode to record.
     #[tokio::test]

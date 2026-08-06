@@ -7,6 +7,10 @@
 //! `base_ref` and hard-resets tracked files to that base. Untracked files are
 //! deliberately preserved — carrying `node_modules`/`target`-style artifacts
 //! into the checkout for free is the point of CoW.
+//!
+//! [`provision_local_clone_checkout`] is the non-CoW standalone sibling: a
+//! plain local clone of an arbitrary source checkout, used when the filesystem
+//! cannot CoW-clone.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,6 +20,7 @@ use intent_core::{Error, Result};
 
 use crate::cow::cow_clone_with_excludes;
 use crate::map_git_err;
+use crate::repo_cache::{provision_plain_clone_checkout, OriginTarget};
 
 /// How many of the slowest fast-path subtree clones to name in the
 /// provisioning summary log.
@@ -237,6 +242,53 @@ pub(crate) fn checkout_in_clone(
     repo.reset(target.as_object(), git2::ResetType::Hard, None)
         .map_err(map_git_err)?;
     Ok(checked_out_sha)
+}
+
+/// Provision a **standalone** plain-clone checkout from an arbitrary local
+/// source repository — the non-CoW fallback for `workspace.duplicate` of a
+/// standalone (`cow`/`direct`) source (intent-hq/monorepo#1560).
+///
+/// A duplicate of a standalone workspace must never hold a live filesystem
+/// reference into the source workspace's directory (a linked worktree rooted
+/// there is orphaned when the source is deleted, and deleting the duplicate
+/// mutates the source). This produces a self-contained repository instead:
+///
+/// 1. `git clone <source_repo> <checkout_path>` — a plain local clone
+///    (hardlinked objects where the filesystem allows). Committed state only;
+///    uncommitted/untracked work in the source is not carried over.
+/// 2. Overlay the source's own remote-tracking refs
+///    (`+refs/remotes/origin/*:refs/remotes/origin/*`) so `base_ref`
+///    resolution sees every upstream branch, not just the source's local ones.
+/// 3. Create + check out `branch` from `base_ref` via [`checkout_in_clone`]
+///    (same base-ref resolution and branch-reuse semantics as the CoW path)
+///    and hard-reset to it.
+/// 4. Retarget `origin` from the source path to the source's own `origin` URL.
+///    When the source has no `origin` (e.g. an `isNewRepo` local-only repo),
+///    the clone's `origin` remote is **removed** so no config value references
+///    the source path.
+///
+/// Returns the SHA the checkout lands on. On failure after the clone, the
+/// partially provisioned `checkout_path` is removed best-effort. Blocking —
+/// callers run it on the blocking pool.
+pub fn provision_local_clone_checkout(
+    source_repo: &Path,
+    checkout_path: &Path,
+    branch: &str,
+    base_ref: Option<&str>,
+) -> Result<String> {
+    // Read the source's upstream URL before cloning: the clone's own `origin`
+    // points at `source_repo`, so it cannot answer this question itself.
+    let source = Repository::open(source_repo).map_err(map_git_err)?;
+    let source_origin_url = source
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().map(str::to_owned).ok());
+    drop(source);
+    let origin = match source_origin_url.as_deref() {
+        Some(url) => OriginTarget::Url(url),
+        None => OriginTarget::Remove,
+    };
+    provision_plain_clone_checkout(source_repo, checkout_path, origin, branch, base_ref)
 }
 
 #[cfg(test)]
@@ -586,5 +638,169 @@ mod tests {
             timings.slowest_subtrees_display().is_empty(),
             timings.slowest_subtrees.is_empty()
         );
+    }
+
+    /// Every value in the clone's own (local) config, so a test can assert
+    /// nothing still points at the source checkout's path.
+    fn local_config_values(checkout: &std::path::Path) -> Vec<String> {
+        let cfg = git2::Config::open(&checkout.join(".git").join("config")).unwrap();
+        let mut values = Vec::new();
+        let mut entries = cfg.entries(None).unwrap();
+        while let Some(entry) = entries.next() {
+            let entry = entry.unwrap();
+            if let Ok(value) = entry.value() {
+                values.push(value.to_string());
+            }
+        }
+        values
+    }
+
+    /// The clone must be a self-contained repository: a real `.git` directory
+    /// (not a worktree gitfile) and no config value naming the source path.
+    fn assert_self_contained(checkout: &std::path::Path, source: &std::path::Path) {
+        assert!(
+            checkout.join(".git").is_dir(),
+            "clone must own a real .git directory, not a gitfile"
+        );
+        let source_str = source.display().to_string();
+        for value in local_config_values(checkout) {
+            assert!(
+                !value.contains(&source_str),
+                "config value {value:?} still references the source path"
+            );
+        }
+    }
+
+    /// Duplicating a standalone source with an `origin`: the clone is a
+    /// self-contained repo on the workspace branch with `origin` retargeted at
+    /// the source's own upstream URL, never the source path.
+    #[test]
+    fn local_clone_retargets_origin_to_the_source_upstream() {
+        let upstream = init_repo("localclone-upstream");
+        commit_file(upstream.path(), "a.txt", "one\n");
+        let source = init_repo("localclone-src");
+        let upstream_url = format!("file://{}", upstream.path().display());
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &upstream_url).unwrap();
+        }
+        commit_file(source.path(), "a.txt", "one\n");
+        let source_sha = head_sha(&source);
+
+        let checkout = unique_checkout("localclone-origin");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", None).unwrap();
+
+        assert_eq!(sha, source_sha);
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(!clone.is_worktree(), "duplicate is a standalone repo");
+        assert_eq!(clone.head().unwrap().shorthand().unwrap(), "dup-ws");
+        assert_eq!(
+            clone.find_remote("origin").unwrap().url().unwrap(),
+            upstream_url.as_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// Duplicating a source with no `origin` (an `isNewRepo` local-only repo):
+    /// the clone's `origin` is removed rather than left pointing at the source.
+    #[test]
+    fn local_clone_removes_origin_when_source_has_none() {
+        let source = init_repo("localclone-noorigin");
+        commit_file(source.path(), "a.txt", "one\n");
+
+        let checkout = unique_checkout("localclone-noorigin");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", None).unwrap();
+
+        assert_eq!(sha, head_sha(&source));
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "origin must be removed when the source has no upstream"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// A `base_ref` naming a source branch starts the workspace branch there,
+    /// not at the source's HEAD.
+    #[test]
+    fn local_clone_branches_from_base_ref() {
+        let source = init_repo("localclone-base");
+        commit_file(source.path(), "a.txt", "one\n");
+        let base_sha = head_sha(&source);
+        crate::testutil::create_branch(source.path(), "base");
+        commit_file(source.path(), "a.txt", "two\n");
+
+        let checkout = unique_checkout("localclone-base");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", Some("base"))
+            .unwrap();
+
+        assert_eq!(sha, base_sha);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n",
+            "tracked files match the base ref, not the source HEAD"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// A branch name the clone already carries (the source's default branch)
+    /// is reused rather than recreated — `provision_worktree` parity.
+    #[test]
+    fn local_clone_reuses_an_existing_branch_name() {
+        let source = init_repo("localclone-reuse");
+        commit_file(source.path(), "a.txt", "one\n");
+        let branch = head_branch(&source);
+        commit_file(source.path(), "a.txt", "two\n");
+        let tip_sha = head_sha(&source);
+
+        let checkout = unique_checkout("localclone-reuse");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_local_clone_checkout(source.path(), &checkout, &branch, Some(&branch))
+            .unwrap();
+
+        assert_eq!(sha, tip_sha, "reused branch keeps its own tip");
+        let clone = Repository::open(&checkout).unwrap();
+        assert_eq!(clone.head().unwrap().shorthand().unwrap(), branch);
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// An unresolvable `base_ref` surfaces the typed error and removes the
+    /// partially provisioned checkout.
+    #[test]
+    fn local_clone_rejects_unresolvable_base_ref_and_cleans_up() {
+        let source = init_repo("localclone-badref");
+        commit_file(source.path(), "a.txt", "one\n");
+
+        let checkout = unique_checkout("localclone-badref");
+        let _cleanup = Cleanup(checkout.clone());
+        let err = provision_local_clone_checkout(source.path(), &checkout, "dup-ws", Some("nope"))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "nope"),
+            "got: {err:?}"
+        );
+        assert!(!checkout.exists(), "partial checkout is removed on failure");
+    }
+
+    /// A source path that is not a repository fails before any clone work.
+    #[test]
+    fn local_clone_rejects_non_repository_source() {
+        let source = std::env::temp_dir().join("localclone-not-a-repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let _cleanup_src = Cleanup(source.clone());
+        let checkout = unique_checkout("localclone-nonrepo");
+        let _cleanup = Cleanup(checkout.clone());
+
+        let err = provision_local_clone_checkout(&source, &checkout, "dup-ws", None).unwrap_err();
+        assert!(matches!(err, Error::Internal(_)), "got: {err:?}");
+        assert!(!checkout.exists());
     }
 }
