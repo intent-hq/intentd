@@ -26,6 +26,10 @@
 //!    chain settles.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
+//!
+//! The `ws.agent.watch` lifecycle is covered by one test per wake arm, and every
+//! wait is clamped to a per-test [`TEST_BUDGET`] so a stall panics naming its
+//! own step before nextest's 180s kill (monorepo#1562).
 
 #![cfg(unix)]
 
@@ -187,15 +191,52 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
+/// Whole-test wall-clock budget (monorepo#1562). nextest terminates these
+/// binaries after `slow-timeout` 90s × `terminate-after` 2 = 180s, which masks
+/// any in-test deadline that `INTENTD_TEST_TIMEOUT_MULTIPLIER` scales past it:
+/// the run reports a bare "test timed out" instead of the step that stalled.
+/// Every wait below is additionally clamped to this deadline, so a stall always
+/// panics naming its own step with headroom before the kill.
+const TEST_BUDGET: Duration = Duration::from_secs(150);
+
+/// Per-test deadline clamp, started at the top of each test — before the daemon
+/// boots, so startup time counts against it.
+#[derive(Clone, Copy)]
+struct Budget {
+    end: tokio::time::Instant,
+}
+
+impl Budget {
+    fn start() -> Self {
+        Self {
+            end: tokio::time::Instant::now() + TEST_BUDGET,
+        }
+    }
+
+    /// Deadline for one step: `secs` scaled by the multiplier, clamped to the
+    /// whole-test budget.
+    fn step(&self, secs: u64) -> tokio::time::Instant {
+        let scaled = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
+        scaled.min(self.end)
+    }
+}
+
+/// Bound for one RPC round-trip. The shared `common::rpc_read_timeout` (60s
+/// base) scales to the entire 180s kill window at multiplier 3, so clamp it
+/// here — a live daemon answers in milliseconds.
+fn rpc_read_budget() -> Duration {
+    common::rpc_read_timeout().min(Duration::from_secs(45))
+}
+
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(common::rpc_read_timeout(), ws.next())
+        let next = timeout(rpc_read_budget(), ws.next())
             .await
-            .expect("wss rpc timed out");
+            .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -383,8 +424,11 @@ async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> Stri
 /// Await `agent:idle` for `agent_id` on the subscriber stream and return the
 /// full event payload (for idle-annotation assertions such as
 /// `isWaitingForOtherAgents`).
-async fn await_idle_event(sub: &mut TlsWs, agent_id: &str, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
+async fn await_idle_event(
+    sub: &mut TlsWs,
+    agent_id: &str,
+    deadline: tokio::time::Instant,
+) -> Value {
     loop {
         let frame = wss_event_opt_until(sub, deadline)
             .await
@@ -402,8 +446,8 @@ async fn await_idle_event(sub: &mut TlsWs, agent_id: &str, secs: u64) -> Value {
 }
 
 /// Await `agent:idle` for `agent_id` on the subscriber stream.
-async fn await_idle(sub: &mut TlsWs, agent_id: &str, secs: u64) {
-    let _ = await_idle_event(sub, agent_id, secs).await;
+async fn await_idle(sub: &mut TlsWs, agent_id: &str, deadline: tokio::time::Instant) {
+    let _ = await_idle_event(sub, agent_id, deadline).await;
 }
 
 /// Serialized conversation text for an agent.
@@ -426,9 +470,8 @@ async fn await_conversation_contains(
     ws_id: &str,
     agent_id: &str,
     needle: &str,
-    secs: u64,
+    deadline: tokio::time::Instant,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
     loop {
         let text = conversation_text(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
@@ -450,8 +493,8 @@ async fn await_conversation_settled(
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
+    deadline: tokio::time::Instant,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut prev = conversation_text(rpc, *req_id, ws_id, agent_id).await;
     *req_id += 1;
     loop {
@@ -506,8 +549,8 @@ async fn await_watch_count(
     agent_id: &str,
     target: &str,
     expected: usize,
+    deadline: tokio::time::Instant,
 ) {
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
         let n = watch_count_on_target(rpc, *req_id, ws_id, agent_id, target).await;
         *req_id += 1;
@@ -535,6 +578,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
     let Some(script) = gate("WSS agent-subscribe policy E2E") else {
         return;
     };
+    let budget = Budget::start();
 
     const SETUP_SUBS: &str = "WATCH1_SETUP_SUBS";
     const TARGET_GO: &str = "WATCH1_TARGET_GO";
@@ -588,7 +632,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "watcher setup send ok: {sent}");
-    await_idle(&mut setup.sub, &watcher, 60).await;
+    await_idle(&mut setup.sub, &watcher, budget.step(60)).await;
 
     // The probe's tool result (persisted via emitToolBlocks) carries the
     // policy flags: both exact agent types rejected pointing at
@@ -600,7 +644,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
         &ws_id,
         &watcher,
         "msgGuard=",
-        30,
+        budget.step(30),
     )
     .await;
     for flag in [
@@ -626,7 +670,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "target send ok: {sent}");
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    let deadline = budget.step(60);
     let mut saw_message = false;
     let mut saw_tool_call = false;
     let mut saw_idle = false;
@@ -669,7 +713,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
         &ws_id,
         &watcher,
         "note:created",
-        30,
+        budget.step(30),
     )
     .await;
 
@@ -705,28 +749,23 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
     }
 }
 
-/// WATCH-1 (monorepo#1229): `ws.agent.watch(agentId)` through the real MCP
-/// bridge registers a watch that wakes the watcher on the target's idle
-/// completion, blocker (`ws.agent.reportBlocker`), discussion
-/// (`ws.agent.requestDiscussion`), and terminal failure. Every completion
-/// wake retires the watch (deliver-once), so the watcher re-arms between
-/// target turns; `ws.agent.unwatch` stops the wakes.
-#[tokio::test]
-async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss() {
-    let Some(script) = gate("WSS agent.watch lifecycle E2E") else {
-        return;
-    };
+// WATCH-1 (monorepo#1229): the `ws.agent.watch` lifecycle. Each wake arm below
+// is a separate test (monorepo#1562): the arms are independent, and one
+// daemon-boot-plus-five-target-turns test could not finish its scaled budgets
+// inside nextest's 180s kill window, so a stall was reported as a bare timeout
+// instead of a named step.
+const DO_WATCH: &str = "WATCH2_DO_WATCH";
+const DO_UNWATCH: &str = "WATCH2_DO_UNWATCH";
+const TARGET_PLAIN1: &str = "WATCH2_PLAIN_ONE";
+const TARGET_BLOCKER: &str = "WATCH2_BLOCKER";
+const TARGET_DISCUSS: &str = "WATCH2_DISCUSS";
+const TARGET_PLAIN2: &str = "WATCH2_PLAIN_TWO";
+const TARGET_DIE: &str = "WATCH2_DIE";
+const BLOCKER_REASON: &str = "WATCH2 sandbox is broken";
+const DISCUSS_REASON: &str = "WATCH2 need a coordinator decision";
 
-    const DO_WATCH: &str = "WATCH2_DO_WATCH";
-    const DO_UNWATCH: &str = "WATCH2_DO_UNWATCH";
-    const TARGET_PLAIN1: &str = "WATCH2_PLAIN_ONE";
-    const TARGET_BLOCKER: &str = "WATCH2_BLOCKER";
-    const TARGET_DISCUSS: &str = "WATCH2_DISCUSS";
-    const TARGET_PLAIN2: &str = "WATCH2_PLAIN_TWO";
-    const TARGET_DIE: &str = "WATCH2_DIE";
-    const BLOCKER_REASON: &str = "WATCH2 sandbox is broken";
-    const DISCUSS_REASON: &str = "WATCH2 need a coordinator decision";
-
+/// The mock behavior shared by every WATCH-2 arm.
+fn watch_lifecycle_behavior() -> String {
     let watch_js = r#"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
@@ -747,7 +786,7 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         "return await ws.agent.requestDiscussion({});",
         json!(DISCUSS_REASON)
     );
-    let behavior = json!({
+    json!({
         "exitIfPromptContains": TARGET_DIE,
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -789,8 +828,21 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
             { "ifPromptContains": TARGET_PLAIN2, "response": "target plain turn two" },
         ],
     })
-    .to_string();
-    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"])).await;
+    .to_string()
+}
+
+/// One WATCH-2 arm's fixture: the daemon, the WatchTarget/Watcher pair, and the
+/// watcher's first `ws.agent.watch(target)` already armed.
+struct WatchLifecycle {
+    setup: Setup,
+    ws_id: String,
+    target: String,
+    watcher: String,
+    req_id: i64,
+}
+
+async fn boot_watch_lifecycle(script: &str, budget: Budget) -> WatchLifecycle {
+    let mut setup = boot_daemon(script, &watch_lifecycle_behavior(), json!(["agent:*"])).await;
     let ws_id = setup.ws_id.clone();
 
     // Target FIRST (so the watcher's ws.agent.list lookup finds it), then the
@@ -805,7 +857,7 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
     )
     .await;
     assert_eq!(sent["success"], true, "watch send ok: {sent}");
-    await_idle(&mut setup.sub, &watcher, 60).await;
+    await_idle(&mut setup.sub, &watcher, budget.step(60)).await;
     let mut req_id = 20i64;
     let text = await_conversation_contains(
         &mut setup.rpc,
@@ -813,66 +865,92 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         &ws_id,
         &watcher,
         "watched=true",
-        30,
+        budget.step(30),
     )
     .await;
     assert!(
         text.contains(&format!("watchTarget={target}")),
         "watch names the target: {text}"
     );
+    WatchLifecycle {
+        setup,
+        ws_id,
+        target,
+        watcher,
+        req_id,
+    }
+}
 
-    // 1. Target idle → completion wake ("Child agent … completed"), which
-    // retires the watch (deliver-once).
+/// WATCH-2a: the target's idle completion wakes the watcher ("Child agent …
+/// completed") and retires the watch (deliver-once).
+#[tokio::test]
+async fn agent_watch_wakes_on_target_idle_completion_over_wss() {
+    let Some(script) = gate("WSS agent.watch idle-wake E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+    let mut fx = boot_watch_lifecycle(&script, budget).await;
+
     let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         30,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_PLAIN1 }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target, "content": TARGET_PLAIN1 }),
     )
     .await;
     assert_eq!(sent["success"], true, "target turn 1 ok: {sent}");
     let text = await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &watcher,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
         "Child agent WatchTarget",
-        60,
+        budget.step(60),
     )
     .await;
     assert!(
         text.contains("completed."),
         "idle wake reports the target completed: {text}"
     );
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
-
-    // 2. Re-arm, then blocker → attention wake ("Watched agent … reports a
-    // blocker: …"). The attention wake does not consume the watch; the
-    // trailing idle of the same target turn does.
-    let sent = wss_rpc(
-        &mut setup.rpc,
-        31,
-        "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        0,
+        budget.step(60),
     )
     .await;
-    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
+}
+
+/// WATCH-2b: the target's blocker (`ws.agent.reportBlocker`) and discussion
+/// (`ws.agent.requestDiscussion`) each deliver an attention wake carrying the
+/// reason. An attention wake does not consume the watch — the trailing idle of
+/// the same target turn does, so the watcher re-arms between the two turns.
+#[tokio::test]
+async fn agent_watch_wakes_on_blocker_and_discussion_attention_over_wss() {
+    let Some(script) = gate("WSS agent.watch attention-wake E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+    let mut fx = boot_watch_lifecycle(&script, budget).await;
+
     let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         32,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_BLOCKER }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target, "content": TARGET_BLOCKER }),
     )
     .await;
     assert_eq!(sent["success"], true, "target blocker turn ok: {sent}");
     let text = await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &watcher,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
         "reports a blocker",
-        60,
+        budget.step(60),
     )
     .await;
     assert!(
@@ -880,116 +958,146 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
         "blocker wake carries the reason: {text}"
     );
 
-    // 3. Re-arm, then discussion → attention wake ("… requests a
-    // discussion: …").
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
+    // The trailing idle of the blocker turn consumed the watch; re-arm, then
+    // the discussion attention wake.
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        0,
+        budget.step(60),
+    )
+    .await;
     let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         33,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.watcher, "content": DO_WATCH }),
     )
     .await;
     assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        1,
+        budget.step(60),
+    )
+    .await;
     let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         34,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_DISCUSS }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target, "content": TARGET_DISCUSS }),
     )
     .await;
     assert_eq!(sent["success"], true, "target discussion turn ok: {sent}");
     let text = await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &watcher,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
         "requests a discussion",
-        60,
+        budget.step(60),
     )
     .await;
     assert!(
         text.contains(DISCUSS_REASON),
         "discussion wake carries the reason: {text}"
     );
+}
 
-    // 4. Re-arm, unwatch, then a further target completion delivers NO new
-    // wake (unwatch removes the live watch it just re-registered).
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
+/// WATCH-2c: `ws.agent.unwatch` removes the live watch, and a further target
+/// completion delivers NO new wake.
+#[tokio::test]
+async fn agent_unwatch_stops_further_wakes_over_wss() {
+    let Some(script) = gate("WSS agent.unwatch E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+    let mut fx = boot_watch_lifecycle(&script, budget).await;
+
     let sent = wss_rpc(
-        &mut setup.rpc,
-        35,
-        "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
-    )
-    .await;
-    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
-    let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         36,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_UNWATCH }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.watcher, "content": DO_UNWATCH }),
     )
     .await;
     assert_eq!(sent["success"], true, "unwatch send ok: {sent}");
     await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &watcher,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
         "unwatched=true",
-        60,
+        budget.step(60),
     )
     .await;
     // The registry no longer holds a watcher→target watch.
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 0).await;
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        0,
+        budget.step(60),
+    )
+    .await;
     // Drain any wake turns still in flight before taking the baseline.
-    let baseline = await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &watcher).await;
+    let baseline = await_conversation_settled(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        budget.step(60),
+    )
+    .await;
     let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         60,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_PLAIN2 }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target, "content": TARGET_PLAIN2 }),
     )
     .await;
     assert_eq!(sent["success"], true, "target turn 2 ok: {sent}");
     // Prove turn 2 finished via the target's OWN transcript (the shared
     // subscriber stream may hold stale buffered idles from earlier turns).
     await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &target,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.target,
         "target plain turn two",
-        60,
+        budget.step(60),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let after = conversation_text(&mut setup.rpc, 61, &ws_id, &watcher).await;
+    let after = conversation_text(&mut fx.setup.rpc, 61, &fx.ws_id, &fx.watcher).await;
     assert_eq!(baseline, after, "no wake may be delivered after unwatch");
+}
 
-    // 5. Re-watch, then the target's terminal failure wakes the watcher
-    // ("Child agent … failed") — the mock kills every attempt on the DIE
-    // marker, so the one-shot silent redrive is spent and the failure goes
-    // terminal.
+/// WATCH-2d: the target's terminal failure wakes the watcher ("Child agent …
+/// failed") — the mock kills every attempt on the DIE marker, so the one-shot
+/// silent redrive is spent and the failure goes terminal.
+#[tokio::test]
+async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
+    let Some(script) = gate("WSS agent.watch failure-wake E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+    let mut fx = boot_watch_lifecycle(&script, budget).await;
+
     let sent = wss_rpc(
-        &mut setup.rpc,
-        62,
-        "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
-    )
-    .await;
-    assert_eq!(sent["success"], true, "re-watch send ok: {sent}");
-    // The transcript already contains the FIRST watch turn's "watched=true",
-    // so poll the registry (not the transcript) for the re-registration.
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &target, 1).await;
-    let sent = wss_rpc(
-        &mut setup.rpc,
+        &mut fx.setup.rpc,
         63,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_DIE }),
+        json!({ "workspaceId": fx.ws_id, "agentId": fx.target, "content": TARGET_DIE }),
     )
     .await;
     assert_eq!(sent["success"], true, "target die turn accepted: {sent}");
@@ -999,16 +1107,16 @@ async fn agent_watch_wakes_on_idle_attention_failed_and_unwatch_stops_over_wss()
     // falls back to the bare agent id (the `agent:failed` payload carries no
     // agentName).
     let text = await_conversation_contains(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &watcher,
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
         "failed.",
-        120,
+        budget.step(90),
     )
     .await;
     assert!(
-        text.contains(&format!("Child agent {target}")),
+        text.contains(&format!("Child agent {}", fx.target)),
         "failure wake names the target: {text}"
     );
 }
@@ -1050,6 +1158,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     let Some(script) = gate("WSS agent-waiting deferral E2E") else {
         return;
     };
+    let budget = Budget::start();
 
     const COORD_GO: &str = "WATCH3_COORD_GO";
     const MIDDLE_GO: &str = "WATCH3_MIDDLE_GO";
@@ -1110,7 +1219,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "coord watch send ok: {sent}");
-    let coord_idle = await_idle_event(&mut setup.sub, &coord, 60).await;
+    let coord_idle = await_idle_event(&mut setup.sub, &coord, budget.step(60)).await;
     assert_eq!(
         coord_idle["data"]["isWaitingForOtherAgents"],
         json!(true),
@@ -1123,7 +1232,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         &ws_id,
         &coord,
         "coordWatched=true",
-        30,
+        budget.step(30),
     )
     .await;
 
@@ -1138,7 +1247,7 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "middle send ok: {sent}");
-    let middle_idle = await_idle_event(&mut setup.sub, &middle, 60).await;
+    let middle_idle = await_idle_event(&mut setup.sub, &middle, budget.step(60)).await;
     assert_eq!(
         middle_idle["data"]["isWaitingForOtherAgents"],
         json!(true),
@@ -1150,13 +1259,15 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         &ws_id,
         &middle,
         "midWatched=true",
-        30,
+        budget.step(30),
     )
     .await;
 
     // Deferred: no wake reached Coord and its watch on Middle stays armed.
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let text = await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord).await;
+    let text =
+        await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord, budget.step(60))
+            .await;
     assert!(
         !text.contains("Child agent"),
         "no completion wake may be delivered on the interim idle: {text}"
@@ -1182,17 +1293,26 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
         &ws_id,
         &coord,
         "Child agent DeferMiddle",
-        120,
+        budget.step(90),
     )
     .await;
     assert!(
         text.contains("completed."),
         "settlement wake reports middle completed: {text}"
     );
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &coord, &middle, 0).await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &coord,
+        &middle,
+        0,
+        budget.step(60),
+    )
+    .await;
     // Exactly-one wake: drain Coord's wake turns, then count the persisted
     // wake rows naming Middle.
-    await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord).await;
+    await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord, budget.step(60)).await;
     let wakes = wake_row_count(
         &mut setup.rpc,
         req_id,
@@ -1214,6 +1334,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
     let Some(script) = gate("WSS agent-waiting re-arm deferral E2E") else {
         return;
     };
+    let budget = Budget::start();
 
     const MIDDLE_GO: &str = "WATCH4_MIDDLE_GO";
     const REARM_GO: &str = "WATCH4_REARM_GO";
@@ -1273,7 +1394,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "middle send ok: {sent}");
-    let middle_idle = await_idle_event(&mut setup.sub, &middle, 60).await;
+    let middle_idle = await_idle_event(&mut setup.sub, &middle, budget.step(60)).await;
     assert_eq!(
         middle_idle["data"]["isWaitingForOtherAgents"],
         json!(true),
@@ -1286,7 +1407,7 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &ws_id,
         &middle,
         "midWatched=true",
-        30,
+        budget.step(30),
     )
     .await;
 
@@ -1307,14 +1428,21 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &ws_id,
         &watcher,
         "rearmed=true",
-        60,
+        budget.step(60),
     )
     .await;
 
     // No synthetic completion: the watcher's transcript stays wake-free and
     // its watch on Middle stays armed.
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let text = await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &watcher).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        budget.step(60),
+    )
+    .await;
     assert!(
         !text.contains("Child agent"),
         "re-arm on an idle-but-waiting target must not fire synthetically: {text}"
@@ -1339,15 +1467,31 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &ws_id,
         &watcher,
         "Child agent RearmMiddle",
-        120,
+        budget.step(90),
     )
     .await;
     assert!(
         text.contains("completed."),
         "settlement wake reports middle completed: {text}"
     );
-    await_watch_count(&mut setup.rpc, &mut req_id, &ws_id, &watcher, &middle, 0).await;
-    await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &watcher).await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        &middle,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        budget.step(60),
+    )
+    .await;
     let wakes = wake_row_count(
         &mut setup.rpc,
         req_id,
