@@ -11405,7 +11405,11 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+    fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
@@ -11447,9 +11451,18 @@ impl WorkspaceApi for Services {
             // subsequent drain/wake parks behind the archived gates — so the
             // sweep accepts it rather than adding a post-claim re-check to
             // the hot drain path.
+            //
+            // The initiating agent (`caller_agent_id`, set only on the MCP
+            // `ws.workspace.archive` front door) is excluded: it is
+            // necessarily mid-turn — blocked awaiting this very tool call —
+            // so interrupting it aborts the worker that owns the in-flight
+            // MCP dispatch. The tool result never reaches the child, the
+            // turn never settles, and the busy slot leaks (workspace
+            // activity stays `agent_running`). The caller's turn ends
+            // normally once the tool result is delivered.
             if let Some(manager) = manager {
                 for (agent_id, agent_ws) in manager.list_busy() {
-                    if agent_ws == id {
+                    if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
                         manager.interrupt(&agent_id).await;
                     }
                 }

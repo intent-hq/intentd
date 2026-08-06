@@ -4920,7 +4920,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     mgr.workers.lock().unwrap().insert(id.clone(), worker);
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
     assert!(archived.archived, "workspace archived");
@@ -4972,6 +4972,88 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
         .expect("session row preserved");
 }
 
+/// Regression (intent-hq/monorepo#1565): an agent archiving its OWN workspace
+/// via `ws.workspace.archive` must not be interrupted by the sweep. The
+/// caller is mid-turn — blocked awaiting the MCP tool result — so aborting
+/// its worker orphans the tool call and leaks the busy slot (the workspace
+/// stays `agent_running` forever). Every OTHER in-flight turn is still
+/// interrupted keep-alive.
+#[tokio::test]
+async fn archive_workspace_skips_the_calling_agents_turn() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-self");
+    let caller = AgentId::from("a-archive-caller");
+    let other = AgentId::from("a-archive-other");
+    seed_agent(&mgr, &ws, &caller).await;
+    insert_extra_session(&mgr, &ws, &other).await;
+    for id in [&caller, &other] {
+        mgr.services
+            .store
+            .set_acp_session_id(&ws, id, &format!("acp-{}", id.as_str()))
+            .await
+            .unwrap();
+        assert!(mgr.try_begin(id, &ws).await);
+        let worker = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    }
+    let _caller_agent = track_mock_agent(&mgr, &caller, false);
+    let _other_agent = track_mock_agent(&mgr, &other, false);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let archived =
+        <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), Some(caller.clone()))
+            .await
+            .expect("archive workspace");
+    assert!(archived.archived, "workspace archived");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let interrupted: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:end")
+        .filter_map(|e| e.data["agentId"].as_str())
+        .collect();
+    assert_eq!(
+        interrupted,
+        vec![other.as_str()],
+        "only the non-calling agent is interrupted"
+    );
+
+    // The caller's turn is untouched: its slot is still held and its worker
+    // still registered, so the in-flight MCP dispatch can return and the turn
+    // ends normally through its own `end_turn`.
+    assert!(mgr.is_busy(&caller), "caller keeps its in-flight slot");
+    assert!(
+        mgr.workers.lock().unwrap().contains_key(&caller),
+        "caller's turn worker survives the sweep"
+    );
+    assert!(!mgr.is_busy(&other), "other agent's slot released");
+    assert!(
+        !mgr.workers.lock().unwrap().contains_key(&other),
+        "other agent's worker aborted"
+    );
+
+    // The caller settles normally once its turn completes — no phantom
+    // running agent left behind (the delete-time symptom in #1565).
+    mgr.end_turn(&caller).await;
+    assert!(!mgr.is_busy(&caller), "caller settles after its turn ends");
+    assert!(
+        mgr.list_busy().is_empty(),
+        "no busy agents remain in the archived workspace"
+    );
+}
+
 /// Pending queued messages survive `workspace.archive` untouched and are NOT
 /// drained into a new turn while the workspace is archived (the archived gate
 /// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
@@ -5004,7 +5086,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
 
-    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
 
@@ -5057,7 +5139,7 @@ async fn archive_workspace_parks_wake_deliveries() {
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
 
-    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
 

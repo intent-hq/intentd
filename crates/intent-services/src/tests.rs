@@ -4622,7 +4622,7 @@ mod change_event_parity {
         let mut sub = subscribe(&h);
         let ws = h
             .services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive");
         let archived_at = ws.archived_at.expect("archivedAt persisted");
@@ -4955,7 +4955,7 @@ mod change_event_parity {
         // Archive — must return activity=agent_running.
         let archived = h
             .services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive workspace");
         assert_eq!(
@@ -4975,7 +4975,7 @@ mod change_event_parity {
 
         // Archive first.
         h.services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive workspace");
 

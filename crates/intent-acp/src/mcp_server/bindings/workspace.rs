@@ -346,7 +346,13 @@ async fn archive(
             blocking.join(", ")
         ));
     }
-    let updated = api.archive_workspace(ws.clone()).await.map_err(map_err)?;
+    // The caller rides along so the service-layer interrupt sweep skips it:
+    // the calling agent is mid-turn awaiting this tool result, and
+    // interrupting it would abort the worker owning this dispatch.
+    let updated = api
+        .archive_workspace(ws.clone(), caller_agent_id.cloned())
+        .await
+        .map_err(map_err)?;
     Ok(json!({
         "ok": true,
         "status": updated.status,

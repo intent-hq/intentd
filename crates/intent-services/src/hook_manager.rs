@@ -2066,7 +2066,10 @@ mod tests {
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert!(svc.hook_task_alive(&hook.hook_id));
 
-        let archived = svc.archive_workspace(ws.clone()).await.expect("archive");
+        let archived = svc
+            .archive_workspace(ws.clone(), None)
+            .await
+            .expect("archive");
         assert!(archived.archived, "workspace archived");
 
         assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
