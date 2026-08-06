@@ -336,7 +336,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn missing_root_watches_nearest_ancestor_non_recursively() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new("miss");
         let root = dir.path.join(".intent").join("specialists");
         let watch = watch_root(root, md_only, || {}).expect("watch root");
@@ -354,7 +358,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn root_created_later_promotes_and_detects_subsequent_changes() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new("promote");
         let root = dir.path.join(".intent").join("specialists");
         let hits = Arc::new(AtomicUsize::new(0));
@@ -402,7 +410,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn directory_only_deletion_is_forwarded() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new("rmdir");
         let root = dir.path.join("specialists");
         std::fs::create_dir_all(root.join("nested")).expect("mk root + nested dir");
