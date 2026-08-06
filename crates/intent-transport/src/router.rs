@@ -1120,6 +1120,7 @@ async fn dispatch(
             let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
+                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
@@ -1505,6 +1506,7 @@ async fn dispatch(
                 })?;
             let input = AgentWakeOrCreateInput {
                 model: opt_nonempty_str(params, "model"),
+                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
