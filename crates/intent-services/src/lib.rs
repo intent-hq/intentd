@@ -17567,19 +17567,22 @@ impl WorkspaceApi for Services {
             // falling back to the flat REST list grouped by reply parent (the
             // same fallback as `pr.listReviewComments`; resolution state is
             // unavailable there, so every fallback thread counts as
-            // unresolved).
-            let threads =
+            // unresolved). The fallback is surfaced via
+            // `comments.threadResolutionUnknown` so consumers can tell the
+            // unresolved count is unreliable rather than silently treating
+            // resolved threads as unresolved.
+            let (threads, thread_resolution_unknown) =
                 match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
                     .await
                 {
-                    Ok((threads, _, _)) => threads,
+                    Ok((threads, _, _)) => (threads, false),
                     Err(_) => {
                         let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
                             sc.list_review_comments(&repo_ref, pr_number, p)
                         })
                         .await
                         .map_err(pr_ops::map_sc_err)?;
-                        pr_ops::fallback_threads(comments)
+                        (pr_ops::fallback_threads(comments), true)
                     }
                 };
             let (review_comment_count, unresolved_thread_count) =
@@ -17615,6 +17618,7 @@ impl WorkspaceApi for Services {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
                     "unresolvedThreadCount": unresolved_thread_count,
+                    "threadResolutionUnknown": thread_resolution_unknown,
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))

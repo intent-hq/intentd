@@ -7698,6 +7698,8 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
+        // Threads came from GraphQL, so resolution state is authoritative.
+        assert_eq!(v["comments"]["threadResolutionUnknown"], false);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
@@ -7705,7 +7707,9 @@ mod pr {
     async fn state_snapshot_counts_via_rest_fallback() {
         // GraphQL threads unavailable: inline comments are counted from the
         // flat REST list (replies included); resolution is unavailable there,
-        // so every fallback thread counts as unresolved.
+        // so every fallback thread counts as unresolved — and the snapshot
+        // must flag the count as unreliable (intent-hq/monorepo#1524) instead
+        // of silently reporting resolved threads as unresolved.
         let (_t, svc, ws) = setup_with(
             StubForge {
                 fail_threads: true,
@@ -7719,6 +7723,7 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert_eq!(v["comments"]["threadResolutionUnknown"], true);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
