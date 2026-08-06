@@ -1987,6 +1987,62 @@ async fn wss_agent_reasoning_effort_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent.delegate` accepts the additive `reasoningEffort` param (PROTOCOL
+/// §5.5 / §5.11) and persists it on the delegated child session, over the real
+/// WSS transport. A fresh daemon has no cached model catalog, so there is no
+/// `effortLevels` evidence and an arbitrary level passes through unvalidated —
+/// the "absence of evidence is not a mismatch" rule; the rejection arm is
+/// covered by the service-layer unit test that seeds the catalog cache.
+#[tokio::test]
+async fn wss_agent_delegate_persists_reasoning_effort() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Delegate effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.delegate","params":{{"workspaceId":"{ws_id}","taskText":"do the thing","reasoningEffort":"xhigh"}}}}"#
+        )],
+    )
+    .await;
+    assert!(
+        sess[0].get("error").is_none(),
+        "delegate with reasoningEffort must succeed without catalog evidence: {}",
+        sess[0]
+    );
+    let agent_id = sess[0]["result"]["agentId"]
+        .as_str()
+        .expect("agentId")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+        )],
+    )
+    .await;
+    assert_eq!(
+        sess[0]["result"]["session"]["reasoningEffort"].as_str(),
+        Some("xhigh"),
+        "delegated child persists the requested effort: {}",
+        sess[0]
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
 /// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
