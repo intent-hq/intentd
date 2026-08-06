@@ -268,6 +268,14 @@ async fn lifecycle_loop(
                         skills.pause_workspace(&ws_id);
                         specialists.pause_workspace(&ws_id);
                     }
+                    Some(false) if file_watchers.contains_key(&ws_id) => {
+                        // Redundant `archived: false` (a `workspace.update`
+                        // restating the flag, or a double unarchive): the
+                        // watches are live, so replacing them would open a
+                        // brief event-loss window while the OS streams
+                        // restart, for no gain.
+                        tracing::debug!(workspace = %ws_id, "already watching; ignoring redundant unarchive delta");
+                    }
                     Some(false) => {
                         let Some(path) = resolve_path(&ev, services.as_ref()).await else {
                             tracing::debug!(workspace = %ws_id, "unarchived workspace without resolvable path; not watching");
@@ -286,15 +294,16 @@ async fn lifecycle_loop(
                         // derived state that missed `file:*`/`.git` events
                         // would have refreshed. Cost is bounded to one pass
                         // per workspace, but this is not a strict no-op for an
-                        // untouched workspace: the specialists flush is
-                        // fingerprint-checked and stays silent, while
+                        // untouched workspace. The skills and specialists
+                        // flushes compare against the fingerprint each watcher
+                        // retained at pause and stay silent when nothing
+                        // moved; a workspace archived before daemon start has
+                        // no such baseline (boot seeds only unarchived
+                        // workspaces) and emits one benign extra event.
                         // `GitStatusRefresher::trigger` always republishes
-                        // `changes:git-status` (it debounces, it has no
-                        // baseline) and the skills flush compares only skill
-                        // names/count (so an edit confined to a `SKILL.md`
-                        // body is folded into the catalog without an event).
-                        // Both are pre-existing properties of the shared
-                        // refresh machinery, not of this transition.
+                        // `changes:git-status` — it debounces and holds no
+                        // baseline, exactly as it does for any single `file:*`
+                        // event today.
                         refresher.trigger(ws_id.clone());
                         skills.resume_workspace(ws_id.clone(), path.clone());
                         specialists.resume_workspace(ws_id, path);

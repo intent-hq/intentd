@@ -130,7 +130,10 @@ impl SpecialistsWatcher {
     /// Resume a suspended workspace (unarchive): re-watch the project tier and
     /// schedule one catch-up flush against the retained fingerprint, so edits
     /// made while suspended emit exactly one `specialists:changed` and an
-    /// untouched tree emits nothing.
+    /// untouched tree emits nothing. That silence holds only when the pause
+    /// happened in this process: a workspace archived before daemon start is
+    /// never seeded (boot lists unarchived workspaces only), so its resume has
+    /// no baseline and emits one benign event.
     pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SpecialistsMsg::Resume(
             workspace_id.clone(),
@@ -775,5 +778,75 @@ mod tests {
             events.is_empty(),
             "deregistered workspace must stop emitting, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pause_retains_fingerprint_so_resume_only_emits_on_real_change() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("pause-user");
+        let ws = TempDir::new("pause-ws");
+        let ws_id = WorkspaceId::from("ws-pause");
+        let proj = project_dir(&ws.path);
+        std::fs::create_dir_all(&proj).expect("mk project tier");
+        let file = proj.join("steady.md");
+        std::fs::write(&file, specialist_md("Steady", "body")).expect("seed specialist");
+
+        let watcher = SpecialistsWatcher::start_with_user_dir(
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+            Some(user.path.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Suspend, change nothing, resume: the retained fingerprint still
+        // matches, so the catch-up flush must stay silent.
+        watcher.pause_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "resume with an unchanged set must not emit, got {events:?}"
+        );
+
+        // Suspend, edit while suspended, resume: the retained fingerprint is
+        // stale, so the catch-up flush emits exactly once.
+        watcher.pause_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::fs::write(&file, specialist_md("Steady", "edited while suspended"))
+            .expect("edit while suspended");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "a suspended workspace must not emit for its own edits, got {events:?}"
+        );
+
+        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "resume after a suspended-window edit must emit exactly one event, got {events:?}"
+        );
+        assert_eq!(events[0].workspace_id, ws_id);
     }
 }
