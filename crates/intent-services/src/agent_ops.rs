@@ -4465,15 +4465,14 @@ impl Services {
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
         // Harness-owned commits: the effective opt-out is the caller's explicit
         // `skipAutoCommit` OR the workspace's effective auto-commit being off,
-        // so delegated children get the OFF commit instruction (and the idle
-        // subscriber skip) whenever nothing would auto-commit anyway.
-        // Deliberately sticky: the derived opt-out is persisted on the
-        // session, so toggling the workspace back ON via
+        // so delegated children skip the idle subscriber whenever nothing
+        // would auto-commit anyway. Deliberately sticky: the derived opt-out
+        // is persisted on the session, so toggling the workspace back ON via
         // `workspace.setAutoCommit` never re-enables idle commits for
-        // sessions created while it was OFF — their first-message commit
-        // instruction already told the agent commits are manual, and
-        // flipping the harness behavior mid-session would contradict it.
-        // New sessions created after the toggle pick up the ON state.
+        // sessions created while it was OFF. New sessions created after the
+        // toggle pick up the ON state. The child's prompt stays status-neutral
+        // (the `## Commit Policy` clause in `rules.rs`); enforcement lives in
+        // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
         // Resolve the child's first message up front so it can be persisted as
@@ -4511,9 +4510,10 @@ impl Services {
         // APPEND the standard "Your Task Note" block after the user message
         // with a `---` separator so the child knows its note ID/title and the
         // single-task scope contract; without a linked note the message is
-        // delivered verbatim. When `skipAutoCommit` is set, a follow-on
-        // commit instruction is concatenated after the scope directive,
-        // byte-for-byte matching the reference.
+        // delivered verbatim. No state-specific commit instruction is
+        // appended: the child relies on the status-neutral `## Commit Policy`
+        // system-prompt clause, and `skip_auto_commit` only gates the idle
+        // subscriber and the `git_ops` commit gate.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
             // Build the preamble from adjacent string literals (via `concat!`)
@@ -4531,16 +4531,11 @@ impl Services {
                 title = title,
                 note_id = note_id,
             );
-            let commit_instruction = if skip_auto_commit {
-                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`."
-            } else {
-                ""
-            };
             message = Some(match message {
                 Some(body) if !body.is_empty() => {
-                    format!("{body}\n\n---\n{preamble}{commit_instruction}")
+                    format!("{body}\n\n---\n{preamble}")
                 }
-                _ => format!("{preamble}{commit_instruction}"),
+                _ => preamble,
             });
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`

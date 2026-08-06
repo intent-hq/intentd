@@ -9844,11 +9844,13 @@ This note is your workspace for this task. Update it with your progress, finding
     );
 }
 
-/// TASK-C2: when `skipAutoCommit=true` the reference appends the
-/// `**Auto-commit is OFF.**` instruction after the scope directive; assert
-/// the exact bytes.
+/// Status-neutral commit policy: even with `skipAutoCommit=true` the child's
+/// first message carries NO state-specific auto-commit instruction — the
+/// message ends at the scope directive, byte-for-byte. The opt-out only gates
+/// the idle subscriber; the prompt-side policy is the neutral
+/// `## Commit Policy` clause in `rules.rs`.
 #[tokio::test]
-async fn delegate_appends_skip_auto_commit_instruction_when_true() {
+async fn delegate_omits_commit_instruction_when_skip_auto_commit_true() {
     let (_t, svc, ws) = setup().await;
     let note = svc
         .create_note(
@@ -9883,21 +9885,22 @@ async fn delegate_appends_skip_auto_commit_instruction_when_true() {
 **Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
 \n\
-**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
-\n\
-**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`.",
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
         note_id = note.id.as_str(),
     );
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert_eq!(
         first_message_text, expected_first_message,
-        "first message must be byte-exact when skipAutoCommit=true"
+        "first message must be byte-exact and status-neutral when skipAutoCommit=true"
+    );
+    assert!(
+        !first_message_text.contains("Auto-commit is"),
+        "no state-specific auto-commit text in the delegation message: {first_message_text}"
     );
 }
 
-/// TASK-C2: `skipAutoCommit=false` (explicit) matches the default and omits
-/// the commit-instruction tail — regression guard so future refactors keep
-/// the branch gated correctly.
+/// `skipAutoCommit=false` (explicit) matches the default: no commit
+/// instruction tail — regression guard alongside the `=true` case above.
 #[tokio::test]
 async fn delegate_omits_skip_auto_commit_instruction_when_false() {
     let (_t, svc, ws) = setup().await;
@@ -9941,8 +9944,9 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
 
 /// Harness-owned commits: when the workspace's effective auto-commit is OFF,
 /// delegation derives `skip_auto_commit = caller arg OR !autoCommit` — the
-/// child gets the OFF commit instruction and the persisted session opt-out
-/// even without an explicit `skipAutoCommit` from the caller.
+/// session persists the opt-out even without an explicit `skipAutoCommit`
+/// from the caller, while the child's first message stays status-neutral
+/// (no OFF-state commit instruction).
 #[tokio::test]
 async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     let (_t, svc, ws) = setup().await;
@@ -9978,8 +9982,8 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
 
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert!(
-        first_message_text.contains("**Auto-commit is OFF.**"),
-        "OFF instruction must be derived from the workspace setting: {first_message_text}"
+        !first_message_text.contains("Auto-commit is"),
+        "delegation message must stay status-neutral when the workspace toggle is off: {first_message_text}"
     );
     let session = svc
         .store()
