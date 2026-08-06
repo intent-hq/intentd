@@ -1275,7 +1275,8 @@ impl Services {
     /// `dispatched` / `evicted` wakes additionally end with a terminal-state
     /// note (after any `[hook logs]` section) telling the owner the hook is
     /// retired and will not run again, with a reschedule pointer — the
-    /// expiry and cancel notices already state this in their own wording.
+    /// expiry notice states this explicitly in its own wording, and
+    /// cancellation implies it.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
         let metadata = json!({
             "type": "hook_wake",
@@ -1989,6 +1990,9 @@ mod tests {
         let session = svc.store().get_agent_session(&owner).await.unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(text.contains("cancelled from the app"), "{text}");
+        // Cancellation keeps its own wording — no dispatch/eviction terminal note.
+        assert!(!text.contains("will not run again"), "{text}");
+        assert!(!text.contains("retired"), "{text}");
         // A second cancel fails: the hook is no longer active.
         let err = svc
             .hook_cancel_op(&ws, &hook.hook_id, true)
