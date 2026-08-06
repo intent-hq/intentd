@@ -2442,6 +2442,52 @@ mod display_status_events {
         );
     }
 
+    /// The documented "fresh `agent.sendMessage`" recovery path for an
+    /// errored (non-poisoned) agent: the direct-send emits the visible
+    /// `failed → in_progress` transition. Pins the recompute after the
+    /// user-row persist in `send_message` — the earlier recompute inside
+    /// `try_begin` still reads `status = Error` and is a no-op, so without
+    /// this one the redriven turn would stay `failed` on the event stream.
+    #[tokio::test]
+    async fn send_message_redrive_emits_failed_to_in_progress() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let mut session = super::workspace_needs_attention::mk_session(&h.ws, "agent-redrive");
+        session.status = intent_core::AgentStatus::Error;
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed: baseline failed.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        let result = manager
+            .send_message(
+                session.id.clone(),
+                h.ws.clone(),
+                "try again".to_string(),
+                None,
+                crate::agent_manager::TurnOptions::default(),
+            )
+            .await
+            .expect("send message");
+        assert_eq!(result["queued"], false, "direct send: {result}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+    }
+
     /// Unread flag triggers (§6.5 step 9): `raise_attention(Unread)` (the
     /// turn-end blue dot) promotes an idle base to `unread` and emits;
     /// `workspace.markSeen` retires the flag and emits the demotion.

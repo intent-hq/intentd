@@ -3528,7 +3528,14 @@ impl AgentManager {
             .await;
         // The persisted user row supersedes a pending question tail, which
         // can retire the workspace's needs_attention displayStatus (§6.5
-        // step 0): recompute-and-compare.
+        // step 0): recompute-and-compare. This recompute ALSO produces the
+        // visible `failed → in_progress` transition on the errored-agent
+        // redrive path (a fresh sendMessage to a non-poisoned Error session):
+        // the earlier recompute inside `try_begin`'s `agent_activity_begin`
+        // still reads `status = Error` (persisted to Active only afterwards)
+        // and is a no-op, so removing or reordering this call would leave the
+        // redriven turn stuck on `failed` for its whole duration. Pinned by
+        // `send_message_redrive_emits_failed_to_in_progress`.
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
             .await;
