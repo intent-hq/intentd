@@ -6,22 +6,19 @@
 //! `models` array, or a `configOptions` select option with `id == "model"`
 //! (claude-agent-acp ≥ 0.60 / codex-acp ≥ 0.16 report the catalog this way),
 //! and the payload may be wrapped under `update` / `sessionUpdate`
-//! (session-update notifications). Codex additionally expands effort-variant
-//! base models into `{model}/{effort}` rows.
+//! (session-update notifications). Effort-capable models carry the PROTOCOL
+//! §5.30 `effortLevels` list on a single base row — codex from its known
+//! level set, other providers from the adapter-advertised
+//! `supportedEffortLevels`.
 
 use serde_json::{json, Map, Value};
 
-/// Reasoning effort levels codex effort-variant models expand into (parity
-/// with `supportedReasoningEfforts` in the FE static catalog).
-const CODEX_EFFORTS: [(&str, &str); 4] = [
-    ("low", "Faster responses with less deliberation"),
-    ("medium", "Balanced speed and reasoning depth"),
-    ("high", "Deeper reasoning for complex problems"),
-    ("xhigh", "Maximum reasoning depth for the hardest problems"),
-];
+/// Reasoning effort levels codex effort-capable models advertise (parity with
+/// `supportedReasoningEfforts` in the FE static catalog).
+const CODEX_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
-/// Codex base models that expand into reasoning-effort variants (parity with
-/// `EFFORT_VARIANT_MODELS` in the FE).
+/// Codex base models that support reasoning effort (parity with
+/// `EFFORT_CAPABLE_MODELS` in the FE).
 const CODEX_EFFORT_VARIANT_MODELS: [&str; 3] =
     ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max"];
 
@@ -112,6 +109,22 @@ fn entry_fields(entry: &Value) -> Option<(String, String, Option<String>)> {
     Some((id, name, description))
 }
 
+/// Adapter-advertised reasoning-effort levels for one raw model entry
+/// (`supportedEffortLevels`, as reported by claude-agent-acp). Non-string and
+/// blank entries are dropped; an absent or empty list yields `None`.
+fn entry_effort_levels(entry: &Value) -> Option<Vec<String>> {
+    let levels: Vec<String> = entry
+        .get("supportedEffortLevels")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    (!levels.is_empty()).then_some(levels)
+}
+
 /// Build one wire row `{ id, name, provider, description? }`.
 fn wire_row(id: &str, name: &str, provider: &str, description: Option<&str>) -> Value {
     let mut row = Map::new();
@@ -124,47 +137,57 @@ fn wire_row(id: &str, name: &str, provider: &str, description: Option<&str>) -> 
     Value::Object(row)
 }
 
+/// Attach the PROTOCOL §5.30 `effortLevels` list to a wire row. Omitted when
+/// the model advertises no levels, so effort-less models stay unchanged.
+fn with_effort_levels(mut row: Value, levels: Option<Vec<String>>) -> Value {
+    if let (Some(levels), Some(obj)) = (levels, row.as_object_mut()) {
+        obj.insert("effortLevels".to_string(), json!(levels));
+    }
+    row
+}
+
 /// Parse an ACP payload (session/new result or session-update notification)
-/// into wire rows for `provider`. Used by claude-code, pi, and droid.
+/// into wire rows for `provider`. Used by claude-code, pi, and droid. Models
+/// advertising `supportedEffortLevels` carry them as `effortLevels`.
 pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
     };
     candidates
         .iter()
-        .filter_map(entry_fields)
-        .map(|(id, name, desc)| wire_row(&id, &name, provider, desc.as_deref()))
+        .filter_map(|entry| {
+            let (id, name, desc) = entry_fields(entry)?;
+            Some(with_effort_levels(
+                wire_row(&id, &name, provider, desc.as_deref()),
+                entry_effort_levels(entry),
+            ))
+        })
         .collect()
 }
 
-/// Codex variant of [`parse_acp_models`]: base models in
-/// [`CODEX_EFFORT_VARIANT_MODELS`] expand into `{model}/{effort}` rows with
-/// effort-suffixed names (parity with the FE `parseModelsFromAcpResponse`).
+/// Codex variant of [`parse_acp_models`]: one base row per model, with the
+/// models in [`CODEX_EFFORT_VARIANT_MODELS`] carrying [`CODEX_EFFORTS`] as
+/// `effortLevels` instead of expanding into `{model}/{effort}` rows —
+/// reasoning effort is a first-class session field (PROTOCOL §5.2/§5.30).
 pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
     };
-    let mut rows = Vec::new();
-    for (id, name, desc) in candidates.iter().filter_map(entry_fields) {
-        if CODEX_EFFORT_VARIANT_MODELS.contains(&id.as_str()) {
-            for (effort, effort_desc) in CODEX_EFFORTS {
-                let effort_label = capitalize(effort);
-                let description = match &desc {
-                    Some(d) => format!("{d} — {}", effort_desc.to_lowercase()),
-                    None => effort_desc.to_string(),
-                };
-                rows.push(wire_row(
-                    &format!("{id}/{effort}"),
-                    &format!("{name} ({effort_label})"),
-                    "codex",
-                    Some(&description),
-                ));
-            }
-        } else {
-            rows.push(wire_row(&id, &name, "codex", desc.as_deref()));
-        }
-    }
-    rows
+    candidates
+        .iter()
+        .filter_map(|entry| {
+            let (id, name, desc) = entry_fields(entry)?;
+            let levels = entry_effort_levels(entry).or_else(|| {
+                CODEX_EFFORT_VARIANT_MODELS
+                    .contains(&id.as_str())
+                    .then(|| CODEX_EFFORTS.iter().map(|s| s.to_string()).collect())
+            });
+            Some(with_effort_levels(
+                wire_row(&id, &name, "codex", desc.as_deref()),
+                levels,
+            ))
+        })
+        .collect()
 }
 
 fn capitalize(s: &str) -> String {
