@@ -8,7 +8,10 @@
 //! Drives the real `intentd serve` binary with the
 //! `INTENTD_TEST_WATCHER_INIT_DELAY_MS` seam standing in for a wedged
 //! `fseventsd`: readiness must land while watcher init is still parked in that
-//! delay, proving it is off the bind critical path.
+//! delay, proving it is off the bind critical path. The seam sleeps the *thread*
+//! (not `tokio::time::sleep`), matching the synchronous `fseventsd` IPC it stands
+//! in for, so the test also fails if init merely moves to another Tokio worker
+//! without `block_in_place`.
 
 #![cfg(unix)]
 
@@ -58,6 +61,10 @@ fn spawn_daemon(dirs: &TestDirs) -> Child {
             "INTENTD_TEST_WATCHER_INIT_DELAY_MS",
             WATCHER_DELAY.as_millis().to_string(),
         )
+        // One Tokio worker: the harshest version of the saturated-runtime case.
+        // A blocking init that is merely `spawn`ed lands on the same worker that
+        // must reach the UDS bind, so this fails without `block_in_place`.
+        .env("TOKIO_WORKER_THREADS", "1")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))

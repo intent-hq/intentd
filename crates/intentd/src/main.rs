@@ -1005,7 +1005,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // timeout) and the watcher registry (serial FSEvents registrations, which on
     // a loaded macOS `fseventsd` cost seconds each). Both handles are aborted on
     // clean shutdown, which drops the registry and every watcher it owns.
-    let mcp_start_task = {
+    let mut mcp_start_task = {
         let services = services.clone();
         tokio::spawn(async move { services.start_enabled_mcp_servers().await })
     };
@@ -1275,8 +1275,23 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     config_watcher_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3). The deferred
-    // start task is aborted first so it cannot spawn a server after the reap.
-    mcp_start_task.abort();
+    // start task is JOINED (bounded) rather than merely aborted: a server still
+    // mid-handshake is not in the hub map yet, so cancelling it there would drop
+    // the child outside the process-group reap and its grandchildren would
+    // survive (`kill_on_drop` only covers the direct child). Letting the sweep
+    // settle first puts every child it spawned in the map, so `shutdown` reaps
+    // them. Only if the grace expires do we abort and accept the drop path.
+    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!(
+                grace_ms = MCP_START_JOIN_GRACE.as_millis() as u64,
+                "deferred MCP start sweep did not settle within the shutdown grace; \
+                 aborting it — a server mid-handshake may leave orphan grandchildren"
+            );
+            mcp_start_task.abort();
+        }
+    }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
@@ -2391,6 +2406,12 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
 /// inert unless the namespaced env var is set to a positive integer.
 const TEST_WATCHER_INIT_DELAY_MS_ENV: &str = "INTENTD_TEST_WATCHER_INIT_DELAY_MS";
 
+/// Bounded wait for the deferred MCP start sweep to settle at shutdown, so a
+/// server spawned mid-handshake lands in the hub map and is covered by the
+/// process-group reap (monorepo#1581). Sized to absorb an in-flight handshake
+/// while staying well inside the FE sidecar's kill grace.
+const MCP_START_JOIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Parse the watcher-init delay override; anything unset, non-numeric, or
 /// non-positive disables the hook.
 fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
@@ -2411,26 +2432,41 @@ fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
 /// Spawned rather than awaited inline because each FSEvents registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
-/// (monorepo#1581). The task parks after startup so it owns the registry;
-/// aborting the returned handle drops it, tearing down every watcher.
+/// (monorepo#1581), and run under `block_in_place` so the blocking registration
+/// cannot starve the worker driving `cmd_serve` either. The task parks after
+/// startup so it owns the registry; aborting the returned handle drops it,
+/// tearing down every watcher.
 fn spawn_watcher_registry_init(
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Some(delay) = test_watcher_init_delay(
-            std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
-                .ok()
-                .as_deref(),
-        ) {
-            tracing::warn!(
-                delay_ms = delay.as_millis() as u64,
-                "watcher registry startup: artificial delay (test seam)"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        let registry = WatcherRegistry::start(bus, api, refresher).await;
+        // `block_in_place`, not a bare `spawn`: the registrations inside are
+        // synchronous `fseventsd` IPC that block the calling *thread*, so
+        // spawning alone would only move them onto another Tokio worker — on a
+        // saturated (or single-worker) runtime that can still be the worker
+        // driving `cmd_serve` toward the UDS bind. `block_in_place` hands this
+        // worker's remaining tasks to another thread for the duration.
+        let registry = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Some(delay) = test_watcher_init_delay(
+                    std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    tracing::warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "watcher registry startup: artificial delay (test seam)"
+                    );
+                    // A *blocking* sleep, standing in for the synchronous
+                    // FSEvents call: a yielding `tokio::time::sleep` would not
+                    // exercise worker starvation at all.
+                    std::thread::sleep(delay);
+                }
+                WatcherRegistry::start(bus, api, refresher).await
+            })
+        });
         tracing::info!("watcher registry ready");
         // Park forever so the registry (and every watcher it owns) stays alive
         // until the handle is aborted at shutdown.
@@ -2446,18 +2482,27 @@ fn spawn_watcher_registry_init(
 /// [`spawn_watcher_registry_init`]: `notify`'s FSEvents registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
-/// (monorepo#1581). The task parks after startup so it owns the watcher guard;
-/// aborting the returned handle drops it, ending the OS subscription.
+/// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
+/// task parks after startup so it owns the watcher guard; aborting the returned
+/// handle drops it, ending the OS subscription.
 fn spawn_config_watcher_init(
     registry: Arc<intent_services::SettingsRegistry>,
     services: Services,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let watcher_services = services.clone();
-        let watcher = match intent_services::ConfigWatcher::start(registry, move |notice| {
-            let services = watcher_services.clone();
-            async move { services.apply_external_settings_change(&notice).await }
-        }) {
+        // `ConfigWatcher::start` is synchronous and its `notify` registration
+        // blocks the calling thread on `fseventsd` IPC, so it runs under
+        // `block_in_place` for the same reason as the watcher registry above.
+        // It stays inside the runtime context, so the watcher's own
+        // `tokio::spawn` of its debounce loop keeps working.
+        let started = tokio::task::block_in_place(|| {
+            intent_services::ConfigWatcher::start(registry, move |notice| {
+                let services = watcher_services.clone();
+                async move { services.apply_external_settings_change(&notice).await }
+            })
+        });
+        let watcher = match started {
             Ok(watcher) => watcher,
             Err(e) => {
                 tracing::warn!(
