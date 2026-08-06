@@ -50,22 +50,33 @@ pub type AgentUsageRow = (
 );
 
 /// SQL scalar expression projecting an `agent_message` row's usage metadata —
-/// top-level `usage` or `_meta.usage`, mirroring intent-services'
-/// `extract_message_usage` — into the `{"usage": {...}}` shape the tally's
-/// per-message fallback consumes. NULL for a row carrying neither, which
-/// [`MESSAGE_USAGE_PRESENT_SQL`] filters out. The `json_valid` guard keeps
-/// non-JSON content (impossible from the store's serde-encoded write paths)
-/// from erroring the statement.
-const MESSAGE_USAGE_JSON_SQL: &str = "CASE WHEN json_valid(content) THEN \
-    json_object('usage', json(COALESCE(json_extract(content, '$.usage'), \
-        json_extract(content, '$._meta.usage')))) END";
+/// top-level `usage` if that key is present at all, else `_meta.usage` — into
+/// the `{"usage": ...}` shape the tally's per-message fallback consumes. The
+/// precedence mirrors intent-services' `extract_message_usage` exactly,
+/// including that an explicit `"usage": null` shadows `_meta.usage`
+/// (`json_type` is SQL-NULL only for an absent path, not for a JSON `null`).
+/// The `->` operator (rather than `json(json_extract(..))`) keeps non-object
+/// usage values — e.g. `"usage": "legacy"` — valid JSON, so they decode to the
+/// zero counters Rust yields for them instead of erroring the statement. Only
+/// evaluated on rows passing [`MESSAGE_USAGE_PRESENT_SQL`], which guarantees
+/// `json_valid(content)`.
+const MESSAGE_USAGE_JSON_SQL: &str = "json_object('usage', \
+    CASE WHEN json_type(content, '$.usage') IS NOT NULL \
+        THEN content -> '$.usage' ELSE content -> '$._meta.usage' END)";
 
 /// Row filter pairing with [`MESSAGE_USAGE_JSON_SQL`]: keeps only messages
 /// that actually carry usage metadata, so the fallback read scales with
-/// usage-bearing messages rather than with the whole transcript.
-const MESSAGE_USAGE_PRESENT_SQL: &str = "json_valid(content) \
-    AND (json_extract(content, '$.usage') IS NOT NULL \
-        OR json_extract(content, '$._meta.usage') IS NOT NULL)";
+/// usage-bearing messages rather than with the whole transcript. The
+/// `json_valid` guard keeps non-JSON content (impossible from the store's
+/// serde-encoded write paths) from erroring the statement.
+///
+/// Must stay equivalent to the `WHERE` clause of the partial index
+/// `idx_agent_message_usage` (migration 0080) — SQLite only satisfies the
+/// filter from that index when the predicates match, and without the index
+/// the filter would load and parse every message body in the session.
+const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) \
+    THEN (json_type(content, '$.usage') IS NOT NULL \
+        OR json_type(content, '$._meta.usage') IS NOT NULL) ELSE 0 END";
 
 /// Read the per-session usage rows for one workspace over an explicit
 /// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
@@ -79,8 +90,10 @@ const MESSAGE_USAGE_PRESENT_SQL: &str = "json_valid(content) \
 ///
 /// That fallback read is bounded (monorepo#1571): SQLite projects each
 /// message's usage metadata ([`MESSAGE_USAGE_JSON_SQL`]) and drops rows
-/// carrying none ([`MESSAGE_USAGE_PRESENT_SQL`]), so message bodies are never
-/// materialized. A presence-only hydration guard (`snapshot.is_none() &&
+/// carrying none ([`MESSAGE_USAGE_PRESENT_SQL`], satisfied from the partial
+/// index `idx_agent_message_usage`), so no message body is loaded or parsed —
+/// the read costs O(usage-bearing rows), not O(transcript). A presence-only
+/// hydration guard (`snapshot.is_none() &&
 /// baseline.is_none()`) would instead have zeroed a cost-only session's
 /// counters, since such a session is still on the tally's per-message
 /// fallback and needs its per-message usage.
@@ -4012,6 +4025,17 @@ mod tests {
             "text": blob,
             "_meta": { "usage": { "cacheReadTokens": 4 } },
         });
+        // An explicit top-level `usage: null` shadows `_meta.usage` in
+        // `extract_message_usage` (it reads the key, not a usable object), so
+        // the projection must pick the null too rather than falling through.
+        let null_usage_msg = serde_json::json!({
+            "text": blob,
+            "usage": serde_json::Value::Null,
+            "_meta": { "usage": { "inputTokens": 7 } },
+        });
+        // A non-object `usage` tallies as zero counters in Rust; the projection
+        // must surface it rather than erroring the statement.
+        let scalar_usage_msg = serde_json::json!({ "text": blob, "usage": "legacy" });
         // No usage metadata anywhere: pure payload, must not be read at all.
         let plain_msg = serde_json::json!([{ "type": "text", "text": blob }]);
 
@@ -4022,12 +4046,31 @@ mod tests {
                 .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
                 .await
                 .expect("insert");
-            for msg in [&usage_msg, &meta_usage_msg, &plain_msg] {
+            for msg in [
+                &usage_msg,
+                &meta_usage_msg,
+                &null_usage_msg,
+                &scalar_usage_msg,
+                &plain_msg,
+            ] {
                 store
                     .append_agent_message(id, "assistant", msg, &ts)
                     .await
                     .expect("append message");
             }
+            // Non-JSON content cannot arrive through the serde-encoded write
+            // paths, but the filter must tolerate it rather than error the
+            // whole statement.
+            sqlx::query(
+                "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+                 VALUES (?, ?, 99, 'assistant', 'not json', ?)",
+            )
+            .bind(format!("msg-{}", Uuid::new_v4()))
+            .bind(&id.0)
+            .bind(&ts)
+            .execute(store.write_pool())
+            .await
+            .expect("inject non-JSON content");
         }
         // Cost-only persist shape: zero counters, cost present.
         store
@@ -4052,6 +4095,8 @@ mod tests {
         let expected = vec![
             serde_json::json!({ "usage": { "inputTokens": 9, "outputTokens": 1 } }),
             serde_json::json!({ "usage": { "cacheReadTokens": 4 } }),
+            serde_json::json!({ "usage": serde_json::Value::Null }),
+            serde_json::json!({ "usage": "legacy" }),
         ];
         for id in [&cost_only, &never_reported] {
             let row = rows.iter().find(|r| r.0 == id.0).expect("row");
@@ -4069,6 +4114,27 @@ mod tests {
                 "fallback session {id} surfaces usage metadata only, in seq order"
             );
         }
+
+        // The filter must be satisfied from the partial index (migration 0080);
+        // a plan that scans agent_message loads and parses every body, which is
+        // exactly the cost this read is supposed to avoid.
+        let plan_sql = format!(
+            "EXPLAIN QUERY PLAN SELECT {MESSAGE_USAGE_JSON_SQL} AS usage_json FROM agent_message \
+             WHERE agent_id = ? AND {MESSAGE_USAGE_PRESENT_SQL} ORDER BY seq ASC"
+        );
+        let plan: String = sqlx::query(&plan_sql)
+            .bind(&cost_only.0)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("query plan")
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            plan.contains("idx_agent_message_usage"),
+            "fallback read must use the usage partial index, plan was: {plan}"
+        );
     }
 
     /// `update_workspace_token_usage` (monorepo#738): the closure sees the
