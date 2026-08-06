@@ -2756,7 +2756,7 @@ pub enum HookState {
 /// A background hook: a small agent-owned script the daemon runs periodically
 /// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
 /// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤19 chars) is enforced at
+/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
 /// the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
