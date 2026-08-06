@@ -2964,7 +2964,10 @@ fn claude_code_session_result() -> Value {
 /// effective model from the `session/new` response's
 /// `configOptions[id="model"]` (currentValue `"default"` → its option's
 /// description "Opus 4.8 with 1M context · …" → "Opus 4.8") and persists it
-/// compound (`claude-code:Opus 4.8`) on `agent_session.model`.
+/// to the separate `resolved_model` column — `agent_session.model` is NEVER
+/// rewritten (monorepo#1534: a display name is not a selectable option id,
+/// so persisting it on `model` made the FE flag it unavailable and fall
+/// back, re-triggering the rewrite forever).
 #[tokio::test]
 async fn open_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
@@ -2976,16 +2979,25 @@ async fn open_session_resolves_and_persists_effective_model() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
-    let opened = services
+    services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
-        Some("claude-code:Opus 4.8"),
-        "placeholder model replaced by the resolved effective model (compound)"
+        Some("claude-code:default"),
+        "placeholder model untouched — never rewritten to a display name"
+    );
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(
+        resolved.as_deref(),
+        Some("Opus 4.8"),
+        "effective display identity persisted to resolved_model (D13)"
     );
 }
 
@@ -3004,11 +3016,10 @@ async fn open_session_never_overwrites_explicit_model() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
-    let opened = services
+    services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert!(opened.effective_model.is_none());
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
@@ -3042,11 +3053,10 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
-    let opened = services
+    services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert!(opened.effective_model.is_none(), "D13 branch not taken");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(
         stored.model.as_deref(),
@@ -3081,7 +3091,7 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
         .set_agent_session_resolved_model(
             &ws,
             &session.id,
-            "claude-code:claude-haiku-4-5",
+            Some("claude-code:claude-haiku-4-5"),
             Some("Haiku 4.5"),
         )
         .await
@@ -3101,8 +3111,9 @@ async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
     assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
-/// D13: a NULL stored model resolves too, persisting the compound id with
-/// the session's resolved provider so `resolve_provider_id` keeps working.
+/// D13: a NULL stored model resolves too — `model` stays NULL (provider
+/// resolution keeps riding the `provider` field) and the display identity
+/// lands in `resolved_model`.
 #[tokio::test]
 async fn open_session_resolves_effective_model_for_null_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
@@ -3114,17 +3125,23 @@ async fn open_session_resolves_effective_model_for_null_model() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
-    let opened = services
+    services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:Opus 4.8"));
+    assert_eq!(stored.model, None, "NULL model stays NULL");
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
 }
 
 /// D13: a response without a resolvable model select (e.g. the plain mock's
-/// bare `{ sessionId }`) leaves the placeholder model untouched.
+/// bare `{ sessionId }`) leaves the placeholder model untouched and persists
+/// no resolution.
 #[tokio::test]
 async fn open_session_without_config_options_keeps_placeholder() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
@@ -3136,17 +3153,61 @@ async fn open_session_without_config_options_keeps_placeholder() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect();
-    let opened = services
+    services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
-    assert!(opened.effective_model.is_none());
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(resolved, None);
+}
+
+/// D13: a placeholder session whose new open resolves nothing clears a
+/// previously persisted resolution (same anti-staleness contract as D14) —
+/// a display name from an older option list must not keep mis-attributing
+/// stats.
+#[tokio::test]
+async fn open_session_placeholder_unresolvable_clears_stale_resolution() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13-stale");
+    session.model = Some("claude-code:default".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let landed = bus
+        .store()
+        .set_agent_session_resolved_model(
+            &ws,
+            &session.id,
+            Some("claude-code:default"),
+            Some("Opus 4.8"),
+        )
+        .await
+        .expect("seed stale resolution");
+    assert!(landed);
+    let (conn, _rx, _agent) = connect();
+    services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    let (model, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(model.as_deref(), Some("claude-code:default"));
+    assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
 /// D13: `session/load` (resume) resolves the effective model the same way as
-/// `session/new`.
+/// `session/new` — into `resolved_model`, never onto `model`.
 #[tokio::test]
 async fn resume_session_resolves_and_persists_effective_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
@@ -3159,14 +3220,19 @@ async fn resume_session_resolves_and_persists_effective_model() {
         .await
         .expect("insert");
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
-    let opened = services
+    services
         .resume_acp_session(&conn, &init_caps(true), &session.id, "/tmp/ws", Vec::new())
         .await
         .expect("resume")
         .expect("resume yields opened session");
-    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model.as_deref(), Some("claude-code:Opus 4.8"));
+    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
 }
 
 /// `agent:stream:activity` leading-edge throttle (PROTOCOL §7): the first
