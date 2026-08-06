@@ -12544,9 +12544,7 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
 /// The mock echoes three `tool_call` updates via `rawUpdates` BEFORE its text
 /// response, so the leading-edge ping of the turn necessarily comes from the
 /// tool arm: it names the first tool (`bash`, derived from the ACP title) and
-/// carries no `lastAgentResponse` (nothing had streamed yet). The shared 1s
-/// leading-edge throttle still applies across both arms — the whole burst plus
-/// the text chunk lands inside one window, so the tick count stays bounded.
+/// carries no `lastAgentResponse` (nothing had streamed yet).
 #[tokio::test]
 async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
     let Some(script) = gate("WSS tool-call activity E2E") else {
@@ -12648,9 +12646,14 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         !activities.is_empty(),
         "the tool-only stretch emits at least one activity over WSS"
     );
+    // Sanity cap, not throttle verification: the mock emits exactly 3
+    // `rawUpdates` plus one `agent_message_chunk` for the whole response, so 4
+    // is the no-throttle maximum. It guards against a future fixture change
+    // multiplying the emit count; the deterministic window-boundary coverage
+    // lives in the `agent_session` unit tests.
     assert!(
         activities.len() <= 4,
-        "the shared 1s throttle bounds the tick count (3 tools + 1 chunk): {activities:?}"
+        "at most one ping per emitter (3 tools + 1 chunk): {activities:?}"
     );
     // The leading-edge ping of the turn came from the tool arm: it names the
     // first call and has no preview text yet.

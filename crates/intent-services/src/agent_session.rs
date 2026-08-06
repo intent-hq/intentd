@@ -2404,7 +2404,7 @@ impl Services {
                 // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({
                     "agentId": agent_id.0,
-                    "toolName": tool_name.clone(),
+                    "toolName": &tool_name,
                     "title": title,
                     "toolKind": tool_kind,
                     "toolCallId": tc.tool_call_id,

@@ -3452,9 +3452,16 @@ async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
         !activities.is_empty(),
         "a turn with no assistant text still emits activity from the tool arm"
     );
+    // Sanity cap, not throttle verification: the turn has exactly three
+    // potential emitters, so this only guards against a future fixture change
+    // multiplying the emit count. The deterministic window-boundary coverage
+    // lives in `activity_throttle_window_is_shared_between_chunk_and_tool_arms`
+    // below. Deliberately not tightened to `< 3` — the throttle is real-clock
+    // based, so a >1s gap between updates on a loaded machine legitimately
+    // produces up to three emits.
     assert!(
         activities.len() <= 3,
-        "the shared 1s throttle keeps the tool burst from emitting per call: {}",
+        "at most one ping per tool call: {}",
         activities.len()
     );
     // The leading-edge ping describes the FIRST tool call and carries no
@@ -3490,7 +3497,11 @@ async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
 /// suppresses an immediately following tool call's ping (and vice versa),
 /// while the window elapsing re-opens the gate for whichever arm comes next.
 /// Drives `route_notification` directly so the window boundaries are
-/// deterministic.
+/// deterministic. The throttle reads a real `Instant` (tokio paused time cannot
+/// help), so the first two routes are adjacent awaits deliberately: if >1s of
+/// wall clock elapsed between them the `t1` ping would no longer be suppressed
+/// and the count would read 3 — a rare failure here is host scheduling noise,
+/// not a regression.
 #[tokio::test]
 async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
