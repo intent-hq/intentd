@@ -160,10 +160,12 @@ jobs:
       # Swatinem/rust-cache — which only ephemeral GitHub-hosted runners
       # needed — pure overhead, so it was dropped. Key it on $RUNNER_NAME:
       # the tinybox slots share one $HOME, and two slots must never write
-      # to the same target dir concurrently.
+      # to the same target dir concurrently. Lives on /raid like ci.yml's
+      # target dirs — $HOME sits on the (much smaller) root volume, which
+      # this job's builds previously helped fill to ENOSPC.
       - name: Set persistent cargo target dir
         shell: bash
-        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:

@@ -10,9 +10,11 @@
 # mid-run). Deletion here is age-based (mtime), oldest first, and strictly
 # path-allowlisted:
 #   /raid/ci-target/*/*/*  per-slot cargo target dirs — stale > 7 days,
-#                          tightened to > 2 days while free space < 100 GiB
+#                          tightened to > 2 days while /raid free < 100 GiB
 #   ~/ci-target/*/*/*      legacy pre-/raid target dirs on the root volume —
-#                          stale > 7 days (tightened alongside /raid); as
+#                          stale > 7 days (the home_days dispatch input
+#                          overrides the window), tightened to > 1 day while
+#                          the root volume's free space is < 50 GiB; as
 #                          these age out, CI itself frees the root volume
 #   ~/ci-install-action/*  per-slot install-action HOMEs — stale > 7 days
 #   ~/setup-pnpm-*         per-slot pnpm dests — stale > 7 days
@@ -35,6 +37,12 @@ on:
         description: Print what would be deleted without deleting anything
         type: boolean
         default: false
+      home_days:
+        description: >-
+          $HOME/ci-target prune window in days (>= 1). Empty = automatic:
+          7 days, tightened to 1 while the root volume is low on space.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -76,9 +84,10 @@ jobs:
       - name: Prune stale CI dirs
         env:
           DRY_RUN: ${{ inputs.dry_run == true }}
+          HOME_DAYS: ${{ inputs.home_days }}
         run: |
           set -euo pipefail
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          free_gib() { df -Pk "$1" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
           remove() {
             if [ "$DRY_RUN" = "true" ]; then
               echo "[dry-run] would delete: $1"
@@ -107,15 +116,32 @@ jobs:
               remove "$dir"
             done < <(find "$root" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
           }
-          echo "free before: $(free_gib) GiB"
+          # $HOME/ci-target window: 7 days by default, overridden by the
+          # home_days dispatch input. Reject anything but an integer >= 1 —
+          # a 0-day window would defeat the freshness check and delete
+          # running jobs' dirs.
+          home_days=7
+          if [ -n "$HOME_DAYS" ]; then
+            case "$HOME_DAYS" in *[!0-9]*) echo "invalid home_days: $HOME_DAYS" >&2; exit 1 ;; esac
+            [ "$HOME_DAYS" -ge 1 ] || { echo "invalid home_days: $HOME_DAYS" >&2; exit 1; }
+            home_days="$HOME_DAYS"
+          fi
+          echo "free before: /raid $(free_gib /raid) GiB, root volume $(free_gib "$HOME") GiB (home window: ${home_days}d)"
           prune_targets 7 /raid/ci-target
-          prune_targets 7 "$HOME/ci-target"
-          # Comfort target: with < 100 GiB free the next day's coverage jobs
-          # could still crowd the volume, so tighten the window to 2 days.
-          if [ "$(free_gib)" -lt 100 ]; then
-            echo "free space < 100 GiB after 7-day pass — tightening to 2 days"
+          prune_targets "$home_days" "$HOME/ci-target"
+          # Comfort target: with < 100 GiB free on /raid the next day's
+          # coverage jobs could still crowd the volume, so tighten to 2 days.
+          if [ "$(free_gib /raid)" -lt 100 ]; then
+            echo "/raid free < 100 GiB after 7-day pass — tightening to 2 days"
             prune_targets 2 /raid/ci-target
-            prune_targets 2 "$HOME/ci-target"
+          fi
+          # Root volume: all 8 slots share $HOME on it, and box-level ENOSPC
+          # kills jobs mid-run, so tighten hard — while free space is
+          # < 50 GiB, sweep $HOME/ci-target with a 1-day window (the
+          # recursive freshness check still protects running jobs' dirs).
+          if [ "$home_days" -gt 1 ] && [ "$(free_gib "$HOME")" -lt 50 ]; then
+            echo "root volume free < 50 GiB — tightening \$HOME/ci-target to 1 day"
+            prune_targets 1 "$HOME/ci-target"
           fi
           # Small per-slot / legacy tool dirs (recreated on demand by their
           # actions): 7-day window, same recursive freshness rule.
@@ -124,6 +150,6 @@ jobs:
             is_fresh "$d" 7 && continue
             remove "$d"
           done
-          echo "free after: $(free_gib) GiB (dry_run=$DRY_RUN)"
+          echo "free after: /raid $(free_gib /raid) GiB, root volume $(free_gib "$HOME") GiB (dry_run=$DRY_RUN)"
       - name: Disk report (after)
         run: df -h /raid "$HOME"
