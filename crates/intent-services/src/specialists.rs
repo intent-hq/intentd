@@ -204,25 +204,33 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// Optional frontmatter scalar keys carried through `build_def`/`render_file`
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
-/// `roleReminder`, `agentType`).
+/// `roleReminder`, `agentType`, plus `reasoningEffort`).
 ///
-/// NOTE: the config scalars `codingAgent`/`model`/`agentType`
-/// ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit semantics across
-/// tiers, like `hidden` (PROTOCOL §5.11, intent-hq/monorepo#718): an omitted
-/// key keeps the lower tiers' effective value, an explicit empty value
-/// (`model: ""`) clears it, and an explicit non-empty value overrides it.
+/// NOTE: the config scalars `codingAgent`/`model`/`agentType`/
+/// `reasoningEffort` ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit
+/// semantics across tiers, like `hidden` (PROTOCOL §5.11,
+/// intent-hq/monorepo#718): an omitted key keeps the lower tiers' effective
+/// value, an explicit empty value (`model: ""`) clears it, and an explicit
+/// non-empty value overrides it.
 /// `roleReminder` stays winner-takes-all — it is carried through only when
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
 /// stale summary of a body that no longer exists).
-const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &["codingAgent", "model", "roleReminder", "agentType"];
+const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
+    "codingAgent",
+    "model",
+    "reasoningEffort",
+    "roleReminder",
+    "agentType",
+];
 
 /// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
 /// across tiers; each key inherits independently.
-const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "agentType"];
+const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "reasoningEffort", "agentType"];
 
 /// Frontmatter/wire key for the ordered list of delegation model options —
-/// `{ model, hint }` pairs a delegating agent can pick from (PROTOCOL §5.11).
+/// `{ model, hint, reasoningEffort? }` entries a delegating agent can pick
+/// from (PROTOCOL §5.11).
 /// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
 /// `modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"}]`) so it fits
 /// the line-based parser and round-trips losslessly. Resolution follows the
@@ -233,7 +241,9 @@ const MODEL_OPTIONS_KEY: &str = "modelOptions";
 
 /// Normalize one `modelOptions` entry to its documented fields, or `None` when
 /// the entry is unusable: `model` must be a non-empty (non-whitespace) string;
-/// `hint` is carried when it is a string and defaults to `""` otherwise.
+/// `hint` is carried when it is a string and defaults to `""` otherwise;
+/// `reasoningEffort` is carried only when it is a non-empty string (the
+/// per-option effort level, PROTOCOL §5.11) and omitted otherwise.
 fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
     let obj = entry.as_object()?;
     let model = obj
@@ -241,12 +251,21 @@ fn normalize_model_option_entry(entry: &Value) -> Option<Value> {
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())?;
     let hint = obj.get("hint").and_then(Value::as_str).unwrap_or("");
-    Some(json!({ "model": model, "hint": hint }))
+    let mut out = json!({ "model": model, "hint": hint });
+    if let Some(effort) = obj
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        out["reasoningEffort"] = json!(effort);
+    }
+    Some(out)
 }
 
 /// Strictly validate a wire `modelOptions` value (`specialist.create`/`edit`
-/// specs): must be a JSON array of `{ model, hint? }` objects with a non-empty
-/// string `model` and a string `hint` (defaulting to `""` when absent).
+/// specs): must be a JSON array of `{ model, hint?, reasoningEffort? }`
+/// objects with a non-empty string `model`, a string `hint` (defaulting to
+/// `""` when absent), and — when present — a string `reasoningEffort`.
 /// Returns the normalized entries in input order (`None` when the key is
 /// absent — the inherit-on-omit case); any invalid shape → `-32602`.
 fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
@@ -268,6 +287,14 @@ fn validate_model_options_spec(value: Option<&Value>) -> Result<Option<Vec<Value
             Some(_) => {
                 return Err(Error::InvalidParams(
                     "modelOptions entry hint must be a string".to_string(),
+                ));
+            }
+        }
+        match entry.get("reasoningEffort") {
+            None | Some(Value::String(_)) => {}
+            Some(_) => {
+                return Err(Error::InvalidParams(
+                    "modelOptions entry reasoningEffort must be a string".to_string(),
                 ));
             }
         }
@@ -715,6 +742,48 @@ impl SpecialistsService {
     pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get("model")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    /// Resolve a specialist's `reasoningEffort` frontmatter scalar through the
+    /// same 3-tier order (project > user > bundled) as [`Self::resolve_model`],
+    /// used as the frontmatter rung of the delegation reasoning-effort
+    /// resolution (PROTOCOL §5.11). Returns `None` when the specialist is
+    /// unknown or declares no `reasoningEffort`, leaving the session field
+    /// unset.
+    pub(crate) fn resolve_reasoning_effort(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("reasoningEffort")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    /// Resolve the `reasoningEffort` declared by the specialist's
+    /// [`MODEL_OPTIONS_KEY`] entry whose `model` equals `model` (PROTOCOL
+    /// §5.11) — the model-option rung of the delegation effort resolution.
+    /// Returns `None` when the specialist is unknown, declares no matching
+    /// option, or the matching option carries no effort.
+    pub(crate) fn resolve_model_option_effort(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+        model: &str,
+    ) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get(MODEL_OPTIONS_KEY)
+                .and_then(Value::as_array)?
+                .iter()
+                .find(|o| o.get("model").and_then(Value::as_str) == Some(model))
+                .and_then(|o| o.get("reasoningEffort"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
@@ -1906,6 +1975,69 @@ mod tests {
         assert_eq!(
             def["modelOptions"],
             json!([{ "model": "opus4.5", "hint": "" }])
+        );
+    }
+
+    #[test]
+    fn model_options_carry_reasoning_effort() {
+        // A per-option `reasoningEffort` round-trips through the single-line
+        // JSON-array scalar; an empty/whitespace-only one is dropped and a
+        // non-string one is rejected by the strict wire validator.
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "modelOptions": [
+                { "model": "fable-5", "hint": "hard", "reasoningEffort": "high" },
+                { "model": "sonnet5", "hint": "", "reasoningEffort": "  " }
+            ],
+            "prompt": "body"
+        });
+        let rendered = render_file("zeta", &spec);
+        let def = build_def("zeta", &rendered, "user", Path::new("/tmp/zeta.md"));
+        assert_eq!(
+            def["modelOptions"],
+            json!([
+                { "model": "fable-5", "hint": "hard", "reasoningEffort": "high" },
+                { "model": "sonnet5", "hint": "" }
+            ])
+        );
+        assert_eq!(render_file("zeta", &def), rendered);
+        assert!(validate_model_options_spec(Some(&json!([
+            { "model": "fable-5", "reasoningEffort": 3 }
+        ])))
+        .is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_scalar_inherits_across_tiers() {
+        // `reasoningEffort` folds like the other config scalars: an omitted
+        // key keeps the lower tier's value, an explicit empty value clears it,
+        // and a non-empty value overrides it.
+        let bundled =
+            "---\nname: \"Z\"\ndescription: \"d\"\nreasoningEffort: \"high\"\n---\n\nbody";
+        let base = build_def("z", bundled, "bundled", Path::new("/tmp/z.md"));
+        assert_eq!(base["reasoningEffort"], json!("high"));
+
+        let omits = "---\nname: \"Z\"\ndescription: \"d\"\n---\n\nuser body";
+        let inherited =
+            build_def_inheriting("z", omits, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert_eq!(
+            inherited["reasoningEffort"],
+            json!("high"),
+            "omitted inherits"
+        );
+
+        let overrides = "---\nname: \"Z\"\ndescription: \"d\"\nreasoningEffort: \"low\"\n---\n\nb";
+        let overridden =
+            build_def_inheriting("z", overrides, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert_eq!(overridden["reasoningEffort"], json!("low"));
+
+        let clears = "---\nname: \"Z\"\ndescription: \"d\"\nreasoningEffort: \"\"\n---\n\nb";
+        let cleared =
+            build_def_inheriting("z", clears, "user", Path::new("/tmp/z.md"), Some(&base));
+        assert!(
+            cleared.get("reasoningEffort").is_none(),
+            "explicit empty clears the inherited value"
         );
     }
 

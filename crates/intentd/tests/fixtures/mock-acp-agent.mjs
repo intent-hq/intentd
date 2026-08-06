@@ -303,6 +303,33 @@ function selectBehavior(behavior, promptText) {
   return behavior;
 }
 
+// Optional `configOptions` on the session/new + session/load results.
+// `MOCK_AGENT_THOUGHT_LEVEL=<currentValue>` advertises a reasoning-effort
+// select under an adapter-specific id (`effort`, as claude-agent-acp names
+// it) with `category: "thought_level"` — the category the daemon's generic
+// effort application discovers it by (PROTOCOL §5.5). Omitted by default so
+// existing tests see the bare `{ sessionId }` result.
+function sessionConfigOptions() {
+  const current = process.env.MOCK_AGENT_THOUGHT_LEVEL;
+  if (!current) return {};
+  return {
+    configOptions: [
+      {
+        id: 'effort',
+        name: 'Effort',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: current,
+        options: [
+          { value: 'low', name: 'Low' },
+          { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      },
+    ],
+  };
+}
+
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
@@ -732,7 +759,7 @@ async function dispatch(msg) {
         : [];
       sessionFromLoad = false;
       logSessionCall('session/new', SESSION_ID);
-      return result(msg.id, { sessionId: SESSION_ID });
+      return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions() });
     }
     case 'session/load':
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
@@ -752,7 +779,7 @@ async function dispatch(msg) {
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
         }
-        return result(msg.id, {});
+        return result(msg.id, sessionConfigOptions());
       }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
