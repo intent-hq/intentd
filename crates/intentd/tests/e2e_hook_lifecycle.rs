@@ -18,9 +18,11 @@
 //!     `lastError`, and the owner is woken with the eviction notice
 //!     (asserted via `agent.getConversation`).
 //!  4. Agent turn 3 schedules a third hook (with a 50-char human-readable
-//!     name, the maximum); the FE cancels it — the response carries the
-//!     cancelled hook with the name intact, `hook:cancelled` fires, and the
-//!     owner is woken with the cancellation notice.
+//!     name, the maximum); a SECOND agent finds it via `ws.hook.list` and
+//!     tries to cancel it through the MCP route — rejected, hook untouched
+//!     (intent-hq/monorepo#1563) — then the FE cancels it: the response
+//!     carries the cancelled hook with the name intact, `hook:cancelled`
+//!     fires, and the owner is woken with the cancellation notice.
 //!  5. Error arms: unknown `hookId` → -32602 on cancel/runNow; `runNow` on a
 //!     cancelled hook → -32602; missing params → -32602.
 //!  6. State carry-over: agent turn 4 schedules a counter hook that threads
@@ -478,6 +480,19 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: '{cancel_hook_name}', code: {}, delayMs: 60000 }});",
         json!("return { dispatch: false };")
     );
+    // Intruder turn (intent-hq/monorepo#1563): a second agent finds the
+    // hook through `ws.hook.list` (workspace-wide) and tries to cancel it.
+    // The MCP route must reject the cross-agent cancel with an error naming
+    // the owning agent.
+    let cancel_others_js = format!(
+        "const hooks = await ws.hook.list(); \
+         const target = hooks.find(h => h.name === '{cancel_hook_name}'); \
+         const out = ['found=' + !!target]; \
+         try {{ await ws.hook.cancel(target.hookId); out.push('cancel=allowed'); }} \
+         catch (e) {{ out.push('cancel=rejected'); \
+                     out.push('ownerNamed=' + e.message.includes(target.agentId)); }} \
+         return out.join(' ');"
+    );
     let counter_inner = "const n = (hookState === null) ? 0 : hookState.n; \
                          if (n >= 2) { return { dispatch: true, message: 'counted ' + n }; } \
                          return { dispatch: false, state: { n: n + 1 } };";
@@ -523,6 +538,15 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_cancel_js, "summary": "schedule cancelme" },
                 },
                 "response": "scheduled cancelme",
+            },
+            {
+                "ifPromptContains": "CANCEL_OTHERS",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": cancel_others_js, "summary": "cancel someone else's hook" },
+                },
+                "emitToolBlocks": true,
+                "response": "tried to cancel cancelme",
             },
             {
                 "ifPromptContains": "SCHEDULE_COUNTER",
@@ -845,6 +869,57 @@ async fn hook_lifecycle_over_wss() {
         .as_str()
         .expect("cancelme hookId")
         .to_string();
+
+    // Ownership scoping (intent-hq/monorepo#1563): a second agent sees the
+    // hook in the workspace-wide `ws.hook.list` but cannot cancel it through
+    // the MCP route — the error names the owning agent and the hook is
+    // untouched (still scheduled, no `hook:cancelled`, owner not woken).
+    let intruder = wss_rpc(
+        &mut rpc,
+        420,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "mock:default" }),
+    )
+    .await;
+    let intruder_id = intruder["agent"]["id"]
+        .as_str()
+        .expect("intruder id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        421,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": intruder_id, "content": "CANCEL_OTHERS" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    for (i, needle) in ["found=true", "cancel=rejected", "ownerNamed=true"]
+        .into_iter()
+        .enumerate()
+    {
+        await_conversation_contains(
+            &mut rpc,
+            430 + (i as i64) * 20,
+            &ws_id,
+            &intruder_id,
+            needle,
+        )
+        .await;
+    }
+    // The hook survived the cross-agent attempt.
+    let listed = wss_rpc(&mut rpc, 440, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let survivor = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(cancel_id))
+        .unwrap_or_else(|| panic!("cancelme still listed: {listed}"))
+        .clone();
+    assert_eq!(
+        survivor["state"], "scheduled",
+        "cross-agent cancel left the hook active: {survivor}"
+    );
+    assert_eq!(survivor["agentId"], json!(agent_id));
 
     let cancelled = wss_rpc(
         &mut rpc,
