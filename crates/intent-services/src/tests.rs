@@ -14623,8 +14623,9 @@ mod worktree_provisioning {
 
     /// New-project flow (intent-hq/monorepo#962): `isNewRepo: true` on a
     /// non-git `repositoryPath` initializes the directory (`git init -b main`
-    /// + seeded `.gitignore`/`README.md` + initial commit) and then provisions
-    /// the checkout normally — no more silent row-only workspace.
+    /// + seeded `.gitignore`/`README.md` + initial commit). The workspace then
+    /// works directly in the repository folder — checkoutMode `direct`, no
+    /// worktree provisioned, workspace branch checked out in place.
     #[tokio::test]
     async fn create_with_is_new_repo_initializes_repo_then_provisions() {
         let tmp = TempDb::new();
@@ -14646,24 +14647,26 @@ mod worktree_provisioning {
             .expect("create")
             .workspace;
 
-        // The source dir became a real repo: initial commit on `main`, seeded
-        // starter files.
+        // The source dir became a real repo: initial commit, seeded starter
+        // files, and the workspace branch checked out in place.
         let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
-        assert_eq!(src.head().unwrap().shorthand().unwrap(), "main");
         let head = src.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.message().unwrap().trim(), "Initial commit");
         assert!(repo_dir.0.join(".gitignore").exists());
         assert!(repo_dir.0.join("README.md").exists());
+        assert_eq!(
+            src.head().unwrap().shorthand().unwrap(),
+            ws.branch.as_str(),
+            "workspace branch checked out directly in the repository folder"
+        );
 
-        // ...and the workspace got a real checkout off it.
-        let wt = ws.worktree_path.as_deref().expect("worktree path set");
-        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
-        assert!(wt_repo.is_worktree());
+        // Direct mode: standalone repo, no worktree provisioned.
+        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             ws.base_commit_sha.as_deref(),
             Some(head.id().to_string().as_str())
         );
-        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
     }
 
     /// intent-hq/monorepo#962: an `isNewRepo` initialization failure fails the
@@ -14701,8 +14704,9 @@ mod worktree_provisioning {
     }
 
     /// intent-hq/monorepo#962: `isNewRepo: true` on an already-initialized
-    /// repo is a no-op — no re-init, no extra commit, and provisioning behaves
-    /// exactly like an ordinary create off a local repo.
+    /// repo is a no-op for the init — no re-init, no extra commit. The
+    /// workspace works directly in the repository folder (checkoutMode
+    /// `direct`) on its workspace branch.
     #[tokio::test]
     async fn create_with_is_new_repo_on_existing_repo_is_a_noop() {
         let tmp = TempDb::new();
@@ -14741,7 +14745,13 @@ mod worktree_provisioning {
             "init\n",
             "existing files must not be overwritten"
         );
-        assert!(ws.worktree_path.is_some(), "provisioning still runs");
+        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            src.head().unwrap().shorthand().unwrap(),
+            ws.branch.as_str(),
+            "workspace branch checked out in place"
+        );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
     }
 
@@ -14846,9 +14856,10 @@ mod worktree_provisioning {
         let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
         let head = src.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.message().unwrap().trim(), "Initial commit");
-        assert!(
-            ws.worktree_path.is_some(),
-            "provisioning runs after recovery"
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Direct),
+            "direct mode after recovery"
         );
         assert_eq!(
             ws.base_commit_sha.as_deref(),
@@ -18033,6 +18044,307 @@ mod clone_orchestration {
             types.iter().all(|t| t != "git:clone:progress"),
             "no clone attempted: {types:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache hydration (PROTOCOL §5.1): `githubUrl` WITHOUT a `clonePath`
+    // hydrates the workspace from `<root>/.repo-cache/<owner>/<repo>` into a
+    // standalone checkout at `<root>/<wsId>/<repo-slug>` (CoW when supported,
+    // else a plain local clone → checkoutMode `direct`).
+    // -----------------------------------------------------------------------
+
+    fn assert_hydrated_checkout(
+        ws: &intent_core::Workspace,
+        root: &std::path::Path,
+        url: &str,
+    ) -> git2::Repository {
+        let checkout = ws.repository_path.as_deref().expect("repositoryPath set");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(checkout),
+            "the checkout IS the repository"
+        );
+        assert!(
+            std::path::Path::new(checkout).starts_with(root.join(&ws.id.0)),
+            "checkout lives under <root>/<wsId>: {checkout}"
+        );
+        let repo = git2::Repository::open(checkout).expect("checkout opens as a git repo");
+        assert!(!repo.is_worktree(), "hydrated checkout is standalone");
+        assert!(
+            matches!(
+                ws.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            ),
+            "hydration persists cow or direct: {:?}",
+            ws.checkout_mode
+        );
+        assert_eq!(
+            repo.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str(),
+            "workspace branch checked out"
+        );
+        {
+            let origin = repo.find_remote("origin").expect("origin remote");
+            assert_eq!(
+                origin.url().expect("origin url"),
+                url,
+                "origin points at the GitHub URL"
+            );
+        }
+        repo
+    }
+
+    /// Cache miss: the first `githubUrl`-only create clones into the repo
+    /// cache, hydrates a standalone checkout, streams `git:clone:*` frames
+    /// before `workspace:created`, and derives owner/name from the URL.
+    #[tokio::test]
+    async fn create_hydrates_from_cache_on_miss() {
+        let source = seed_repo("intentd-hydrate-src");
+        let root = unique_dir("intentd-hydrate-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Hydrated".to_string()),
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let repo = assert_hydrated_checkout(&ws, &root.0, &url);
+        assert!(
+            ws.base_commit_sha.is_some(),
+            "base commit SHA recorded from the checkout"
+        );
+        drop(repo);
+        // Owner/name derived from the URL (file:// → last two segments).
+        assert!(ws.repository_owner.is_some(), "owner derived from URL");
+        assert_eq!(
+            ws.repository_name.as_deref(),
+            source.0.file_name().map(|n| n.to_str().unwrap()),
+            "name derived from URL"
+        );
+        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`.
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws.repository_owner.as_deref().unwrap())
+            .join(ws.repository_name.as_deref().unwrap());
+        assert!(cache.join(".git").exists(), "repo cache populated");
+        // The clone event stream ran before the workspace insert.
+        let types = drain_event_types(&mut sub).await;
+        let done_pos = types.iter().position(|t| t == "git:clone:done");
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        assert!(
+            types.iter().any(|t| t == "git:clone:progress"),
+            "git:clone:progress observed: {types:?}"
+        );
+        assert!(done_pos.is_some(), "git:clone:done observed: {types:?}");
+        assert!(
+            done_pos < ws_pos,
+            "hydration completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// Cache hit: a second create for the same URL refreshes the existing
+    /// cache (a marker planted in the cache's `.git` survives — no re-clone)
+    /// and hydrates a second, independent checkout.
+    #[tokio::test]
+    async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
+        let source = seed_repo("intentd-hydrate2-src");
+        let root = unique_dir("intentd-hydrate2-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws1 = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws1.repository_owner.as_deref().unwrap())
+            .join(ws1.repository_name.as_deref().unwrap());
+        let marker = cache.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        let ws2 = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("second create")
+            .workspace;
+
+        assert!(marker.exists(), "cache hit refreshes, never re-clones");
+        assert_ne!(ws1.id, ws2.id);
+        assert_ne!(
+            ws1.repository_path, ws2.repository_path,
+            "each workspace gets its own standalone checkout"
+        );
+        assert_hydrated_checkout(&ws2, &root.0, &url);
+    }
+
+    /// `baseRef` checkout: the hydrated checkout's workspace branch starts at
+    /// the requested base ref, not the cache's default-branch tip.
+    #[tokio::test]
+    async fn hydration_checks_out_requested_base_ref() {
+        let source = seed_repo("intentd-hydrate-base-src");
+        // Pin `base` at the first commit, then advance the default branch.
+        let base_sha = {
+            let repo = git2::Repository::open(&source.0).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("base", &head, false).unwrap();
+            head.id().to_string()
+        };
+        std::fs::write(source.0.join("later.txt"), "after base\n").unwrap();
+        {
+            let repo = git2::Repository::open(&source.0).unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "feat: later", &tree, &[&parent])
+                .unwrap();
+        }
+        let root = unique_dir("intentd-hydrate-base-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let repo = assert_hydrated_checkout(&ws, &root.0, &url);
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(base_sha.as_str()),
+            "workspace branch starts at the base ref"
+        );
+        assert_eq!(repo.head().unwrap().target().unwrap().to_string(), base_sha);
+        let checkout = std::path::Path::new(ws.repository_path.as_deref().unwrap());
+        assert!(
+            !checkout.join("later.txt").exists(),
+            "tracked files match the base ref, not the default tip"
+        );
+    }
+
+    /// Concurrent `githubUrl`-only creates for the same repo serialize on the
+    /// per-repo cache lock and all succeed with independent checkouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hydrating_creates_same_repo_all_succeed() {
+        let source = seed_repo("intentd-hydrate-conc-src");
+        let root = unique_dir("intentd-hydrate-conc-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let svc = svc.clone();
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                svc.create_workspace(
+                    WorkspaceCreate {
+                        github_url: Some(url),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+            }));
+        }
+        let mut seen_paths = std::collections::HashSet::new();
+        for task in tasks {
+            let ws = task.await.unwrap().expect("concurrent create").workspace;
+            assert_hydrated_checkout(&ws, &root.0, &url);
+            assert!(
+                seen_paths.insert(ws.repository_path.clone().unwrap()),
+                "each create gets its own checkout"
+            );
+        }
+    }
+
+    /// A hydration whose cache clone cannot succeed (unreachable `file://`
+    /// source, no `clonePath`) fails the whole create — no row persisted, no
+    /// partial state.
+    #[tokio::test]
+    async fn hydration_cache_failure_fails_create_no_row_persisted() {
+        let root = unique_dir("intentd-hydrate-fail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let missing = format!("/does/not/exist/{}/repo.git", uuid::Uuid::new_v4());
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(format!("file://{missing}")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail when the cache clone fails");
+        assert!(
+            matches!(err, intent_core::Error::CloneFailed { .. }),
+            "typed clone failure: {err}"
+        );
+        let list = store.list_workspaces(true).await.expect("list");
+        assert!(list.is_empty(), "no row persisted on hydration failure");
     }
 }
 

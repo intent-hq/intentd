@@ -186,6 +186,85 @@ fn clone(github_url: &str, cache_path: &Path, token: Option<&str>) -> Result<()>
     })
 }
 
+/// Run blocking work under the per-repo cache lock for `cache_path`, so a
+/// checkout provisioned FROM the cache never overlaps a concurrent
+/// [`ensure_cached_repo`] refresh/re-clone of the same cache (which
+/// hard-resets or deletes the directory mid-read). The closure runs on the
+/// blocking pool.
+pub async fn with_cache_lock_blocking<T, F>(cache_path: &Path, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let lock = lock_for(cache_path);
+    let _guard = lock.lock().await;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+}
+
+/// Provision a **standalone** plain-clone checkout from a cached repo (the
+/// `direct` fallback of `workspace.create` cache hydration, used when the
+/// filesystem cannot CoW-clone the cache into the workspaces root).
+///
+/// Steps (all local, no network):
+/// 1. `git clone <cache_path> <checkout_path>` — a plain local clone
+///    (hardlinked objects where the filesystem allows).
+/// 2. Copy the cache's remote-tracking refs (`refs/remotes/origin/*`, the
+///    GitHub branches) into the clone so `base_ref` resolution sees every
+///    upstream branch, not just the cache's default.
+/// 3. Retarget `origin` from the cache path to `origin_url` (the real GitHub
+///    URL), so pushes/fetches in the checkout never touch the cache.
+/// 4. Create + check out `branch` from `base_ref` (same resolution and
+///    branch-reuse semantics as the CoW checkout path) and hard-reset to it.
+///
+/// Returns the SHA the checkout lands on. On failure after the clone, the
+/// partially provisioned `checkout_path` is removed best-effort. Blocking —
+/// callers run it on the blocking pool.
+pub fn provision_direct_checkout(
+    cache_path: &Path,
+    checkout_path: &Path,
+    origin_url: &str,
+    branch: &str,
+    base_ref: Option<&str>,
+) -> Result<String> {
+    if let Some(parent) = checkout_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Internal(format!("cannot create checkout parent dir: {e}")))?;
+    }
+    let parent = checkout_path
+        .parent()
+        .ok_or_else(|| Error::Internal("checkout path has no parent".to_string()))?;
+    let dir_name = checkout_path
+        .file_name()
+        .ok_or_else(|| Error::Internal("checkout path has no file name".to_string()))?;
+    let args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), cache_path.as_os_str(), dir_name];
+    run_git_os(parent, &args, None, CACHE_CLONE_TIMEOUT)?;
+    (|| {
+        // The local clone only maps the cache's refs/heads/* (its default
+        // branch) into refs/remotes/origin/*; overlay the cache's own
+        // remote-tracking refs so every GitHub branch resolves as a base ref.
+        run_git(
+            checkout_path,
+            &[
+                "fetch",
+                "origin",
+                "+refs/remotes/origin/*:refs/remotes/origin/*",
+            ],
+            None,
+            CACHE_FETCH_TIMEOUT,
+        )?;
+        let repo = Repository::open(checkout_path).map_err(map_git_err)?;
+        repo.remote_set_url("origin", origin_url)
+            .map_err(map_git_err)?;
+        drop(repo);
+        crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")
+    })()
+    .inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(checkout_path);
+    })
+}
+
 /// Delete the cache dir (self-heal / pre-clone cleanup). Missing path is fine.
 fn remove_cache_path(cache_path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(cache_path) {
@@ -559,6 +638,91 @@ mod tests {
         let path = task.await.unwrap().unwrap();
         assert_eq!(path, cache_path);
         assert!(path.join("a.txt").exists());
+    }
+
+    /// `provision_direct_checkout` produces a standalone plain clone of the
+    /// cache on the workspace branch, with `origin` retargeted at the real
+    /// URL (never the cache path).
+    #[tokio::test]
+    async fn direct_checkout_is_standalone_on_branch_with_retargeted_origin() {
+        let origin = init_repo("repocache-direct-basic");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("direct-basic");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let checkout_root = CacheRoot::new("direct-basic-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        let sha = provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        assert_eq!(sha, head_sha(origin.path()));
+        let repo = Repository::open(&checkout).unwrap();
+        assert!(!repo.is_worktree(), "direct checkout is a standalone repo");
+        let head = repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), "ws-branch");
+        assert_eq!(
+            repo.find_remote("origin").unwrap().url().unwrap(),
+            url.as_str(),
+            "origin retargeted from the cache to the real URL"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    /// A `base_ref` naming a non-default origin branch resolves through the
+    /// remote-tracking refs copied from the cache.
+    #[tokio::test]
+    async fn direct_checkout_resolves_non_default_base_ref() {
+        let origin = init_repo("repocache-direct-base");
+        commit_file(origin.path(), "a.txt", "one\n");
+        // Pin `base` at the first commit, then advance the default branch.
+        let base_sha = head_sha(origin.path());
+        crate::testutil::create_branch(origin.path(), "base");
+        commit_file(origin.path(), "a.txt", "two\n");
+        let root = CacheRoot::new("direct-base");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let checkout_root = CacheRoot::new("direct-base-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        let sha =
+            provision_direct_checkout(&cache, &checkout, &url, "ws-branch", Some("base")).unwrap();
+
+        assert_eq!(sha, base_sha, "branch starts at the base ref");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n",
+            "tracked files match the base ref, not the default tip"
+        );
+    }
+
+    /// An unresolvable `base_ref` surfaces as the typed error and removes the
+    /// partially provisioned checkout.
+    #[tokio::test]
+    async fn direct_checkout_rejects_unresolvable_base_ref_and_cleans_up() {
+        let origin = init_repo("repocache-direct-badref");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("direct-badref");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let checkout_root = CacheRoot::new("direct-badref-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        let err = provision_direct_checkout(&cache, &checkout, &url, "ws-branch", Some("nope"))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "nope"),
+            "got: {err:?}"
+        );
+        assert!(!checkout.exists(), "partial checkout is removed on failure");
     }
 
     /// Several concurrent ensures for the same repo all succeed and agree on

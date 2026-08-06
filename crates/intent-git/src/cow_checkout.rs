@@ -185,7 +185,10 @@ fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
 }
 
 /// Branch + checkout + hard reset inside the freshly cloned repository.
-fn checkout_in_clone(
+/// Shared with [`crate::repo_cache::provision_direct_checkout`], which needs
+/// the identical base-ref resolution + branch-reuse semantics in a plain
+/// local clone.
+pub(crate) fn checkout_in_clone(
     checkout_path: &Path,
     branch: &str,
     base_ref: Option<&str>,

@@ -717,7 +717,10 @@ fn percent_after(text: &str, label: &str) -> Option<u32> {
     rest[start..end].parse::<u32>().ok().map(|p| p.min(100))
 }
 
-fn progress_event(
+/// Shared with the `workspace.create` cache-hydration arm in `lib.rs`, which
+/// streams the same `git:clone:progress` / `git:clone:done` frames while
+/// hydrating from the repo cache instead of a network clone.
+pub(crate) fn progress_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     phase: &str,
@@ -742,7 +745,7 @@ fn progress_event(
     }
 }
 
-fn done_event(
+pub(crate) fn done_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     ok: bool,
@@ -776,7 +779,7 @@ fn done_event(
     }
 }
 
-async fn publish(bus: &EventBus, _ws: &WorkspaceId, event: NewEvent) {
+pub(crate) async fn publish(bus: &EventBus, _ws: &WorkspaceId, event: NewEvent) {
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish git:clone event");
     }

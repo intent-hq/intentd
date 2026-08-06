@@ -10009,6 +10009,16 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from)
                         .filter(|p| p.join(".git").exists());
+                    // Cache-hydration state: set when `githubUrl` is present
+                    // without a `clonePath` — the workspace checkout is
+                    // provisioned from the repo cache in the provisioning
+                    // section below (after branch naming). Carries the cache
+                    // path and the original GitHub URL (for the `direct`
+                    // fallback's origin retarget).
+                    let mut cache_hydration: Option<(PathBuf, String)> = None;
+                    // `isNewRepo` creates work directly in the initialized
+                    // repository folder (checkoutMode `direct`, no worktree).
+                    let mut new_repo_direct = false;
                     if existing_repo.is_none() {
                         if let Some(url) = input
                             .github_url
@@ -10022,6 +10032,149 @@ impl WorkspaceApi for Services {
                                         .to_string(),
                                 )
                             })?;
+                            // Cache hydration (PROTOCOL §5.1): a `githubUrl`
+                            // WITHOUT a `clonePath` hydrates the workspace
+                            // from the daemon-managed repo cache
+                            // (`<workspaces_root>/.repo-cache/<owner>/<repo>`)
+                            // instead of cloning into `<root>/clones/`. The
+                            // cache is ensured (cloned or refreshed) here —
+                            // the network phase — and the standalone checkout
+                            // is provisioned below, after branch naming. An
+                            // explicit `clonePath` keeps the legacy network
+                            // clone exactly (back-compat for older FE), as do
+                            // URLs that carry no `owner/repo` pair (no cache
+                            // slot to hydrate from).
+                            let explicit_clone_path = input
+                                .clone_path
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .is_some();
+                            // Hydration also requires that a checkout will
+                            // actually be provisioned below: remote /
+                            // `skipWorktree` / caller-supplied `worktreePath`
+                            // creates keep the legacy network clone, whose
+                            // `repositoryPath` exists without provisioning.
+                            let provisions_checkout = !input.is_remote.unwrap_or(false)
+                                && !input.skip_isolation.unwrap_or(false)
+                                && input
+                                    .worktree_path
+                                    .as_deref()
+                                    .is_none_or(|p| p.is_empty());
+                            let cache_owner_repo = if explicit_clone_path
+                                || !provisions_checkout
+                            {
+                                None
+                            } else {
+                                clone_ops::parse_owner_repo(url)
+                            };
+                            if let Some((owner, name)) = cache_owner_repo {
+                                let request_id = uuid::Uuid::new_v4().to_string();
+                                // Stream the same `git:clone:*` frames as a
+                                // network clone so the FE initializer shows
+                                // progress: a starting tick, the cache
+                                // ensure (the only network-bound phase), and
+                                // a terminal done. Checkout provisioning
+                                // below is local-only, matching the legacy
+                                // flow where worktree provisioning runs
+                                // after `git:clone:done`.
+                                clone_ops::publish(
+                                    &bus_ref,
+                                    &id,
+                                    clone_ops::progress_event(
+                                        &id,
+                                        &request_id,
+                                        "starting",
+                                        0,
+                                        "Preparing repository cache...",
+                                    ),
+                                )
+                                .await;
+                                let token = github_git_token_for_url(
+                                    services.settings_registry.as_deref(),
+                                    url,
+                                )
+                                .await;
+                                let cache_root = workspaces_root.join(".repo-cache");
+                                let cache_path = match intent_git::repo_cache::ensure_cached_repo(
+                                    &cache_root,
+                                    url,
+                                    &owner,
+                                    &name,
+                                    token.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(path) => path,
+                                    Err(e) => {
+                                        let detail = match e {
+                                            Error::Internal(msg) => msg,
+                                            other => other.to_string(),
+                                        };
+                                        let category =
+                                            clone_ops::classify_clone_error(&detail);
+                                        let error_code = (category
+                                            != intent_core::CloneErrorCategory::Other)
+                                            .then_some(category);
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::done_event(
+                                                &id,
+                                                &request_id,
+                                                false,
+                                                Some(&detail),
+                                                error_code,
+                                            ),
+                                        )
+                                        .await;
+                                        return Err(Error::CloneFailed {
+                                            category,
+                                            detail,
+                                        });
+                                    }
+                                };
+                                clone_ops::publish(
+                                    &bus_ref,
+                                    &id,
+                                    clone_ops::progress_event(
+                                        &id,
+                                        &request_id,
+                                        "checkout",
+                                        90,
+                                        "Repository cache ready",
+                                    ),
+                                )
+                                .await;
+                                clone_ops::publish(
+                                    &bus_ref,
+                                    &id,
+                                    clone_ops::done_event(&id, &request_id, true, None, None),
+                                )
+                                .await;
+                                if input.repository_owner.is_none() {
+                                    input.repository_owner = Some(owner);
+                                }
+                                if input.repository_name.is_none() {
+                                    input.repository_name = Some(name.clone());
+                                }
+                                // The workspace checkout IS the repository
+                                // (self-contained; the cache can be deleted
+                                // safely). It lives at the same
+                                // `<root>/<wsId>/<repo-slug>` the worktree
+                                // path would use.
+                                let repo_slug_name = input
+                                    .repository_name
+                                    .clone()
+                                    .filter(|n| !n.is_empty())
+                                    .unwrap_or(name);
+                                let checkout_dir = workspaces_root
+                                    .join(&id.0)
+                                    .join(worktree_folder_slug(&repo_slug_name));
+                                input.repository_path =
+                                    Some(checkout_dir.to_string_lossy().to_string());
+                                cache_hydration = Some((cache_path, url.to_string()));
+                            } else {
                             let target = match input.clone_path.as_deref() {
                                 Some(p) if !p.trim().is_empty() => PathBuf::from(p),
                                 _ => workspaces_root
@@ -10093,6 +10246,7 @@ impl WorkspaceApi for Services {
                                     input.repository_name = Some(name);
                                 }
                             }
+                            }
                         } else if input.is_new_repo.unwrap_or(false) {
                             // New-project flow (intent-hq/monorepo#962): the FE
                             // marks non-git / not-yet-existing folders with
@@ -10120,6 +10274,7 @@ impl WorkspaceApi for Services {
                                     )
                                 })?;
                             initialize_repository_for_create(repo_path).await?;
+                            new_repo_direct = true;
                         }
                     } else if input.is_new_repo.unwrap_or(false)
                         && input
@@ -10141,6 +10296,7 @@ impl WorkspaceApi for Services {
                         if let Some(repo_path) = existing_repo.clone() {
                             initialize_repository_for_create(repo_path).await?;
                         }
+                        new_repo_direct = true;
                     }
                     // Repository owner/name derivation from origin remote (STAB-64):
                     // when `repositoryPath` is a local git repo and the caller left
@@ -10351,7 +10507,200 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
                     let workspaces_root_pathbuf = workspaces_root.clone();
-                    if let Some(repo_dir) = repo_dir {
+                    if let Some((cache_path, hydration_url)) = cache_hydration {
+                        // Cache hydration (PROTOCOL §5.1): provision a
+                        // **standalone** checkout from the repo cache at the
+                        // `repositoryPath` chosen in the clone arm above
+                        // (`<root>/<wsId>/<repo-slug>`). Never a linked
+                        // worktree against the cache — a cache refresh
+                        // hard-resets/re-clones the cache dir, which would
+                        // corrupt linked worktrees. CoW clone when the
+                        // filesystem supports it (mode `cow`, parity with
+                        // cowIsolation checkouts), else a plain local clone
+                        // from the cache (mode `direct`). Provisioning runs
+                        // under the per-repo cache lock so a concurrent
+                        // create's cache refresh cannot mutate the cache
+                        // mid-copy.
+                        if !ws.is_remote && !ws.skip_worktree && !has_worktree {
+                            let checkout_path = repo_dir.clone().ok_or_else(|| {
+                                Error::Internal(
+                                    "workspace.create: cache hydration lost its checkout path"
+                                        .to_string(),
+                                )
+                            })?;
+                            let ws_dir = workspaces_root_pathbuf.join(&ws.id.0);
+                            std::fs::create_dir_all(&ws_dir).map_err(|e| {
+                                Error::Internal(format!(
+                                    "cannot create workspace dir for cache hydration: {e}"
+                                ))
+                            })?;
+                            let probe_cache = cache_path.clone();
+                            let probe_dst = ws_dir.clone();
+                            let support = tokio::task::spawn_blocking(move || {
+                                intent_git::cow_probe(&probe_cache, &probe_dst)
+                            })
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("CoW probe task failed: {e}"))
+                            })?;
+                            let mut mode = match support {
+                                Ok(intent_git::CowSupport::Supported) => {
+                                    intent_core::CheckoutMode::Cow
+                                }
+                                Ok(intent_git::CowSupport::Unsupported) => {
+                                    intent_core::CheckoutMode::Direct
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        cache = %cache_path.display(),
+                                        error = %e,
+                                        "workspace.create: CoW probe failed; hydrating via local clone (direct)"
+                                    );
+                                    intent_core::CheckoutMode::Direct
+                                }
+                            };
+                            let branch = ws.branch.clone();
+                            let base_ref = ws.base_ref.clone();
+                            let provision = |mode: intent_core::CheckoutMode| {
+                                let cache = cache_path.clone();
+                                let checkout = checkout_path.clone();
+                                let branch = branch.clone();
+                                let base_ref = base_ref.clone();
+                                let url = hydration_url.clone();
+                                async move {
+                                    let lock_cache = cache.clone();
+                                    intent_git::repo_cache::with_cache_lock_blocking(
+                                        &lock_cache,
+                                        move || match mode {
+                                            intent_core::CheckoutMode::Cow => {
+                                                let sha =
+                                                    intent_git::cow_checkout::provision_cow_checkout(
+                                                        &cache,
+                                                        &checkout,
+                                                        &branch,
+                                                        base_ref.as_deref(),
+                                                        "origin",
+                                                        &[],
+                                                    )?;
+                                                // The CoW clone inherits the
+                                                // cache's `origin` (already the
+                                                // GitHub URL); retarget
+                                                // explicitly so the checkout
+                                                // never references the cache
+                                                // even if the cache was seeded
+                                                // differently.
+                                                intent_git::remote::set_remote_url(
+                                                    &checkout, "origin", &url,
+                                                )?;
+                                                Ok(sha)
+                                            }
+                                            intent_core::CheckoutMode::Direct => {
+                                                intent_git::repo_cache::provision_direct_checkout(
+                                                    &cache,
+                                                    &checkout,
+                                                    &url,
+                                                    &branch,
+                                                    base_ref.as_deref(),
+                                                )
+                                            }
+                                            intent_core::CheckoutMode::Worktree => {
+                                                Err(Error::Internal(
+                                                    "cache hydration never provisions a linked worktree"
+                                                        .to_string(),
+                                                ))
+                                            }
+                                        },
+                                    )
+                                    .await
+                                }
+                            };
+                            let sha = match provision(mode).await {
+                                Ok(sha) => sha,
+                                Err(Error::Unsupported(reason))
+                                    if mode == intent_core::CheckoutMode::Cow =>
+                                {
+                                    // Safety net: the probe passed but the
+                                    // clone itself was still unsupported.
+                                    // Fall back to the plain local clone.
+                                    tracing::warn!(
+                                        cache = %cache_path.display(),
+                                        reason = %reason,
+                                        "workspace.create: CoW hydration unsupported despite a passing probe; retrying as a local clone (direct)"
+                                    );
+                                    remove_workspace_dir_if_empty(&ws_dir);
+                                    mode = intent_core::CheckoutMode::Direct;
+                                    match provision(mode).await {
+                                        Ok(sha) => sha,
+                                        Err(e) => {
+                                            remove_workspace_dir_if_empty(&ws_dir);
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // The provisioning helpers already removed
+                                    // the failed checkout; drop the
+                                    // `<root>/<wsId>` parent if left empty so a
+                                    // failed create leaves the workspaces root
+                                    // clean (#774).
+                                    remove_workspace_dir_if_empty(&ws_dir);
+                                    return Err(e);
+                                }
+                            };
+                            ws.worktree_path =
+                                Some(checkout_path.to_string_lossy().to_string());
+                            ws.checkout_mode = Some(mode);
+                            if ws.base_commit_sha.is_none() {
+                                ws.base_commit_sha = Some(sha);
+                            }
+                        }
+                    } else if new_repo_direct {
+                        // `isNewRepo` creates work directly in the initialized
+                        // repository folder: a standalone repo, no worktree
+                        // provisioned (checkoutMode `direct`). Create + check
+                        // out the workspace branch there so agents land on
+                        // `ws.branch` as with every other checkout mode.
+                        if let Some(repo_dir) = repo_dir {
+                            if !ws.is_remote
+                                && !ws.skip_worktree
+                                && !has_worktree
+                                && repo_dir.join(".git").exists()
+                            {
+                                let branch = ws.branch.clone();
+                                let repo = repo_dir.clone();
+                                let sha = worktree_locks
+                                    .with_lock(&repo_dir, move || async move {
+                                        tokio::task::spawn_blocking(move || {
+                                            // Reuse an existing branch of the
+                                            // same name (retried create), else
+                                            // create it from HEAD; then check
+                                            // it out and report HEAD's SHA.
+                                            if intent_git::branches::checkout_branch(
+                                                &repo, &branch,
+                                            )
+                                            .is_err()
+                                            {
+                                                intent_git::branches::create_branch(
+                                                    &repo, &branch, true,
+                                                )?;
+                                            }
+                                            intent_git::refs::rev_parse(&repo, "HEAD")
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            Error::Internal(format!(
+                                                "branch checkout task failed: {e}"
+                                            ))
+                                        })?
+                                    })
+                                    .await?;
+                                ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                                if ws.base_commit_sha.is_none() {
+                                    ws.base_commit_sha = Some(sha);
+                                }
+                            }
+                        }
+                    } else if let Some(repo_dir) = repo_dir {
                         if !ws.is_remote && !ws.skip_worktree && !has_worktree {
                             if repo_dir.join(".git").exists() {
                                 let repo_name = known_repo_name(
@@ -10480,6 +10829,16 @@ impl WorkspaceApi for Services {
                                                                 base_ref.as_deref(),
                                                                 &remote,
                                                             )
+                                                        }
+                                                        // Local-repo creates never
+                                                        // select `direct` (cache
+                                                        // hydration has its own
+                                                        // provisioning arm above).
+                                                        intent_core::CheckoutMode::Direct => {
+                                                            Err(Error::Internal(
+                                                                "direct checkout mode is not provisioned from a local repository"
+                                                                    .to_string(),
+                                                            ))
                                                         }
                                                     },
                                                 )
@@ -11511,14 +11870,18 @@ impl WorkspaceApi for Services {
                                 let repo = repo_dir.clone();
                                 let branch_flag = branch_auto_generated_bg;
                                 let wt_locked = wt.clone();
-                                // A CoW checkout is a standalone clone: no
-                                // registration to prune in the source repo,
-                                // and its workspace branch lives only inside
-                                // the clone — so the source-repo branch-delete
-                                // guard must not run (a same-named source
-                                // branch was never this workspace's).
-                                let is_cow = ws_cleanup.checkout_mode
-                                    == Some(intent_core::CheckoutMode::Cow);
+                                // A CoW or direct checkout is a standalone
+                                // clone: no registration to prune in the
+                                // source repo, and its workspace branch lives
+                                // only inside the clone — so the source-repo
+                                // branch-delete guard must not run (a
+                                // same-named source branch was never this
+                                // workspace's).
+                                let is_standalone = matches!(
+                                    ws_cleanup.checkout_mode,
+                                    Some(intent_core::CheckoutMode::Cow)
+                                        | Some(intent_core::CheckoutMode::Direct)
+                                );
                                 // Under the per-repo lock: git-metadata work
                                 // only (registration prune, rename of the
                                 // checkout to a trash path, branch-delete
@@ -11533,7 +11896,7 @@ impl WorkspaceApi for Services {
                                 let trash = worktree_locks_bg
                                     .with_lock(&repo_dir, move || async move {
                                         let task = tokio::task::spawn_blocking(move || {
-                                            if is_cow {
+                                            if is_standalone {
                                                 cleanup_workspace_cow_checkout_locked(&wt_locked)
                                             } else {
                                                 cleanup_workspace_worktree_locked(
@@ -12077,6 +12440,13 @@ impl WorkspaceApi for Services {
                                                 "origin",
                                             )
                                         }
+                                        // Duplicates never select `direct`: the
+                                        // decision matrix above only yields
+                                        // Cow or Worktree.
+                                        intent_core::CheckoutMode::Direct => Err(Error::Internal(
+                                            "direct checkout mode is not provisioned by workspace.duplicate"
+                                                .to_string(),
+                                        )),
                                     })
                                     .await;
                                     tracing::info!(

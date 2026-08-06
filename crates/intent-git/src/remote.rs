@@ -105,6 +105,13 @@ pub fn ahead_behind(worktree_path: &Path, base_ref: &str) -> Result<(i64, i64)> 
     }
 }
 
+/// Retarget an existing remote at `url` (`git remote set-url` parity). Errors
+/// when the repository cannot be opened or the remote does not exist.
+pub fn set_remote_url(worktree_path: &Path, remote: &str, url: &str) -> Result<()> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    repo.remote_set_url(remote, url).map_err(map_git_err)
+}
+
 /// Add the `origin` remote pointing at `url`, initializing a git repository at
 /// `worktree_path` first when it is not already one (ports the TS `addRemote`
 /// auto-init: `git init -b main`, configure identity, an initial empty commit,
