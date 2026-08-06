@@ -12,10 +12,19 @@
 # llvm-cov but should complete within 90s. One extra period is generous enough
 # to absorb CI load variance without false positives. A hung test (e.g. waiting
 # on a never-arriving event with heartbeat Ping frames resetting a per-frame
-# timeout) will be terminated at 270s (3 × 90s) rather than consuming the full
+# timeout) will be terminated at 180s (2 × 90s) rather than consuming the full
 # 30-minute coverage job. Codified after STAB-TBD (PR #221's
 # completion_report_cleared test hung indefinitely in CI, timing out the
 # coverage jobs at 30 min on every run).
+#
+# Corollary for test authors (monorepo#1562): an in-test deadline must expire
+# BEFORE that 180s kill, otherwise the run reports a bare "test timed out"
+# instead of the assertion naming the step that stalled. Budgets built from
+# `common::test_timeout` scale with INTENTD_TEST_TIMEOUT_MULTIPLIER (3 under
+# coverage), so a 60s base already reaches the kill window on its own — long
+# multi-step e2e tests should clamp every wait to a whole-test budget below 180s
+# (see `TEST_BUDGET` in `tests/e2e_wss_agent_watch.rs`) and split into
+# independent arms when the steps cannot fit.
 #
 # Test groups: Heavy daemon-spawning e2e binaries (delegation group persist,
 # interrupted agents resume, serve --resume-all) serialize among themselves
