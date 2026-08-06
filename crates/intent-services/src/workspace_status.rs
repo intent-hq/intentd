@@ -1733,6 +1733,117 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
+    /// Cross-agent isolation: agent B's turn-begin clear
+    /// (`clear_attention_request_if_present`) must not retire agent A's
+    /// pending request — the workspace stays `needs_attention` (no demotion
+    /// event) until A's own request is cleared.
+    #[tokio::test]
+    async fn other_agents_clear_preserves_needs_attention() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let a = super::workspace_needs_attention::mk_session(&h.ws, "agent-a");
+        let b = super::workspace_needs_attention::mk_session(&h.ws, "agent-b");
+        h.store.insert_agent_session(&a).await.expect("session a");
+        h.store.insert_agent_session(&b).await.expect("session b");
+        h.store
+            .set_attention_request(&h.ws, &a.id, "discussion", "A needs input", &now_iso())
+            .await
+            .expect("raise on A");
+        // Seed: baseline needs_attention (from A's pending request).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        // B's turn-begin clear: no request pending on B → no-op, no event.
+        manager
+            .clear_attention_request_if_present(&b.id, &h.ws)
+            .await;
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_agent_session(&a.id).await.expect("reload A");
+        assert_eq!(
+            reloaded.attention_request_kind.as_deref(),
+            Some("discussion"),
+            "A's pending request survives B's clear"
+        );
+        assert!(h.services.workspace_needs_attention(&h.ws).await);
+
+        // Clearing A's own request retires the hold and emits the demotion.
+        manager
+            .clear_attention_request_if_present(&a.id, &h.ws)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// An agent run ending must not demote a surviving `needs_attention`:
+    /// the pending request outranks both the running promotion and the
+    /// post-debounce idle recompute, so the whole begin→end cycle stays
+    /// silent and the read path keeps serving `needs_attention`.
+    #[tokio::test]
+    async fn agent_end_preserves_surviving_needs_attention() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-hold");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "blocker", "stuck", &now_iso())
+            .await
+            .expect("raise");
+        // Seed: baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws).await;
+        // Wait out the debounced idle recompute: needs_attention outranks
+        // both transitions, so nothing emits (assert_silent's 300ms watch
+        // covers the 100ms debounce window).
+        assert_silent(&mut sub).await;
+        assert!(h.services.workspace_needs_attention(&h.ws).await);
+    }
+
+    /// Idle-demotion vs activity-begin race: an `agent_activity_begin`
+    /// landing inside the grace window cancels the pending idle flip — no
+    /// bogus `idle` demotion emits and the status stays `in_progress`.
+    #[tokio::test]
+    async fn activity_begin_in_grace_window_cancels_idle_demotion() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed: no agent running → idle baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+
+        // End then immediately begin again: the second begin cancels the
+        // pending idle debounce, so no demotion ever emits (assert_silent's
+        // 300ms watch covers the 100ms window).
+        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_silent(&mut sub).await;
+    }
+
     /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
     /// the persisted user row supersedes the pending question tail
     /// (store-only `agent.sendMessage` path) and emits the demotion.
