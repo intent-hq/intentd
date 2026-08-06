@@ -12,14 +12,16 @@
 //!    transitions away from `needs_attention` and settles at `idle`.
 //! 3. A pending-question tail (turn ends with a trailing
 //!    `application/vnd.intent.question+json` resource block) raises
-//!    `needs_attention`; `agent.dismissQuestions` retires it.
+//!    `needs_attention` PERSISTENTLY — an untagged user message and the turn
+//!    it drives do not retire it; `agent.dismissQuestions` does.
 //! 4. A delegated (child/background) agent raising a blocker never produces
 //!    `needs_attention`, even though `agent:attention-requested` fires and
 //!    the linked task moves to `blocked`.
 //! 5. The transcript-mutation RPCs recompute the derivation over the wire
-//!    (monorepo#1266): `agent.appendMessage` with a user row retires a
-//!    pending-question `needs_attention`, and `agent.replaceMessages`
-//!    swapping back to a question-tail transcript raises it again.
+//!    (monorepo#1266): `agent.appendMessage` with an answer-tagged user row
+//!    retires a pending-question `needs_attention`, and
+//!    `agent.replaceMessages` swapping back to a question-tail transcript
+//!    raises it again.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -580,7 +582,9 @@ async fn discussion_request_promotes_and_user_message_retires_over_wss() {
 
 /// Scenario 3 — a pending-question tail promotes `needs_attention`: the
 /// asker's turn ends with a trailing question resource block
-/// (`ws.app.question.ask`), and `agent.dismissQuestions` retires it.
+/// (`ws.app.question.ask`). The promotion is PERSISTENT — an untagged user
+/// message and the agent turn it drives push the question off the transcript
+/// tail without retiring it — and only `agent.dismissQuestions` retires it.
 #[tokio::test]
 async fn question_tail_promotes_and_dismiss_retires_over_wss() {
     let Some(script) = gate("WSS needs_attention question E2E") else {
@@ -698,6 +702,54 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
         get_display_status(&mut rpc, &ws_id).await,
         "needs_attention",
         "workspace.get serves needs_attention while the question is pending"
+    );
+
+    // ---- Persistence: an untagged user message + the agent turn it drives
+    // do NOT retire the question. The pending-questions marker only clears on
+    // an answer tag or an explicit dismissal, so the workspace stays flagged
+    // even though the transcript tail is no longer the question row.
+    let plain = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "unrelated aside while the question is pending",
+        }),
+    )
+    .await;
+    assert_eq!(plain["success"], true, "plain user send ok: {plain}");
+
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!("timed out waiting for the plain turn to go idle"),
+        };
+        assert_ne!(
+            ev["type"], "workspace:displayStatus-changed",
+            "an untagged user message must not move displayStatus: {ev}"
+        );
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(agent_id) {
+            break;
+        }
+    }
+    let conv = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert_ne!(
+        messages.last().expect("non-empty transcript")["id"],
+        json!(question_mid),
+        "the question row is no longer the transcript tail"
+    );
+    assert_eq!(
+        get_display_status(&mut rpc, &ws_id).await,
+        "needs_attention",
+        "pendingness survives an untagged user message and the agent's turn"
     );
 
     // ---- Retire: agent.dismissQuestions clears the question hold ----

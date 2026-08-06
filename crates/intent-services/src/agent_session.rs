@@ -1605,12 +1605,13 @@ impl Services {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
                 .await;
         }
-        // The new assistant tail moves the question-hold derivation (§6.5
-        // step 0): a trailing question resource block RAISES the workspace's
-        // needs_attention displayStatus; a question-free tail after a prior
-        // question message RETIRES it. Recompute-and-compare (transition-only
-        // emission inside) so steady-state question-free turns stay silent.
-        if message_persisted {
+        // A question-bearing tail arms the marker above and so RAISES the
+        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare. A question-FREE tail no longer moves the
+        // derivation at all — pendingness now survives the agent's later
+        // turns — so those turn ends skip the workspace-wide probe entirely
+        // instead of relying on the dedup cache to stay silent.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -1952,9 +1953,9 @@ impl Services {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
                 .await;
         }
-        // Same §6.5 step-0 recompute as the prompt-turn persist: the new
-        // assistant tail moves the question-hold derivation either way.
-        if message_persisted {
+        // Same §6.5 step-0 recompute as the prompt-turn persist: only a
+        // question-bearing tail moves the question-hold derivation.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         self.clear_live_turn(agent_id);

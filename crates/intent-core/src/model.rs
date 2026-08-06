@@ -2043,13 +2043,14 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately (a user
-/// message supersedes any pending Q&A). Everything else (MCP front-door
-/// sends, reportToParent / completion-watch / event-subscription wakes,
+/// user-originated entry point — which always delivers immediately; it
+/// bypasses the hold but does NOT release it (only an answer-tagged row or
+/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
+/// reportToParent / completion-watch / event-subscription wakes,
 /// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
 /// `Automatic` and is held in the queue while the target agent's question
 /// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than dismissing a pending Q&A.
+/// fail closed (held) rather than burying a pending Q&A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
     /// FE-originated `agent.sendMessage` (typed message or wizard answers):

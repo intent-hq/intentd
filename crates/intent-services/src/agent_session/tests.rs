@@ -1899,30 +1899,66 @@ fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::even
     })
 }
 
-/// monorepo#1266 regression (retire): a user row appended via
-/// `agent.appendMessage` supersedes a pending question tail, so the op's own
-/// recompute must retire the workspace's `needs_attention` displayStatus —
-/// not leave it stale until the next trigger or snapshot.
+/// monorepo#1266 regression (retire): the ANSWER row appended via
+/// `agent.appendMessage` — tagged `question_answers` for the marked question
+/// message — resolves the pending Q&A, so the op's own recompute must retire
+/// the workspace's `needs_attention` displayStatus rather than leave it stale
+/// until the next trigger or snapshot. A PLAIN user row does not: pendingness
+/// now survives it, so the status stays `needs_attention` and nothing emits.
 #[tokio::test]
-async fn append_message_op_user_row_retires_needs_attention() {
+async fn append_message_op_answer_row_retires_needs_attention() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    // Seed a question-bearing assistant tail, then the last-observed
-    // baseline (needs_attention; a first observation never emits).
-    bus.store()
-        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+    // Seed a question-bearing assistant tail through the op so the
+    // pending-questions marker is armed, then the last-observed baseline
+    // (needs_attention; a first observation never emits).
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
         .await
         .expect("append question tail");
+    let asked_id = asked["message"]["id"]
+        .as_str()
+        .expect("question row id")
+        .to_string();
     services
         .maybe_emit_display_status_changed(&workspace_id)
         .await;
     let mut sub = display_status_sub(&bus, &workspace_id);
+
+    // A plain user row leaves the Q&A pending — no transition, no emit.
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "unrelated aside" }]),
+            None,
+        )
+        .await
+        .expect("plain appendMessage succeeds");
+    assert!(
+        services.question_hold_active(&agent_id).await,
+        "a plain user row must not resolve the pending Q&A"
+    );
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no displayStatus transition for a plain user row"
+    );
 
     services
         .agent_append_message_op(
             agent_id.clone(),
             "user".to_string(),
             json!([{ "type": "text", "text": "answer" }]),
-            None,
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            })),
         )
         .await
         .expect("appendMessage succeeds");

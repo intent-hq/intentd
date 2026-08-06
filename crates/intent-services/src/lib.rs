@@ -4349,8 +4349,8 @@ impl Services {
             None => {
                 // Question hold (PROTOCOL §5.5): parent wakes are automatic —
                 // an active hold parks the wake in the queue instead of
-                // appending the user row that would supersede the pending
-                // Q&A (mirrors the manager path's `send_message` gate).
+                // appending a user row that would bury the pending Q&A
+                // (mirrors the manager path's `send_message` gate).
                 if self.question_hold_active(&parent_agent_id).await {
                     let (queued, position) = self.enqueue_message(
                         &parent_agent_id,
@@ -17012,10 +17012,10 @@ impl WorkspaceApi for Services {
                 }
                 None => {
                     // Question hold (PROTOCOL §5.5): the store-only fallback
-                    // must honor the automatic-delivery gate too — persisting
-                    // the row would supersede the pending Q&A. User-originated
-                    // sends pass through (a user answer/typed message is the
-                    // documented hold release).
+                    // must honor the automatic-delivery gate too — the row it
+                    // persists would bury the pending Q&A. User-originated
+                    // sends pass through (never held; only an answer-tagged
+                    // row or `agent.dismissQuestions` releases the hold).
                     if !origin.is_user() && self.question_hold_active(&agent_id).await {
                         self.require_agent_session(&agent_id).await?;
                         let (queued, position) = self.enqueue_message(

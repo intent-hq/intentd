@@ -1192,8 +1192,10 @@ async fn dispatch(
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held
-            // (they supersede a pending Q&A by design).
+            // ONLY user-originated entry point — user sends are never held.
+            // They do not release the hold either: only an answer-tagged row
+            // (`messageMetadata.type = "question_answers"`) or
+            // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
                 .agent_send_message(
                     ws,

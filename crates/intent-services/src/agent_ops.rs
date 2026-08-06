@@ -481,11 +481,11 @@ pub(crate) struct QueuedMessage {
     /// `true` when the entry carries a USER-originated `agent.sendMessage`
     /// that was parked by a queue-fallback path (busy race, quarantine,
     /// append-failure). The question hold never blocks user messages
-    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
-    /// hold-gated drain paths deliver the first user-origin entry instead
-    /// of suspending — without this marker a user answer parked by the
-    /// turn-end busy race would deadlock against the hold it is supposed
-    /// to release. Persisted so the bypass survives daemon restarts.
+    /// (PROTOCOL §5.5), so the hold-gated drain paths deliver the first
+    /// user-origin entry instead of suspending — without this marker a user
+    /// answer parked by the turn-end busy race would deadlock against the
+    /// hold its answer tag is supposed to release. Persisted so the bypass
+    /// survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
 }
@@ -2736,24 +2736,41 @@ impl Services {
         // as the turn-end and user-send persists: an appended assistant row
         // bearing question blocks arms the pending marker, an appended user
         // row tagged `question_answers` for the marked message clears it.
-        if role == "assistant" && has_question_blocks(&content) {
+        // Only those two transitions move the hold — a plain user row leaves
+        // it pending — so they also gate the displayStatus recompute below.
+        let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
                 .await;
-        } else if role == "user" {
-            self.resolve_pending_questions_for_answer(
-                &session.workspace_id,
-                &agent_id,
-                metadata.as_ref(),
-            )
-            .await;
+            true
+        } else if role == "user"
+            && self
+                .resolve_pending_questions_for_answer(
+                    &session.workspace_id,
+                    &agent_id,
+                    metadata.as_ref(),
+                )
+                .await
+        {
+            // This path only persists a row (no turn of its own), so the
+            // released hold needs an explicit drain kick for the entries it
+            // parked — same kick `agent.dismissQuestions` performs.
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
+                    .await;
+            }
+            true
+        } else {
+            false
+        };
+        // A moved question-hold derivation — an answered question set retires
+        // the hold, an assistant row with a trailing question block raises it
+        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare (monorepo#1266).
+        if hold_moved {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
         }
-        // The appended row can move the question-hold derivation — an answered
-        // question set retires the hold, an assistant row with a trailing
-        // question block raises it — which flips the workspace's
-        // needs_attention displayStatus (§6.5 step 0): recompute-and-compare
-        // (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
         Ok(json!({ "success": true, "message": message }))
     }
 
@@ -3395,18 +3412,20 @@ impl Services {
                 // Answer intake (PROTOCOL §5.5, question hold): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
-                // clears the pending-questions marker.
-                self.resolve_pending_questions_for_answer(
-                    &session.workspace_id,
-                    &agent_id,
-                    message_metadata.as_ref(),
-                )
-                .await;
-                // The user row supersedes a pending question tail, which can
+                // clears the pending-questions marker, and only that clear can
                 // retire the workspace's needs_attention displayStatus (§6.5
                 // step 0): recompute-and-compare.
-                self.maybe_emit_display_status_changed(&session.workspace_id)
-                    .await;
+                if self
+                    .resolve_pending_questions_for_answer(
+                        &session.workspace_id,
+                        &agent_id,
+                        message_metadata.as_ref(),
+                    )
+                    .await
+                {
+                    self.maybe_emit_display_status_changed(&session.workspace_id)
+                        .await;
+                }
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -3525,18 +3544,20 @@ impl Services {
         )
         .await;
         // Answer intake (PROTOCOL §5.5, question hold): parity with the
-        // runtime `send_queued_message_now` persist.
-        self.resolve_pending_questions_for_answer(
-            &session.workspace_id,
-            &agent_id,
-            entry.message_metadata.as_ref(),
-        )
-        .await;
-        // The user row supersedes a pending question tail, which can retire
-        // the workspace's needs_attention displayStatus (§6.5 step 0):
-        // recompute-and-compare.
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
+        // runtime `send_queued_message_now` persist — only a matching answer
+        // tag clears the marker, and only that clear can retire the
+        // workspace's needs_attention displayStatus (§6.5 step 0).
+        if self
+            .resolve_pending_questions_for_answer(
+                &session.workspace_id,
+                &agent_id,
+                entry.message_metadata.as_ref(),
+            )
+            .await
+        {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
+        }
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
@@ -3712,8 +3733,9 @@ impl Services {
     /// release a newer hold nor re-arm an old one. The daemon never inspects
     /// the answer TEXT (spec §Decisions 3).
     ///
-    /// Returns `true` when the marker was cleared, so callers can kick the
-    /// queue drain / recompute displayStatus.
+    /// Returns `true` when the marker was cleared, so callers can recompute
+    /// displayStatus and — on the persist-only paths that start no turn of
+    /// their own — kick the queue drain for the entries the hold parked.
     pub(crate) async fn resolve_pending_questions_for_answer(
         &self,
         workspace_id: &WorkspaceId,
@@ -6580,7 +6602,7 @@ impl Services {
                 // deployments with and without a runtime manager. Question
                 // hold (PROTOCOL §5.5): sendToTask is automatic by
                 // definition, so an active hold parks the message instead
-                // of persisting the superseding user row.
+                // of persisting a user row that buries the pending Q&A.
                 if self.question_hold_active(&agent).await {
                     let (queued, position) = self.enqueue_message(
                         &agent,
@@ -7380,7 +7402,7 @@ impl Services {
     {
         // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
         // runtime path above — the store-only persist would append the user
-        // row that supersedes the pending Q&A, so park the wake in the queue
+        // row whose turn would bury the pending Q&A, so park the wake in the queue
         // instead (hermetic wiring keeps the hold contract testable).
         if self.question_hold_active(agent_id).await {
             let (queued, position) = self.enqueue_message(
@@ -7559,8 +7581,7 @@ impl Services {
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
     /// quarantine, append-failure). The question-hold drain gates deliver
     /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
-    /// answer supersedes the pending Q&A and must never deadlock against
-    /// the hold it releases).
+    /// answer must never deadlock against the hold its answer tag releases).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_origin(
         &self,
@@ -7661,9 +7682,9 @@ impl Services {
     /// Pop the oldest ready-to-send **user-origin** queued message, if any
     /// (question hold, PROTOCOL §5.5). While the hold is active the drain
     /// paths deliver ONLY user-origin entries — a user answer parked by the
-    /// turn-end busy race must supersede the pending Q&A instead of
-    /// deadlocking behind the hold it is supposed to release; automatic
-    /// entries stay parked.
+    /// turn-end busy race must reach the transcript instead of deadlocking
+    /// behind the hold its answer tag releases; automatic entries stay
+    /// parked.
     pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
@@ -8648,8 +8669,9 @@ impl Services {
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load).
-        // Automatic origin: a resume continuation must not supersede a Q&A
-        // the agent had pending when the harness shut down (question hold).
+        // Automatic origin: a resume continuation must not bury a Q&A the
+        // agent had pending when the harness shut down (question hold — the
+        // marker is persisted, so the hold survives the restart).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),
