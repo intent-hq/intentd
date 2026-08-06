@@ -635,6 +635,31 @@ mod dto {
     }
 }
 
+const REVIEW_DECISION_QUERY: &str = r#"
+query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $prNumber) {
+      reviewDecision
+    }
+  }
+}
+"#;
+
+/// Map the GraphQL `reviewDecision` payload to [`ReviewDecision`]. GitHub
+/// reports `null` when the base branch has no review requirement; that (or
+/// any unrecognized value) maps to `None`.
+fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
+    match data
+        .pointer("/repository/pullRequest/reviewDecision")
+        .and_then(Value::as_str)
+    {
+        Some("APPROVED") => Some(ReviewDecision::Approved),
+        Some("CHANGES_REQUESTED") => Some(ReviewDecision::ChangesRequested),
+        Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
+        _ => None,
+    }
+}
+
 const REVIEW_THREADS_QUERY: &str = r#"
 query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
@@ -979,6 +1004,20 @@ impl SourceControl for GitHubSourceControl {
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
         self.rest_collect_all(&route, |v| v, map_review).await
+    }
+
+    async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
+        let payload = json!({
+            "query": REVIEW_DECISION_QUERY,
+            "variables": {
+                "owner": repo.owner,
+                "repo": repo.name,
+                "prNumber": number,
+            },
+        });
+        let resp: Value = self.client.graphql(&payload).await?;
+        let data = graphql_data(resp)?;
+        Ok(parse_review_decision(&data))
     }
 
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
@@ -1431,6 +1470,31 @@ mod tests {
 
         let no_data = graphql_data(json!({ "data": null })).unwrap_err();
         assert!(matches!(no_data, Error::Api(_)));
+    }
+
+    #[test]
+    fn parses_review_decision_including_null() {
+        let data = |v: Value| json!({ "repository": { "pullRequest": { "reviewDecision": v } } });
+        assert_eq!(
+            parse_review_decision(&data(json!("APPROVED"))),
+            Some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            parse_review_decision(&data(json!("CHANGES_REQUESTED"))),
+            Some(ReviewDecision::ChangesRequested)
+        );
+        assert_eq!(
+            parse_review_decision(&data(json!("REVIEW_REQUIRED"))),
+            Some(ReviewDecision::ReviewRequired)
+        );
+        // Null (unprotected base: no review requirement) and unrecognized
+        // values map to None, as does a missing pullRequest node.
+        assert_eq!(parse_review_decision(&data(Value::Null)), None);
+        assert_eq!(parse_review_decision(&data(json!("SOMETHING_NEW"))), None);
+        assert_eq!(
+            parse_review_decision(&json!({ "repository": { "pullRequest": null } })),
+            None
+        );
     }
 
     #[test]

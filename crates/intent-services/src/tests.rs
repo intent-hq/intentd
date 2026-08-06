@@ -3723,6 +3723,91 @@ async fn query_filters_and_defaults_limit_50() {
     assert!(none.as_array().expect("bare array").is_empty());
 }
 
+/// monorepo#1538: `event.query`'s `eventType` accepts subscribe-style globs
+/// (mirroring `event_type_matches`): `prefix:*` matches the category, bare `*`
+/// means no type filter, and anything else — including `note*` without a
+/// colon — stays an exact match. Both the legacy-array and paginated paths
+/// honor the glob.
+#[tokio::test]
+async fn query_event_type_glob_matches_subscribe_semantics() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for (i, t) in ["note:updated", "note:deleted", "workspace:updated"]
+        .iter()
+        .enumerate()
+    {
+        svc.store()
+            .insert_event(&intent_store::NewEvent {
+                workspace_id: ws.clone(),
+                timestamp: format!("2026-01-01T00:00:0{i}Z"),
+                event_type: t.to_string(),
+                actor: EventActor {
+                    actor_type: ActorType::Agent,
+                    id: Some("a".to_string()),
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+    }
+
+    let params = |event_type: &str, paginate: Option<bool>| intent_core::EventQueryParams {
+        event_type: Some(event_type.to_string()),
+        paginate,
+        ..Default::default()
+    };
+
+    // `note:*` → both note-category events, nothing else.
+    let notes = svc
+        .event_query(ws.clone(), params("note:*", None))
+        .await
+        .expect("glob query");
+    let notes = notes.as_array().expect("bare array");
+    assert_eq!(notes.len(), 2);
+    assert!(notes
+        .iter()
+        .all(|e| e["type"].as_str().unwrap().starts_with("note:")));
+
+    // Exact type is unchanged.
+    let exact = svc
+        .event_query(ws.clone(), params("note:updated", None))
+        .await
+        .expect("exact query");
+    let exact = exact.as_array().expect("bare array");
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0]["type"], "note:updated");
+
+    // Bare `*` behaves like no type filter.
+    let all = svc
+        .event_query(ws.clone(), params("*", None))
+        .await
+        .expect("star query");
+    assert_eq!(all.as_array().expect("bare array").len(), 3);
+
+    // `note*` (no colon) stays an exact literal → matches nothing.
+    let literal = svc
+        .event_query(ws.clone(), params("note*", None))
+        .await
+        .expect("literal query");
+    assert!(literal.as_array().expect("bare array").is_empty());
+
+    // The paginated path honors the glob too.
+    let page = svc
+        .event_query(ws.clone(), params("note:*", Some(true)))
+        .await
+        .expect("paginated glob query");
+    let items = page["items"].as_array().expect("envelope items");
+    assert_eq!(items.len(), 2);
+    assert!(items
+        .iter()
+        .all(|e| e["type"].as_str().unwrap().starts_with("note:")));
+    assert!(page["nextToken"].is_null());
+}
+
 /// TA-2 / §5.5: `event.query` is opt-in paginated. Without `paginate`/`page_token`
 /// it returns the legacy bare array; with it, it returns the `{ items, nextToken }`
 /// envelope (newest→oldest, clamped limit) and an opaque token that walks
@@ -6712,8 +6797,8 @@ mod pr {
         AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
         PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
-        Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities,
-        SourceControl, UserIdentity,
+        Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -6765,6 +6850,19 @@ mod pr {
         /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
         /// exercising the `pr_state` `mergeBlockedReason` wiring.
         dirty_pr: bool,
+        /// When true, `get_pr` reports the sample PR with
+        /// `mergeableState: "blocked"` (required checks / merge queue /
+        /// token without push access), exercising the `pr_state` decision
+        /// regression (intent-hq/monorepo#1524).
+        blocked_pr: bool,
+        /// When true, `list_reviews` returns no reviews at all.
+        no_reviews: bool,
+        /// The forge's authoritative `reviewDecision` (`None` mirrors an
+        /// unprotected base / host without the signal).
+        review_decision: Option<ReviewDecision>,
+        /// When true, `review_decision` fails, exercising the degrade-to-
+        /// aggregate path of `pr_state`.
+        fail_review_decision: bool,
     }
 
     fn sample_pr() -> PullRequest {
@@ -6937,6 +7035,10 @@ mod pr {
                 pr.mergeable = Some(false);
                 pr.mergeable_state = Some("dirty".into());
             }
+            if self.blocked_pr {
+                pr.mergeable = Some(false);
+                pr.mergeable_state = Some("blocked".into());
+            }
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
@@ -6995,7 +7097,16 @@ mod pr {
                 submitted_at: "2026-06-17T05:00:00.000Z".into(),
             })
         }
+        async fn review_decision(&self, _: &RepoRef, _: u64) -> ScResult<Option<ReviewDecision>> {
+            if self.fail_review_decision {
+                return Err(ScError::Api("graphql down".into()));
+            }
+            Ok(self.review_decision)
+        }
         async fn list_reviews(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Review>> {
+            if self.no_reviews {
+                return Ok(vec![]);
+            }
             Ok(vec![
                 Review {
                     author: "alice".into(),
@@ -7587,6 +7698,8 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
+        // Threads came from GraphQL, so resolution state is authoritative.
+        assert_eq!(v["comments"]["threadResolutionUnknown"], false);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
@@ -7594,7 +7707,9 @@ mod pr {
     async fn state_snapshot_counts_via_rest_fallback() {
         // GraphQL threads unavailable: inline comments are counted from the
         // flat REST list (replies included); resolution is unavailable there,
-        // so every fallback thread counts as unresolved.
+        // so every fallback thread counts as unresolved — and the snapshot
+        // must flag the count as unreliable (intent-hq/monorepo#1524) instead
+        // of silently reporting resolved threads as unresolved.
         let (_t, svc, ws) = setup_with(
             StubForge {
                 fail_threads: true,
@@ -7608,6 +7723,7 @@ mod pr {
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 2);
+        assert_eq!(v["comments"]["threadResolutionUnknown"], true);
         assert_eq!(v["comments"]["totalCount"], 3);
     }
 
@@ -7645,6 +7761,66 @@ mod pr {
         // A merged PR never reports a blocked reason, even when the forge
         // still surfaces a dirty mergeable state.
         assert_eq!(v["mergeBlockedReason"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_blocked_state_without_reviews_is_none_decision() {
+        // Regression (intent-hq/monorepo#1524): REST `mergeable_state:
+        // "blocked"` conflates required checks / merge queue / token access
+        // and is NOT a review-requirement signal. With no reviews and a null
+        // provider `reviewDecision` (unprotected base), the decision must be
+        // `none`, never `review_required`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                blocked_pr: true,
+                no_reviews: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["mergeableState"], "blocked");
+        assert_eq!(v["reviews"]["decision"], "none");
+        assert_eq!(v["reviews"]["approvals"], 0);
+        assert_eq!(v["reviews"]["changesRequested"], 0);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_provider_review_required_maps_directly() {
+        // A protected base reporting `REVIEW_REQUIRED` yields
+        // `review_required` even with a clean mergeable state — the decision
+        // comes from the forge's `reviewDecision`, not `mergeable_state`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                no_reviews: true,
+                review_decision: Some(ReviewDecision::ReviewRequired),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["mergeableState"], "clean");
+        assert_eq!(v["reviews"]["decision"], "review_required");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_decision_fetch_error_degrades_to_aggregate() {
+        // A failed `reviewDecision` fetch never fails the snapshot: the
+        // decision degrades to the aggregated actionable reviews (the stub's
+        // default reviews carry one approval).
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_review_decision: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
+        assert_eq!(v["reviews"]["decision"], "approved");
+        assert_eq!(v["reviews"]["approvals"], 1);
     }
 
     #[tokio::test]

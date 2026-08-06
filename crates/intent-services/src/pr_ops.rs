@@ -16,8 +16,8 @@ use std::sync::Arc;
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
     CheckRun, CheckState, MergeMethod, Page, PageParams, PrQuery, PrState, PullRequest, RepoRef,
-    Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, SourceControl,
-    SourceControlRegistry, SourceControlSettings,
+    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+    SourceControl, SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -544,24 +544,35 @@ pub(crate) fn merge_blocked_reason(
     reason.map(str::to_string)
 }
 
-/// The `ws.pr.snapshot` `reviews.decision` derivation: `changes_requested` /
-/// `approved` from the aggregated actionable reviews; `review_required` when
-/// an open (incl. draft) PR has no actionable reviews but the forge reports
-/// the merge as `blocked` (required reviews / branch protection unmet); else
-/// `none`.
+/// The `ws.pr.snapshot` `reviews.decision` derivation. The forge's
+/// authoritative [`ReviewDecision`] (GraphQL `reviewDecision` on GitHub) maps
+/// directly when present — `review_required` only for open (incl. draft)
+/// PRs. Without one (no review requirement on the base branch, a host
+/// without the signal, or a failed fetch) the decision falls back to the
+/// aggregated actionable reviews: `changes_requested`, else `approved`, else
+/// `none`. REST `mergeable_state` is never consulted — its `blocked` value
+/// conflates required checks / merge queues / token access and is not a
+/// review-requirement signal (intent-hq/monorepo#1524).
 pub(crate) fn snapshot_review_decision(
     agg: &ReviewAggregate,
     state: &str,
-    mergeable_state: &str,
+    provider_decision: Option<ReviewDecision>,
 ) -> &'static str {
-    if agg.changes_requested_count > 0 {
-        "changes_requested"
-    } else if agg.approval_count > 0 {
-        "approved"
-    } else if (state == "open" || state == "draft") && mergeable_state == "blocked" {
-        "review_required"
-    } else {
-        "none"
+    match provider_decision {
+        Some(ReviewDecision::ChangesRequested) => "changes_requested",
+        Some(ReviewDecision::Approved) => "approved",
+        Some(ReviewDecision::ReviewRequired) if state == "open" || state == "draft" => {
+            "review_required"
+        }
+        _ => {
+            if agg.changes_requested_count > 0 {
+                "changes_requested"
+            } else if agg.approval_count > 0 {
+                "approved"
+            } else {
+                "none"
+            }
+        }
     }
 }
 
@@ -1100,36 +1111,61 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_decision_orders_changes_requested_approved_required_none() {
+    fn snapshot_decision_maps_provider_decision_directly() {
         let agg = |approvals: i64, changes: i64| ReviewAggregate {
             approval_count: approvals,
             changes_requested_count: changes,
         };
+        // The forge's authoritative decision wins over the aggregate.
         assert_eq!(
-            snapshot_review_decision(&agg(1, 1), "open", "clean"),
+            snapshot_review_decision(&agg(0, 0), "open", Some(ReviewDecision::ChangesRequested)),
             "changes_requested"
         );
         assert_eq!(
-            snapshot_review_decision(&agg(2, 0), "open", "blocked"),
+            snapshot_review_decision(&agg(0, 1), "open", Some(ReviewDecision::Approved)),
             "approved"
         );
         assert_eq!(
-            snapshot_review_decision(&agg(0, 0), "open", "blocked"),
+            snapshot_review_decision(&agg(0, 0), "open", Some(ReviewDecision::ReviewRequired)),
             "review_required"
         );
         assert_eq!(
-            snapshot_review_decision(&agg(0, 0), "draft", "blocked"),
+            snapshot_review_decision(&agg(0, 0), "draft", Some(ReviewDecision::ReviewRequired)),
             "review_required"
         );
+        // `review_required` only applies to open/draft PRs; merged/closed
+        // fall back to the aggregate.
         assert_eq!(
-            snapshot_review_decision(&agg(0, 0), "open", "clean"),
+            snapshot_review_decision(&agg(0, 0), "merged", Some(ReviewDecision::ReviewRequired)),
             "none"
         );
-        // Merged/closed PRs never derive `review_required` from `blocked`.
         assert_eq!(
-            snapshot_review_decision(&agg(0, 0), "merged", "blocked"),
-            "none"
+            snapshot_review_decision(&agg(1, 0), "closed", Some(ReviewDecision::ReviewRequired)),
+            "approved"
         );
+    }
+
+    #[test]
+    fn snapshot_decision_without_provider_decision_derives_from_aggregate() {
+        // Regression (intent-hq/monorepo#1524): with a null `reviewDecision`
+        // and no reviews, the decision is `none` — never `review_required`
+        // inferred from REST `mergeable_state == "blocked"` (which is no
+        // longer consulted at all).
+        let agg = |approvals: i64, changes: i64| ReviewAggregate {
+            approval_count: approvals,
+            changes_requested_count: changes,
+        };
+        assert_eq!(snapshot_review_decision(&agg(0, 0), "open", None), "none");
+        assert_eq!(snapshot_review_decision(&agg(0, 0), "draft", None), "none");
+        assert_eq!(
+            snapshot_review_decision(&agg(1, 1), "open", None),
+            "changes_requested"
+        );
+        assert_eq!(
+            snapshot_review_decision(&agg(2, 0), "open", None),
+            "approved"
+        );
+        assert_eq!(snapshot_review_decision(&agg(0, 0), "merged", None), "none");
     }
 
     #[test]

@@ -2036,7 +2036,6 @@ impl AgentManager {
                     stored_model.as_deref(),
                 )
                 .await;
-                self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -2081,7 +2080,6 @@ impl AgentManager {
                 stored_model.as_deref(),
             )
             .await;
-            self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
             return Ok(opened.session_id);
         }
 
@@ -2106,28 +2104,7 @@ impl AgentManager {
             stored_model.as_deref(),
         )
         .await;
-        self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
         Ok(opened.session_id)
-    }
-
-    /// Sync the live handle's `spawned_model` to what `resolve_spawn` will
-    /// yield now that the session open persisted an effective model (D13):
-    /// otherwise the next `ensure_started` would see a model "change"
-    /// (placeholder → effective) that no `agent.setModel` requested and
-    /// pointlessly respawn the child. The stored value mirrors
-    /// `resolve_spawn`'s bare-model filter — an effective display name
-    /// always carries whitespace ("Opus 4.8"), which `resolve_spawn` drops
-    /// to `None` (spawn on the provider default, exactly what the
-    /// placeholder resolved from). No-op when nothing was persisted or the
-    /// handle is gone.
-    fn sync_spawned_model(&self, agent_id: &AgentId, effective_model: Option<&str>) {
-        let Some(effective) = effective_model else {
-            return;
-        };
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
-            handle.spawned_model = Some(effective.to_string())
-                .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
-        }
     }
 
     /// Best-effort post-session model application, gated per provider
@@ -2233,9 +2210,10 @@ impl AgentManager {
     /// pre-spawn provider switch must not be sent). Bare ids are treated as
     /// provider-local; compound ids are stripped to their bare part.
     /// Whitespace-bearing ids are also `None`: real provider option ids never
-    /// contain spaces, so a display name persisted by the effective-model
-    /// resolution (D13, e.g. `claude-code:Opus 4.8`) must not be sent back as
-    /// a `session/set_model` / `session/set_config_option` value.
+    /// contain spaces, so a display name persisted onto `model` by the
+    /// pre-monorepo#1534 effective-model resolution (legacy rows, e.g.
+    /// `claude-code:Opus 4.8`) must not be sent back as a
+    /// `session/set_model` / `session/set_config_option` value.
     fn provider_local_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -5810,12 +5788,12 @@ fn resolve_spawn(
         session,
         crate::agent_session::derived_default_provider(settings).as_deref(),
     );
-    // Whitespace-bearing bare ids are persisted effective-model display names
-    // (D13, e.g. `claude-code:Opus 4.8`) — stats/attribution values, not
-    // spawnable model ids. They must not reach `SpawnOptions.model` (CLI
-    // `--model` flags, codex config args, opencode env config); dropping them
-    // spawns on the provider default, exactly what the placeholder resolved
-    // from.
+    // Whitespace-bearing bare ids are effective-model display names persisted
+    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows, e.g.
+    // `claude-code:Opus 4.8`) — stats/attribution values, not spawnable model
+    // ids. They must not reach `SpawnOptions.model` (CLI `--model` flags,
+    // codex config args, opencode env config); dropping them spawns on the
+    // provider default, exactly what the placeholder resolved from.
     let model = session
         .model
         .as_ref()

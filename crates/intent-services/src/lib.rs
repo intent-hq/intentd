@@ -1088,9 +1088,22 @@ impl Services {
     /// Hydrate the in-memory script registry from the persisted definitions
     /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
     /// composition root on boot so `script.*` survives daemon restarts; runtime
-    /// state always starts fresh (idle). Returns the number of scripts loaded.
+    /// state starts fresh (idle), except that a service-mode script still
+    /// carrying the stored-on-write `was_running` marker hydrates with
+    /// `previouslyRunning: true` so clients can re-render its tab. Returns the
+    /// number of scripts loaded.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
         self.script_manager().hydrate().await
+    }
+
+    /// Clean daemon shutdown (monorepo#1526): flag every managed script with
+    /// user-stop semantics (so no auto-restart races the teardown), kill every
+    /// PTY session the host tracks — scripts and terminals alike — in one
+    /// concurrent group-kill sweep bounded by a single SIGTERM grace, then
+    /// await the supervisor settles under a bounded backstop. Returns
+    /// `(scripts_stopped, ptys_killed)`.
+    pub async fn shutdown_pty_sessions(&self) -> (usize, usize) {
+        self.script_manager().stop_all().await
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
@@ -14780,7 +14793,18 @@ impl WorkspaceApi for Services {
                 ..Default::default()
             };
             if let Some(t) = params.event_type.filter(|s| !s.is_empty()) {
-                q.event_types = vec![t];
+                // Subscribe-parity glob (monorepo#1538), mirroring
+                // `event_type_matches` in events/filter.rs: bare `*` means no
+                // type filter; `prefix:*` compiles to a SQL prefix match;
+                // anything else (including `note*` without a colon) stays an
+                // exact match.
+                if t == "*" {
+                    // No type filter.
+                } else if let Some(stem) = t.strip_suffix(":*") {
+                    q.event_type_prefix = Some(format!("{stem}:"));
+                } else {
+                    q.event_types = vec![t];
+                }
             }
             if let Some(at) = params.actor_type.filter(|s| !s.is_empty()) {
                 // An unrecognized actorType matches nothing (TS equals filter).
@@ -17553,12 +17577,30 @@ impl WorkspaceApi for Services {
                 _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
             };
 
-            let reviews = sc
-                .list_reviews(&repo_ref, pr_number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            // `list_reviews` and `review_decision` are independent reads;
+            // run them concurrently so the extra `reviewDecision` GraphQL
+            // round-trip doesn't add serial latency to every snapshot (this
+            // handler backs hook polling).
+            let (reviews, review_decision_result) = tokio::join!(
+                sc.list_reviews(&repo_ref, pr_number),
+                sc.review_decision(&repo_ref, pr_number)
+            );
+            let reviews = reviews.map_err(pr_ops::map_sc_err)?;
             let agg = pr_ops::aggregate_reviews(&reviews);
-            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+            // The forge's authoritative review-requirement verdict (GraphQL
+            // `reviewDecision` on GitHub). A fetch error degrades to `None`
+            // (aggregate-derived decision) rather than failing the snapshot.
+            let provider_decision = review_decision_result
+                .inspect_err(|e| {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number,
+                        "pr.snapshot: review_decision fetch failed, falling back to aggregate"
+                    );
+                })
+                .ok()
+                .flatten();
+            let decision = pr_ops::snapshot_review_decision(&agg, state, provider_decision);
 
             let conversation = sc
                 .list_comments(&repo_ref, pr_number)
@@ -17569,21 +17611,30 @@ impl WorkspaceApi for Services {
             // falling back to the flat REST list grouped by reply parent (the
             // same fallback as `pr.listReviewComments`; resolution state is
             // unavailable there, so every fallback thread counts as
-            // unresolved).
-            let threads =
-                match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
+            // unresolved). The fallback is surfaced via
+            // `comments.threadResolutionUnknown` so consumers can tell the
+            // unresolved count is unreliable rather than silently treating
+            // resolved threads as unresolved.
+            let (threads, thread_resolution_unknown) = match pr_ops::fetch_all_pages(|p| {
+                sc.get_review_threads(&repo_ref, pr_number, p)
+            })
+            .await
+            {
+                Ok((threads, _, _)) => (threads, false),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number,
+                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (threadResolutionUnknown)"
+                    );
+                    let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
+                        sc.list_review_comments(&repo_ref, pr_number, p)
+                    })
                     .await
-                {
-                    Ok((threads, _, _)) => threads,
-                    Err(_) => {
-                        let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
-                            sc.list_review_comments(&repo_ref, pr_number, p)
-                        })
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                        pr_ops::fallback_threads(comments)
-                    }
-                };
+                    .map_err(pr_ops::map_sc_err)?;
+                    (pr_ops::fallback_threads(comments), true)
+                }
+            };
             let (review_comment_count, unresolved_thread_count) =
                 pr_ops::count_thread_comments(&threads);
 
@@ -17617,6 +17668,7 @@ impl WorkspaceApi for Services {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
                     "unresolvedThreadCount": unresolved_thread_count,
+                    "threadResolutionUnknown": thread_resolution_unknown,
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))
