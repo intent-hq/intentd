@@ -32,7 +32,7 @@ use intent_acp::{
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
-    BoxFuture, Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    BoxFuture, Error, EventActor, Result, UsageCost, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::{InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -4487,10 +4487,30 @@ impl AgentManager {
         // that outlast the interrupt drain window): opening on one would
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
+        //
+        // A `usage_update` cost is the one exception: providers commonly emit
+        // the final cost report after the response, so it can lead a buffered
+        // burst. It materializes no transcript content, so it is persisted
+        // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
+        // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
+            Some(intent_acp::session::MappedUpdate::UsageCost(cost)) => {
+                drop(guard);
+                self.services
+                    .persist_cost_only_ordered(
+                        agent_id,
+                        workspace_id,
+                        UsageCost {
+                            amount: cost.amount,
+                            currency: cost.currency,
+                        },
+                    )
+                    .await;
+                return true;
+            }
             _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues

@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use intent_acp::session::Usage;
-use intent_core::{AgentSession, TokenUsage, TokenUsageTotals, UsageCost};
+use intent_core::{token_usage_reported, AgentSession, TokenUsage, TokenUsageTotals, UsageCost};
 use serde_json::Value;
 
 /// Model key used when an agent session has no recorded model (§5.23 fallback).
@@ -63,8 +63,11 @@ fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
 struct CostBucket(BTreeMap<String, f64>);
 
 impl CostBucket {
+    /// Non-finite amounts are ignored: a `NaN` would win `resolve`'s
+    /// `total_cmp` (it sorts above every finite value) and then serialize as
+    /// `null`, a shape the protocol does not describe.
     fn add(&mut self, cost: Option<&UsageCost>) {
-        if let Some(cost) = cost {
+        if let Some(cost) = cost.filter(|c| c.amount.is_finite()) {
             *self.0.entry(cost.currency.clone()).or_insert(0.0) += cost.amount;
         }
     }
@@ -72,6 +75,7 @@ impl CostBucket {
     fn resolve(self) -> Option<UsageCost> {
         self.0
             .into_iter()
+            .filter(|(_, amount)| amount.is_finite())
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(currency, amount)| UsageCost { amount, currency })
     }
@@ -188,10 +192,15 @@ pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
 /// cumulative end-of-turn report (see [`snapshot_from_turn_usage`]), so their
 /// sum never double-counts. A baseline WITHOUT a snapshot uses the baseline
 /// alone — never baseline + message sums, since the pre-recreate snapshot
-/// already superseded the message metadata. Only when BOTH are absent (the
-/// session never reported end-of-turn usage and was never recreated) does the
-/// tally fall back to summing per-message usage metadata via
-/// [`agent_token_tally_from_contents`].
+/// already superseded the message metadata. Only when neither part carries a
+/// token report (both absent, or present with all-zero counters — the shape a
+/// cost-only `usage_update` persist leaves behind for a provider that never
+/// sends an end-of-turn token report) does the tally fall back to summing
+/// per-message usage metadata via [`agent_token_tally_from_contents`]; any
+/// cost reported on the absent-counter parts still rides along, so a
+/// cost-only report never zeroes a fallback session's counters
+/// ([`intent_core::token_usage_reported`] keeps the store-side hydration
+/// decision in lockstep).
 pub fn agent_token_tally(
     agent_id: &str,
     model: Option<&str>,
@@ -199,20 +208,23 @@ pub fn agent_token_tally(
     snapshot: Option<&TokenUsageTotals>,
     contents: &[serde_json::Value],
 ) -> AgentTokenTally {
-    if baseline.is_none() && snapshot.is_none() {
-        return agent_token_tally_from_contents(agent_id, model, contents);
+    // Cost combines with the same never-double-count rule as the counters
+    // (§5.23): the baseline banks folded-away ACP sessions, the snapshot is
+    // the current one.
+    let cost = UsageCost::merge(
+        baseline.and_then(|b| b.cost.as_ref()),
+        snapshot.and_then(|s| s.cost.as_ref()),
+    );
+    if !token_usage_reported(baseline, snapshot) {
+        let mut tally = agent_token_tally_from_contents(agent_id, model, contents);
+        tally.totals.cost = cost;
+        return tally;
     }
     let mut totals = baseline.cloned().unwrap_or_default();
     if let Some(snapshot) = snapshot {
         add_totals(&mut totals, snapshot);
     }
-    // Cost combines with the same never-double-count rule as the counters
-    // (§5.23): the baseline banks folded-away ACP sessions, the snapshot is
-    // the current one.
-    totals.cost = UsageCost::merge(
-        baseline.and_then(|b| b.cost.as_ref()),
-        snapshot.and_then(|s| s.cost.as_ref()),
-    );
+    totals.cost = cost;
     AgentTokenTally {
         agent_id: agent_id.to_string(),
         model: model.unwrap_or("").to_string(),
@@ -402,6 +414,51 @@ mod tests {
             &[],
         );
         assert_eq!(cost_less.totals.cost, None);
+    }
+
+    /// A zero-counter snapshot is what a cost-only `usage_update` persist
+    /// leaves behind; it must not suppress the per-message fallback, and its
+    /// cost still rides along.
+    #[test]
+    fn cost_only_snapshot_keeps_the_message_sum_fallback() {
+        let snapshot = TokenUsageTotals {
+            cost: Some(cost(0.4, "USD")),
+            ..TokenUsageTotals::default()
+        };
+        let contents = vec![serde_json::json!({
+            "usage": { "inputTokens": 7, "outputTokens": 3 }
+        })];
+        let tally = agent_token_tally(
+            "agent-f",
+            Some("sonnet-5"),
+            None,
+            Some(&snapshot),
+            &contents,
+        );
+        assert_eq!(tally.totals.input_tokens, 7);
+        assert_eq!(tally.totals.output_tokens, 3);
+        assert_eq!(tally.totals.cost, Some(cost(0.4, "USD")));
+    }
+
+    /// A non-finite amount (a corrupt stored snapshot) is ignored rather than
+    /// winning the bucket compare and serializing as `null`.
+    #[test]
+    fn non_finite_cost_is_ignored_by_the_bucket() {
+        let tallies = vec![
+            AgentTokenTally {
+                agent_id: "agent-1".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(10, 1, f64::NAN, "USD"),
+            },
+            AgentTokenTally {
+                agent_id: "agent-2".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(10, 1, 2.0, "EUR"),
+            },
+        ];
+        let usage = aggregate_token_usage(&tallies);
+        assert_eq!(usage.totals.cost, Some(cost(2.0, "EUR")));
+        assert_eq!(usage.by_agent_id["agent-1"].cost, None);
     }
 
     #[test]

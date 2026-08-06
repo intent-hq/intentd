@@ -19884,6 +19884,57 @@ mod turn_token_usage {
         assert_eq!(usage.totals.cost.as_ref().map(|c| c.amount), Some(2.0));
     }
 
+    /// A cost-only report for an agent whose provider never sends the
+    /// end-of-turn token report must not switch the tally off the per-message
+    /// fallback: the zero-counter snapshot it writes carries the cost only,
+    /// and the message sums keep driving the counters.
+    #[tokio::test]
+    async fn cost_only_report_keeps_message_sum_fallback() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "sonnet-5"))
+            .await
+            .expect("insert session");
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+        h.services
+            .persist_turn_token_usage(
+                &agent,
+                &h.ws,
+                None,
+                Some(intent_core::UsageCost {
+                    amount: 0.4,
+                    currency: "USD".to_string(),
+                }),
+            )
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(
+            usage.by_agent_id[&agent.0].input_tokens, 7,
+            "message-sum fallback survives the cost-only persist"
+        );
+        assert_eq!(usage.by_agent_id[&agent.0].output_tokens, 3);
+        assert_eq!(
+            usage.by_agent_id[&agent.0].cost.as_ref().map(|c| c.amount),
+            Some(0.4)
+        );
+        assert_eq!(usage.totals.input_tokens, 7);
+    }
+
     /// Session recreate folds the outgoing session's cost into the baseline
     /// exactly like the token counters: the pre-recreate cost is neither lost
     /// nor double-counted once the fresh session reports again.

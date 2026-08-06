@@ -38,7 +38,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
 /// `message_contents` is non-empty only for sessions whose decoded snapshot
-/// AND baseline are both absent (the per-message fallback path — see
+/// and baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]).
 pub type AgentUsageRow = (
     String,
@@ -52,7 +52,9 @@ pub type AgentUsageRow = (
 /// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
 /// the transactional recompute in `workspace_repo.rs` (write transaction,
 /// monorepo#738) share one implementation. Message contents are hydrated only
-/// when both the decoded snapshot and baseline are absent; a malformed
+/// when neither the decoded snapshot nor the baseline carries a token report
+/// ([`intent_core::token_usage_reported`], which also treats the all-zero
+/// counters of a cost-only persist as "no report"); a malformed
 /// snapshot/baseline decodes to `None` and still hydrates.
 pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
@@ -80,29 +82,31 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        // Message contents feed the tally only when BOTH snapshot and
-        // baseline are absent (`agent_token_tally`'s fallback rule), so the
-        // per-session content fetch is skipped otherwise (monorepo#738).
-        let contents: Vec<serde_json::Value> = if snapshot.is_none() && baseline.is_none() {
-            let message_sql =
-                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
-            let message_rows = sqlx::query(message_sql)
-                .bind(&agent_id)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("get agent messages for usage failed: {e}"))
-                })?;
-            message_rows
-                .iter()
-                .map(|row| {
-                    let content_str: String = row.get("content");
-                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Message contents feed the tally only when neither snapshot nor
+        // baseline carries a token report (`agent_token_tally`'s fallback
+        // rule), so the per-session content fetch is skipped otherwise
+        // (monorepo#738).
+        let contents: Vec<serde_json::Value> =
+            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                let message_sql =
+                    "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+                let message_rows = sqlx::query(message_sql)
+                    .bind(&agent_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("get agent messages for usage failed: {e}"))
+                    })?;
+                message_rows
+                    .iter()
+                    .map(|row| {
+                        let content_str: String = row.get("content");
+                        serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         result.push((agent_id, model, snapshot, baseline, contents));
     }

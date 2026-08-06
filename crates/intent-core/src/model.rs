@@ -364,7 +364,17 @@ impl UsageCost {
     /// Pairwise cost merge used where at most two figures combine (the
     /// recreate baseline fold and the `baseline + snapshot` per-agent tally):
     /// matching currencies sum, a (pathological) mismatch keeps the larger
-    /// amount. Absent operands contribute nothing.
+    /// amount (ties keep `lhs`, the banked baseline). Absent operands
+    /// contribute nothing.
+    ///
+    /// The mismatch arm is deliberately lossy and, unlike the bucket roll-up
+    /// (which sums per currency before picking the dominant one), it is
+    /// applied iteratively: each ACP session recreate re-merges into the
+    /// banked baseline, so an agent that switches to a cheaper-per-session
+    /// currency discards the new currency's spend one fold at a time. That is
+    /// an accepted consequence of storing a single figure — a cross-currency
+    /// numeric comparison is semantically meaningless and the daemon never
+    /// invents a conversion rate.
     pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
         match (lhs, rhs) {
             (None, None) => None,
@@ -397,6 +407,36 @@ pub struct TokenUsageTotals {
     /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<UsageCost>,
+}
+
+impl TokenUsageTotals {
+    /// Whether all four consumption counters are zero, i.e. this tally carries
+    /// no token report at all. A persisted session snapshot in that state is a
+    /// cost-only report (§5.23) and MUST NOT suppress the per-message token
+    /// fallback for a provider that never sends an end-of-turn token report.
+    pub fn counters_are_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
+    }
+}
+
+/// Whether a session's persisted recreate `baseline` / current-session
+/// `snapshot` pair carries an actual token report, i.e. whether the per-agent
+/// tally uses it instead of falling back to summing per-message usage
+/// metadata (§5.23). An all-zero-counter part counts as "no report": a
+/// cost-only `usage_update` persist writes exactly that shape, and treating it
+/// as a report would silently zero the counters of a provider that never sends
+/// the end-of-turn token report. Shared by the store's usage-row fetch (which
+/// hydrates message contents only for fallback sessions, monorepo#738) and the
+/// tally itself, so the two decisions can never drift apart.
+pub fn token_usage_reported(
+    baseline: Option<&TokenUsageTotals>,
+    snapshot: Option<&TokenUsageTotals>,
+) -> bool {
+    let reported = |t: Option<&TokenUsageTotals>| t.is_some_and(|t| !t.counters_are_zero());
+    reported(baseline) || reported(snapshot)
 }
 
 /// Durable token-usage snapshot returned by `workspace.getTokenUsage` and pushed
@@ -3543,6 +3583,11 @@ mod tests {
             UsageCost::merge(Some(&usd(1.0)), Some(&eur(9.0))),
             Some(eur(9.0)),
             "mismatched currencies keep the larger amount"
+        );
+        assert_eq!(
+            UsageCost::merge(Some(&usd(2.0)), Some(&eur(2.0))),
+            Some(usd(2.0)),
+            "an equal-amount cross-currency tie keeps the lhs (banked baseline)"
         );
     }
 

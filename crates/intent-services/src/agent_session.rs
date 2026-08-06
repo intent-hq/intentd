@@ -1900,7 +1900,7 @@ impl Services {
         // token report, but the burst may still carry an ACP `usage_update`
         // cost (§5.23) — persist it (cost-only) so it is not lost.
         if let Some(cost) = transcript.usage_cost.clone() {
-            self.persist_turn_token_usage(agent_id, workspace_id, None, Some(cost))
+            self.persist_cost_only_ordered(agent_id, workspace_id, cost)
                 .await;
         }
         let blocks = transcript.into_blocks();
@@ -1990,6 +1990,32 @@ impl Services {
             .await;
     }
 
+    /// Persist a standalone ACP `usage_update` cost (§5.23), ordered against
+    /// the per-agent [`TurnBookkeeping`] chain: a cost arriving between a
+    /// prompt releasing its busy slot and that prompt's *detached* bookkeeping
+    /// task writing would otherwise read the pre-turn snapshot and write back
+    /// the older counters. Awaiting the predecessor first keeps the same
+    /// per-agent ordering the prompt path relies on; the write itself is
+    /// awaited inline (this path holds no stream deadline), so the chain slot
+    /// is left free for the next turn.
+    pub(crate) async fn persist_cost_only_ordered(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        cost: UsageCost,
+    ) {
+        let prev = self
+            .turn_bookkeeping
+            .lock()
+            .ok()
+            .and_then(|mut chain| chain.remove(agent_id));
+        if let Some(prev) = prev {
+            let _ = prev.await;
+        }
+        self.persist_turn_token_usage(agent_id, workspace_id, None, Some(cost))
+            .await;
+    }
+
     /// Persist one turn's end-of-turn usage report and refresh the workspace
     /// tally (§5.23). The report is interpreted as the session's cumulative
     /// snapshot (see `token_usage::snapshot_from_turn_usage`), so it REPLACES
@@ -2019,9 +2045,14 @@ impl Services {
                 .await
             {
                 Ok((_, _, _, stored)) => stored,
+                // Degrade, never drop: the read only recovers the half of the
+                // snapshot this turn carries no fresh report for, so a failure
+                // must not discard the half we do have. The lost fallback is
+                // self-healing — both reports are cumulative, so the next one
+                // restores it.
                 Err(e) => {
                     tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
-                    return;
+                    None
                 }
             }
         } else {
