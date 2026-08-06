@@ -3354,7 +3354,7 @@ async fn set_model_clears_resolved_display_model() {
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, "auggie:sonnet4.5", Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
@@ -9844,11 +9844,13 @@ This note is your workspace for this task. Update it with your progress, finding
     );
 }
 
-/// TASK-C2: when `skipAutoCommit=true` the reference appends the
-/// `**Auto-commit is OFF.**` instruction after the scope directive; assert
-/// the exact bytes.
+/// Status-neutral commit policy: even with `skipAutoCommit=true` the child's
+/// first message carries NO state-specific auto-commit instruction — the
+/// message ends at the scope directive, byte-for-byte. The opt-out only gates
+/// the idle subscriber; the prompt-side policy is the neutral
+/// `## Commit Policy` clause in `rules.rs`.
 #[tokio::test]
-async fn delegate_appends_skip_auto_commit_instruction_when_true() {
+async fn delegate_omits_commit_instruction_when_skip_auto_commit_true() {
     let (_t, svc, ws) = setup().await;
     let note = svc
         .create_note(
@@ -9883,21 +9885,22 @@ async fn delegate_appends_skip_auto_commit_instruction_when_true() {
 **Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
 \n\
-**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
-\n\
-**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`.",
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
         note_id = note.id.as_str(),
     );
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert_eq!(
         first_message_text, expected_first_message,
-        "first message must be byte-exact when skipAutoCommit=true"
+        "first message must be byte-exact and status-neutral when skipAutoCommit=true"
+    );
+    assert!(
+        !first_message_text.contains("Auto-commit is"),
+        "no state-specific auto-commit text in the delegation message: {first_message_text}"
     );
 }
 
-/// TASK-C2: `skipAutoCommit=false` (explicit) matches the default and omits
-/// the commit-instruction tail — regression guard so future refactors keep
-/// the branch gated correctly.
+/// `skipAutoCommit=false` (explicit) matches the default: no commit
+/// instruction tail — regression guard alongside the `=true` case above.
 #[tokio::test]
 async fn delegate_omits_skip_auto_commit_instruction_when_false() {
     let (_t, svc, ws) = setup().await;
@@ -9941,8 +9944,9 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
 
 /// Harness-owned commits: when the workspace's effective auto-commit is OFF,
 /// delegation derives `skip_auto_commit = caller arg OR !autoCommit` — the
-/// child gets the OFF commit instruction and the persisted session opt-out
-/// even without an explicit `skipAutoCommit` from the caller.
+/// session persists the opt-out even without an explicit `skipAutoCommit`
+/// from the caller, while the child's first message stays status-neutral
+/// (no OFF-state commit instruction).
 #[tokio::test]
 async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     let (_t, svc, ws) = setup().await;
@@ -9978,8 +9982,8 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
 
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert!(
-        first_message_text.contains("**Auto-commit is OFF.**"),
-        "OFF instruction must be derived from the workspace setting: {first_message_text}"
+        !first_message_text.contains("Auto-commit is"),
+        "delegation message must stay status-neutral when the workspace toggle is off: {first_message_text}"
     );
     let session = svc
         .store()
@@ -13595,6 +13599,57 @@ async fn agent_update_rejects_unknown_field() {
         .await
         .expect_err("unknown field");
     assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent.update` changing `model` clears the persisted display resolution —
+/// same anti-staleness contract as `agent.setModel` — while a `model`-less
+/// update leaves it intact.
+#[tokio::test]
+async fn agent_update_model_change_clears_resolved_model() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Resolver".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let landed = svc
+        .store()
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
+        .await
+        .expect("seed resolved model");
+    assert!(landed);
+
+    // Non-model update: resolution survives.
+    svc.agent_update_op(id.clone(), json!({ "name": "Renamed" }))
+        .await
+        .expect("name update");
+    let (_, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
+
+    // Model update: stale resolution is cleared.
+    svc.agent_update_op(id.clone(), json!({ "model": "auggie:opus4.7" }))
+        .await
+        .expect("model update");
+    let (model, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(resolved, None, "model change must clear stale resolution");
 }
 
 /// The immutable/write-once invariants on `provider`/`acpSessionId` are still

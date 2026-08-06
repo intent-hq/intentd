@@ -3723,6 +3723,91 @@ async fn query_filters_and_defaults_limit_50() {
     assert!(none.as_array().expect("bare array").is_empty());
 }
 
+/// monorepo#1538: `event.query`'s `eventType` accepts subscribe-style globs
+/// (mirroring `event_type_matches`): `prefix:*` matches the category, bare `*`
+/// means no type filter, and anything else — including `note*` without a
+/// colon — stays an exact match. Both the legacy-array and paginated paths
+/// honor the glob.
+#[tokio::test]
+async fn query_event_type_glob_matches_subscribe_semantics() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for (i, t) in ["note:updated", "note:deleted", "workspace:updated"]
+        .iter()
+        .enumerate()
+    {
+        svc.store()
+            .insert_event(&intent_store::NewEvent {
+                workspace_id: ws.clone(),
+                timestamp: format!("2026-01-01T00:00:0{i}Z"),
+                event_type: t.to_string(),
+                actor: EventActor {
+                    actor_type: ActorType::Agent,
+                    id: Some("a".to_string()),
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+    }
+
+    let params = |event_type: &str, paginate: Option<bool>| intent_core::EventQueryParams {
+        event_type: Some(event_type.to_string()),
+        paginate,
+        ..Default::default()
+    };
+
+    // `note:*` → both note-category events, nothing else.
+    let notes = svc
+        .event_query(ws.clone(), params("note:*", None))
+        .await
+        .expect("glob query");
+    let notes = notes.as_array().expect("bare array");
+    assert_eq!(notes.len(), 2);
+    assert!(notes
+        .iter()
+        .all(|e| e["type"].as_str().unwrap().starts_with("note:")));
+
+    // Exact type is unchanged.
+    let exact = svc
+        .event_query(ws.clone(), params("note:updated", None))
+        .await
+        .expect("exact query");
+    let exact = exact.as_array().expect("bare array");
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0]["type"], "note:updated");
+
+    // Bare `*` behaves like no type filter.
+    let all = svc
+        .event_query(ws.clone(), params("*", None))
+        .await
+        .expect("star query");
+    assert_eq!(all.as_array().expect("bare array").len(), 3);
+
+    // `note*` (no colon) stays an exact literal → matches nothing.
+    let literal = svc
+        .event_query(ws.clone(), params("note*", None))
+        .await
+        .expect("literal query");
+    assert!(literal.as_array().expect("bare array").is_empty());
+
+    // The paginated path honors the glob too.
+    let page = svc
+        .event_query(ws.clone(), params("note:*", Some(true)))
+        .await
+        .expect("paginated glob query");
+    let items = page["items"].as_array().expect("envelope items");
+    assert_eq!(items.len(), 2);
+    assert!(items
+        .iter()
+        .all(|e| e["type"].as_str().unwrap().starts_with("note:")));
+    assert!(page["nextToken"].is_null());
+}
+
 /// TA-2 / §5.5: `event.query` is opt-in paginated. Without `paginate`/`page_token`
 /// it returns the legacy bare array; with it, it returns the `{ items, nextToken }`
 /// envelope (newest→oldest, clamped limit) and an opaque token that walks
