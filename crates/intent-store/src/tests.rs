@@ -97,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
         ]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
         ]
     );
 }
@@ -4425,6 +4425,114 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_was_running_marker_set_clear_and_reset_semantics() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let script = |ws: &str, id: &str| intent_core::Script {
+        id: id.to_string(),
+        workspace_id: ws.to_string(),
+        name: "dev".to_string(),
+        command: "npm run dev".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Service,
+        category: None,
+        source: "user".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("insert");
+    store
+        .upsert_script(&script("ws-1", "s-2"))
+        .await
+        .expect("insert");
+
+    // Fresh rows carry no marker.
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Set is scoped to the targeted (workspace, id) and survives repeated
+    // reads.
+    store
+        .set_script_was_running("ws-1", "s-1", true)
+        .await
+        .expect("set");
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())]
+    );
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())],
+        "marker persists until explicitly cleared"
+    );
+
+    // A write against the same id in a different workspace must not touch
+    // the row owned by ws-1 (the runtime registry permits the same
+    // client-supplied id in separate workspaces).
+    store
+        .set_script_was_running("ws-2", "s-1", false)
+        .await
+        .expect("cross-workspace no-op");
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())],
+        "cross-workspace write is a no-op"
+    );
+
+    // An upsert (INSERT OR REPLACE) resets the marker — a replaced
+    // definition starts a fresh runtime life.
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("replace");
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Clear is durable; an unknown id is a no-op, not an error.
+    store
+        .set_script_was_running("ws-1", "s-2", true)
+        .await
+        .expect("set");
+    store
+        .set_script_was_running("ws-1", "s-2", false)
+        .await
+        .expect("clear");
+    store
+        .set_script_was_running("ws-1", "missing", true)
+        .await
+        .expect("unknown id no-op");
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Remove deletes the row (marker gone with it).
+    store
+        .set_script_was_running("ws-1", "s-2", true)
+        .await
+        .expect("set");
+    assert!(store.remove_script("s-2").await.expect("remove"));
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
 }
 
 #[tokio::test]

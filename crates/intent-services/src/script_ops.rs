@@ -9,7 +9,7 @@
 //! dev-server URL, surfaced on the `script:state` event for the `forward.*`
 //! hook. Live output streams as `script:output` (base64 `chunk`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -282,19 +282,34 @@ impl ScriptManager {
     }
 
     /// Boot-time hydration: load every persisted definition into the runtime
-    /// registry with a fresh idle state (runtime state is never persisted).
-    /// Ids already registered are left untouched. Returns the number loaded.
+    /// registry with a fresh idle state (runtime state is never persisted,
+    /// except the stored-on-write `was_running` marker, surfaced here as
+    /// `previouslyRunning: true` — the script was running when the previous
+    /// daemon process died). Ids already registered are left untouched.
+    /// Returns the number loaded.
     pub(crate) async fn hydrate(&self) -> Result<usize> {
         let defs = self.store.list_all_scripts().await?;
+        let was_running: HashSet<(String, String)> = self
+            .store
+            .list_was_running_script_ids()
+            .await?
+            .into_iter()
+            .collect();
         let mut guard = self.scripts.lock().unwrap();
         let mut loaded = 0;
         for def in defs {
             let key = (WorkspaceId::from(def.workspace_id.as_str()), def.id.clone());
             guard.entry(key).or_insert_with(|| {
                 loaded += 1;
+                let state = ScriptRuntimeState {
+                    previously_running: was_running
+                        .contains(&(def.workspace_id.clone(), def.id.clone()))
+                        .then_some(true),
+                    ..Default::default()
+                };
                 ManagedScript {
                     def,
-                    state: ScriptRuntimeState::default(),
+                    state,
                     pty_id: None,
                     stopped_by_user: false,
                     supervisor: None,
@@ -582,6 +597,12 @@ impl ScriptManager {
 
     /// `script.stop`: flag user-stop, kill the PTY (cancelling auto-restart), and
     /// await the supervisor's teardown. Scoped to `workspace_id`.
+    ///
+    /// A stop on a non-running script that still carries the hydrated
+    /// `previouslyRunning` marker is the FE dismiss affordance: it durably
+    /// clears the `was_running` marker, publishes the cleared state as
+    /// `script:state` so subscribers drop the marker too, and returns ok (a
+    /// stopped script is exactly the requested state, not an error).
     pub(crate) async fn stop(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let (handle, pty_id, was_running) = {
@@ -603,11 +624,22 @@ impl ScriptManager {
             let _ = handle.await;
         }
         if !was_running {
-            let mut guard = self.scripts.lock().unwrap();
-            if let Some(m) = guard.get_mut(&key) {
-                if m.state.status != ScriptStatus::Running {
-                    m.state.status = ScriptStatus::Idle;
+            let dismissed_state = {
+                let mut guard = self.scripts.lock().unwrap();
+                match guard.get_mut(&key) {
+                    Some(m) => {
+                        if m.state.status != ScriptStatus::Running {
+                            m.state.status = ScriptStatus::Idle;
+                        }
+                        m.state.previously_running.take().map(|_| m.state.clone())
+                    }
+                    None => None,
                 }
+            };
+            if let Some(state) = dismissed_state {
+                self.persist_was_running(workspace_id, script_id, false)
+                    .await;
+                self.emit_state(workspace_id, script_id, &state).await;
             }
         }
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -964,6 +996,11 @@ impl ScriptManager {
     /// Flip a script to `running` and emit `script:state`. Returns `false` if
     /// the script was removed — or removed and recreated under a new
     /// generation (monorepo#1194) — concurrently (caller should reap the PTY).
+    ///
+    /// Stored-on-write: a service-mode start durably sets the `was_running`
+    /// marker (and drops any hydrated `previouslyRunning`), so a daemon that
+    /// dies while the service runs hydrates it as previously running.
+    /// Command-mode scripts never set the marker.
     async fn mark_running(
         &self,
         ws: &WorkspaceId,
@@ -972,7 +1009,7 @@ impl ScriptManager {
         pty_id: PtyId,
     ) -> bool {
         let pid = self.pty.pid(pty_id);
-        let state = {
+        let (state, is_service) = {
             let mut guard = self.scripts.lock().unwrap();
             let Some(m) = guard
                 .get_mut(&(ws.clone(), script_id.to_string()))
@@ -988,8 +1025,12 @@ impl ScriptManager {
             m.state.stopped_at = None;
             m.state.error = None;
             m.state.detected_url = None;
-            m.state.clone()
+            m.state.previously_running = None;
+            (m.state.clone(), m.def.mode == ScriptMode::Service)
         };
+        if is_service {
+            self.persist_was_running(ws, script_id, true).await;
+        }
         self.emit_state(ws, script_id, &state).await;
         true
     }
@@ -998,6 +1039,11 @@ impl ScriptManager {
     /// Returns `(stopped_by_user, restart_count)` for the restart decision;
     /// `None` when the entry is gone or recreated under a new generation
     /// (the stale writer must not touch it — monorepo#1194).
+    ///
+    /// Stored-on-write: a service-mode exit (user stop or natural) durably
+    /// clears the `was_running` marker — the process is gone, so a daemon
+    /// death from here on must not resurrect the tab. An auto-restart's
+    /// respawn re-sets it via `mark_running`.
     async fn mark_exited(
         &self,
         ws: &WorkspaceId,
@@ -1005,7 +1051,7 @@ impl ScriptManager {
         generation: u64,
         exit: Option<PtyExit>,
     ) -> Option<(bool, u32)> {
-        let (state, flags) = {
+        let (state, flags, is_service) = {
             let mut guard = self.scripts.lock().unwrap();
             let m = guard
                 .get_mut(&(ws.clone(), script_id.to_string()))
@@ -1013,10 +1059,30 @@ impl ScriptManager {
             m.state.status = ScriptStatus::Exited;
             m.state.exit_code = exit.as_ref().map(|e| e.exit_code as i64);
             m.state.stopped_at = Some(now_iso());
-            (m.state.clone(), (m.stopped_by_user, m.state.restart_count))
+            (
+                m.state.clone(),
+                (m.stopped_by_user, m.state.restart_count),
+                m.def.mode == ScriptMode::Service,
+            )
         };
+        if is_service {
+            self.persist_was_running(ws, script_id, false).await;
+        }
         self.emit_state(ws, script_id, &state).await;
         Some(flags)
+    }
+
+    /// Best-effort stored-on-write update of the `was_running` marker: a
+    /// store failure is logged, never propagated — the runtime transition
+    /// (and its `script:state` event) must not fail over a bookkeeping write.
+    async fn persist_was_running(&self, ws: &WorkspaceId, script_id: &str, was_running: bool) {
+        if let Err(e) = self
+            .store
+            .set_script_was_running(ws.as_str(), script_id, was_running)
+            .await
+        {
+            tracing::warn!(script = %script_id, error = %e, "persist script was_running marker failed");
+        }
     }
 
     /// Record a spawn/cwd failure on the runtime state and emit `script:state`.
@@ -1904,9 +1970,205 @@ mod tests {
             entry["runtime"]["status"], "idle",
             "runtime state starts fresh, never persisted"
         );
+        assert!(
+            entry["runtime"].get("previouslyRunning").is_none(),
+            "never-started script hydrates without the marker: {entry}"
+        );
 
         // Hydration is idempotent — already-registered ids are untouched.
         assert_eq!(svc2.hydrate_scripts().await.expect("re-hydrate"), 0);
+    }
+
+    /// A service running when the daemon dies hydrates as `idle` with
+    /// `previouslyRunning: true` (the stored-on-write `was_running` marker),
+    /// and the marker persists across repeated restarts until the script is
+    /// stopped.
+    #[tokio::test]
+    async fn service_running_at_daemon_death_hydrates_previously_running() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        // Simulate a daemon death (no stop ran): a fresh Services over the
+        // same store hydrates the marker as `previouslyRunning: true`.
+        let store = h.services.store().clone();
+        let svc2 = Services::new(store.clone());
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc2
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle");
+        assert_eq!(st["previouslyRunning"], true, "marker surfaced: {st}");
+
+        // The marker survives another restart untouched.
+        let svc3 = Services::new(store.clone());
+        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc3
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["previouslyRunning"], true, "marker persists: {st}");
+
+        // A real stop (running process) durably clears it.
+        h.services
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop");
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "stop clears the marker"
+        );
+        let svc4 = Services::new(store.clone());
+        assert_eq!(svc4.hydrate_scripts().await.expect("hydrate"), 1);
+        let st = svc4.script_status(h.ws.clone(), id).await.expect("status");
+        assert!(
+            st.get("previouslyRunning").is_none(),
+            "post-stop hydration carries no marker: {st}"
+        );
+    }
+
+    /// `script.stop` on a hydrated non-running script that carries the marker
+    /// is the FE dismiss affordance: it returns ok, drops `previouslyRunning`
+    /// from the runtime state, publishes the cleared state as `script:state`,
+    /// and durably clears the persisted marker.
+    #[tokio::test]
+    async fn script_stop_dismisses_previously_running_marker() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+
+        let store = h.services.store().clone();
+        let bus2 = EventBus::new(store.clone());
+        let svc2 = Services::new(store.clone()).with_event_bus(bus2.clone());
+        let mut sub2 = bus2.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+        assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
+
+        // Dismiss: stop the hydrated (idle, not running) script.
+        let v = svc2
+            .script_stop(h.ws.clone(), id.clone())
+            .await
+            .expect("stop is ok, not an error");
+        assert_eq!(v["ok"], true);
+
+        // Dismiss broadcasts the cleared state so other subscribers don't
+        // retain a stale `previouslyRunning: true`.
+        let ev = await_state(&mut sub2, LIVENESS, |v| {
+            v["data"]["scriptId"] == id.as_str()
+        })
+        .await;
+        assert_eq!(ev["data"]["status"], "idle");
+        assert!(
+            ev["data"].get("previouslyRunning").is_none(),
+            "dismiss event carries no marker: {ev}"
+        );
+        let st = svc2
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .expect("status");
+        assert_eq!(st["status"], "idle");
+        assert!(
+            st.get("previouslyRunning").is_none(),
+            "dismiss drops the runtime marker: {st}"
+        );
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "dismiss durably clears the persisted marker"
+        );
+
+        // Teardown: reap the still-running PTY owned by the first instance.
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("teardown stop");
+    }
+
+    /// Command-mode scripts never set the was-running marker — neither while
+    /// running nor after exit.
+    #[tokio::test]
+    async fn command_mode_never_sets_was_running_marker() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "cmd", "echo done", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let store = h.services.store().clone();
+        // `mark_running` persists (for services) strictly before emitting
+        // `running`, so observing the event proves no write happened.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "no marker while a command runs"
+        );
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "no marker after a command exits"
+        );
+    }
+
+    /// A service's natural exit durably clears the marker (the process is
+    /// gone; a daemon death from here on must not resurrect the tab).
+    #[tokio::test]
+    async fn service_natural_exit_clears_was_running_marker() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        // Exits immediately: under the production too-fast floor the exit is
+        // final (no auto-restart re-setting the marker).
+        let id = create_simple(&h, "svc", "true", ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let store = h.services.store().clone();
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
+        assert_eq!(
+            store.list_was_running_script_ids().await.expect("list"),
+            vec![(h.ws.as_str().to_string(), id.clone())],
+            "service start sets the marker"
+        );
+        // `mark_exited` clears the marker strictly before emitting `exited`.
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "exited").await;
+        assert!(
+            store
+                .list_was_running_script_ids()
+                .await
+                .expect("list")
+                .is_empty(),
+            "natural exit clears the marker"
+        );
     }
 
     #[tokio::test]
