@@ -598,8 +598,9 @@ impl ScriptManager {
     ///
     /// A stop on a non-running script that still carries the hydrated
     /// `previouslyRunning` marker is the FE dismiss affordance: it durably
-    /// clears the `was_running` marker and returns ok (a stopped script is
-    /// exactly the requested state, not an error).
+    /// clears the `was_running` marker, publishes the cleared state as
+    /// `script:state` so subscribers drop the marker too, and returns ok (a
+    /// stopped script is exactly the requested state, not an error).
     pub(crate) async fn stop(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let key = (workspace_id.clone(), script_id.to_string());
         let (handle, pty_id, was_running) = {
@@ -621,20 +622,21 @@ impl ScriptManager {
             let _ = handle.await;
         }
         if !was_running {
-            let dismissed_marker = {
+            let dismissed_state = {
                 let mut guard = self.scripts.lock().unwrap();
                 match guard.get_mut(&key) {
                     Some(m) => {
                         if m.state.status != ScriptStatus::Running {
                             m.state.status = ScriptStatus::Idle;
                         }
-                        m.state.previously_running.take().is_some()
+                        m.state.previously_running.take().map(|_| m.state.clone())
                     }
-                    None => false,
+                    None => None,
                 }
             };
-            if dismissed_marker {
+            if let Some(state) = dismissed_state {
                 self.persist_was_running(script_id, false).await;
+                self.emit_state(workspace_id, script_id, &state).await;
             }
         }
         Ok(json!({ "ok": true, "scriptId": script_id }))
@@ -2034,7 +2036,8 @@ mod tests {
 
     /// `script.stop` on a hydrated non-running script that carries the marker
     /// is the FE dismiss affordance: it returns ok, drops `previouslyRunning`
-    /// from the runtime state, and durably clears the persisted marker.
+    /// from the runtime state, publishes the cleared state as `script:state`,
+    /// and durably clears the persisted marker.
     #[tokio::test]
     async fn script_stop_dismisses_previously_running_marker() {
         let h = harness().await;
@@ -2047,7 +2050,13 @@ mod tests {
         await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
 
         let store = h.services.store().clone();
-        let svc2 = Services::new(store.clone());
+        let bus2 = EventBus::new(store.clone());
+        let svc2 = Services::new(store.clone()).with_event_bus(bus2.clone());
+        let mut sub2 = bus2.subscribe(SubscriptionFilter {
+            event_types: vec!["script:*".to_string()],
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
         assert_eq!(svc2.hydrate_scripts().await.expect("hydrate"), 1);
 
         // Dismiss: stop the hydrated (idle, not running) script.
@@ -2056,6 +2065,18 @@ mod tests {
             .await
             .expect("stop is ok, not an error");
         assert_eq!(v["ok"], true);
+
+        // Dismiss broadcasts the cleared state so other subscribers don't
+        // retain a stale `previouslyRunning: true`.
+        let ev = await_state(&mut sub2, LIVENESS, |v| {
+            v["data"]["scriptId"] == id.as_str()
+        })
+        .await;
+        assert_eq!(ev["data"]["status"], "idle");
+        assert!(
+            ev["data"].get("previouslyRunning").is_none(),
+            "dismiss event carries no marker: {ev}"
+        );
         let st = svc2
             .script_status(h.ws.clone(), id.clone())
             .await
