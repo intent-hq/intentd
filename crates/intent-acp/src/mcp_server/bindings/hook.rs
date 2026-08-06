@@ -103,3 +103,100 @@ async fn run_now(
         .await
         .map_err(map_err)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::{BoxFuture, Result};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `WorkspaceApi` that records whether the ownership-scoped hook methods
+    /// were reached at all — the caller-context guards must reject before the
+    /// service layer sees the call.
+    #[derive(Default)]
+    struct SpyApi {
+        cancel_called: AtomicBool,
+        schedule_called: AtomicBool,
+    }
+
+    impl WorkspaceApi for SpyApi {
+        fn hook_cancel(
+            &self,
+            _workspace_id: WorkspaceId,
+            _hook_id: HookId,
+            _caller: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.cancel_called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+
+        fn hook_schedule(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: AgentId,
+            _params: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.schedule_called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({ "ok": true })) })
+        }
+    }
+
+    fn spy() -> (Arc<SpyApi>, Arc<dyn WorkspaceApi>, WorkspaceId) {
+        let spy = Arc::new(SpyApi::default());
+        let api: Arc<dyn WorkspaceApi> = spy.clone();
+        (spy, api, WorkspaceId::from_string("ws-hook"))
+    }
+
+    /// Acceptance criterion (intent-hq/monorepo#1563): `hook.cancel` without
+    /// an agent caller context is rejected before the service is touched, so
+    /// the hook is untouched — mirroring the `hook.schedule` guard.
+    #[tokio::test]
+    async fn cancel_without_caller_context_is_rejected_and_never_reaches_the_service() {
+        let (spy, api, ws) = spy();
+        let err = dispatch(&api, &ws, None, "cancel", &json!({ "hookId": "hook-1" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("requires an agent caller context"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !spy.cancel_called.load(Ordering::SeqCst),
+            "service must not be reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_with_caller_context_reaches_the_service() {
+        let (spy, api, ws) = spy();
+        let caller = AgentId::from("agent-caller");
+        dispatch(
+            &api,
+            &ws,
+            Some(&caller),
+            "cancel",
+            &json!({ "hookId": "hook-1" }),
+        )
+        .await
+        .expect("cancel dispatched");
+        assert!(spy.cancel_called.load(Ordering::SeqCst));
+    }
+
+    /// The mirrored `hook.schedule` guard, previously untested.
+    #[tokio::test]
+    async fn schedule_without_caller_context_is_rejected_and_never_reaches_the_service() {
+        let (spy, api, ws) = spy();
+        let err = dispatch(&api, &ws, None, "schedule", &json!({ "name": "watch" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("requires an agent caller context"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !spy.schedule_called.load(Ordering::SeqCst),
+            "service must not be reached"
+        );
+    }
+}
