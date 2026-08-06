@@ -193,8 +193,8 @@ jobs:
         if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-user-static
+          sudo apt-get -o DPkg::Lock::Timeout=300 update -q
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y -q qemu-user-static
           qemu-aarch64-static "./staging/intentd-$TARGET/intentd" --sitter-version
       - name: Smoke test (windows)
         if: ${{ runner.os == 'Windows' }}

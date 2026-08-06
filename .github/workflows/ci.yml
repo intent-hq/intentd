@@ -158,12 +158,14 @@ jobs:
           fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
       # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
-      # relies on the runner user's passwordless sudo.
+      # relies on the runner user's passwordless sudo. DPkg::Lock::Timeout
+      # makes apt wait for the apt/dpkg locks instead of failing instantly
+      # when a co-tenant job on the shared runner holds them (monorepo#1515).
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get update -qq
-            sudo -n apt-get install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
@@ -434,8 +436,8 @@ jobs:
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get update -qq
-            sudo -n apt-get install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Per-job persistent target dir outside the work dir (see the `check`
       # job's comment for the rationale). cargo llvm-cov honors it, and the
@@ -584,8 +586,8 @@ jobs:
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
-            sudo -n apt-get update -qq
-            sudo -n apt-get install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
       # Raise the per-user inotify instance ceiling. The instrumented full
       # suite starts many real notify watchers in parallel (file, .git

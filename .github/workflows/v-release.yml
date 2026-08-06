@@ -131,10 +131,11 @@ jobs:
         if: "runner.os == 'Windows'"
         run: "echo C:\\Program Files\\Git\\bin>>\"%GITHUB_PATH%\""
         shell: "cmd"
-      - name: "Make apt-get non-interactive (Linux)"
+      - name: "Make apt-get non-interactive and lock-tolerant (Linux)"
         if: "runner.os == 'Linux'"
         run: |
           echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+          echo 'DPkg::Lock::Timeout "300";' | sudo tee /etc/apt/apt.conf.d/90lock-timeout >/dev/null
           echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
         shell: "bash"
       - name: "Provision Rust toolchain and matrix targets (self-hosted runners)"

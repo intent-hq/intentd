@@ -20,11 +20,18 @@
 # /etc/apt/apt.conf.d/90assumeyes; tinybox doesn't have it, so apt prompts,
 # reads EOF, and aborts. Mirror the hosted-image config and export
 # DEBIAN_FRONTEND=noninteractive for the later steps.
-- name: Make apt-get non-interactive (Linux)
+# Also set DPkg::Lock::Timeout system-wide so every later apt-get call —
+# including the generated "Install dependencies" step, which can't be edited
+# — waits up to 300s for the apt/dpkg locks instead of failing instantly
+# when a co-tenant job on the shared self-hosted runner holds them
+# (monorepo#1515: v0.5.0 aarch64-musl leg lost the lock race in
+# `sudo apt-get update`).
+- name: Make apt-get non-interactive and lock-tolerant (Linux)
   if: runner.os == 'Linux'
   shell: bash
   run: |
     echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes >/dev/null
+    echo 'DPkg::Lock::Timeout "300";' | sudo tee /etc/apt/apt.conf.d/90lock-timeout >/dev/null
     echo "DEBIAN_FRONTEND=noninteractive" >> "$GITHUB_ENV"
 - name: Provision Rust toolchain and matrix targets (self-hosted runners)
   shell: bash
