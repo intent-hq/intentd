@@ -125,8 +125,6 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.autoFetch` — periodically fetch from the remote.
-    pub auto_fetch: bool,
     /// `workspace.cowIsolation` — CoW workspace provisioning and per-agent
     /// sandboxing (requires CoW filesystem support on the workspaces root;
     /// workspace creation fails when unsupported).
@@ -701,7 +699,14 @@ where
 /// `server.listenMode` is retired outright: the daemon always serves UDS and
 /// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
 /// discarded (no catalog entry remains) and stripped from the file.
-pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai", "server.listenMode"];
+/// `workspace.autoFetch` is likewise retired outright (the periodic-fetch
+/// feature was removed) — discarded and stripped.
+pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
+    "model.workspaceOverrides",
+    "ai",
+    "server.listenMode",
+    "workspace.autoFetch",
+];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
@@ -931,8 +936,6 @@ providerSettings = {}
 # sshKeyPath = "~/.ssh/id_ed25519"
 # Default shell -- shell used for terminals/scripts.
 # defaultShell = "/bin/zsh"
-# Auto-fetch -- periodically fetch from the remote.
-autoFetch = false
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
@@ -1135,7 +1138,6 @@ mod tests {
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
         assert!(d.background_agents.provider_settings.is_empty());
-        assert!(!d.workspace.auto_fetch);
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert!(d.mcp.enable_user_servers);
@@ -1457,6 +1459,26 @@ mod tests {
         let err = SettingsFile::parse_str("[server]\nlistenMode = \"uds\"\n").unwrap_err();
         assert!(err.to_string().contains("listenMode"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("listenMode"));
+    }
+
+    #[test]
+    fn auto_fetch_is_no_longer_a_schema_key() {
+        // Strict parse rejects the retired key like any other unknown key.
+        let err = SettingsFile::parse_str("[workspace]\nautoFetch = false\n").unwrap_err();
+        assert!(err.to_string().contains("autoFetch"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoFetch"));
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_auto_fetch() {
+        let text = "[workspace]\nautoFetch = false\ncowIsolation = true\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert!(file.workspace.cow_isolation);
+        assert_eq!(
+            legacy.get("workspace.autoFetch"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(legacy.len(), 1);
     }
 
     #[test]

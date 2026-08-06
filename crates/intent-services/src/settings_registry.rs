@@ -55,7 +55,6 @@ pub const KNOWN_PATHS: &[&str] = &[
     "workspace.worktreesLocation",
     "workspace.sshKeyPath",
     "workspace.defaultShell",
-    "workspace.autoFetch",
     "workspace.cowIsolation",
     "git.autoCommit",
     "mcp.enableUserServers",
