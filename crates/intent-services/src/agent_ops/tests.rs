@@ -6539,7 +6539,11 @@ async fn models_list_returns_non_empty_catalog_with_source() {
         json!({ "id": "m2", "name": "Model Two", "provider": "auggie" }),
     ];
     let fetched = rows.clone();
-    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    // `saturating_sub(1)` (the `seed_auggie_cache` hedge): the second call
+    // below re-reads `now_ms()`, and `fresh()` rejects entries timestamped
+    // after the read — a backwards wall-clock step between the two reads
+    // must not fall through to the real CLI probe.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
     let res = svc
         .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
         .await
@@ -6853,9 +6857,11 @@ async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
     let (_t, svc, _ws) = setup().await;
     let rows = vec![json!({ "id": "shared", "name": "Shared", "provider": "auggie" })];
     let fetched = rows.clone();
-    // Real clock: the entry the legacy fetch stores must be fresh for the
-    // per-provider read below, which uses `now_ms()`.
-    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    // Real clock minus 1ms (the `seed_auggie_cache` hedge): the entry the
+    // legacy fetch stores must be fresh for the per-provider read below,
+    // which re-reads `now_ms()` — and `fresh()` rejects entries timestamped
+    // after the read, so a backwards wall-clock step must not trigger a probe.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
     let res = svc
         .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
         .await
