@@ -14795,8 +14795,9 @@ mod worktree_provisioning {
 
     /// New-project flow (intent-hq/monorepo#962): `isNewRepo: true` on a
     /// non-git `repositoryPath` initializes the directory (`git init -b main`
-    /// + seeded `.gitignore`/`README.md` + initial commit) and then provisions
-    /// the checkout normally — no more silent row-only workspace.
+    /// + seeded `.gitignore`/`README.md` + initial commit). The workspace then
+    /// works directly in the repository folder — checkoutMode `direct`, no
+    /// worktree provisioned, workspace branch checked out in place.
     #[tokio::test]
     async fn create_with_is_new_repo_initializes_repo_then_provisions() {
         let tmp = TempDb::new();
@@ -14818,24 +14819,26 @@ mod worktree_provisioning {
             .expect("create")
             .workspace;
 
-        // The source dir became a real repo: initial commit on `main`, seeded
-        // starter files.
+        // The source dir became a real repo: initial commit, seeded starter
+        // files, and the workspace branch checked out in place.
         let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
-        assert_eq!(src.head().unwrap().shorthand().unwrap(), "main");
         let head = src.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.message().unwrap().trim(), "Initial commit");
         assert!(repo_dir.0.join(".gitignore").exists());
         assert!(repo_dir.0.join("README.md").exists());
+        assert_eq!(
+            src.head().unwrap().shorthand().unwrap(),
+            ws.branch.as_str(),
+            "workspace branch checked out directly in the repository folder"
+        );
 
-        // ...and the workspace got a real checkout off it.
-        let wt = ws.worktree_path.as_deref().expect("worktree path set");
-        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
-        assert!(wt_repo.is_worktree());
+        // Direct mode: standalone repo, no worktree provisioned.
+        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             ws.base_commit_sha.as_deref(),
             Some(head.id().to_string().as_str())
         );
-        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
     }
 
     /// intent-hq/monorepo#962: an `isNewRepo` initialization failure fails the
@@ -14873,8 +14876,9 @@ mod worktree_provisioning {
     }
 
     /// intent-hq/monorepo#962: `isNewRepo: true` on an already-initialized
-    /// repo is a no-op — no re-init, no extra commit, and provisioning behaves
-    /// exactly like an ordinary create off a local repo.
+    /// repo is a no-op for the init — no re-init, no extra commit. The
+    /// workspace works directly in the repository folder (checkoutMode
+    /// `direct`) on its workspace branch.
     #[tokio::test]
     async fn create_with_is_new_repo_on_existing_repo_is_a_noop() {
         let tmp = TempDb::new();
@@ -14913,8 +14917,69 @@ mod worktree_provisioning {
             "init\n",
             "existing files must not be overwritten"
         );
-        assert!(ws.worktree_path.is_some(), "provisioning still runs");
+        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            src.head().unwrap().shorthand().unwrap(),
+            ws.branch.as_str(),
+            "workspace branch checked out in place"
+        );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// An `isNewRepo` create on an already-initialized repo honors a
+    /// caller-supplied non-HEAD `baseRef`: the in-place workspace branch (and
+    /// `baseCommitSha`) start at the requested base, not at HEAD.
+    #[tokio::test]
+    async fn create_with_is_new_repo_honors_base_ref_on_existing_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, base_sha, _) = seed_repo("intentd-newrepo-baseref");
+        // Pin `base` at the first commit, then advance HEAD.
+        {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("base", &head, false).unwrap();
+        }
+        std::fs::write(repo_dir.0.join("later.txt"), "after base\n").unwrap();
+        {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            commit_all(&repo, "feat: later");
+        }
+        let root = unique_dir("intentd-newrepo-baseref-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(base_sha.as_str()),
+            "workspace branch starts at the requested base ref, not HEAD"
+        );
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert_eq!(src.head().unwrap().shorthand().unwrap(), ws.branch.as_str());
+        assert_eq!(
+            src.head().unwrap().target().unwrap().to_string(),
+            base_sha,
+            "checked-out branch points at the base commit"
+        );
+        assert!(
+            !repo_dir.0.join("later.txt").exists(),
+            "work tree matches the base ref"
+        );
     }
 
     /// intent-hq/monorepo#962 guard: without `isNewRepo`, a non-git
@@ -15018,9 +15083,10 @@ mod worktree_provisioning {
         let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
         let head = src.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.message().unwrap().trim(), "Initial commit");
-        assert!(
-            ws.worktree_path.is_some(),
-            "provisioning runs after recovery"
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Direct),
+            "direct mode after recovery"
         );
         assert_eq!(
             ws.base_commit_sha.as_deref(),
@@ -18206,6 +18272,411 @@ mod clone_orchestration {
             "no clone attempted: {types:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Cache hydration (PROTOCOL §5.1): `githubUrl` WITHOUT a `clonePath`
+    // hydrates the workspace from `<root>/.repo-cache/<owner>/<repo>` into a
+    // standalone checkout at `<root>/<wsId>/<repo-slug>` (CoW when supported,
+    // else a plain local clone → checkoutMode `direct`).
+    // -----------------------------------------------------------------------
+
+    fn assert_hydrated_checkout(
+        ws: &intent_core::Workspace,
+        root: &std::path::Path,
+        url: &str,
+    ) -> git2::Repository {
+        let checkout = ws.repository_path.as_deref().expect("repositoryPath set");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(checkout),
+            "the checkout IS the repository"
+        );
+        assert!(
+            std::path::Path::new(checkout).starts_with(root.join(&ws.id.0)),
+            "checkout lives under <root>/<wsId>: {checkout}"
+        );
+        let repo = git2::Repository::open(checkout).expect("checkout opens as a git repo");
+        assert!(!repo.is_worktree(), "hydrated checkout is standalone");
+        assert!(
+            matches!(
+                ws.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            ),
+            "hydration persists cow or direct: {:?}",
+            ws.checkout_mode
+        );
+        assert_eq!(
+            repo.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str(),
+            "workspace branch checked out"
+        );
+        {
+            let origin = repo.find_remote("origin").expect("origin remote");
+            assert_eq!(
+                origin.url().expect("origin url"),
+                url,
+                "origin points at the GitHub URL"
+            );
+        }
+        repo
+    }
+
+    /// Cache miss: the first `githubUrl`-only create clones into the repo
+    /// cache, hydrates a standalone checkout, streams `git:clone:*` frames
+    /// before `workspace:created`, and derives owner/name from the URL.
+    #[tokio::test]
+    async fn create_hydrates_from_cache_on_miss() {
+        let source = seed_repo("intentd-hydrate-src");
+        let root = unique_dir("intentd-hydrate-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Hydrated".to_string()),
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let repo = assert_hydrated_checkout(&ws, &root.0, &url);
+        assert!(
+            ws.base_commit_sha.is_some(),
+            "base commit SHA recorded from the checkout"
+        );
+        drop(repo);
+        // Owner/name derived from the URL (file:// → last two segments).
+        assert!(ws.repository_owner.is_some(), "owner derived from URL");
+        assert_eq!(
+            ws.repository_name.as_deref(),
+            source.0.file_name().map(|n| n.to_str().unwrap()),
+            "name derived from URL"
+        );
+        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`.
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws.repository_owner.as_deref().unwrap())
+            .join(ws.repository_name.as_deref().unwrap());
+        assert!(cache.join(".git").exists(), "repo cache populated");
+        // The clone event stream ran before the workspace insert.
+        let types = drain_event_types(&mut sub).await;
+        let done_pos = types.iter().position(|t| t == "git:clone:done");
+        let ws_pos = types.iter().position(|t| t == "workspace:created");
+        assert!(
+            types.iter().any(|t| t == "git:clone:progress"),
+            "git:clone:progress observed: {types:?}"
+        );
+        assert!(done_pos.is_some(), "git:clone:done observed: {types:?}");
+        assert!(
+            done_pos < ws_pos,
+            "hydration completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// Cache hit: a second create for the same URL refreshes the existing
+    /// cache (a marker planted in the cache's `.git` survives — no re-clone)
+    /// and hydrates a second, independent checkout.
+    #[tokio::test]
+    async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
+        let source = seed_repo("intentd-hydrate2-src");
+        let root = unique_dir("intentd-hydrate2-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws1 = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("first create")
+            .workspace;
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws1.repository_owner.as_deref().unwrap())
+            .join(ws1.repository_name.as_deref().unwrap());
+        let marker = cache.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        let ws2 = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("second create")
+            .workspace;
+
+        assert!(marker.exists(), "cache hit refreshes, never re-clones");
+        assert_ne!(ws1.id, ws2.id);
+        assert_ne!(
+            ws1.repository_path, ws2.repository_path,
+            "each workspace gets its own standalone checkout"
+        );
+        assert_hydrated_checkout(&ws2, &root.0, &url);
+    }
+
+    /// `baseRef` checkout: the hydrated checkout's workspace branch starts at
+    /// the requested base ref, not the cache's default-branch tip.
+    #[tokio::test]
+    async fn hydration_checks_out_requested_base_ref() {
+        let source = seed_repo("intentd-hydrate-base-src");
+        // Pin `base` at the first commit, then advance the default branch.
+        let base_sha = {
+            let repo = git2::Repository::open(&source.0).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("base", &head, false).unwrap();
+            head.id().to_string()
+        };
+        std::fs::write(source.0.join("later.txt"), "after base\n").unwrap();
+        {
+            let repo = git2::Repository::open(&source.0).unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "feat: later", &tree, &[&parent])
+                .unwrap();
+        }
+        let root = unique_dir("intentd-hydrate-base-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let repo = assert_hydrated_checkout(&ws, &root.0, &url);
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(base_sha.as_str()),
+            "workspace branch starts at the base ref"
+        );
+        assert_eq!(repo.head().unwrap().target().unwrap().to_string(), base_sha);
+        let checkout = std::path::Path::new(ws.repository_path.as_deref().unwrap());
+        assert!(
+            !checkout.join("later.txt").exists(),
+            "tracked files match the base ref, not the default tip"
+        );
+    }
+
+    /// Concurrent `githubUrl`-only creates for the same repo serialize on the
+    /// per-repo cache lock and all succeed with independent checkouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hydrating_creates_same_repo_all_succeed() {
+        let source = seed_repo("intentd-hydrate-conc-src");
+        let root = unique_dir("intentd-hydrate-conc-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let svc = svc.clone();
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                svc.create_workspace(
+                    WorkspaceCreate {
+                        github_url: Some(url),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+            }));
+        }
+        let mut seen_paths = std::collections::HashSet::new();
+        for task in tasks {
+            let ws = task.await.unwrap().expect("concurrent create").workspace;
+            assert_hydrated_checkout(&ws, &root.0, &url);
+            assert!(
+                seen_paths.insert(ws.repository_path.clone().unwrap()),
+                "each create gets its own checkout"
+            );
+        }
+    }
+
+    /// A hydration whose cache clone cannot succeed (unreachable `file://`
+    /// source, no `clonePath`) fails the whole create — no row persisted, no
+    /// partial state.
+    #[tokio::test]
+    async fn hydration_cache_failure_fails_create_no_row_persisted() {
+        let root = unique_dir("intentd-hydrate-fail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let missing = format!("/does/not/exist/{}/repo.git", uuid::Uuid::new_v4());
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(format!("file://{missing}")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail when the cache clone fails");
+        assert!(
+            matches!(err, intent_core::Error::CloneFailed { .. }),
+            "typed clone failure: {err}"
+        );
+        let list = store.list_workspaces(true).await.expect("list");
+        assert!(list.is_empty(), "no row persisted on hydration failure");
+    }
+
+    /// Back-compat regression guard: an explicit `clonePath` alongside
+    /// `githubUrl` keeps the legacy network-clone path exactly — repo cloned
+    /// at `clonePath`, a linked worktree provisioned off it (`checkoutMode:
+    /// "worktree"`), and **no** `.repo-cache` directory created.
+    #[tokio::test]
+    async fn explicit_clone_path_keeps_legacy_clone_no_cache() {
+        let source = seed_repo("intentd-legacy-clone-src");
+        let root = unique_dir("intentd-legacy-clone-root");
+        let target = unique_dir("intentd-legacy-clone-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(
+            ws.repository_path.as_deref(),
+            Some(clone_dir.to_string_lossy().as_ref()),
+            "repositoryPath is the explicit clone target"
+        );
+        assert!(clone_dir.join(".git").exists(), "clone landed at clonePath");
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "legacy path provisions a linked worktree"
+        );
+        assert_ne!(
+            ws.worktree_path.as_deref(),
+            ws.repository_path.as_deref(),
+            "worktree is distinct from the cloned repo"
+        );
+        assert!(
+            !root.0.join(".repo-cache").exists(),
+            "explicit clonePath must not touch the repo cache"
+        );
+    }
+
+    /// `workspace.delete` of a hydrated workspace removes the standalone
+    /// checkout (and its `<root>/<wsId>` parent) while the repo cache stays
+    /// untouched for future creates.
+    #[tokio::test]
+    async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
+        let source = seed_repo("intentd-hydrate-del-src");
+        let root = unique_dir("intentd-hydrate-del-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws.repository_owner.as_deref().unwrap())
+            .join(ws.repository_name.as_deref().unwrap());
+        assert!(checkout.exists() && cache.exists());
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+        // Fast-ack: poll for the background cleanup.
+        let ws_dir = root.0.join(&ws.id.0);
+        for _ in 0..100 {
+            if !checkout.exists() && !ws_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(!checkout.exists(), "hydrated checkout removed");
+        assert!(!ws_dir.exists(), "empty <root>/<wsId> parent removed");
+        assert!(
+            cache.join(".git").exists(),
+            "repo cache survives workspace deletion"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19527,7 +19998,7 @@ mod turn_token_usage {
 
         // Turn 1: cumulative snapshot 70/50 (+30 cached read, +4 cached write).
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(70, 50, 30, 4))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 30, 4)), None)
             .await;
         let ev1 = recv_usage_event(&mut sub).await;
         assert_eq!(ev1["type"], WORKSPACE_TOKEN_USAGE_CHANGED);
@@ -19541,7 +20012,7 @@ mod turn_token_usage {
         // Turn 2: cumulative snapshot grows to 100/80. REPLACES turn 1 — the
         // tally is 100/80, NOT 170/130.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 45, 6))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 45, 6)), None)
             .await;
         let ev2 = recv_usage_event(&mut sub).await;
         assert_eq!(ev2["data"]["tokenUsage"]["totals"]["inputTokens"], 100);
@@ -19571,13 +20042,13 @@ mod turn_token_usage {
         let mut sub = subscribe_usage(&h);
 
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         recv_usage_event(&mut sub).await;
 
         // Same cumulative snapshot again (e.g. a zero-cost turn).
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         assert!(
             timeout(Duration::from_millis(100), sub.recv())
@@ -19617,7 +20088,7 @@ mod turn_token_usage {
 
         // Only the first session reports end-of-turn usage.
         h.services
-            .persist_turn_token_usage(&with_snapshot, &h.ws, &acp_usage(70, 50, 0, 0))
+            .persist_turn_token_usage(&with_snapshot, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
             .await;
 
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -19762,7 +20233,7 @@ mod turn_token_usage {
         let h = harness().await;
         let mut sub = subscribe_usage(&h);
         h.services
-            .persist_turn_token_usage(&AgentId::new(), &h.ws, &acp_usage(1, 1, 0, 0))
+            .persist_turn_token_usage(&AgentId::new(), &h.ws, Some(&acp_usage(1, 1, 0, 0)), None)
             .await;
         assert!(
             timeout(Duration::from_millis(100), sub.recv())
@@ -19793,7 +20264,7 @@ mod turn_token_usage {
 
         // Session reports cumulative 100/80 before the recreate.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         assert_eq!(ws.token_usage.unwrap().totals.input_tokens, 100);
@@ -19808,7 +20279,7 @@ mod turn_token_usage {
         // The recreated ACP session restarts its cumulative counts: its first
         // turn reports 5/3. The tally must be 105/83, not 5/3.
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(5, 3, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), None)
             .await;
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         let usage = ws.token_usage.expect("usage persisted");
@@ -19849,7 +20320,7 @@ mod turn_token_usage {
             .await
             .expect("append message");
         h.services
-            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         h.store
             .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
@@ -19898,7 +20369,7 @@ mod turn_token_usage {
             .await
             .expect("set acp id");
         h.services
-            .persist_turn_token_usage(&recreated, &h.ws, &acp_usage(100, 80, 0, 0))
+            .persist_turn_token_usage(&recreated, &h.ws, Some(&acp_usage(100, 80, 0, 0)), None)
             .await;
         h.store
             .replace_acp_session_id(&h.ws, &recreated, "acp-1", "acp-2")
@@ -19906,7 +20377,7 @@ mod turn_token_usage {
             .expect("CAS swap");
         // Normal agent: live cumulative snapshot 70/50.
         h.services
-            .persist_turn_token_usage(&normal, &h.ws, &acp_usage(70, 50, 0, 0))
+            .persist_turn_token_usage(&normal, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
             .await;
         // Fallback agent: never reported end-of-turn usage; message sums only.
         h.store
@@ -19967,6 +20438,213 @@ mod turn_token_usage {
         assert_eq!(scanned.by_model, live.by_model);
     }
 
+    /// ACP `usage_update` cost (§5.23) persists on the session snapshot and
+    /// surfaces on every `TokenUsage` bucket. Cost is cumulative per ACP
+    /// session, so the latest report REPLACES the previous one, and a turn
+    /// that reports only tokens keeps the last cost (never drops it).
+    #[tokio::test]
+    async fn turn_end_persists_and_aggregates_usage_cost() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), cost(0.5))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(0.5));
+        assert_eq!(usage.by_agent_id[&agent.0].cost, cost(0.5));
+        assert_eq!(usage.by_model["opus-4.8"].cost, cost(0.5));
+
+        // Cumulative: the next report REPLACES (1.25, not 1.75).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), cost(1.25))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 2")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(1.25));
+
+        // A token-only turn keeps the last reported cost.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(120, 90, 0, 0)), None)
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 3")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 120);
+        assert_eq!(usage.totals.cost, cost(1.25), "cost is not dropped");
+    }
+
+    /// A cost-only report (no end-of-turn token usage — e.g. a harness-wake
+    /// burst) persists the cost without zeroing the session's counters.
+    #[tokio::test]
+    async fn cost_only_report_preserves_token_counters() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 50, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(
+                &agent,
+                &h.ws,
+                None,
+                Some(intent_core::UsageCost {
+                    amount: 2.0,
+                    currency: "USD".to_string(),
+                }),
+            )
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 70, "counters preserved");
+        assert_eq!(usage.totals.output_tokens, 50);
+        assert_eq!(usage.totals.cost.as_ref().map(|c| c.amount), Some(2.0));
+    }
+
+    /// A cost-only report for an agent whose provider never sends the
+    /// end-of-turn token report must not switch the tally off the per-message
+    /// fallback: the zero-counter snapshot it writes carries the cost only,
+    /// and the message sums keep driving the counters.
+    #[tokio::test]
+    async fn cost_only_report_keeps_message_sum_fallback() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "sonnet-5"))
+            .await
+            .expect("insert session");
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+        h.services
+            .persist_turn_token_usage(
+                &agent,
+                &h.ws,
+                None,
+                Some(intent_core::UsageCost {
+                    amount: 0.4,
+                    currency: "USD".to_string(),
+                }),
+            )
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(
+            usage.by_agent_id[&agent.0].input_tokens, 7,
+            "message-sum fallback survives the cost-only persist"
+        );
+        assert_eq!(usage.by_agent_id[&agent.0].output_tokens, 3);
+        assert_eq!(
+            usage.by_agent_id[&agent.0].cost.as_ref().map(|c| c.amount),
+            Some(0.4)
+        );
+        assert_eq!(usage.totals.input_tokens, 7);
+    }
+
+    /// Session recreate folds the outgoing session's cost into the baseline
+    /// exactly like the token counters: the pre-recreate cost is neither lost
+    /// nor double-counted once the fresh session reports again.
+    #[tokio::test]
+    async fn recreate_folds_cost_into_baseline() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+        let cost = |amount: f64| {
+            Some(intent_core::UsageCost {
+                amount,
+                currency: "USD".to_string(),
+            })
+        };
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 80, 0, 0)), cost(3.0))
+            .await;
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // Recreated session, no report yet: the banked baseline cost carries.
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(3.0), "baseline cost survives");
+
+        // Fresh session reports its own cumulative cost from zero: the
+        // effective total is baseline + snapshot.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(5, 3, 0, 0)), cost(1.5))
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 2")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(usage.totals.cost, cost(4.5));
+        assert_eq!(usage.totals.input_tokens, 105);
+    }
+
     /// Clobber regression (monorepo#738): the recompute persists via a scoped
     /// `token_usage` + `updated_at` write inside one transaction, so a
     /// recompute racing a workspace title update can never revert the title
@@ -19992,6 +20670,7 @@ mod turn_token_usage {
                         output_tokens: i + 1,
                         cache_read_tokens: 0,
                         cache_creation_tokens: 0,
+                        cost: None,
                     },
                 )
                 .await
@@ -20039,7 +20718,12 @@ mod turn_token_usage {
             let agent = agent.clone();
             handles.push(tokio::spawn(async move {
                 services
-                    .persist_turn_token_usage(&agent, &ws, &acp_usage(input, input / 10, 0, 0))
+                    .persist_turn_token_usage(
+                        &agent,
+                        &ws,
+                        Some(&acp_usage(input, input / 10, 0, 0)),
+                        None,
+                    )
                     .await;
             }));
         }
