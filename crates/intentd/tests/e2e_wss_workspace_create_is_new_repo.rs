@@ -119,8 +119,9 @@ fn run_git(args: &[&str], dir: &Path) -> String {
 
 /// `workspace.create` with `isNewRepo: true` on a fresh empty (non-git) dir
 /// succeeds over WSS: the daemon initializes the directory (`git init -b
-/// main` + initial commit) and provisions a real checkout — the result
-/// carries `worktreePath` + `checkoutMode: "worktree"` and `baseCommitSha`
+/// main` + initial commit) and the workspace works directly in the
+/// initialized repository folder on its workspace branch — the result
+/// carries `checkoutMode: "direct"`, no `worktreePath`, and `baseCommitSha`
 /// matches the seeded initial commit (PROTOCOL §5.1).
 #[tokio::test]
 async fn workspace_create_is_new_repo_initializes_and_provisions() {
@@ -154,28 +155,27 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
         run_git(&["log", "-1", "--pretty=%s"], &project.0),
         "Initial commit"
     );
-    assert_eq!(
-        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &project.0),
-        "main"
-    );
+    assert!(project.0.join("README.md").exists(), "starter files seeded");
 
-    // ...and the workspace got a real provisioned checkout off it.
-    let wt = workspace["worktreePath"]
-        .as_str()
-        .expect("worktreePath populated");
+    // ...and the workspace works directly in the initialized repository
+    // folder (standalone repo, no worktree) on its workspace branch.
+    assert!(
+        workspace["worktreePath"].is_null(),
+        "no worktree for isNewRepo creates, got: {workspace}"
+    );
     assert_eq!(
         workspace["checkoutMode"],
-        json!("worktree"),
+        json!("direct"),
         "got: {workspace}"
     );
     assert_eq!(workspace["baseCommitSha"], json!(head_sha));
-    let wt_path = PathBuf::from(wt);
-    assert!(wt_path.join("README.md").exists(), "checkout populated");
+    let branch = workspace["branch"].as_str().expect("branch populated");
     assert_eq!(
-        run_git(&["rev-parse", "--is-inside-work-tree"], &wt_path),
-        "true"
+        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &project.0),
+        branch,
+        "workspace branch checked out in place"
     );
-    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &project.0), head_sha);
 }
 
 /// An `isNewRepo` initialization failure (`repositoryPath` points at a

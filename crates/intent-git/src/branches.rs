@@ -158,6 +158,35 @@ pub fn create_branch(repo_path: &Path, branch_name: &str, checkout: bool) -> Res
     Ok(())
 }
 
+/// Create `branch_name` at `base_ref` (local branch, then any rev-parsable
+/// spec — tag/SHA) and check it out. Errors with [`Error::BaseRefUnresolvable`]
+/// when the base ref does not resolve, and when the branch already exists.
+/// Used by the `isNewRepo` create arm, which works directly in the
+/// repository folder (no worktree) but must still honor a caller-supplied
+/// `baseRef` (`provision_worktree` parity).
+pub fn create_branch_at(repo_path: &Path, branch_name: &str, base_ref: &str) -> Result<()> {
+    if branch_name.is_empty() {
+        return Err(Error::InvalidParams(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    let base_commit = [format!("refs/heads/{base_ref}"), base_ref.to_string()]
+        .iter()
+        .find_map(|spec| repo.revparse_single(spec).ok())
+        .and_then(|obj| obj.peel_to_commit().ok())
+        .ok_or_else(|| Error::BaseRefUnresolvable {
+            base_ref: base_ref.to_string(),
+        })?;
+    repo.branch(branch_name, &base_commit, false)
+        .map_err(map_git_err)?;
+    let refname = format!("refs/heads/{branch_name}");
+    let obj = repo.revparse_single(&refname).map_err(map_git_err)?;
+    repo.checkout_tree(&obj, None).map_err(map_git_err)?;
+    repo.set_head(&refname).map_err(map_git_err)?;
+    Ok(())
+}
+
 /// Check out an existing local branch (`git checkout <name>` parity). Errors
 /// when the branch is missing. Ports `gitService.checkoutBranch`.
 pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
