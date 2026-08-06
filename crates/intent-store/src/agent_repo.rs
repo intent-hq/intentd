@@ -36,10 +36,11 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     sandbox_branch, stop_reason, stop_reason_timestamp";
 
 /// One agent session's usage inputs for the workspace token-usage tally
-/// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
-/// `message_contents` is non-empty only for sessions whose decoded snapshot
-/// and baseline carry no token report (the per-message fallback path — see
-/// [`Store::get_workspace_agent_usage_data`]).
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
+/// `message_usage` is non-empty only for sessions whose decoded snapshot and
+/// baseline carry no token report (the per-message fallback path — see
+/// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
+/// metadata of usage-bearing messages — never message bodies.
 pub type AgentUsageRow = (
     String,
     Option<String>,
@@ -48,14 +49,41 @@ pub type AgentUsageRow = (
     Vec<serde_json::Value>,
 );
 
+/// SQL scalar expression projecting an `agent_message` row's usage metadata —
+/// top-level `usage` or `_meta.usage`, mirroring intent-services'
+/// `extract_message_usage` — into the `{"usage": {...}}` shape the tally's
+/// per-message fallback consumes. NULL for a row carrying neither, which
+/// [`MESSAGE_USAGE_PRESENT_SQL`] filters out. The `json_valid` guard keeps
+/// non-JSON content (impossible from the store's serde-encoded write paths)
+/// from erroring the statement.
+const MESSAGE_USAGE_JSON_SQL: &str = "CASE WHEN json_valid(content) THEN \
+    json_object('usage', json(COALESCE(json_extract(content, '$.usage'), \
+        json_extract(content, '$._meta.usage')))) END";
+
+/// Row filter pairing with [`MESSAGE_USAGE_JSON_SQL`]: keeps only messages
+/// that actually carry usage metadata, so the fallback read scales with
+/// usage-bearing messages rather than with the whole transcript.
+const MESSAGE_USAGE_PRESENT_SQL: &str = "json_valid(content) \
+    AND (json_extract(content, '$.usage') IS NOT NULL \
+        OR json_extract(content, '$._meta.usage') IS NOT NULL)";
+
 /// Read the per-session usage rows for one workspace over an explicit
 /// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
 /// the transactional recompute in `workspace_repo.rs` (write transaction,
-/// monorepo#738) share one implementation. Message contents are hydrated only
-/// when neither the decoded snapshot nor the baseline carries a token report
+/// monorepo#738) share one implementation. Per-message usage is read only when
+/// neither the decoded snapshot nor the baseline carries a token report
 /// ([`intent_core::token_usage_reported`], which also treats the all-zero
-/// counters of a cost-only persist as "no report"); a malformed
-/// snapshot/baseline decodes to `None` and still hydrates.
+/// counters of a cost-only persist as "no report", keeping this in lockstep
+/// with `agent_token_tally`'s fallback rule); a malformed snapshot/baseline
+/// decodes to `None` and stays on the fallback too.
+///
+/// That fallback read is bounded (monorepo#1571): SQLite projects each
+/// message's usage metadata ([`MESSAGE_USAGE_JSON_SQL`]) and drops rows
+/// carrying none ([`MESSAGE_USAGE_PRESENT_SQL`]), so message bodies are never
+/// materialized. A presence-only hydration guard (`snapshot.is_none() &&
+/// baseline.is_none()`) would instead have zeroed a cost-only session's
+/// counters, since such a session is still on the tally's per-message
+/// fallback and needs its per-message usage.
 pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
     workspace_id: &WorkspaceId,
@@ -82,15 +110,18 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        // Message contents feed the tally only when neither snapshot nor
+        // Per-message usage feeds the tally only when neither snapshot nor
         // baseline carries a token report (`agent_token_tally`'s fallback
-        // rule), so the per-session content fetch is skipped otherwise
-        // (monorepo#738).
+        // rule), so the per-session message read is skipped otherwise
+        // (monorepo#738) — and when it does run it projects usage metadata in
+        // SQL rather than message bodies (monorepo#1571).
         let contents: Vec<serde_json::Value> =
             if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
-                let message_sql =
-                    "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
-                let message_rows = sqlx::query(message_sql)
+                let message_sql = format!(
+                    "SELECT {MESSAGE_USAGE_JSON_SQL} AS usage_json FROM agent_message \
+                     WHERE agent_id = ? AND {MESSAGE_USAGE_PRESENT_SQL} ORDER BY seq ASC"
+                );
+                let message_rows = sqlx::query(&message_sql)
                     .bind(&agent_id)
                     .fetch_all(&mut *conn)
                     .await
@@ -99,9 +130,9 @@ pub(crate) async fn fetch_agent_usage_rows(
                     })?;
                 message_rows
                     .iter()
-                    .map(|row| {
-                        let content_str: String = row.get("content");
-                        serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                    .filter_map(|row| {
+                        let usage_json: Option<String> = row.get("usage_json");
+                        usage_json.and_then(|s| serde_json::from_str(&s).ok())
                     })
                     .collect()
             } else {
@@ -1216,13 +1247,15 @@ impl Store {
     /// Get lightweight usage data for all agents in a workspace: for each agent,
     /// returns the agent_id, model, the persisted end-of-turn `token_usage`
     /// snapshot (if any), the persisted `token_usage_baseline` folded from
-    /// prior ACP sessions (if any, monorepo#737), and message content JSON
-    /// (for tallying without full AgentSession hydration; finding F2). Message
-    /// contents are hydrated ONLY for sessions where both the decoded snapshot
-    /// and baseline are absent — the tally falls back to message sums for those
-    /// alone (see `agent_token_tally`), so snapshot/baseline-backed sessions
-    /// return empty `contents` (monorepo#738). A malformed snapshot/baseline
-    /// decodes to `None` and therefore still hydrates.
+    /// prior ACP sessions (if any, monorepo#737), and per-message usage
+    /// metadata (for tallying without full AgentSession hydration; finding F2).
+    /// Messages are read ONLY for sessions whose decoded snapshot and baseline
+    /// carry no token report — the tally falls back to message sums for those
+    /// alone (see `agent_token_tally`), so report-backed sessions return an
+    /// empty list (monorepo#738) — and that read is bounded: SQLite projects
+    /// each message's usage metadata and drops rows carrying none, so message
+    /// bodies never cross the boundary (monorepo#1571). A malformed
+    /// snapshot/baseline decodes to `None` and therefore stays on the fallback.
     pub async fn get_workspace_agent_usage_data(
         &self,
         workspace_id: &WorkspaceId,
@@ -3813,6 +3846,95 @@ mod tests {
             vec![usage_msg],
             "malformed snapshot still hydrates (fallback preserved)"
         );
+    }
+
+    /// Bounded fallback read (monorepo#1571): a session on the per-message
+    /// fallback path — including one whose snapshot is present but carries
+    /// zero counters (the cost-only persist shape, which MUST stay on the
+    /// fallback) — never materializes message bodies. Only the usage metadata
+    /// of usage-bearing messages crosses the boundary; messages without usage
+    /// metadata contribute no row at all.
+    #[tokio::test]
+    async fn usage_data_fallback_read_projects_usage_without_message_bodies() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-bounded".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        // A body large enough that its presence in the row is unmistakable.
+        let blob = "x".repeat(64 * 1024);
+        let usage_msg = serde_json::json!({
+            "text": blob,
+            "usage": { "inputTokens": 9, "outputTokens": 1 },
+        });
+        let meta_usage_msg = serde_json::json!({
+            "text": blob,
+            "_meta": { "usage": { "cacheReadTokens": 4 } },
+        });
+        // No usage metadata anywhere: pure payload, must not be read at all.
+        let plain_msg = serde_json::json!([{ "type": "text", "text": blob }]);
+
+        let cost_only = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let never_reported = AgentId(format!("agent-{}", Uuid::new_v4()));
+        for id in [&cost_only, &never_reported] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+            for msg in [&usage_msg, &meta_usage_msg, &plain_msg] {
+                store
+                    .append_agent_message(id, "assistant", msg, &ts)
+                    .await
+                    .expect("append message");
+            }
+        }
+        // Cost-only persist shape: zero counters, cost present.
+        store
+            .set_agent_session_token_usage(
+                &ws_id,
+                &cost_only,
+                &TokenUsageTotals {
+                    cost: Some(UsageCost {
+                        amount: 0.4,
+                        currency: "USD".to_string(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set cost-only snapshot");
+
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        let expected = vec![
+            serde_json::json!({ "usage": { "inputTokens": 9, "outputTokens": 1 } }),
+            serde_json::json!({ "usage": { "cacheReadTokens": 4 } }),
+        ];
+        for id in [&cost_only, &never_reported] {
+            let row = rows.iter().find(|r| r.0 == id.0).expect("row");
+            // Compare/report on the encoded length first so a regression that
+            // materializes the 64 KiB bodies does not dump them into the
+            // failure output.
+            let encoded = serde_json::to_string(&row.4).expect("encode usage");
+            assert!(
+                !encoded.contains(&blob),
+                "no message body materialized for {id} ({} bytes)",
+                encoded.len()
+            );
+            assert_eq!(
+                row.4, expected,
+                "fallback session {id} surfaces usage metadata only, in seq order"
+            );
+        }
     }
 
     /// `update_workspace_token_usage` (monorepo#738): the closure sees the
