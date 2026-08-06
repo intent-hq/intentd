@@ -1,4 +1,5 @@
-//! WSS e2e for post-session model application via `session/set_config_option`.
+//! WSS e2e for post-session model AND reasoning-effort application via
+//! `session/set_config_option`.
 //!
 //! Providers whose adapter exposes the model as a `configOptions[id="model"]`
 //! select (`supports_config_option_model`; claude-code's pinned adapter) get
@@ -12,6 +13,13 @@
 //! * The call fires once on the fresh session with the bare model id (the
 //!   compound `mock:` prefix stripped), BEFORE the first prompt resolves.
 //! * A second turn on the same live session does NOT re-issue it.
+//!
+//! The same seam covers the generic reasoning-effort application (PROTOCOL
+//! §5.5): with the mock advertising a `thought_level`-category select
+//! (`MOCK_AGENT_THOUGHT_LEVEL=<currentValue>`) under its own config id, the
+//! session's `reasoningEffort` is applied at session setup and re-applied on
+//! the LIVE session after an `agent.update` change, so it lands before the
+//! next prompt without a respawn.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -494,5 +502,239 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
     assert!(
         rendered.contains("\"ok\""),
         "assistant response landed despite the rejected set_config_option: {rendered}"
+    );
+}
+
+/// PROTOCOL §5.5: the session's `reasoningEffort` reaches a provider that
+/// advertises a `thought_level`-category config option, under the ADAPTER's
+/// own config id (`effort` here — codex-acp names it `reasoning_effort`), and
+/// a mid-session `agent.update` change is re-applied on the same live session
+/// so it takes effect by the next prompt with no respawn.
+#[tokio::test]
+async fn reasoning_effort_applied_and_reapplied_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        // The provider opens on "medium" and offers low/medium/high.
+        ("MOCK_AGENT_THOUGHT_LEVEL", "medium"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "Effort E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Effort",
+            "model": "mock:sonnet",
+            "reasoningEffort": "high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert_eq!(
+        created["agent"]["reasoningEffort"], "high",
+        "effort persisted on create: {created}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // One call, under the adapter's own config id, with the stored effort.
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "one effort application: {log:?}");
+    assert_eq!(log[0]["configId"], "effort", "adapter's id: {:?}", log[0]);
+    assert_eq!(log[0]["value"], "high", "stored effort: {:?}", log[0]);
+
+    // A second turn on the same live session re-applies nothing.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second turn" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
+    await_stream_end(&mut sub, &agent_id).await;
+    assert_eq!(
+        read_config_log(&config_log).len(),
+        1,
+        "unchanged effort is not re-sent"
+    );
+
+    // Mid-session change → applied on the SAME live session before the turn.
+    let updated = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.update",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "changes": { "reasoningEffort": "low" },
+        }),
+    )
+    .await;
+    assert_eq!(updated["agent"]["reasoningEffort"], "low", "{updated}");
+    let sent3 = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "third turn" }),
+    )
+    .await;
+    assert_eq!(sent3["success"], true, "third sendMessage ok: {sent3}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 2, "the change was applied: {log:?}");
+    assert_eq!(log[1]["configId"], "effort", "{:?}", log[1]);
+    assert_eq!(log[1]["value"], "low", "{:?}", log[1]);
+}
+
+/// A provider that advertises no `thought_level` option silently ignores the
+/// session's `reasoningEffort` — no `session/set_config_option` is issued and
+/// the turn completes normally.
+#[tokio::test]
+async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    // No MOCK_AGENT_THOUGHT_LEVEL and no config-option model: the mock's
+    // session results carry no `configOptions` at all.
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "Effort NoOp E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "EffortNoOp",
+            "model": "mock:sonnet",
+            "reasoningEffort": "high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    assert!(
+        read_config_log(&config_log).is_empty(),
+        "no config option advertised → nothing sent: {:?}",
+        read_config_log(&config_log)
     );
 }
