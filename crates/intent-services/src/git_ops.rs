@@ -30,8 +30,13 @@ const NO_DISCARD_PATHS_MSG: &str =
     "No file paths provided. Please specify at least one file path to discard.";
 
 /// TS `assertAgentCommitAllowed` rejection message (auto-commit disabled).
-const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace. \
-Use ws.git.commit with userRequested: true if the user asked you to commit.";
+/// The `Auto-commit is disabled` prefix is load-bearing: `auto_commit.rs`
+/// matches on it (`AUTO_COMMIT_DISABLED_MARK`) to treat the rejection as a
+/// silent skip.
+const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace: the user \
+has turned off agent commits here and does not want agents committing. Do not work around \
+this gate — do not commit via raw `git commit` or any other means. Only if the user has \
+explicitly asked you to commit, retry ws.git.commit with userRequested: true.";
 
 /// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
 /// auto-commit is disabled, unless `user_requested` bypasses it. The gate
