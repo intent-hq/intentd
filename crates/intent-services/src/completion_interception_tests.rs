@@ -1345,6 +1345,227 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
+    /// Poll until the sandbox reaches `expected` or the deadline passes.
+    /// The claim guard's drop reset runs on a detached task, so tests must
+    /// wait for it rather than assert immediately.
+    async fn wait_for_sandbox_status(
+        store: &Store,
+        ws_id: &WorkspaceId,
+        agent_id: &AgentId,
+        expected: SandboxStatus,
+    ) -> SandboxStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = store
+                .get_sandbox(ws_id, agent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == expected || std::time::Instant::now() > deadline {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claim_guard_drop_resets_stranded_merging_row() {
+        // Regression for the stranded-`merging` incident: a merge path that
+        // claimed the row and then died without persisting a terminal status
+        // (dropped future / panic) must not leave the row `merging` — the
+        // armed guard's Drop resets it to merge_pending.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-guard-drop");
+        let Some((test_root, _repo_path, _sandbox_path, ws, _services, _bus)) =
+            setup_merge_pending_sandbox(&store, "guard-drop", &agent_id).await
+        else {
+            return;
+        };
+
+        // Claim the row exactly like a merge path does.
+        assert!(store
+            .try_transition_sandbox_status(
+                &ws.id,
+                &agent_id,
+                SandboxStatus::MergePending,
+                SandboxStatus::Merging,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let guard = crate::sandbox_ops::MergeClaimGuard::armed(
+            store.clone(),
+            ws.id.clone(),
+            agent_id.clone(),
+        );
+
+        // The owning scope dies without disarming (cancellation / panic).
+        drop(guard);
+
+        let status =
+            wait_for_sandbox_status(&store, &ws.id, &agent_id, SandboxStatus::MergePending).await;
+        assert_eq!(
+            status,
+            SandboxStatus::MergePending,
+            "dropped armed guard must reset merging → merge_pending"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_claim_guard_disarm_keeps_terminal_status() {
+        // Counterpart: after the merge path persists its terminal status and
+        // disarms, dropping the guard must NOT touch the row.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-guard-disarm");
+        let Some((test_root, _repo_path, _sandbox_path, ws, _services, _bus)) =
+            setup_merge_pending_sandbox(&store, "guard-disarm", &agent_id).await
+        else {
+            return;
+        };
+
+        assert!(store
+            .try_transition_sandbox_status(
+                &ws.id,
+                &agent_id,
+                SandboxStatus::MergePending,
+                SandboxStatus::Merging,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let mut guard = crate::sandbox_ops::MergeClaimGuard::armed(
+            store.clone(),
+            ws.id.clone(),
+            agent_id.clone(),
+        );
+
+        // Merge finished: terminal status persisted, guard disarmed.
+        store
+            .update_sandbox_status(&ws.id, &agent_id, SandboxStatus::Merged, &now_iso())
+            .await
+            .unwrap();
+        guard.disarm();
+        drop(guard);
+
+        // Give a misbehaving guard time to fire before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::Merged,
+            "disarmed guard must not touch the terminal status"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_manual_merge_on_claimed_row_returns_in_progress() {
+        // sandbox.cow.merge on a row already claimed `merging` is an expected
+        // state: a structured { status: "in_progress" } result, not an
+        // Error::Internal the caller has to string-match.
+
+        use intent_core::WorkspaceApi;
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-claimed");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "claimed-rpc", &agent_id).await
+        else {
+            return;
+        };
+
+        store
+            .update_sandbox_status(&ws.id, &agent_id, SandboxStatus::Merging, &now_iso())
+            .await
+            .unwrap();
+
+        let result = services
+            .sandbox_merge(ws.id.clone(), agent_id.clone())
+            .await
+            .expect("claimed row must be a typed result, not an error");
+        assert_eq!(result["status"], json!("in_progress"));
+        assert_eq!(result["ok"], json!(true));
+        assert!(
+            !repo_path.join("swept.txt").exists(),
+            "in_progress result must not merge anything"
+        );
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::Merging,
+            "the in-flight claim must be left alone"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_watchdog_resets_stale_merging_row() {
+        // A row stranded `merging` in a LIVE daemon (claim owner lost without
+        // the guard firing) is reset to merge_pending by the sweep's watchdog
+        // once past the stale threshold — and then merged in the same sweep.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-stale");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-stale", &agent_id).await
+        else {
+            return;
+        };
+
+        // Strand it `merging` with a claim timestamp older than the threshold.
+        let stale = (time::OffsetDateTime::now_utc()
+            - (crate::SANDBOX_MERGING_STALE_AFTER + time::Duration::minutes(1)))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+        store
+            .update_sandbox_status(&ws.id, &agent_id, SandboxStatus::Merging, &stale)
+            .await
+            .unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(
+            summary.merged, 1,
+            "watchdog resets the stale row and the same sweep merges it"
+        );
+        assert!(repo_path.join("swept.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_watchdog_leaves_fresh_merging_row_alone() {
+        // A row claimed `merging` moments ago has a live owner; the watchdog
+        // must not steal the claim from an in-flight merge.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-fresh");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-fresh", &agent_id).await
+        else {
+            return;
+        };
+
+        store
+            .update_sandbox_status(&ws.id, &agent_id, SandboxStatus::Merging, &now_iso())
+            .await
+            .unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert!(summary.is_empty(), "fresh merging row must be untouched");
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::Merging);
+        assert!(!repo_path.join("swept.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
     #[tokio::test]
     async fn test_recover_stranded_merging_sandboxes() {
         // A sandbox stranded `merging` by a daemon that died mid-merge is

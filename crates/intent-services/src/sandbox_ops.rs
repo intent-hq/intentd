@@ -117,6 +117,89 @@ pub struct ProvisionConfig {
     pub workspaces_root: PathBuf,
 }
 
+/// Crash-safe scope guard for a claimed sandbox merge (`… → merging`).
+///
+/// Every merge path claims the row via CAS before doing git work; if the
+/// owning future is dropped mid-flight (caller cancellation — e.g. the
+/// `workspace_api` eval timeout that stranded a row `merging` in the
+/// isolation-lab incident — or a panic between claim and finalize), nothing
+/// used to reset the status, leaving the sandbox stranded: invisible to the
+/// retry sweep and unclaimable by the RPC until a daemon restart.
+///
+/// Arm the guard right after a successful claim; call [`disarm`] once the
+/// merge's terminal status has been persisted. On drop while still armed,
+/// the guard schedules a compare-and-swap `merging → merge_pending` on a
+/// detached task (Drop cannot await), so a misfire after some OTHER terminal
+/// status landed is a harmless CAS miss.
+///
+/// [`disarm`]: MergeClaimGuard::disarm
+pub(crate) struct MergeClaimGuard {
+    store: Option<Store>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+}
+
+impl MergeClaimGuard {
+    /// Arm a guard for the given claimed sandbox.
+    pub(crate) fn armed(store: Store, workspace_id: WorkspaceId, agent_id: AgentId) -> Self {
+        Self {
+            store: Some(store),
+            workspace_id,
+            agent_id,
+        }
+    }
+
+    /// Disarm: the merge path has persisted its intended terminal status.
+    pub(crate) fn disarm(&mut self) {
+        self.store = None;
+    }
+}
+
+impl Drop for MergeClaimGuard {
+    fn drop(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let agent_id = self.agent_id.clone();
+        // Drop cannot await; hand the reset to the runtime when one exists
+        // (always true in the daemon). CAS from `merging` only — if the merge
+        // actually finished and this is a late misfire, the swap is a no-op.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                match store
+                    .try_transition_sandbox_status(
+                        &workspace_id,
+                        &agent_id,
+                        SandboxStatus::Merging,
+                        SandboxStatus::MergePending,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            workspace = %workspace_id.0,
+                            "sandbox merge abandoned mid-flight (cancelled or panicked); \
+                             claim guard reset merging → merge_pending"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %agent_id.0,
+                            workspace = %workspace_id.0,
+                            error = %e,
+                            "sandbox merge claim guard failed to reset stranded merging row"
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// Provision a sandbox for an agent in a sandbox-eligible (direct-mode or
 /// CoW-checkout) workspace.
 ///
@@ -521,6 +604,14 @@ pub async fn merge_sandbox(
 /// 7. On success: return Merged with the applied range.
 ///
 /// The canonical repository is never left mid-merge/cherry-pick (always abort on failure).
+///
+/// The git work (libgit2 commit/cherry-pick plus the `git fetch` subprocess)
+/// runs on the blocking pool via [`tokio::task::spawn_blocking`], for two
+/// reasons: it must not pin an async runtime worker for the duration of a
+/// large fetch/cherry-pick, and a blocking task runs to completion even if
+/// the awaiting future is dropped — so a cancelled caller (e.g. the 30s
+/// `workspace_api` eval timeout, monorepo stranded-`merging` incident) can
+/// never abandon the canonical repo mid-mutation.
 pub async fn merge_sandbox_with(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -538,13 +629,66 @@ pub async fn merge_sandbox_with(
     let canonical_path = resolve_user_directory(&workspace)?;
     let sandbox_path = PathBuf::from(&sandbox.path);
 
-    // The whole git2 section lives in a block so no non-Send repo handle is
-    // alive across the last-merged-commit await below.
     let outcome = {
+        let sandbox = sandbox.clone();
+        let agent_id = agent_id.clone();
+        let canonical_path = canonical_path.clone();
+        let sandbox_path = sandbox_path.clone();
+        tokio::task::spawn_blocking(move || {
+            merge_sandbox_git(
+                &canonical_path,
+                &sandbox_path,
+                &sandbox,
+                &agent_id,
+                dirty_handling,
+            )
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("sandbox merge git task failed: {e}")))?
+    };
+
+    // Persistent sandboxes merge repeatedly: record the merged range's tip so
+    // the next merge only picks up commits after it. Best-effort — the merge
+    // itself already landed; a lost update only re-applies an already-merged
+    // (now empty) range next time.
+    if let Ok(MergeOutcome::Merged {
+        sandbox_head_sha, ..
+    }) = &outcome
+    {
+        if let Err(e) = store
+            .set_sandbox_last_merged_commit(workspace_id, agent_id, sandbox_head_sha, &now_iso())
+            .await
+        {
+            tracing::warn!(
+                agent = %agent_id.0,
+                error = %e,
+                "failed to record sandbox last merged commit"
+            );
+        }
+    }
+
+    outcome
+}
+
+/// The synchronous git section of [`merge_sandbox_with`]: dirty-state commit,
+/// canonical-overlap check, fetch, cherry-pick. Runs on the blocking pool.
+/// Logs per-phase wall-clock timings (dirty-commit, fetch, cherry-pick) so a
+/// slow merge names its slow phase.
+fn merge_sandbox_git(
+    canonical_path: &Path,
+    sandbox_path: &Path,
+    sandbox: &Sandbox,
+    agent_id: &AgentId,
+    dirty_handling: DirtyHandling,
+) -> Result<MergeOutcome> {
+    let mut dirty_commit_ms: u64 = 0;
+    let fetch_ms: u64;
+    let cherrypick_ms: u64;
+    {
         // Open both repositories
-        let canonical_repo = git2::Repository::open(&canonical_path)
+        let canonical_repo = git2::Repository::open(canonical_path)
             .map_err(|e| Error::Internal(format!("open canonical repo failed: {e}")))?;
-        let sandbox_repo = git2::Repository::open(&sandbox_path)
+        let sandbox_repo = git2::Repository::open(sandbox_path)
             .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
 
         // Handle dirty sandbox state per the caller's policy: commit it
@@ -561,6 +705,7 @@ pub async fn merge_sandbox_with(
                     format!("Auto-commit dirty state for {}", agent_id.0)
                 }
             };
+            let dirty_started = std::time::Instant::now();
             let sig = sandbox_repo
                 .signature()
                 .map_err(|e| Error::Internal(format!("get sandbox signature failed: {e}")))?;
@@ -588,6 +733,7 @@ pub async fn merge_sandbox_with(
             sandbox_repo
                 .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
                 .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
+            dirty_commit_ms = dirty_started.elapsed().as_millis() as u64;
         }
 
         // Get canonical HEAD
@@ -606,7 +752,7 @@ pub async fn merge_sandbox_with(
 
             // Get the list of files changed by the sandbox since the last merge
             // (or from snapshot/base on the first merge)
-            let base_sha = merge_start_sha(&sandbox);
+            let base_sha = merge_start_sha(sandbox);
             let sandbox_changed = get_files_in_range(&sandbox_repo, base_sha, "HEAD")?;
 
             // Check for overlap
@@ -681,13 +827,14 @@ pub async fn merge_sandbox_with(
         // mistaken for an option or a remote-helper URL. GIT_TERMINAL_PROMPT=0 and
         // a null stdin force fail-fast instead of a hidden credential prompt
         // (parity with intent-git/src/fetch.rs); the transport is local-only.
+        let fetch_started = std::time::Instant::now();
         let fetch_out = std::process::Command::new("git")
             .arg("fetch")
             .arg("--no-tags")
             .arg("--quiet")
             .arg(sandbox_path_str)
             .arg(&refspec)
-            .current_dir(&canonical_path)
+            .current_dir(canonical_path)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(std::process::Stdio::null())
             .output()
@@ -698,43 +845,32 @@ pub async fn merge_sandbox_with(
                 String::from_utf8_lossy(&fetch_out.stderr).trim()
             )));
         }
+        fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
+        let cherrypick_started = std::time::Instant::now();
         let outcome = apply_sandbox_commits(
             &canonical_repo,
             &sandbox_repo,
-            &sandbox,
+            sandbox,
             &canonical_head_commit,
         );
+        cherrypick_ms = cherrypick_started.elapsed().as_millis() as u64;
 
         // The temp ref only anchors the fetch; drop it regardless of outcome.
         if let Ok(mut r) = canonical_repo.find_reference(&temp_ref) {
             let _ = r.delete();
         }
 
+        tracing::info!(
+            agent = %agent_id.0,
+            dirty_commit_ms,
+            fetch_ms,
+            cherrypick_ms,
+            "sandbox merge git phases completed"
+        );
+
         outcome
-    };
-
-    // Persistent sandboxes merge repeatedly: record the merged range's tip so
-    // the next merge only picks up commits after it. Best-effort — the merge
-    // itself already landed; a lost update only re-applies an already-merged
-    // (now empty) range next time.
-    if let Ok(MergeOutcome::Merged {
-        sandbox_head_sha, ..
-    }) = &outcome
-    {
-        if let Err(e) = store
-            .set_sandbox_last_merged_commit(workspace_id, agent_id, sandbox_head_sha, &now_iso())
-            .await
-        {
-            tracing::warn!(
-                agent = %agent_id.0,
-                error = %e,
-                "failed to record sandbox last merged commit"
-            );
-        }
     }
-
-    outcome
 }
 
 /// The start of the next merge range: the last successfully merged tip when

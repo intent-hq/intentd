@@ -2741,7 +2741,16 @@ impl Services {
             let mut sub = bus.subscribe(filter);
             while let Some(events) = sub.recv().await {
                 for event in events {
-                    services.handle_completion_event(&event).await;
+                    // Detach per event: a completion that triggers a sandbox
+                    // merge-back does git work (dirty commit + LLM message,
+                    // fetch, cherry-pick) and must not head-of-line-block the
+                    // subscriber loop — while one merge ran inline here, every
+                    // other agent's completion wake sat undelivered (and the
+                    // subscriber queue could lag out entirely).
+                    let services = services.clone();
+                    tokio::spawn(async move {
+                        services.handle_completion_event(&event).await;
+                    });
                 }
             }
         })
@@ -3585,7 +3594,9 @@ impl Services {
         agent_id: &AgentId,
         session: &AgentSession,
     ) -> SandboxMergeDisposition {
-        use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
         use intent_store::SandboxStatus;
 
         // Load sandbox record
@@ -3640,6 +3651,7 @@ impl Services {
             );
             return SandboxMergeDisposition::propagate_silent();
         }
+        let claim_started = std::time::Instant::now();
         match self
             .store
             .try_transition_sandbox_status(
@@ -3667,6 +3679,13 @@ impl Services {
                 );
             }
         }
+        let claim_ms = claim_started.elapsed().as_millis() as u64;
+        // Crash-safe claim scope: if this future is dropped or panics before a
+        // terminal status is persisted, the guard resets `merging →
+        // merge_pending` so the row is never stranded (the mechanism behind
+        // the isolation-lab stranded-`merging` incident).
+        let mut claim_guard =
+            MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
 
         // Turn-end dirty-state policy: with the workspace's effective
         // auto-commit ON, generate an LLM-assisted commit message for the
@@ -3674,14 +3693,17 @@ impl Services {
         // OFF, refuse to commit — `DirtyHandling::Bounce` makes the merge
         // return `Dirty` without snapshotting or merging anything.
         let auto_commit = self.effective_auto_commit(workspace_id).await;
+        let commit_msg_started = std::time::Instant::now();
         let dirty_handling = if auto_commit {
             let message = self.sandbox_dirty_commit_message(agent_id, session).await;
             DirtyHandling::Commit(message)
         } else {
             DirtyHandling::Bounce
         };
+        let commit_msg_ms = commit_msg_started.elapsed().as_millis() as u64;
 
         // Attempt merge
+        let merge_started = std::time::Instant::now();
         let outcome =
             match merge_sandbox_with(&self.store, workspace_id, agent_id, dirty_handling).await {
                 Ok(outcome) => outcome,
@@ -3700,10 +3722,12 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
                     // Propagate completion with error status
                     return SandboxMergeDisposition::propagate_with("merge_pending");
                 }
             };
+        let merge_ms = merge_started.elapsed().as_millis() as u64;
 
         match outcome {
             MergeOutcome::Merged {
@@ -3714,6 +3738,7 @@ impl Services {
                 // Success! Shared bookkeeping: mark merged, emit
                 // sandbox:cow:merged, clear retry count. The sandbox
                 // persists for the agent's next turn.
+                let finalize_started = std::time::Instant::now();
                 self.finalize_sandbox_merged(
                     workspace_id,
                     agent_id,
@@ -3721,6 +3746,15 @@ impl Services {
                     &canonical_head,
                 )
                 .await;
+                claim_guard.disarm();
+                tracing::info!(
+                    agent = %agent_id.0,
+                    claim_ms,
+                    commit_msg_ms,
+                    merge_ms,
+                    finalize_ms = finalize_started.elapsed().as_millis() as u64,
+                    "sandbox turn-end merge phase timings"
+                );
 
                 // Propagate completion normally
                 SandboxMergeDisposition {
@@ -3745,6 +3779,7 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
 
                     tracing::warn!(
                         agent = %agent_id.0,
@@ -3766,6 +3801,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await;
+                claim_guard.disarm();
 
                 self.increment_sandbox_retry_count(workspace_id, agent_id)
                     .await;
@@ -3858,6 +3894,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await;
+                claim_guard.disarm();
 
                 tracing::warn!(
                     agent = %agent_id.0,
@@ -3882,6 +3919,7 @@ impl Services {
                     .store
                     .update_sandbox_status(workspace_id, agent_id, sandbox.status, &now_iso())
                     .await;
+                claim_guard.disarm();
 
                 let message = format!(
                     "⚠️ Your sandbox has uncommitted changes and this workspace has auto-commit \
@@ -3982,26 +4020,32 @@ impl Services {
         // canonical repo carries non-commit refs (refs/intent/blobs/*,
         // refs/stash) that libgit2's local transport trips over ("object is
         // not a committish", InvalidSpec) — same failure class fixed for the
-        // merge-back fetch in sandbox_ops::merge_sandbox.
-        let fetch_out = std::process::Command::new("git")
-            .arg("fetch")
-            .arg("--no-tags")
-            .arg("--quiet")
-            .arg(canonical_path)
-            .arg("+HEAD:refs/remotes/canonical/HEAD")
-            .current_dir(sandbox_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
-        if !fetch_out.status.success() {
-            return Err(Error::Internal(format!(
-                "fetch canonical to sandbox failed: {}",
-                String::from_utf8_lossy(&fetch_out.stderr).trim()
-            )));
-        }
-
-        Ok(())
+        // merge-back fetch in sandbox_ops::merge_sandbox. Runs on the blocking
+        // pool: a large local fetch must not pin an async runtime worker.
+        let canonical_path = canonical_path.clone();
+        let sandbox_path = sandbox_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let fetch_out = std::process::Command::new("git")
+                .arg("fetch")
+                .arg("--no-tags")
+                .arg("--quiet")
+                .arg(&canonical_path)
+                .arg("+HEAD:refs/remotes/canonical/HEAD")
+                .current_dir(&sandbox_path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
+            if !fetch_out.status.success() {
+                return Err(Error::Internal(format!(
+                    "fetch canonical to sandbox failed: {}",
+                    String::from_utf8_lossy(&fetch_out.stderr).trim()
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("fetch canonical task failed: {e}")))?
     }
 
     async fn get_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> i64 {
@@ -4163,10 +4207,22 @@ impl Services {
     /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
     ///   returned to `merge_pending`.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
-        use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
+        use crate::sandbox_ops::{
+            merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+        };
         use intent_store::SandboxStatus;
 
         let mut summary = MergeSweepSummary::default();
+
+        // Live watchdog for stranded `merging` rows: every merge path holds
+        // the claim only for the duration of one merge attempt (well under a
+        // sweep interval), so a row still `merging` after
+        // [`SANDBOX_MERGING_STALE_AFTER`] lost its owner without the claim
+        // guard firing (e.g. a pre-guard daemon, or a guard reset that itself
+        // failed). Reset it to `merge_pending` so the sweep/RPC can reclaim
+        // it without a daemon restart.
+        self.reset_stale_merging_sandboxes().await;
+
         let pending = match self
             .store
             .list_sandboxes_by_status(SandboxStatus::MergePending)
@@ -4263,6 +4319,11 @@ impl Services {
                 }
             }
 
+            // Crash-safe claim scope: reset `merging → merge_pending` if the
+            // sweep task is aborted (daemon shutdown) or panics mid-merge.
+            let mut claim_guard =
+                MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
+
             // Same dirty-state policy as the completion path: with the
             // workspace's auto-commit OFF the sweep must not commit the
             // agent's uncommitted work — `Dirty` is handled like `Blocked`
@@ -4286,6 +4347,7 @@ impl Services {
                         &canonical_head,
                     )
                     .await;
+                    claim_guard.disarm();
                     summary.merged += 1;
                 }
                 Ok(MergeOutcome::Blocked {
@@ -4301,6 +4363,7 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
                     summary.blocked += 1;
                     tracing::info!(
                         sandbox = %sandbox.id,
@@ -4321,6 +4384,7 @@ impl Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
                     summary.blocked += 1;
                     tracing::info!(
                         sandbox = %sandbox.id,
@@ -4335,17 +4399,88 @@ impl Services {
                 }) => {
                     let last_error = format!("merge conflict on: {}", conflicting_paths.join(", "));
                     self.record_sweep_merge_failure(&sandbox, &last_error).await;
+                    claim_guard.disarm();
                     summary.conflicts += 1;
                 }
                 Err(e) => {
                     self.record_sweep_merge_failure(&sandbox, &e.to_string())
                         .await;
+                    claim_guard.disarm();
                     summary.errors += 1;
                 }
             }
         }
 
         summary
+    }
+
+    /// Watchdog for rows stranded `merging` in a LIVE daemon: any sandbox
+    /// whose `updated_at` (stamped by the claim CAS) is older than
+    /// [`SANDBOX_MERGING_STALE_AFTER`] no longer has a plausible in-flight
+    /// owner — every merge path settles or resets its claim within one
+    /// attempt. CAS-reset it to `merge_pending` (WARN) so the sweep and the
+    /// manual RPC can pick it up again. Complements
+    /// [`Services::recover_stranded_merging_sandboxes`], which handles the
+    /// daemon-restart case unconditionally.
+    async fn reset_stale_merging_sandboxes(&self) {
+        use intent_store::SandboxStatus;
+
+        let merging = match self
+            .store
+            .list_sandboxes_by_status(SandboxStatus::Merging)
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "merging watchdog: listing merging sandboxes failed");
+                return;
+            }
+        };
+        if merging.is_empty() {
+            return;
+        }
+        let cutoff = time::OffsetDateTime::now_utc() - SANDBOX_MERGING_STALE_AFTER;
+        for sandbox in merging {
+            let stale = intent_core::parse_iso(&sandbox.updated_at)
+                .map(|updated| updated < cutoff)
+                // Unparseable timestamp: treat as stale rather than let the
+                // row hide from recovery forever.
+                .unwrap_or(true);
+            if !stale {
+                continue;
+            }
+            match self
+                .store
+                .try_transition_sandbox_status(
+                    &sandbox.workspace_id,
+                    &sandbox.agent_id,
+                    SandboxStatus::Merging,
+                    SandboxStatus::MergePending,
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        claimed_at = %sandbox.updated_at,
+                        "sandbox stuck merging past the stale threshold; watchdog reset to merge_pending"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        error = %e,
+                        "merging watchdog: reset failed"
+                    );
+                }
+            }
+        }
     }
 
     /// Bookkeeping for a failed sweep merge attempt: return the sandbox to
@@ -7466,6 +7601,12 @@ fn search_done_event(
 /// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
 pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
+
+/// How long a sandbox may sit `merging` (per its claim-time `updated_at`)
+/// before the sweep's watchdog treats the claim as orphaned and resets the
+/// row to `merge_pending`. One merge attempt completes in seconds; 10 minutes
+/// (one sweep interval) is far past any legitimate in-flight merge.
+pub const SANDBOX_MERGING_STALE_AFTER: time::Duration = time::Duration::minutes(10);
 
 /// What [`Services::handle_sandbox_merge_on_completion`] decided about a
 /// sandboxed agent's completion: whether it propagates to the coordinator
@@ -18050,21 +18191,29 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
-            use crate::sandbox_ops::{merge_sandbox_with, DirtyHandling, MergeOutcome};
+            use crate::sandbox_ops::{
+                merge_sandbox_with, DirtyHandling, MergeClaimGuard, MergeOutcome,
+            };
             use intent_store::SandboxStatus;
 
             // Claim the merge atomically (current status → merging) so the RPC
             // never merges concurrently with the completion path or the
             // background retry sweep — every merge path goes through the same
-            // compare-and-swap claim protocol.
+            // compare-and-swap claim protocol. A row already claimed is an
+            // EXPECTED state, not an internal error: return a structured
+            // `status: "in_progress"` result so callers (ws.agent.mergeSandbox)
+            // can react without string-matching an error message.
             let sandbox = store
                 .get_sandbox(&workspace_id, &sandbox_id)
                 .await?
                 .ok_or_else(|| Error::Internal("Sandbox not found".to_string()))?;
+            let already_in_progress = serde_json::json!({
+                "ok": true,
+                "status": "in_progress",
+                "reason": "a sandbox merge is already in progress; retry after it settles",
+            });
             if sandbox.status == SandboxStatus::Merging {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
+                return Ok(already_in_progress);
             }
             let claimed = store
                 .try_transition_sandbox_status(
@@ -18076,10 +18225,13 @@ impl WorkspaceApi for Services {
                 )
                 .await?;
             if !claimed {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
+                return Ok(already_in_progress);
             }
+            // Crash-safe claim scope: reset `merging → merge_pending` if this
+            // future is dropped (client disconnect / eval timeout) or panics
+            // before a terminal status lands.
+            let mut claim_guard =
+                MergeClaimGuard::armed(store.clone(), workspace_id.clone(), sandbox_id.clone());
 
             // Same dirty-state policy as the automatic paths: with the
             // workspace's auto-commit ON, commit uncommitted sandbox state
@@ -18120,6 +18272,7 @@ impl WorkspaceApi for Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
                     return Err(e);
                 }
             };
@@ -18140,6 +18293,7 @@ impl WorkspaceApi for Services {
                         &canonical_head,
                     )
                     .await;
+                    claim_guard.disarm();
 
                     Ok(serde_json::json!({
                         "ok": true,
@@ -18160,6 +18314,7 @@ impl WorkspaceApi for Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
 
                     Ok(serde_json::json!({
                         "ok": true,
@@ -18180,6 +18335,7 @@ impl WorkspaceApi for Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
 
                     Ok(serde_json::json!({
                         "ok": true,
@@ -18199,6 +18355,7 @@ impl WorkspaceApi for Services {
                             &now_iso(),
                         )
                         .await;
+                    claim_guard.disarm();
 
                     Ok(serde_json::json!({
                         "ok": true,
