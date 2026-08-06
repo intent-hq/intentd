@@ -3068,10 +3068,10 @@ async fn agent_session_round_trip_and_append_only_log() {
 }
 
 /// Attention-request fields (`attention_request_kind` / `..._reason` /
-/// `..._timestamp`) round-trip through insert → update → get, and
-/// `clear_attention_request` clears them exactly once: `true` when a request
-/// was pending, `false` on the no-op repeat, `NotFound` for a missing session
-/// or workspace mismatch.
+/// `..._timestamp`) round-trip through insert → `set_attention_request` →
+/// get, and `clear_attention_request` clears them exactly once: `true` when a
+/// request was pending, `false` on the no-op repeat, `NotFound` for a missing
+/// session or workspace mismatch.
 #[tokio::test]
 async fn agent_session_attention_request_round_trip_and_clear() {
     let tmp = TempDb::new();
@@ -3094,15 +3094,11 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .await
         .expect("noop clear"));
 
-    // Persist a pending request via the full-session UPDATE writer.
-    let mut session = store.get_agent_session(&agent_id).await.expect("get");
-    session.attention_request_kind = Some("blocker".to_string());
-    session.attention_request_reason = Some("sandbox is broken".to_string());
-    session.attention_request_timestamp = Some("t-attn".to_string());
+    // Persist a pending request via the narrow attention writer.
     store
-        .update_agent_session(&ws, &session)
+        .set_attention_request(&ws, &agent_id, "blocker", "sandbox is broken", "t-attn")
         .await
-        .expect("update session");
+        .expect("set attention request");
 
     let loaded = store.get_agent_session(&agent_id).await.expect("reload");
     assert_eq!(loaded.attention_request_kind.as_deref(), Some("blocker"));
@@ -3146,6 +3142,90 @@ async fn agent_session_attention_request_round_trip_and_clear() {
             .await,
         Err(Error::NotFound(_))
     ));
+
+    // Narrow-writer NotFound parity: missing session and workspace mismatch.
+    assert!(matches!(
+        store
+            .set_attention_request(&ws, &AgentId::from("agent-missing"), "blocker", "r", "t")
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .set_attention_request(&WorkspaceId::new(), &agent_id, "blocker", "r", "t")
+            .await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// G9 regression (attention-clobber race): the full-row
+/// `update_agent_session` must NOT write the `attention_request_*` columns.
+/// A long-lived in-memory `AgentSession` persisted mid-race can therefore
+/// neither resurrect a request that `clear_attention_request` already NULLed
+/// nor clobber a fresh one written by `set_attention_request` in the interim.
+#[tokio::test]
+async fn full_row_update_never_touches_attention_request_columns() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-eeeeeeee-1111-2222-3333-666666666666");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Race A: a stale session snapshot carrying a pending request must not
+    // resurrect it after a narrow clear.
+    store
+        .set_attention_request(&ws, &agent_id, "blocker", "sandbox broken", "t-attn")
+        .await
+        .expect("set attention request");
+    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    assert_eq!(stale.attention_request_kind.as_deref(), Some("blocker"));
+    assert!(store
+        .clear_attention_request(&ws, &agent_id, "t-clear")
+        .await
+        .expect("clear"));
+    store
+        .update_agent_session(&ws, &stale)
+        .await
+        .expect("racing full-row persist");
+    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(
+        after.attention_request_kind, None,
+        "full-row persist of a stale session must not resurrect a cleared request"
+    );
+    assert_eq!(after.attention_request_reason, None);
+    assert_eq!(after.attention_request_timestamp, None);
+
+    // Race B: a stale request-free snapshot must not clobber a fresh request.
+    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    store
+        .set_attention_request(&ws, &agent_id, "discussion", "need a decision", "t-attn-2")
+        .await
+        .expect("set attention request");
+    store
+        .update_agent_session(&ws, &stale)
+        .await
+        .expect("racing full-row persist");
+    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(
+        after.attention_request_kind.as_deref(),
+        Some("discussion"),
+        "full-row persist of a stale session must not clobber a fresh request"
+    );
+    assert_eq!(
+        after.attention_request_reason.as_deref(),
+        Some("need a decision")
+    );
+    assert_eq!(
+        after.attention_request_timestamp.as_deref(),
+        Some("t-attn-2")
+    );
 }
 
 /// `insert_agent_session_with_messages` persists the session and its whole

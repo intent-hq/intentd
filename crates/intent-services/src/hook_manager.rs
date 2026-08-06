@@ -56,8 +56,8 @@ pub(crate) const MIN_HOOK_DELAY_MS: i64 = 10_000;
 pub(crate) const MAX_HOOK_TTL_MS: i64 = 3_600_000;
 pub(crate) const DEFAULT_HOOK_TTL_MS: i64 = MAX_HOOK_TTL_MS;
 
-/// Maximum hook name length (spec: name > 19 chars fails validation).
-pub(crate) const MAX_HOOK_NAME_LEN: usize = 19;
+/// Maximum hook name length (spec: name > 50 chars fails validation).
+pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 
 /// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
 /// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
@@ -1568,16 +1568,16 @@ mod tests {
     #[tokio::test]
     async fn schedule_validates_name_delay_and_code() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Name too long (20 chars > 19 cap).
+        // Name too long (51 chars > 50 cap).
         let err = svc
             .hook_schedule_op(
                 &ws,
                 &owner,
-                &json!({ "name": "a".repeat(20), "code": "return;", "delayMs": 10_000 }),
+                &json!({ "name": "a".repeat(51), "code": "return;", "delayMs": 10_000 }),
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("at most 19"), "{err}");
+        assert!(err.to_string().contains("at most 50"), "{err}");
         // Delay below the floor.
         let err = svc
             .hook_schedule_op(
@@ -1597,6 +1597,32 @@ mod tests {
         // Nothing persisted by any failed validation.
         let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert!(hooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schedule_accepts_fifty_char_name() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let name = "b".repeat(50);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": name,
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule with 50-char name");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.name, name);
+        assert_eq!(hook.state, HookState::Scheduled);
+        // Round-trips through list untouched.
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let hooks = listed["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["name"], json!(name));
     }
 
     #[tokio::test]
@@ -2132,10 +2158,8 @@ mod tests {
         )
         .await
         .expect("schedule");
-        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
-        session.attention_request_kind = Some("discussion".to_string());
         svc.store()
-            .update_agent_session(&ws, &session)
+            .set_attention_request(&ws, &owner, "discussion", "need input", &now_iso())
             .await
             .unwrap();
         let mut row = svc.store().get_workspace(&ws).await.unwrap();

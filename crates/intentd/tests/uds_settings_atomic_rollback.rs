@@ -558,7 +558,7 @@ async fn db_read_error_during_capture_fails_batch() {
         "settings.update",
         json!({ "changes": [
             { "path": "git.autoCommit", "value": false },
-            { "path": "workspace.autoFetch", "value": true },
+            { "path": "workspace.cowIsolation", "value": true },
         ] }),
     )
     .await;
@@ -578,7 +578,7 @@ async fn db_read_error_during_capture_fails_batch() {
         &mut reader,
         3,
         "settings.get",
-        json!({ "path": "workspace.autoFetch" }),
+        json!({ "path": "workspace.cowIsolation" }),
     )
     .await;
     assert_eq!(v2["value"], true);
@@ -595,7 +595,7 @@ async fn db_read_error_during_capture_fails_batch() {
         "settings.update",
         json!({ "changes": [
             { "path": "git.autoCommit", "value": true },
-            { "path": "workspace.autoFetch", "value": false },
+            { "path": "workspace.cowIsolation", "value": false },
         ] }),
     )
     .await;
@@ -608,7 +608,7 @@ async fn db_read_error_during_capture_fails_batch() {
     let err = &resp["error"];
     let err_data = err["data"].as_str().unwrap_or("");
     assert!(
-        err_data.contains("git.autoCommit") || err_data.contains("workspace.autoFetch"),
+        err_data.contains("git.autoCommit") || err_data.contains("workspace.cowIsolation"),
         "error should name the failing key in data field: {err}"
     );
     assert!(
@@ -628,9 +628,9 @@ async fn db_read_error_during_capture_fails_batch() {
         .await
         .expect("read git.autoCommit");
     let v2_after = store2
-        .get_setting("workspace.autoFetch")
+        .get_setting("workspace.cowIsolation")
         .await
-        .expect("read workspace.autoFetch");
+        .expect("read workspace.cowIsolation");
     assert_eq!(
         v1_after,
         Some("false".to_string()),
@@ -639,6 +639,6 @@ async fn db_read_error_during_capture_fails_batch() {
     assert_eq!(
         v2_after,
         Some("true".to_string()),
-        "workspace.autoFetch should still be true (baseline)"
+        "workspace.cowIsolation should still be true (baseline)"
     );
 }
