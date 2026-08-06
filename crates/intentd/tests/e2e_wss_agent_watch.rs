@@ -195,8 +195,9 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// binaries after `slow-timeout` 90s × `terminate-after` 2 = 180s, which masks
 /// any in-test deadline that `INTENTD_TEST_TIMEOUT_MULTIPLIER` scales past it:
 /// the run reports a bare "test timed out" instead of the step that stalled.
-/// Every wait below is additionally clamped to this deadline, so a stall always
-/// panics naming its own step with headroom before the kill.
+/// Daemon startup and every poll/event wait below is clamped to this deadline,
+/// and each RPC round-trip is separately capped by [`rpc_read_budget`], so a
+/// stall always panics naming its own step with headroom before the kill.
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
 /// Per-test deadline clamp, started at the top of each test — before the daemon
@@ -1044,6 +1045,18 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
     let budget = Budget::start();
     let mut fx = boot_watch_lifecycle(&script, budget).await;
 
+    // The fixture's watch must still be live going in, so a regression that
+    // retires watches early fails here rather than as `unwatched=false` below.
+    await_watch_count(
+        &mut fx.setup.rpc,
+        &mut fx.req_id,
+        &fx.ws_id,
+        &fx.watcher,
+        &fx.target,
+        1,
+        budget.step(30),
+    )
+    .await;
     let sent = wss_rpc(
         &mut fx.setup.rpc,
         36,
