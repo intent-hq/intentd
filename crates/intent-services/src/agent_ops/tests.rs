@@ -3354,7 +3354,7 @@ async fn set_model_clears_resolved_display_model() {
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, "auggie:sonnet4.5", Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
@@ -13595,6 +13595,57 @@ async fn agent_update_rejects_unknown_field() {
         .await
         .expect_err("unknown field");
     assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent.update` changing `model` clears the persisted display resolution —
+/// same anti-staleness contract as `agent.setModel` — while a `model`-less
+/// update leaves it intact.
+#[tokio::test]
+async fn agent_update_model_change_clears_resolved_model() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Resolver".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let landed = svc
+        .store()
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
+        .await
+        .expect("seed resolved model");
+    assert!(landed);
+
+    // Non-model update: resolution survives.
+    svc.agent_update_op(id.clone(), json!({ "name": "Renamed" }))
+        .await
+        .expect("name update");
+    let (_, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
+
+    // Model update: stale resolution is cleared.
+    svc.agent_update_op(id.clone(), json!({ "model": "auggie:opus4.7" }))
+        .await
+        .expect("model update");
+    let (model, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(resolved, None, "model change must clear stale resolution");
 }
 
 /// The immutable/write-once invariants on `provider`/`acpSessionId` are still

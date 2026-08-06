@@ -3330,9 +3330,10 @@ async fn agent_session_status_only_lookup() {
     ));
 }
 
-/// `set_agent_session_resolved_model` (D14) guard: the write lands only
-/// while `model` still equals `expected_model` — a mismatch (concurrent
-/// `agent.setModel`) returns `false` and leaves `resolved_model` untouched.
+/// `set_agent_session_resolved_model` (D13/D14) guard: the write lands only
+/// while `model` still equals `expected_model` (`None` matches NULL) — a
+/// mismatch (concurrent `agent.setModel`) returns `false` and leaves
+/// `resolved_model` untouched.
 /// `clear_agent_session_resolved_model` is idempotent (already-NULL column
 /// and absent row are both no-ops).
 #[tokio::test]
@@ -3354,7 +3355,12 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // Guard failure: expected_model no longer matches → false, no write.
     let landed = store
-        .set_agent_session_resolved_model(&ws, &agent_id, "claude-code:sonnet", Some("Sonnet 5"))
+        .set_agent_session_resolved_model(
+            &ws,
+            &agent_id,
+            Some("claude-code:sonnet"),
+            Some("Sonnet 5"),
+        )
         .await
         .expect("guarded write");
     assert!(!landed, "mismatched expected_model must not land");
@@ -3364,12 +3370,19 @@ async fn agent_session_resolved_model_guard_and_clear() {
         .expect("read");
     assert_eq!(resolved, None, "resolved_model untouched on guard failure");
 
+    // Guard failure: expecting NULL against a non-NULL model → false.
+    let landed = store
+        .set_agent_session_resolved_model(&ws, &agent_id, None, Some("Fable 5"))
+        .await
+        .expect("guarded write");
+    assert!(!landed, "None expected_model must not match a set model");
+
     // Guard success: matching expected_model lands the resolution.
     let landed = store
         .set_agent_session_resolved_model(
             &ws,
             &agent_id,
-            "claude-code:claude-fable-5[1m]",
+            Some("claude-code:claude-fable-5[1m]"),
             Some("Fable 5"),
         )
         .await
@@ -3383,7 +3396,12 @@ async fn agent_session_resolved_model_guard_and_clear() {
 
     // A None resolution overwrites (clears) via the same guarded write.
     let landed = store
-        .set_agent_session_resolved_model(&ws, &agent_id, "claude-code:claude-fable-5[1m]", None)
+        .set_agent_session_resolved_model(
+            &ws,
+            &agent_id,
+            Some("claude-code:claude-fable-5[1m]"),
+            None,
+        )
         .await
         .expect("guarded clear");
     assert!(landed);
@@ -3403,6 +3421,26 @@ async fn agent_session_resolved_model_guard_and_clear() {
         .clear_agent_session_resolved_model(&ws, &missing)
         .await
         .expect("clear on absent row is a no-op");
+
+    // D13: a NULL-model session is guarded with `None` expected_model.
+    let null_model_id = AgentId::from("agent-aaaaaaaa-1111-2222-3333-666666666666");
+    let mut null_session = sample_agent_session(&null_model_id, &ws);
+    null_session.model = None;
+    store
+        .insert_agent_session(&null_session)
+        .await
+        .expect("insert NULL-model session");
+    let landed = store
+        .set_agent_session_resolved_model(&ws, &null_model_id, None, Some("Opus 4.8"))
+        .await
+        .expect("guarded write on NULL model");
+    assert!(landed, "None expected_model matches NULL");
+    let (model, resolved, _, _) = store
+        .get_agent_session_token_usage(&ws, &null_model_id)
+        .await
+        .expect("read");
+    assert_eq!(model, None, "model stays NULL");
+    assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
 }
 
 /// `set_agent_session_status` stop_reason parameter: `None` leaves the column

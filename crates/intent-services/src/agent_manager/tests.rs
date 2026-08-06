@@ -7505,10 +7505,11 @@ async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     // provider_binary may or may not be resolved depending on what's installed
 }
 
-/// A persisted effective-model display name (D13, whitespace-bearing, e.g.
-/// `claude-code:Opus 4.8`) still selects the provider via its compound
-/// prefix but never reaches `SpawnOptions.model` — it is a stats/attribution
-/// value, not a spawnable model id; the spawn runs on the provider default.
+/// A persisted effective-model display name (legacy pre-monorepo#1534 row,
+/// whitespace-bearing, e.g. `claude-code:Opus 4.8`) still selects the
+/// provider via its compound prefix but never reaches `SpawnOptions.model` —
+/// it is a stats/attribution value, not a spawnable model id; the spawn runs
+/// on the provider default.
 #[tokio::test]
 async fn resolve_spawn_drops_effective_display_name_model() {
     if intent_providers::find_npx().is_none() {
