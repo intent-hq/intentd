@@ -364,7 +364,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "4.7",
+        sess[0]["result"]["protocolVersion"], "4.8",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1933,6 +1933,117 @@ async fn wss_sandbox_profiles_round_trip() {
         srv.port,
         srv.cfg.clone(),
         r#"{"jsonrpc":"2.0","id":4,"method":"sandbox.profiles.update","params":{"profiles":{"vm":{"enabled":true}}}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// `sandbox.image.check` (PROTOCOL §5.5b, v4.8): dry-run guest-image validity
+/// check — daemon-global, no workspaceId. Asserts the documented result shape
+/// on both outcomes (`valid: true` with manifest metadata; `valid: false`
+/// with a structured error — fetch failures are results, not RPC errors) and
+/// `-32602` on a missing `manifestUrl`.
+#[tokio::test]
+async fn wss_sandbox_image_check() {
+    use std::io::{Read, Write};
+
+    // Minimal fixture HTTP server: a conforming manifest at /manifest.json.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let manifest_body = serde_json::json!({
+        "schema": 1,
+        "id": "intent-guest-base",
+        "version": "9.9.9",
+        "arch": "aarch64",
+        "rootfs": {
+            "url": format!("{base}/rootfs.tar.xz"),
+            "format": "tar.xz",
+            "sha256": "a".repeat(64),
+        },
+        "vsockExec": {
+            "init": "/usr/local/bin/intent-init",
+            "port": 4088,
+            "protocol": "intent-exec/1",
+        },
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                manifest_body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(manifest_body.as_bytes());
+        }
+    });
+
+    let srv = start(WsOptions::default()).await;
+
+    // Valid manifest → { valid: true, imageId, version, arch }.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sandbox.image.check","params":{{"manifestUrl":"{base}/manifest.json"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], true, "{resp}");
+    assert_eq!(resp["result"]["imageId"], "intent-guest-base", "{resp}");
+    assert_eq!(resp["result"]["version"], "9.9.9", "{resp}");
+    assert_eq!(resp["result"]["arch"], "aarch64", "{resp}");
+    // manifestSha256: hex sha of the fetched document — the pin to save.
+    assert!(
+        resp["result"]["manifestSha256"]
+            .as_str()
+            .is_some_and(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())),
+        "{resp}"
+    );
+
+    // Unreachable URL → { valid: false, error } (a result, not an RPC error).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"sandbox.image.check","params":{"manifestUrl":"http://127.0.0.1:1/manifest.json"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], false, "{resp}");
+    assert!(
+        resp["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("failed to fetch image manifest")),
+        "{resp}"
+    );
+
+    // Pin mismatch → { valid: false, error } naming the sha mismatch.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"sandbox.image.check","params":{{"manifestUrl":"{base}/manifest.json","sha256":"{}"}}}}"#,
+            "b".repeat(64)
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["valid"], false, "{resp}");
+    assert!(
+        resp["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("sha256 mismatch")),
+        "{resp}"
+    );
+
+    // Missing manifestUrl → -32602.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"sandbox.image.check","params":{}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");

@@ -2255,6 +2255,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sandbox.image.check`: dry-run validity check of a microVM guest-image
+    /// reference (global, no `workspaceId`) — params `{ manifestUrl,
+    /// sha256? }`. Fetches the manifest, verifies the optional outer pin, and
+    /// contract-checks it **without** downloading the rootfs or touching the
+    /// image cache. Returns `{ valid: true, imageId, version, arch }` on
+    /// success or `{ valid: false, error }` (a structured human-readable
+    /// failure) — fetch/validation failures are results, not RPC errors, so
+    /// clients can check-before-save. A malformed `manifestUrl` param
+    /// (missing/empty) → `-32602`.
+    fn sandbox_image_check(
+        &self,
+        manifest_url: String,
+        sha256: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (manifest_url, sha256);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::sandbox_image_check not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
     ///
     /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);

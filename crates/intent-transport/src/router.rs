@@ -1728,6 +1728,27 @@ async fn dispatch(
             let r = api.sandbox_options().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "sandbox.image.check" => {
+            // Global namespace (no workspaceId): dry-run guest-image validity
+            // check (PROTOCOL §5.5b). Fetch/validation failures are results
+            // (`valid: false`), not RPC errors.
+            let manifest_url = params
+                .get("manifestUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| rpc(INVALID_PARAMS, "manifestUrl is required"))?
+                .to_string();
+            let sha256 = params
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let r = api
+                .sandbox_image_check(manifest_url, sha256)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "git.status" => {
             let ws = require_ws_note(params)?;
             let status = api.git_status(ws).await.map_err(domain_to_rpc)?;

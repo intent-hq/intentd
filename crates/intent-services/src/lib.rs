@@ -8980,6 +8980,43 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn sandbox_image_check(
+        &self,
+        manifest_url: String,
+        sha256: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Dry-run guest-image validity check (§5.5b): fetch + pin-verify
+            // + contract-check the manifest without downloading the rootfs or
+            // touching the cache. Failures are results (`valid: false`), not
+            // RPC errors, so clients can check-before-save.
+            let image_ref = intent_core::GuestImageRef {
+                manifest_url,
+                sha256,
+            };
+            match sandbox_image::fetch_and_validate_manifest(
+                &image_ref,
+                &sandbox_image::ImageSource::ProfileDefault,
+            )
+            .await
+            {
+                Ok((manifest, bytes)) => Ok(serde_json::json!({
+                    "valid": true,
+                    "imageId": manifest.id,
+                    "version": manifest.version,
+                    "arch": manifest.arch,
+                    // Sha of the fetched manifest document, so clients can
+                    // pin the override they are about to save.
+                    "manifestSha256": sandbox_image::manifest_sha256(&bytes),
+                })),
+                Err(e) => Ok(serde_json::json!({
+                    "valid": false,
+                    "error": e.to_string(),
+                })),
+            }
+        })
+    }
+
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
     }

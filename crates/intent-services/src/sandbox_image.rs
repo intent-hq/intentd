@@ -410,13 +410,14 @@ pub async fn ensure_image(
     }
 }
 
-async fn ensure_image_inner(
-    data_dir: &Path,
+/// Fetch the manifest referenced by `image_ref`, verify the optional outer
+/// pin, and contract-check it — the network/validation half of
+/// [`ensure_image`], without touching the cache or downloading the rootfs.
+/// Also the engine behind the `sandbox.image.check` dry-run RPC (§5.5b).
+pub async fn fetch_and_validate_manifest(
     image_ref: &GuestImageRef,
     source: &ImageSource,
-    bus: Option<&EventBus>,
-    workspace_id: Option<&WorkspaceId>,
-) -> std::result::Result<CachedImage, ImageError> {
+) -> std::result::Result<(ImageManifest, Vec<u8>), ImageError> {
     let url = &image_ref.manifest_url;
     let client = reqwest::Client::new();
 
@@ -450,6 +451,18 @@ async fn ensure_image_inner(
             detail: format!("manifest is not UTF-8: {e}"),
         })?;
     let manifest = ImageManifest::parse_and_validate(&manifest_text, url, source)?;
+    Ok((manifest, manifest_bytes))
+}
+
+async fn ensure_image_inner(
+    data_dir: &Path,
+    image_ref: &GuestImageRef,
+    source: &ImageSource,
+    bus: Option<&EventBus>,
+    workspace_id: Option<&WorkspaceId>,
+) -> std::result::Result<CachedImage, ImageError> {
+    let url = &image_ref.manifest_url;
+    let (manifest, manifest_bytes) = fetch_and_validate_manifest(image_ref, source).await?;
 
     // 4. Cache check — content-addressed by the rootfs digest, so identical
     // rootfs bytes referenced from different manifests share one entry.
@@ -491,6 +504,7 @@ async fn ensure_image_inner(
     .await;
 
     let tmp_path = entry_dir.join(format!("rootfs.{}.partial", manifest.rootfs.format));
+    let client = reqwest::Client::new();
     let actual = download_hashed(&client, &manifest.rootfs.url, &tmp_path)
         .await
         .map_err(|detail| ImageError::RootfsDownload {
@@ -590,6 +604,12 @@ async fn download_hashed(
         .await
         .map_err(|e| format!("flush {}: {e}", dest.display()))?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hex sha256 of a fetched manifest document — the pin value clients save
+/// alongside a `sandbox.microvm.image` override (`sandbox.image.check`, §5.5b).
+pub fn manifest_sha256(bytes: &[u8]) -> String {
+    hex_sha256(bytes)
 }
 
 /// Hex sha256 of a byte slice.
@@ -831,6 +851,45 @@ mod tests {
             .expect_err("manifest pin mismatch must fail");
         assert!(matches!(err, ImageError::ManifestSha256Mismatch { .. }));
         assert!(err.to_string().contains("sandbox profile default image"));
+    }
+
+    /// The dry-run half (`sandbox.image.check` engine): validates the
+    /// manifest without downloading the rootfs or touching any cache.
+    #[tokio::test]
+    async fn fetch_and_validate_manifest_is_a_dry_run() {
+        let rootfs: Vec<u8> = b"never-downloaded".to_vec();
+        let (base, rootfs_hits) = serve_image(rootfs);
+
+        let (manifest, bytes) =
+            fetch_and_validate_manifest(&image_ref(&base), &ImageSource::ProfileDefault)
+                .await
+                .expect("valid manifest");
+        assert_eq!(manifest.id, "intent-guest-base");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.arch, "aarch64");
+        assert!(!bytes.is_empty());
+        // Dry run: the rootfs was never fetched.
+        assert_eq!(rootfs_hits.load(Ordering::SeqCst), 0);
+
+        // Pin mismatch surfaces as the structured error.
+        let pinned = GuestImageRef {
+            manifest_url: format!("{base}/manifest.json"),
+            sha256: Some(hex_sha256(b"wrong")),
+        };
+        let err = fetch_and_validate_manifest(&pinned, &ImageSource::ProfileDefault)
+            .await
+            .expect_err("pin mismatch must fail");
+        assert!(matches!(err, ImageError::ManifestSha256Mismatch { .. }));
+
+        // Unreachable host surfaces as ManifestFetch.
+        let unreachable = GuestImageRef {
+            manifest_url: "http://127.0.0.1:1/manifest.json".to_string(),
+            sha256: None,
+        };
+        let err = fetch_and_validate_manifest(&unreachable, &ImageSource::ProfileDefault)
+            .await
+            .expect_err("unreachable must fail");
+        assert!(matches!(err, ImageError::ManifestFetch { .. }));
     }
 
     #[tokio::test]

@@ -33,9 +33,14 @@
 //! persisted `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
 //! error payloads (§9) — no method-catalog change.
+//! Version 4.8 adds the `sandbox.image.check` router method (additive;
+//! §5.5b): a dry-run guest-image validity check — manifest fetch + optional
+//! pin verify + contract check, no rootfs download, no cache mutation —
+//! returning `{ valid, imageId?, version?, arch?, manifestSha256?, error? }`
+//! (283 router methods, 320 dispatchable names).
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.7";
+pub const PROTOCOL_VERSION: &str = "4.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
