@@ -67,6 +67,16 @@ impl DisplayStatusCache {
         }
     }
 
+    /// Drop the baseline for a deleted workspace so the entry does not leak
+    /// for the daemon's lifetime (and a same-id recreate starts from a fresh
+    /// seed instead of a stale baseline). Best-effort — a poisoned lock is
+    /// ignored.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(workspace_id);
+        }
+    }
+
     /// Test-only visibility into whether a baseline exists for `workspace_id`.
     #[cfg(test)]
     pub(crate) fn contains(&self, workspace_id: &WorkspaceId) -> bool {
@@ -158,6 +168,29 @@ impl Services {
                 display_status_changed_event(workspace_id, status),
             )
             .await;
+        }
+    }
+
+    /// Evict a deleted workspace's last-observed baseline (G7): called from
+    /// `workspace.delete` after the store cascade so the in-memory map does
+    /// not leak entries for the daemon's lifetime.
+    pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
+        self.last_display_statuses.evict(workspace_id);
+    }
+
+    /// Recompute after a spec-body write. The spec's markdown gates
+    /// `taskStats` (`extract_spec_task_ids`: with links present, only linked
+    /// child tasks count), so editing the spec body — adding/removing task
+    /// links, checkbox rewrites, version restores — can move the derived
+    /// rollup without any task-note mutation. Non-spec notes skip the probe
+    /// entirely; the dedup cache suppresses no-op spec writes.
+    pub(crate) async fn maybe_emit_display_status_for_spec_write(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &intent_core::NoteId,
+    ) {
+        if note_id.as_str() == "spec" {
+            self.maybe_emit_display_status_changed(workspace_id).await;
         }
     }
 
@@ -1435,6 +1468,269 @@ mod display_status_events {
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
+    }
+
+    /// Bare spec note (no task metadata) whose body carries the task links
+    /// that gate `taskStats`.
+    fn spec_note(ws: &WorkspaceId, content: &str) -> Note {
+        let ts = now_iso();
+        Note {
+            id: NoteId::from("spec"),
+            workspace_id: ws.clone(),
+            title: "Spec".to_string(),
+            content: content.to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: true,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    const LINK_T1: &str = "- [x] [Task t1](intent://local/task/t1)";
+    const LINK_T2: &str = "- [ ] [Task t2](intent://local/task/t2)";
+
+    /// G3: a spec-body write over `note.update` that changes the linked task
+    /// set moves the link-gated `taskStats` rollup and emits the transition.
+    #[tokio::test]
+    async fn spec_body_update_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, LINK_T1))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // Baseline: only t1 is linked → all complete.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(format!("{LINK_T1}\n{LINK_T2}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update spec body");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G4: `note.restoreVersion` on the spec re-gates `taskStats` from the
+    /// restored body and emits the transition.
+    #[tokio::test]
+    async fn spec_restore_version_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, "empty"))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // v1 links only the complete task; v2 links both.
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(LINK_T1.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write v1");
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(format!("{LINK_T1}\n{LINK_T2}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write v2");
+        // Baseline: both linked → open tasks remain → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .restore_note_version(h.ws.clone(), NoteId::from("spec"), 1, None)
+            .await
+            .expect("restore v1");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// G5: a spec checkbox-line rewrite over `task.update` that strips a
+    /// task link re-gates `taskStats` and emits the transition.
+    #[tokio::test]
+    async fn spec_task_line_update_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, &format!("{LINK_T1}\n{LINK_T2}")))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // Baseline: both linked → open tasks remain → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                2,
+                Some("plain text, link removed".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("rewrite checkbox line");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// G6: `task.createPrerequisite` with the spec as dependent adds a fresh
+    /// open spec-child task and emits the transition.
+    #[tokio::test]
+    async fn create_prerequisite_on_spec_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, "no links"))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        // Baseline: fallback mode, one complete child → complete.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .create_prerequisite(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                "Fresh prerequisite".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create prerequisite");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G7: `workspace.delete` evicts the last-observed baseline so the
+    /// in-memory cache does not leak deleted-workspace entries.
+    #[tokio::test]
+    async fn workspace_delete_evicts_baseline() {
+        let h = harness().await;
+        // Hermetic root: the delete path sweeps the workspaces root, and
+        // tests must never touch `~/intent/workspaces`.
+        let root = crate::tests::WorkspacesRoot::new();
+        let services = h
+            .services
+            .clone()
+            .with_workspaces_root(root.path().to_path_buf());
+        services.maybe_emit_display_status_changed(&h.ws).await;
+        assert!(services.last_display_statuses.contains(&h.ws));
+
+        services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+        assert!(
+            !services.last_display_statuses.contains(&h.ws),
+            "deleted workspace's baseline must be evicted"
+        );
+    }
+
+    /// G8: `workspace.update` carrying a PR field recomputes — a `prStatus`
+    /// flip to open moves the derived rollup to `pr_open` and emits.
+    #[tokio::test]
+    async fn workspace_update_pr_status_transition_emits() {
+        let h = harness().await;
+        // Baseline: no tasks, no PR → not_started → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    pr_status: Some(Some(intent_core::PullRequestStatus::Open)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "pr_open" })
+        );
+
+        // A non-PR update (title) does not probe: no event even if nothing
+        // else changed (and no spurious emission either).
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename workspace");
+        assert_silent(&mut sub).await;
     }
 
     /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
