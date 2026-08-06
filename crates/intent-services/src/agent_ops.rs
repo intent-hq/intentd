@@ -4739,15 +4739,18 @@ impl Services {
             let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
                 // Sandbox-eligible: direct-mode workspaces (no worktree or
-                // skip_worktree=true; sandbox sourced from the user's repo folder)
-                // and CoW-checkout workspaces (sourced from the workspace
-                // checkout). Worktree-mode workspaces keep the shared checkout
-                // (no sandbox).
+                // skip_worktree=true; sandbox sourced from the user's repo folder),
+                // CoW-checkout workspaces (sourced from the workspace checkout),
+                // and direct-checkout workspaces (`checkoutMode == "direct"`,
+                // standalone plain repo — cache-hydrated or isNewRepo).
+                // Worktree-mode workspaces keep the shared checkout (no sandbox).
                 let is_direct_mode = (ws.skip_worktree || ws.worktree_path.is_none())
                     && ws.repository_path.is_some();
-                let is_cow_checkout = ws.checkout_mode == Some(intent_core::CheckoutMode::Cow)
-                    && ws.worktree_path.is_some();
-                if is_direct_mode || is_cow_checkout {
+                let is_standalone_checkout = matches!(
+                    ws.checkout_mode,
+                    Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                ) && ws.worktree_path.is_some();
+                if is_direct_mode || is_standalone_checkout {
                     // Same root fallback as `workspace.create` (the intentd
                     // binary configures the root via INTENTD_WORKSPACES_DIR /
                     // `workspaces.root` rather than `.with_workspaces_root`).

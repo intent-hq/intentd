@@ -229,10 +229,12 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cow_supported: Option<bool>,
     /// How the workspace checkout was provisioned by `workspace.create` (§5.1):
-    /// `worktree` (linked git worktree) or `cow` (standalone copy-on-write
-    /// clone). Omitted for rows without a daemon-provisioned checkout
-    /// (`skipWorktree`, remote, caller-supplied `worktreePath`, non-git repo
-    /// paths, pre-existing rows).
+    /// `worktree` (linked git worktree), `cow` (standalone copy-on-write
+    /// clone), or `direct` (standalone plain repository — a local git clone
+    /// hydrated from the repo cache, or an `isNewRepo` initialization working
+    /// directly in the repository folder). Omitted for rows without a
+    /// daemon-provisioned checkout (`skipWorktree`, remote, caller-supplied
+    /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
     /// Disk footprint of the daemon-managed workspace directory
@@ -255,6 +257,10 @@ pub enum CheckoutMode {
     Worktree,
     /// Standalone copy-on-write clone of the source repository directory.
     Cow,
+    /// Standalone plain git repository: a local clone hydrated from the repo
+    /// cache (non-CoW filesystems), or an `isNewRepo` initialization working
+    /// directly in the repository folder (no worktree provisioned).
+    Direct,
 }
 
 /// Disk footprint of a workspace's daemon-managed directory
@@ -3013,6 +3019,22 @@ mod tests {
         );
         let back: ScriptStatus = serde_json::from_value(json!("restarting")).unwrap();
         assert_eq!(back, ScriptStatus::Restarting);
+    }
+
+    #[test]
+    fn checkout_mode_wire_values_round_trip() {
+        // `Workspace.checkoutMode` wire values are lowercase strings:
+        // `worktree`, `cow`, and `direct` (standalone plain repo — cache
+        // hydration fallback or isNewRepo initialization).
+        for (mode, wire) in [
+            (CheckoutMode::Worktree, "worktree"),
+            (CheckoutMode::Cow, "cow"),
+            (CheckoutMode::Direct, "direct"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
+            let back: CheckoutMode = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, mode);
+        }
     }
 
     #[test]
