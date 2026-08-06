@@ -2427,7 +2427,7 @@ impl Services {
                 // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({
                     "agentId": agent_id.0,
-                    "toolName": tool_name,
+                    "toolName": &tool_name,
                     "title": title,
                     "toolKind": tool_kind,
                     "toolCallId": tc.tool_call_id,
@@ -2448,6 +2448,36 @@ impl Services {
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_TOOL_CALL, data)
                     .await;
+                // External activity signal (§7): tool calls keep the liveness
+                // tick (and the pushed preview) alive through tool-heavy
+                // stretches where no assistant text streams — otherwise a
+                // watched-agent row freezes at the turn's last text
+                // (monorepo#1414). Shares the ONE per-agent leading-edge
+                // throttle window with the chunk arm, so a turn mixing text
+                // and tool calls still emits at most one activity per second.
+                // Adds `lastToolUse` describing the call just recorded.
+                if self.should_emit_activity(agent_id) {
+                    let mut activity_data = json!({
+                        "agentId": agent_id.0,
+                        "messageId": message_id,
+                        "lastToolUse": {
+                            "name": tool_name,
+                            "status": tc.status,
+                        },
+                    });
+                    stamp_live_preview_fields(
+                        &mut activity_data,
+                        &transcript.text_block_strings(),
+                        transcript.final_text_block_open(),
+                    );
+                    self.publish_agent_event(
+                        workspace_id,
+                        agent_id,
+                        AGENT_STREAM_ACTIVITY,
+                        activity_data,
+                    )
+                    .await;
+                }
             }
         }
         // Refresh the live-turn slot with the partial transcript so a mid-turn

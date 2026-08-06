@@ -423,6 +423,41 @@ fn resolve_delegate_provider(
     }
 }
 
+/// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
+/// the specialist's frontmatter `codingAgent` (or its compound `model`
+/// prefix) when it names a *known* provider, else the settings-derived
+/// default, bottoming out at the first registered provider — but tolerant of
+/// an unknown/unavailable provider instead of erroring, since a preview must
+/// never fail. Used by [`Services::specialist_model_options`] so the
+/// delegate-docs hint names the default each specialist's *own* provider
+/// override would actually pin, instead of assuming every specialist spawns
+/// on the shared settings-derived provider (a specialist pinned to another
+/// provider previously showed that other provider's fallback/`None`).
+pub(crate) fn resolve_delegate_provider_preview(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> String {
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            if intent_providers::find_provider(&provider_id).is_some() {
+                return provider_id;
+            }
+        }
+    }
+    crate::agent_session::derived_default_provider(&services.effective_settings())
+        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
+}
+
 /// Reject a known provider id that the daemon's own provider discovery
 /// reports as unavailable (not installed, or gated off by a missing env
 /// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE

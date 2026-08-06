@@ -829,7 +829,18 @@ impl Services {
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
-    /// per-agent `workspace_api` tool description at bridge creation.
+    /// per-agent `workspace_api` tool description at bridge creation. Each
+    /// listed specialist also carries the default a no-`model`
+    /// `agent.delegate` would pin, computed by
+    /// [`agent_ops::resolve_agent_default_model`] against the *same*
+    /// per-specialist provider [`agent_ops::resolve_delegate_provider_preview`]
+    /// resolves (mirroring [`agent_ops::resolve_delegate_provider`], the
+    /// provider `agent.delegate` itself spawns on) — not a single
+    /// settings-derived provider shared across every specialist, so a
+    /// specialist pinned to another provider (frontmatter `codingAgent` or a
+    /// compound `model` prefix) still shows the default it actually pins.
+    /// `is_background = true` matches `agent.delegate` always marking its
+    /// children background, so `backgroundAgents.*` settings apply here too.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -871,8 +882,17 @@ impl Services {
                 if options.is_empty() {
                     return None;
                 }
+                let provider =
+                    agent_ops::resolve_delegate_provider_preview(self, Some(id), workspace_path);
                 Some(intent_acp::SpecialistModelOptions {
                     specialist: id.to_string(),
+                    default_model: agent_ops::resolve_agent_default_model(
+                        self,
+                        Some(id),
+                        workspace_path,
+                        Some(&provider),
+                        true,
+                    ),
                     options,
                 })
             })
