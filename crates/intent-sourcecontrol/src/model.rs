@@ -112,6 +112,18 @@ pub enum ReviewVerdict {
     Comment,
 }
 
+/// The forge's authoritative review-requirement verdict for a pull request
+/// (GitHub GraphQL `reviewDecision`). `None` at the trait level means the
+/// forge reports no review requirement (unprotected base) or the host does
+/// not support the signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
 /// Normalized CI check-run state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
