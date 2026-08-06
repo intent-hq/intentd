@@ -6530,18 +6530,32 @@ async fn auggie_fetches_return_none_for_unresolvable_binary() {
 #[tokio::test]
 async fn models_list_returns_non_empty_catalog_with_source() {
     let (_t, svc, _ws) = setup().await;
-    let res = svc.models_list_op(None, false).await.expect("models.list");
+    // Hermetic (monorepo#1527): drive the legacy path through the injectable
+    // fetch seam so the catalog is non-empty by construction — the real CLI
+    // probe legitimately degrades to an empty `source: "static"` list when
+    // auggie is unavailable, so probing it here made this test flake in CI.
+    let rows = vec![
+        json!({ "id": "m1", "name": "Model One", "provider": "auggie" }),
+        json!({ "id": "m2", "name": "Model Two", "provider": "auggie" }),
+    ];
+    let fetched = rows.clone();
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let res = svc
+        .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
+        .await
+        .expect("models.list");
     let models = res["models"].as_array().unwrap();
     assert!(!models.is_empty());
     assert!(models[0].get("id").is_some());
     assert!(models[0].get("name").is_some());
     assert!(models[0].get("provider").is_some());
-    let source = res["source"].as_str().unwrap();
-    assert!(source == "auggie" || source == "static", "source: {source}");
+    assert_eq!(res["source"], "auggie");
     // No providerId → legacy shape: no providerId/warning/stale fields.
     assert!(res.get("providerId").is_none());
-    // A second call is served from the cache (auggie) or recomputed statics —
-    // either way the result is stable within the TTL window.
+    assert!(res.get("warning").is_none());
+    assert!(res.get("stale").is_none());
+    // A second call through the real entry point is served from the fresh
+    // cache within the TTL window — stable, no CLI probe spawns.
     let again = svc
         .models_list_op(None, false)
         .await
@@ -6555,22 +6569,22 @@ async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallba
     // Seed the unified cache under the legacy key with a fresh sentinel entry.
     let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
     seed_auggie_cache(&svc, sentinel.clone());
-    // Non-forced: the sentinel is served straight from the cache.
+    // Non-forced: the sentinel is served straight from the fresh cache by
+    // the real entry point — no CLI probe spawns.
     let cached = svc.models_list_op(None, false).await.expect("cached");
     assert_eq!(cached["models"], json!(sentinel));
-    // Forced: the cache read is skipped and a fresh probe is awaited. The
-    // sentinel may only reappear as the last-good fallback after a failed
-    // probe — in which case it must be labeled stale + warning, never
-    // served silently as fresh.
-    let forced = svc.models_list_op(None, true).await.expect("forced");
-    if forced["models"] == json!(sentinel) {
-        assert_eq!(forced["stale"], true, "{forced}");
-        assert!(forced["warning"].is_string(), "{forced}");
-    } else {
-        assert!(forced.get("stale").is_none());
-        let source = forced["source"].as_str().unwrap();
-        assert!(source == "auggie" || source == "static", "source: {source}");
-    }
+    // Forced: the cache read is skipped and the probe is awaited — injected
+    // deterministic failure via the seam (monorepo#1527: the real CLI probe's
+    // outcome is environment-dependent). The sentinel reappears only as the
+    // last-good fallback, labeled stale + warning — never silently as fresh.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let forced = svc
+        .models_list_auggie_with(true, now, || Box::pin(async { None }))
+        .await
+        .expect("forced");
+    assert_eq!(forced["models"], json!(sentinel));
+    assert_eq!(forced["stale"], true, "{forced}");
+    assert!(forced["warning"].is_string(), "{forced}");
 }
 
 #[tokio::test]
