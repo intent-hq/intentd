@@ -938,6 +938,50 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_rewrites_claude_code_mcp_titles() {
+        // Claude Code titles MCP tools `mcp__<server>__<tool>`; the title is
+        // rewritten to `{server}_{tool}` and fed through the affix strip —
+        // the same treatment as the codex dot rule.
+        assert_eq!(
+            session::derive_tool_name("mcp__workspace-mcp__workspace_api", None),
+            "workspace_api"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__github__list_issues", None),
+            "github_list_issues"
+        );
+        // Tool names containing single underscores survive intact; the
+        // server segment ends at the first `__`.
+        assert_eq!(
+            session::derive_tool_name("mcp__endara__execute_tools_Endara", None),
+            "endara_execute_tools_Endara"
+        );
+        // Prose titles containing `mcp__` mid-string (with whitespace) never
+        // match.
+        assert_eq!(
+            session::derive_tool_name("Call mcp__github__list_issues now", None),
+            "Call mcp__github__list_issues now"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__workspace-mcp__some tool", None),
+            "mcp__workspace-mcp__some tool"
+        );
+        // Missing server or tool segment → no match, title passes through.
+        assert_eq!(
+            session::derive_tool_name("mcp__server", None),
+            "mcp__server"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp____tool", None),
+            "mcp____tool"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__server__", None),
+            "mcp__server__"
+        );
+    }
+
+    #[test]
     fn derive_tool_name_recognizes_opencode_input_shapes() {
         // Captured from opencode 1.18.3: once arguments stream in, titles
         // turn into raw prose (the command line, a file path, a regex), so
