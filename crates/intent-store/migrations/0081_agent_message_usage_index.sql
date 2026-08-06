@@ -14,6 +14,7 @@
 
 CREATE INDEX idx_agent_message_usage
   ON agent_message(agent_id, seq)
-  WHERE CASE WHEN json_valid(content)
-    THEN (json_type(content, '$.usage') IS NOT NULL
-        OR json_type(content, '$._meta.usage') IS NOT NULL) ELSE 0 END;
+  WHERE CASE WHEN json_valid(content) THEN
+    (CASE WHEN json_type(content, '$.usage') IS NOT NULL
+        THEN json_type(content, '$.usage') = 'object'
+        ELSE json_type(content, '$._meta.usage') = 'object' END) ELSE 0 END;

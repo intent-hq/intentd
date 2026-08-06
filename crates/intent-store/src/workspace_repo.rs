@@ -163,14 +163,15 @@ impl Store {
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
     ///
-    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) scans
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
     /// `agent_message` for sessions still on the per-message fallback (no
     /// snapshot/baseline token report), and that work happens while holding
     /// the daemon's sole write connection and the SQLite write lock. The
     /// report-backed skip keeps the common case cheap, and the fallback read
-    /// itself projects usage metadata in SQL instead of materializing message
-    /// bodies (monorepo#1571), so a workspace of long-history fallback
-    /// sessions pays only for its usage-bearing rows.
+    /// projects each message's usage object in SQL and filters to
+    /// usage-bearing rows off a partial index instead of materializing message
+    /// bodies (monorepo#1571) — so what a workspace of long-history fallback
+    /// sessions pays for is its usage-bearing rows, not its transcript bytes.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,
