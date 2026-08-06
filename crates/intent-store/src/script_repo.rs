@@ -1,7 +1,9 @@
 //! Script-definition registry (`script.*`, PROTOCOL §5.8). Parity with the
 //! FE's `.workspace/scripts.json` persistence: definitions survive a daemon
 //! restart and are hydrated into the runtime registry on boot. Runtime state
-//! is transient and never persisted.
+//! is transient and never persisted — except the `was_running` marker
+//! (stored-on-write), which records that a service-mode script was running
+//! when the daemon died so hydration can surface `previouslyRunning`.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +18,9 @@ const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, c
 
 impl Store {
     /// Insert or replace a script definition, keyed on `id` (mirrors the FE
-    /// `upsertScript`: an existing id is fully replaced).
+    /// `upsertScript`: an existing id is fully replaced). The replace resets
+    /// the `was_running` marker to its default (cleared) — an upserted
+    /// definition starts a fresh runtime life.
     pub async fn upsert_script(&self, s: &Script) -> Result<()> {
         let sql = format!(
             "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -60,6 +64,43 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list scripts failed: {e}")))?;
         rows.iter().map(map_script_row).collect()
+    }
+
+    /// Set or clear the service was-running marker (stored-on-write): set on a
+    /// service-mode script's successful start, cleared on user `script.stop`
+    /// and natural exit (`script.remove` deletes the row). Scoped to
+    /// `workspace_id` — the runtime registry permits the same client-supplied
+    /// id in separate workspaces, so an id-only write could mark a row owned
+    /// by another workspace. Unknown ids are a no-op, not an error.
+    pub async fn set_script_was_running(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        was_running: bool,
+    ) -> Result<()> {
+        sqlx::query("UPDATE script SET was_running = ? WHERE id = ? AND workspace_id = ?")
+            .bind(was_running as i64)
+            .bind(id)
+            .bind(workspace_id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set script was_running failed: {e}")))?;
+        Ok(())
+    }
+
+    /// `(workspace_id, id)` pairs of scripts still carrying the was-running
+    /// marker — the boot-time hydration read behind the `previouslyRunning`
+    /// runtime field. Workspace-qualified because the same client-supplied id
+    /// may exist in separate workspaces.
+    pub async fn list_was_running_script_ids(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT workspace_id, id FROM script WHERE was_running = 1")
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list was-running scripts failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("workspace_id"), r.get("id")))
+            .collect())
     }
 }
 

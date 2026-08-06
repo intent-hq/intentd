@@ -2411,7 +2411,7 @@ impl Services {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
-                    workspace_id,
+                    workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
                     event_type: intent_core::events::AGENT_DELETED.to_string(),
                     actor: crate::system_actor(),
@@ -2423,6 +2423,11 @@ impl Services {
                 },
             )
             .await;
+            // Deleting a session can retire a needs_attention hold (a pending
+            // attention request or unanswered question dies with the row):
+            // recompute-and-compare (§6.5 step 0); the dedup cache suppresses
+            // the no-op when nothing derived from this session.
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -2457,6 +2462,7 @@ impl Services {
             }
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
+        let prior_model = session.model.clone();
         let allowed = [
             "status",
             "isActive",
@@ -2601,6 +2607,19 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // The stored model changed, so any persisted display resolution now
+        // names the wrong model — clear it, same anti-staleness contract as
+        // `agent.setModel` (the next session open re-resolves). Best-effort:
+        // the update itself already landed.
+        if obj.contains_key("model") && session.model != prior_model {
+            if let Err(e) = self
+                .store
+                .clear_agent_session_resolved_model(&workspace_id, &agent_id)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
+            }
+        }
         let event_type = if mutated_only_name {
             intent_core::events::AGENT_RENAMED
         } else {
@@ -2620,6 +2639,13 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // `status` / `isBackground` feed the needs_attention derivation (a
+        // deleted or background session's pending request/question no longer
+        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
+        // probe entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") {
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }
@@ -3744,8 +3770,9 @@ impl Services {
 
     /// Deliver the questions-dismissed system notice (`agent.dismissQuestions`,
     /// PROTOCOL §5.5): a system-origin message telling the agent the user
-    /// dismissed its N pending questions without answering, so it proceeds on
-    /// its own judgment instead of waiting for answers that will never come.
+    /// dismissed its N pending questions without answering. The notice is
+    /// informative only: the agent must not re-ask and must not proceed with
+    /// any work — it ends its turn and waits for the user's next message.
     /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
     /// an idle agent gets the notice as an immediate turn; when it lands in
     /// the queue instead (busy turn, store-append fallback, or a NEWER pending
@@ -3774,8 +3801,9 @@ impl Services {
             n => format!("{n} questions"),
         };
         let content = format!(
-            "User dismissed your {noun} without answering. Do not re-ask; \
-             continue with your best judgment."
+            "User dismissed your {noun} without answering. This is an informative \
+             notice only — do not re-ask and do not proceed with any work; end \
+             your turn and wait for the user's next message."
         );
         let metadata = json!({
             "type": QUESTIONS_DISMISSED_METADATA_TYPE,
@@ -4214,24 +4242,24 @@ impl Services {
         if reason.is_empty() {
             return Err(Error::InvalidParams("reason is required".to_string()));
         }
-        let mut session = self.load_session_internal(&caller).await?;
+        let session = self.load_session_internal(&caller).await?;
         // Scope-guard the caller-supplied `workspace_id` (same shape as
         // `agent_report_to_parent_op`): reject a cross-workspace mismatch with
         // `NotFound` before any state changes.
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
-        // 1. Persist the pending attention request on the session.
+        // 1. Persist the pending attention request on the session via the
+        // narrow attention writer (with `clear_attention_request` the only
+        // post-insert mutator of the attention columns — the full-row
+        // `update_agent_session` excludes them so a racing persist of a stale
+        // session cannot clobber this write).
         let saved_at = now_iso();
-        session.attention_request_kind = Some(kind.clone());
-        session.attention_request_reason = Some(reason.clone());
-        session.attention_request_timestamp = Some(saved_at.clone());
-        session.updated_at = saved_at.clone();
         let workspace_id = session.workspace_id.clone();
         let task_note_id = session.task_note_id.clone();
         let parent = session.parent_agent_id.clone();
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .set_attention_request(&workspace_id, &caller, &kind, &reason, &saved_at)
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,
@@ -4437,15 +4465,14 @@ impl Services {
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
         // Harness-owned commits: the effective opt-out is the caller's explicit
         // `skipAutoCommit` OR the workspace's effective auto-commit being off,
-        // so delegated children get the OFF commit instruction (and the idle
-        // subscriber skip) whenever nothing would auto-commit anyway.
-        // Deliberately sticky: the derived opt-out is persisted on the
-        // session, so toggling the workspace back ON via
+        // so delegated children skip the idle subscriber whenever nothing
+        // would auto-commit anyway. Deliberately sticky: the derived opt-out
+        // is persisted on the session, so toggling the workspace back ON via
         // `workspace.setAutoCommit` never re-enables idle commits for
-        // sessions created while it was OFF — their first-message commit
-        // instruction already told the agent commits are manual, and
-        // flipping the harness behavior mid-session would contradict it.
-        // New sessions created after the toggle pick up the ON state.
+        // sessions created while it was OFF. New sessions created after the
+        // toggle pick up the ON state. The child's prompt stays status-neutral
+        // (the `## Commit Policy` clause in `rules.rs`); enforcement lives in
+        // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
         // Resolve the child's first message up front so it can be persisted as
@@ -4483,9 +4510,10 @@ impl Services {
         // APPEND the standard "Your Task Note" block after the user message
         // with a `---` separator so the child knows its note ID/title and the
         // single-task scope contract; without a linked note the message is
-        // delivered verbatim. When `skipAutoCommit` is set, a follow-on
-        // commit instruction is concatenated after the scope directive,
-        // byte-for-byte matching the reference.
+        // delivered verbatim. No state-specific commit instruction is
+        // appended: the child relies on the status-neutral `## Commit Policy`
+        // system-prompt clause, and `skip_auto_commit` only gates the idle
+        // subscriber and the `git_ops` commit gate.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
             // Build the preamble from adjacent string literals (via `concat!`)
@@ -4503,16 +4531,11 @@ impl Services {
                 title = title,
                 note_id = note_id,
             );
-            let commit_instruction = if skip_auto_commit {
-                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`."
-            } else {
-                ""
-            };
             message = Some(match message {
                 Some(body) if !body.is_empty() => {
-                    format!("{body}\n\n---\n{preamble}{commit_instruction}")
+                    format!("{body}\n\n---\n{preamble}")
                 }
-                _ => format!("{preamble}{commit_instruction}"),
+                _ => preamble,
             });
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`

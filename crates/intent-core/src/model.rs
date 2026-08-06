@@ -2664,7 +2664,8 @@ pub enum ScriptStatus {
 
 /// In-memory runtime state of a script process — the `script.status` result and
 /// the `runtime` field of a `script.list` entry (ported from the TS
-/// `ScriptRuntimeState`). Not persisted.
+/// `ScriptRuntimeState`). Not persisted, except the `was_running` marker
+/// behind `previously_running` (stored-on-write on the `script` row).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuntimeState {
@@ -2682,6 +2683,13 @@ pub struct ScriptRuntimeState {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_url: Option<String>,
+    /// `Some(true)` on a hydrated `idle` state whose service-mode script was
+    /// running when the previous daemon process died (the persisted
+    /// `was_running` marker), so clients can re-render its tab after a
+    /// restart. Omitted otherwise (presence-detected additive convention,
+    /// PROTOCOL §5.8); cleared once the script is started or stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previously_running: Option<bool>,
 }
 
 impl Default for ScriptRuntimeState {
@@ -2695,6 +2703,7 @@ impl Default for ScriptRuntimeState {
             restart_count: 0,
             error: None,
             detected_url: None,
+            previously_running: None,
         }
     }
 }
@@ -2762,7 +2771,7 @@ pub enum HookState {
 /// A background hook: a small agent-owned script the daemon runs periodically
 /// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
 /// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤19 chars) is enforced at
+/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
 /// the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

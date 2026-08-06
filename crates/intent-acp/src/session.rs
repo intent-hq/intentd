@@ -462,13 +462,19 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     the same downstream treatment as [`unwrap_codex_mcp_input`]'s
 ///     rewritten name (`mcp.workspace-mcp.workspace_api` → `workspace_api`,
 ///     `mcp.other-server.some_tool` → `other-server_some_tool`).
-///  3. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///  3. Claude Code titles MCP tools `mcp__<server>__<tool>`
+///     (double-underscore-separated, no whitespace — prose titles containing
+///     `mcp__` never match); the title is rewritten to `{server}_{tool}` and
+///     fed through the affix strip below, the same downstream treatment as
+///     the codex dot rule (`mcp__workspace-mcp__workspace_api` →
+///     `workspace_api`, `mcp__github__list_issues` → `github_list_issues`).
+///  4. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  4. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  5. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  5. When none of the above yielded an identifier (the title is prose
+///  6. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -489,7 +495,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  6. Otherwise the title passes through as-is.
+///  7. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -503,6 +509,9 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
         return strip_workspace_mcp_affix(name);
     }
     if let Some(rewritten) = split_codex_mcp_title(title) {
+        return strip_workspace_mcp_affix(&rewritten);
+    }
+    if let Some(rewritten) = split_claude_mcp_title(title) {
         return strip_workspace_mcp_affix(&rewritten);
     }
     let stripped = strip_workspace_mcp_affix(title);
@@ -634,6 +643,23 @@ fn split_codex_mcp_title(title: &str) -> Option<String> {
     }
     let rest = title.strip_prefix("mcp.")?;
     let (server, tool) = rest.split_once('.')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{server}_{tool}"))
+}
+
+/// Recognize Claude Code's double-underscore-separated ACP title form for MCP
+/// tools — `mcp__<server>__<tool>`, where the server segment runs to the
+/// first `__` and the title carries no whitespace (so prose titles containing
+/// `mcp__` never match) — and rewrite it to the `{server}_{tool}` name shared
+/// with [`split_codex_mcp_title`]. Returns `None` for any other title.
+fn split_claude_mcp_title(title: &str) -> Option<String> {
+    if title.contains(char::is_whitespace) {
+        return None;
+    }
+    let rest = title.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
     if server.is_empty() || tool.is_empty() {
         return None;
     }

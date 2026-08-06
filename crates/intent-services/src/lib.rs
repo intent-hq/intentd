@@ -18,7 +18,7 @@ use intent_core::events::{
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -33,15 +33,14 @@ use intent_core::{
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
-    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
-    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateResult, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceId,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -103,6 +102,7 @@ pub mod tool_block;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
@@ -468,15 +468,11 @@ pub struct Services {
     idle_debounce_gen: Arc<Mutex<u64>>,
     /// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5):
     /// the recompute-and-compare seam behind
-    /// [`Services::maybe_emit_display_status_changed`]. A mutation that can
-    /// move the derivation recomputes it and publishes
-    /// `workspace:displayStatus-changed` only on an actual transition, so
-    /// no-op recomputes never spam the bus. Seeded lazily (first recompute
-    /// after a mutation, or an emit-path enrichment) — a first observation
-    /// records without emitting. In-memory only; a daemon restart re-seeds on
-    /// first touch. Shared across clones so every service handle compares
-    /// against the same last-emitted value.
-    last_display_statuses: Arc<Mutex<HashMap<WorkspaceId, WorkspaceDisplayStatus>>>,
+    /// [`Services::maybe_emit_display_status_changed`]. See
+    /// [`workspace_status::DisplayStatusCache`] — the map is private to the
+    /// `workspace_status` module. Shared across clones so every service
+    /// handle compares against the same last-emitted value.
+    last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -646,7 +642,7 @@ impl Services {
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
-            last_display_statuses: Arc::new(Mutex::new(HashMap::new())),
+            last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -1092,9 +1088,22 @@ impl Services {
     /// Hydrate the in-memory script registry from the persisted definitions
     /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
     /// composition root on boot so `script.*` survives daemon restarts; runtime
-    /// state always starts fresh (idle). Returns the number of scripts loaded.
+    /// state starts fresh (idle), except that a service-mode script still
+    /// carrying the stored-on-write `was_running` marker hydrates with
+    /// `previouslyRunning: true` so clients can re-render its tab. Returns the
+    /// number of scripts loaded.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
         self.script_manager().hydrate().await
+    }
+
+    /// Clean daemon shutdown (monorepo#1526): flag every managed script with
+    /// user-stop semantics (so no auto-restart races the teardown), kill every
+    /// PTY session the host tracks — scripts and terminals alike — in one
+    /// concurrent group-kill sweep bounded by a single SIGTERM grace, then
+    /// await the supervisor settles under a bounded backstop. Returns
+    /// `(scripts_stopped, ptys_killed)`.
+    pub async fn shutdown_pty_sessions(&self) -> (usize, usize) {
+        self.script_manager().stop_all().await
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
@@ -1304,36 +1313,10 @@ impl Services {
         // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
         // derived-field ladder). Clients fetch it on demand via the dedicated
         // `workspace.diskUsage` method (monorepo#1396).
-        // Derived "current cycle" display status over the active/latest PR and
-        // the taskStats computed above; never persisted. Only populated when
-        // taskStats was computable: on a transient notes-read failure the field
-        // stays absent (clients fall back to local derivation on a missing
-        // field) and the last-observed cache is left untouched, so a
-        // None-compute can never misreport `not_started`/`pr_*` or pollute the
-        // baseline. Seed the last-observed cache when absent so the first
-        // post-read mutation compares against this baseline (a seed never
-        // emits; see [`Services::maybe_emit_display_status_changed`]).
-        if ws.task_stats.is_some() {
-            // Derive from the row's own `activity` (set by every caller just
-            // before enrichment) so a single response can never pair
-            // `activity: "agent_running"` with `displayStatus: "idle"`.
-            // Active background hooks fold into the promotion (§6.5): an
-            // idle agent still watching via a hook reads as active work.
-            let display_status = compute_display_status(
-                self.workspace_needs_attention(&ws.id).await,
-                ws.activity == WorkspaceActivity::AgentRunning
-                    || self.workspace_has_active_hooks(&ws.id).await
-                    || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
-                ws.active_pull_request.as_ref(),
-                ws.pull_requests.as_deref().unwrap_or_default(),
-                ws.pr_status,
-                ws.task_stats.as_ref(),
-            );
-            if let Ok(mut map) = self.last_display_statuses.lock() {
-                map.entry(ws.id.clone()).or_insert(display_status);
-            }
-            ws.display_status = Some(display_status);
-        }
+        // Derived "current cycle" display status over the active/latest PR
+        // and the taskStats computed above; never persisted. See
+        // [`Services::enrich_display_status`] (workspace_status module).
+        self.enrich_display_status(ws).await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -1344,96 +1327,6 @@ impl Services {
     /// seq-0 snapshot is self-sufficient for client status rendering.
     pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
-    }
-
-    /// Recompute a workspace's derived `displayStatus` and publish
-    /// `workspace:displayStatus-changed` iff it transitioned since the last
-    /// observation (PROTOCOL §6.5). Called after the mutations that can move
-    /// the derivation (task/note status updates, task-note deletion, PR
-    /// link/status changes, agent activity begin/debounced end, hook
-    /// lifecycle transitions) — never from
-    /// a polling loop. The first
-    /// observation for a workspace seeds the cache without emitting (no
-    /// baseline to transition from); a read
-    /// failure skips the recompute entirely so a transient store error can
-    /// never fake a transition. Best-effort: errors are swallowed, the
-    /// mutation's own result is the contract. Concurrent callers (e.g. the
-    /// debounced idle demotion racing an `agent_activity_begin` promotion)
-    /// can in principle invert: the compute-then-insert is not atomic, so a
-    /// stale compute inserted second would emit outdated and leave the
-    /// baseline stale until the next transition. The activity read and cache
-    /// insert have no await between them, so the window is negligible and
-    /// self-heals on the next transition.
-    pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
-        let Ok(ws) = self.store.get_workspace(workspace_id).await else {
-            return;
-        };
-        let Ok(notes) = self.store.list_notes(workspace_id).await else {
-            return;
-        };
-        let task_stats = compute_task_stats(&notes);
-        let needs_attention = self.workspace_needs_attention(workspace_id).await;
-        let status = compute_display_status(
-            needs_attention,
-            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(workspace_id).await
-                || self
-                    .workspace_has_waiting_agent_subscriptions(workspace_id)
-                    .await,
-            ws.active_pull_request.as_ref(),
-            ws.pull_requests.as_deref().unwrap_or_default(),
-            ws.pr_status,
-            Some(&task_stats),
-        );
-        let transitioned = match self.last_display_statuses.lock() {
-            Ok(mut map) => match map.insert(workspace_id.clone(), status) {
-                Some(previous) => previous != status,
-                None => false,
-            },
-            Err(_) => return,
-        };
-        if transitioned {
-            publish_event(
-                &self.event_bus,
-                display_status_changed_event(workspace_id, status),
-            )
-            .await;
-        }
-    }
-
-    /// Whether any **top-level** agent in the workspace is waiting on the
-    /// user (PROTOCOL §6.5, `needs_attention`): a session with no
-    /// `parent_agent_id`, not background, and not deleted, that either
-    /// carries a pending attention request (`attention_request_kind` —
-    /// `discussion`/`blocker`) or has pending structured questions
-    /// ([`Services::question_hold_active`]). Child/background sessions never
-    /// count — their attention surface is the parent/subscriber (attention
-    /// -retire taxonomy). The cheap metadata check runs over every candidate
-    /// first, so transcript tail reads only happen when no session already
-    /// flagged via an attention request. Best-effort: a store read failure
-    /// fails open to `false` (and `question_hold_active` fails open itself)
-    /// so list/get emission is never wedged.
-    pub(crate) async fn workspace_needs_attention(&self, workspace_id: &WorkspaceId) -> bool {
-        let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
-            return false;
-        };
-        let top_level: Vec<_> = sessions
-            .iter()
-            .filter(|s| {
-                s.parent_agent_id.is_none()
-                    && !s.is_background
-                    && s.status != intent_core::AgentStatus::Deleted
-            })
-            .collect();
-        if top_level.iter().any(|s| s.attention_request_kind.is_some()) {
-            return true;
-        }
-        for session in top_level {
-            if self.question_hold_active(&session.id).await {
-                return true;
-            }
-        }
-        false
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -5212,7 +5105,7 @@ fn extract_spec_task_ids(content: &str) -> HashSet<String> {
 /// (`blocked` is excluded from `inProgress`, like `discussion_needed`). When
 /// the spec body has no task links, all direct children with task metadata count
 /// (TS backward-compat fallback).
-fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
+pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
     let linked = notes
         .iter()
         .find(|n| n.id.as_str() == "spec")
@@ -5253,118 +5146,6 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
         }
     }
     stats
-}
-
-/// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
-/// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
-/// in live agent activity (previously a client-side overlay) and the
-/// per-workspace needs-attention signal:
-/// 0. `needs_attention` → `needs_attention` unconditionally: a top-level
-///    agent waiting on the user outranks everything, including a running
-///    agent ([`Services::workspace_needs_attention`]).
-/// 1. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says. Callers fold active-hook
-///    state into this flag ([`Services::workspace_has_active_hooks`]) so an
-///    idle agent still watching via a background hook reads the same.
-/// 2. Active PR — the linked `activePullRequest` when open/draft, else the
-///    most recently updated open/draft entry in `pullRequests` — yields
-///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
-///    When neither carries an open/draft entry but the workspace `prStatus`
-///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
-///    and yields `pr_open` (never `pr_ready`: the column carries no
-///    mergeable info).
-/// 3. Open tasks remain (`completed < total`) → `in_progress` when any task
-///    has started, else `not_started`.
-/// 4. Latest PR (linked, else most recently updated entry) merged — or
-///    `prStatus == Merged` — → `pr_merged`.
-/// 5. All tasks complete → `complete`; else `not_started`.
-/// 6. Without a running agent, a task-stage rollup (`in_progress` /
-///    `not_started` from steps 3/5) demotes to `idle`; the PR stages and
-///    `complete` pass through unchanged.
-///
-/// A merged PR in history never masks an open PR (step 2 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 3 precedes the merged check).
-fn compute_display_status(
-    needs_attention: bool,
-    agent_running: bool,
-    active_pr: Option<&PullRequestInfo>,
-    pull_requests: &[PullRequestInfo],
-    pr_status: Option<PullRequestStatus>,
-    task_stats: Option<&WorkspaceTaskStats>,
-) -> WorkspaceDisplayStatus {
-    if needs_attention {
-        return WorkspaceDisplayStatus::NeedsAttention;
-    }
-    if agent_running {
-        return WorkspaceDisplayStatus::InProgress;
-    }
-    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
-        WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
-            WorkspaceDisplayStatus::Idle
-        }
-        other => other,
-    }
-}
-
-/// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
-/// the caller applies the attention/agent-activity promotion/demotion
-/// around it.
-fn compute_base_display_status(
-    active_pr: Option<&PullRequestInfo>,
-    pull_requests: &[PullRequestInfo],
-    pr_status: Option<PullRequestStatus>,
-    task_stats: Option<&WorkspaceTaskStats>,
-) -> WorkspaceDisplayStatus {
-    let is_open = |pr: &&PullRequestInfo| {
-        matches!(
-            pr.status,
-            PullRequestStatus::Open | PullRequestStatus::Draft
-        )
-    };
-    let open_pr = active_pr.filter(is_open).or_else(|| {
-        pull_requests
-            .iter()
-            .filter(is_open)
-            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
-    });
-    if let Some(pr) = open_pr {
-        let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        return if pr.mergeable == Some(true) && !draft {
-            WorkspaceDisplayStatus::PrReady
-        } else {
-            WorkspaceDisplayStatus::PrOpen
-        };
-    }
-    if matches!(
-        pr_status,
-        Some(PullRequestStatus::Open | PullRequestStatus::Draft)
-    ) {
-        return WorkspaceDisplayStatus::PrOpen;
-    }
-    let (total, completed, in_progress) = task_stats
-        .map(|s| (s.total, s.completed, s.in_progress))
-        .unwrap_or_default();
-    if total > 0 && completed < total {
-        return if in_progress > 0 || completed > 0 {
-            WorkspaceDisplayStatus::InProgress
-        } else {
-            WorkspaceDisplayStatus::NotStarted
-        };
-    }
-    let latest_pr = active_pr.or_else(|| {
-        pull_requests
-            .iter()
-            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
-    });
-    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
-        || pr_status == Some(PullRequestStatus::Merged)
-    {
-        return WorkspaceDisplayStatus::PrMerged;
-    }
-    if total > 0 && completed == total {
-        return WorkspaceDisplayStatus::Complete;
-    }
-    WorkspaceDisplayStatus::NotStarted
 }
 
 /// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
@@ -6615,28 +6396,6 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "activity": activity,
-        }),
-    }
-}
-
-/// Build a `workspace:displayStatus-changed` change event with the
-/// self-sufficient payload `{ workspaceId, displayStatus }` (PROTOCOL §6.5).
-fn display_status_changed_event(
-    workspace_id: &WorkspaceId,
-    display_status: WorkspaceDisplayStatus,
-) -> NewEvent {
-    NewEvent {
-        workspace_id: workspace_id.clone(),
-        timestamp: now_iso(),
-        event_type: WORKSPACE_DISPLAY_STATUS_CHANGED.to_string(),
-        actor: system_actor(),
-        session_id: None,
-        correlation_id: None,
-        parent_event_id: None,
-        metadata: None,
-        data: serde_json::json!({
-            "workspaceId": workspace_id.as_str(),
-            "displayStatus": display_status,
         }),
     }
 }
@@ -9879,27 +9638,10 @@ impl WorkspaceApi for Services {
                 // A stats-read failure degrades to absent taskStats +
                 // displayStatus (clients fall back to local derivation on a
                 // missing field), mirroring `enrich_workspace_aggregates`.
+                // Same derivation + baseline seeding as the enriched path
+                // (see [`Services::enrich_display_status`]).
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                if ws.task_stats.is_some() {
-                    let display_status = compute_display_status(
-                        this.workspace_needs_attention(&ws.id).await,
-                        ws.activity == WorkspaceActivity::AgentRunning
-                            || this.workspace_has_active_hooks(&ws.id).await
-                            || this.workspace_has_waiting_agent_subscriptions(&ws.id).await,
-                        ws.active_pull_request.as_ref(),
-                        ws.pull_requests.as_deref().unwrap_or_default(),
-                        ws.pr_status,
-                        ws.task_stats.as_ref(),
-                    );
-                    // Seed the last-observed cache when absent so the first
-                    // post-boot mutation compares against this baseline (a
-                    // seed never emits; see
-                    // [`Services::maybe_emit_display_status_changed`]).
-                    if let Ok(mut map) = this.last_display_statuses.lock() {
-                        map.entry(ws.id.clone()).or_insert(display_status);
-                    }
-                    ws.display_status = Some(display_status);
-                }
+                this.enrich_display_status(ws).await;
             }
             Ok(list)
         })
@@ -11494,6 +11236,12 @@ impl WorkspaceApi for Services {
         }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            // Captured before the `if let` arms below move the fields out.
+            let pr_fields_changed = update.pr_number.is_some()
+                || update.pr_url.is_some()
+                || update.pr_status.is_some()
+                || update.active_pull_request.is_some()
+                || update.pull_requests.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -11625,6 +11373,13 @@ impl WorkspaceApi for Services {
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
             publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+            // PR link/status changes feed the derived displayStatus (the
+            // `pr_*` rungs sit between activity and taskStats): recompute-
+            // and-compare after the persist so the transition emits (§6.5).
+            // Chief is skipped — virtual, never listed, nothing derives.
+            if !ws.id.is_chief() && pr_fields_changed {
+                this.maybe_emit_display_status_changed(&ws.id).await;
+            }
             Ok(ws)
         })
     }
@@ -11849,6 +11604,10 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             }
+            // Evict the deleted workspace's last-observed displayStatus
+            // baseline so the in-memory map does not leak for the daemon's
+            // lifetime (and a same-id recreate seeds fresh).
+            services.evict_display_status_baseline(&id);
             // Fast-ack: the client receives `{ success: true }` here while the
             // worktree and workspace-directory cleanup proceeds asynchronously
             // in the background. Bounded latency regardless of checkout size
@@ -13456,6 +13215,13 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            if content_changed {
+                services
+                    .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                    .await;
+            }
             Ok(note)
         })
     }
@@ -13514,6 +13280,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             let total_length = final_content.chars().count();
             Ok(NoteAddResult {
                 ok: true,
@@ -13584,6 +13355,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteEditResult {
                 ok: true,
                 note_id: note.id,
@@ -13654,6 +13430,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteEditLinesResult {
                 ok: true,
                 note_id: note.id,
@@ -13746,6 +13527,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(NoteSetContentResult {
                 ok: true,
                 title: note.title,
@@ -14010,6 +13796,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // Restoring an older spec body can move taskStats (link-gated
+            // rollup); non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             // Re-read so the returned note carries the post-update `rev`.
             let note = fetch_note(&store, &workspace_id, &note_id).await?;
 
@@ -14243,6 +14034,11 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A spec checkbox-line rewrite can add/remove task links and
+            // move taskStats; non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
             Ok(TaskUpdateResult {
                 ok: true,
                 note_id: note.id,
@@ -14443,6 +14239,14 @@ impl WorkspaceApi for Services {
                     None,
                 )
                 .await?;
+            // A fresh spec-child task can move the derived rollup (§6.5),
+            // e.g. a completed workspace gaining a new open task. Non-spec
+            // dependents never count into taskStats — skip the probe.
+            if dependent_note_id.as_str() == "spec" {
+                services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
             Ok(TaskCreatePrerequisiteResult {
                 ok: true,
                 prerequisite_note_id: child.id,
@@ -15375,7 +15179,18 @@ impl WorkspaceApi for Services {
                 ..Default::default()
             };
             if let Some(t) = params.event_type.filter(|s| !s.is_empty()) {
-                q.event_types = vec![t];
+                // Subscribe-parity glob (monorepo#1538), mirroring
+                // `event_type_matches` in events/filter.rs: bare `*` means no
+                // type filter; `prefix:*` compiles to a SQL prefix match;
+                // anything else (including `note*` without a colon) stays an
+                // exact match.
+                if t == "*" {
+                    // No type filter.
+                } else if let Some(stem) = t.strip_suffix(":*") {
+                    q.event_type_prefix = Some(format!("{stem}:"));
+                } else {
+                    q.event_types = vec![t];
+                }
             }
             if let Some(at) = params.actor_type.filter(|s| !s.is_empty()) {
                 // An unrecognized actorType matches nothing (TS equals filter).
@@ -18148,12 +17963,30 @@ impl WorkspaceApi for Services {
                 _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
             };
 
-            let reviews = sc
-                .list_reviews(&repo_ref, pr_number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
+            // `list_reviews` and `review_decision` are independent reads;
+            // run them concurrently so the extra `reviewDecision` GraphQL
+            // round-trip doesn't add serial latency to every snapshot (this
+            // handler backs hook polling).
+            let (reviews, review_decision_result) = tokio::join!(
+                sc.list_reviews(&repo_ref, pr_number),
+                sc.review_decision(&repo_ref, pr_number)
+            );
+            let reviews = reviews.map_err(pr_ops::map_sc_err)?;
             let agg = pr_ops::aggregate_reviews(&reviews);
-            let decision = pr_ops::snapshot_review_decision(&agg, state, &mergeable_state);
+            // The forge's authoritative review-requirement verdict (GraphQL
+            // `reviewDecision` on GitHub). A fetch error degrades to `None`
+            // (aggregate-derived decision) rather than failing the snapshot.
+            let provider_decision = review_decision_result
+                .inspect_err(|e| {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number,
+                        "pr.snapshot: review_decision fetch failed, falling back to aggregate"
+                    );
+                })
+                .ok()
+                .flatten();
+            let decision = pr_ops::snapshot_review_decision(&agg, state, provider_decision);
 
             let conversation = sc
                 .list_comments(&repo_ref, pr_number)
@@ -18164,21 +17997,30 @@ impl WorkspaceApi for Services {
             // falling back to the flat REST list grouped by reply parent (the
             // same fallback as `pr.listReviewComments`; resolution state is
             // unavailable there, so every fallback thread counts as
-            // unresolved).
-            let threads =
-                match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, pr_number, p))
+            // unresolved). The fallback is surfaced via
+            // `comments.threadResolutionUnknown` so consumers can tell the
+            // unresolved count is unreliable rather than silently treating
+            // resolved threads as unresolved.
+            let (threads, thread_resolution_unknown) = match pr_ops::fetch_all_pages(|p| {
+                sc.get_review_threads(&repo_ref, pr_number, p)
+            })
+            .await
+            {
+                Ok((threads, _, _)) => (threads, false),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        pr_number,
+                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (threadResolutionUnknown)"
+                    );
+                    let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
+                        sc.list_review_comments(&repo_ref, pr_number, p)
+                    })
                     .await
-                {
-                    Ok((threads, _, _)) => threads,
-                    Err(_) => {
-                        let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
-                            sc.list_review_comments(&repo_ref, pr_number, p)
-                        })
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                        pr_ops::fallback_threads(comments)
-                    }
-                };
+                    .map_err(pr_ops::map_sc_err)?;
+                    (pr_ops::fallback_threads(comments), true)
+                }
+            };
             let (review_comment_count, unresolved_thread_count) =
                 pr_ops::count_thread_comments(&threads);
 
@@ -18212,6 +18054,7 @@ impl WorkspaceApi for Services {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
                     "unresolvedThreadCount": unresolved_thread_count,
+                    "threadResolutionUnknown": thread_resolution_unknown,
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))
