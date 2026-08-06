@@ -5046,6 +5046,94 @@ async fn terminal_data_many_chunks_transient_over_wss() {
     );
 }
 
+/// Regression (monorepo#1538): `event.query`'s `eventType` accepts
+/// subscribe-style globs over the wire — `note:*` matches note-category
+/// events (it previously compiled to an exact `event_type = 'note:*'` match
+/// and silently returned `[]`), exact types are unchanged, and bare `*`
+/// behaves like no type filter.
+#[tokio::test]
+async fn event_query_event_type_glob_over_wss() {
+    let (_daemon, ws_id, note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Drive a note mutation so a `note:updated` event is persisted.
+    let updated = wss_rpc(
+        &mut rpc,
+        1,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "# Target\nevent-query-glob-marker\n",
+        }),
+    )
+    .await;
+    assert_eq!(updated["note"]["id"], json!(note_id));
+
+    // Category glob matches the persisted note event(s). Poll briefly: the
+    // event write is committed asynchronously relative to the RPC response.
+    let mut id = 2;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let glob_rows = loop {
+        let rows = wss_rpc(
+            &mut rpc,
+            id,
+            "event.query",
+            json!({ "workspaceId": ws_id, "eventType": "note:*" }),
+        )
+        .await;
+        id += 1;
+        if !rows.as_array().expect("glob rows array").is_empty() {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "note:* never matched the persisted note event: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        glob_rows
+            .as_array()
+            .expect("glob rows array")
+            .iter()
+            .all(|e| e["type"].as_str().unwrap_or_default().starts_with("note:")),
+        "note:* must return only note-category events: {glob_rows}"
+    );
+
+    // Exact-type query is unchanged and agrees with the glob.
+    let exact_rows = wss_rpc(
+        &mut rpc,
+        id,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "note:updated" }),
+    )
+    .await;
+    assert!(
+        !exact_rows.as_array().expect("exact rows array").is_empty(),
+        "exact note:updated query regressed: {exact_rows}"
+    );
+
+    // Bare `*` behaves like no type filter (previously an exact match on the
+    // literal `*` → silent `[]`), so the note event is visible through it.
+    let star_rows = wss_rpc(
+        &mut rpc,
+        id + 1,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "*" }),
+    )
+    .await;
+    assert!(
+        star_rows
+            .as_array()
+            .expect("star rows array")
+            .iter()
+            .any(|e| e["type"].as_str().unwrap_or_default().starts_with("note:")),
+        "bare * must behave like no type filter: {star_rows}"
+    );
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and

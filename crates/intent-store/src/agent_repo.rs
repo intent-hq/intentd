@@ -1034,81 +1034,53 @@ impl Store {
         Ok(())
     }
 
-    /// Guarded write of a session's effective model resolved at session open
-    /// (D13): sets `model` only while the stored value still equals
-    /// `expected_current` (the placeholder read before the ACP call — `None`
-    /// matches NULL), so a concurrent explicit `agent.setModel` is never
-    /// overwritten. Any stale `resolved_model` is cleared in the same write
-    /// (the effective model IS the display identity — D14). Returns whether
-    /// the write landed; `false` means the guard failed (model changed
-    /// concurrently or the row is absent), which callers treat as a benign
-    /// skip. Scoped to `workspace_id` (defense-in-depth).
-    pub async fn set_agent_session_effective_model(
-        &self,
-        workspace_id: &WorkspaceId,
-        id: &AgentId,
-        expected_current: Option<&str>,
-        effective: &str,
-    ) -> Result<bool> {
-        let res = match expected_current {
-            Some(current) => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                     WHERE id=? AND workspace_id=? AND model=?",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .bind(current)
-                .execute(self.write_pool())
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                 WHERE id=? AND workspace_id=? AND model IS NULL",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .execute(self.write_pool())
-                .await
-            }
-        }
-        .map_err(|e| Error::Internal(format!("set agent session effective model failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    /// Guarded write of a session's *resolved* display model (D14): the
-    /// display identity of an EXPLICITLY selected model id, matched against
-    /// the provider's `configOptions[id="model"]` option list at session
-    /// open. Unlike [`set_agent_session_effective_model`](Store::set_agent_session_effective_model)
-    /// this never touches `model` — the raw option id keeps driving provider
-    /// configuration (spawn flags / `session/set_config_option`); the
-    /// resolution is used ONLY for usage-stats attribution. `resolved` is
-    /// written as given, `None` included — an id that no longer resolves
-    /// must overwrite (not orphan) a previously persisted resolution, or a
-    /// stale display name would keep mis-attributing stats. Writes only
-    /// while `model` still equals `expected_model` (the explicit id read
-    /// before the ACP call), so a resolution is never attached to a model a
+    /// Guarded write of a session's *resolved* display model (D13/D14): the
+    /// display identity resolved against the provider's
+    /// `configOptions[id="model"]` option list at session open — for an
+    /// explicit pick (D14) and for a placeholder/NULL model whose effective
+    /// model the provider reported (D13). This never touches `model` — the
+    /// stored id (or placeholder) keeps driving provider configuration
+    /// (spawn flags / `session/set_config_option`); the resolution is used
+    /// ONLY for usage-stats attribution. `resolved` is written as given,
+    /// `None` included — an id that no longer resolves must overwrite (not
+    /// orphan) a previously persisted resolution, or a stale display name
+    /// would keep mis-attributing stats. Writes only while `model` still
+    /// equals `expected_model` (the value read before the ACP call — `None`
+    /// matches NULL), so a resolution is never attached to a model a
     /// concurrent `agent.setModel` changed. Returns whether the write
     /// landed. Scoped to `workspace_id` (defense-in-depth).
     pub async fn set_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-        expected_model: &str,
+        expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
-        let res = sqlx::query(
-            "UPDATE agent_session SET resolved_model=? WHERE id=? AND workspace_id=? AND model=?",
-        )
-        .bind(resolved)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(expected_model)
-        .execute(self.write_pool())
-        .await
+        let res = match expected_model {
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model=?",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .bind(expected)
+                .execute(self.write_pool())
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model IS NULL",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+            }
+        }
         .map_err(|e| Error::Internal(format!("set agent session resolved model failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
@@ -1332,12 +1304,17 @@ impl Store {
         if current_acp_session_id.is_some() && s.acp_session_id != current_acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
+        // The attention_request_* columns are deliberately ABSENT from this
+        // full-row UPDATE: a long-lived in-memory `AgentSession` persisted
+        // here mid-race must not resurrect a request that
+        // `clear_attention_request` already NULLed (or clobber one that
+        // `set_attention_request` just wrote). Those two narrow writers are
+        // the only post-insert mutators of the attention columns.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
-             completion_report=?, completion_report_timestamp=?, attention_request_kind=?, \
-             attention_request_reason=?, attention_request_timestamp=?, delegation_depth=?, \
+             completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
              metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
              stop_reason_timestamp=? \
@@ -1359,9 +1336,6 @@ impl Store {
         .bind(s.skip_auto_commit as i64)
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
-        .bind(&s.attention_request_kind)
-        .bind(&s.attention_request_reason)
-        .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
@@ -1677,6 +1651,45 @@ impl Store {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Persist a pending attention request (`attention_request_kind` /
+    /// `..._reason` / `..._timestamp`): a narrow write of the three attention
+    /// columns plus `updated_at` (refreshed to `timestamp`). Together with
+    /// [`Store::clear_attention_request`] this is the ONLY writer of the
+    /// attention columns after insert — the full-row
+    /// [`Store::update_agent_session`] deliberately excludes them so a stale
+    /// in-memory session persisted mid-race can neither resurrect a cleared
+    /// request nor clobber a fresh one. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    pub async fn set_attention_request(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        kind: &str,
+        reason: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=?, \
+             attention_request_reason=?, attention_request_timestamp=?, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(kind)
+        .bind(reason)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set attention request failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
     }
 
     /// Clear the pending attention request (`attention_request_kind` /

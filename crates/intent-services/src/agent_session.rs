@@ -92,13 +92,6 @@ pub struct AcpSessionOpened {
     /// recreate won the CAS (the modes we captured belong to the wrong
     /// session).
     pub modes: Option<SessionModeState>,
-    /// The bare effective model resolved from the response's
-    /// `configOptions[id="model"]` and persisted onto `agent_session.model`
-    /// (D13), when the stored model was a placeholder and the resolution +
-    /// guarded write both succeeded. The manager syncs the live handle's
-    /// `spawned_model` to this value so the next `ensure_started` does not
-    /// misread the persisted effective model as an `agent.setModel` change.
-    pub effective_model: Option<String>,
 }
 
 /// Accumulates streamed assistant content into one transcript message per turn,
@@ -1070,25 +1063,35 @@ impl Services {
     }
 
     /// Persist the effective model resolved from a session-open response's
-    /// `configOptions` (D13): only when the stored model is a placeholder
-    /// (NULL / blank / `default` sentinel — an explicitly user-selected model
-    /// is NEVER overwritten), and only while it still is at write time (the
-    /// store's guarded CAS write loses benignly to a concurrent
-    /// `agent.setModel`). Always persisted as the compound
-    /// `{provider_id}:{effective}` (e.g. `claude-code:Opus 4.8`) so
-    /// [`resolve_provider_id`] keeps resolving the same provider even when
-    /// the stored model was NULL and the `provider` field is empty. Returns
-    /// the *bare* effective model when the write landed — the value
-    /// `resolve_spawn` will yield next, which the manager syncs onto the
-    /// live handle's `spawned_model`.
+    /// `configOptions` (D13): when the stored model is a placeholder (NULL /
+    /// blank / `default` sentinel), the effective display identity (e.g.
+    /// "Opus 4.8") is persisted to the separate `resolved_model` column —
+    /// `agent_session.model` is NEVER rewritten (monorepo#1534: a display
+    /// name is not a selectable option id, so persisting it on `model` made
+    /// the FE flag it unavailable and fall back to the default, re-triggering
+    /// the rewrite and a "model changed" notice on every session open). The
+    /// outcome is persisted EITHER way — a `None` resolution overwrites
+    /// (clears) any previously persisted display name, so a resolution from
+    /// an older option list can never go stale and mis-attribute stats. The
+    /// store write is guarded on `model` still equalling the pre-open stored
+    /// value (`None` matches NULL), so it loses benignly to a concurrent
+    /// `agent.setModel`.
+    ///
+    /// Dropped guarantee (intentional): the old rewrite persisted the
+    /// compound `{provider_id}:{effective}`, which as a side effect pinned
+    /// the provider for legacy rows with a NULL `model` AND an empty
+    /// `provider`. Such rows now fall through to the configured default /
+    /// first-registered provider on every resolution — a reversion to
+    /// pre-D13 behavior; current creation paths pin `model` at creation, so
+    /// no new rows enter that population.
     ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
-    /// instead: the stored id is never rewritten (it keeps driving provider
-    /// configuration — spawn flags / `session/set_config_option`); its
-    /// display identity is resolved against the same option list via
-    /// [`resolve_explicit_display_model`] and persisted to the separate
-    /// `resolved_model` column, used only for usage-stats attribution. That
-    /// branch returns `None` — `resolve_spawn` is unaffected.
+    /// instead: its display identity is resolved against the same option
+    /// list via [`resolve_explicit_display_model`] and persisted to the same
+    /// `resolved_model` column. In both branches the stored `model` keeps
+    /// driving provider configuration (spawn flags /
+    /// `session/set_config_option`) and the resolution is used ONLY for
+    /// usage-stats attribution.
     ///
     /// Best-effort: failures are logged, never propagated — model resolution
     /// must not fail session open.
@@ -1096,10 +1099,9 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-        provider_id: &str,
         stored_model: Option<&str>,
         config_options: Option<&[SessionConfigOption]>,
-    ) -> Option<String> {
+    ) {
         if !usage_stats::is_placeholder_model(stored_model) {
             self.persist_resolved_display_model(
                 workspace_id,
@@ -1108,27 +1110,29 @@ impl Services {
                 config_options,
             )
             .await;
-            return None;
+            return;
         }
-        let effective = resolve_effective_model(config_options)?;
-        let persisted = format!("{provider_id}:{effective}");
+        let effective = resolve_effective_model(config_options);
         match self
             .store
-            .set_agent_session_effective_model(workspace_id, agent_id, stored_model, &persisted)
+            .set_agent_session_resolved_model(
+                workspace_id,
+                agent_id,
+                stored_model,
+                effective.as_deref(),
+            )
             .await
         {
             Ok(true) => {
                 tracing::debug!(
                     agent = %agent_id,
-                    model = %persisted,
-                    "persisted effective session model from configOptions"
+                    resolved = %effective.as_deref().unwrap_or("<none>"),
+                    "persisted effective session model from configOptions to resolved_model"
                 );
-                Some(effective)
             }
-            Ok(false) => None, // lost to a concurrent explicit model change
+            Ok(false) => {} // lost to a concurrent explicit model change
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "persist effective session model failed");
-                None
             }
         }
     }
@@ -1158,7 +1162,12 @@ impl Services {
         let resolved = resolve_explicit_display_model(&bare_id, config_options);
         match self
             .store
-            .set_agent_session_resolved_model(workspace_id, agent_id, stored, resolved.as_deref())
+            .set_agent_session_resolved_model(
+                workspace_id,
+                agent_id,
+                Some(stored),
+                resolved.as_deref(),
+            )
             .await
         {
             Ok(true) => {
@@ -1217,19 +1226,16 @@ impl Services {
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
             .await?;
-        let effective_model = self
-            .persist_effective_model(
-                &workspace_id,
-                agent_id,
-                &provider_id,
-                stored.model.as_deref(),
-                resp.config_options.as_deref(),
-            )
-            .await;
+        self.persist_effective_model(
+            &workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            effective_model,
         })
     }
 
@@ -1283,24 +1289,21 @@ impl Services {
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
         // The effective-model resolution is skipped for the same reason.
-        let (modes, effective_model) = if canonical == new_acp_session_id {
-            let effective_model = self
-                .persist_effective_model(
-                    &workspace_id,
-                    agent_id,
-                    &provider_id,
-                    stored.model.as_deref(),
-                    resp.config_options.as_deref(),
-                )
-                .await;
-            (resp.modes, effective_model)
+        let modes = if canonical == new_acp_session_id {
+            self.persist_effective_model(
+                &workspace_id,
+                agent_id,
+                stored.model.as_deref(),
+                resp.config_options.as_deref(),
+            )
+            .await;
+            resp.modes
         } else {
-            (None, None)
+            None
         };
         Ok(AcpSessionOpened {
             session_id: canonical,
             modes,
-            effective_model,
         })
     }
 
@@ -1382,19 +1385,16 @@ impl Services {
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
-        let effective_model = self
-            .persist_effective_model(
-                &workspace_id,
-                agent_id,
-                &provider_id,
-                stored.model.as_deref(),
-                resp.config_options.as_deref(),
-            )
-            .await;
+        self.persist_effective_model(
+            &workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            effective_model,
         }))
     }
 
