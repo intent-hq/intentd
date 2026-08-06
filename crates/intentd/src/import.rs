@@ -292,49 +292,53 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
             }
         };
         match store.get_agent_session(&session.id).await {
-            Ok(_) => match store
-                .update_agent_session(&session.workspace_id.clone(), &session)
-                .await
-            {
-                Ok(()) => {
-                    // The full-row update deliberately excludes the
-                    // attention_request_* columns (narrow-writer contract);
-                    // restore imported attention state explicitly. The hold
-                    // is keyed on `kind` alone (`workspace_needs_attention`),
-                    // so a partial snapshot still restores: missing `reason`
-                    // defaults to "" and missing `timestamp` to the session's
-                    // `updatedAt`. Only a kind-less session clears.
-                    let attn = match &session.attention_request_kind {
-                        Some(kind) => store
-                            .set_attention_request(
-                                &session.workspace_id,
-                                &session.id,
-                                kind,
-                                session.attention_request_reason.as_deref().unwrap_or(""),
-                                session
-                                    .attention_request_timestamp
-                                    .as_deref()
-                                    .unwrap_or(&session.updated_at),
-                            )
-                            .await
-                            .map(|_| ()),
-                        None => store
-                            .clear_attention_request(
-                                &session.workspace_id,
-                                &session.id,
-                                &session.updated_at,
-                            )
-                            .await
-                            .map(|_| ()),
-                    };
-                    match attn {
-                        Ok(()) => summary.agents_updated += 1,
-                        Err(e) => summary
-                            .skip(format!("agent {} attention update failed: {e}", session.id)),
-                    }
+            Ok(_) => {
+                // The full-row update deliberately excludes the
+                // attention_request_* columns (narrow-writer contract), so
+                // imported attention state is restored explicitly. The hold
+                // is keyed on `kind` alone (`workspace_needs_attention`), so
+                // a partial snapshot still restores: missing `reason`
+                // defaults to "" and missing `timestamp` to the session's
+                // `updatedAt`. Only a kind-less session clears. Ordering:
+                // the narrow writers couple `updated_at` to their timestamp
+                // argument, so attention is restored FIRST and the full-row
+                // update runs after, rewriting `updated_at` back to the
+                // exported value (import fidelity, PR #928 review).
+                let attn = match &session.attention_request_kind {
+                    Some(kind) => store
+                        .set_attention_request(
+                            &session.workspace_id,
+                            &session.id,
+                            kind,
+                            session.attention_request_reason.as_deref().unwrap_or(""),
+                            session
+                                .attention_request_timestamp
+                                .as_deref()
+                                .unwrap_or(&session.updated_at),
+                        )
+                        .await
+                        .map(|_| ()),
+                    None => store
+                        .clear_attention_request(
+                            &session.workspace_id,
+                            &session.id,
+                            &session.updated_at,
+                        )
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = attn {
+                    summary.skip(format!("agent {} attention update failed: {e}", session.id));
+                    continue;
                 }
-                Err(e) => summary.skip(format!("agent {} update failed: {e}", session.id)),
-            },
+                match store
+                    .update_agent_session(&session.workspace_id.clone(), &session)
+                    .await
+                {
+                    Ok(()) => summary.agents_updated += 1,
+                    Err(e) => summary.skip(format!("agent {} update failed: {e}", session.id)),
+                }
+            }
             Err(Error::NotFound(_)) => {
                 if let Err(e) = store.insert_agent_session(&session).await {
                     summary.skip(format!("agent {} insert failed: {e}", session.id));
@@ -636,6 +640,59 @@ mod tests {
             .await
             .expect("reload plain session");
         assert_eq!(plain.attention_request_kind, None);
+    }
+
+    /// A full attention triple round-trips through the update path without
+    /// regressing `updated_at` (PR #928 review): `set_attention_request`
+    /// couples `updated_at` to the attention timestamp, so the importer
+    /// restores attention *before* the full-row update, which then rewrites
+    /// `updated_at` back to the exported value.
+    #[tokio::test]
+    async fn reimport_preserves_attention_triple_and_updated_at() {
+        let source = write_fixture();
+        let ws_dir = source
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join(".workspace");
+        std::fs::write(
+            ws_dir.join("agents").join("a3.json"),
+            json!({
+                "id": "agent-3", "workspaceId": "ws-1", "name": "Blocked",
+                "status": "idle", "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-04T00:00:00Z",
+                "attentionRequestKind": "discussion",
+                "attentionRequestReason": "need input",
+                "attentionRequestTimestamp": "2026-01-03T12:00:00Z",
+                "messages": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (store, _db_dir) = open_store().await;
+        run(&store, source.path()).await.expect("first import");
+        run(&store, source.path()).await.expect("second import");
+
+        let blocked = store
+            .get_agent_session(&AgentId::from("agent-3"))
+            .await
+            .expect("reload session");
+        assert_eq!(
+            blocked.attention_request_kind.as_deref(),
+            Some("discussion")
+        );
+        assert_eq!(
+            blocked.attention_request_reason.as_deref(),
+            Some("need input")
+        );
+        assert_eq!(
+            blocked.attention_request_timestamp.as_deref(),
+            Some("2026-01-03T12:00:00Z"),
+        );
+        assert_eq!(
+            blocked.updated_at, "2026-01-04T00:00:00Z",
+            "exported updated_at must not regress to the attention timestamp"
+        );
     }
 
     #[tokio::test]
