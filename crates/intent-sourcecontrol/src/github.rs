@@ -4,8 +4,9 @@
 //! REST calls go through octocrab's generic `get`/`post`/`patch`/`put` helpers
 //! (returning raw JSON we map ourselves, mirroring the TS ground truth which
 //! parsed raw GitHub payloads), and review-thread resolution uses the GraphQL
-//! client. octocrab does not surface GraphQL-level `errors`, so we validate
-//! them here like `pr-comment.service.ts` did.
+//! client. octocrab unwraps the GraphQL envelope itself (`data` on success,
+//! `errors` mapped onto [`Error::Api`]), so [`graphql_data`] only guards
+//! against a `null` payload.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -471,22 +472,17 @@ fn encode_path_segments(path: &str) -> String {
     out
 }
 
-/// Validate a GraphQL envelope and return its `data` object (parity with
-/// `validateGraphQLResponse` in `pr-comment.service.ts`).
-fn graphql_data(mut resp: Value) -> Result<Value> {
-    if let Some(errors) = resp.get("errors").and_then(Value::as_array) {
-        if !errors.is_empty() {
-            let msg = errors[0]
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown GraphQL error");
-            return Err(Error::Api(format!("graphql error: {msg}")));
-        }
+/// Validate the `data` payload of a GraphQL response.
+///
+/// `octocrab::Octocrab::graphql` already unwraps the envelope — it returns the
+/// `data` object on success and turns an `errors` array into
+/// `octocrab::Error::Graphql` (mapped onto [`Error::Api`]) — so the only
+/// remaining failure mode is a `null` payload with no accompanying error.
+fn graphql_data(data: Value) -> Result<Value> {
+    if data.is_null() {
+        return Err(Error::Api("graphql response returned no data".to_string()));
     }
-    match resp.get_mut("data") {
-        Some(data) if !data.is_null() => Ok(data.take()),
-        _ => Err(Error::Api("graphql response returned no data".to_string())),
-    }
+    Ok(data)
 }
 
 mod dto {
@@ -1460,15 +1456,12 @@ mod tests {
     }
 
     #[test]
-    fn graphql_data_extracts_and_validates() {
-        let data = graphql_data(json!({ "data": { "x": 1 } })).unwrap();
-        assert_eq!(data, json!({ "x": 1 }));
+    fn graphql_data_passes_payload_and_rejects_null() {
+        // octocrab hands us the already-unwrapped `data` payload.
+        let data = graphql_data(json!({ "repository": { "x": 1 } })).unwrap();
+        assert_eq!(data, json!({ "repository": { "x": 1 } }));
 
-        let err =
-            graphql_data(json!({ "errors": [{ "message": "boom" }], "data": null })).unwrap_err();
-        assert!(matches!(err, Error::Api(_)));
-
-        let no_data = graphql_data(json!({ "data": null })).unwrap_err();
+        let no_data = graphql_data(Value::Null).unwrap_err();
         assert!(matches!(no_data, Error::Api(_)));
     }
 

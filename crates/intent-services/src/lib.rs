@@ -18000,30 +18000,29 @@ impl WorkspaceApi for Services {
             let conversation_count = conversation.len() as i64;
             // Inline review comments: threads via GraphQL when available,
             // falling back to the flat REST list grouped by reply parent (the
-            // same fallback as `pr.listReviewComments`; resolution state is
-            // unavailable there, so every fallback thread counts as
-            // unresolved). The fallback is surfaced via
-            // `comments.threadResolutionUnknown` so consumers can tell the
-            // unresolved count is unreliable rather than silently treating
-            // resolved threads as unresolved.
-            let (threads, thread_resolution_unknown) = match pr_ops::fetch_all_pages(|p| {
+            // same fallback as `pr.listReviewComments`). Resolution state is
+            // unavailable on the fallback path, so every fallback thread
+            // counts as unresolved — the fallback is logged at `warn` with the
+            // underlying error so that degradation is visible at the default
+            // log level instead of silently inflating the unresolved count.
+            let threads = match pr_ops::fetch_all_pages(|p| {
                 sc.get_review_threads(&repo_ref, pr_number, p)
             })
             .await
             {
-                Ok((threads, _, _)) => (threads, false),
+                Ok((threads, _, _)) => threads,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         error = %e,
                         pr_number,
-                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (threadResolutionUnknown)"
+                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (thread resolution state unavailable, unresolvedThreadCount may be inflated)"
                     );
                     let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
                         sc.list_review_comments(&repo_ref, pr_number, p)
                     })
                     .await
                     .map_err(pr_ops::map_sc_err)?;
-                    (pr_ops::fallback_threads(comments), true)
+                    pr_ops::fallback_threads(comments)
                 }
             };
             let (review_comment_count, unresolved_thread_count) =
@@ -18059,7 +18058,6 @@ impl WorkspaceApi for Services {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
                     "unresolvedThreadCount": unresolved_thread_count,
-                    "threadResolutionUnknown": thread_resolution_unknown,
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))
