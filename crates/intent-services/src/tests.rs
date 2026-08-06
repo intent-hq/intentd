@@ -19467,6 +19467,102 @@ mod last_activity_events {
         );
     }
 
+    /// Regression (monorepo#1580): the debounced derivation persists its
+    /// result, so the cheap read paths that never derive — `list_workspaces_lite`,
+    /// which backs the `workspace.subscribe` seq-0 snapshot — serve the fresh
+    /// value straight off the column (the post-restart shape). Reverting the
+    /// `bump_workspace_last_activity` call in `schedule_last_activity_event`
+    /// leaves the column NULL and fails this test.
+    #[tokio::test]
+    async fn debounced_last_activity_is_persisted_for_lite_reads() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Nothing derived yet: the seeded row has no stored lastActivity.
+        assert!(h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("seed reload")
+            .last_activity
+            .is_none());
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // Wait for the debounce window to fire and derive.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let expected = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .updated_at;
+
+        // The store column itself carries the derived value (survives restart).
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity;
+        assert_eq!(
+            persisted.as_deref(),
+            Some(expected.as_str()),
+            "derived lastActivity must be persisted to the workspace column"
+        );
+
+        // The lite list (seq-0 snapshot source) serves it without deriving.
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(expected.as_str()));
+    }
+
+    /// The persisted `lastActivity` never walks backwards: a later derivation
+    /// carrying an older timestamp is declined by the monotonic column write
+    /// (monorepo#1580).
+    #[tokio::test]
+    async fn persisted_last_activity_is_monotonic() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Seed a far-future stored value; the derivation (which sees only the
+        // much older updated_at) must not regress it.
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("seed future lastActivity"));
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "a stale derivation must not walk lastActivity backwards"
+        );
+    }
+
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]

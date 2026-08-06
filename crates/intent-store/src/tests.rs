@@ -280,6 +280,87 @@ async fn workspace_round_trip_and_archive_filter() {
     assert!(!got.archived);
 }
 
+/// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:
+/// it writes only `last_activity` (never `updated_at` or any other column),
+/// declines a stale or equal timestamp, fills a NULL column, tolerates
+/// differing fractional-second precision, and reports `NotFound` for a
+/// missing workspace.
+#[tokio::test]
+async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut seed = sample_workspace(&id, "Bump WS", false);
+    seed.last_activity = None;
+    seed.updated_at = "2020-01-01T00:00:00Z".to_string();
+    store.insert_workspace(&seed).await.expect("insert");
+
+    // NULL column: first bump writes.
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump from null"));
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.last_activity.as_deref(), Some("2026-01-01T00:00:00Z"));
+    // Scoped: no other column moved.
+    assert_eq!(got.updated_at, "2020-01-01T00:00:00Z");
+    assert_eq!(got.title, "Bump WS");
+
+    // Newer wins even with coarser fractional-second precision on the stored
+    // side (julianday comparison, not lexicographic).
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00.500Z")
+        .await
+        .expect("bump newer"));
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00.500Z")
+    );
+
+    // Older declines, leaving the stored value intact.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "2025-06-01T00:00:00Z")
+        .await
+        .expect("bump older"));
+    // Equal declines too.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00.500Z")
+        .await
+        .expect("bump equal"));
+    // Malformed input never writes.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "not-a-timestamp")
+        .await
+        .expect("bump malformed"));
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00.500Z")
+    );
+    assert_eq!(
+        store.get_workspace(&id).await.expect("get").updated_at,
+        "2020-01-01T00:00:00Z"
+    );
+
+    // Missing workspace → NotFound.
+    assert!(matches!(
+        store
+            .bump_workspace_last_activity(&WorkspaceId::from("nope"), "2026-01-01T00:00:00Z")
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
+}
+
 #[tokio::test]
 async fn workspace_get_update_delete() {
     let tmp = TempDb::new();
