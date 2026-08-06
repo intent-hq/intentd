@@ -366,6 +366,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             name: format!("Scale {a}"),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Completed,
             is_active: false,

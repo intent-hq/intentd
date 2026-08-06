@@ -460,6 +460,35 @@ fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
 }
 
 #[test]
+fn cached_effort_levels_reads_matching_row() {
+    let cache = ModelCatalogCache::new(None);
+    cache.store(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                    "effortLevels": ["low", "high"] }),
+            json!({ "id": "auggie:fable-6", "name": "Fable 6", "provider": "auggie" }),
+        ],
+        1_000,
+    );
+    assert_eq!(
+        cache.cached_effort_levels("fable-5"),
+        Some(vec!["low".to_string(), "high".to_string()])
+    );
+    // A compound id scopes the search to its provider and matches the bare part.
+    assert_eq!(
+        cache.cached_effort_levels("auggie:fable-5"),
+        Some(vec!["low".to_string(), "high".to_string()])
+    );
+    // A row that declares no levels, an unknown id, and a foreign-scoped
+    // compound id all carry no evidence.
+    assert_eq!(cache.cached_effort_levels("fable-6"), None);
+    assert_eq!(cache.cached_effort_levels("unknown-model"), None);
+    assert_eq!(cache.cached_effort_levels("grok:fable-5"), None);
+}
+
+#[test]
 fn cached_catalog_claims_none_without_usable_entry() {
     let cache = ModelCatalogCache::new(None);
     // No entry at all → no evidence.

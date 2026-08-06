@@ -5563,6 +5563,7 @@ mod workspace_api_tool_tests {
                 options: vec![SpecialistModelOption {
                     model: "opencode:kimi-k3".to_string(),
                     hint: "cheap".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             }]);
         let resp = srv
@@ -7621,6 +7622,7 @@ mod wsapi4_bindings_tests {
             name: format!("agent-{id}"),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
