@@ -19,12 +19,14 @@
 pub mod context;
 pub mod engine;
 pub mod error;
+pub mod extract;
 pub mod providers;
 pub mod registry;
 pub mod token;
 
 pub use engine::{TranscribeRequest, Transcript, VoiceEngine};
 pub use error::{Error, Result};
+pub use extract::{extract_vocabulary, SourceKind};
 pub use providers::elevenlabs::{ElevenLabsEngine, ELEVENLABS_API_BASE_URL};
 pub use providers::openai::{OpenAiEngine, OPENAI_API_BASE_URL};
 pub use registry::{VoiceProvider, VoiceRegistry, VoiceSettings};

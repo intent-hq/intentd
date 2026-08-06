@@ -30,10 +30,15 @@
 //! `pr.replyToReviewComment`, `pr.resolveThread`, `pr.createReview` — keeping
 //! only `pr.status` and `pr.refresh`; the `github.*` explicit-addressing
 //! surface (§5.27) and the MCP-only `ws.pr.snapshot` engine are unchanged —
-//! 268 router methods, 305 total.
+//! 268 router methods, 305 total. Version 5.1 adds workspace-derived
+//! vocabulary for voice dictation (additive; §5.41): the optional
+//! `workspaceId` param on `voice.transcribe` and the new
+//! `voice.getWorkspaceVocabulary` router method, plus the
+//! `voice.workspaceVocabulary.maxTerms` setting — 269 router methods,
+//! 306 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "5.0";
+pub const PROTOCOL_VERSION: &str = "5.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

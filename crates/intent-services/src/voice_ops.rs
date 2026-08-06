@@ -67,6 +67,12 @@ pub(crate) struct ParsedRequest {
     pub provider_override: Option<VoiceProvider>,
     pub prompt: Option<String>,
     pub keyterms: Vec<String>,
+    /// Opt-in workspace-vocabulary injection (PROTOCOL §5.41, v4.6).
+    /// Tolerant by design: absent/blank (and explicit `null`, like
+    /// `context.keyterms`) parse to `None`; an unknown or stale id is the
+    /// caller's concern (never an error there either); only a non-string
+    /// value rejects with `InvalidParams`.
+    pub workspace_id: Option<String>,
 }
 
 /// Map a voice engine/registry error onto a domain error (→ `-32603`): a
@@ -137,6 +143,19 @@ pub(crate) fn parse_request(params: &serde_json::Value) -> Result<ParsedRequest>
         })?),
     };
 
+    let workspace_id = match params.get("workspaceId") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(_) => {
+            return Err(Error::InvalidParams(
+                "workspaceId must be a string".to_string(),
+            ))
+        }
+    };
+
     let ctx = params.get("context");
     let prompt = ctx
         .and_then(|c| c.get("prompt"))
@@ -167,6 +186,7 @@ pub(crate) fn parse_request(params: &serde_json::Value) -> Result<ParsedRequest>
         provider_override,
         prompt,
         keyterms,
+        workspace_id,
     })
 }
 
@@ -218,17 +238,26 @@ pub(crate) fn parse_vocabulary_setting(value: Option<&serde_json::Value>) -> Vec
 }
 
 /// Build the provider [`TranscribeRequest`]: merge the configured
-/// `voice.vocabulary` terms with the request keyterms and compose the OpenAI
-/// prompt (see [`intent_voice::context`]). Both fields are always populated;
-/// each engine consumes the one it supports. `language` is the resolved
-/// value from [`resolve_language`] (per-call > `voice.language` setting >
-/// auto-detect).
+/// `voice.vocabulary` terms, the auto-derived workspace vocabulary (empty
+/// when the call carries no `workspaceId` — PROTOCOL §5.41, v4.6), and the
+/// request keyterms — in that fixed order, under the existing dedup/cap
+/// rules — and compose the OpenAI prompt (see [`intent_voice::context`]).
+/// Both fields are always populated; each engine consumes the one it
+/// supports. `language` is the resolved value from [`resolve_language`]
+/// (per-call > `voice.language` setting > auto-detect).
 pub(crate) fn build_engine_request(
     parsed: &ParsedRequest,
     vocabulary: &[String],
+    workspace_terms: &[String],
     language: Option<String>,
 ) -> TranscribeRequest {
-    let keyterms = context::merge_keyterms(vocabulary, &parsed.keyterms);
+    // user voice.vocabulary → workspace auto-terms, ahead of the request
+    // keyterms; merge_keyterms dedups case-insensitively with first spelling
+    // winning, so earlier tiers keep priority.
+    let mut biased: Vec<String> = Vec::with_capacity(vocabulary.len() + workspace_terms.len());
+    biased.extend_from_slice(vocabulary);
+    biased.extend_from_slice(workspace_terms);
+    let keyterms = context::merge_keyterms(&biased, &parsed.keyterms);
     let prompt = context::compose_prompt(&keyterms, parsed.prompt.as_deref());
     TranscribeRequest {
         audio: parsed.audio.clone(),
@@ -371,7 +400,7 @@ mod tests {
         }))
         .unwrap();
         let vocabulary = vec!["intentd".to_string(), "clippy".to_string()];
-        let req = build_engine_request(&parsed, &vocabulary, parsed.language.clone());
+        let req = build_engine_request(&parsed, &vocabulary, &[], parsed.language.clone());
         assert!(
             req.keyterms.contains(&"intentd".to_string()),
             "configured vocabulary merged in"
@@ -389,7 +418,7 @@ mod tests {
     fn engine_request_honors_custom_vocabulary() {
         let parsed = parse_request(&json!({ "audio": b64(b"x") })).unwrap();
         let vocabulary = vec!["Endara".to_string(), "TOON".to_string()];
-        let req = build_engine_request(&parsed, &vocabulary, parsed.language.clone());
+        let req = build_engine_request(&parsed, &vocabulary, &[], parsed.language.clone());
         assert_eq!(req.keyterms, vec!["Endara".to_string(), "TOON".to_string()]);
         assert!(
             !req.keyterms.contains(&"intentd".to_string()),
@@ -404,8 +433,82 @@ mod tests {
             "context": { "keyterms": ["Endara"] },
         }))
         .unwrap();
-        let req = build_engine_request(&parsed, &[], parsed.language.clone());
+        let req = build_engine_request(&parsed, &[], &[], parsed.language.clone());
         assert_eq!(req.keyterms, vec!["Endara".to_string()]);
+    }
+
+    #[test]
+    fn parses_workspace_id_tolerantly() {
+        let parsed = parse_request(&json!({ "audio": b64(b"x") })).unwrap();
+        assert_eq!(parsed.workspace_id, None, "absent → None");
+        let parsed = parse_request(&json!({ "audio": b64(b"x"), "workspaceId": null })).unwrap();
+        assert_eq!(parsed.workspace_id, None, "explicit null → None");
+        let parsed = parse_request(&json!({ "audio": b64(b"x"), "workspaceId": "  " })).unwrap();
+        assert_eq!(parsed.workspace_id, None, "blank → None");
+        let parsed =
+            parse_request(&json!({ "audio": b64(b"x"), "workspaceId": "ws-abc" })).unwrap();
+        assert_eq!(parsed.workspace_id.as_deref(), Some("ws-abc"));
+    }
+
+    #[test]
+    fn non_string_workspace_id_rejects() {
+        for bad in [json!(42), json!(true), json!(["ws-abc"]), json!({})] {
+            let err =
+                parse_request(&json!({ "audio": b64(b"x"), "workspaceId": bad })).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(ref m) if m.contains("workspaceId")),
+                "expected InvalidParams naming workspaceId"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_request_merges_workspace_terms_between_vocab_and_request() {
+        let parsed = parse_request(&json!({
+            "audio": b64(b"x"),
+            "context": { "keyterms": ["Endara"] },
+        }))
+        .unwrap();
+        let vocabulary = vec!["Intent".to_string()];
+        let workspace_terms = vec!["intentd".to_string(), "clippy".to_string()];
+        let req = build_engine_request(
+            &parsed,
+            &vocabulary,
+            &workspace_terms,
+            parsed.language.clone(),
+        );
+        assert_eq!(
+            req.keyterms,
+            vec![
+                "Intent".to_string(),
+                "intentd".to_string(),
+                "clippy".to_string(),
+                "Endara".to_string(),
+            ],
+            "fixed merge order: user vocabulary → workspace auto-terms → request keyterms"
+        );
+    }
+
+    #[test]
+    fn workspace_terms_dedup_first_spelling_wins() {
+        let parsed = parse_request(&json!({
+            "audio": b64(b"x"),
+            "context": { "keyterms": ["INTENTD"] },
+        }))
+        .unwrap();
+        let vocabulary = vec!["Clippy".to_string()];
+        let workspace_terms = vec!["intentd".to_string(), "clippy".to_string()];
+        let req = build_engine_request(
+            &parsed,
+            &vocabulary,
+            &workspace_terms,
+            parsed.language.clone(),
+        );
+        assert_eq!(
+            req.keyterms,
+            vec!["Clippy".to_string(), "intentd".to_string()],
+            "case-insensitive dedup, earlier tier's spelling wins"
+        );
     }
 
     #[test]
