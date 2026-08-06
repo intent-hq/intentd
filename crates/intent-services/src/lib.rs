@@ -1088,7 +1088,10 @@ impl Services {
     /// Hydrate the in-memory script registry from the persisted definitions
     /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
     /// composition root on boot so `script.*` survives daemon restarts; runtime
-    /// state always starts fresh (idle). Returns the number of scripts loaded.
+    /// state starts fresh (idle), except that a service-mode script still
+    /// carrying the stored-on-write `was_running` marker hydrates with
+    /// `previouslyRunning: true` so clients can re-render its tab. Returns the
+    /// number of scripts loaded.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
         self.script_manager().hydrate().await
     }

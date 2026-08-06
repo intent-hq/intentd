@@ -133,11 +133,13 @@ pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io:
 /// request tasks are aborted at whatever await point they have reached. This
 /// is intentional — the peer can no longer receive the responses, and running
 /// orphaned calls to completion would hold their resources with no consumer.
-/// The trade-off: combined with the stdio proxy's synthesized retryable
-/// [`BRIDGE_DISCONNECTED_CODE`] errors, a provider retry after a TCP blip can
-/// re-run a call whose first attempt partially executed before the abort, so
-/// non-idempotent tool calls (e.g. mutation scripts) may double-apply the
-/// steps that completed before the drop.
+/// An aborted call may thus have partially executed, which is why the stdio
+/// proxy answers requests it already delivered with the non-retryable
+/// [`BRIDGE_OUTCOME_UNKNOWN_CODE`] instead of the retryable
+/// [`BRIDGE_DISCONNECTED_CODE`] (monorepo#1530): a blind provider retry after
+/// a TCP blip would re-run a call whose first attempt partially executed
+/// before the abort, double-applying the steps that completed before the
+/// drop.
 async fn serve_connection<S: BridgeDispatch>(
     server: Arc<S>,
     stream: TcpStream,
@@ -208,6 +210,18 @@ pub(crate) const BRIDGE_DISCONNECTED_CODE: i64 = -32001;
 pub(crate) const BRIDGE_DISCONNECTED_MESSAGE: &str =
     "workspace-mcp bridge temporarily disconnected; retry";
 
+/// JSON-RPC error code (implementation-defined `-32000`-range server error)
+/// synthesized by the bridge for requests that had already been delivered to
+/// the listener when the TCP side dropped (monorepo#1530). The listener may
+/// have executed the call — partially or fully — before the drop, so the
+/// error is explicitly non-retryable: blindly re-running a non-idempotent
+/// `workspace_api` call could double-apply its side effects.
+pub(crate) const BRIDGE_OUTCOME_UNKNOWN_CODE: i64 = -32002;
+
+/// Human-readable companion to [`BRIDGE_OUTCOME_UNKNOWN_CODE`].
+pub(crate) const BRIDGE_OUTCOME_UNKNOWN_MESSAGE: &str =
+    "workspace-mcp call was delivered but its outcome is unknown after a disconnect; do not blindly retry";
+
 /// Max stdin lines buffered during the initial connect window (monorepo#908).
 /// The window is ~5s and a well-behaved client sends a handful of lines; the
 /// cap only guards against a flooding client growing memory unboundedly.
@@ -253,11 +267,19 @@ impl Default for BridgeRetryConfig {
 }
 
 /// How one connected pump session ended.
-enum SessionEnd {
+pub(crate) enum SessionEnd {
     /// The stdio side reached EOF: the provider is gone, exit cleanly.
     StdinEof,
     /// The TCP side dropped: attempt a reconnect.
     TcpDropped,
+}
+
+/// A forwarded-but-unanswered request id, tagged with whether its line was
+/// successfully written to the TCP socket — i.e. delivered to the listener,
+/// which may have executed it (monorepo#1530).
+struct PendingRequest {
+    id: Value,
+    delivered: bool,
 }
 
 /// Body of the `intentd mcp-bridge --connect <addr>` subcommand: connect to a
@@ -275,8 +297,12 @@ enum SessionEnd {
 /// request that carries an `id` is answered with a retryable JSON-RPC error
 /// ([`BRIDGE_DISCONNECTED_CODE`]) instead of being dropped — except for lines
 /// that race a still-pending connect attempt, which are held until that
-/// attempt's outcome is known (monorepo#906) — and requests that were in
-/// flight when the connection died get the same synthesized error so the
+/// attempt's outcome is known (monorepo#906). Requests that were pending when
+/// the connection died are classified by delivery (monorepo#1530): ids never
+/// written to the socket get the same retryable error, while ids already
+/// delivered to the listener get the non-retryable
+/// [`BRIDGE_OUTCOME_UNKNOWN_CODE`] — the listener may have executed them
+/// before the drop, so a blind retry could double-apply. Either way the
 /// provider's MCP client never has to time out.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
     run_bridge(
@@ -343,8 +369,10 @@ where
             None => return Ok(()),
         };
         initial = false;
+        let (tcp_read, tcp_write) = stream.into_split();
         match pump_session(
-            stream,
+            tcp_read,
+            tcp_write,
             std::mem::take(&mut buffered),
             &mut input,
             &mut output,
@@ -534,30 +562,43 @@ async fn buffer_or_reject<W: AsyncWrite + Unpin>(
 /// Pump one connected session: stdin lines → socket, socket lines → stdout.
 /// Lines buffered during the initial connect window are flushed to the socket
 /// first, in order, before live traffic is pumped (monorepo#908). Tracks the
-/// `id` of every forwarded request until its response comes back; when the
-/// TCP side drops, every still-pending id gets the synthesized retryable
-/// error so the provider client is never left waiting.
-async fn pump_session<R, W>(
-    stream: TcpStream,
+/// `id` of every forwarded request until its response comes back, along with
+/// whether its line was successfully written to the socket; when the TCP side
+/// drops, every still-pending id is answered so the provider client is never
+/// left waiting — delivered ids with the non-retryable
+/// [`BRIDGE_OUTCOME_UNKNOWN_CODE`] (the listener may have executed them,
+/// monorepo#1530), undelivered ids with the retryable
+/// [`BRIDGE_DISCONNECTED_CODE`].
+pub(crate) async fn pump_session<TR, TW, R, W>(
+    tcp_read: TR,
+    mut tcp_write: TW,
     buffered: Vec<String>,
     input: &mut Lines<BufReader<R>>,
     output: &mut W,
 ) -> std::io::Result<SessionEnd>
 where
+    TR: AsyncRead + Unpin,
+    TW: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (tcp_read, mut tcp_write) = stream.into_split();
     let mut tcp_lines = BufReader::new(tcp_read).lines();
     // Requests forwarded but not yet answered, keyed by the id's canonical
     // JSON so numeric and string ids never collide.
-    let mut pending: HashMap<String, Value> = HashMap::new();
+    let mut pending: HashMap<String, PendingRequest> = HashMap::new();
     // Buffered ids are registered for the whole batch up front: once the
     // flush begins the session owns these requests, so a TCP drop mid-flush
-    // synthesizes the retryable error for the not-yet-written ones too.
+    // answers the not-yet-written ones too — as undelivered (retryable),
+    // while the already-written prefix is delivered (outcome unknown).
     for line in &buffered {
         if let Some(id) = request_id(line) {
-            pending.insert(id.to_string(), id);
+            pending.insert(
+                id.to_string(),
+                PendingRequest {
+                    id,
+                    delivered: false,
+                },
+            );
         }
     }
     let mut flush_dropped = false;
@@ -568,6 +609,11 @@ where
         if write_line(&mut tcp_write, line).await.is_err() {
             flush_dropped = true;
             break;
+        }
+        if let Some(id) = request_id(line) {
+            if let Some(entry) = pending.get_mut(&id.to_string()) {
+                entry.delivered = true;
+            }
         }
     }
     let end = if flush_dropped {
@@ -580,11 +626,25 @@ where
                         if line.trim().is_empty() {
                             continue;
                         }
+                        // Two-phase transition: register the request as
+                        // undelivered, then mark it delivered only once its
+                        // line was written to the socket.
+                        let mut key = None;
                         if let Some(id) = request_id(&line) {
-                            pending.insert(id.to_string(), id);
+                            let k = id.to_string();
+                            pending.insert(k.clone(), PendingRequest {
+                                id,
+                                delivered: false,
+                            });
+                            key = Some(k);
                         }
                         if write_line(&mut tcp_write, &line).await.is_err() {
                             break SessionEnd::TcpDropped;
+                        }
+                        if let Some(key) = key {
+                            if let Some(entry) = pending.get_mut(&key) {
+                                entry.delivered = true;
+                            }
                         }
                     }
                     None => break SessionEnd::StdinEof,
@@ -602,8 +662,12 @@ where
         }
     };
     if matches!(end, SessionEnd::TcpDropped) {
-        for id in pending.into_values() {
-            write_disconnected_error(output, &id).await?;
+        for entry in pending.into_values() {
+            if entry.delivered {
+                write_outcome_unknown_error(output, &entry.id).await?;
+            } else {
+                write_disconnected_error(output, &entry.id).await?;
+            }
         }
     }
     Ok(end)
@@ -656,6 +720,25 @@ async fn write_disconnected_error<W: AsyncWrite + Unpin>(
             "code": BRIDGE_DISCONNECTED_CODE,
             "message": BRIDGE_DISCONNECTED_MESSAGE,
             "data": { "retryable": true },
+        },
+    });
+    write_line(output, &response.to_string()).await
+}
+
+/// Write the synthesized non-retryable outcome-unknown JSON-RPC error for
+/// `id` to `output` — the request was delivered to the listener before the
+/// drop, so it may have (partially) executed (monorepo#1530).
+async fn write_outcome_unknown_error<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    id: &Value,
+) -> std::io::Result<()> {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": BRIDGE_OUTCOME_UNKNOWN_CODE,
+            "message": BRIDGE_OUTCOME_UNKNOWN_MESSAGE,
+            "data": { "retryable": false },
         },
     });
     write_line(output, &response.to_string()).await
