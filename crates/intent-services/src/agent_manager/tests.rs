@@ -10493,12 +10493,14 @@ mod attention_request_clear_gates {
         session.provider = Some("mock".to_string());
         session.parent_agent_id = parent;
         session.is_background = background;
-        session.attention_request_kind = Some("discussion".to_string());
-        session.attention_request_reason = Some("need a decision".to_string());
-        session.attention_request_timestamp = Some(now_iso());
         mgr.services
             .store
             .update_agent_session(ws, &session)
+            .await
+            .expect("seed session shape");
+        mgr.services
+            .store
+            .set_attention_request(ws, id, "discussion", "need a decision", &now_iso())
             .await
             .expect("seed pending attention request");
     }

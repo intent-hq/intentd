@@ -2411,7 +2411,7 @@ impl Services {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
-                    workspace_id,
+                    workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
                     event_type: intent_core::events::AGENT_DELETED.to_string(),
                     actor: crate::system_actor(),
@@ -2423,6 +2423,11 @@ impl Services {
                 },
             )
             .await;
+            // Deleting a session can retire a needs_attention hold (a pending
+            // attention request or unanswered question dies with the row):
+            // recompute-and-compare (§6.5 step 0); the dedup cache suppresses
+            // the no-op when nothing derived from this session.
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -2634,6 +2639,13 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // `status` / `isBackground` feed the needs_attention derivation (a
+        // deleted or background session's pending request/question no longer
+        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
+        // probe entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") {
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }
@@ -4230,24 +4242,24 @@ impl Services {
         if reason.is_empty() {
             return Err(Error::InvalidParams("reason is required".to_string()));
         }
-        let mut session = self.load_session_internal(&caller).await?;
+        let session = self.load_session_internal(&caller).await?;
         // Scope-guard the caller-supplied `workspace_id` (same shape as
         // `agent_report_to_parent_op`): reject a cross-workspace mismatch with
         // `NotFound` before any state changes.
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
-        // 1. Persist the pending attention request on the session.
+        // 1. Persist the pending attention request on the session via the
+        // narrow attention writer (with `clear_attention_request` the only
+        // post-insert mutator of the attention columns — the full-row
+        // `update_agent_session` excludes them so a racing persist of a stale
+        // session cannot clobber this write).
         let saved_at = now_iso();
-        session.attention_request_kind = Some(kind.clone());
-        session.attention_request_reason = Some(reason.clone());
-        session.attention_request_timestamp = Some(saved_at.clone());
-        session.updated_at = saved_at.clone();
         let workspace_id = session.workspace_id.clone();
         let task_note_id = session.task_note_id.clone();
         let parent = session.parent_agent_id.clone();
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .set_attention_request(&workspace_id, &caller, &kind, &reason, &saved_at)
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,

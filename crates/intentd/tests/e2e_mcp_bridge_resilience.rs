@@ -9,9 +9,11 @@
 //! would time the ping out and evict the tool surface).
 //!
 //! Scenario 2 — a real `intentd mcp-bridge` subprocess survives a TCP blip:
-//! in-flight and gap requests get the synthesized retryable `-32001` error
-//! (never silence), and once the listener is back the bridge reconnects and
-//! serves requests again over the SAME stdio session.
+//! an in-flight request already delivered to the listener gets the synthesized
+//! non-retryable outcome-unknown `-32002` error (monorepo#1530), a gap request
+//! gets the retryable `-32001` error (never silence), and once the listener is
+//! back the bridge reconnects and serves requests again over the SAME stdio
+//! session.
 //!
 //! Scenario 3 — startup race (monorepo#908): a bridge subprocess spawned
 //! before its listener is reachable BUFFERS stdin (notably the MCP
@@ -237,6 +239,11 @@ use tokio::time::timeout;
 /// (see `intent_acp::mcp_bridge::BRIDGE_DISCONNECTED_CODE`).
 const BRIDGE_DISCONNECTED_CODE: i64 = -32001;
 
+/// JSON-RPC error code the bridge synthesizes for requests delivered to the
+/// listener before a drop — outcome unknown, not retryable (monorepo#1530;
+/// see `intent_acp::mcp_bridge::BRIDGE_OUTCOME_UNKNOWN_CODE`).
+const BRIDGE_OUTCOME_UNKNOWN_CODE: i64 = -32002;
+
 async fn write_json_line<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, v: &serde_json::Value) {
     w.write_all(format!("{v}\n").as_bytes())
         .await
@@ -261,10 +268,11 @@ async fn read_json_line<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// A real `intentd mcp-bridge --connect <addr>` subprocess survives a TCP
-/// blip: the request in flight when the connection drops and a request sent
-/// during the gap both get the retryable `-32001` error (never silence), and
-/// once the listener is back the bridge reconnects on its own and serves
-/// requests again over the SAME stdio session.
+/// blip: the request in flight when the connection drops was delivered to the
+/// listener, so it gets the non-retryable outcome-unknown `-32002` error
+/// (monorepo#1530); a request sent during the gap gets the retryable `-32001`
+/// error (never silence); and once the listener is back the bridge reconnects
+/// on its own and serves requests again over the SAME stdio session.
 #[tokio::test]
 async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
     // Fake daemon listener the test controls end-to-end.
@@ -345,14 +353,15 @@ async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
     drop(lines1);
     drop(listener);
 
-    // The in-flight request gets the synthesized retryable error.
+    // The in-flight request was delivered to the listener before the drop, so
+    // it gets the synthesized non-retryable outcome-unknown error.
     let resp = read_json_line(&mut stdout, "in-flight error for id 2").await;
     assert_eq!(resp["id"], serde_json::json!(2));
     assert_eq!(
         resp["error"]["code"],
-        serde_json::json!(BRIDGE_DISCONNECTED_CODE)
+        serde_json::json!(BRIDGE_OUTCOME_UNKNOWN_CODE)
     );
-    assert_eq!(resp["error"]["data"]["retryable"], serde_json::json!(true));
+    assert_eq!(resp["error"]["data"]["retryable"], serde_json::json!(false));
 
     // A request sent during the gap also errors retryably instead of hanging.
     write_json_line(
