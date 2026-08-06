@@ -10107,10 +10107,16 @@ impl WorkspaceApi for Services {
                                 {
                                     Ok(path) => path,
                                     Err(e) => {
-                                        let detail = match e {
+                                        // Legacy-clone parity: redact any
+                                        // credential-bearing URL before the
+                                        // detail reaches events, errors, or
+                                        // logs (repo_cache redacts git stderr
+                                        // at source; this also covers wrapper
+                                        // messages embedding the URL).
+                                        let detail = clone_ops::redact_credentials(&match e {
                                             Error::Internal(msg) => msg,
                                             other => other.to_string(),
-                                        };
+                                        });
                                         let category =
                                             clone_ops::classify_clone_error(&detail);
                                         let error_code = (category
@@ -10521,7 +10527,19 @@ impl WorkspaceApi for Services {
                         // under the per-repo cache lock so a concurrent
                         // create's cache refresh cannot mutate the cache
                         // mid-copy.
-                        if !ws.is_remote && !ws.skip_worktree && !has_worktree {
+                        // The clone arm only arms hydration when a checkout
+                        // will be provisioned here (its `provisions_checkout`
+                        // gate mirrors this guard). If the two ever diverge,
+                        // `repositoryPath` would dangle at a directory that
+                        // was never created — fail loudly instead of
+                        // persisting a broken row.
+                        if ws.is_remote || ws.skip_worktree || has_worktree {
+                            return Err(Error::Internal(
+                                "workspace.create: cache hydration armed but checkout provisioning is skipped (guard divergence)"
+                                    .to_string(),
+                            ));
+                        }
+                        {
                             let checkout_path = repo_dir.clone().ok_or_else(|| {
                                 Error::Internal(
                                     "workspace.create: cache hydration lost its checkout path"
@@ -10573,6 +10591,12 @@ impl WorkspaceApi for Services {
                                         &lock_cache,
                                         move || match mode {
                                             intent_core::CheckoutMode::Cow => {
+                                                // No cowCloneExclude here (unlike
+                                                // the cowIsolation arm below):
+                                                // the source is the pristine
+                                                // cache clone — tracked files
+                                                // only, no deps/build artifacts
+                                                // for excludes to skip.
                                                 let sha =
                                                     intent_git::cow_checkout::provision_cow_checkout(
                                                         &cache,
@@ -10667,22 +10691,38 @@ impl WorkspaceApi for Services {
                                 && repo_dir.join(".git").exists()
                             {
                                 let branch = ws.branch.clone();
+                                let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
                                 let sha = worktree_locks
                                     .with_lock(&repo_dir, move || async move {
                                         tokio::task::spawn_blocking(move || {
                                             // Reuse an existing branch of the
                                             // same name (retried create), else
-                                            // create it from HEAD; then check
-                                            // it out and report HEAD's SHA.
+                                            // create it — at the caller's
+                                            // `baseRef` when supplied
+                                            // (provision_worktree parity),
+                                            // else from HEAD; then check it
+                                            // out and report HEAD's SHA.
                                             if intent_git::branches::checkout_branch(
                                                 &repo, &branch,
                                             )
                                             .is_err()
                                             {
-                                                intent_git::branches::create_branch(
-                                                    &repo, &branch, true,
-                                                )?;
+                                                match base_ref
+                                                    .as_deref()
+                                                    .filter(|r| !r.is_empty())
+                                                {
+                                                    Some(base) => {
+                                                        intent_git::branches::create_branch_at(
+                                                            &repo, &branch, base,
+                                                        )?
+                                                    }
+                                                    None => {
+                                                        intent_git::branches::create_branch(
+                                                            &repo, &branch, true,
+                                                        )?
+                                                    }
+                                                }
                                             }
                                             intent_git::refs::rev_parse(&repo, "HEAD")
                                         })

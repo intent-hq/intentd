@@ -14755,6 +14755,61 @@ mod worktree_provisioning {
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
     }
 
+    /// An `isNewRepo` create on an already-initialized repo honors a
+    /// caller-supplied non-HEAD `baseRef`: the in-place workspace branch (and
+    /// `baseCommitSha`) start at the requested base, not at HEAD.
+    #[tokio::test]
+    async fn create_with_is_new_repo_honors_base_ref_on_existing_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, base_sha, _) = seed_repo("intentd-newrepo-baseref");
+        // Pin `base` at the first commit, then advance HEAD.
+        {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("base", &head, false).unwrap();
+        }
+        std::fs::write(repo_dir.0.join("later.txt"), "after base\n").unwrap();
+        {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            commit_all(&repo, "feat: later");
+        }
+        let root = unique_dir("intentd-newrepo-baseref-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    base_ref: Some("base".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(base_sha.as_str()),
+            "workspace branch starts at the requested base ref, not HEAD"
+        );
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert_eq!(src.head().unwrap().shorthand().unwrap(), ws.branch.as_str());
+        assert_eq!(
+            src.head().unwrap().target().unwrap().to_string(),
+            base_sha,
+            "checked-out branch points at the base commit"
+        );
+        assert!(
+            !repo_dir.0.join("later.txt").exists(),
+            "work tree matches the base ref"
+        );
+    }
+
     /// intent-hq/monorepo#962 guard: without `isNewRepo`, a non-git
     /// `repositoryPath` keeps the documented legacy behavior — the create
     /// succeeds row-only (no worktree, no init) and the dir stays non-git.
@@ -18345,6 +18400,110 @@ mod clone_orchestration {
         );
         let list = store.list_workspaces(true).await.expect("list");
         assert!(list.is_empty(), "no row persisted on hydration failure");
+    }
+
+    /// Back-compat regression guard: an explicit `clonePath` alongside
+    /// `githubUrl` keeps the legacy network-clone path exactly — repo cloned
+    /// at `clonePath`, a linked worktree provisioned off it (`checkoutMode:
+    /// "worktree"`), and **no** `.repo-cache` directory created.
+    #[tokio::test]
+    async fn explicit_clone_path_keeps_legacy_clone_no_cache() {
+        let source = seed_repo("intentd-legacy-clone-src");
+        let root = unique_dir("intentd-legacy-clone-root");
+        let target = unique_dir("intentd-legacy-clone-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url),
+                    clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(
+            ws.repository_path.as_deref(),
+            Some(clone_dir.to_string_lossy().as_ref()),
+            "repositoryPath is the explicit clone target"
+        );
+        assert!(clone_dir.join(".git").exists(), "clone landed at clonePath");
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "legacy path provisions a linked worktree"
+        );
+        assert_ne!(
+            ws.worktree_path.as_deref(),
+            ws.repository_path.as_deref(),
+            "worktree is distinct from the cloned repo"
+        );
+        assert!(
+            !root.0.join(".repo-cache").exists(),
+            "explicit clonePath must not touch the repo cache"
+        );
+    }
+
+    /// `workspace.delete` of a hydrated workspace removes the standalone
+    /// checkout (and its `<root>/<wsId>` parent) while the repo cache stays
+    /// untouched for future creates.
+    #[tokio::test]
+    async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
+        let source = seed_repo("intentd-hydrate-del-src");
+        let root = unique_dir("intentd-hydrate-del-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
+        let cache = root
+            .0
+            .join(".repo-cache")
+            .join(ws.repository_owner.as_deref().unwrap())
+            .join(ws.repository_name.as_deref().unwrap());
+        assert!(checkout.exists() && cache.exists());
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+        // Fast-ack: poll for the background cleanup.
+        let ws_dir = root.0.join(&ws.id.0);
+        for _ in 0..100 {
+            if !checkout.exists() && !ws_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(!checkout.exists(), "hydrated checkout removed");
+        assert!(!ws_dir.exists(), "empty <root>/<wsId> parent removed");
+        assert!(
+            cache.join(".git").exists(),
+            "repo cache survives workspace deletion"
+        );
     }
 }
 

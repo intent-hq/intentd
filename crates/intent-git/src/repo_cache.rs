@@ -97,30 +97,64 @@ pub async fn ensure_cached_repo(
 /// otherwise (or when the refresh reports any anomaly) wipe and re-clone.
 fn ensure_blocking(cache_path: &Path, github_url: &str, token: Option<&str>) -> Result<()> {
     if cache_path.exists() {
-        match refresh(cache_path, token) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %cache_path.display(),
-                    "repo cache refresh failed; deleting cache and re-cloning"
-                );
+        if origin_matches(cache_path, github_url) {
+            match refresh(cache_path, token) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %cache_path.display(),
+                        "repo cache refresh failed; deleting cache and re-cloning"
+                    );
+                }
             }
+        } else {
+            // The cache is keyed by `<owner>/<repo>` segments only, so two
+            // different hosts (or two `file://` sources) carrying the same
+            // owner/repo pair must never serve each other's content. A cache
+            // whose `origin` differs from the requested URL is stale, not a
+            // hit — wipe and re-clone from the requested URL.
+            tracing::warn!(
+                path = %cache_path.display(),
+                "repo cache origin does not match the requested URL; re-cloning"
+            );
         }
     }
     remove_cache_path(cache_path)?;
     clone(github_url, cache_path, token)
 }
 
-/// Refresh an existing cache: fetch + prune, then hard-reset the remote's
-/// default branch (resolved from the `origin/HEAD` symref the clone created)
-/// so the checkout exactly mirrors the remote — a diverged or dirty cache is
+/// Whether the cache's `origin` remote points at exactly `github_url`. Any
+/// failure to read it (unopenable repo, missing remote) counts as a mismatch
+/// — the caller self-heals by re-cloning.
+fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
+    let Ok(repo) = Repository::open(cache_path) else {
+        return false;
+    };
+    let Ok(remote) = repo.find_remote("origin") else {
+        return false;
+    };
+    remote.url().ok() == Some(github_url)
+}
+
+/// Refresh an existing cache: fetch + prune, re-resolve the remote's default
+/// branch (`git remote set-head origin --auto` — a fetch alone never updates
+/// the `origin/HEAD` symref recorded at clone time, so a remote that changed
+/// its default branch would otherwise pin the cache to the obsolete one),
+/// then hard-reset that branch and drop untracked files so the work tree
+/// exactly mirrors the remote — a diverged, dirty, or polluted cache is
 /// clobbered, never merged. Every failure here is an anomaly the caller
 /// self-heals by re-cloning.
 fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     run_git(
         cache_path,
         &["fetch", "--prune", "origin"],
+        token,
+        CACHE_FETCH_TIMEOUT,
+    )?;
+    run_git(
+        cache_path,
+        &["remote", "set-head", "origin", "--auto"],
         token,
         CACHE_FETCH_TIMEOUT,
     )?;
@@ -141,7 +175,11 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     repo.set_head(&format!("refs/heads/{default}"))
         .map_err(map_git_err)?;
     drop(repo);
-    crate::reset::reset_hard(cache_path, "HEAD")
+    crate::reset::reset_hard(cache_path, "HEAD")?;
+    // Untracked pollution (e.g. leftovers from a process killed mid-checkout
+    // in the cache) survives a hard reset and would be byte-copied into every
+    // hydrated checkout; clean it so refresh restores a pristine work tree.
+    run_git(cache_path, &["clean", "-fdx"], None, CACHE_FETCH_TIMEOUT)
 }
 
 /// Resolve the remote's default branch from the `refs/remotes/origin/HEAD`
@@ -177,8 +215,14 @@ fn clone(github_url: &str, cache_path: &Path, token: Option<&str>) -> Result<()>
     let dir_name = cache_path
         .file_name()
         .ok_or_else(|| Error::Internal("cache path has no file name".to_string()))?;
-    let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), github_url.as_ref()];
-    args.push(dir_name.as_ref());
+    // `--` so a caller-supplied URL starting with `-` can never be parsed as
+    // a git option (option injection).
+    let args: Vec<&std::ffi::OsStr> = vec![
+        "clone".as_ref(),
+        "--".as_ref(),
+        github_url.as_ref(),
+        dir_name,
+    ];
     run_git_os(parent, &args, token, CACHE_CLONE_TIMEOUT).inspect_err(|_| {
         // A failed clone must not leave a half-written cache behind for the
         // next caller's refresh to trip over.
@@ -238,7 +282,12 @@ pub fn provision_direct_checkout(
     let dir_name = checkout_path
         .file_name()
         .ok_or_else(|| Error::Internal("checkout path has no file name".to_string()))?;
-    let args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), cache_path.as_os_str(), dir_name];
+    let args: Vec<&std::ffi::OsStr> = vec![
+        "clone".as_ref(),
+        "--".as_ref(),
+        cache_path.as_os_str(),
+        dir_name,
+    ];
     run_git_os(parent, &args, None, CACHE_CLONE_TIMEOUT)?;
     (|| {
         // The local clone only maps the cache's refs/heads/* (its default
@@ -276,12 +325,14 @@ fn remove_cache_path(cache_path: &Path) -> Result<()> {
     }
 }
 
-/// Reject `owner`/`repo` values that would escape the cache root or collapse
-/// path segments — they come from external input (GitHub URLs / API payloads).
+/// Reject `owner`/`repo` values that would escape the cache root, collapse
+/// path segments, or read as a git option (leading `-`) — they come from
+/// external input (GitHub URLs / API payloads).
 fn validate_segment(what: &str, value: &str) -> Result<()> {
     let bad = value.is_empty()
         || value == "."
         || value == ".."
+        || value.starts_with('-')
         || value.contains('/')
         || value.contains('\\')
         || value.contains('\0');
@@ -326,6 +377,22 @@ fn run_git_os(
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
 
+    // Drain stderr concurrently: clone/fetch progress and diagnostics can
+    // fill the pipe on larger repos, and an undrained pipe blocks the child
+    // forever — the poll loop below would then kill a healthy child at the
+    // deadline.
+    let drain = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let read_stderr = |drain: Option<std::thread::JoinHandle<String>>| {
+        drain.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
+
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -333,7 +400,10 @@ fn run_git_os(
                 if status.success() {
                     return Ok(());
                 }
-                let stderr = read_stderr(&mut child);
+                // Redact before embedding: git stderr routinely echoes the
+                // remote URL, which may carry userinfo credentials; this
+                // message travels into logs, events, and JSON-RPC errors.
+                let stderr = crate::redact::redact_credentials(&read_stderr(drain));
                 return Err(Error::Internal(format!(
                     "git {} failed: {}",
                     args.first()
@@ -363,15 +433,6 @@ fn run_git_os(
             }
         }
     }
-}
-
-fn read_stderr(child: &mut std::process::Child) -> String {
-    use std::io::Read;
-    let mut buf = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut buf);
-    }
-    buf
 }
 
 #[cfg(test)]
@@ -586,8 +647,8 @@ mod tests {
         assert!(!root.path().join("acme").join("widget").exists());
     }
 
-    /// Owner/repo segments that would escape the cache root are rejected
-    /// before any filesystem or git work.
+    /// Owner/repo segments that would escape the cache root or read as a git
+    /// option are rejected before any filesystem or git work.
     #[tokio::test]
     async fn invalid_segments_are_rejected() {
         let root = CacheRoot::new("badseg");
@@ -599,12 +660,141 @@ mod tests {
             (".", "repo"),
             ("a/b", "repo"),
             ("owner", "a\\b"),
+            ("-owner", "repo"),
+            ("owner", "--upload-pack=x"),
         ] {
             let err = ensure_cached_repo(root.path(), "file:///nowhere", owner, repo, None)
                 .await
                 .expect_err("invalid segment must be rejected");
             assert!(matches!(err, Error::InvalidParams(_)), "{owner:?}/{repo:?}");
         }
+    }
+
+    /// The cache is keyed by owner/repo segments only, so a cached clone
+    /// whose `origin` does not match the requested URL (same owner/repo pair
+    /// on a different host/source) is wiped and re-cloned from the requested
+    /// URL — never served as a hit with the wrong content.
+    #[tokio::test]
+    async fn origin_mismatch_recloned_from_requested_url() {
+        let origin_a = init_repo("repocache-origin-hosta");
+        commit_file(origin_a.path(), "a.txt", "host A\n");
+        let origin_b = init_repo("repocache-origin-hostb");
+        commit_file(origin_b.path(), "b.txt", "host B\n");
+        let root = CacheRoot::new("hostkey");
+
+        let path = ensure_cached_repo(
+            root.path(),
+            &file_url(origin_a.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Same owner/repo pair, different source URL: must re-clone from B.
+        let path2 = ensure_cached_repo(
+            root.path(),
+            &file_url(origin_b.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(!marker.exists(), "origin mismatch must re-clone");
+        assert!(!path.join("a.txt").exists(), "host A content gone");
+        assert_eq!(
+            std::fs::read_to_string(path.join("b.txt")).unwrap(),
+            "host B\n"
+        );
+        assert_eq!(head_sha(&path), head_sha(origin_b.path()));
+    }
+
+    /// Untracked pollution in the cache work tree (e.g. leftovers from a
+    /// process killed mid-checkout) is cleaned by the refresh, so it never
+    /// copies into hydrated checkouts.
+    #[tokio::test]
+    async fn refresh_cleans_untracked_pollution() {
+        let origin = init_repo("repocache-origin-clean");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("clean");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        std::fs::write(path.join("pollution.txt"), "untracked leftover").unwrap();
+        std::fs::create_dir_all(path.join("junk-dir")).unwrap();
+        std::fs::write(path.join("junk-dir").join("x"), "y").unwrap();
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(
+            !path.join("pollution.txt").exists(),
+            "refresh must clean untracked files"
+        );
+        assert!(
+            !path.join("junk-dir").exists(),
+            "refresh must clean untracked directories"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    /// A remote that changed its default branch after the cache was cloned:
+    /// the refresh re-resolves `origin/HEAD` (`remote set-head --auto`) and
+    /// tracks the new default instead of pinning the obsolete one.
+    #[tokio::test]
+    async fn refresh_follows_changed_remote_default_branch() {
+        let origin = init_repo("repocache-origin-sethead");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("sethead");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Flip the remote's default branch to a new branch with new content.
+        {
+            let repo = Repository::open(origin.path()).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("develop", &head, false).unwrap();
+            repo.set_head("refs/heads/develop").unwrap();
+        }
+        commit_file(origin.path(), "dev.txt", "on develop\n");
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(
+            marker.exists(),
+            "default-branch change refreshes, no re-clone"
+        );
+        let repo = Repository::open(&path).unwrap();
+        assert_eq!(
+            repo.head().unwrap().shorthand().unwrap(),
+            "develop",
+            "cache tracks the remote's new default branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("dev.txt")).unwrap(),
+            "on develop\n"
+        );
     }
 
     /// Concurrent callers for the same repo serialize on the per-repo lock:
