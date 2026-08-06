@@ -39,8 +39,9 @@ on:
         default: false
       home_days:
         description: >-
-          $HOME/ci-target prune window in days (>= 1). Empty = automatic:
-          7 days, tightened to 1 while the root volume is low on space.
+          $HOME/ci-target prune window in days (>= 1). Empty = automatic
+          (7 days). Either way the window tightens to 1 day while the root
+          volume is low on space.
         type: string
         default: ""
 
@@ -119,12 +120,13 @@ jobs:
           # $HOME/ci-target window: 7 days by default, overridden by the
           # home_days dispatch input. Reject anything but an integer >= 1 —
           # a 0-day window would defeat the freshness check and delete
-          # running jobs' dirs.
+          # running jobs' dirs. 10# forces base-10 so leading-zero values
+          # like 08/09 don't parse as invalid octal literals downstream.
           home_days=7
           if [ -n "$HOME_DAYS" ]; then
             case "$HOME_DAYS" in *[!0-9]*) echo "invalid home_days: $HOME_DAYS" >&2; exit 1 ;; esac
-            [ "$HOME_DAYS" -ge 1 ] || { echo "invalid home_days: $HOME_DAYS" >&2; exit 1; }
-            home_days="$HOME_DAYS"
+            home_days=$(( 10#$HOME_DAYS ))
+            [ "$home_days" -ge 1 ] || { echo "invalid home_days: $HOME_DAYS" >&2; exit 1; }
           fi
           echo "free before: /raid $(free_gib /raid) GiB, root volume $(free_gib "$HOME") GiB (home window: ${home_days}d)"
           prune_targets 7 /raid/ci-target
@@ -137,8 +139,9 @@ jobs:
           fi
           # Root volume: all 8 slots share $HOME on it, and box-level ENOSPC
           # kills jobs mid-run, so tighten hard — while free space is
-          # < 50 GiB, sweep $HOME/ci-target with a 1-day window (the
-          # recursive freshness check still protects running jobs' dirs).
+          # < 50 GiB, sweep $HOME/ci-target with a 1-day window regardless
+          # of whether home_days was set explicitly (the recursive
+          # freshness check still protects running jobs' dirs).
           if [ "$home_days" -gt 1 ] && [ "$(free_gib "$HOME")" -lt 50 ]; then
             echo "root volume free < 50 GiB — tightening \$HOME/ci-target to 1 day"
             prune_targets 1 "$HOME/ci-target"
