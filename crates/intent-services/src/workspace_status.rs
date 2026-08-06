@@ -2489,6 +2489,50 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
+    /// Regression (intentd#945 review): the turn-end `raise_attention(Unread)`
+    /// never downgrades a persistent `review_required` flag — the raise is a
+    /// guarded no-op (no `attention-changed`, no `needs_attention → unread`
+    /// demotion), and a later `workspace.markSeen` (guarded on `unread`)
+    /// leaves the review-required attention in place.
+    #[tokio::test]
+    async fn unread_raise_never_downgrades_review_required() {
+        let h = harness().await;
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    attention: Some(intent_core::WorkspaceAttention::ReviewRequired),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set review_required");
+        // Seed: needs_attention baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert_silent(&mut sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ws.attention,
+            intent_core::WorkspaceAttention::ReviewRequired,
+            "turn-end unread raise must not overwrite review_required"
+        );
+
+        // markSeen only clears `unread`; review_required persists untouched.
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ws.attention,
+            intent_core::WorkspaceAttention::ReviewRequired
+        );
+    }
+
     /// ReviewRequired flag triggers (§6.5 step 2): a `workspace.update`
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it

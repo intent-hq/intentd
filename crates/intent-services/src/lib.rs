@@ -1741,6 +1741,12 @@ impl Services {
     /// blue dot. Persists `attention = level` and emits a self-sufficient
     /// `workspace:attention-changed` only when the value actually changes
     /// (§10.1). Best-effort: a missing workspace surfaces as an error.
+    ///
+    /// Raising `unread` never downgrades a persistent `review_required` flag
+    /// (which only `workspace.dismissAttention` retires): the write is guarded
+    /// on `attention = none`, so a completed turn on a review-required
+    /// workspace is a no-op — no event, no `needs_attention → unread`
+    /// demotion in the derived displayStatus.
     pub(crate) async fn raise_attention(
         &self,
         workspace_id: &WorkspaceId,
@@ -1752,9 +1758,14 @@ impl Services {
         // full-row replace, so a concurrent row mutation is never clobbered —
         // and let the write's row count decide "changed", so the
         // emit-only-on-change choice is atomic rather than read-based.
+        let expected = match level {
+            // Unread only promotes from a clear flag (see doc above).
+            WorkspaceAttention::Unread => Some(WorkspaceAttention::None),
+            _ => None,
+        };
         let changed = self
             .store
-            .set_workspace_attention(workspace_id, level, Some(&now_iso()), None)
+            .set_workspace_attention(workspace_id, level, Some(&now_iso()), expected)
             .await?;
         if !changed {
             return Ok(());
