@@ -619,6 +619,8 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     );
 
     // Mid-session change → applied on the SAME live session before the turn.
+    // Stored with the caller's spelling ("LOW"); the adapter must receive its
+    // OWN spelling ("low") since matching is case-insensitive.
     let updated = wss_rpc(
         &mut rpc,
         13,
@@ -626,11 +628,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
         json!({
             "workspaceId": ws_id,
             "agentId": agent_id,
-            "changes": { "reasoningEffort": "low" },
+            "changes": { "reasoningEffort": "LOW" },
         }),
     )
     .await;
-    assert_eq!(updated["agent"]["reasoningEffort"], "low", "{updated}");
+    assert_eq!(updated["agent"]["reasoningEffort"], "LOW", "{updated}");
     let sent3 = wss_rpc(
         &mut rpc,
         14,
@@ -644,7 +646,11 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     let log = read_config_log(&config_log);
     assert_eq!(log.len(), 2, "the change was applied: {log:?}");
     assert_eq!(log[1]["configId"], "effort", "{:?}", log[1]);
-    assert_eq!(log[1]["value"], "low", "{:?}", log[1]);
+    assert_eq!(
+        log[1]["value"], "low",
+        "the adapter's own spelling is sent, not the caller's: {:?}",
+        log[1]
+    );
 }
 
 /// A provider that advertises no `thought_level` option silently ignores the

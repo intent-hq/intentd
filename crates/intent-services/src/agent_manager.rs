@@ -2172,11 +2172,17 @@ impl AgentManager {
     /// Send the session's `reasoningEffort` to the provider through the
     /// `thought_level` config option discovered at session open, then update
     /// the handle's tracked `current_value` so the next call is a no-op until
-    /// the effort actually changes. No-op when: the provider advertised no
-    /// such option, the session has no effort set, the adapter is already on
-    /// that value, or the value is not among the ones the select accepts
-    /// (a stale effort from another provider's vocabulary must not be sent).
-    /// Failures are logged at WARN — the provider keeps its current effort.
+    /// the effort actually changes. A CLEARED effort restores the provider's
+    /// own default — the value the adapter reported at session open — so the
+    /// clear takes effect on the live session rather than leaving the last
+    /// applied level in place. No-op when: the provider advertised no such
+    /// option, the adapter is already on that value, or the value is not among
+    /// the ones the select accepts (a stale effort from another provider's
+    /// vocabulary must not be sent). Matching against the advertised values is
+    /// case-insensitive — the stored level keeps the caller's spelling
+    /// (validation is case-insensitive too), so the ADAPTER's spelling is what
+    /// gets sent. Failures are logged at WARN — the provider keeps its current
+    /// effort.
     async fn apply_thought_level(
         &self,
         conn: &Connection,
@@ -2184,25 +2190,32 @@ impl AgentManager {
         acp_session_id: &str,
         stored_effort: Option<&str>,
     ) {
-        let effort = stored_effort.map(str::trim).filter(|e| !e.is_empty());
-        let Some(effort) = effort else { return };
-        let Some((config_id, needed)) = ({
+        let requested = stored_effort.map(str::trim).filter(|e| !e.is_empty());
+        let Some((config_id, value)) = ({
             let handles = self.handles.lock().unwrap();
             handles.get(agent_id).and_then(|h| {
-                h.thought_level.as_ref().map(|t| {
-                    (
-                        t.config_id.clone(),
-                        t.current_value != effort
-                            && (t.values.is_empty() || t.values.iter().any(|v| v == effort)),
-                    )
+                h.thought_level.as_ref().and_then(|t| {
+                    // The adapter's own spelling of the requested level; with
+                    // no advertised values the stored spelling is all we have.
+                    // A cleared effort targets the provider's opening default.
+                    let value = match requested {
+                        Some(effort) => {
+                            match t.values.iter().find(|v| v.eq_ignore_ascii_case(effort)) {
+                                Some(v) => v.clone(),
+                                None if t.values.is_empty() => effort.to_string(),
+                                None => return None,
+                            }
+                        }
+                        None => t.initial_value.clone(),
+                    };
+                    (!value.is_empty() && !t.current_value.eq_ignore_ascii_case(&value))
+                        .then(|| (t.config_id.clone(), value))
                 })
             })
         }) else {
             return;
         };
-        if !needed {
-            return;
-        }
+        let effort = value.as_str();
         match intent_acp::session::set_session_config_option(
             conn,
             acp_session_id,
@@ -5852,7 +5865,7 @@ struct ResolvedSpawn {
     /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
     /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
     /// keeps emitting `-c model_reasoning_effort=…` for sessions whose
-    /// compound `{base}/{effort}` model id was split by migration 0079.
+    /// compound `{base}/{effort}` model id was split by migration 0080.
     reasoning_effort: Option<String>,
     cwd: PathBuf,
     provider_binary: Option<PathBuf>,
@@ -8705,6 +8718,7 @@ mod thought_level_tests {
     fn option(current: &str) -> ThoughtLevelOption {
         ThoughtLevelOption {
             config_id: "effort".to_string(),
+            initial_value: current.to_string(),
             current_value: current.to_string(),
             values: vec!["low".into(), "medium".into(), "high".into()],
         }
@@ -8775,8 +8789,49 @@ mod thought_level_tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
-    /// No stored effort (or a blank one) is a no-op: the provider keeps
-    /// whatever default it opened with.
+    /// The stored level keeps the caller's spelling, but the ADAPTER's own
+    /// spelling is what reaches `session/set_config_option` — otherwise a
+    /// validated `"HIGH"` would never be applied to a `["low","high"]` select.
+    #[tokio::test]
+    async fn caller_spelling_is_matched_case_insensitively() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("HIGH"))
+            .await;
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one call issued: {recorded:?}");
+        assert_eq!(recorded[0]["value"], "high", "adapter's own spelling sent");
+
+        // The tracked value advanced, so a differently-cased repeat is a no-op.
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("High"))
+            .await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "no redundant re-apply");
+    }
+
+    /// Clearing the effort restores the provider's own opening default on the
+    /// live session, rather than leaving the last applied level in place.
+    #[tokio::test]
+    async fn clearing_the_effort_restores_the_provider_default() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", None)
+            .await;
+        let values: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["high", "medium"]);
+
+        // Already back on the default → a second clear sends nothing.
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("   "))
+            .await;
+        assert_eq!(calls.lock().unwrap().len(), 2, "no redundant restore");
+    }
+
+    /// No stored effort (or a blank one) while the adapter is still on its
+    /// opening default is a no-op — nothing to restore.
     #[tokio::test]
     async fn absent_or_blank_stored_effort_is_a_no_op() {
         let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;

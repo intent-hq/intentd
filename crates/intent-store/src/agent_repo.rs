@@ -3769,20 +3769,20 @@ mod tests {
         assert_eq!(cleared.reasoning_effort, None, "cleared on update");
     }
 
-    /// Migration 0079 splits legacy codex `{base}/{effort}` compound model
+    /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
     /// ids into base model + `reasoning_effort`, guarded on codex evidence
     /// (provider column, `codex:` prefix, or known effort-variant base) AND a
     /// known effort suffix — slash-bearing non-codex ids stay untouched.
     #[tokio::test]
-    async fn migration_0079_splits_codex_compound_model_ids() {
+    async fn migration_0080_splits_codex_compound_model_ids() {
         use intent_core::now_iso;
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
         let ts = now_iso();
-        let ws_id = WorkspaceId("ws-0079".to_string());
+        let ws_id = WorkspaceId("ws-0080".to_string());
         let mk_id = || AgentId(format!("agent-{}", Uuid::new_v4()));
-        // (model, provider, expected model, expected effort after 0079)
+        // (model, provider, expected model, expected effort after 0080)
         let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
             // codex provider evidence → split.
             (
@@ -3830,12 +3830,12 @@ mod tests {
                 session.provider = provider.map(str::to_string);
                 store.insert_agent_session(&session).await.expect("insert");
             }
-            // Rewind to the pre-0079 schema so the reopen re-runs the
+            // Rewind to the pre-0080 schema so the reopen re-runs the
             // migration against these rows (same pattern as the 0054 test).
-            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 79")
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 80")
                 .execute(store.write_pool())
                 .await
-                .expect("forget 0079");
+                .expect("forget 0080");
             sqlx::query("ALTER TABLE agent_session DROP COLUMN reasoning_effort")
                 .execute(store.write_pool())
                 .await
@@ -3843,18 +3843,18 @@ mod tests {
             store.close().await;
         }
 
-        let store = Store::open(&tmp).await.expect("reopen applies 0079");
+        let store = Store::open(&tmp).await.expect("reopen applies 0080");
         for (id, (model, _, expected_model, expected_effort)) in ids.iter().zip(&cases) {
             let session = store.get_agent_session(id).await.expect("get");
             assert_eq!(
                 session.model.as_deref(),
                 Some(*expected_model),
-                "model after 0079 for legacy {model}"
+                "model after 0080 for legacy {model}"
             );
             assert_eq!(
                 session.reasoning_effort.as_deref(),
                 *expected_effort,
-                "reasoning_effort after 0079 for legacy {model}"
+                "reasoning_effort after 0080 for legacy {model}"
             );
         }
     }

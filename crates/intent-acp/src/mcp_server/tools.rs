@@ -831,8 +831,9 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let mut block = String::from(
         "    Specialist model options (pass the compound id as `model` to \
          `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
-         specialist's default; an option's `effort` is applied automatically \
-         unless you pass an explicit `reasoningEffort`):\n",
+         specialist's default; on `ws.agent.delegate` an option's `effort` is \
+         applied automatically unless you pass an explicit `reasoningEffort` — \
+         `ws.agent.create` applies only the `reasoningEffort` you pass):\n",
     );
     for spec in model_options {
         block.push_str("      ");

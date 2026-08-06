@@ -110,7 +110,12 @@ pub struct AcpSessionOpened {
 pub struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
-    /// The value the adapter reported as current at session open.
+    /// The value the adapter reported as current at session open — the
+    /// provider's own default, restored when the session's `reasoningEffort`
+    /// is cleared.
+    pub initial_value: String,
+    /// The value the adapter is currently on (tracked across applications so
+    /// an unchanged effort is never re-sent).
     pub current_value: String,
     /// The values the select accepts (flattened across groups). Used to skip
     /// an effort the adapter would reject.
@@ -804,6 +809,7 @@ fn discover_thought_level(
     };
     Some(ThoughtLevelOption {
         config_id: option.id.0.to_string(),
+        initial_value: select.current_value.0.to_string(),
         current_value: select.current_value.0.to_string(),
         values,
     })
