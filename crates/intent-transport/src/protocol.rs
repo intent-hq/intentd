@@ -35,10 +35,13 @@
 //! `workspaceId` param on `voice.transcribe` and the new
 //! `voice.getWorkspaceVocabulary` router method, plus the
 //! `voice.workspaceVocabulary.maxTerms` setting — 269 router methods,
-//! 306 total.
+//! 306 total. Version 5.2 adds the first-class `reasoningEffort` session
+//! field (additive; §5.5): accepted on `agent.create`, patchable/clearable
+//! via `agent.update` `changes`, and served on the `AgentSession` /
+//! `AgentLite` projections (omitted when unset) — no method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "5.1";
+pub const PROTOCOL_VERSION: &str = "5.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

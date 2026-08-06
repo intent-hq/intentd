@@ -23,7 +23,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
-    stop_reason_timestamp";
+    stop_reason_timestamp, reasoning_effort";
 
 /// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
 /// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
@@ -33,7 +33,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
-    sandbox_branch, stop_reason, stop_reason_timestamp";
+    sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
@@ -342,7 +342,7 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
     .transpose()
 }
 
-/// Bind the full 32-column `agent_session` insert value list onto `query`, in
+/// Bind the full 34-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
@@ -383,7 +383,8 @@ fn bind_session_insert<'q>(
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
-        .bind(&s.stop_reason_timestamp))
+        .bind(&s.stop_reason_timestamp)
+        .bind(&s.reasoning_effort))
 }
 
 impl Store {
@@ -398,7 +399,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -456,7 +457,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1317,7 +1318,7 @@ impl Store {
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
              metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
-             stop_reason_timestamp=? \
+             stop_reason_timestamp=?, reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1347,6 +1348,7 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
+        .bind(&s.reasoning_effort)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.write_pool())
@@ -1992,6 +1994,7 @@ fn map_session_row_with_system_prompt(
         name: col(row, "name")?,
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
         model: col(row, "model")?,
+        reasoning_effort: col(row, "reasoning_effort")?,
         provider: col(row, "provider")?,
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
@@ -2835,6 +2838,7 @@ mod tests {
             name: "First".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -2947,6 +2951,7 @@ mod tests {
             name: "Usage".to_string(),
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3098,6 +3103,7 @@ mod tests {
             name: "Baseline".to_string(),
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3725,6 +3731,134 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline NULL for pre-existing rows");
     }
 
+    /// `reasoning_effort` persists across insert → read (full + summary
+    /// projections) and clears via `update_agent_session` (PROTOCOL §5.5,
+    /// Option B: stored as-is, cleared when absent).
+    #[tokio::test]
+    async fn reasoning_effort_roundtrip_and_clear() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort".to_string());
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let full = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(full.reasoning_effort.as_deref(), Some("high"));
+        let summary = store
+            .get_agent_session_summary(&agent_id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
+
+        session.reasoning_effort = None;
+        store
+            .update_agent_session(&ws_id, &session)
+            .await
+            .expect("update");
+        let cleared = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(cleared.reasoning_effort, None, "cleared on update");
+    }
+
+    /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
+    /// ids into base model + `reasoning_effort`, guarded on codex evidence
+    /// (provider column, `codex:` prefix, or known effort-variant base) AND a
+    /// known effort suffix — slash-bearing non-codex ids stay untouched.
+    #[tokio::test]
+    async fn migration_0080_splits_codex_compound_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-0080".to_string());
+        let mk_id = || AgentId(format!("agent-{}", Uuid::new_v4()));
+        // (model, provider, expected model, expected effort after 0080)
+        let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
+            // codex provider evidence → split.
+            (
+                "gpt-5.3-codex/high",
+                Some("codex"),
+                "gpt-5.3-codex",
+                Some("high"),
+            ),
+            // codex compound prefix evidence → split.
+            (
+                "codex:gpt-5.3-codex/xhigh",
+                None,
+                "codex:gpt-5.3-codex",
+                Some("xhigh"),
+            ),
+            // known effort-variant base evidence → split.
+            (
+                "gpt-5.2-codex/medium",
+                None,
+                "gpt-5.2-codex",
+                Some("medium"),
+            ),
+            // bare codex model: no slash → untouched.
+            ("gpt-5.3-codex", Some("codex"), "gpt-5.3-codex", None),
+            // HuggingFace-style slash id, suffix not an effort level → untouched.
+            (
+                "unsloth/Qwen3-32B",
+                Some("unsloth"),
+                "unsloth/Qwen3-32B",
+                None,
+            ),
+            // effort-shaped suffix but no codex evidence → untouched.
+            ("some-org/high", None, "some-org/high", None),
+        ];
+        let ids: Vec<AgentId> = cases.iter().map(|_| mk_id()).collect();
+        {
+            let store = Store::open(&tmp).await.expect("create test store");
+            store
+                .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+                .await
+                .expect("insert workspace");
+            for (id, (model, provider, _, _)) in ids.iter().zip(&cases) {
+                let mut session = baseline_test_session(id, &ws_id, &ts, None);
+                session.model = Some(model.to_string());
+                session.provider = provider.map(str::to_string);
+                store.insert_agent_session(&session).await.expect("insert");
+            }
+            // Rewind to the pre-0080 schema so the reopen re-runs the
+            // migration against these rows (same pattern as the 0054 test).
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 80")
+                .execute(store.write_pool())
+                .await
+                .expect("forget 0080");
+            sqlx::query("ALTER TABLE agent_session DROP COLUMN reasoning_effort")
+                .execute(store.write_pool())
+                .await
+                .expect("drop reasoning_effort column");
+            store.close().await;
+        }
+
+        let store = Store::open(&tmp).await.expect("reopen applies 0080");
+        for (id, (model, _, expected_model, expected_effort)) in ids.iter().zip(&cases) {
+            let session = store.get_agent_session(id).await.expect("get");
+            assert_eq!(
+                session.model.as_deref(),
+                Some(*expected_model),
+                "model after 0080 for legacy {model}"
+            );
+            assert_eq!(
+                session.reasoning_effort.as_deref(),
+                *expected_effort,
+                "reasoning_effort after 0080 for legacy {model}"
+            );
+        }
+    }
+
     /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
     /// hydrates message contents ONLY when both the decoded snapshot and
     /// baseline are absent — snapshot- and/or baseline-backed sessions return
@@ -4186,6 +4320,7 @@ mod tests {
             name: "Test Agent".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -4341,6 +4476,7 @@ mod tests {
             name: "Test Agent".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: Some("auggie".to_string()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -4555,6 +4691,7 @@ mod tests {
                 name: format!("Agent {}", agent_id.0),
                 name_explicitly_set: false,
                 model: None,
+                reasoning_effort: None,
                 provider: None,
                 status: AgentStatus::Idle,
                 is_active: false,

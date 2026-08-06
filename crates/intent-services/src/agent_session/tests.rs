@@ -574,6 +574,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         name: "Builder".to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -3233,6 +3234,92 @@ async fn resume_session_resolves_and_persists_effective_model() {
         .await
         .expect("read resolved model");
     assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
+}
+
+/// A `session/new` result whose `configOptions` carry a `thought_level`
+/// select under an adapter-specific id (`effort`, as claude-agent-acp names
+/// it) — the shape the generic reasoning-effort discovery keys on.
+fn thought_level_session_result() -> Value {
+    json!({
+        "sessionId": ACP_SID,
+        "configOptions": [
+            { "id": "model", "name": "Model", "category": "model", "type": "select",
+              "currentValue": "sonnet",
+              "options": [ { "value": "sonnet", "name": "Sonnet" } ] },
+            { "id": "effort", "name": "Effort", "category": "thought_level",
+              "type": "select", "currentValue": "medium",
+              "options": [ { "value": "low", "name": "Low" },
+                           { "value": "medium", "name": "Medium" },
+                           { "value": "high", "name": "High" } ] }
+        ]
+    })
+}
+
+/// PROTOCOL §5.5: the reasoning-effort selector is discovered by CATEGORY, so
+/// the adapter's own config id (`effort` here, `reasoning_effort` for
+/// codex-acp) is carried back for the later `session/set_config_option`,
+/// together with its current value and accepted values.
+#[tokio::test]
+async fn open_session_discovers_thought_level_option() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-discover");
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(thought_level_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    let tl = opened.thought_level.expect("thought_level discovered");
+    assert_eq!(tl.config_id, "effort", "adapter's own config id is carried");
+    assert_eq!(tl.current_value, "medium");
+    assert_eq!(tl.values, vec!["low", "medium", "high"]);
+}
+
+/// A provider that advertises no `thought_level` option yields `None`, so the
+/// session's `reasoningEffort` is silently ignored for it.
+#[tokio::test]
+async fn open_session_without_thought_level_option_yields_none() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-absent");
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert!(opened.thought_level.is_none());
+}
+
+/// `session/load` (resume) discovers the selector the same way as
+/// `session/new` — a resumed session must honor `reasoningEffort` too.
+#[tokio::test]
+async fn resume_session_discovers_thought_level_option() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-resume");
+    session.acp_session_id = Some(ACP_SID.to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(thought_level_session_result());
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("resume")
+        .expect("resume yields opened session");
+    assert_eq!(
+        opened.thought_level.expect("discovered").config_id,
+        "effort"
+    );
 }
 
 /// `agent:stream:activity` leading-edge throttle (PROTOCOL §7): the first
