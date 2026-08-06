@@ -284,9 +284,17 @@ async fn lifecycle_loop(
                         );
                         // Catch-up for the unwatched window: recompute the
                         // derived state that missed `file:*`/`.git` events
-                        // would have refreshed. All three paths are
-                        // fingerprint- or diff-checked, so an untouched
-                        // workspace emits nothing.
+                        // would have refreshed. Cost is bounded to one pass
+                        // per workspace, but this is not a strict no-op for an
+                        // untouched workspace: the specialists flush is
+                        // fingerprint-checked and stays silent, while
+                        // `GitStatusRefresher::trigger` always republishes
+                        // `changes:git-status` (it debounces, it has no
+                        // baseline) and the skills flush compares only skill
+                        // names/count (so an edit confined to a `SKILL.md`
+                        // body is folded into the catalog without an event).
+                        // Both are pre-existing properties of the shared
+                        // refresh machinery, not of this transition.
                         refresher.trigger(ws_id.clone());
                         skills.resume_workspace(ws_id.clone(), path.clone());
                         specialists.resume_workspace(ws_id, path);
