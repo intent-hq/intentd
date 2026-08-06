@@ -262,10 +262,11 @@ pub(crate) fn checkout_in_clone(
 /// 3. Create + check out `branch` from `base_ref` via [`checkout_in_clone`]
 ///    (same base-ref resolution and branch-reuse semantics as the CoW path)
 ///    and hard-reset to it.
-/// 4. Retarget `origin` from the source path to the source's own `origin` URL.
-///    When the source has no `origin` (e.g. an `isNewRepo` local-only repo),
-///    the clone's `origin` remote is **removed** so no config value references
-///    the source path.
+/// 4. Retarget `origin` at the source's own `origin` URL, resolved so it is
+///    valid from the duplicate's directory ([`resolve_source_origin`]). When
+///    the source has no usable `origin` (e.g. an `isNewRepo` local-only repo,
+///    or an `origin` that is the source checkout itself), the clone's `origin`
+///    remote is **removed** so no config value references the source path.
 ///
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
@@ -284,11 +285,69 @@ pub fn provision_local_clone_checkout(
         .ok()
         .and_then(|r| r.url().map(str::to_owned).ok());
     drop(source);
-    let origin = match source_origin_url.as_deref() {
+    let resolved_origin = source_origin_url
+        .as_deref()
+        .and_then(|url| resolve_source_origin(source_repo, url));
+    let origin = match resolved_origin.as_deref() {
         Some(url) => OriginTarget::Url(url),
         None => OriginTarget::Remove,
     };
     provision_plain_clone_checkout(source_repo, checkout_path, origin, branch, base_ref)
+}
+
+/// The local filesystem path a remote URL denotes, or `None` when the URL is
+/// network-addressed (and therefore location-independent).
+///
+/// Git accepts local repositories both as bare paths (`../upstream`,
+/// `/srv/git/r`) and as `file://` URLs; everything else — an explicit scheme
+/// (`https://`, `ssh://`, `git://`) or the scp-like `user@host:path` shorthand
+/// — is remote. A single-letter segment before the colon is a Windows drive
+/// (`C:\repos\r`), not an scp host.
+fn local_origin_path(url: &str) -> Option<&str> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        return Some(rest);
+    }
+    if url.contains("://") {
+        return None;
+    }
+    if let Some(colon) = url.find(':') {
+        let host = &url[..colon];
+        let is_windows_drive = host.len() == 1 && host.chars().all(|c| c.is_ascii_alphabetic());
+        if !is_windows_drive && !host.contains('/') && !host.contains('\\') {
+            return None;
+        }
+    }
+    Some(url)
+}
+
+/// Resolve the source's `origin` URL into a value that still means the same
+/// thing from the duplicate's own directory, or `None` when `origin` must be
+/// dropped instead.
+///
+/// A network URL, and a local path that is already absolute, are carried over
+/// verbatim. The two cases that cannot be:
+///
+/// - A **relative** local path (`../upstream`) resolves against the repository
+///   holding it, so verbatim it would re-resolve against the duplicate's
+///   directory and name something else entirely. It is absolutized.
+/// - A local path resolving to `source_repo` itself means the source checkout
+///   *is* the upstream; keeping it would leave the duplicate depending on a
+///   directory that disappears with the source workspace (monorepo#1560), so
+///   the remote is dropped.
+fn resolve_source_origin(source_repo: &Path, url: &str) -> Option<String> {
+    let Some(local) = local_origin_path(url) else {
+        return Some(url.to_string());
+    };
+    let local = Path::new(local);
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let resolved = canonical(&source_repo.join(local));
+    if resolved == canonical(source_repo) {
+        return None;
+    }
+    if local.is_absolute() {
+        return Some(url.to_string());
+    }
+    Some(resolved.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -308,6 +367,16 @@ mod tests {
                 false
             }
         }
+    }
+
+    /// `testutil::init_repo` at a caller-chosen path, for tests that need two
+    /// repositories in a known relative layout (`../upstream`).
+    fn init_repo_at(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
     }
 
     fn unique_checkout(tag: &str) -> std::path::PathBuf {
@@ -702,6 +771,69 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
             "one\n"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// A **relative** local-path `origin` (`../upstream`) resolves against the
+    /// repository holding it, so carrying it over verbatim would re-resolve it
+    /// against the duplicate's directory. It is absolutized so it still names
+    /// the same upstream, and stays fetchable from the duplicate.
+    #[test]
+    fn local_clone_absolutizes_a_relative_local_origin() {
+        // `<tmp>/<parent>/{upstream,source}`, so `../upstream` is meaningful
+        // from the source but not from the duplicate's own directory.
+        let parent = unique_checkout("localclone-relparent");
+        let _cleanup_parent = Cleanup(parent.clone());
+        std::fs::create_dir_all(&parent).unwrap();
+        let upstream = parent.join("upstream");
+        init_repo_at(&upstream);
+        commit_file(&upstream, "a.txt", "one\n");
+        let source = parent.join("source");
+        init_repo_at(&source);
+        {
+            let repo = Repository::open(&source).unwrap();
+            repo.remote("origin", "../upstream").unwrap();
+        }
+        commit_file(&source, "a.txt", "one\n");
+
+        let checkout = unique_checkout("localclone-relorigin");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_local_clone_checkout(&source, &checkout, "dup-ws", None).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        let origin = clone.find_remote("origin").unwrap();
+        let url = std::path::Path::new(origin.url().unwrap());
+        assert!(url.is_absolute(), "relative origin must be absolutized");
+        assert_eq!(
+            std::fs::canonicalize(url).unwrap(),
+            std::fs::canonicalize(&upstream).unwrap(),
+            "absolutized origin still names the same upstream"
+        );
+        assert_self_contained(&checkout, &source);
+    }
+
+    /// A local-path `origin` that resolves to the source checkout ITSELF (so
+    /// the source is its own upstream): the remote is dropped rather than
+    /// pinning the duplicate to a directory that dies with the source.
+    #[test]
+    fn local_clone_removes_origin_pointing_at_the_source_itself() {
+        let source = init_repo("localclone-selforigin");
+        commit_file(source.path(), "a.txt", "one\n");
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &source.path().display().to_string())
+                .unwrap();
+        }
+
+        let checkout = unique_checkout("localclone-selforigin");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_local_clone_checkout(source.path(), &checkout, "dup-ws", None).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "an origin naming the source checkout must be removed"
         );
         assert_self_contained(&checkout, source.path());
     }
