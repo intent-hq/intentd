@@ -943,8 +943,10 @@ async fn specialist_model_options_surface_in_bridge_description() {
         "delegate docs must carry the options header:\n{desc}"
     );
     assert!(
-        desc.contains("chooser: `opencode:kimi-k3` (cheap), `auggie:opus`"),
-        "options line must list compound ids + hints in order: {desc}"
+        desc.contains(
+            "chooser: default: provider default, `opencode:kimi-k3` (cheap), `auggie:opus`"
+        ),
+        "options line must name the resolved default then compound ids + hints in order: {desc}"
     );
     assert!(
         !desc.contains("plain:"),
