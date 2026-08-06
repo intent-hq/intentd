@@ -39,31 +39,87 @@ use crate::{compute_task_stats, publish_event, system_actor, Services};
 /// touch. Shared across clones (behind `Arc`) so every service handle
 /// compares against the same last-emitted value. The map is private to this
 /// module: outside code can neither read nor write the baseline.
+///
+/// Evict-vs-in-flight-compute race: a recompute/enrichment reads the store,
+/// awaits, then writes the cache — a `workspace.delete` eviction can land in
+/// between, and the late write would resurrect a baseline for the deleted id
+/// (a leaked entry, and a stale comparison for an importer re-insert of the
+/// same id). Guard: `evictions` counts evictions under the same lock; writers
+/// snapshot it via [`DisplayStatusCache::generation`] *before* their store
+/// reads and their write is dropped when the counter moved and no entry
+/// survived for the id (an entry that still exists was not evicted — or was
+/// legitimately re-seeded — so the write proceeds). A dropped write is always
+/// safe: the next transition recomputes from fresh state.
 #[derive(Default)]
-pub(crate) struct DisplayStatusCache(Mutex<HashMap<WorkspaceId, WorkspaceDisplayStatus>>);
+pub(crate) struct DisplayStatusCache(Mutex<CacheInner>);
+
+#[derive(Default)]
+struct CacheInner {
+    map: HashMap<WorkspaceId, WorkspaceDisplayStatus>,
+    /// Total evictions since startup; see the eviction-race guard above.
+    evictions: u64,
+}
 
 impl DisplayStatusCache {
+    /// Snapshot the eviction generation. Writers capture this *before* their
+    /// store reads and pass it back to [`seed`](Self::seed) /
+    /// [`record`](Self::record), which drop the write when an eviction
+    /// intervened. A poisoned lock returns `u64::MAX` (never matches a live
+    /// generation, and the write path bails on the poisoned lock anyway).
+    fn generation(&self) -> u64 {
+        self.0.lock().map(|g| g.evictions).unwrap_or(u64::MAX)
+    }
+
     /// Seed the baseline when absent (read paths): records the first
     /// observation without reporting a transition, so the first post-read
-    /// mutation compares against it. Best-effort — a poisoned lock is
-    /// ignored.
-    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus) {
-        if let Ok(mut map) = self.0.lock() {
-            map.entry(workspace_id.clone()).or_insert(status);
+    /// mutation compares against it. `generation` is the pre-read snapshot;
+    /// a stale seed for an id with no surviving entry is dropped (eviction
+    /// race, see the type docs). Best-effort — a poisoned lock is ignored.
+    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus, generation: u64) {
+        if let Ok(mut inner) = self.0.lock() {
+            if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
+                return;
+            }
+            inner.map.entry(workspace_id.clone()).or_insert(status);
         }
     }
 
     /// Record `status` and report whether it transitioned since the last
     /// observation: `Some(false)` on a first observation (a seed has no
-    /// baseline to transition from), `None` on a poisoned lock (the caller
-    /// skips emission).
-    fn record(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus) -> Option<bool> {
+    /// baseline to transition from), `None` on a poisoned lock or when the
+    /// write was dropped by the eviction-race guard (the caller skips
+    /// emission). `generation` is the pre-read snapshot from
+    /// [`generation`](Self::generation).
+    fn record(
+        &self,
+        workspace_id: &WorkspaceId,
+        status: WorkspaceDisplayStatus,
+        generation: u64,
+    ) -> Option<bool> {
         match self.0.lock() {
-            Ok(mut map) => Some(match map.insert(workspace_id.clone(), status) {
-                Some(previous) => previous != status,
-                None => false,
-            }),
+            Ok(mut inner) => {
+                if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
+                    return None;
+                }
+                Some(match inner.map.insert(workspace_id.clone(), status) {
+                    Some(previous) => previous != status,
+                    None => false,
+                })
+            }
             Err(_) => None,
+        }
+    }
+
+    /// Drop the baseline for a deleted workspace so the entry does not leak
+    /// for the daemon's lifetime (and an importer re-insert of the same id
+    /// starts from a fresh seed instead of a stale baseline). Bumps the
+    /// eviction generation so in-flight computes that read the store before
+    /// the delete cascade cannot write a baseline back for the deleted id.
+    /// Best-effort — a poisoned lock is ignored.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.map.remove(workspace_id);
+            inner.evictions += 1;
         }
     }
 
@@ -73,6 +129,7 @@ impl DisplayStatusCache {
         self.0
             .lock()
             .expect("lock cache")
+            .map
             .contains_key(workspace_id)
     }
 }
@@ -92,6 +149,9 @@ impl Services {
         if ws.task_stats.is_none() {
             return;
         }
+        // Pre-read generation snapshot: a `workspace.delete` eviction racing
+        // the awaits below must not have this seed resurrect the baseline.
+        let generation = self.last_display_statuses.generation();
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`.
@@ -107,7 +167,8 @@ impl Services {
             ws.pr_status,
             ws.task_stats.as_ref(),
         );
-        self.last_display_statuses.seed(&ws.id, display_status);
+        self.last_display_statuses
+            .seed(&ws.id, display_status, generation);
         ws.display_status = Some(display_status);
     }
 
@@ -129,6 +190,11 @@ impl Services {
     /// insert have no await between them, so the window is negligible and
     /// self-heals on the next transition.
     pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
+        // Pre-read generation snapshot: an eviction (workspace.delete)
+        // landing between the store reads below and the cache write must
+        // drop this compute rather than re-insert a baseline for the
+        // deleted id (see the `DisplayStatusCache` docs).
+        let generation = self.last_display_statuses.generation();
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
         };
@@ -149,7 +215,10 @@ impl Services {
             ws.pr_status,
             Some(&task_stats),
         );
-        let Some(transitioned) = self.last_display_statuses.record(workspace_id, status) else {
+        let Some(transitioned) =
+            self.last_display_statuses
+                .record(workspace_id, status, generation)
+        else {
             return;
         };
         if transitioned {
@@ -158,6 +227,34 @@ impl Services {
                 display_status_changed_event(workspace_id, status),
             )
             .await;
+        }
+    }
+
+    /// Evict a deleted workspace's last-observed baseline (G7): called from
+    /// `workspace.delete` after the store cascade so the in-memory map does
+    /// not leak entries for the daemon's lifetime. Bumps the cache's eviction
+    /// generation, so a recompute that read the workspace before the cascade
+    /// drops its late write instead of resurrecting the baseline. Workspace
+    /// ids are never recycled by `workspace.create` (tombstoned via
+    /// `deleted_workspace_id`), so a stale-baseline collision could only
+    /// come from such a late write — which the generation guard prevents.
+    pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
+        self.last_display_statuses.evict(workspace_id);
+    }
+
+    /// Recompute after a spec-body write. The spec's markdown gates
+    /// `taskStats` (`extract_spec_task_ids`: with links present, only linked
+    /// child tasks count), so editing the spec body — adding/removing task
+    /// links, checkbox rewrites, version restores — can move the derived
+    /// rollup without any task-note mutation. Non-spec notes skip the probe
+    /// entirely; the dedup cache suppresses no-op spec writes.
+    pub(crate) async fn maybe_emit_display_status_for_spec_write(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &intent_core::NoteId,
+    ) {
+        if note_id.as_str() == "spec" {
+            self.maybe_emit_display_status_changed(workspace_id).await;
         }
     }
 
@@ -977,11 +1074,12 @@ mod display_status_events {
 
     use intent_core::{
         now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata, TaskStatus,
-        WorkspaceApi, WorkspaceId,
+        WorkspaceApi, WorkspaceDisplayStatus, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::{json, Value};
 
+    use super::DisplayStatusCache;
     use crate::tests::{workspace, DebounceEnvGuard, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
@@ -1339,6 +1437,67 @@ mod display_status_events {
         );
     }
 
+    /// G1: `agent.delete` recomputes the derived rollup — deleting the
+    /// top-level agent whose pending attention request drives
+    /// `needs_attention` emits the demotion.
+    #[tokio::test]
+    async fn agent_delete_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-del");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "blocker", "stuck", &now_iso())
+            .await
+            .expect("set attention");
+        // Seed: baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_delete_op(session.id.clone(), Some(h.ws.clone()))
+            .await
+            .expect("delete agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G2: `agent.update` recomputes when a status-relevant field changes —
+    /// flipping the attention-holding agent to `isBackground: true` removes
+    /// it from the needs_attention derivation and emits the demotion.
+    #[tokio::test]
+    async fn agent_update_is_background_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-bg");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "discussion", "input", &now_iso())
+            .await
+            .expect("set attention");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "isBackground": true }))
+            .await
+            .expect("update agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the question hold and emits the
     /// needs_attention → idle demotion.
@@ -1374,6 +1533,429 @@ mod display_status_events {
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
+    }
+
+    /// Bare spec note (no task metadata) whose body carries the task links
+    /// that gate `taskStats`.
+    fn spec_note(ws: &WorkspaceId, content: &str) -> Note {
+        let ts = now_iso();
+        Note {
+            id: NoteId::from("spec"),
+            workspace_id: ws.clone(),
+            title: "Spec".to_string(),
+            content: content.to_string(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: true,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    const LINK_T1: &str = "- [x] [Task t1](intent://local/task/t1)";
+    const LINK_T2: &str = "- [ ] [Task t2](intent://local/task/t2)";
+
+    /// G3: a spec-body write over `note.update` that changes the linked task
+    /// set moves the link-gated `taskStats` rollup and emits the transition.
+    #[tokio::test]
+    async fn spec_body_update_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, LINK_T1))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // Baseline: only t1 is linked → all complete.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(format!("{LINK_T1}\n{LINK_T2}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update spec body");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G4: `note.restoreVersion` on the spec re-gates `taskStats` from the
+    /// restored body and emits the transition.
+    #[tokio::test]
+    async fn spec_restore_version_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, "empty"))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // v1 links only the complete task; v2 links both.
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(LINK_T1.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write v1");
+        h.services
+            .update_note(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                intent_core::NoteUpdateInput {
+                    content: Some(format!("{LINK_T1}\n{LINK_T2}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write v2");
+        // Baseline: both linked → open tasks remain → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .restore_note_version(h.ws.clone(), NoteId::from("spec"), 1, None)
+            .await
+            .expect("restore v1");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// G5: a spec checkbox-line rewrite over `task.update` that strips a
+    /// task link re-gates `taskStats` and emits the transition.
+    #[tokio::test]
+    async fn spec_task_line_update_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, &format!("{LINK_T1}\n{LINK_T2}")))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        // Baseline: both linked → open tasks remain → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                2,
+                Some("plain text, link removed".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("rewrite checkbox line");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// G6: `task.createPrerequisite` with the spec as dependent adds a fresh
+    /// open spec-child task and emits the transition.
+    #[tokio::test]
+    async fn create_prerequisite_on_spec_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&spec_note(&h.ws, "no links"))
+            .await
+            .expect("insert spec");
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert t1");
+        // Baseline: fallback mode, one complete child → complete.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .create_prerequisite(
+                h.ws.clone(),
+                NoteId::from("spec"),
+                "Fresh prerequisite".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create prerequisite");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// G7: `workspace.delete` evicts the last-observed baseline so the
+    /// in-memory cache does not leak deleted-workspace entries.
+    #[tokio::test]
+    async fn workspace_delete_evicts_baseline() {
+        let h = harness().await;
+        // Hermetic root: the delete path sweeps the workspaces root, and
+        // tests must never touch `~/intent/workspaces`.
+        let root = crate::tests::WorkspacesRoot::new();
+        let services = h
+            .services
+            .clone()
+            .with_workspaces_root(root.path().to_path_buf());
+        services.maybe_emit_display_status_changed(&h.ws).await;
+        assert!(services.last_display_statuses.contains(&h.ws));
+
+        services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("delete workspace");
+        assert!(
+            !services.last_display_statuses.contains(&h.ws),
+            "deleted workspace's baseline must be evicted"
+        );
+    }
+
+    /// Eviction-race guard (PR #928 review): a compute whose generation
+    /// snapshot predates an eviction must drop its cache write — neither
+    /// `record` nor `seed` may resurrect a baseline for the deleted id.
+    #[tokio::test]
+    async fn stale_compute_after_eviction_drops_write() {
+        let cache = DisplayStatusCache::default();
+        let ws = WorkspaceId::new();
+
+        // In-flight recompute snapshots the generation, then the delete's
+        // eviction lands before its write.
+        let generation = cache.generation();
+        cache.record(&ws, WorkspaceDisplayStatus::InProgress, generation);
+        assert!(cache.contains(&ws));
+        cache.evict(&ws);
+        let stale = cache.record(&ws, WorkspaceDisplayStatus::Idle, generation);
+        assert_eq!(stale, None, "stale record must be dropped, not compared");
+        assert!(
+            !cache.contains(&ws),
+            "stale record must not resurrect the evicted baseline"
+        );
+
+        // Same for the read-path seed.
+        cache.seed(&ws, WorkspaceDisplayStatus::Idle, generation);
+        assert!(
+            !cache.contains(&ws),
+            "stale seed must not resurrect the evicted baseline"
+        );
+
+        // A fresh snapshot taken after the eviction writes normally (the
+        // importer re-insert / post-delete read path seeds fresh).
+        let fresh = cache.generation();
+        assert_eq!(
+            cache.record(&ws, WorkspaceDisplayStatus::Idle, fresh),
+            Some(false),
+            "fresh compute seeds without emitting"
+        );
+        assert!(cache.contains(&ws));
+
+        // An unrelated eviction does not drop writes for ids whose entry
+        // survives: the guard only bites when the id's own entry is gone.
+        let generation = cache.generation();
+        cache.evict(&WorkspaceId::new());
+        assert_eq!(
+            cache.record(&ws, WorkspaceDisplayStatus::Complete, generation),
+            Some(true),
+            "surviving entry still records a transition"
+        );
+    }
+
+    /// G8: `workspace.update` carrying a PR field recomputes — a `prStatus`
+    /// flip to open moves the derived rollup to `pr_open` and emits.
+    #[tokio::test]
+    async fn workspace_update_pr_status_transition_emits() {
+        let h = harness().await;
+        // Baseline: no tasks, no PR → not_started → idle.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    pr_status: Some(Some(intent_core::PullRequestStatus::Open)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "pr_open" })
+        );
+
+        // A non-PR update (title) does not probe: no event even if nothing
+        // else changed (and no spurious emission either).
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename workspace");
+        assert_silent(&mut sub).await;
+    }
+
+    /// Cross-agent isolation: agent B's turn-begin clear
+    /// (`clear_attention_request_if_present`) must not retire agent A's
+    /// pending request — the workspace stays `needs_attention` (no demotion
+    /// event) until A's own request is cleared.
+    #[tokio::test]
+    async fn other_agents_clear_preserves_needs_attention() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let a = super::workspace_needs_attention::mk_session(&h.ws, "agent-a");
+        let b = super::workspace_needs_attention::mk_session(&h.ws, "agent-b");
+        h.store.insert_agent_session(&a).await.expect("session a");
+        h.store.insert_agent_session(&b).await.expect("session b");
+        h.store
+            .set_attention_request(&h.ws, &a.id, "discussion", "A needs input", &now_iso())
+            .await
+            .expect("raise on A");
+        // Seed: baseline needs_attention (from A's pending request).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        // B's turn-begin clear: no request pending on B → no-op, no event.
+        manager
+            .clear_attention_request_if_present(&b.id, &h.ws)
+            .await;
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_agent_session(&a.id).await.expect("reload A");
+        assert_eq!(
+            reloaded.attention_request_kind.as_deref(),
+            Some("discussion"),
+            "A's pending request survives B's clear"
+        );
+        assert!(h.services.workspace_needs_attention(&h.ws).await);
+
+        // Clearing A's own request retires the hold and emits the demotion.
+        manager
+            .clear_attention_request_if_present(&a.id, &h.ws)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// An agent run ending must not demote a surviving `needs_attention`:
+    /// the pending request outranks both the running promotion and the
+    /// post-debounce idle recompute, so the whole begin→end cycle stays
+    /// silent and the read path keeps serving `needs_attention`.
+    #[tokio::test]
+    async fn agent_end_preserves_surviving_needs_attention() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-hold");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "blocker", "stuck", &now_iso())
+            .await
+            .expect("raise");
+        // Seed: baseline needs_attention.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        h.services.agent_activity_end(&h.ws).await;
+        // Wait out the debounced idle recompute: needs_attention outranks
+        // both transitions, so nothing emits (assert_silent's 300ms watch
+        // covers the 100ms debounce window).
+        assert_silent(&mut sub).await;
+        assert!(h.services.workspace_needs_attention(&h.ws).await);
+    }
+
+    /// Idle-demotion vs activity-begin race: an `agent_activity_begin`
+    /// landing inside the grace window cancels the pending idle flip — no
+    /// bogus `idle` demotion emits and the status stays `in_progress`.
+    #[tokio::test]
+    async fn activity_begin_in_grace_window_cancels_idle_demotion() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed: no agent running → idle baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+
+        // End then immediately begin again: the second begin cancels the
+        // pending idle debounce, so no demotion ever emits (assert_silent's
+        // 300ms watch covers the 100ms window).
+        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_silent(&mut sub).await;
     }
 
     /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):

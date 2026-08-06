@@ -97,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
         ]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
         ]
     );
 }
@@ -3068,10 +3068,10 @@ async fn agent_session_round_trip_and_append_only_log() {
 }
 
 /// Attention-request fields (`attention_request_kind` / `..._reason` /
-/// `..._timestamp`) round-trip through insert → update → get, and
-/// `clear_attention_request` clears them exactly once: `true` when a request
-/// was pending, `false` on the no-op repeat, `NotFound` for a missing session
-/// or workspace mismatch.
+/// `..._timestamp`) round-trip through insert → `set_attention_request` →
+/// get, and `clear_attention_request` clears them exactly once: `true` when a
+/// request was pending, `false` on the no-op repeat, `NotFound` for a missing
+/// session or workspace mismatch.
 #[tokio::test]
 async fn agent_session_attention_request_round_trip_and_clear() {
     let tmp = TempDb::new();
@@ -3094,15 +3094,11 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .await
         .expect("noop clear"));
 
-    // Persist a pending request via the full-session UPDATE writer.
-    let mut session = store.get_agent_session(&agent_id).await.expect("get");
-    session.attention_request_kind = Some("blocker".to_string());
-    session.attention_request_reason = Some("sandbox is broken".to_string());
-    session.attention_request_timestamp = Some("t-attn".to_string());
+    // Persist a pending request via the narrow attention writer.
     store
-        .update_agent_session(&ws, &session)
+        .set_attention_request(&ws, &agent_id, "blocker", "sandbox is broken", "t-attn")
         .await
-        .expect("update session");
+        .expect("set attention request");
 
     let loaded = store.get_agent_session(&agent_id).await.expect("reload");
     assert_eq!(loaded.attention_request_kind.as_deref(), Some("blocker"));
@@ -3146,6 +3142,90 @@ async fn agent_session_attention_request_round_trip_and_clear() {
             .await,
         Err(Error::NotFound(_))
     ));
+
+    // Narrow-writer NotFound parity: missing session and workspace mismatch.
+    assert!(matches!(
+        store
+            .set_attention_request(&ws, &AgentId::from("agent-missing"), "blocker", "r", "t")
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        store
+            .set_attention_request(&WorkspaceId::new(), &agent_id, "blocker", "r", "t")
+            .await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+/// G9 regression (attention-clobber race): the full-row
+/// `update_agent_session` must NOT write the `attention_request_*` columns.
+/// A long-lived in-memory `AgentSession` persisted mid-race can therefore
+/// neither resurrect a request that `clear_attention_request` already NULLed
+/// nor clobber a fresh one written by `set_attention_request` in the interim.
+#[tokio::test]
+async fn full_row_update_never_touches_attention_request_columns() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-eeeeeeee-1111-2222-3333-666666666666");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Race A: a stale session snapshot carrying a pending request must not
+    // resurrect it after a narrow clear.
+    store
+        .set_attention_request(&ws, &agent_id, "blocker", "sandbox broken", "t-attn")
+        .await
+        .expect("set attention request");
+    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    assert_eq!(stale.attention_request_kind.as_deref(), Some("blocker"));
+    assert!(store
+        .clear_attention_request(&ws, &agent_id, "t-clear")
+        .await
+        .expect("clear"));
+    store
+        .update_agent_session(&ws, &stale)
+        .await
+        .expect("racing full-row persist");
+    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(
+        after.attention_request_kind, None,
+        "full-row persist of a stale session must not resurrect a cleared request"
+    );
+    assert_eq!(after.attention_request_reason, None);
+    assert_eq!(after.attention_request_timestamp, None);
+
+    // Race B: a stale request-free snapshot must not clobber a fresh request.
+    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    store
+        .set_attention_request(&ws, &agent_id, "discussion", "need a decision", "t-attn-2")
+        .await
+        .expect("set attention request");
+    store
+        .update_agent_session(&ws, &stale)
+        .await
+        .expect("racing full-row persist");
+    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    assert_eq!(
+        after.attention_request_kind.as_deref(),
+        Some("discussion"),
+        "full-row persist of a stale session must not clobber a fresh request"
+    );
+    assert_eq!(
+        after.attention_request_reason.as_deref(),
+        Some("need a decision")
+    );
+    assert_eq!(
+        after.attention_request_timestamp.as_deref(),
+        Some("t-attn-2")
+    );
 }
 
 /// `insert_agent_session_with_messages` persists the session and its whole
@@ -4345,6 +4425,114 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_was_running_marker_set_clear_and_reset_semantics() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let script = |ws: &str, id: &str| intent_core::Script {
+        id: id.to_string(),
+        workspace_id: ws.to_string(),
+        name: "dev".to_string(),
+        command: "npm run dev".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Service,
+        category: None,
+        source: "user".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+    };
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("insert");
+    store
+        .upsert_script(&script("ws-1", "s-2"))
+        .await
+        .expect("insert");
+
+    // Fresh rows carry no marker.
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Set is scoped to the targeted (workspace, id) and survives repeated
+    // reads.
+    store
+        .set_script_was_running("ws-1", "s-1", true)
+        .await
+        .expect("set");
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())]
+    );
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())],
+        "marker persists until explicitly cleared"
+    );
+
+    // A write against the same id in a different workspace must not touch
+    // the row owned by ws-1 (the runtime registry permits the same
+    // client-supplied id in separate workspaces).
+    store
+        .set_script_was_running("ws-2", "s-1", false)
+        .await
+        .expect("cross-workspace no-op");
+    assert_eq!(
+        store.list_was_running_script_ids().await.expect("list"),
+        vec![("ws-1".to_string(), "s-1".to_string())],
+        "cross-workspace write is a no-op"
+    );
+
+    // An upsert (INSERT OR REPLACE) resets the marker — a replaced
+    // definition starts a fresh runtime life.
+    store
+        .upsert_script(&script("ws-1", "s-1"))
+        .await
+        .expect("replace");
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Clear is durable; an unknown id is a no-op, not an error.
+    store
+        .set_script_was_running("ws-1", "s-2", true)
+        .await
+        .expect("set");
+    store
+        .set_script_was_running("ws-1", "s-2", false)
+        .await
+        .expect("clear");
+    store
+        .set_script_was_running("ws-1", "missing", true)
+        .await
+        .expect("unknown id no-op");
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
+
+    // Remove deletes the row (marker gone with it).
+    store
+        .set_script_was_running("ws-1", "s-2", true)
+        .await
+        .expect("set");
+    assert!(store.remove_script("s-2").await.expect("remove"));
+    assert!(store
+        .list_was_running_script_ids()
+        .await
+        .expect("list")
+        .is_empty());
 }
 
 #[tokio::test]
