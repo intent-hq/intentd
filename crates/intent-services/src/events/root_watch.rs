@@ -11,8 +11,9 @@
 //! Watch registration itself never runs on the caller's thread: the OS-level
 //! `notify` call can block indefinitely (macOS FSEvents,
 //! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
-//! socket was bound. Every registration is therefore performed from a spawned
-//! task on the blocking pool; failures are logged rather than returned.
+//! socket was bound. Every registration is therefore performed on a detached
+//! OS thread — not the blocking pool, which the runtime waits for on shutdown
+//! — and failures are logged rather than returned.
 //!
 //! Event filtering also lives here: an event is forwarded when any of its
 //! paths falls under the canonical root and either matches the caller's
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// A watch on a single intended root that may not exist yet.
@@ -125,26 +126,44 @@ async fn watch_loop(
     promote_loop(root, filename_matches, on_change, inner).await;
 }
 
-/// Run [`recursive_watcher`] on the blocking pool. `None` means the blocking
-/// task itself failed (runtime shutdown), which is already logged.
+/// Run [`recursive_watcher`] off-thread. `None` means the registration never
+/// produced a result, which is already logged.
 async fn spawn_recursive_watcher(
     root: PathBuf,
     filename_matches: fn(&Path) -> bool,
     on_change: Arc<dyn Fn() + Send + Sync>,
 ) -> Option<notify::Result<RecommendedWatcher>> {
-    let handle =
-        tokio::task::spawn_blocking(move || recursive_watcher(&root, filename_matches, on_change));
-    join_watcher_task(handle).await
+    let rx = register_off_thread(move || recursive_watcher(&root, filename_matches, on_change));
+    await_registration(rx).await
 }
 
-/// Await a watcher-registration blocking task, logging a join failure.
-async fn join_watcher_task(
-    handle: JoinHandle<notify::Result<RecommendedWatcher>>,
+/// Perform a `notify` registration on a detached OS thread.
+///
+/// Deliberately not `spawn_blocking`: a started blocking task cannot be
+/// aborted and the runtime waits for the blocking pool while shutting down,
+/// so a registration parked inside the wedged backend this defers
+/// (intent-hq/monorepo#1572) would turn the startup stall into a shutdown
+/// hang. A detached thread is invisible to the runtime, so shutdown stays
+/// prompt; at worst a wedged registration leaks one thread for the lifetime
+/// of the process.
+fn register_off_thread(
+    build: impl FnOnce() -> notify::Result<RecommendedWatcher> + Send + 'static,
+) -> oneshot::Receiver<notify::Result<RecommendedWatcher>> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(build());
+    });
+    rx
+}
+
+/// Await an off-thread registration, logging a lost result.
+async fn await_registration(
+    rx: oneshot::Receiver<notify::Result<RecommendedWatcher>>,
 ) -> Option<notify::Result<RecommendedWatcher>> {
-    match handle.await {
+    match rx.await {
         Ok(result) => Some(result),
-        Err(e) => {
-            tracing::warn!(error = %e, "watch registration task did not complete");
+        Err(_) => {
+            tracing::warn!("watch registration thread did not report a result");
             None
         }
     }
@@ -217,7 +236,7 @@ async fn promote_loop(
         let ancestor = find_existing_ancestor(&root);
         let tx = wake_tx.clone();
         let watch_target = ancestor.clone();
-        let handle = tokio::task::spawn_blocking(move || {
+        let rx = register_off_thread(move || {
             let mut watcher =
                 notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
                     Ok(_) => {
@@ -233,7 +252,7 @@ async fn promote_loop(
             watcher.watch(&watch_target, RecursiveMode::NonRecursive)?;
             Ok(watcher)
         });
-        match join_watcher_task(handle).await {
+        match await_registration(rx).await {
             Some(Ok(watcher)) => store(&inner, watcher, ancestor.clone(), false),
             Some(Err(e)) => {
                 tracing::warn!(
