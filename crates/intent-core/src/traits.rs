@@ -139,11 +139,12 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// Archive a workspace (status→archived) (PROTOCOL §5.1).
     ///
-    /// `caller_agent_id` names the agent that initiated the archive (the MCP
-    /// `ws.workspace.archive` front door); it is excluded from the graceful
-    /// interrupt sweep so an agent archiving its own workspace is not
-    /// interrupted mid-tool-call. The RPC front door (FE/iOS) passes `None`,
-    /// which interrupts every in-flight turn in the workspace.
+    /// `caller_agent_id` names the agent that initiated the archive (the
+    /// agent-facing `ws.workspace.archive` host: the MCP front door and the
+    /// background-hook runtime); it is excluded from the graceful interrupt
+    /// sweep so an agent archiving its own workspace is not interrupted
+    /// mid-tool-call. The RPC front door (FE/iOS) passes `None`, which
+    /// interrupts every in-flight turn in the workspace.
     fn archive_workspace(
         &self,
         id: WorkspaceId,
