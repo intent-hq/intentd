@@ -71,7 +71,7 @@ const MESSAGE_USAGE_JSON_SQL: &str = "json_object('usage', \
 /// serde-encoded write paths) from erroring the statement.
 ///
 /// Must stay equivalent to the `WHERE` clause of the partial index
-/// `idx_agent_message_usage` (migration 0080) — SQLite only satisfies the
+/// `idx_agent_message_usage` (migration 0081) — SQLite only satisfies the
 /// filter from that index when the predicates match, and without the index
 /// the filter would load and parse every message body in the session.
 const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) \
@@ -4115,7 +4115,7 @@ mod tests {
             );
         }
 
-        // The filter must be satisfied from the partial index (migration 0080);
+        // The filter must be satisfied from the partial index (migration 0081);
         // a plan that scans agent_message loads and parses every body, which is
         // exactly the cost this read is supposed to avoid.
         let plan_sql = format!(
