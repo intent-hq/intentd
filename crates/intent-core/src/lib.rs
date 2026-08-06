@@ -77,7 +77,7 @@ pub use model::{
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
+    TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
     WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
     WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
     WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,

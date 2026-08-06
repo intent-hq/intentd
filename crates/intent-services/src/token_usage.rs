@@ -14,8 +14,10 @@
 //! without a store or bus; only the read + `workspace:tokenUsage-changed` event
 //! cross the wire (the scan itself has no RPC, §6.8).
 
+use std::collections::BTreeMap;
+
 use intent_acp::session::Usage;
-use intent_core::{AgentSession, TokenUsage, TokenUsageTotals};
+use intent_core::{AgentSession, TokenUsage, TokenUsageTotals, UsageCost};
 use serde_json::Value;
 
 /// Model key used when an agent session has no recorded model (§5.23 fallback).
@@ -29,7 +31,7 @@ pub const UNKNOWN_PROVIDER: &str = UNKNOWN_MODEL;
 
 /// One agent's contribution to the workspace tally: its `agent-{uuid}` id, the
 /// effective model name, and the summed per-turn counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentTokenTally {
     pub agent_id: String,
     pub model: String,
@@ -37,7 +39,10 @@ pub struct AgentTokenTally {
 }
 
 /// Add `rhs` into `lhs` counter-by-counter (saturating, so a pathological tally
-/// can never panic on overflow).
+/// can never panic on overflow). The optional `cost` is NOT folded here:
+/// bucket-level cost accumulation is currency-aware and lives in
+/// [`CostBucket`] (the roll-up) / [`UsageCost::merge`] (the pairwise
+/// baseline+snapshot fold).
 fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
     lhs.input_tokens = lhs.input_tokens.saturating_add(rhs.input_tokens);
     lhs.output_tokens = lhs.output_tokens.saturating_add(rhs.output_tokens);
@@ -47,12 +52,42 @@ fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
         .saturating_add(rhs.cache_creation_tokens);
 }
 
+/// Currency-aware cost accumulator for one roll-up bucket (`totals`, one
+/// `byAgentId` entry, one `byModel` entry): amounts sum per ISO 4217 code and
+/// the bucket resolves to the currency with the largest sum. Mixing
+/// currencies inside a bucket is pathological (an agent switching providers
+/// mid-workspace) — picking the dominant currency keeps the wire shape a
+/// single figure rather than inventing a conversion. A bucket with no
+/// reported cost resolves to `None` (never a fabricated zero).
+#[derive(Default)]
+struct CostBucket(BTreeMap<String, f64>);
+
+impl CostBucket {
+    fn add(&mut self, cost: Option<&UsageCost>) {
+        if let Some(cost) = cost {
+            *self.0.entry(cost.currency.clone()).or_insert(0.0) += cost.amount;
+        }
+    }
+
+    fn resolve(self) -> Option<UsageCost> {
+        self.0
+            .into_iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(currency, amount)| UsageCost { amount, currency })
+    }
+}
+
 /// Roll per-agent tallies up into the materialized `TokenUsage` snapshot:
 /// `byAgentId` keyed by `agent-{uuid}`, `byModel` keyed by the effective model
 /// name (`"unknown"` fallback), plus the workspace-wide `totals`. `lastScanAt`
 /// is stamped by the caller (the scan job records the RFC-3339 scan time).
+/// Provider-reported costs (§5.23) accumulate per bucket via [`CostBucket`];
+/// buckets no contributing session reported a cost for stay cost-less.
 pub fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     let mut usage = TokenUsage::default();
+    let mut totals_cost = CostBucket::default();
+    let mut agent_costs: BTreeMap<String, CostBucket> = BTreeMap::new();
+    let mut model_costs: BTreeMap<String, CostBucket> = BTreeMap::new();
     for tally in tallies {
         add_totals(&mut usage.totals, &tally.totals);
         add_totals(
@@ -64,7 +99,30 @@ pub fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
         } else {
             tally.model.clone()
         };
-        add_totals(usage.by_model.entry(model).or_default(), &tally.totals);
+        add_totals(
+            usage.by_model.entry(model.clone()).or_default(),
+            &tally.totals,
+        );
+        totals_cost.add(tally.totals.cost.as_ref());
+        agent_costs
+            .entry(tally.agent_id.clone())
+            .or_default()
+            .add(tally.totals.cost.as_ref());
+        model_costs
+            .entry(model)
+            .or_default()
+            .add(tally.totals.cost.as_ref());
+    }
+    usage.totals.cost = totals_cost.resolve();
+    for (agent_id, bucket) in agent_costs {
+        if let Some(entry) = usage.by_agent_id.get_mut(&agent_id) {
+            entry.cost = bucket.resolve();
+        }
+    }
+    for (model, bucket) in model_costs {
+        if let Some(entry) = usage.by_model.get_mut(&model) {
+            entry.cost = bucket.resolve();
+        }
     }
     usage
 }
@@ -117,6 +175,9 @@ pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cached_read_tokens.unwrap_or(0),
         cache_creation_tokens: usage.cached_write_tokens.unwrap_or(0),
+        // Cost rides on a separate ACP `usage_update` notification, not the
+        // end-of-turn report; the caller stamps it onto the snapshot.
+        cost: None,
     }
 }
 
@@ -145,6 +206,13 @@ pub fn agent_token_tally(
     if let Some(snapshot) = snapshot {
         add_totals(&mut totals, snapshot);
     }
+    // Cost combines with the same never-double-count rule as the counters
+    // (§5.23): the baseline banks folded-away ACP sessions, the snapshot is
+    // the current one.
+    totals.cost = UsageCost::merge(
+        baseline.and_then(|b| b.cost.as_ref()),
+        snapshot.and_then(|s| s.cost.as_ref()),
+    );
     AgentTokenTally {
         agent_id: agent_id.to_string(),
         model: model.unwrap_or("").to_string(),
@@ -187,6 +255,8 @@ fn extract_message_usage(content: &Value) -> Option<TokenUsageTotals> {
         output_tokens: field("outputTokens"),
         cache_read_tokens: field("cacheReadTokens"),
         cache_creation_tokens: field("cacheCreationTokens"),
+        // Legacy per-message metadata never carried a cost figure.
+        cost: None,
     })
 }
 
@@ -200,6 +270,21 @@ mod tests {
             output_tokens: o,
             cache_read_tokens: r,
             cache_creation_tokens: c,
+            cost: None,
+        }
+    }
+
+    fn cost(amount: f64, currency: &str) -> UsageCost {
+        UsageCost {
+            amount,
+            currency: currency.to_string(),
+        }
+    }
+
+    fn totals_with_cost(i: u64, o: u64, amount: f64, currency: &str) -> TokenUsageTotals {
+        TokenUsageTotals {
+            cost: Some(cost(amount, currency)),
+            ..totals(i, o, 0, 0)
         }
     }
 
@@ -228,6 +313,95 @@ mod tests {
         assert_eq!(usage.by_model["opus-4.8"], totals(150, 30, 12, 1));
         assert_eq!(usage.by_model[UNKNOWN_MODEL], totals(5, 5, 0, 0));
         assert!(usage.last_scan_at.is_none());
+    }
+
+    /// Cost aggregation (§5.23): reporting sessions sum per bucket, sessions
+    /// without a cost contribute nothing (never a fabricated 0), and a bucket
+    /// no session reported for stays cost-less.
+    #[test]
+    fn aggregates_cost_only_from_reporting_sessions() {
+        let tallies = vec![
+            AgentTokenTally {
+                agent_id: "agent-1".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(100, 20, 1.25, "USD"),
+            },
+            AgentTokenTally {
+                agent_id: "agent-2".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(50, 10, 0.75, "USD"),
+            },
+            AgentTokenTally {
+                agent_id: "agent-3".into(),
+                model: "sonnet-5".into(),
+                totals: totals(5, 5, 0, 0),
+            },
+        ];
+        let usage = aggregate_token_usage(&tallies);
+        assert_eq!(usage.totals.cost, Some(cost(2.0, "USD")));
+        assert_eq!(usage.by_agent_id["agent-1"].cost, Some(cost(1.25, "USD")));
+        assert_eq!(usage.by_model["opus-4.8"].cost, Some(cost(2.0, "USD")));
+        assert_eq!(
+            usage.by_agent_id["agent-3"].cost, None,
+            "a session that reported no cost contributes none"
+        );
+        assert_eq!(usage.by_model["sonnet-5"].cost, None);
+    }
+
+    /// Mixed currencies inside one bucket are pathological; the bucket keeps
+    /// the currency with the largest summed amount rather than inventing a
+    /// conversion.
+    #[test]
+    fn mixed_currencies_keep_the_largest_sum() {
+        let tallies = vec![
+            AgentTokenTally {
+                agent_id: "agent-1".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(10, 1, 1.0, "USD"),
+            },
+            AgentTokenTally {
+                agent_id: "agent-2".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(10, 1, 4.0, "EUR"),
+            },
+            AgentTokenTally {
+                agent_id: "agent-3".into(),
+                model: "opus-4.8".into(),
+                totals: totals_with_cost(10, 1, 2.0, "EUR"),
+            },
+        ];
+        let usage = aggregate_token_usage(&tallies);
+        assert_eq!(usage.totals.cost, Some(cost(6.0, "EUR")));
+        assert_eq!(usage.by_model["opus-4.8"].cost, Some(cost(6.0, "EUR")));
+    }
+
+    /// The per-agent tally merges the recreate baseline's banked cost with
+    /// the current session's snapshot cost, mirroring the counter rule.
+    #[test]
+    fn agent_token_tally_merges_baseline_and_snapshot_cost() {
+        let baseline = totals_with_cost(100, 80, 3.0, "USD");
+        let snapshot = totals_with_cost(5, 3, 1.5, "USD");
+        let both = agent_token_tally(
+            "agent-r",
+            Some("opus-4.8"),
+            Some(&baseline),
+            Some(&snapshot),
+            &[],
+        );
+        assert_eq!(both.totals.cost, Some(cost(4.5, "USD")));
+        // Baseline alone keeps its banked cost.
+        let baseline_only =
+            agent_token_tally("agent-r", Some("opus-4.8"), Some(&baseline), None, &[]);
+        assert_eq!(baseline_only.totals.cost, Some(cost(3.0, "USD")));
+        // Neither reported cost → none.
+        let cost_less = agent_token_tally(
+            "agent-r",
+            Some("opus-4.8"),
+            Some(&totals(1, 1, 0, 0)),
+            Some(&totals(1, 1, 0, 0)),
+            &[],
+        );
+        assert_eq!(cost_less.totals.cost, None);
     }
 
     #[test]

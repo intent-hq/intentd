@@ -1439,6 +1439,35 @@ mod session_tests {
         };
         assert_eq!(session::map_notification(&other), None);
     }
+
+    /// `usage_update` maps to [`MappedUpdate::UsageCost`] when it carries a
+    /// `cost` object (§5.23) and to `None` when it reports only the context
+    /// window — a cost-less provider must never fabricate a zero figure.
+    #[test]
+    fn usage_update_maps_only_when_cost_is_reported() {
+        let with_cost: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000,
+            "cost": { "amount": 1.25, "currency": "USD" }
+        }))
+        .expect("usage_update with cost deserializes");
+        assert_eq!(
+            session::map_session_update(&with_cost),
+            Some(MappedUpdate::UsageCost(session::MappedUsageCost {
+                amount: 1.25,
+                currency: "USD".to_string(),
+            }))
+        );
+
+        let without_cost: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000
+        }))
+        .expect("usage_update without cost deserializes");
+        assert_eq!(session::map_session_update(&without_cost), None);
+    }
 }
 
 /// Agent→BE MCP server, config conversions, env baseline/redaction, and the

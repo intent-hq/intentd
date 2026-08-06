@@ -9,7 +9,7 @@
 
 use intent_core::{
     AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    WorkspaceId,
+    UsageCost, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -1894,6 +1894,9 @@ impl Store {
                         cache_creation_tokens: b
                             .cache_creation_tokens
                             .saturating_add(s.cache_creation_tokens),
+                        // Cost is cumulative per ACP session exactly like the
+                        // counters, so the fold banks it the same way (§5.23).
+                        cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
                     })
                 }
             };
@@ -2973,6 +2976,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &first)
@@ -2983,6 +2987,7 @@ mod tests {
             output_tokens: 80,
             cache_read_tokens: 45,
             cache_creation_tokens: 6,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &second)
@@ -3140,6 +3145,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 5,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap1)
@@ -3172,6 +3178,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_creation_tokens: 40,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap2)
@@ -3194,6 +3201,7 @@ mod tests {
                 output_tokens: 60,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 45,
+                cost: None,
             }),
             "second recreate accumulates onto the baseline"
         );
@@ -3246,6 +3254,7 @@ mod tests {
             output_tokens: 8,
             cache_read_tokens: 9,
             cache_creation_tokens: 10,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3286,6 +3295,7 @@ mod tests {
             output_tokens: 4,
             cache_read_tokens: 5,
             cache_creation_tokens: 6,
+            cost: None,
         };
 
         // Write-once first set: snapshot and baseline stay untouched.
@@ -3361,6 +3371,7 @@ mod tests {
             output_tokens: 22,
             cache_read_tokens: 33,
             cache_creation_tokens: 44,
+            cost: None,
         };
 
         // Malformed snapshot + valid baseline: the fold treats the snapshot
@@ -3470,6 +3481,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3524,6 +3536,7 @@ mod tests {
             output_tokens: 6,
             cache_read_tokens: 7,
             cache_creation_tokens: 8,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3600,6 +3613,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             };
             store
                 .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3633,6 +3647,7 @@ mod tests {
                 output_tokens: 120,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             }),
             "every fold landed exactly once"
         );
@@ -3655,6 +3670,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         {
             let store = Store::open(&tmp).await.expect("create test store");
@@ -3716,6 +3732,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
 
         // Each session gets one message with usage metadata; only the
@@ -3809,6 +3826,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)

@@ -348,15 +348,55 @@ pub fn is_chief_workspace(id: &WorkspaceId) -> bool {
     id.0 == CHIEF_WORKSPACE_ID
 }
 
-/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1).
-/// Reused for the per-agent, per-model, and workspace-wide rollups.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A monetary cost figure attached to a token tally (PROTOCOL §5.23), sourced
+/// from the ACP `usage_update` session notification's `cost` object. `amount`
+/// is the cumulative spend and `currency` an ISO 4217 code (e.g. `"USD"`).
+/// Only providers that report cost populate it — absence is never coerced to
+/// zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl UsageCost {
+    /// Pairwise cost merge used where at most two figures combine (the
+    /// recreate baseline fold and the `baseline + snapshot` per-agent tally):
+    /// matching currencies sum, a (pathological) mismatch keeps the larger
+    /// amount. Absent operands contribute nothing.
+    pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
+        match (lhs, rhs) {
+            (None, None) => None,
+            (Some(c), None) | (None, Some(c)) => Some(c.clone()),
+            (Some(a), Some(b)) => Some(if a.currency == b.currency {
+                UsageCost {
+                    amount: a.amount + b.amount,
+                    currency: a.currency.clone(),
+                }
+            } else if b.amount > a.amount {
+                b.clone()
+            } else {
+                a.clone()
+            }),
+        }
+    }
+}
+
+/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1),
+/// plus the optional provider-reported cost. Reused for the per-agent,
+/// per-model, and workspace-wide rollups.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Cumulative cost, present only when at least one contributing session
+    /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<UsageCost>,
 }
 
 /// Durable token-usage snapshot returned by `workspace.getTokenUsage` and pushed
@@ -364,7 +404,7 @@ pub struct TokenUsageTotals {
 /// are `agent-{uuid}`; `byModel` keys are the effective model name (`"unknown"`
 /// fallback); `lastScanAt` is the RFC-3339 timestamp of the last internal scan
 /// (`null` before the first scan).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     pub by_agent_id: BTreeMap<String, TokenUsageTotals>,
@@ -3422,6 +3462,7 @@ mod tests {
                 output_tokens: 3400,
                 cache_read_tokens: 8000,
                 cache_creation_tokens: 1200,
+                cost: None,
             },
         );
         let mut by_model = BTreeMap::new();
@@ -3439,8 +3480,70 @@ mod tests {
         assert_eq!(v["byModel"]["opus-4.8"]["outputTokens"], 3400);
         assert_eq!(v["totals"]["inputTokens"], 12000);
         assert_eq!(v["lastScanAt"], serde_json::Value::Null);
+        // Absent cost is OMITTED (not null) so existing clients see the
+        // pre-cost shape byte-for-byte.
+        assert!(v["totals"].get("cost").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// A reported cost serializes as camelCase `cost: { amount, currency }`
+    /// on every `TokenUsage` bucket and round-trips (§5.23).
+    #[test]
+    fn token_usage_cost_wire_shape() {
+        let totals = TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: Some(UsageCost {
+                amount: 1.25,
+                currency: "USD".to_string(),
+            }),
+        };
+        let mut by_agent_id = BTreeMap::new();
+        by_agent_id.insert("agent-123".to_string(), totals.clone());
+        let mut by_model = BTreeMap::new();
+        by_model.insert("opus-4.8".to_string(), totals.clone());
+        let usage = TokenUsage {
+            by_agent_id,
+            totals,
+            by_model,
+            last_scan_at: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["totals"]["cost"]["amount"], 1.25);
+        assert_eq!(v["totals"]["cost"]["currency"], "USD");
+        assert_eq!(v["byAgentId"]["agent-123"]["cost"]["amount"], 1.25);
+        assert_eq!(v["byModel"]["opus-4.8"]["cost"]["currency"], "USD");
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    /// `UsageCost::merge`: matching currencies sum, a mismatch keeps the
+    /// larger amount, and absent operands contribute nothing.
+    #[test]
+    fn usage_cost_merge_rules() {
+        let usd = |amount: f64| UsageCost {
+            amount,
+            currency: "USD".to_string(),
+        };
+        let eur = |amount: f64| UsageCost {
+            amount,
+            currency: "EUR".to_string(),
+        };
+        assert_eq!(UsageCost::merge(None, None), None);
+        assert_eq!(UsageCost::merge(Some(&usd(1.0)), None), Some(usd(1.0)));
+        assert_eq!(UsageCost::merge(None, Some(&usd(2.0))), Some(usd(2.0)));
+        assert_eq!(
+            UsageCost::merge(Some(&usd(1.5)), Some(&usd(2.5))),
+            Some(usd(4.0))
+        );
+        assert_eq!(
+            UsageCost::merge(Some(&usd(1.0)), Some(&eur(9.0))),
+            Some(eur(9.0)),
+            "mismatched currencies keep the larger amount"
+        );
     }
 
     /// `SetupScript` serializes with the camelCase `updatedAt`/`generatedBy` keys
