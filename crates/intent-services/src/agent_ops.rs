@@ -317,6 +317,56 @@ fn ensure_bare_model_matches_provider(
     Ok(())
 }
 
+/// Reject a `reasoningEffort` level the resolved model provably does not
+/// support with `-32602` (InvalidParams), naming the valid values. Evidence is
+/// the cached model catalog's `effortLevels` for `model_id`
+/// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
+/// same probe-free, read-only rule as the bare-model ownership guard: with no
+/// evidence (no model, no cached row, or a row declaring no levels) the value
+/// passes through unvalidated, since providers own the effort vocabulary
+/// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
+/// caller's spelling.
+fn ensure_effort_supported_by_model(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogCache,
+    model_id: Option<&str>,
+    effort: &str,
+) -> Result<()> {
+    let Some(levels) = model_id.and_then(|m| cache.cached_effort_levels(m)) else {
+        return Ok(());
+    };
+    if levels.iter().any(|l| l.eq_ignore_ascii_case(effort)) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "{method}: reasoningEffort {effort} is not supported by model {} (valid values: {})",
+        model_id.unwrap_or_default(),
+        levels.join(", ")
+    )))
+}
+
+/// Resolve the effective `reasoningEffort` for a delegated/woken child
+/// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
+/// the chosen model option's declared effort, then the specialist's
+/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
+/// params collapse to unset without falling through — an explicit clear.
+fn resolve_delegate_reasoning_effort(
+    services: &Services,
+    param: Option<&str>,
+    specialist: Option<&str>,
+    model: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Option<String> {
+    if let Some(param) = param {
+        return (!param.trim().is_empty()).then(|| param.to_string());
+    }
+    let spec_id = specialist?;
+    let specialists_svc = services.specialists_service();
+    model
+        .and_then(|m| specialists_svc.resolve_model_option_effort(spec_id, workspace_path, m))
+        .or_else(|| specialists_svc.resolve_reasoning_effort(spec_id, workspace_path))
+}
+
 /// Resolve the provider `agent.delegate` should spawn on when the caller
 /// supplies no explicit `model` (spec Decision D2). The wire has no
 /// `provider` param, so the daemon must derive one itself instead of leaving
@@ -371,6 +421,41 @@ fn resolve_delegate_provider(
         }
         None => Ok(None),
     }
+}
+
+/// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
+/// the specialist's frontmatter `codingAgent` (or its compound `model`
+/// prefix) when it names a *known* provider, else the settings-derived
+/// default, bottoming out at the first registered provider — but tolerant of
+/// an unknown/unavailable provider instead of erroring, since a preview must
+/// never fail. Used by [`Services::specialist_model_options`] so the
+/// delegate-docs hint names the default each specialist's *own* provider
+/// override would actually pin, instead of assuming every specialist spawns
+/// on the shared settings-derived provider (a specialist pinned to another
+/// provider previously showed that other provider's fallback/`None`).
+pub(crate) fn resolve_delegate_provider_preview(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> String {
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            if intent_providers::find_provider(&provider_id).is_some() {
+                return provider_id;
+            }
+        }
+    }
+    crate::agent_session::derived_default_provider(&services.effective_settings())
+        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
 
 /// Reject a known provider id that the daemon's own provider discovery
@@ -2011,6 +2096,7 @@ impl Services {
         // `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
+            reasoning_effort,
             agent_type: _,
             metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
@@ -2020,6 +2106,10 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
+        // Empty/whitespace collapses to None (an explicit clear); a non-empty
+        // level is validated against the resolved model below, once the model
+        // resolution has settled.
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
@@ -2147,6 +2237,20 @@ impl Services {
                 }
             }
         }
+        // Reasoning effort (PROTOCOL §5.5): validate the requested level
+        // against the *resolved* model's cached `effortLevels`, with the same
+        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
+        // no evidence means the value passes through, since providers own the
+        // vocabulary. Runs before the session is persisted so a `-32602`
+        // rejection is side-effect free.
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.create",
+                &self.models_catalog,
+                resolved_model.as_deref(),
+                effort,
+            )?;
+        }
         let session = AgentSession {
             id,
             workspace_id,
@@ -2156,6 +2260,7 @@ impl Services {
             name,
             name_explicitly_set,
             model: resolved_model,
+            reasoning_effort,
             provider,
             system_prompt: None,
             specialist,
@@ -2471,6 +2576,7 @@ impl Services {
             "name",
             "nameExplicitlySet",
             "model",
+            "reasoningEffort",
             "provider",
             "systemPrompt",
             "specialist",
@@ -2536,6 +2642,10 @@ impl Services {
                 }
                 "model" => {
                     session.model = update_optional_string(value, "model")?;
+                }
+                "reasoningEffort" => {
+                    session.reasoning_effort = update_optional_string(value, "reasoningEffort")?
+                        .filter(|e| !e.trim().is_empty());
                 }
                 "provider" => {
                     session.provider = update_optional_string(value, "provider")?;
@@ -4656,20 +4766,46 @@ impl Services {
         // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
         // provider via `agent_create_op`'s existing derivation, so D2 is
         // skipped in that case.
+        // SECURITY: derive workspace_path from the stored workspace record,
+        // never a client-supplied value (same rationale as
+        // `agent_create_op`'s model resolution).
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
         let delegate_provider = if input.model.is_none() {
-            // SECURITY: derive workspace_path from the stored workspace
-            // record, never a client-supplied value (same rationale as
-            // `agent_create_op`'s model resolution).
-            let wp = self
-                .store
-                .get_workspace(&workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w));
-            resolve_delegate_provider(self, input.specialist.as_deref(), wp.as_deref())?
+            resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
             None
         };
+        // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
+        // effort > specialist frontmatter > unset, validated against the
+        // cached catalog's `effortLevels` for the effective model (the
+        // explicit `model`, else the specialist's own pin). Runs BEFORE the
+        // child is created so a `-32602` rejection is side-effect free.
+        let effective_model = input.model.clone().or_else(|| {
+            input.specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input.reasoning_effort.as_deref(),
+            input.specialist.as_deref(),
+            effective_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.delegate",
+                &self.models_catalog,
+                effective_model.as_deref(),
+                effort,
+            )?;
+        }
         let mut extra_metadata = serde_json::Map::new();
         if let Some(depth) = delegation_depth {
             extra_metadata.insert("delegationDepth".to_string(), json!(depth));
@@ -4682,6 +4818,7 @@ impl Services {
         extra_metadata.insert("isBackground".to_string(), json!(true));
         let extra = AgentCreateExtra {
             provider: delegate_provider,
+            reasoning_effort,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable
             // by the child's opening-turn `ws.workspace.setAgentName`
@@ -6740,6 +6877,42 @@ impl Services {
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
+        // Reasoning effort (PROTOCOL §5.11), create branch only: the
+        // wake-level param wins over `create.reasoningEffort`, then the chosen
+        // model option's effort, then the specialist frontmatter. Validated
+        // against the cached catalog's `effortLevels` for the resolved model
+        // before the child is created, so a `-32602` leaves no orphan.
+        // SECURITY: the project tier comes from the stored workspace record.
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        let effort_model = model.clone().or_else(|| {
+            specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input
+                .reasoning_effort
+                .as_deref()
+                .or(create_opts.reasoning_effort.as_deref()),
+            specialist.as_deref(),
+            effort_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.wakeOrCreate",
+                &self.models_catalog,
+                effort_model.as_deref(),
+                effort,
+            )?;
+        }
 
         // B5: rich create payload (`name` default `Task: {title}`,
         // `contextReferences` + provenance metadata folded into the persisted
@@ -6766,6 +6939,7 @@ impl Services {
         );
         let extra = AgentCreateExtra {
             provider,
+            reasoning_effort,
             agent_type,
             metadata,
             workspace_path: None,

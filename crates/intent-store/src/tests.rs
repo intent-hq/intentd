@@ -97,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80
         ]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80
         ]
     );
 }
@@ -278,6 +278,107 @@ async fn workspace_round_trip_and_archive_filter() {
     assert_eq!(got.path, Some("/tmp/ws-meta".to_string()));
     assert_eq!(got.repository_path, Some("/tmp/repo".to_string()));
     assert!(!got.archived);
+}
+
+/// `bump_workspace_last_activity` (monorepo#1580) is scoped and monotonic:
+/// it writes only `last_activity` (never `updated_at` or any other column),
+/// declines a stale or equal timestamp, fills a NULL column, overwrites a
+/// malformed stored value, tolerates differing fractional-second precision,
+/// and reports `NotFound` for a missing workspace.
+#[tokio::test]
+async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut seed = sample_workspace(&id, "Bump WS", false);
+    seed.last_activity = None;
+    seed.updated_at = "2020-01-01T00:00:00Z".to_string();
+    store.insert_workspace(&seed).await.expect("insert");
+
+    // NULL column: first bump writes.
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump from null"));
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.last_activity.as_deref(), Some("2026-01-01T00:00:00Z"));
+    // Scoped: no other column moved.
+    assert_eq!(got.updated_at, "2020-01-01T00:00:00Z");
+    assert_eq!(got.title, "Bump WS");
+
+    // Newer wins even with coarser fractional-second precision on the stored
+    // side (julianday comparison, not lexicographic).
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00.500Z")
+        .await
+        .expect("bump newer"));
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00.500Z")
+    );
+
+    // Older declines, leaving the stored value intact.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "2025-06-01T00:00:00Z")
+        .await
+        .expect("bump older"));
+    // Equal declines too.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00.500Z")
+        .await
+        .expect("bump equal"));
+    // Malformed input never writes.
+    assert!(!store
+        .bump_workspace_last_activity(&id, "not-a-timestamp")
+        .await
+        .expect("bump malformed"));
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00.500Z")
+    );
+    assert_eq!(
+        store.get_workspace(&id).await.expect("get").updated_at,
+        "2020-01-01T00:00:00Z"
+    );
+
+    // A malformed STORED value parses to NULL and is treated as older, so the
+    // bump repairs a corrupted column.
+    let corrupt_id = WorkspaceId::new();
+    let mut corrupt = sample_workspace(&corrupt_id, "Corrupt WS", false);
+    corrupt.last_activity = Some("not-a-timestamp".to_string());
+    store.insert_workspace(&corrupt).await.expect("insert");
+    assert!(store
+        .bump_workspace_last_activity(&corrupt_id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump over malformed stored value"));
+    assert_eq!(
+        store
+            .get_workspace(&corrupt_id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z")
+    );
+
+    // Missing workspace → NotFound.
+    assert!(matches!(
+        store
+            .bump_workspace_last_activity(&WorkspaceId::from("nope"), "2026-01-01T00:00:00Z")
+            .await,
+        Err(intent_core::Error::NotFound(_))
+    ));
 }
 
 #[tokio::test]
@@ -2967,6 +3068,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         name: "Builder".to_string(),
         name_explicitly_set: false,
         model: Some("opus".to_string()),
+        reasoning_effort: None,
         provider: None,
         system_prompt: Some("be helpful".to_string()),
         specialist: None,

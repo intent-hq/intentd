@@ -5560,9 +5560,11 @@ mod workspace_api_tool_tests {
             .with_agent_features(no_hooks_features())
             .with_specialist_model_options(vec![SpecialistModelOptions {
                 specialist: "implementor".to_string(),
+                default_model: Some("auggie:claude-opus-5".to_string()),
                 options: vec![SpecialistModelOption {
                     model: "opencode:kimi-k3".to_string(),
                     hint: "cheap".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             }]);
         let resp = srv
@@ -5571,8 +5573,10 @@ mod workspace_api_tool_tests {
             .unwrap();
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
-            desc.contains("implementor: `opencode:kimi-k3` (cheap)"),
-            "delegate docs must list the specialist's model options"
+            desc.contains(
+                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
+            ),
+            "delegate docs must list the specialist's default model and options"
         );
         assert!(
             !desc.contains("ws.hook."),
@@ -7621,6 +7625,7 @@ mod wsapi4_bindings_tests {
             name: format!("agent-{id}"),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,

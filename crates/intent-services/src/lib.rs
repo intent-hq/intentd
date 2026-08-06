@@ -829,7 +829,18 @@ impl Services {
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
-    /// per-agent `workspace_api` tool description at bridge creation.
+    /// per-agent `workspace_api` tool description at bridge creation. Each
+    /// listed specialist also carries the default a no-`model`
+    /// `agent.delegate` would pin, computed by
+    /// [`agent_ops::resolve_agent_default_model`] against the *same*
+    /// per-specialist provider [`agent_ops::resolve_delegate_provider_preview`]
+    /// resolves (mirroring [`agent_ops::resolve_delegate_provider`], the
+    /// provider `agent.delegate` itself spawns on) — not a single
+    /// settings-derived provider shared across every specialist, so a
+    /// specialist pinned to another provider (frontmatter `codingAgent` or a
+    /// compound `model` prefix) still shows the default it actually pins.
+    /// `is_background = true` matches `agent.delegate` always marking its
+    /// children background, so `backgroundAgents.*` settings apply here too.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -860,14 +871,28 @@ impl Services {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string(),
+                            reasoning_effort: o
+                                .get("reasoningEffort")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                         })
                     })
                     .collect();
                 if options.is_empty() {
                     return None;
                 }
+                let provider =
+                    agent_ops::resolve_delegate_provider_preview(self, Some(id), workspace_path);
                 Some(intent_acp::SpecialistModelOptions {
                     specialist: id.to_string(),
+                    default_model: agent_ops::resolve_agent_default_model(
+                        self,
+                        Some(id),
+                        workspace_path,
+                        Some(&provider),
+                        true,
+                    ),
                     options,
                 })
             })
@@ -1171,6 +1196,10 @@ impl Services {
     /// previously known value. Rapid calls for the same workspace coalesce into at most
     /// one event per `LAST_ACTIVITY_DEBOUNCE_MS` window, carrying the latest derived
     /// value. Cancels any pending timer for the workspace before scheduling a new one.
+    /// The derived value is also persisted (scoped, monotonic column write) so the cheap
+    /// read paths that do not derive — `list_workspaces_lite` and the
+    /// `workspace.subscribe` seq-0 snapshot — serve a fresh `lastActivity` after a daemon
+    /// restart (monorepo#1580).
     /// Best-effort: store/emit failures are logged but do not surface to the caller.
     pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
         // Cancel any pending debounce timer for this workspace and increment generation.
@@ -1219,6 +1248,28 @@ impl Services {
             // Emit only when the derived value changed.
             if old_activity != new_activity {
                 if let Some(new_val) = &new_activity {
+                    // Persist the derived value (monorepo#1580). Without this
+                    // the column keeps whatever the last full-row write left
+                    // behind, so cheap read paths that do not derive
+                    // (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+                    // snapshot) serve a stale `lastActivity` after a restart.
+                    // Scoped + monotonic: only this column moves, and an
+                    // out-of-order late timer can never walk the value back.
+                    // A declined bump (a concurrent writer already persisted
+                    // something newer) still emits below — the event is a
+                    // change signal, and the concurrent task's own event
+                    // carries the newer value.
+                    if let Err(e) = this
+                        .store
+                        .bump_workspace_last_activity(&ws_id, new_val)
+                        .await
+                    {
+                        tracing::warn!(
+                            workspace = %ws_id.as_str(),
+                            error = %e,
+                            "schedule_last_activity_event: persist lastActivity failed"
+                        );
+                    }
                     publish_event(
                         &this.event_bus,
                         workspace_updated_event(
@@ -17995,30 +18046,29 @@ impl WorkspaceApi for Services {
             let conversation_count = conversation.len() as i64;
             // Inline review comments: threads via GraphQL when available,
             // falling back to the flat REST list grouped by reply parent (the
-            // same fallback as `pr.listReviewComments`; resolution state is
-            // unavailable there, so every fallback thread counts as
-            // unresolved). The fallback is surfaced via
-            // `comments.threadResolutionUnknown` so consumers can tell the
-            // unresolved count is unreliable rather than silently treating
-            // resolved threads as unresolved.
-            let (threads, thread_resolution_unknown) = match pr_ops::fetch_all_pages(|p| {
+            // same fallback as `pr.listReviewComments`). Resolution state is
+            // unavailable on the fallback path, so every fallback thread
+            // counts as unresolved — the fallback is logged at `warn` with the
+            // underlying error so that degradation is visible at the default
+            // log level instead of silently inflating the unresolved count.
+            let threads = match pr_ops::fetch_all_pages(|p| {
                 sc.get_review_threads(&repo_ref, pr_number, p)
             })
             .await
             {
-                Ok((threads, _, _)) => (threads, false),
+                Ok((threads, _, _)) => threads,
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         error = %e,
                         pr_number,
-                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (threadResolutionUnknown)"
+                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (thread resolution state unavailable, unresolvedThreadCount may be inflated)"
                     );
                     let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
                         sc.list_review_comments(&repo_ref, pr_number, p)
                     })
                     .await
                     .map_err(pr_ops::map_sc_err)?;
-                    (pr_ops::fallback_threads(comments), true)
+                    pr_ops::fallback_threads(comments)
                 }
             };
             let (review_comment_count, unresolved_thread_count) =
@@ -18054,7 +18104,6 @@ impl WorkspaceApi for Services {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
                     "unresolvedThreadCount": unresolved_thread_count,
-                    "threadResolutionUnknown": thread_resolution_unknown,
                     "totalCount": conversation_count + review_comment_count,
                 },
             }))

@@ -42,6 +42,9 @@ pub struct SpecialistModelOption {
     pub model: String,
     /// Free-text hint for choosing this option; empty when the author gave none.
     pub hint: String,
+    /// Reasoning-effort level this option implies, passed as `reasoningEffort`
+    /// when the option is chosen; empty when the author declared none.
+    pub reasoning_effort: String,
 }
 
 /// One specialist's resolved `modelOptions` list, injected into the
@@ -49,6 +52,10 @@ pub struct SpecialistModelOption {
 pub struct SpecialistModelOptions {
     /// Specialist id (the `specialist` param of delegate/create).
     pub specialist: String,
+    /// Compound id a no-`model` delegate would pin, as resolved by the same
+    /// resolver the `resolvedModel` preview uses; `None` when resolution
+    /// yields the provider CLI default.
+    pub default_model: Option<String>,
     /// Ordered options as authored in the winning tier's frontmatter.
     pub options: Vec<SpecialistModelOption>,
 }
@@ -203,9 +210,10 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -217,7 +225,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -276,7 +284,7 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, threadResolutionUnknown, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `threadResolutionUnknown: true` flags a degraded read: thread resolution state could not be fetched, so every thread counts as unresolved and `unresolvedThreadCount` is unreliable.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
     This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
@@ -417,9 +425,10 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -429,7 +438,7 @@ API:
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
@@ -486,7 +495,7 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, threadResolutionUnknown, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `threadResolutionUnknown: true` flags a degraded read: thread resolution state could not be fetched, so every thread counts as unresolved and `unresolvedThreadCount` is unreliable.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
     This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
@@ -814,33 +823,46 @@ pub fn workspace_api_description_with_model_options(
 }
 
 /// Render the injected continuation block: one header line plus one line per
-/// specialist listing its options as `` `<compound id>` (<hint>) `` entries
-/// (the hint parenthetical is omitted when empty). All lines are indented ≥4
-/// so the `[agentFeatures]` pruning treats them as continuation lines of the
-/// `ws.agent.delegate` entry. Author-supplied text is flattened onto one line
-/// so a multi-line hint cannot break the description's line structure.
+/// specialist naming its resolved default (`` default `<compound id>` ``, or
+/// `default: provider default` when resolution yields the provider CLI
+/// default) followed by its options as `` `<compound id>` (<hint>) `` entries
+/// (the hint parenthetical is omitted when empty, and an option's declared
+/// reasoning effort is appended to it as `effort: <level>`). All lines are
+/// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
+/// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
+/// onto one line so a multi-line hint cannot break the description's line
+/// structure.
 fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (pass the compound id as `model` to \
          `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
-         specialist's default):\n",
+         specialist's default; on `ws.agent.delegate` an option's `effort` is \
+         applied automatically unless you pass an explicit `reasoningEffort` — \
+         `ws.agent.create` applies only the `reasoningEffort` you pass):\n",
     );
     for spec in model_options {
         block.push_str("      ");
         block.push_str(&flat(&spec.specialist));
         block.push_str(": ");
-        let entries: Vec<String> = spec
-            .options
-            .iter()
-            .map(|o| {
-                if o.hint.is_empty() {
-                    format!("`{}`", flat(&o.model))
-                } else {
-                    format!("`{}` ({})", flat(&o.model), flat(&o.hint))
-                }
-            })
-            .collect();
+        let mut entries: Vec<String> = vec![match spec.default_model.as_deref() {
+            Some(m) => format!("default `{}`", flat(m)),
+            None => "default: provider default".to_string(),
+        }];
+        entries.extend(spec.options.iter().map(|o| {
+            let mut paren: Vec<String> = Vec::new();
+            if !o.hint.is_empty() {
+                paren.push(flat(&o.hint));
+            }
+            if !o.reasoning_effort.is_empty() {
+                paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
+            }
+            if paren.is_empty() {
+                format!("`{}`", flat(&o.model))
+            } else {
+                format!("`{}` ({})", flat(&o.model), paren.join("; "))
+            }
+        }));
         block.push_str(&entries.join(", "));
         block.push('\n');
     }
@@ -1688,22 +1710,28 @@ mod tests {
         vec![
             SpecialistModelOptions {
                 specialist: "implementor".to_string(),
+                default_model: Some("auggie:claude-opus-5".to_string()),
                 options: vec![
                     SpecialistModelOption {
                         model: "opencode:kimi-k3".to_string(),
                         hint: "cheap".to_string(),
+                        reasoning_effort: String::new(),
                     },
                     SpecialistModelOption {
                         model: "auggie:opus".to_string(),
                         hint: String::new(),
+                        reasoning_effort: String::new(),
                     },
                 ],
             },
+            // No resolved default → the provider CLI default label.
             SpecialistModelOptions {
                 specialist: "verifier".to_string(),
+                default_model: None,
                 options: vec![SpecialistModelOption {
                     model: "grok:grok-5".to_string(),
                     hint: "fast reviews".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             },
         ]
@@ -1730,9 +1758,9 @@ mod tests {
     }
 
     // Options are injected as continuation lines directly under the
-    // `ws.agent.delegate` doc entry: compound id + hint per specialist, the
-    // hint parenthetical omitted when empty, and the next method line
-    // (`ws.agent.send`) still follows.
+    // `ws.agent.delegate` doc entry: the resolved default first, then compound
+    // id + hint per specialist, the hint parenthetical omitted when empty, and
+    // the next method line (`ws.agent.send`) still follows.
     #[test]
     fn model_options_injected_into_delegate_docs() {
         let features = AgentFeaturesSettings::default();
@@ -1747,12 +1775,17 @@ mod tests {
                 "chief={is_chief}: header missing"
             );
             assert!(
-                got.contains("implementor: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+                got.contains(
+                    "implementor: default `auggie:claude-opus-5`, \
+                     `opencode:kimi-k3` (cheap), `auggie:opus`"
+                ),
                 "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
             );
+            // An unresolved default renders the provider-CLI-default label
+            // rather than a fabricated id.
             assert!(
-                got.contains("verifier: `grok:grok-5` (fast reviews)"),
-                "chief={is_chief}: verifier options line missing"
+                got.contains("verifier: default: provider default, `grok:grok-5` (fast reviews)"),
+                "chief={is_chief}: verifier options line missing/miswritten:\n{got}"
             );
             // The block sits between the delegate entry and the next method
             // line, i.e. inside the delegate docs.
@@ -1782,6 +1815,41 @@ mod tests {
         }
     }
 
+    // A declared per-option `reasoningEffort` is rendered inside the option's
+    // parenthetical as `effort: <level>` — appended after a hint when both are
+    // present, and standing alone when the author gave no hint.
+    #[test]
+    fn model_options_block_renders_per_option_effort() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            default_model: None,
+            options: vec![
+                SpecialistModelOption {
+                    model: "fable-5".to_string(),
+                    hint: "hard tasks".to_string(),
+                    reasoning_effort: "high".to_string(),
+                },
+                SpecialistModelOption {
+                    model: "sonnet5".to_string(),
+                    hint: String::new(),
+                    reasoning_effort: "low".to_string(),
+                },
+            ],
+        }];
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            &options,
+        );
+        assert!(
+            got.contains(
+                "implementor: default: provider default, `fable-5` (hard tasks; effort: high), \
+                 `sonnet5` (effort: low)"
+            ),
+            "per-option effort not rendered:\n{got}"
+        );
+    }
+
     // The injection composes with feature pruning: a bridge with a disabled
     // toggle still gets the options block, and the pruned namespace stays
     // gone.
@@ -1794,7 +1862,7 @@ mod tests {
         let got = workspace_api_description_with_model_options(false, &features, &sample_options());
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
-            got.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
             "options block missing on a pruned description"
         );
     }
@@ -1805,9 +1873,11 @@ mod tests {
     fn model_options_flatten_multiline_hints() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
+            default_model: Some("auggie:claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
                 model: "opencode:kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),
+                reasoning_effort: String::new(),
             }],
         }];
         let got = workspace_api_description_with_model_options(

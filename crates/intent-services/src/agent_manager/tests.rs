@@ -363,6 +363,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name: "A".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -404,6 +405,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name: "B".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -459,6 +461,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name: "C".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -543,6 +546,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name: "D".into(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -694,6 +698,7 @@ fn mock_handle() -> AgentHandle {
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
+        thought_level: None,
         wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         wake_listener: None,
     }
@@ -1408,6 +1413,7 @@ fn track_mock_agent_inner(
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            thought_level: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
         },
@@ -1476,6 +1482,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         name: "Builder".to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -4433,6 +4440,25 @@ async fn services_with_specialists(dir: &TempSpecialistsDir) -> (TempDb, Service
     (tmp, services)
 }
 
+/// Like [`services_with_specialists`] but also wires a writable settings
+/// registry (TOML-backed, temp config dir) so a test can `apply()` provider/
+/// background-agent settings and see them reflected in resolution.
+async fn services_with_specialists_and_registry(
+    dir: &TempSpecialistsDir,
+) -> (TempDb, Services, tempfile::TempDir) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_specialist_dirs(Some(dir.0.clone()), None);
+    (tmp, services, config_dir)
+}
+
 /// An otherwise-empty session carrying just the `specialist` under test.
 fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
     AgentSession {
@@ -4444,6 +4470,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         name: "SpB".to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: specialist.map(str::to_string),
@@ -4539,6 +4566,15 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         "chooser",
         "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
     );
+    // Carries options plus a frontmatter `model` on the default provider →
+    // the resolved default is reported alongside them.
+    let default_provider = intent_providers::first_provider_id();
+    dir.write(
+        "pinned",
+        &format!(
+            "---\nname: \"Pinned\"\ndescription: \"Pinned default\"\nmodel: \"{default_provider}:pinned-model\"\nmodelOptions: [{{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}}]\n---\n\nbody"
+        ),
+    );
     // No options → omitted.
     dir.write(
         "plain",
@@ -4561,6 +4597,17 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
     assert_eq!(chooser.options[0].hint, "cheap");
     assert_eq!(chooser.options[1].model, "auggie:opus");
     assert_eq!(chooser.options[1].hint, "");
+    // No frontmatter model and no configured default → provider CLI default.
+    assert_eq!(chooser.default_model, None);
+    let pinned = listed
+        .iter()
+        .find(|s| s.specialist == "pinned")
+        .expect("pinned listed");
+    assert_eq!(
+        pinned.default_model.as_deref(),
+        Some(format!("{default_provider}:pinned-model").as_str()),
+        "the frontmatter default must be reported as the specialist's default"
+    );
     assert!(
         !listed.iter().any(|s| s.specialist == "plain"),
         "specialists without options are omitted"
@@ -4568,6 +4615,79 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
     assert!(
         !listed.iter().any(|s| s.specialist == "ghost"),
         "hidden specialists are omitted"
+    );
+}
+
+/// A specialist pinned to another provider via frontmatter `codingAgent`
+/// reports the default THAT provider would pin, not the settings-derived
+/// default shared by every other specialist (PR #958 review: `agent.delegate`
+/// resolves the specialist's own provider override before falling back to the
+/// settings-derived provider).
+#[tokio::test]
+async fn specialist_model_options_default_honors_specialist_coding_agent_override() {
+    let dir = TempSpecialistsDir::new();
+    let default_provider = intent_providers::first_provider_id();
+    // Pinned to a DIFFERENT (non-default) known provider than the settings
+    // default, with a provider-default configured for THAT provider only.
+    dir.write(
+        "opencode-pinned",
+        "---\nname: \"OpenCode pinned\"\ndescription: \"Pinned to opencode\"\ncodingAgent: \"opencode\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
+    );
+    let (_tmp, services, _cfg) = services_with_specialists_and_registry(&dir).await;
+    services
+        .settings_registry()
+        .expect("registry wired")
+        .apply(&[(
+            "model.providerDefaults".to_string(),
+            json!({ "opencode": "opencode:default-model" }),
+        )])
+        .expect("set opencode provider default");
+
+    let listed = services.specialist_model_options(None);
+    let pinned = listed
+        .iter()
+        .find(|s| s.specialist == "opencode-pinned")
+        .expect("opencode-pinned listed");
+    assert_eq!(
+        pinned.default_model.as_deref(),
+        Some("opencode:default-model"),
+        "default must be resolved against the specialist's own codingAgent \
+         override ({default_provider} is the settings-derived default, not opencode)"
+    );
+}
+
+/// Delegated agents are always background (`agent.delegate` sets
+/// `metadata.isBackground: true`), so the hint's default must apply
+/// `backgroundAgents.typeOverrides`/`defaultModel` — matching what a real
+/// delegate to this specialist actually pins (PR #958 review: the preview
+/// previously passed `is_background: false`, hiding these settings).
+#[tokio::test]
+async fn specialist_model_options_default_honors_background_agent_settings() {
+    let dir = TempSpecialistsDir::new();
+    dir.write(
+        "chooser",
+        "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
+    );
+    let (_tmp, services, _cfg) = services_with_specialists_and_registry(&dir).await;
+    services
+        .settings_registry()
+        .expect("registry wired")
+        .apply(&[(
+            "backgroundAgents.typeOverrides".to_string(),
+            json!({ "chooser": "auggie:background-model" }),
+        )])
+        .expect("set background type override");
+
+    let listed = services.specialist_model_options(None);
+    let chooser = listed
+        .iter()
+        .find(|s| s.specialist == "chooser")
+        .expect("chooser listed");
+    assert_eq!(
+        chooser.default_model.as_deref(),
+        Some("auggie:background-model"),
+        "background-agent type override must apply since agent.delegate always \
+         creates background agents"
     );
 }
 
@@ -4740,6 +4860,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         name: "Extra".to_string(),
         name_explicitly_set: false,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -9212,6 +9333,7 @@ mod harness_wake_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            thought_level: None,
             wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -9838,6 +9960,7 @@ mod model_change_notice_tests {
         ResolvedSpawn {
             provider: *intent_providers::provider_config(provider_id),
             model: model.map(str::to_string),
+            reasoning_effort: None,
             cwd: std::env::temp_dir(),
             provider_binary: None,
             extra_env: Default::default(),

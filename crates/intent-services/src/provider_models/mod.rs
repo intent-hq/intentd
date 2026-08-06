@@ -12,8 +12,8 @@
 //! - `claude-code` — ACP probe via the pinned npx adapter
 //!   ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
 //! - `codex` — ACP probe via a resolved `codex-acp` binary, falling back to
-//!   the pinned npx package. Base models with reasoning-effort support are
-//!   expanded into `{model}/{effort}` variants (parity with the FE). The FE
+//!   the pinned npx package. Base models with reasoning-effort support carry
+//!   their levels as `effortLevels` (parity with the FE). The FE
 //!   additionally tries a `codex app-server` transport first, but that path
 //!   exists to reuse its Electron-managed codex runtime; daemon-side the
 //!   codex-acp probe reaches the same catalog (codex-acp itself queries the
@@ -141,7 +141,7 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 }
 
 /// codex: ACP probe via a resolved `codex-acp` binary, else the pinned npx
-/// fallback. Effort-variant base models expand into `{model}/{effort}` rows.
+/// fallback. Effort-capable base models carry `effortLevels` on one row.
 ///
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
