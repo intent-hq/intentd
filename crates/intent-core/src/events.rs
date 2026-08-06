@@ -55,8 +55,13 @@ pub const AGENT_STREAM_START: &str = "agent:stream:start";
 // Payload is `{ agentId, messageId }` plus the server-derived live preview
 // (`lastAgentResponse` / `digest`, each omitted until derivable from the
 // streamed-so-far text); leading-edge throttled per agent (first activity of
-// a turn emits immediately, then at most one per second). Full transcript
-// content flows on the internal chat channel (`CHAT_STREAM_DELTA`) instead.
+// a turn emits immediately, then at most one per second). Emitted from BOTH
+// the assistant-text-chunk arm and the tool-call arm, sharing the one
+// per-agent throttle window, so a tool-heavy stretch keeps ticking; the
+// tool-call emit additionally carries `lastToolUse: { name, status }`
+// describing the call just recorded (absent on text-chunk emits). Full
+// transcript content flows on the internal chat channel
+// (`CHAT_STREAM_DELTA`) instead.
 pub const AGENT_STREAM_ACTIVITY: &str = "agent:stream:activity";
 // Terminal stream frame. The transcript-bearing terminal paths — normal
 // prompt-turn completion, harness-wake finalize, and the user-interrupt
