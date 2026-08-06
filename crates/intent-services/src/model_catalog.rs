@@ -377,6 +377,64 @@ impl ModelCatalogCache {
             .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
     }
 
+    /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
+    /// `model_id` may be compound (`provider:model`, restricting the search to
+    /// that provider) or bare (searched across every registered provider in
+    /// registry order). Returns the first non-empty `effortLevels` list found
+    /// on a matching cached row, or `None` when there is no evidence — no
+    /// cached entry, no matching row, or a row that declares no levels.
+    /// Synchronous, read-only, and probe-free like
+    /// [`Self::cached_catalog_claims`]: the delegation effort guard must never
+    /// block on a catalog fetch, and absence of evidence is never a rejection.
+    pub(crate) fn cached_effort_levels(&self, model_id: &str) -> Option<Vec<String>> {
+        let (scoped_provider, bare_id) = match model_id.split_once(':') {
+            Some((prefix, bare)) if source_for(prefix).is_some() => (Some(prefix), bare),
+            _ => (None, model_id),
+        };
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        for source in SOURCES {
+            if scoped_provider.is_some_and(|p| p != source.provider_id) {
+                continue;
+            }
+            let Some(entry) = entries.get(source.provider_id) else {
+                continue;
+            };
+            if entry.version_key != (source.version_key)() {
+                continue;
+            }
+            let levels = entry
+                .models
+                .iter()
+                .find(|row| {
+                    row.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| row_id_matches(source.provider_id, id, bare_id))
+                })
+                .and_then(|row| row.get("effortLevels"))
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<String>>()
+                })
+                .filter(|levels| !levels.is_empty());
+            if levels.is_some() {
+                return levels;
+            }
+        }
+        None
+    }
+
+    /// Seed a cache entry from tests in other modules (the real
+    /// [`Self::store`] is module-private). No persistence side effects: the
+    /// snapshot write is skipped when no `persist_path` is configured.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
+        self.store(provider_id, version_key, models, Self::now_ms());
+    }
+
     /// Provider ids whose cached catalog claims `bare_id` (see
     /// [`Self::cached_catalog_claims`]), in registry order.
     pub(crate) fn providers_claiming_model_cached(&self, bare_id: &str) -> Vec<String> {
@@ -636,12 +694,16 @@ fn failure_fallback(
 fn rows_claim_model(provider_id: &str, rows: &[Value], bare_id: &str) -> bool {
     rows.iter()
         .filter_map(|row| row.get("id").and_then(Value::as_str))
-        .any(|id| {
-            id == bare_id
-                || id
-                    .split_once(':')
-                    .is_some_and(|(prefix, bare)| prefix == provider_id && bare == bare_id)
-        })
+        .any(|id| row_id_matches(provider_id, id, bare_id))
+}
+
+/// Whether one cached row id (`row_id`, from `provider_id`'s catalog) names
+/// `bare_id` under [`rows_claim_model`]'s matching rules.
+fn row_id_matches(provider_id: &str, row_id: &str, bare_id: &str) -> bool {
+    row_id == bare_id
+        || row_id
+            .split_once(':')
+            .is_some_and(|(prefix, bare)| prefix == provider_id && bare == bare_id)
 }
 
 #[cfg(test)]
