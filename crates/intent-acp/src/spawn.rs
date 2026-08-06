@@ -25,6 +25,11 @@ pub struct SpawnOptions<'a> {
     pub provider: &'a ProviderConfig,
     /// Raw (provider-stripped) model id, or `None`.
     pub model: Option<&'a str>,
+    /// Session-level reasoning-effort level (PROTOCOL §5.5, Option B), or
+    /// `None` for the provider default. Consumed by the codex `-c
+    /// model_reasoning_effort=…` config override; an effort embedded in a
+    /// compound `{base}/{effort}` model id still wins over this value.
+    pub reasoning_effort: Option<&'a str>,
     /// Working directory for the child.
     pub cwd: Option<&'a Path>,
     /// Path to a rules file (appended when the provider supports rules).
@@ -66,6 +71,7 @@ impl<'a> SpawnOptions<'a> {
         Self {
             provider,
             model: None,
+            reasoning_effort: None,
             cwd: None,
             rules_file: None,
             mcp_config_file: None,
@@ -108,10 +114,14 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
         },
     );
     if opts.provider.id == "codex" {
+        // Effort fallback precedence: session `reasoningEffort` field, then
+        // the env seam. An effort embedded in a compound `{base}/{effort}`
+        // model id wins over both (inside `apply_codex_config_args`).
         let env_effort = std::env::var("CODEX_REASONING_EFFORT")
             .ok()
             .or_else(|| std::env::var("CODEX_MODEL_REASONING_EFFORT").ok());
-        provider_args = apply_codex_config_args(provider_args, opts.model, env_effort.as_deref());
+        let effort = opts.reasoning_effort.or(env_effort.as_deref());
+        provider_args = apply_codex_config_args(provider_args, opts.model, effort);
     }
     args.extend(provider_args);
     args
@@ -291,6 +301,47 @@ mod build_args_tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["--remove-tool", "sub-agent-explore"]));
+    }
+
+    #[test]
+    fn build_args_applies_session_reasoning_effort_for_codex() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(codex);
+        opts.model = Some("gpt-5.3-codex");
+        opts.reasoning_effort = Some("xhigh");
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"xhigh\""),
+            "session effort missing from codex args: {args:?}"
+        );
+
+        // A compound {base}/{effort} model id wins over the session field.
+        let mut opts = SpawnOptions::new(codex);
+        opts.model = Some("gpt-5.3-codex/high");
+        opts.reasoning_effort = Some("xhigh");
+        let args = build_args(&opts);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"high\""),
+            "model-embedded effort must win: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("xhigh")),
+            "session effort must not override the model-embedded one: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_ignores_reasoning_effort_for_non_codex_providers() {
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(auggie);
+        opts.reasoning_effort = Some("high");
+        let args = build_args(&opts);
+        assert!(
+            !args.iter().any(|a| a.contains("model_reasoning_effort")),
+            "non-codex spawn args unexpectedly carry effort config: {args:?}"
+        );
     }
 
     #[test]

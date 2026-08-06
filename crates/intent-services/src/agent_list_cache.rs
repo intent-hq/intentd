@@ -281,6 +281,7 @@ mod tests {
             name: id.to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,

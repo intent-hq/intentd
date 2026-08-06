@@ -274,7 +274,29 @@ fn parse_empty_available_models_still_reads_config_options() {
 }
 
 #[test]
-fn parse_codex_models_expands_effort_variants() {
+fn parse_acp_models_carry_adapter_advertised_effort_levels() {
+    // claude-agent-acp advertises per-model effort support as
+    // `supportedEffortLevels`; it surfaces as `effortLevels` (PROTOCOL §5.30).
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "opus", "name": "Opus",
+              "supportedEffortLevels": ["low", "medium", "high", "max"] },
+            { "modelId": "haiku", "name": "Haiku" },
+            { "modelId": "sonnet", "name": "Sonnet", "supportedEffortLevels": [] }
+        ] }
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0]["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+    assert!(!rows[1].as_object().unwrap().contains_key("effortLevels"));
+    assert!(!rows[2].as_object().unwrap().contains_key("effortLevels"));
+}
+
+#[test]
+fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
     let payload = json!({
         "models": {
             "available": [
@@ -285,37 +307,50 @@ fn parse_codex_models_expands_effort_variants() {
         }
     });
     let rows = parse_codex_acp_models(&payload);
-    // 4 effort variants + 1 bare model
-    assert_eq!(rows.len(), 5);
-    assert_eq!(rows[0]["id"], "gpt-5.3-codex/low");
-    assert_eq!(rows[0]["name"], "GPT-5.3 Codex (Low)");
+    // One base row per model — no `{model}/{effort}` expansion.
+    assert_eq!(rows.len(), 2);
     assert_eq!(
-        rows[0]["description"],
-        "Flagship coding model — faster responses with less deliberation"
+        rows[0],
+        json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex",
+                "description": "Flagship coding model",
+                "effortLevels": ["low", "medium", "high", "xhigh"] })
     );
-    assert_eq!(rows[3]["id"], "gpt-5.3-codex/xhigh");
-    assert_eq!(rows[3]["name"], "GPT-5.3 Codex (Xhigh)");
     assert_eq!(
-        rows[4],
+        rows[1],
         json!({ "id": "gpt-5.4", "name": "GPT-5.4", "provider": "codex" })
     );
-    assert!(rows.iter().all(|r| r["provider"] == "codex"));
 }
 
 #[test]
-fn parse_codex_models_effort_variant_without_description() {
+fn parse_codex_models_effort_levels_without_description() {
     let payload = json!({ "models": { "availableModels": [ { "modelId": "gpt-5.2-codex" } ] } });
     let rows = parse_codex_acp_models(&payload);
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows[1]["id"], "gpt-5.2-codex/medium");
-    assert_eq!(rows[1]["description"], "Balanced speed and reasoning depth");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex",
+                "effortLevels": ["low", "medium", "high", "xhigh"] })
+    );
+}
+
+#[test]
+fn parse_codex_models_prefer_adapter_advertised_effort_levels() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.3-codex", "name": "GPT-5.3 Codex",
+              "supportedEffortLevels": ["low", "high"] }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["effortLevels"], json!(["low", "high"]));
 }
 
 #[test]
 fn parse_codex_models_from_config_options() {
     // Canned from a live codex-acp@0.16.0 session/new result (2026-07-21):
     // same configOptions[id="model"].options shape as claude-code. None of
-    // these ids are effort-variant base models, so no expansion happens.
+    // these ids are effort-capable, so no row carries `effortLevels`.
     let payload = json!({
         "sessionId": "sess_2",
         "modes": { "currentModeId": "auto", "availableModes": [] },
@@ -360,8 +395,9 @@ fn parse_codex_models_from_config_options() {
 }
 
 #[test]
-fn parse_codex_config_options_expand_effort_variants() {
-    // Effort-variant base models expand even when reported via configOptions.
+fn parse_codex_config_options_carry_effort_levels() {
+    // Effort-capable base models carry `effortLevels` when reported via
+    // configOptions too — still one row per model.
     let payload = json!({
         "configOptions": [
             { "id": "model",
@@ -369,9 +405,12 @@ fn parse_codex_config_options_expand_effort_variants() {
         ]
     });
     let rows = parse_codex_acp_models(&payload);
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0]["id"], "gpt-5.3-codex/low");
-    assert_eq!(rows[3]["id"], "gpt-5.3-codex/xhigh");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "gpt-5.3-codex");
+    assert_eq!(
+        rows[0]["effortLevels"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
 }
 
 #[test]
