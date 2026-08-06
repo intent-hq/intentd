@@ -133,10 +133,12 @@ pub trait SourceControl: Send + Sync {
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>>;
 
     /// The forge's authoritative review-requirement verdict for a pull
-    /// request (GraphQL `reviewDecision` on GitHub). `Ok(None)` means the
-    /// forge reports no review requirement (e.g. an unprotected base
-    /// branch); the default implementation returns `Ok(None)` for hosts
-    /// without the signal.
+    /// request (GraphQL `reviewDecision` on GitHub). `Ok(None)` means no
+    /// authoritative decision is available (e.g. an unprotected base
+    /// branch, or the host lacks the signal) — not a positive assertion
+    /// that reviews aren't required; callers fall back to an
+    /// aggregate-derived decision. The default implementation returns
+    /// `Ok(None)` for hosts without the signal.
     async fn review_decision(
         &self,
         _repo: &RepoRef,
