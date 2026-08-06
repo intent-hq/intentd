@@ -2158,10 +2158,8 @@ mod tests {
         )
         .await
         .expect("schedule");
-        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
-        session.attention_request_kind = Some("discussion".to_string());
         svc.store()
-            .update_agent_session(&ws, &session)
+            .set_attention_request(&ws, &owner, "discussion", "need input", &now_iso())
             .await
             .unwrap();
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
