@@ -552,6 +552,25 @@ impl PtyHost {
         count
     }
 
+    /// Kill every tracked PTY across all scopes (clean daemon shutdown —
+    /// monorepo#1526). Teardowns run concurrently so the wall-clock cost of
+    /// the sweep stays one SIGTERM grace, not one per session, keeping the
+    /// whole shutdown inside the FE sidecar's own kill grace. Returns the
+    /// number reaped. No process-group orphans are left behind.
+    pub async fn kill_all(&self) -> usize {
+        let victims: Vec<Arc<PtySession>> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.drain().map(|(_, session)| session).collect()
+        };
+        let count = victims.len();
+        let mut teardowns = tokio::task::JoinSet::new();
+        for session in victims {
+            teardowns.spawn(async move { teardown(&session).await });
+        }
+        while teardowns.join_next().await.is_some() {}
+        count
+    }
+
     fn get(&self, id: PtyId) -> Result<Arc<PtySession>> {
         self.sessions
             .lock()
@@ -1249,6 +1268,57 @@ mod tests {
             dead,
             "SIGKILL escalation must reap the TERM-trapping descendant"
         );
+    }
+
+    /// Clean daemon shutdown (monorepo#1526): `kill_all` reaps every tracked
+    /// session across all scopes — including a TERM+HUP-trapping descendant —
+    /// leaving an empty host and no process-group orphans.
+    #[tokio::test]
+    async fn kill_all_reaps_every_scope_including_trapped_descendants() {
+        let host = PtyHost::new();
+        let plain = host.spawn(cat_spec("scope-a")).unwrap();
+        let mut spec = SpawnSpec::new("scope-b", "sh");
+        // Same trap shape as teardown_kills_term_trapping_descendant_...: the
+        // descendant prints its PID only after TERM/HUP are ignored, and
+        // sleeps in a loop so only SIGKILL removes it.
+        spec.args = vec![
+            "-c".into(),
+            r#"sh -c 'trap "" TERM HUP; echo "trapped-$$"; while :; do sleep 1; done' & sleep 300"#
+                .into(),
+        ];
+        let trapped = host.spawn(spec).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        let descendant: u32 = loop {
+            let out = host.scrollback(trapped).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("trapped-").and_then(|p| p.parse().ok()))
+            {
+                break pid;
+            }
+            if Instant::now() >= deadline {
+                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(pid_alive(descendant), "descendant alive before kill_all");
+
+        let reaped = host.kill_all().await;
+        assert_eq!(reaped, 2);
+        assert_eq!(host.count(), 0);
+        assert!(!host.is_alive(plain));
+        assert!(!host.is_alive(trapped));
+
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
+        while pid_alive(descendant) {
+            assert!(
+                Instant::now() < deadline,
+                "TERM-trapping descendant {descendant} survived kill_all"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// After the direct child exits on its own, `reap_group_stragglers`

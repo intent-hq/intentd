@@ -613,6 +613,43 @@ impl ScriptManager {
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
+    /// Clean daemon shutdown (monorepo#1526): stop every managed script across
+    /// all workspaces with the same user-stop semantics as `script.stop`, so
+    /// no auto-restart supervisor respawns a PTY while the daemon tears down.
+    /// Every entry is flagged `stopped_by_user` under one lock acquisition
+    /// BEFORE any PTY is killed; the per-script teardowns (kill the recorded
+    /// PTY, await the supervisor) then run concurrently so the wall-clock cost
+    /// of the sweep is one SIGTERM grace, not one per script. Returns the
+    /// number of scripts that had a live PTY or supervisor.
+    pub(crate) async fn stop_all(&self) -> usize {
+        let victims: Vec<(Option<tokio::task::JoinHandle<()>>, Option<PtyId>)> = {
+            let mut guard = self.scripts.lock().unwrap();
+            guard
+                .values_mut()
+                .map(|m| {
+                    m.stopped_by_user = true;
+                    (m.supervisor.take(), m.pty_id)
+                })
+                .filter(|(handle, pty_id)| handle.is_some() || pty_id.is_some())
+                .collect()
+        };
+        let count = victims.len();
+        let mut teardowns = tokio::task::JoinSet::new();
+        for (handle, pty_id) in victims {
+            let pty = self.pty.clone();
+            teardowns.spawn(async move {
+                if let Some(pty_id) = pty_id {
+                    pty.kill(pty_id).await;
+                }
+                if let Some(handle) = handle {
+                    let _ = handle.await;
+                }
+            });
+        }
+        while teardowns.join_next().await.is_some() {}
+        count
+    }
+
     /// `script.restart`: stop, reset the restart counter, then start. Scoped to
     /// `workspace_id`. The stop→start gap is surfaced as `restarting`
     /// (monorepo#1318) so a snapshot taken mid-restart never reports
@@ -2488,6 +2525,51 @@ mod tests {
             .await
             .expect("status");
         assert_ne!(st["status"], "running", "status reflects the dead group");
+    }
+
+    /// Clean daemon shutdown (monorepo#1526): `shutdown_pty_sessions` stops a
+    /// running service with user-stop semantics — the TERM+HUP-trapping
+    /// straggler dies, the supervisor does not auto-restart it — and then
+    /// kills every remaining PTY (a plain terminal-style session), leaving the
+    /// host empty.
+    #[tokio::test]
+    async fn shutdown_pty_sessions_stops_scripts_and_kills_all_ptys() {
+        let h = harness().await;
+        let (flag, pidfile) = straggler_paths("shutdown");
+        let cmd = straggler_command(&flag.0, &pidfile.0, "wait");
+        let id = create_simple(&h, "svc", &cmd, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        let straggler = await_straggler_pid(&pidfile.0).await;
+        let _guard = KillOnDrop(straggler);
+        assert!(pid_alive(straggler), "straggler alive before shutdown");
+
+        // A terminal-style PTY outside any script registry entry.
+        let terminal = h
+            .services
+            .pty()
+            .spawn(SpawnSpec::new("ws-term", "cat"))
+            .expect("spawn terminal");
+        assert!(h.services.pty().is_alive(terminal));
+
+        let (scripts, ptys) = h.services.shutdown_pty_sessions().await;
+        assert_eq!(scripts, 1, "one running script stopped");
+        assert_eq!(ptys, 1, "the remaining terminal PTY killed");
+
+        await_pid_dead(straggler, "TERM+HUP-trapping straggler").await;
+        assert_eq!(h.services.pty().count(), 0, "host empty after shutdown");
+
+        // User-stop semantics: the awaited supervisor exited without
+        // respawning, so the script settles non-running with no new PTY.
+        let st = h
+            .services
+            .script_status(h.ws.clone(), id)
+            .await
+            .expect("status");
+        assert_ne!(st["status"], "running", "no auto-restart after stop-all");
+        assert_eq!(h.services.pty().count(), 0, "no respawned PTY");
     }
 
     /// Regression (monorepo#1300): when the shell exits on its own but a

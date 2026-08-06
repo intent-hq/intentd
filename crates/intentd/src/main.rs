@@ -1284,6 +1284,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     mcp_hub.shutdown().await;
     manager.shutdown().await;
 
+    // Kill every daemon-owned PTY session — terminals and scripts — so no
+    // child survives the daemon as an orphan (monorepo#1526). Scripts are
+    // stopped first with user-stop semantics so no auto-restart supervisor
+    // races the sweep; both phases tear down concurrently, bounded by one
+    // SIGTERM grace each, staying inside the FE sidecar's own kill grace.
+    let (scripts_stopped, ptys_killed) = services.shutdown_pty_sessions().await;
+    if scripts_stopped > 0 || ptys_killed > 0 {
+        tracing::info!(
+            scripts = scripts_stopped,
+            ptys = ptys_killed,
+            "graceful shutdown: reaped daemon-owned PTY sessions"
+        );
+    }
+
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
 

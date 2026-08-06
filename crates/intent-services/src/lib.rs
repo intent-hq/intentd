@@ -1093,6 +1093,18 @@ impl Services {
         self.script_manager().hydrate().await
     }
 
+    /// Clean daemon shutdown (monorepo#1526): stop every managed script with
+    /// user-stop semantics (so no auto-restart races the teardown), then kill
+    /// every remaining PTY session (terminals and scripts) via the group-kill
+    /// escalation. Both sweeps tear their victims down concurrently, so the
+    /// whole call is bounded by one SIGTERM grace per phase. Returns
+    /// `(scripts_stopped, ptys_killed)`.
+    pub async fn shutdown_pty_sessions(&self) -> (usize, usize) {
+        let scripts = self.script_manager().stop_all().await;
+        let ptys = self.pty.kill_all().await;
+        (scripts, ptys)
+    }
+
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
     /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight
     /// OR if a pending idle debounce is scheduled (grace window). During the grace
