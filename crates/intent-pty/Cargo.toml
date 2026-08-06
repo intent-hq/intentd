@@ -12,3 +12,4 @@ intent-core = { path = "../intent-core", version = "0.5.0" }
 nix.workspace = true
 portable-pty.workspace = true
 tokio.workspace = true
+tracing.workspace = true

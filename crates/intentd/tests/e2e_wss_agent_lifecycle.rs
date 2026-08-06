@@ -5046,6 +5046,94 @@ async fn terminal_data_many_chunks_transient_over_wss() {
     );
 }
 
+/// Regression (monorepo#1538): `event.query`'s `eventType` accepts
+/// subscribe-style globs over the wire — `note:*` matches note-category
+/// events (it previously compiled to an exact `event_type = 'note:*'` match
+/// and silently returned `[]`), exact types are unchanged, and bare `*`
+/// behaves like no type filter.
+#[tokio::test]
+async fn event_query_event_type_glob_over_wss() {
+    let (_daemon, ws_id, note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Drive a note mutation so a `note:updated` event is persisted.
+    let updated = wss_rpc(
+        &mut rpc,
+        1,
+        "note.update",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "content": "# Target\nevent-query-glob-marker\n",
+        }),
+    )
+    .await;
+    assert_eq!(updated["note"]["id"], json!(note_id));
+
+    // Category glob matches the persisted note event(s). Poll briefly: the
+    // event write is committed asynchronously relative to the RPC response.
+    let mut id = 2;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let glob_rows = loop {
+        let rows = wss_rpc(
+            &mut rpc,
+            id,
+            "event.query",
+            json!({ "workspaceId": ws_id, "eventType": "note:*" }),
+        )
+        .await;
+        id += 1;
+        if !rows.as_array().expect("glob rows array").is_empty() {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "note:* never matched the persisted note event: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        glob_rows
+            .as_array()
+            .expect("glob rows array")
+            .iter()
+            .all(|e| e["type"].as_str().unwrap_or_default().starts_with("note:")),
+        "note:* must return only note-category events: {glob_rows}"
+    );
+
+    // Exact-type query is unchanged and agrees with the glob.
+    let exact_rows = wss_rpc(
+        &mut rpc,
+        id,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "note:updated" }),
+    )
+    .await;
+    assert!(
+        !exact_rows.as_array().expect("exact rows array").is_empty(),
+        "exact note:updated query regressed: {exact_rows}"
+    );
+
+    // Bare `*` behaves like no type filter (previously an exact match on the
+    // literal `*` → silent `[]`), so the note event is visible through it.
+    let star_rows = wss_rpc(
+        &mut rpc,
+        id + 1,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "*" }),
+    )
+    .await;
+    assert!(
+        star_rows
+            .as_array()
+            .expect("star rows array")
+            .iter()
+            .any(|e| e["type"].as_str().unwrap_or_default().starts_with("note:")),
+        "bare * must behave like no type filter: {star_rows}"
+    );
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and
@@ -11662,6 +11750,133 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         usage["lastScanAt"].is_string(),
         "lastScanAt stamped by the live update: {read}"
     );
+}
+
+/// ACP `usage_update` cost capture over the real WSS transport (§5.23): the
+/// mock agent streams a `usage_update` session notification carrying a
+/// cumulative `cost` object, and the daemon folds it onto the workspace tally
+/// so `workspace:tokenUsage-changed` and `workspace.getTokenUsage` both carry
+/// `cost: { amount, currency }` on `totals`, `byAgentId`, and `byModel`.
+/// Cost is cumulative per ACP session, so a second turn's report REPLACES the
+/// first.
+#[tokio::test]
+async fn usage_update_cost_captured_over_wss() {
+    let Some(script) = gate("WSS usage-cost E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "turn one",
+        "usage": { "totalTokens": 120, "inputTokens": 70, "outputTokens": 50 },
+        "rawUpdates": [{
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000,
+            "cost": { "amount": 0.5, "currency": "USD" },
+        }],
+        "rules": [{
+            "ifPromptContains": "SECOND_TURN",
+            "response": "turn two",
+            "usage": { "totalTokens": 180, "inputTokens": 100, "outputTokens": 80 },
+            "rawUpdates": [{
+                "sessionUpdate": "usage_update",
+                "used": 61_000,
+                "size": 200_000,
+                "cost": { "amount": 1.25, "currency": "USD" },
+            }],
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:tokenUsage-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Cost", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage 1 ok: {sent}");
+    let ev1 = wss_event(&mut sub, 30).await;
+    let usage1 = &ev1["params"]["event"]["data"]["tokenUsage"];
+    assert_eq!(usage1["totals"]["cost"]["amount"], 0.5, "event: {ev1}");
+    assert_eq!(usage1["totals"]["cost"]["currency"], "USD");
+    assert_eq!(usage1["byAgentId"][&agent_id]["cost"]["amount"], 0.5);
+    assert_eq!(usage1["byModel"]["mock:default"]["cost"]["amount"], 0.5);
+
+    // Turn 2 — cumulative per ACP session, so 1.25 REPLACES 0.5 (not 1.75).
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SECOND_TURN please" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "sendMessage 2 ok: {sent2}");
+    let ev2 = wss_event(&mut sub, 30).await;
+    assert_eq!(
+        ev2["params"]["event"]["data"]["tokenUsage"]["totals"]["cost"]["amount"], 1.25,
+        "cumulative cost replaces, never sums: {ev2}"
+    );
+
+    let read = wss_rpc(
+        &mut rpc,
+        13,
+        "workspace.getTokenUsage",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let usage = &read["tokenUsage"];
+    assert_eq!(usage["totals"]["cost"]["amount"], 1.25, "read: {read}");
+    assert_eq!(usage["totals"]["cost"]["currency"], "USD");
+    assert_eq!(usage["totals"]["inputTokens"], 100);
 }
 
 /// Title-preserving tool updates (the claude-code "Run" collapse): ACP

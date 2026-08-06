@@ -17,9 +17,10 @@
 //!     `hook.runNow` again — the run throws, `hook:evicted` carries
 //!     `lastError`, and the owner is woken with the eviction notice
 //!     (asserted via `agent.getConversation`).
-//!  4. Agent turn 3 schedules a third hook; the FE cancels it — the response
-//!     carries the cancelled hook, `hook:cancelled` fires, and the owner is
-//!     woken with the cancellation notice.
+//!  4. Agent turn 3 schedules a third hook (with a 50-char human-readable
+//!     name, the maximum); the FE cancels it — the response carries the
+//!     cancelled hook with the name intact, `hook:cancelled` fires, and the
+//!     owner is woken with the cancellation notice.
 //!  5. Error arms: unknown `hookId` → -32602 on cancel/runNow; `runNow` on a
 //!     cancelled hook → -32602; missing params → -32602.
 //!  6. State carry-over: agent turn 4 schedules a counter hook that threads
@@ -468,8 +469,13 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: 'watcher', code: {}, delayMs: 60000 }});",
         json!(watcher_inner)
     );
+    // Maximum-length (50-char) human-readable hook name, scheduled through
+    // the production MCP `ws.hook.schedule` route and asserted to round-trip
+    // through the wire events and the `hook.cancel` response below.
+    let cancel_hook_name = "watch cancelled hook with a fifty character name!!";
+    assert_eq!(cancel_hook_name.chars().count(), 50, "name is 50 chars");
     let schedule_cancel_js = format!(
-        "return await ws.hook.schedule({{ name: 'cancelme', code: {}, delayMs: 60000 }});",
+        "return await ws.hook.schedule({{ name: '{cancel_hook_name}', code: {}, delayMs: 60000 }});",
         json!("return { dispatch: false };")
     );
     let counter_inner = "const n = (hookState === null) ? 0 : hookState.n; \
@@ -633,6 +639,13 @@ async fn hook_lifecycle_over_wss() {
             .contains("[Background hook \"dispatcher\"] CI is red"),
         "wake content carries the dispatch message: {wake}"
     );
+    assert!(
+        wake["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("has now fired and is retired"),
+        "dispatch wake carries the terminal-state note: {wake}"
+    );
 
     // After the turn ends the queue drains: the wake lands in the transcript.
     await_conversation_contains(
@@ -641,6 +654,15 @@ async fn hook_lifecycle_over_wss() {
         &ws_id,
         &agent_id,
         "[Background hook \\\"dispatcher\\\"] CI is red",
+    )
+    .await;
+    // The terminal-state note survives the queue/conversation delivery path.
+    await_conversation_contains(
+        &mut rpc,
+        101,
+        &ws_id,
+        &agent_id,
+        "has now fired and is retired",
     )
     .await;
 
@@ -795,7 +817,8 @@ async fn hook_lifecycle_over_wss() {
             .contains("EVICT marker found"),
         "hook:evicted carries lastError: {evicted}"
     );
-    // The owner is woken with the eviction notice.
+    // The owner is woken with the eviction notice, ending with the
+    // terminal-state note.
     await_conversation_contains(
         &mut rpc,
         310,
@@ -804,6 +827,7 @@ async fn hook_lifecycle_over_wss() {
         "was evicted after a failed run",
     )
     .await;
+    await_conversation_contains(&mut rpc, 311, &ws_id, &agent_id, "will not run again").await;
 
     // ── 4. FE cancel: hook:cancelled + owner woken with the notice ───────
     let sent = wss_rpc(
@@ -814,7 +838,9 @@ async fn hook_lifecycle_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("cancelme")).await;
+    // The 50-char (maximum) name is accepted by the MCP schedule route and
+    // round-trips through the `hook:scheduled` event.
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some(cancel_hook_name)).await;
     let cancel_id = scheduled["data"]["hookId"]
         .as_str()
         .expect("cancelme hookId")
@@ -830,7 +856,12 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(cancelled["ok"], json!(true), "{cancelled}");
     assert_eq!(cancelled["hook"]["state"], "cancelled", "{cancelled}");
     assert_eq!(cancelled["hook"]["hookId"], json!(cancel_id));
-    let ev = next_hook_event(&mut sub, "hook:cancelled", Some("cancelme")).await;
+    assert_eq!(
+        cancelled["hook"]["name"],
+        json!(cancel_hook_name),
+        "50-char name persists and round-trips: {cancelled}"
+    );
+    let ev = next_hook_event(&mut sub, "hook:cancelled", Some(cancel_hook_name)).await;
     assert_eq!(ev["data"]["hookId"], json!(cancel_id));
     // FE cancel (`by_owner = false`) wakes the owner with the notice.
     await_conversation_contains(

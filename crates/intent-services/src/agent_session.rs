@@ -24,7 +24,7 @@ use intent_core::events::{
     AGENT_STREAM_STATUS, AGENT_TOOL_CALL, CHAT_STREAM_DELTA,
 };
 use intent_core::{
-    now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId,
+    now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -92,13 +92,6 @@ pub struct AcpSessionOpened {
     /// recreate won the CAS (the modes we captured belong to the wrong
     /// session).
     pub modes: Option<SessionModeState>,
-    /// The bare effective model resolved from the response's
-    /// `configOptions[id="model"]` and persisted onto `agent_session.model`
-    /// (D13), when the stored model was a placeholder and the resolution +
-    /// guarded write both succeeded. The manager syncs the live handle's
-    /// `spawned_model` to this value so the next `ensure_started` does not
-    /// misread the persisted effective model as an `agent.setModel` change.
-    pub effective_model: Option<String>,
     /// The provider's reasoning-effort selector discovered in the same
     /// response's `configOptions` (PROTOCOL §5.5), if it advertised one. The
     /// manager applies the session's `reasoningEffort` through it and keeps it
@@ -142,6 +135,10 @@ struct Transcript {
     /// `toolCallId` → index of its standalone proposal-resource block (§7.1;
     /// append-once, then patch — mirrors `tool_result_index`).
     proposal_index: HashMap<String, usize>,
+    /// Latest cumulative session cost seen in an ACP `usage_update` during
+    /// this turn (§5.23). Cumulative per ACP session, so the last one wins;
+    /// `None` when the provider reported no cost.
+    usage_cost: Option<UsageCost>,
 }
 
 impl Transcript {
@@ -153,6 +150,7 @@ impl Transcript {
             tool_use_index: HashMap::new(),
             tool_result_index: HashMap::new(),
             proposal_index: HashMap::new(),
+            usage_cost: None,
         }
     }
 
@@ -1125,25 +1123,35 @@ impl Services {
     }
 
     /// Persist the effective model resolved from a session-open response's
-    /// `configOptions` (D13): only when the stored model is a placeholder
-    /// (NULL / blank / `default` sentinel — an explicitly user-selected model
-    /// is NEVER overwritten), and only while it still is at write time (the
-    /// store's guarded CAS write loses benignly to a concurrent
-    /// `agent.setModel`). Always persisted as the compound
-    /// `{provider_id}:{effective}` (e.g. `claude-code:Opus 4.8`) so
-    /// [`resolve_provider_id`] keeps resolving the same provider even when
-    /// the stored model was NULL and the `provider` field is empty. Returns
-    /// the *bare* effective model when the write landed — the value
-    /// `resolve_spawn` will yield next, which the manager syncs onto the
-    /// live handle's `spawned_model`.
+    /// `configOptions` (D13): when the stored model is a placeholder (NULL /
+    /// blank / `default` sentinel), the effective display identity (e.g.
+    /// "Opus 4.8") is persisted to the separate `resolved_model` column —
+    /// `agent_session.model` is NEVER rewritten (monorepo#1534: a display
+    /// name is not a selectable option id, so persisting it on `model` made
+    /// the FE flag it unavailable and fall back to the default, re-triggering
+    /// the rewrite and a "model changed" notice on every session open). The
+    /// outcome is persisted EITHER way — a `None` resolution overwrites
+    /// (clears) any previously persisted display name, so a resolution from
+    /// an older option list can never go stale and mis-attribute stats. The
+    /// store write is guarded on `model` still equalling the pre-open stored
+    /// value (`None` matches NULL), so it loses benignly to a concurrent
+    /// `agent.setModel`.
+    ///
+    /// Dropped guarantee (intentional): the old rewrite persisted the
+    /// compound `{provider_id}:{effective}`, which as a side effect pinned
+    /// the provider for legacy rows with a NULL `model` AND an empty
+    /// `provider`. Such rows now fall through to the configured default /
+    /// first-registered provider on every resolution — a reversion to
+    /// pre-D13 behavior; current creation paths pin `model` at creation, so
+    /// no new rows enter that population.
     ///
     /// A NON-placeholder (explicitly selected) model takes the D14 branch
-    /// instead: the stored id is never rewritten (it keeps driving provider
-    /// configuration — spawn flags / `session/set_config_option`); its
-    /// display identity is resolved against the same option list via
-    /// [`resolve_explicit_display_model`] and persisted to the separate
-    /// `resolved_model` column, used only for usage-stats attribution. That
-    /// branch returns `None` — `resolve_spawn` is unaffected.
+    /// instead: its display identity is resolved against the same option
+    /// list via [`resolve_explicit_display_model`] and persisted to the same
+    /// `resolved_model` column. In both branches the stored `model` keeps
+    /// driving provider configuration (spawn flags /
+    /// `session/set_config_option`) and the resolution is used ONLY for
+    /// usage-stats attribution.
     ///
     /// Best-effort: failures are logged, never propagated — model resolution
     /// must not fail session open.
@@ -1151,10 +1159,9 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-        provider_id: &str,
         stored_model: Option<&str>,
         config_options: Option<&[SessionConfigOption]>,
-    ) -> Option<String> {
+    ) {
         if !usage_stats::is_placeholder_model(stored_model) {
             self.persist_resolved_display_model(
                 workspace_id,
@@ -1163,27 +1170,29 @@ impl Services {
                 config_options,
             )
             .await;
-            return None;
+            return;
         }
-        let effective = resolve_effective_model(config_options)?;
-        let persisted = format!("{provider_id}:{effective}");
+        let effective = resolve_effective_model(config_options);
         match self
             .store
-            .set_agent_session_effective_model(workspace_id, agent_id, stored_model, &persisted)
+            .set_agent_session_resolved_model(
+                workspace_id,
+                agent_id,
+                stored_model,
+                effective.as_deref(),
+            )
             .await
         {
             Ok(true) => {
                 tracing::debug!(
                     agent = %agent_id,
-                    model = %persisted,
-                    "persisted effective session model from configOptions"
+                    resolved = %effective.as_deref().unwrap_or("<none>"),
+                    "persisted effective session model from configOptions to resolved_model"
                 );
-                Some(effective)
             }
-            Ok(false) => None, // lost to a concurrent explicit model change
+            Ok(false) => {} // lost to a concurrent explicit model change
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "persist effective session model failed");
-                None
             }
         }
     }
@@ -1213,7 +1222,12 @@ impl Services {
         let resolved = resolve_explicit_display_model(&bare_id, config_options);
         match self
             .store
-            .set_agent_session_resolved_model(workspace_id, agent_id, stored, resolved.as_deref())
+            .set_agent_session_resolved_model(
+                workspace_id,
+                agent_id,
+                Some(stored),
+                resolved.as_deref(),
+            )
             .await
         {
             Ok(true) => {
@@ -1272,19 +1286,16 @@ impl Services {
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
             .await?;
-        let effective_model = self
-            .persist_effective_model(
-                &workspace_id,
-                agent_id,
-                &provider_id,
-                stored.model.as_deref(),
-                resp.config_options.as_deref(),
-            )
-            .await;
+        self.persist_effective_model(
+            &workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            effective_model,
             thought_level: discover_thought_level(resp.config_options.as_deref()),
         })
     }
@@ -1340,25 +1351,22 @@ impl Services {
         // our modes are meaningless for it and would target the wrong sid.
         // The effective-model and thought-level resolutions are skipped for
         // the same reason.
-        let (modes, effective_model, thought_level) = if canonical == new_acp_session_id {
-            let effective_model = self
-                .persist_effective_model(
-                    &workspace_id,
-                    agent_id,
-                    &provider_id,
-                    stored.model.as_deref(),
-                    resp.config_options.as_deref(),
-                )
-                .await;
+        let (modes, thought_level) = if canonical == new_acp_session_id {
+            self.persist_effective_model(
+                &workspace_id,
+                agent_id,
+                stored.model.as_deref(),
+                resp.config_options.as_deref(),
+            )
+            .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
-            (resp.modes, effective_model, thought_level)
+            (resp.modes, thought_level)
         } else {
-            (None, None, None)
+            (None, None)
         };
         Ok(AcpSessionOpened {
             session_id: canonical,
             modes,
-            effective_model,
             thought_level,
         })
     }
@@ -1441,19 +1449,16 @@ impl Services {
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
-        let effective_model = self
-            .persist_effective_model(
-                &workspace_id,
-                agent_id,
-                &provider_id,
-                stored.model.as_deref(),
-                resp.config_options.as_deref(),
-            )
-            .await;
+        self.persist_effective_model(
+            &workspace_id,
+            agent_id,
+            stored.model.as_deref(),
+            resp.config_options.as_deref(),
+        )
+        .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            effective_model,
             thought_level: discover_thought_level(resp.config_options.as_deref()),
         }))
     }
@@ -1591,6 +1596,9 @@ impl Services {
             turn_usage = outcome.usage;
             outcome.stop_reason
         });
+        // Latest ACP `usage_update` cost of the turn (§5.23), accumulated by
+        // `route_notification`; persisted alongside the token snapshot below.
+        let turn_cost = transcript.usage_cost.clone();
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
@@ -1682,7 +1690,7 @@ impl Services {
         // turn N can neither skew turn N+1's stats delta nor overwrite its
         // newer cumulative snapshot.
         let run_completed = result.is_ok();
-        if turn_usage.is_some() || run_completed {
+        if turn_usage.is_some() || turn_cost.is_some() || run_completed {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
@@ -1706,9 +1714,16 @@ impl Services {
                         run_completed,
                     )
                     .await;
-                if let Some(usage) = turn_usage {
+                // A turn with neither report has nothing to persist; either
+                // one alone still updates its half of the snapshot.
+                if turn_usage.is_some() || turn_cost.is_some() {
                     services
-                        .persist_turn_token_usage(&agent_id_task, &workspace_id_task, &usage)
+                        .persist_turn_token_usage(
+                            &agent_id_task,
+                            &workspace_id_task,
+                            turn_usage.as_ref(),
+                            turn_cost,
+                        )
                         .await;
                 }
             });
@@ -1946,6 +1961,13 @@ impl Services {
                 Err(_) => {}
             }
         }
+        // A wake turn has no `session/prompt` and therefore no end-of-turn
+        // token report, but the burst may still carry an ACP `usage_update`
+        // cost (§5.23) — persist it (cost-only) so it is not lost.
+        if let Some(cost) = transcript.usage_cost.clone() {
+            self.persist_cost_only_ordered(agent_id, workspace_id, cost)
+                .await;
+        }
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
         let mut message_persisted = false;
@@ -2033,6 +2055,32 @@ impl Services {
             .await;
     }
 
+    /// Persist a standalone ACP `usage_update` cost (§5.23), ordered against
+    /// the per-agent [`TurnBookkeeping`] chain: a cost arriving between a
+    /// prompt releasing its busy slot and that prompt's *detached* bookkeeping
+    /// task writing would otherwise read the pre-turn snapshot and write back
+    /// the older counters. Awaiting the predecessor first keeps the same
+    /// per-agent ordering the prompt path relies on; the write itself is
+    /// awaited inline (this path holds no stream deadline), so the chain slot
+    /// is left free for the next turn.
+    pub(crate) async fn persist_cost_only_ordered(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        cost: UsageCost,
+    ) {
+        let prev = self
+            .turn_bookkeeping
+            .lock()
+            .ok()
+            .and_then(|mut chain| chain.remove(agent_id));
+        if let Some(prev) = prev {
+            let _ = prev.await;
+        }
+        self.persist_turn_token_usage(agent_id, workspace_id, None, Some(cost))
+            .await;
+    }
+
     /// Persist one turn's end-of-turn usage report and refresh the workspace
     /// tally (§5.23). The report is interpreted as the session's cumulative
     /// snapshot (see `token_usage::snapshot_from_turn_usage`), so it REPLACES
@@ -2040,13 +2088,46 @@ impl Services {
     /// re-aggregated, persisted, and `workspace:tokenUsage-changed` emitted
     /// when it changed. Best-effort: errors are logged, never propagated —
     /// usage bookkeeping must not fail an otherwise-successful turn.
+    ///
+    /// `cost` is the latest ACP `usage_update` cost observed during the turn,
+    /// also cumulative per ACP session (latest wins). The two reports are
+    /// independent — a provider may send either alone — so each part of the
+    /// stored snapshot falls back to its previously persisted value when this
+    /// turn carried no fresh report for it: a cost-only turn never zeroes the
+    /// counters, and a counters-only turn never drops a cost already
+    /// reported for the session.
     pub(crate) async fn persist_turn_token_usage(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
-        usage: &session::Usage,
+        usage: Option<&session::Usage>,
+        cost: Option<UsageCost>,
     ) {
-        let snapshot = token_usage::snapshot_from_turn_usage(usage);
+        let stored = if usage.is_none() || cost.is_none() {
+            match self
+                .store
+                .get_agent_session_token_usage(workspace_id, agent_id)
+                .await
+            {
+                Ok((_, _, _, stored)) => stored,
+                // Degrade, never drop: the read only recovers the half of the
+                // snapshot this turn carries no fresh report for, so a failure
+                // must not discard the half we do have. The lost fallback is
+                // self-healing — both reports are cumulative, so the next one
+                // restores it.
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "read prior token usage failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut snapshot = match usage {
+            Some(usage) => token_usage::snapshot_from_turn_usage(usage),
+            None => stored.clone().unwrap_or_default(),
+        };
+        snapshot.cost = cost.or_else(|| stored.and_then(|s| s.cost));
         if let Err(e) = self
             .store
             .set_agent_session_token_usage(workspace_id, agent_id, &snapshot)
@@ -2243,6 +2324,18 @@ impl Services {
                     )
                     .await;
                 }
+            }
+            MappedUpdate::UsageCost(cost) => {
+                // §5.23: cumulative per ACP session, so the latest report
+                // wins. Recorded on the transcript and persisted with the
+                // turn's token snapshot; it materializes no transcript
+                // content and publishes no event, so this is NOT a turn
+                // update (the redrive eligibility must stay unaffected).
+                transcript.usage_cost = Some(UsageCost {
+                    amount: cost.amount,
+                    currency: cost.currency,
+                });
+                return false;
             }
             MappedUpdate::ToolCall(tc) => {
                 // §7.1 deterministic attach: claim the pending `AtToolResult`

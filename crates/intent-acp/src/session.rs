@@ -7,8 +7,10 @@
 //! append-only transcript (publish/accumulate live in `intent-services`, which
 //! owns the store + bus; the mapping stays side-effect free here). Variants
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
-//! (plan/mode/thought/commands/usage/…) map to `None`: emitting invented event
-//! strings would break wire parity with the live iOS client.
+//! (plan/mode/thought/commands/…) map to `None`: emitting invented event
+//! strings would break wire parity with the live iOS client. `usage_update`
+//! emits no event either, but its cumulative `cost` is mapped so the service
+//! layer can fold it into the workspace `TokenUsage` tally (§5.23).
 //!
 //! ## Session lifetime semantics
 //!
@@ -310,6 +312,20 @@ pub enum MappedUpdate {
     },
     /// `tool_call` / `tool_call_update` → `agent:tool:call`.
     ToolCall(MappedToolCall),
+    /// `usage_update` → no canonical `WorkspaceEvent`, but its cumulative
+    /// per-ACP-session `cost` feeds the workspace `TokenUsage` tally (§5.23).
+    /// Mapped only when the notification actually carries a cost object; the
+    /// context-window fields (`used`/`size`) are not consumed here.
+    UsageCost(MappedUsageCost),
+}
+
+/// The cumulative session cost carried by an ACP `usage_update` (§5.23).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappedUsageCost {
+    /// Cumulative spend for the ACP session so far.
+    pub amount: f64,
+    /// ISO 4217 currency code (e.g. `"USD"`).
+    pub currency: String,
 }
 
 /// A tool call mapped to the `agent:tool:call` event payload taxonomy (§6.6).
@@ -333,7 +349,9 @@ pub struct MappedToolCall {
 }
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
-/// no canonical `WorkspaceEvent` (plan/mode/thought/commands/usage/…) (§6.6).
+/// no canonical `WorkspaceEvent` and nothing else to accumulate
+/// (plan/mode/thought/commands/…) (§6.6). `usage_update` maps only when it
+/// carries a `cost` object (§5.23).
 pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
@@ -346,6 +364,12 @@ pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
         SessionUpdate::ToolCallUpdate(update) => {
             Some(MappedUpdate::ToolCall(map_tool_call_update(update)))
         }
+        SessionUpdate::UsageUpdate(usage) => usage.cost.as_ref().map(|cost| {
+            MappedUpdate::UsageCost(MappedUsageCost {
+                amount: cost.amount,
+                currency: cost.currency.clone(),
+            })
+        }),
         _ => None,
     }
 }
@@ -462,13 +486,19 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     the same downstream treatment as [`unwrap_codex_mcp_input`]'s
 ///     rewritten name (`mcp.workspace-mcp.workspace_api` → `workspace_api`,
 ///     `mcp.other-server.some_tool` → `other-server_some_tool`).
-///  3. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///  3. Claude Code titles MCP tools `mcp__<server>__<tool>`
+///     (double-underscore-separated, no whitespace — prose titles containing
+///     `mcp__` never match); the title is rewritten to `{server}_{tool}` and
+///     fed through the affix strip below, the same downstream treatment as
+///     the codex dot rule (`mcp__workspace-mcp__workspace_api` →
+///     `workspace_api`, `mcp__github__list_issues` → `github_list_issues`).
+///  4. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  4. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  5. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  5. When none of the above yielded an identifier (the title is prose
+///  6. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -489,7 +519,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  6. Otherwise the title passes through as-is.
+///  7. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -503,6 +533,9 @@ pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
         return strip_workspace_mcp_affix(name);
     }
     if let Some(rewritten) = split_codex_mcp_title(title) {
+        return strip_workspace_mcp_affix(&rewritten);
+    }
+    if let Some(rewritten) = split_claude_mcp_title(title) {
         return strip_workspace_mcp_affix(&rewritten);
     }
     let stripped = strip_workspace_mcp_affix(title);
@@ -634,6 +667,23 @@ fn split_codex_mcp_title(title: &str) -> Option<String> {
     }
     let rest = title.strip_prefix("mcp.")?;
     let (server, tool) = rest.split_once('.')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{server}_{tool}"))
+}
+
+/// Recognize Claude Code's double-underscore-separated ACP title form for MCP
+/// tools — `mcp__<server>__<tool>`, where the server segment runs to the
+/// first `__` and the title carries no whitespace (so prose titles containing
+/// `mcp__` never match) — and rewrite it to the `{server}_{tool}` name shared
+/// with [`split_codex_mcp_title`]. Returns `None` for any other title.
+fn split_claude_mcp_title(title: &str) -> Option<String> {
+    if title.contains(char::is_whitespace) {
+        return None;
+    }
+    let rest = title.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
     if server.is_empty() || tool.is_empty() {
         return None;
     }

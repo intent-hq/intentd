@@ -738,15 +738,28 @@ fn audit_diverged_sandbox_branches(
 ///
 /// - CoW-checkout workspaces (`checkoutMode == "cow"`): the workspace
 ///   checkout (`worktree_path`) is canonical.
+/// - Direct-checkout workspaces (`checkoutMode == "direct"`, standalone plain
+///   repo): the workspace checkout (`worktree_path`) when one was provisioned
+///   (cache hydration), else the repository folder itself (`isNewRepo`
+///   initialization).
 /// - Worktree workspaces share the checkout with the user (no sandboxes):
 ///   returns an error.
-/// - Otherwise (direct mode: skip_worktree = true OR no worktree provisioned):
-///   the user's repository folder (`repository_path`).
+/// - Otherwise (skip_worktree = true OR no worktree provisioned): the user's
+///   repository folder (`repository_path`).
 fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let repo_path = match workspace.checkout_mode {
         Some(CheckoutMode::Cow) => workspace.worktree_path.as_ref().ok_or_else(|| {
             Error::InvalidParams("CoW workspace has no worktree_path".to_string())
         })?,
+        Some(CheckoutMode::Direct) => workspace
+            .worktree_path
+            .as_ref()
+            .or(workspace.repository_path.as_ref())
+            .ok_or_else(|| {
+                Error::InvalidParams(
+                    "direct workspace has neither worktree_path nor repository_path".to_string(),
+                )
+            })?,
         Some(CheckoutMode::Worktree) => {
             return Err(Error::InvalidParams(
                 "worktree-mode workspaces do not support agent sandboxes".to_string(),

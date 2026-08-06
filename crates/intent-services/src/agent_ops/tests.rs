@@ -3354,7 +3354,7 @@ async fn set_model_clears_resolved_display_model() {
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
     let landed = svc
         .store()
-        .set_agent_session_resolved_model(&ws, &id, "auggie:sonnet4.5", Some("Sonnet 4.5"))
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
         .await
         .expect("seed resolved model");
     assert!(landed);
@@ -6654,18 +6654,36 @@ async fn auggie_fetches_return_none_for_unresolvable_binary() {
 #[tokio::test]
 async fn models_list_returns_non_empty_catalog_with_source() {
     let (_t, svc, _ws) = setup().await;
-    let res = svc.models_list_op(None, false).await.expect("models.list");
+    // Hermetic (monorepo#1527): drive the legacy path through the injectable
+    // fetch seam so the catalog is non-empty by construction — the real CLI
+    // probe legitimately degrades to an empty `source: "static"` list when
+    // auggie is unavailable, so probing it here made this test flake in CI.
+    let rows = vec![
+        json!({ "id": "m1", "name": "Model One", "provider": "auggie" }),
+        json!({ "id": "m2", "name": "Model Two", "provider": "auggie" }),
+    ];
+    let fetched = rows.clone();
+    // `saturating_sub(1)` (the `seed_auggie_cache` hedge): the second call
+    // below re-reads `now_ms()`, and `fresh()` rejects entries timestamped
+    // after the read — a backwards wall-clock step between the two reads
+    // must not fall through to the real CLI probe.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
+    let res = svc
+        .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
+        .await
+        .expect("models.list");
     let models = res["models"].as_array().unwrap();
     assert!(!models.is_empty());
     assert!(models[0].get("id").is_some());
     assert!(models[0].get("name").is_some());
     assert!(models[0].get("provider").is_some());
-    let source = res["source"].as_str().unwrap();
-    assert!(source == "auggie" || source == "static", "source: {source}");
+    assert_eq!(res["source"], "auggie");
     // No providerId → legacy shape: no providerId/warning/stale fields.
     assert!(res.get("providerId").is_none());
-    // A second call is served from the cache (auggie) or recomputed statics —
-    // either way the result is stable within the TTL window.
+    assert!(res.get("warning").is_none());
+    assert!(res.get("stale").is_none());
+    // A second call through the real entry point is served from the fresh
+    // cache within the TTL window — stable, no CLI probe spawns.
     let again = svc
         .models_list_op(None, false)
         .await
@@ -6679,22 +6697,22 @@ async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallba
     // Seed the unified cache under the legacy key with a fresh sentinel entry.
     let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
     seed_auggie_cache(&svc, sentinel.clone());
-    // Non-forced: the sentinel is served straight from the cache.
+    // Non-forced: the sentinel is served straight from the fresh cache by
+    // the real entry point — no CLI probe spawns.
     let cached = svc.models_list_op(None, false).await.expect("cached");
     assert_eq!(cached["models"], json!(sentinel));
-    // Forced: the cache read is skipped and a fresh probe is awaited. The
-    // sentinel may only reappear as the last-good fallback after a failed
-    // probe — in which case it must be labeled stale + warning, never
-    // served silently as fresh.
-    let forced = svc.models_list_op(None, true).await.expect("forced");
-    if forced["models"] == json!(sentinel) {
-        assert_eq!(forced["stale"], true, "{forced}");
-        assert!(forced["warning"].is_string(), "{forced}");
-    } else {
-        assert!(forced.get("stale").is_none());
-        let source = forced["source"].as_str().unwrap();
-        assert!(source == "auggie" || source == "static", "source: {source}");
-    }
+    // Forced: the cache read is skipped and the probe is awaited — injected
+    // deterministic failure via the seam (monorepo#1527: the real CLI probe's
+    // outcome is environment-dependent). The sentinel reappears only as the
+    // last-good fallback, labeled stale + warning — never silently as fresh.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let forced = svc
+        .models_list_auggie_with(true, now, || Box::pin(async { None }))
+        .await
+        .expect("forced");
+    assert_eq!(forced["models"], json!(sentinel));
+    assert_eq!(forced["stale"], true, "{forced}");
+    assert!(forced["warning"].is_string(), "{forced}");
 }
 
 #[tokio::test]
@@ -6963,9 +6981,11 @@ async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
     let (_t, svc, _ws) = setup().await;
     let rows = vec![json!({ "id": "shared", "name": "Shared", "provider": "auggie" })];
     let fetched = rows.clone();
-    // Real clock: the entry the legacy fetch stores must be fresh for the
-    // per-provider read below, which uses `now_ms()`.
-    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    // Real clock minus 1ms (the `seed_auggie_cache` hedge): the entry the
+    // legacy fetch stores must be fresh for the per-provider read below,
+    // which re-reads `now_ms()` — and `fresh()` rejects entries timestamped
+    // after the read, so a backwards wall-clock step must not trigger a probe.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
     let res = svc
         .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
         .await
@@ -9948,11 +9968,13 @@ This note is your workspace for this task. Update it with your progress, finding
     );
 }
 
-/// TASK-C2: when `skipAutoCommit=true` the reference appends the
-/// `**Auto-commit is OFF.**` instruction after the scope directive; assert
-/// the exact bytes.
+/// Status-neutral commit policy: even with `skipAutoCommit=true` the child's
+/// first message carries NO state-specific auto-commit instruction — the
+/// message ends at the scope directive, byte-for-byte. The opt-out only gates
+/// the idle subscriber; the prompt-side policy is the neutral
+/// `## Commit Policy` clause in `rules.rs`.
 #[tokio::test]
-async fn delegate_appends_skip_auto_commit_instruction_when_true() {
+async fn delegate_omits_commit_instruction_when_skip_auto_commit_true() {
     let (_t, svc, ws) = setup().await;
     let note = svc
         .create_note(
@@ -9987,21 +10009,22 @@ async fn delegate_appends_skip_auto_commit_instruction_when_true() {
 **Your Task Note:** \"Port frobnicator\" (ID: {note_id})\n\
 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
 \n\
-**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
-\n\
-**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `ws.git.commit` with `userRequested: true`.",
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
         note_id = note.id.as_str(),
     );
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert_eq!(
         first_message_text, expected_first_message,
-        "first message must be byte-exact when skipAutoCommit=true"
+        "first message must be byte-exact and status-neutral when skipAutoCommit=true"
+    );
+    assert!(
+        !first_message_text.contains("Auto-commit is"),
+        "no state-specific auto-commit text in the delegation message: {first_message_text}"
     );
 }
 
-/// TASK-C2: `skipAutoCommit=false` (explicit) matches the default and omits
-/// the commit-instruction tail — regression guard so future refactors keep
-/// the branch gated correctly.
+/// `skipAutoCommit=false` (explicit) matches the default: no commit
+/// instruction tail — regression guard alongside the `=true` case above.
 #[tokio::test]
 async fn delegate_omits_skip_auto_commit_instruction_when_false() {
     let (_t, svc, ws) = setup().await;
@@ -10045,8 +10068,9 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
 
 /// Harness-owned commits: when the workspace's effective auto-commit is OFF,
 /// delegation derives `skip_auto_commit = caller arg OR !autoCommit` — the
-/// child gets the OFF commit instruction and the persisted session opt-out
-/// even without an explicit `skipAutoCommit` from the caller.
+/// session persists the opt-out even without an explicit `skipAutoCommit`
+/// from the caller, while the child's first message stays status-neutral
+/// (no OFF-state commit instruction).
 #[tokio::test]
 async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     let (_t, svc, ws) = setup().await;
@@ -10082,8 +10106,8 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
 
     let first_message_text = child_session_first_message_text(&svc, &child).await;
     assert!(
-        first_message_text.contains("**Auto-commit is OFF.**"),
-        "OFF instruction must be derived from the workspace setting: {first_message_text}"
+        !first_message_text.contains("Auto-commit is"),
+        "delegation message must stay status-neutral when the workspace toggle is off: {first_message_text}"
     );
     let session = svc
         .store()
@@ -13756,6 +13780,57 @@ async fn agent_update_rejects_unknown_field() {
         .await
         .expect_err("unknown field");
     assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent.update` changing `model` clears the persisted display resolution —
+/// same anti-staleness contract as `agent.setModel` — while a `model`-less
+/// update leaves it intact.
+#[tokio::test]
+async fn agent_update_model_change_clears_resolved_model() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Resolver".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let landed = svc
+        .store()
+        .set_agent_session_resolved_model(&ws, &id, Some("auggie:sonnet4.5"), Some("Sonnet 4.5"))
+        .await
+        .expect("seed resolved model");
+    assert!(landed);
+
+    // Non-model update: resolution survives.
+    svc.agent_update_op(id.clone(), json!({ "name": "Renamed" }))
+        .await
+        .expect("name update");
+    let (_, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
+
+    // Model update: stale resolution is cleared.
+    svc.agent_update_op(id.clone(), json!({ "model": "auggie:opus4.7" }))
+        .await
+        .expect("model update");
+    let (model, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(resolved, None, "model change must clear stale resolution");
 }
 
 /// The immutable/write-once invariants on `provider`/`acpSessionId` are still
@@ -19318,8 +19393,9 @@ async fn dismiss_questions_notifies_agent_immediately_when_idle() {
     assert_eq!(
         last.content[0]["text"],
         json!(
-            "User dismissed your 1 question without answering. Do not re-ask; \
-             continue with your best judgment."
+            "User dismissed your 1 question without answering. This is an \
+             informative notice only — do not re-ask and do not proceed with \
+             any work; end your turn and wait for the user's next message."
         ),
         "singular wording with the derived count"
     );

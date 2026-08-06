@@ -114,62 +114,10 @@ pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
 }
 
 /// Redact a `user[:pass]@` credential fragment from any URL-like substring in
-/// `text`. Best-effort; used only for the terminal `error` payload.
-///
-/// Two passes: an authority pass anchored on `://`, then a scheme-less pass
-/// masking bare `user[:pass]@host` fragments — a front-truncated stderr tail
-/// or an scp-like remote carries no `://` anchor to find (monorepo#836).
-fn redact_credentials(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(scheme_end) = rest.find("://") {
-        out.push_str(&rest[..scheme_end + 3]);
-        rest = &rest[scheme_end + 3..];
-        let end_authority = rest.find(['/', ' ', '\t', '\n']).unwrap_or(rest.len());
-        let authority = &rest[..end_authority];
-        if let Some(at) = authority.rfind('@') {
-            out.push_str("***@");
-            out.push_str(&authority[at + 1..]);
-        } else {
-            out.push_str(authority);
-        }
-        rest = &rest[end_authority..];
-    }
-    out.push_str(rest);
-    redact_bare_userinfo(&out)
-}
-
-/// Scheme-less pass of [`redact_credentials`]: mask the userinfo of any bare
-/// `user[:pass]@host` fragment. Deliberately over-eager — it also masks the
-/// `git@` of scp-like remotes — because a mangled username in an error
-/// message is harmless while a leaked password or token is not, and tokens
-/// often travel as the username with no `:pass` (e.g. `ghp_…@github.com`).
-///
-/// Known best-effort limitation: `'`/`"` sit in the delimiter set to bound
-/// quoted contexts, yet RFC 3986 permits them (sub-delims) unencoded in
-/// userinfo — a bare `user:pa'ss@host` fragment therefore masks only from
-/// the quote onward. The `://`-anchored first pass fully handles the quoted
-/// URLs git actually emits, and the line-boundary tail trim makes bare
-/// fragments rare, so this trade-off is deliberate.
-fn redact_bare_userinfo(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('@') {
-        let before = &rest[..at];
-        // The userinfo starts after the last delimiter before the `@`.
-        let start = before
-            .rfind([' ', '\t', '\r', '\n', '/', '\'', '"'])
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        out.push_str(&before[..start]);
-        if start < at {
-            out.push_str("***");
-        }
-        out.push('@');
-        rest = &rest[at + 1..];
-    }
-    out.push_str(rest);
-    out
+/// `text` (see [`intent_git::redact::redact_credentials`], monorepo#836).
+/// Best-effort; used for the terminal `error` payload.
+pub(crate) fn redact_credentials(text: &str) -> String {
+    intent_git::redact::redact_credentials(text)
 }
 
 /// Classify a (already-redacted) clone failure message into a machine-readable
@@ -717,7 +665,10 @@ fn percent_after(text: &str, label: &str) -> Option<u32> {
     rest[start..end].parse::<u32>().ok().map(|p| p.min(100))
 }
 
-fn progress_event(
+/// Shared with the `workspace.create` cache-hydration arm in `lib.rs`, which
+/// streams the same `git:clone:progress` / `git:clone:done` frames while
+/// hydrating from the repo cache instead of a network clone.
+pub(crate) fn progress_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     phase: &str,
@@ -742,7 +693,7 @@ fn progress_event(
     }
 }
 
-fn done_event(
+pub(crate) fn done_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     ok: bool,
@@ -776,7 +727,7 @@ fn done_event(
     }
 }
 
-async fn publish(bus: &EventBus, _ws: &WorkspaceId, event: NewEvent) {
+pub(crate) async fn publish(bus: &EventBus, _ws: &WorkspaceId, event: NewEvent) {
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish git:clone event");
     }
