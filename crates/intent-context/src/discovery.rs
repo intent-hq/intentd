@@ -32,12 +32,18 @@ fn home_dir() -> Option<PathBuf> {
 /// priority in auggie discovery. This is auggie's own install location, not a
 /// generic Intent-managed binary tier.
 pub fn managed_binary_path() -> Option<PathBuf> {
+    managed_binary_path_with_home(home_dir().as_deref())
+}
+
+/// Variant of [`managed_binary_path`] with the home directory injected instead
+/// of resolved from the environment (see `enriched_tool_dirs_with_home`).
+fn managed_binary_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "auggie.exe"
     } else {
         "auggie"
     };
-    Some(home_dir()?.join(".augment").join("bin").join(name))
+    Some(home?.join(".augment").join("bin").join(name))
 }
 
 /// Build the ordered, de-duplicated list of directories to search (port of
@@ -88,15 +94,16 @@ pub fn find_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Read the auggie binary path recorded by auggie's own installer in
-/// `~/.augment/auggie-path` (a single line holding an absolute path).
+/// `~/.augment/auggie-path` (a single line holding an absolute path). The first
+/// non-blank line is used, so a marker that grows extra lines still resolves.
 ///
 /// Returns `None` — silently — when the marker is missing, unreadable, empty,
 /// relative, or stale (points at something that is no longer an executable
 /// file), so a leftover marker never shadows a working install.
 fn marker_file_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
     let marker = home?.join(".augment").join("auggie-path");
-    let recorded = std::fs::read_to_string(&marker).ok()?;
-    let recorded = PathBuf::from(recorded.trim());
+    let contents = std::fs::read_to_string(&marker).ok()?;
+    let recorded = PathBuf::from(contents.lines().map(str::trim).find(|l| !l.is_empty())?);
     if !recorded.is_absolute() || !is_executable_file(&recorded) {
         return None;
     }
@@ -109,15 +116,22 @@ fn marker_file_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
 /// auggie's authoritative record of where it installed itself — daemon-launched
 /// processes inherit a minimal PATH that often misses that directory entirely.
 pub fn find_auggie() -> Option<PathBuf> {
-    if let Some(managed) = managed_binary_path() {
+    find_auggie_with_home(home_dir().as_deref(), &enhanced_path_dirs())
+}
+
+/// Variant of [`find_auggie`] with the home directory and search dirs injected
+/// instead of resolved from the environment, so the tier precedence is testable
+/// without mutating process-global `HOME` or `PATH`.
+fn find_auggie_with_home(home: Option<&Path>, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(managed) = managed_binary_path_with_home(home) {
         if is_executable_file(&managed) {
             return Some(managed);
         }
     }
-    if let Some(recorded) = marker_file_path_with_home(home_dir().as_deref()) {
+    if let Some(recorded) = marker_file_path_with_home(home) {
         return Some(recorded);
     }
-    find_in_dirs(&enhanced_path_dirs())
+    find_in_dirs(path_dirs)
 }
 
 /// Build the PATH for *executing* auggie (port of `getAuggieExecPATH`): prepend
@@ -256,6 +270,65 @@ mod tests {
         let dir = unique_temp_dir("marker-empty");
         write_marker(dir.path(), "\n  \n");
         assert_eq!(marker_file_path_with_home(Some(dir.path())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_file_uses_first_non_blank_line() {
+        let dir = unique_temp_dir("marker-multiline");
+        let bin = dir.path().join("auggie");
+        write_executable(&bin);
+        write_marker(
+            dir.path(),
+            &format!("\n{}\n# trailing junk\n", bin.to_str().unwrap()),
+        );
+        assert_eq!(marker_file_path_with_home(Some(dir.path())), Some(bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_auggie_prefers_managed_binary_over_marker_and_path() {
+        let dir = unique_temp_dir("tier-managed");
+        let managed = dir.path().join(".augment").join("bin").join("auggie");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        write_executable(&managed);
+        let marked = dir.path().join("marked-auggie");
+        write_executable(&marked);
+        write_marker(dir.path(), marked.to_str().unwrap());
+        let path_dir = unique_temp_dir("tier-managed-path");
+        write_executable(&path_dir.path().join("auggie"));
+        assert_eq!(
+            find_auggie_with_home(Some(dir.path()), &[path_dir.path().to_path_buf()]),
+            Some(managed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_auggie_prefers_marker_over_path_scan() {
+        let dir = unique_temp_dir("tier-marker");
+        let marked = dir.path().join("marked-auggie");
+        write_executable(&marked);
+        write_marker(dir.path(), marked.to_str().unwrap());
+        let path_dir = unique_temp_dir("tier-marker-path");
+        write_executable(&path_dir.path().join("auggie"));
+        assert_eq!(
+            find_auggie_with_home(Some(dir.path()), &[path_dir.path().to_path_buf()]),
+            Some(marked)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_auggie_falls_back_to_path_scan_without_marker() {
+        let dir = unique_temp_dir("tier-path");
+        let path_dir = unique_temp_dir("tier-path-dirs");
+        let bin = path_dir.path().join("auggie");
+        write_executable(&bin);
+        assert_eq!(
+            find_auggie_with_home(Some(dir.path()), &[path_dir.path().to_path_buf()]),
+            Some(bin)
+        );
     }
 
     #[test]
