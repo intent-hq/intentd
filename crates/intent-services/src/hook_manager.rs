@@ -687,17 +687,27 @@ impl Services {
     }
 
     /// `hook.cancel`: stop an active hook's task, mark it cancelled, and emit
-    /// `hook:cancelled`. A non-owner cancel (`by_owner = false`, the FE path)
+    /// `hook:cancelled`. `caller` is the cancelling agent (MCP): hooks are
+    /// agent-owned, so a non-owner is rejected and an owner cancel delivers
+    /// no self-wake. The FE path (`caller = None`) cancels any hook and
     /// additionally wakes the owning agent with a notice.
     pub(crate) async fn hook_cancel_op(
         &self,
         workspace_id: &WorkspaceId,
         hook_id: &HookId,
-        by_owner: bool,
+        caller: Option<&AgentId>,
     ) -> Result<Value> {
         let hook = self.store.get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
+        }
+        if let Some(caller) = caller {
+            if caller != &hook.agent_id {
+                return Err(Error::InvalidParams(format!(
+                    "hook.cancel: hook {} is owned by agent {} — you can only cancel your own hooks",
+                    hook_id.0, hook.agent_id.0
+                )));
+            }
         }
         if !matches!(hook.state, HookState::Scheduled | HookState::Running) {
             return Err(Error::InvalidParams(format!(
@@ -705,9 +715,11 @@ impl Services {
                 hook_id.0
             )));
         }
-        // FE-cancel (by_owner = false) wakes the owner with a notice;
+        // FE-cancel (no agent caller) wakes the owner with a notice;
         // owner-side cancel delivers no wake.
-        let notice = (!by_owner).then_some("This hook was cancelled from the app.");
+        let notice = caller
+            .is_none()
+            .then_some("This hook was cancelled from the app.");
         let hook = self.cancel_active_hook(hook, notice).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
@@ -1975,9 +1987,9 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert!(svc.hook_task_alive(&hook.hook_id));
-        // FE-initiated cancel (by_owner = false) → owner woken.
+        // FE-initiated cancel (no agent caller) → owner woken.
         let cancelled = svc
-            .hook_cancel_op(&ws, &hook.hook_id, false)
+            .hook_cancel_op(&ws, &hook.hook_id, None)
             .await
             .expect("cancel");
         assert_eq!(cancelled["hook"]["state"], json!("cancelled"));
@@ -1995,7 +2007,7 @@ mod tests {
         assert!(!text.contains("retired"), "{text}");
         // A second cancel fails: the hook is no longer active.
         let err = svc
-            .hook_cancel_op(&ws, &hook.hook_id, true)
+            .hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not active"), "{err}");
@@ -2017,7 +2029,7 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        svc.hook_cancel_op(&ws, &hook.hook_id, true)
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("owner cancel");
         let session = svc.store().get_agent_session(&owner).await.unwrap();
@@ -2025,6 +2037,58 @@ mod tests {
             session.messages.is_empty(),
             "owner-initiated cancel must not wake the owner"
         );
+    }
+
+    /// Regression (intent-hq/monorepo#1563): an agent cancelling a sibling
+    /// agent's hook is rejected with an error naming the owner, and the hook
+    /// stays active with its scheduler task alive — the accidental
+    /// list+cancel-all cleanup idiom cannot kill another agent's watch.
+    #[tokio::test]
+    async fn cross_agent_cancel_is_rejected_and_leaves_hook_active() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let other = AgentId::from("agent-other");
+        svc.store()
+            .insert_agent_session(&agent(&ws, "agent-other"))
+            .await
+            .expect("other agent");
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "owned-watch",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+
+        let err = svc
+            .hook_cancel_op(&ws, &hook.hook_id, Some(&other))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("only cancel your own hooks"), "{msg}");
+        assert!(msg.contains(&owner.0), "error names the owner: {msg}");
+
+        // The hook survives untouched: still scheduled, task alive, no wake.
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Scheduled);
+        assert!(svc.hook_task_alive(&hook.hook_id), "task still alive");
+        let types = hook_event_types(&svc, &ws, &[]).await;
+        assert!(
+            !types.iter().any(|t| t == HOOK_CANCELLED),
+            "no cancel event: {types:?}"
+        );
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        assert!(session.messages.is_empty(), "owner not woken");
+
+        // The owner can still cancel it.
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
+            .await
+            .expect("owner cancel");
     }
 
     /// `workspace.archive` cancels every ACTIVE hook in the workspace per
@@ -2165,7 +2229,7 @@ mod tests {
         );
 
         // Settle the hook: the promotion lapses and the base rollup runs.
-        svc.hook_cancel_op(&ws, &hook.hook_id, true)
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
         assert!(!svc.workspace_has_active_hooks(&ws).await);
@@ -2237,7 +2301,7 @@ mod tests {
         svc.maybe_emit_display_status_changed(&ws).await;
         assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
 
-        svc.hook_cancel_op(&ws, &hook.hook_id, true)
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
         assert_eq!(

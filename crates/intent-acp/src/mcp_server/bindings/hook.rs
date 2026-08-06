@@ -5,8 +5,9 @@
 //! `hook.schedule` — hooks are agent-authored by design, §6.8) and attributes
 //! the calling agent as the hook's owner, so it requires an agent caller
 //! context; `list` / `cancel` / `runNow` mirror the wire methods of the same
-//! names. An owner-initiated cancel (`by_owner = true`) does not wake the
-//! owner — only the FE cancel path does.
+//! names. `cancel` is ownership-scoped and therefore also requires an agent
+//! caller context: an agent can only cancel its own hooks, and that cancel
+//! does not wake the owner — only the FE cancel path does.
 
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub(crate) async fn dispatch(
     match method {
         "schedule" => schedule(api, ws, caller, args).await,
         "list" => list(api, ws).await,
-        "cancel" => cancel(api, ws, args).await,
+        "cancel" => cancel(api, ws, caller, args).await,
         "runNow" => run_now(api, ws, args).await,
         other => Err(format!("hook: unknown method `hook.{other}`")),
     }
@@ -72,12 +73,24 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
 async fn cancel(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    // Cancel is ownership-scoped: without an agent caller context there is
+    // no owner to check against (mirrors `hook.schedule`).
+    let Some(caller) = caller else {
+        return Err(
+            "hook.cancel requires an agent caller context to verify hook ownership".to_string(),
+        );
+    };
     let hook_id = req_str(args, "hookId").map_err(|_| "hookId is required".to_string())?;
-    api.hook_cancel(ws.clone(), HookId::from(hook_id.as_str()), true)
-        .await
-        .map_err(map_err)
+    api.hook_cancel(
+        ws.clone(),
+        HookId::from(hook_id.as_str()),
+        Some(caller.clone()),
+    )
+    .await
+    .map_err(map_err)
 }
 
 async fn run_now(

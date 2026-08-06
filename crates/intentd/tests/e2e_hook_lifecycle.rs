@@ -863,7 +863,7 @@ async fn hook_lifecycle_over_wss() {
     );
     let ev = next_hook_event(&mut sub, "hook:cancelled", Some(cancel_hook_name)).await;
     assert_eq!(ev["data"]["hookId"], json!(cancel_id));
-    // FE cancel (`by_owner = false`) wakes the owner with the notice.
+    // FE cancel (no agent caller) wakes the owner with the notice.
     await_conversation_contains(
         &mut rpc,
         410,
