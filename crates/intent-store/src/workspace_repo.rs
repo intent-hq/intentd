@@ -295,6 +295,58 @@ impl Store {
         Ok(false)
     }
 
+    /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
+    /// `last_activity` column — never `updated_at`, never a full-row replace —
+    /// and only when the supplied timestamp is strictly newer than the stored
+    /// one (or the column is NULL / unparseable). Same scoped-update
+    /// discipline as [`Self::set_workspace_attention`].
+    ///
+    /// Backs the debounced `lastActivity` derivation in intent-services so the
+    /// persisted column tracks the derived value and cheap read paths
+    /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
+    /// a fresh timestamp after a restart.
+    ///
+    /// Comparison runs through SQLite's `julianday()` rather than raw TEXT so
+    /// timestamps of differing fractional-second precision order correctly
+    /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
+    /// `last_activity` parses to NULL and is treated as "older" (overwritten);
+    /// a malformed input never writes. Returns whether a row was written;
+    /// `NotFound` when the workspace does not exist.
+    pub async fn bump_workspace_last_activity(
+        &self,
+        id: &WorkspaceId,
+        last_activity: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workspace SET last_activity=? WHERE id=? AND julianday(?) IS NOT NULL \
+             AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
+             OR julianday(last_activity) < julianday(?))",
+        )
+        .bind(last_activity)
+        .bind(&id.0)
+        .bind(last_activity)
+        .bind(last_activity)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("bump last_activity failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Zero rows: either the monotonic guard declined (not newer) or the
+        // workspace is missing — distinguish so callers keep NotFound semantics.
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
+            .bind(&id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("bump last_activity presence check failed: {e}"))
+            })?;
+        if col::<i64>(&row, "present")? == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in
     /// `deleted_workspace_id` (same transaction as the row delete) so
     /// `workspace.create` never recycles the id for a later workspace (FE
