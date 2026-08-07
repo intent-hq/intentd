@@ -414,7 +414,8 @@ fn ensure_bare_model_matches_provider(
     if !cached_owners.is_empty() && requested_cache == Some(false) {
         return Err(Error::InvalidParams(format!(
             "{method}: model {model_id} does not belong to provider {effective} \
-             (providers with this model: {})",
+             (providers with this model: {}); pass providerId to select the \
+             intended provider",
             cached_owners.join(", ")
         )));
     }
@@ -2600,12 +2601,25 @@ impl Services {
     /// When the new model is a compound id (`provider:model`) whose provider
     /// differs from session.provider, this updates session.provider to match,
     /// ensuring the next spawn uses the correct binary.
+    ///
+    /// `provider_id` is the optional explicit provider (additive param,
+    /// monorepo#1657): absent keeps the historical behavior byte-for-byte;
+    /// present it must name a registered provider, a compound `model_id`'s
+    /// prefix must agree with it, and a bare `model_id` is validated against
+    /// — and session.provider reconciled to — the GIVEN provider instead of
+    /// the session's effective one.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
+        // An explicit providerId must be a registered provider before any
+        // mutation (same misroute vector as the compound prefix below).
+        if let Some(pid) = provider_id.as_deref() {
+            ensure_known_provider("agent.setModel", pid)?;
+        }
         // Parse the compound prefix once: reject unknown providers before any
         // mutation (the same misroute vector as agent.create — persisting one
         // would make the next spawn silently fall back to the default binary,
@@ -2615,7 +2629,32 @@ impl Services {
         let model_provider = if model_id.contains(':') {
             let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
             ensure_known_provider("agent.setModel", &model_provider)?;
+            // An explicit providerId must agree with the compound prefix
+            // (normalized): a conflict is a client bug — reject before any
+            // mutation rather than guessing which provider was meant.
+            if let Some(pid) = provider_id.as_deref() {
+                let prefix = intent_providers::provider_config(&model_provider).id;
+                if prefix != pid {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.setModel: modelId {model_id} names provider {prefix} \
+                         but providerId is {pid}"
+                    )));
+                }
+            }
             Some(model_provider)
+        } else if let Some(pid) = provider_id {
+            // Bare model with an explicit providerId: ownership is validated
+            // against the GIVEN provider (not the session's effective one),
+            // and session.provider is reconciled to it below — same write
+            // path as the compound-prefix case — so the next spawn runs the
+            // intended binary (monorepo#1657).
+            ensure_bare_model_matches_provider(
+                "agent.setModel",
+                &self.models_catalog,
+                &pid,
+                &model_id,
+            )?;
+            Some(pid)
         } else {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
@@ -2641,8 +2680,9 @@ impl Services {
             )?;
             None
         };
-        // Reconcile the provider to the compound prefix (bare ids keep the
-        // session's provider). The write goes through the narrow
+        // Reconcile the provider to the compound prefix or explicit
+        // providerId (bare ids without one keep the session's provider). The
+        // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
         // after `acp_session_id` is persisted would otherwise trip

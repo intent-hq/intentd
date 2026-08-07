@@ -1310,9 +1310,23 @@ async fn dispatch(
         "agent.setModel" => {
             let agent_id = require_agent_id(params)?;
             let model_id = require_str_param(params, "modelId")?;
+            // Optional explicit provider (additive, PROTOCOL §5.5): empty /
+            // whitespace-only (and JSON null) are treated as absent so older
+            // clients sending a blank field keep the historical behavior; a
+            // present non-string value is a malformed request — reject it
+            // rather than silently falling back to the legacy path.
+            match params.get("providerId") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => {
+                    return Err(invalid_params(
+                        "agent.setModel: providerId must be a string",
+                    ))
+                }
+            }
+            let provider_id = opt_nonempty_str(params, "providerId").map(|s| s.trim().to_string());
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_set_model(ws, agent_id, model_id)
+                .agent_set_model(ws, agent_id, model_id, provider_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

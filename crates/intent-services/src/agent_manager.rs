@@ -4225,7 +4225,7 @@ impl AgentManager {
         let pre_truncate = async {
             if let Some(model_id) = model {
                 self.services
-                    .agent_set_model_op(agent_id.clone(), model_id)
+                    .agent_set_model_op(agent_id.clone(), model_id, None)
                     .await?;
             }
             self.services
