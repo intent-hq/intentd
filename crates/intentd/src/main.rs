@@ -2373,8 +2373,12 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
             // INFO only when the sweep attempted work; skip-only passes
             // (e.g. a permanently capped sandbox every tick) log at debug so
             // they do not spam the log forever.
-            let attempted =
-                summary.merged + summary.conflicts + summary.blocked + summary.errors > 0;
+            let attempted = summary.merged
+                + summary.conflicts
+                + summary.blocked
+                + summary.errors
+                + summary.timed_out_lanes
+                > 0;
             if attempted {
                 tracing::info!(
                     merged = summary.merged,
@@ -2384,6 +2388,7 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
                     skipped_busy = summary.skipped_busy,
                     skipped_raced = summary.skipped_raced,
                     errors = summary.errors,
+                    timed_out_lanes = summary.timed_out_lanes,
                     "merge-pending retry sweep completed"
                 );
             } else if !summary.is_empty() {

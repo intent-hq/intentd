@@ -1342,6 +1342,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sweep_budget_aborts_wedged_lane_and_completes_pass() {
+        // Regression (dev-seat sweep stall): one wedged merge (hung fetch —
+        // simulated via the sweep-delay test seam) must not pin the whole
+        // sweep pass. The budget aborts the stuck lane (its claim guard
+        // resets the row `merging → merge_pending`), the other workspace's
+        // lane still lands, and the sweep RETURNS — so the daemon's ticker
+        // re-arms instead of stalling forever behind the wedge.
+
+        let (store, _db) = temp_store().await;
+        let agent_wedged = AgentId::from("agent-wedged-budget");
+        let Some((root_a, _repo_a, _sb_a, ws_a, services, _bus_a)) =
+            setup_merge_pending_sandbox(&store, "sweep-budget-a", &agent_wedged).await
+        else {
+            return;
+        };
+        let agent_clean = AgentId::from("agent-clean-budget");
+        let Some((root_b, repo_b, _sb_b, ws_b, _services_b, _bus_b)) =
+            setup_merge_pending_sandbox(&store, "sweep-budget-b", &agent_clean).await
+        else {
+            let _ = fs::remove_dir_all(&root_a);
+            return;
+        };
+
+        // Wedge A's merge attempt well past the budget.
+        services.set_test_sweep_delay(&agent_wedged, std::time::Duration::from_secs(30));
+
+        let started = std::time::Instant::now();
+        let summary = services
+            .sweep_merge_pending_sandboxes_with_budget(std::time::Duration::from_millis(1500))
+            .await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "sweep must return promptly after the budget, not wait out the wedge"
+        );
+        assert_eq!(
+            summary.merged, 1,
+            "the clean lane must land despite the wedge"
+        );
+        assert_eq!(
+            summary.timed_out_lanes, 1,
+            "the wedged lane must be aborted"
+        );
+        assert!(repo_b.join("swept.txt").exists());
+        let clean = store
+            .get_sandbox(&ws_b.id, &agent_clean)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean.status, SandboxStatus::Merged);
+
+        // The aborted lane's claim guard resets the wedged row so the next
+        // tick can reclaim it (the reset is spawned from Drop; allow it a
+        // moment to run).
+        let mut wedged_status = SandboxStatus::Merging;
+        for _ in 0..40 {
+            wedged_status = store
+                .get_sandbox(&ws_a.id, &agent_wedged)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if wedged_status == SandboxStatus::MergePending {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            wedged_status,
+            SandboxStatus::MergePending,
+            "claim guard must reset the aborted lane's claim for the next tick"
+        );
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_selects_retry_count_zero_rows() {
+        // Regression (dev-seat merge-verification round): a fresh
+        // `merge_pending` row with retry_count=0 must be selected and merged
+        // by the sweep — the retry cap only excludes rows AT the cap, and a
+        // capped sibling in the same pass must not shadow the fresh row.
+
+        let (store, _db) = temp_store().await;
+        let agent_fresh = AgentId::from("agent-retry-zero");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-zero", &agent_fresh).await
+        else {
+            return;
+        };
+        let fresh = store
+            .get_sandbox(&ws.id, &agent_fresh)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh.retry_count, 0,
+            "precondition: fresh row at zero retries"
+        );
+
+        // Capped sibling in the same workspace lane.
+        let agent_capped = AgentId::from("agent-retry-capped");
+        let config = ProvisionConfig {
+            workspaces_root: test_root.join("workspaces"),
+        };
+        create_agent_session(&store, &ws.id, &agent_capped, None, None).await;
+        let outcome = provision_sandbox(&store, &ws.id, &agent_capped, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported { .. } = outcome else {
+            panic!("Expected Supported outcome");
+        };
+        store
+            .update_sandbox_status(
+                &ws.id,
+                &agent_capped,
+                SandboxStatus::MergePending,
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..crate::SANDBOX_MERGE_SWEEP_RETRY_CAP {
+            store
+                .increment_sandbox_retry_count(&ws.id, &agent_capped)
+                .await
+                .unwrap();
+        }
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.merged, 1, "retry_count=0 row must be merged");
+        assert_eq!(summary.skipped_capped, 1, "capped sibling skipped");
+        assert!(repo_path.join("swept.txt").exists());
+        let merged = store
+            .get_sandbox(&ws.id, &agent_fresh)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.status, SandboxStatus::Merged);
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
     async fn test_sweep_skips_sandbox_at_retry_cap() {
         // A sandbox that already burned the retry cap stays merge_pending for
         // manual sandbox.cow.merge / sandbox.cow.discard — the sweep must not touch it.

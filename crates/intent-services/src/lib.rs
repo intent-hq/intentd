@@ -421,6 +421,11 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Test-only per-agent delay injected into the sweep's merge attempt
+    /// (after the claim), standing in for a wedged merge (hung fetch). Lets
+    /// unit tests prove the sweep's time budget aborts a stuck lane without
+    /// stalling the pass. Empty in production. Shared across clones.
+    test_sweep_delays: Arc<Mutex<HashMap<AgentId, std::time::Duration>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -638,6 +643,7 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            test_sweep_delays: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -1917,6 +1923,17 @@ impl Services {
             } else {
                 set.remove(agent_id);
             }
+        }
+    }
+
+    /// Test-only seam: inject a delay into the sweep's merge attempt for
+    /// `agent_id`'s sandbox (after the claim), simulating a wedged merge so
+    /// tests can prove the sweep budget aborts stuck lanes. No production
+    /// caller.
+    #[doc(hidden)]
+    pub fn set_test_sweep_delay(&self, agent_id: &AgentId, delay: std::time::Duration) {
+        if let Ok(mut map) = self.test_sweep_delays.lock() {
+            map.insert(agent_id.clone(), delay);
         }
     }
 
@@ -4649,6 +4666,24 @@ impl Services {
     /// but a slow or wedged merge in one workspace must not delay another
     /// workspace's landings.
     pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
+        self.sweep_merge_pending_sandboxes_with_budget(SANDBOX_MERGE_SWEEP_BUDGET)
+            .await
+    }
+
+    /// [`Services::sweep_merge_pending_sandboxes`] with an explicit time
+    /// budget. The budget bounds the whole pass: when it expires, the
+    /// still-running workspace lanes are aborted (each in-flight claim's
+    /// [`MergeClaimGuard`] resets its row `merging → merge_pending`, and the
+    /// git mutation itself is on the blocking pool, so the canonical repo is
+    /// never abandoned mid-mutation) and the sweep returns with
+    /// `timed_out_lanes > 0`. Without the bound, one wedged merge (e.g. a
+    /// hung `git fetch` subprocess) blocked the summary forever, the
+    /// daemon's sweep ticker never re-armed, and every other sandbox stopped
+    /// being swept — the dev-seat stall.
+    pub async fn sweep_merge_pending_sandboxes_with_budget(
+        &self,
+        budget: std::time::Duration,
+    ) -> MergeSweepSummary {
         use intent_store::SandboxStatus;
 
         // Live watchdog for stranded `merging` rows: every merge path holds
@@ -4694,9 +4729,43 @@ impl Services {
             });
         }
         let mut summary = MergeSweepSummary::default();
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let res = tokio::select! {
+                res = join.join_next() => match res {
+                    Some(res) => res,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    // Budget exhausted: abort the stragglers. Each aborted
+                    // lane's in-flight claim guard resets its row, and the
+                    // blocking-pool git task runs to completion — safe to
+                    // abandon the awaiting future.
+                    summary.timed_out_lanes = join.len();
+                    join.abort_all();
+                    tracing::warn!(
+                        timed_out_lanes = summary.timed_out_lanes,
+                        budget_secs = budget.as_secs(),
+                        "merge retry sweep: budget exhausted; aborting slow workspace lanes so the sweep keeps ticking"
+                    );
+                    break;
+                }
+            };
+            match res {
+                Ok(lane_summary) => summary.absorb(&lane_summary),
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    summary.errors += 1;
+                    tracing::warn!(error = %e, "merge retry sweep: workspace lane task failed");
+                }
+            }
+        }
+        // Drain whatever the abort left behind (already-finished lanes may
+        // still yield results; cancelled ones are skipped).
         while let Some(res) = join.join_next().await {
             match res {
                 Ok(lane_summary) => summary.absorb(&lane_summary),
+                Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     summary.errors += 1;
                     tracing::warn!(error = %e, "merge retry sweep: workspace lane task failed");
@@ -4804,9 +4873,20 @@ impl Services {
         }
 
         // Crash-safe claim scope: reset `merging → merge_pending` if the
-        // sweep task is aborted (daemon shutdown) or panics mid-merge.
+        // sweep task is aborted (daemon shutdown, sweep budget expiry) or
+        // panics mid-merge.
         let mut claim_guard =
             MergeClaimGuard::armed(self.store.clone(), workspace_id.clone(), agent_id.clone());
+
+        // Test seam: simulate a wedged merge (see `set_test_sweep_delay`).
+        let test_delay = self
+            .test_sweep_delays
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&agent_id).copied());
+        if let Some(delay) = test_delay {
+            tokio::time::sleep(delay).await;
+        }
 
         // Same dirty-state policy as the completion path: with the
         // workspace's auto-commit OFF the sweep must not commit the
@@ -7970,6 +8050,13 @@ pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 /// (one sweep interval) is far past any legitimate in-flight merge.
 pub const SANDBOX_MERGING_STALE_AFTER: time::Duration = time::Duration::minutes(10);
 
+/// Time budget for one [`Services::sweep_merge_pending_sandboxes`] pass.
+/// Bounds the whole sweep so one wedged merge (hung fetch, giant cherry-pick)
+/// cannot pin the sweep loop past its own interval and starve every other
+/// sandbox of retries. Kept under the daemon's sweep interval (10 min) so a
+/// fresh tick always follows a timed-out pass.
+pub const SANDBOX_MERGE_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(480);
+
 /// What [`Services::handle_sandbox_merge_on_completion`] decided about a
 /// sandboxed agent's completion: whether it propagates to the coordinator
 /// (`false` = the agent was bounced and will re-complete) and, when it does,
@@ -8036,6 +8123,10 @@ pub struct MergeSweepSummary {
     pub skipped_manual_merge: usize,
     /// Hard errors (claim failures or merge errors; retry consumed on merge errors).
     pub errors: usize,
+    /// Workspace lanes aborted because the sweep's time budget expired
+    /// (their in-flight claims were reset by the claim guard; remaining
+    /// rows stay `merge_pending` for the next tick).
+    pub timed_out_lanes: usize,
 }
 
 impl MergeSweepSummary {
@@ -8054,6 +8145,7 @@ impl MergeSweepSummary {
         self.skipped_raced += other.skipped_raced;
         self.skipped_manual_merge += other.skipped_manual_merge;
         self.errors += other.errors;
+        self.timed_out_lanes += other.timed_out_lanes;
     }
 }
 
