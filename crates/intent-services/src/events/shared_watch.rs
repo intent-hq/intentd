@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use notify::{RecursiveMode, Watcher};
@@ -59,18 +59,59 @@ struct Sink {
 }
 
 /// Command to a group's registrar thread. Dropping the sender ends the thread,
-/// which drops the watcher and tears the stream down. `Watch` carries the flag
-/// the registrar raises once the root is actually registered.
+/// which drops the watcher and tears the stream down. `Watch` carries the
+/// [`Registration`] the registrar settles once the root is actually registered.
 enum Cmd {
-    Watch(PathBuf, Arc<AtomicBool>),
+    Watch(PathBuf, Arc<Registration>),
     Unwatch(PathBuf),
 }
 
+/// Outcome of one deferred `watcher.watch()`, shared between the registrar
+/// thread and everyone waiting on it.
+///
+/// Failure is tracked distinctly from success because a root that failed to
+/// register is dead but still refcounted: without the distinction a later
+/// subscriber would join the existing `Root` entry, never re-send `Cmd::Watch`,
+/// and silently receive a channel that can never deliver — with no recovery
+/// until every subscriber drops. [`SharedWatchHub::subscribe`] retries such a
+/// root instead.
+#[derive(Default)]
+struct Registration {
+    /// [`REG_PENDING`] / [`REG_LIVE`] / [`REG_FAILED`].
+    state: std::sync::atomic::AtomicU8,
+}
+
+const REG_PENDING: u8 = 0;
+const REG_LIVE: u8 = 1;
+const REG_FAILED: u8 = 2;
+
+impl Registration {
+    /// Whether the registrar has answered, either way. Waiters unblock here:
+    /// nothing will ever arrive for a failed registration, so waiting past it
+    /// would only stall.
+    fn settled(&self) -> bool {
+        self.state.load(Ordering::Acquire) != REG_PENDING
+    }
+
+    fn failed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REG_FAILED
+    }
+
+    fn settle(&self, live: bool) {
+        self.state
+            .store(if live { REG_LIVE } else { REG_FAILED }, Ordering::Release);
+    }
+
+    fn reset(&self) {
+        self.state.store(REG_PENDING, Ordering::Release);
+    }
+}
+
 /// A watched root: how many subscribers reference it (two workspaces can
-/// resolve to the same root) and whether its registration has landed.
+/// resolve to the same root) and the state of its deferred registration.
 struct Root {
     subscribers: usize,
-    established: Arc<AtomicBool>,
+    registration: Arc<Registration>,
 }
 
 /// One shared stream: the registrar handle, the roots on it, and its demux
@@ -102,20 +143,20 @@ pub(super) struct SubHandle {
     group: PathBuf,
     root: PathBuf,
     id: u64,
-    established: Arc<AtomicBool>,
+    registration: Arc<Registration>,
 }
 
 impl SubHandle {
-    /// Await this subscription's root actually being registered with the OS,
-    /// returning on timeout rather than waiting forever. Registration is
-    /// deferred off the caller's thread (monorepo#1572), so a caller whose
-    /// correctness depends on the watch existing — a catch-up flush, or a test
-    /// about to mutate the watched tree — has to wait for it. (In-crate the
-    /// only such caller is [`watch_tiers`], which reads the flag directly; the
-    /// handle-level wrapper exists for the watcher tests.)
+    /// Await this subscription's registration settling, returning on timeout
+    /// rather than waiting forever. Registration is deferred off the caller's
+    /// thread (monorepo#1572), so a caller whose correctness depends on the
+    /// watch existing — a catch-up flush, or a test about to mutate the watched
+    /// tree — has to wait for it. (In-crate the only such caller is
+    /// [`watch_tiers`], which reads the registration directly; the handle-level
+    /// wrapper exists for the watcher tests.)
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
-        wait_established(&self.established, timeout).await;
+        wait_settled(&self.registration, timeout).await;
     }
 }
 
@@ -123,12 +164,12 @@ impl SubHandle {
 /// flushing anyway: a wedged backend must not suppress the flush entirely.
 const ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Poll `flag` until the registrar raises it or `timeout` elapses. Returns
-/// either way — the registrar raises the flag even on a failed registration, so
-/// the timeout only covers a backend that never answers at all.
-async fn wait_established(flag: &AtomicBool, timeout: std::time::Duration) {
+/// Poll `registration` until the registrar settles it or `timeout` elapses.
+/// Returns either way — a failure settles it too, so the timeout only covers a
+/// backend that never answers at all.
+async fn wait_settled(registration: &Registration, timeout: std::time::Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
-    while !flag.load(Ordering::Acquire) {
+    while !registration.settled() {
         if tokio::time::Instant::now() >= deadline {
             return;
         }
@@ -138,6 +179,25 @@ async fn wait_established(flag: &AtomicBool, timeout: std::time::Duration) {
 
 impl Drop for SubHandle {
     fn drop(&mut self) {
+        // Take the sinks handle out from under `state`, then release `state`
+        // before touching the sinks lock. `demux` holds the sinks lock while it
+        // runs, so blocking on it here — with the hub-wide `state` mutex held —
+        // would let one group's stream stall every other group's `subscribe`,
+        // exactly the cross-group coupling the module header disclaims.
+        let sinks = {
+            let state = match self.hub.state.lock() {
+                Ok(state) => state,
+                Err(e) => e.into_inner(),
+            };
+            let Some(group) = state.groups.get(&self.group) else {
+                return;
+            };
+            Arc::clone(&group.sinks)
+        };
+        if let Ok(mut sinks) = sinks.lock() {
+            sinks.retain(|s| s.id != self.id);
+        }
+
         let mut state = match self.hub.state.lock() {
             Ok(state) => state,
             Err(e) => e.into_inner(),
@@ -145,9 +205,6 @@ impl Drop for SubHandle {
         let Some(group) = state.groups.get_mut(&self.group) else {
             return;
         };
-        if let Ok(mut sinks) = group.sinks.lock() {
-            sinks.retain(|s| s.id != self.id);
-        }
         let drop_root = match group.roots.get_mut(&self.root) {
             Some(root) => {
                 root.subscribers -= 1;
@@ -180,7 +237,23 @@ impl SharedWatchHub {
         self: &Arc<Self>,
         root: &Path,
     ) -> (SubHandle, mpsc::UnboundedReceiver<notify::Event>, PathBuf) {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root = match std::fs::canonicalize(root) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                // The raw form will not prefix-match the canonical paths the OS
+                // reports (macOS `/var` vs `/private/var`), so this subscription
+                // may see nothing on the fast pass. Callers guard with an
+                // existence check, so it means the root vanished underneath
+                // them; log it so "watch registered but nothing arrives" is
+                // diagnosable rather than silent.
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "watch root could not be canonicalized; demux may not match its events"
+                );
+                root.to_path_buf()
+            }
+        };
         let group_key = root
             .parent()
             .map(Path::to_path_buf)
@@ -210,14 +283,23 @@ impl SharedWatchHub {
         }
         let entry = group.roots.entry(root.clone()).or_insert_with(|| Root {
             subscribers: 0,
-            established: Arc::new(AtomicBool::new(false)),
+            registration: Arc::new(Registration::default()),
         });
         entry.subscribers += 1;
-        let established = Arc::clone(&entry.established);
-        if entry.subscribers == 1 {
+        // A root whose registration failed is dead but still refcounted, so a
+        // new subscriber joining it would otherwise inherit a channel that can
+        // never deliver, with no recovery until every subscriber drops. Retry
+        // instead: a transient cause (the directory briefly missing) resolves,
+        // and a persistent one just fails again and is logged again.
+        let retry_failed = entry.subscribers > 1 && entry.registration.failed();
+        if retry_failed {
+            entry.registration.reset();
+        }
+        let registration = Arc::clone(&entry.registration);
+        if entry.subscribers == 1 || retry_failed {
             let _ = group
                 .cmd
-                .send(Cmd::Watch(root.clone(), Arc::clone(&established)));
+                .send(Cmd::Watch(root.clone(), Arc::clone(&registration)));
         }
         drop(state);
 
@@ -227,7 +309,7 @@ impl SharedWatchHub {
                 group: group_key,
                 root: root.clone(),
                 id,
-                established,
+                registration,
             },
             rx,
             root,
@@ -245,9 +327,10 @@ impl SharedWatchHub {
     }
 
     /// Registration state of one root: `None` when nothing watches it,
-    /// `Some(false)` when a watch is requested but has not landed yet,
-    /// `Some(true)` once the OS has it. Path is canonicalized to match the form
-    /// [`Self::subscribe`] keys roots by.
+    /// `Some(false)` while the watch request is still pending, `Some(true)` once
+    /// the registrar has answered (either way — a failed registration will never
+    /// settle further, so waiters must not park on it). Path is canonicalized to
+    /// match the form [`Self::subscribe`] keys roots by.
     #[cfg(test)]
     pub(super) fn root_established(&self, root: &Path) -> Option<bool> {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -259,7 +342,7 @@ impl SharedWatchHub {
             .groups
             .values()
             .find_map(|g| g.roots.get(&root))
-            .map(|r| r.established.load(Ordering::Acquire))
+            .map(|r| r.registration.settled())
     }
 
     /// Await every currently-requested root being registered with the OS.
@@ -289,8 +372,7 @@ impl SharedWatchHub {
                     .values()
                     .flat_map(|g| g.roots.values())
                     .collect();
-                roots.len() >= expect_roots
-                    && roots.iter().all(|r| r.established.load(Ordering::Acquire))
+                roots.len() >= expect_roots && roots.iter().all(|r| r.registration.settled())
             };
             if ready || tokio::time::Instant::now() >= deadline {
                 return;
@@ -325,13 +407,18 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
         };
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                Cmd::Watch(root, established) => {
-                    if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                        tracing::warn!(root = %root.display(), error = %e, "shared watch registration failed");
+                Cmd::Watch(root, registration) => {
+                    // Settled either way, so waiters do not hang on a failure;
+                    // the failed state is distinct so a later subscriber to the
+                    // same root can retry it rather than inheriting a dead
+                    // channel.
+                    match watcher.watch(&root, RecursiveMode::Recursive) {
+                        Ok(()) => registration.settle(true),
+                        Err(e) => {
+                            tracing::warn!(root = %root.display(), error = %e, "shared watch registration failed");
+                            registration.settle(false);
+                        }
                     }
-                    // Raised either way: a failed registration will never
-                    // establish, and waiters must not hang on it.
-                    established.store(true, Ordering::Release);
                 }
                 Cmd::Unwatch(root) => {
                     if let Err(e) = watcher.unwatch(&root) {
@@ -358,49 +445,77 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
 ///
 /// The cheap `starts_with` pass runs first and is the only one needed in
 /// practice: the roots are canonicalized at subscribe time and FSEvents reports
-/// canonical paths. Only when no sink matches raw are the paths resolved (a
-/// symlinked root, or a deleted path that cannot be canonicalized directly) and
-/// the pass repeated, so a busy stream costs no filesystem syscalls per event.
+/// canonical paths. Resolution (a symlinked root, or a deleted path that cannot
+/// be canonicalized directly) is attempted only for the paths that no sink
+/// matched raw, so a busy stream costs no filesystem syscalls per event. Doing
+/// it per path rather than per event matters for multi-path events: one path
+/// matching raw must not suppress the fallback for a sibling path that needs it.
+///
+/// The routing table is snapshotted and the lock released before any of that
+/// work happens. Resolution stats the filesystem, and holding the sinks lock
+/// across it would make a wedged volume block `SubHandle::drop` — which holds
+/// the hub-wide `state` mutex — and through it every other group's `subscribe`,
+/// contradicting the per-group isolation this module claims. A sink that goes
+/// away mid-send just makes the send a no-op.
 fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
-    let Ok(sinks) = sinks.lock() else {
-        return;
+    let routes: Vec<(PathBuf, mpsc::UnboundedSender<notify::Event>)> = match sinks.lock() {
+        Ok(sinks) => sinks
+            .iter()
+            .map(|s| (s.root.clone(), s.tx.clone()))
+            .collect(),
+        Err(_) => return,
     };
-    let mut matched = false;
-    for sink in sinks.iter() {
-        if send_narrowed(sink, event, &event.paths) {
-            matched = true;
-        }
+
+    let mut unmatched: Vec<usize> = (0..event.paths.len()).collect();
+    for (root, tx) in &routes {
+        let mine = narrow(event, &event.paths, root);
+        unmatched.retain(|i| !event.paths[*i].starts_with(root));
+        send_narrowed(tx, event, mine);
     }
-    if matched {
+    if unmatched.is_empty() {
         return;
     }
-    let resolved: Vec<PathBuf> = event
-        .paths
-        .iter()
-        .map(|p| canonical_root(p, &find_existing_ancestor(p)))
-        .collect();
-    for sink in sinks.iter() {
-        send_narrowed(sink, event, &resolved);
+
+    // Resolve only the leftovers; every other index keeps a path no root can
+    // match, so it cannot be rescued and must not be sent.
+    let mut resolved = event.paths.clone();
+    for i in &unmatched {
+        let raw = &event.paths[*i];
+        resolved[*i] = canonical_root(raw, &find_existing_ancestor(raw));
+    }
+    for (root, tx) in &routes {
+        let mine: Vec<PathBuf> = unmatched
+            .iter()
+            .filter(|i| resolved[**i].starts_with(root))
+            .map(|i| event.paths[*i].clone())
+            .collect();
+        send_narrowed(tx, event, mine);
     }
 }
 
-/// Forward `event` to `sink` with its path list narrowed to the entries of
-/// `candidates` that fall under the sink's root, mapped back to the raw paths so
-/// consumers still see what the OS reported. Returns whether anything matched.
-fn send_narrowed(sink: &Sink, event: &notify::Event, candidates: &[PathBuf]) -> bool {
-    let mine: Vec<PathBuf> = candidates
+/// The raw paths of `event` whose `candidates` counterpart falls under `root`.
+fn narrow(event: &notify::Event, candidates: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    candidates
         .iter()
         .zip(event.paths.iter())
-        .filter(|(candidate, _)| candidate.starts_with(&sink.root))
+        .filter(|(candidate, _)| candidate.starts_with(root))
         .map(|(_, raw)| raw.clone())
-        .collect();
-    if mine.is_empty() {
-        return false;
+        .collect()
+}
+
+/// Forward `event` carrying only `paths` (already narrowed to the destination's
+/// root), preserving the original event kind. No-op when nothing matched.
+fn send_narrowed(
+    tx: &mpsc::UnboundedSender<notify::Event>,
+    event: &notify::Event,
+    paths: Vec<PathBuf>,
+) {
+    if paths.is_empty() {
+        return;
     }
     let mut narrowed = event.clone();
-    narrowed.paths = mine;
-    let _ = sink.tx.send(narrowed);
-    true
+    narrowed.paths = paths;
+    let _ = tx.send(narrowed);
 }
 
 /// Whether an event should be forwarded for a tier-style watch: any of its
@@ -462,9 +577,9 @@ pub(super) fn watch_tiers(
                 .fold(canonical.clone(), |acc, part| acc.join(part))
         })
         .collect();
-    let established = Arc::clone(&sub.established);
+    let registration = Arc::clone(&sub.registration);
     let task = tokio::spawn(async move {
-        wait_established(&established, ESTABLISH_TIMEOUT).await;
+        wait_settled(&registration, ESTABLISH_TIMEOUT).await;
         on_change();
         while let Some(event) = rx.recv().await {
             if tier_event_matches(&event, &tier_roots, filename_matches) {
@@ -574,6 +689,17 @@ mod tests {
         {}
         while rx_b.try_recv().is_ok() {}
 
+        // Prove b's sink delivers at all before asserting what it must NOT
+        // receive: a mis-wired subscription that delivers nothing would satisfy
+        // the negative assertion vacuously.
+        std::fs::write(b.join("only-b.txt"), "x").expect("write in b");
+        assert!(
+            next_for(&mut rx_b, &root_b, "only-b.txt", Duration::from_secs(10))
+                .await
+                .is_some(),
+            "b's own change must reach its sink"
+        );
+
         std::fs::write(a.join("only-a.txt"), "x").expect("write in a");
         assert!(
             next_for(&mut rx_a, &root_a, "only-a.txt", Duration::from_secs(10))
@@ -678,5 +804,106 @@ mod tests {
         demux(&sinks, &event);
 
         assert!(rx_a.try_recv().is_err(), "unrelated path must not deliver");
+    }
+
+    /// The resolution fallback is per path, not per event: one path of a
+    /// multi-path event matching raw must not suppress resolution for a sibling
+    /// path that only reaches its sink after canonicalization.
+    #[test]
+    fn a_raw_match_does_not_suppress_resolution_for_sibling_paths() {
+        use notify::event::{EventKind, ModifyKind, RenameMode};
+
+        let parent = TempDir::new("fallback");
+        // A symlinked root: the sink is keyed by the canonical form, so the raw
+        // path the "OS" reports under the link only matches after resolution.
+        let real = parent.path.join("real");
+        let link = parent.path.join("link");
+        std::fs::create_dir_all(&real).expect("mk real");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real");
+
+        let plain = parent.path.join("plain");
+        std::fs::create_dir_all(&plain).expect("mk plain");
+        let canonical_plain = std::fs::canonicalize(&plain).expect("canonicalize plain");
+
+        let (tx_plain, mut rx_plain) = mpsc::unbounded_channel();
+        let (tx_linked, mut rx_linked) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![
+            Sink {
+                id: 0,
+                root: canonical_plain.clone(),
+                tx: tx_plain,
+            },
+            Sink {
+                id: 1,
+                root: canonical_real,
+                tx: tx_linked,
+            },
+        ]));
+
+        // One event, two paths: the first matches raw, the second needs
+        // resolution. Before the per-path fallback the first suppressed the
+        // second entirely.
+        std::fs::write(plain.join("moved.txt"), "x").expect("write plain");
+        std::fs::write(real.join("moved.txt"), "x").expect("write real");
+        let via_link = link.join("moved.txt");
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(canonical_plain.join("moved.txt"))
+            .add_path(via_link.clone());
+        demux(&sinks, &event);
+
+        assert_eq!(
+            rx_plain
+                .try_recv()
+                .expect("raw-matching sink must be delivered")
+                .paths,
+            vec![canonical_plain.join("moved.txt")]
+        );
+        assert_eq!(
+            rx_linked
+                .try_recv()
+                .expect("sink reachable only after resolution must still be delivered")
+                .paths,
+            vec![via_link],
+            "the resolved sink receives the raw path the OS reported"
+        );
+    }
+
+    /// A root whose registration failed is dead but still refcounted, so a later
+    /// subscriber must re-request the watch rather than inherit a channel that
+    /// can never deliver.
+    #[test]
+    fn a_failed_registration_is_retried_by_the_next_subscriber() {
+        let parent = TempDir::new("retry");
+        let root = parent.path.join("ws");
+        std::fs::create_dir_all(&root).expect("mk ws");
+
+        let hub = SharedWatchHub::new();
+        let (_first, _rx1, canonical) = hub.subscribe(&root);
+        // Simulate the registrar reporting a failure (e.g. the directory was
+        // briefly missing) rather than racing a real one.
+        {
+            let state = hub.state.lock().unwrap();
+            let entry = state
+                .groups
+                .values()
+                .find_map(|g| g.roots.get(&canonical))
+                .expect("root must be tracked");
+            entry.registration.settle(false);
+            assert!(entry.registration.failed());
+        }
+
+        let (_second, _rx2, _) = hub.subscribe(&root);
+        let state = hub.state.lock().unwrap();
+        let entry = state
+            .groups
+            .values()
+            .find_map(|g| g.roots.get(&canonical))
+            .expect("root must still be tracked");
+        assert_eq!(entry.subscribers, 2);
+        assert!(
+            !entry.registration.failed(),
+            "joining a failed root must re-request the watch, not inherit the failure"
+        );
     }
 }
