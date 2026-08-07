@@ -46,6 +46,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+mod acp_adapter;
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
