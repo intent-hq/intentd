@@ -47,6 +47,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "providers.paths",
     "model.default",
     "model.providerDefaults",
+    "model.defaultReasoningEffort",
     "backgroundAgents.defaultModel",
     "backgroundAgents.typeOverrides",
     "backgroundAgents.providerSettings",

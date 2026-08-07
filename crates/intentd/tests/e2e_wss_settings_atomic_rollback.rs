@@ -538,3 +538,129 @@ async fn workspace_api_settings_round_trip_over_wss() {
     .await;
     assert_eq!(resp["result"]["value"], json!(true));
 }
+
+/// `model.defaultReasoningEffort` over WSS (per AGENTS.md testing gate): the
+/// TOML-backed optional string appears in `settings.list` with no
+/// `defaultValue`, round-trips verbatim through `settings.update` /
+/// `settings.get` / `settings.reset`, reads back as unset when cleared with a
+/// blank string, and rejects non-string values with `-32602`. Every response
+/// envelope is asserted against PROTOCOL §5.12 / §9 (`jsonrpc`, `id`, and the
+/// documented `result` / `error` shape).
+#[tokio::test]
+async fn model_default_reasoning_effort_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let path = "model.defaultReasoningEffort";
+
+    // settings.list — advertised as a string with no default, unset value.
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == path)
+        .unwrap_or_else(|| panic!("{path} missing from settings.list"));
+    assert_eq!(entry["type"], json!("string"));
+    assert_eq!(entry["category"], json!("providers"));
+    assert!(entry.get("defaultValue").is_none(), "{entry}");
+    assert_eq!(entry["value"], Value::Null);
+    assert_eq!(entry["origin"], json!("default"));
+
+    // Update → stored as-is, read back with `file` origin.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "xhigh" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 2);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 1, "{resp}");
+    assert_eq!(applied[0]["path"], json!(path));
+    assert_eq!(applied[0]["value"], json!("xhigh"));
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 3);
+    assert_eq!(resp["result"]["path"], json!(path));
+    assert_eq!(resp["result"]["value"], json!("xhigh"));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // A blank string clears it back to unset (no explicit empty effort is ever
+    // served to clients).
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 4);
+    let resp = wss_rpc(&mut ws, 5, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 5);
+    assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
+
+    // Non-string values reject with -32602 (PROTOCOL §9).
+    let resp = wss_rpc(
+        &mut ws,
+        6,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": 3 }] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 6, -32602);
+
+    // Reset restores the unset default.
+    let resp = wss_rpc(&mut ws, 7, "settings.reset", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 7);
+    assert_eq!(resp["result"]["path"], json!(path));
+    assert_eq!(resp["result"]["value"], Value::Null);
+    let resp = wss_rpc(&mut ws, 8, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 8);
+    assert_eq!(resp["result"]["value"], Value::Null);
+    assert_eq!(resp["result"]["origin"], json!("default"));
+}
+
+/// Assert the JSON-RPC 2.0 success envelope (PROTOCOL §1): `jsonrpc: "2.0"`,
+/// the echoed `id`, a `result` object and no `error` member.
+fn assert_success_envelope(resp: &Value, id: i64) {
+    assert_eq!(resp["jsonrpc"], json!("2.0"), "{resp}");
+    assert_eq!(resp["id"], json!(id), "{resp}");
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert!(resp["result"].is_object(), "{resp}");
+}
+
+/// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,
+/// the echoed `id`, the expected `error.code` with a message, and no `result`.
+fn assert_error_envelope(resp: &Value, id: i64, code: i64) {
+    assert_eq!(resp["jsonrpc"], json!("2.0"), "{resp}");
+    assert_eq!(resp["id"], json!(id), "{resp}");
+    assert!(resp.get("result").is_none(), "{resp}");
+    assert_eq!(resp["error"]["code"], json!(code), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{resp}"
+    );
+}
