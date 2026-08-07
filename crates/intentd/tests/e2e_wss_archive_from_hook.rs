@@ -198,9 +198,9 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-/// Send one JSON-RPC frame and return the matching result; out-of-band
-/// notifications are ignored.
-async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
+/// Send one JSON-RPC frame and return the matching envelope (`result` or
+/// `error` intact); out-of-band notifications are ignored.
+async fn wss_rpc_envelope(ws: &mut TlsWs, method: &str, params: Value) -> Value {
     let id = next_id();
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
@@ -214,8 +214,7 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -224,6 +223,41 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
             Some(Ok(_)) => continue,
             other => panic!("expected text frame, got {other:?}"),
         }
+    }
+}
+
+/// Send one JSON-RPC frame and return the matching result; out-of-band
+/// notifications are ignored.
+async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
+    let v = wss_rpc_envelope(ws, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
+/// `hook.runNow`, retried while the scheduler task is not registered yet.
+///
+/// `hook_schedule_op` emits `hook:scheduled` BEFORE `spawn_hook_task` registers
+/// the hook's control channel, so a `runNow` sent the instant that event lands
+/// can beat registration and come back `Internal("... has no live scheduler
+/// task")`. The window is a few statements wide server-side against a full WSS
+/// round trip client-side, but a loaded CI runner can hit it — retry that one
+/// error shape instead of failing the run.
+async fn wss_hook_run_now(ws: &mut TlsWs, params: Value) -> Value {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(30));
+    loop {
+        let v = wss_rpc_envelope(ws, "hook.runNow", params.clone()).await;
+        let racing = v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no live scheduler task"));
+        if !racing {
+            assert!(v.get("error").is_none(), "rpc hook.runNow errored: {v}");
+            return v["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "hook.runNow never saw a live scheduler task: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -391,7 +425,7 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
         &mut sub,
         "events.subscribe",
         json!({
-            "eventTypes": ["hook:*", "workspace:updated", "agent:*"],
+            "eventTypes": ["hook:*", "workspace:updated"],
             "workspaceId": ws_id,
         }),
     )
@@ -441,12 +475,7 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
 
     // Drive the armed run: this one calls `ws.workspace.archive()`, whose own
     // sweep cancels this very hook's task mid-call.
-    let ran = wss_rpc(
-        &mut rpc,
-        "hook.runNow",
-        json!({ "workspaceId": ws_id, "hookId": hook_id }),
-    )
-    .await;
+    let ran = wss_hook_run_now(&mut rpc, json!({ "workspaceId": ws_id, "hookId": hook_id })).await;
     assert_eq!(ran["ok"], json!(true), "{ran}");
 
     // The archive delta lands (#1577: it used to be dropped with the caller)

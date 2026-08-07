@@ -11943,6 +11943,7 @@ impl WorkspaceApi for Services {
             // the abort means `archive()` never returns to the script, which
             // stops running for good — the hook is `cancelled` by the sweep
             // like any other hook in the workspace.
+            let id_for_log = id.clone();
             let tail = tokio::spawn(async move {
                 let mut ws = ws;
                 // Gracefully interrupt every in-flight turn in the workspace —
@@ -12030,8 +12031,16 @@ impl WorkspaceApi for Services {
             // tail runs on. A `JoinError` means the tail itself panicked —
             // the row is already archived, so surface it rather than
             // reporting a bogus success shape.
-            tail.await
-                .map_err(|e| Error::Internal(format!("archive tail task failed: {e}")))
+            tail.await.map_err(|e| {
+                // The `JoinError` text names no workspace, so log the id —
+                // otherwise a panicked tail is undiagnosable from daemon logs.
+                tracing::error!(
+                    workspace = %id_for_log.as_str(),
+                    error = %e,
+                    "workspace.archive: post-persist tail task failed; row is archived"
+                );
+                Error::Internal(format!("archive tail task failed: {e}"))
+            })
         })
     }
 
