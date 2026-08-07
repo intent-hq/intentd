@@ -138,8 +138,19 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Archive a workspace (status→archived) (PROTOCOL §5.1).
-    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-        let _ = id;
+    ///
+    /// `caller_agent_id` names the agent that initiated the archive (the
+    /// agent-facing `ws.workspace.archive` host: the MCP front door and the
+    /// background-hook runtime); it is excluded from the graceful interrupt
+    /// sweep so an agent archiving its own workspace is not interrupted
+    /// mid-tool-call. The RPC front door (FE/iOS) passes `None`, which
+    /// interrupts every in-flight turn in the workspace.
+    fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, caller_agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::archive_workspace not implemented".to_string(),
