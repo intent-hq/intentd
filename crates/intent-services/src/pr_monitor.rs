@@ -306,6 +306,79 @@ fn monitor_label(m: &PrMonitor) -> String {
     format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number)
 }
 
+/// The list-surface projection of one monitor: identity + lifecycle plus the
+/// hover/click fields the FE needs — PR title/URL and a compact summary of
+/// the last-refresh snapshot, whether changes are accumulated awaiting the
+/// debounce emit, and when the last change landed. Everything is read off the
+/// persisted row (the baseline snapshot column is parsed, never re-fetched),
+/// so a list stays O(rows returned).
+fn pr_monitor_wire(m: &PrMonitor) -> Value {
+    let snapshot: Option<PrMonitorSnapshot> = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let mut out = json!({
+        "monitorId": m.monitor_id,
+        "workspaceId": m.workspace_id,
+        "agentId": m.agent_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+        "state": m.state,
+        "pendingChanges": m.pending_changes,
+        "hasPendingChanges": !m.pending_changes.is_empty(),
+        "createdAt": m.created_at,
+        "updatedAt": m.updated_at,
+    });
+    let obj = out.as_object_mut().expect("json object");
+    for (key, value) in [
+        ("pendingSince", &m.pending_since),
+        ("lastChangeAt", &m.last_change_at),
+        ("lastPolledAt", &m.last_polled_at),
+        ("lastError", &m.last_error),
+    ] {
+        if let Some(v) = value {
+            obj.insert(key.to_string(), Value::String(v.clone()));
+        }
+    }
+    if let Some(s) = snapshot {
+        let r = &s.requirements;
+        obj.insert("title".to_string(), Value::String(s.title.clone()));
+        obj.insert("url".to_string(), Value::String(s.url.clone()));
+        obj.insert(
+            "lastSnapshot".to_string(),
+            json!({
+                "state": r.state,
+                "isDraft": r.is_draft,
+                "hasConflicts": r.has_conflicts,
+                "isBehind": r.is_behind,
+                "mergeable": r.mergeable,
+                "mergeBlockedReason": r.merge_blocked_reason,
+                "checks": {
+                    "total": r.checks.total,
+                    "passed": r.checks.passed,
+                    "failed": r.checks.failed,
+                    "pending": r.checks.pending,
+                    "failingRequired": r.checks.failing_required,
+                    "pendingRequired": r.checks.pending_required,
+                    "requiredKnown": r.checks.required_known,
+                },
+                "approvals": {
+                    "decision": r.approvals.decision,
+                    "have": r.approvals.have,
+                    "needed": r.approvals.needed,
+                    "changesRequested": r.approvals.changes_requested,
+                },
+                "threads": {
+                    "unresolved": r.threads.unresolved,
+                    "resolutionRequired": r.threads.resolution_required,
+                },
+                "rulesKnown": r.rules_known,
+            }),
+        );
+    }
+    out
+}
+
 /// Render the refreshed merge-requirements checklist as the wake's
 /// "where the PR stands now" section.
 fn render_checklist(s: &PrMonitorSnapshot) -> String {
@@ -658,7 +731,10 @@ impl Services {
     /// One pass over every active monitor. Per-monitor failures are logged
     /// and persisted as `lastError` — a forge outage must never kill the
     /// loop or terminalize a monitor.
-    pub(crate) async fn poll_pr_monitors(&self) {
+    ///
+    /// `pub` so integration tests can drive a deterministic single sweep
+    /// instead of racing [`Self::spawn_pr_monitor_loop`]'s timer.
+    pub async fn poll_pr_monitors(&self) {
         let monitors = match self.store.load_active_pr_monitors().await {
             Ok(monitors) => monitors,
             Err(e) => {
@@ -974,6 +1050,145 @@ impl Services {
                 "pr monitor owner wake delivery failed"
             );
         }
+    }
+
+    /// Resolve the `(owner, name)` a monitor call targets: an explicit
+    /// `"owner/name"` override wins, otherwise the workspace's own repo.
+    async fn resolve_monitor_repo(
+        &self,
+        workspace_id: &WorkspaceId,
+        repo: Option<String>,
+    ) -> Result<(String, String)> {
+        match repo {
+            Some(slug) => pr_ops::parse_repo_slug(&slug),
+            None => {
+                let ws = self.store.get_workspace(workspace_id).await?;
+                pr_ops::repo_of(&ws)
+            }
+        }
+    }
+
+    /// `ws.pr.monitor`: register (idempotently) a monitor and return
+    /// `{ ok, monitor, requirements }` — the row the UI lists plus the
+    /// freshly fetched merge-requirements checklist the model acts on.
+    pub(crate) async fn pr_monitor_start_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> Result<Value> {
+        let (owner, name) = self.resolve_monitor_repo(workspace_id, repo).await?;
+        let (monitor, requirements) = self
+            .pr_monitor_register(workspace_id, agent_id, &owner, &name, pr_number)
+            .await?;
+        Ok(json!({
+            "ok": true,
+            "monitor": pr_monitor_wire(&monitor),
+            "requirements": requirements,
+        }))
+    }
+
+    /// `ws.pr.unmonitor`: cancel the caller's own active monitor on
+    /// `(repo, pr_number)`. Unknown/foreign PRs surface as `NotFound` naming
+    /// the label, and the owner is never self-woken.
+    pub(crate) async fn pr_monitor_stop_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> Result<Value> {
+        let (owner, name) = self.resolve_monitor_repo(workspace_id, repo).await?;
+        let existing = self
+            .store
+            .find_active_pr_monitor(agent_id, &owner, &name, pr_number as i64)
+            .await?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "pr.unmonitor: no active monitor on {owner}/{name}#{pr_number}"
+                ))
+            })?;
+        let monitor = self
+            .pr_monitor_cancel(workspace_id, &existing.monitor_id, Some(agent_id))
+            .await?;
+        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor) }))
+    }
+
+    /// `ws.pr.monitors` / wire `prMonitor.list`: `{ monitors: [...] }`.
+    /// `agent_id` narrows to one owner (the MCP caller's own view); `None` is
+    /// the workspace-wide FE view.
+    pub(crate) async fn pr_monitor_list_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Value> {
+        let monitors = match agent_id {
+            Some(a) => self.pr_monitors_for_agent(a).await?,
+            None => self.pr_monitors_for_workspace(workspace_id).await?,
+        };
+        let monitors: Vec<Value> = monitors
+            .into_iter()
+            .filter(|m| &m.workspace_id == workspace_id)
+            .map(|m| pr_monitor_wire(&m))
+            .collect();
+        Ok(json!({ "monitors": monitors }))
+    }
+
+    /// Wire `prMonitor.cancel`: the FE cancel path — any monitor in the
+    /// workspace, and the owning agent is notified.
+    pub(crate) async fn pr_monitor_cancel_by_id_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        monitor_id: &PrMonitorId,
+    ) -> Result<Value> {
+        let monitor = self
+            .pr_monitor_cancel(workspace_id, monitor_id, None)
+            .await?;
+        Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor) }))
+    }
+
+    /// Wire `prMonitor.flush`: emit the pending debounced changes now.
+    /// `flushed: false` when nothing was pending (a no-op, not an error).
+    pub(crate) async fn pr_monitor_flush_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        monitor_id: &PrMonitorId,
+    ) -> Result<Value> {
+        let flushed = self.pr_monitor_flush(workspace_id, monitor_id).await?;
+        Ok(json!({ "ok": true, "flushed": flushed }))
+    }
+
+    /// The per-turn snapshot's `prMonitors` field: one
+    /// `"<owner>/<name>#<number>"` label per ACTIVE monitor this agent owns,
+    /// suffixed with `" (changes pending)"` while a debounced emit is
+    /// accumulating. O(this agent's monitors) — one indexed per-agent read,
+    /// no snapshot parsing. Best-effort: a store failure reads as empty so a
+    /// snapshot build never fails on it.
+    pub(crate) async fn active_pr_monitor_labels(&self, agent_id: &AgentId) -> Vec<String> {
+        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "pr-monitor snapshot lookup failed; prMonitors reads as empty"
+                );
+                return Vec::new();
+            }
+        };
+        monitors
+            .into_iter()
+            .filter(|m| m.state == PrMonitorState::Active)
+            .map(|m| {
+                let label = monitor_label(&m);
+                if m.pending_changes.is_empty() {
+                    label
+                } else {
+                    format!("{label} (changes pending)")
+                }
+            })
+            .collect()
     }
 
     /// Emit one `prMonitor:*` lifecycle event with the canonical
@@ -2024,6 +2239,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.state, PrMonitorState::Cancelled);
+    }
+
+    /// The MCP/wire op surface: `pr.monitor` defaults the repo to the
+    /// workspace's own, `pr.monitors` projects the list-surface fields the FE
+    /// hover needs, and `pr.unmonitor` resolves the caller's monitor by
+    /// `(repo, prNumber)`.
+    #[tokio::test]
+    async fn monitor_ops_resolve_the_workspace_repo_and_project_the_list_payload() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+
+        // No `repo` override → the workspace's own `o/r`.
+        let started = svc
+            .pr_monitor_start_op(&ws, &owner, 42, None)
+            .await
+            .expect("start");
+        assert_eq!(started["ok"], json!(true));
+        assert_eq!(started["monitor"]["repo"], json!("o/r"));
+        assert_eq!(started["monitor"]["state"], json!("active"));
+        assert_eq!(started["requirements"]["state"], json!("open"));
+
+        // An accumulated (undelivered) change surfaces on the list payload.
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| s.conversation_comments = 1);
+        svc.poll_pr_monitors().await;
+
+        let listed = svc
+            .pr_monitor_list_op(&ws, Some(&owner))
+            .await
+            .expect("list");
+        let rows = listed["monitors"].as_array().expect("array");
+        assert_eq!(rows.len(), 1, "one monitor: {listed}");
+        let row = &rows[0];
+        assert_eq!(row["prNumber"], json!(42));
+        assert_eq!(row["title"], json!("Add thing"));
+        assert_eq!(row["url"], json!("https://github.com/o/r/pull/42"));
+        assert_eq!(row["hasPendingChanges"], json!(true));
+        assert!(row["lastChangeAt"].is_string(), "{row}");
+        assert_eq!(row["lastSnapshot"]["state"], json!("open"));
+        assert_eq!(row["lastSnapshot"]["checks"]["total"], json!(1));
+        assert_eq!(row["lastSnapshot"]["approvals"]["needed"], json!(1));
+        // Workspace-scoped view sees the same row.
+        let ws_view = svc.pr_monitor_list_op(&ws, None).await.expect("ws list");
+        assert_eq!(ws_view["monitors"].as_array().map(Vec::len), Some(1));
+
+        // Flush delivers the held wake now; a second flush is a no-op.
+        let monitor_id = PrMonitorId::from(row["monitorId"].as_str().unwrap());
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor_id).await.unwrap(),
+            json!({ "ok": true, "flushed": true })
+        );
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor_id).await.unwrap(),
+            json!({ "ok": true, "flushed": false })
+        );
+
+        // `pr.unmonitor` resolves by (repo, prNumber) and drops the row from
+        // the list surfaces; a second call reports NotFound.
+        let stopped = svc
+            .pr_monitor_stop_op(&ws, &owner, 42, Some("o/r".into()))
+            .await
+            .expect("stop");
+        assert_eq!(stopped["monitor"]["state"], json!("cancelled"));
+        assert_eq!(
+            svc.pr_monitor_list_op(&ws, Some(&owner)).await.unwrap(),
+            json!({ "monitors": [] })
+        );
+        let err = svc
+            .pr_monitor_stop_op(&ws, &owner, 42, None)
+            .await
+            .expect_err("no active monitor");
+        assert!(err.to_string().contains("no active monitor"), "{err}");
+    }
+
+    /// `prMonitor.cancel` (the FE path, no agent caller) notifies the owner.
+    #[tokio::test]
+    async fn cancel_by_id_op_notifies_the_owning_agent() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        let out = svc
+            .pr_monitor_cancel_by_id_op(&ws, &monitor.monitor_id)
+            .await
+            .expect("cancel");
+        assert_eq!(out["monitor"]["state"], json!("cancelled"));
+        assert!(owner_messages(&svc, &owner)
+            .await
+            .contains("cancelled from the app"));
+    }
+
+    /// The per-turn snapshot's `prMonitors` labels: active monitors only, with
+    /// the pending-changes marker while a debounced emit is accumulating.
+    #[tokio::test]
+    async fn snapshot_labels_cover_active_monitors_and_mark_pending_changes() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        assert!(svc.active_pr_monitor_labels(&owner).await.is_empty());
+
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(
+            svc.active_pr_monitor_labels(&owner).await,
+            vec!["o/r#42".to_string()]
+        );
+
+        forge.edit(|s| s.conversation_comments = 1);
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            svc.active_pr_monitor_labels(&owner).await,
+            vec!["o/r#42 (changes pending)".to_string()]
+        );
+
+        // Cancelled monitors leave the snapshot.
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert!(svc.active_pr_monitor_labels(&owner).await.is_empty());
+    }
+
+    /// The labels reach the wire: `ws.agent.snapshot()` serializes them as
+    /// `prMonitors`, an active monitor alone makes the snapshot non-trivial
+    /// (so the turn-prompt line injects), and the field is omitted entirely
+    /// once no monitor is active.
+    #[tokio::test]
+    async fn snapshot_serializes_pr_monitors_and_injects_the_turn_line() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+
+        // No monitors → field omitted and the snapshot stays trivial.
+        let empty = svc
+            .agent_snapshot_op(ws.clone(), owner.clone())
+            .await
+            .expect("snapshot");
+        assert!(
+            !empty
+                .as_object()
+                .expect("object")
+                .contains_key("prMonitors"),
+            "empty prMonitors omitted: {empty}"
+        );
+        assert!(
+            svc.agent_state_snapshot_line(&owner).await.is_none(),
+            "trivial snapshot must not inject"
+        );
+
+        let monitor = register(&svc, &ws, &owner).await;
+        let v = svc
+            .agent_snapshot_op(ws.clone(), owner.clone())
+            .await
+            .expect("snapshot");
+        assert_eq!(v["prMonitors"], json!(["o/r#42"]), "serialized: {v}");
+
+        let line = svc
+            .agent_state_snapshot_line(&owner)
+            .await
+            .expect("an active monitor makes the snapshot non-trivial");
+        let json_part = line
+            .strip_prefix("current ws.agent.snapshot() => ")
+            .expect("JSON payload");
+        let parsed: Value = serde_json::from_str(json_part).expect("valid JSON");
+        assert_eq!(parsed["prMonitors"], json!(["o/r#42"]), "line: {line}");
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        let after = svc
+            .agent_snapshot_op(ws.clone(), owner.clone())
+            .await
+            .expect("snapshot");
+        assert!(
+            !after
+                .as_object()
+                .expect("object")
+                .contains_key("prMonitors"),
+            "cancelled monitor leaves the snapshot: {after}"
+        );
     }
 
     #[tokio::test]

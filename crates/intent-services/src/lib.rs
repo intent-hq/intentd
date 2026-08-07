@@ -18498,91 +18498,40 @@ impl WorkspaceApi for Services {
                 .mergeable_state
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let merge_blocked_reason =
-                pr_ops::merge_blocked_reason(state, pr.mergeable, &mergeable_state);
 
-            // Check runs on the PR head (SHA, else source branch). Providers
-            // without check-run support — or a PR whose head cannot be
-            // determined — report an empty tally rather than failing the
-            // whole snapshot.
-            let head_ref = pr
-                .head_sha
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
-            let (check_summary, failed_names) = match &head_ref {
-                Some(git_ref) if sc.capabilities().check_runs => {
-                    let runs = sc
-                        .check_runs(&repo_ref, git_ref)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                    (
-                        pr_ops::summarize_check_runs(&runs),
-                        pr_ops::failed_check_names(&runs),
-                    )
-                }
-                _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
-            };
-
-            // `list_reviews` and `review_decision` are independent reads;
-            // run them concurrently so the extra `reviewDecision` GraphQL
-            // round-trip doesn't add serial latency to every snapshot (this
-            // handler backs hook polling).
-            let (reviews, review_decision_result) = tokio::join!(
-                sc.list_reviews(&repo_ref, pr_number),
-                sc.review_decision(&repo_ref, pr_number)
-            );
-            let reviews = reviews.map_err(pr_ops::map_sc_err)?;
-            let agg = pr_ops::aggregate_reviews(&reviews);
-            // The forge's authoritative review-requirement verdict (GraphQL
-            // `reviewDecision` on GitHub). A fetch error degrades to `None`
-            // (aggregate-derived decision) rather than failing the snapshot.
-            let provider_decision = review_decision_result
-                .inspect_err(|e| {
-                    tracing::debug!(
-                        error = %e,
-                        pr_number,
-                        "pr.snapshot: review_decision fetch failed, falling back to aggregate"
-                    );
-                })
-                .ok()
-                .flatten();
-            let decision = pr_ops::snapshot_review_decision(&agg, state, provider_decision);
-
-            let conversation = sc
-                .list_comments(&repo_ref, pr_number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            let conversation_count = conversation.len() as i64;
-            // Inline review comments: threads via GraphQL when available,
-            // falling back to the flat REST list grouped by reply parent (the
-            // same fallback as `pr.listReviewComments`). Resolution state is
-            // unavailable on the fallback path, so every fallback thread
-            // counts as unresolved — the fallback is logged at `warn` with the
-            // underlying error so that degradation is visible at the default
-            // log level instead of silently inflating the unresolved count.
-            let threads = match pr_ops::fetch_all_pages(|p| {
-                sc.get_review_threads(&repo_ref, pr_number, p)
-            })
-            .await
-            {
-                Ok((threads, _, _)) => threads,
+            // The one-shot read composes EXACTLY the checklist the PR monitor
+            // works with, so `ws.pr.snapshot`, monitor wakes and
+            // `prMonitor.list` summaries all describe a PR with the same
+            // object — this registers nothing and triggers no monitoring.
+            // Every forge sub-read inside degrades on its own.
+            let (requirements, review_comment_count) =
+                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
+            let unresolved_thread_count = requirements.threads.unresolved;
+            // The conversation-comment count is not part of the checklist; a
+            // failing read reports zero rather than failing the snapshot.
+            let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
+                Ok(comments) => comments.len() as i64,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         pr_number,
-                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (thread resolution state unavailable, unresolvedThreadCount may be inflated)"
+                        "pr.snapshot: conversation comments unavailable, reporting zero"
                     );
-                    let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
-                        sc.list_review_comments(&repo_ref, pr_number, p)
-                    })
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                    pr_ops::fallback_threads(comments)
+                    0
                 }
             };
-            let (review_comment_count, unresolved_thread_count) =
-                pr_ops::count_thread_comments(&threads);
+            // The pre-existing compact blocks stay stable for callers that
+            // already read them, but are projected off the checklist rather
+            // than computed a second time. `checks.failedNames` lists every
+            // failing check, in rollup order; `requirements.checks
+            // .failingRequired` narrows it to the required ones.
+            let failed_names: Vec<&str> = requirements
+                .checks
+                .items
+                .iter()
+                .filter(|c| c.status == "failed")
+                .map(|c| c.name.as_str())
+                .collect();
 
             Ok(serde_json::json!({
                 "repo": repo_slug,
@@ -18597,18 +18546,18 @@ impl WorkspaceApi for Services {
                 "updatedAt": pr.updated_at,
                 "mergeable": pr.mergeable,
                 "mergeableState": mergeable_state,
-                "mergeBlockedReason": merge_blocked_reason,
+                "mergeBlockedReason": requirements.merge_blocked_reason,
                 "checks": {
-                    "total": check_summary.total,
-                    "passed": check_summary.passed,
-                    "failed": check_summary.failed,
-                    "pending": check_summary.pending,
+                    "total": requirements.checks.total,
+                    "passed": requirements.checks.passed,
+                    "failed": requirements.checks.failed,
+                    "pending": requirements.checks.pending,
                     "failedNames": failed_names,
                 },
                 "reviews": {
-                    "decision": decision,
-                    "approvals": agg.approval_count,
-                    "changesRequested": agg.changes_requested_count,
+                    "decision": requirements.approvals.decision,
+                    "approvals": requirements.approvals.have,
+                    "changesRequested": requirements.approvals.changes_requested,
                 },
                 "comments": {
                     "conversationCount": conversation_count,
@@ -18616,6 +18565,10 @@ impl WorkspaceApi for Services {
                     "unresolvedThreadCount": unresolved_thread_count,
                     "totalCount": conversation_count + review_comment_count,
                 },
+                // The merge-requirements checklist: the same object
+                // `ws.pr.monitor` returns and monitor wakes / list summaries
+                // carry.
+                "requirements": requirements,
             }))
         })
     }
@@ -20317,6 +20270,68 @@ impl WorkspaceApi for Services {
         hook_id: intent_core::HookId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
+    }
+
+    /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
+    fn pr_monitor_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+                .await
+        })
+    }
+
+    /// `ws.pr.unmonitor`: cancel the caller's own monitor on a PR.
+    fn pr_monitor_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
+                .await
+        })
+    }
+
+    /// `ws.pr.monitors` / `prMonitor.list`: monitors for one agent or the
+    /// whole workspace.
+    fn pr_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
+                .await
+        })
+    }
+
+    /// `prMonitor.cancel`: the FE cancel path (notifies the owning agent).
+    fn pr_monitor_cancel_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: intent_core::PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
+                .await
+        })
+    }
+
+    /// `prMonitor.flush`: emit the pending debounced changes immediately.
+    fn pr_monitor_flush_pending(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: intent_core::PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.pr_monitor_flush_op(&workspace_id, &monitor_id).await })
     }
 }
 

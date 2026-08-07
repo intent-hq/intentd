@@ -431,14 +431,6 @@ pub(crate) struct ReviewAggregate {
     pub changes_requested_count: i64,
 }
 
-/// Check-run tally for the `ws.pr.snapshot` `checks` block.
-pub(crate) struct CheckRunSummary {
-    pub total: i64,
-    pub passed: i64,
-    pub failed: i64,
-    pub pending: i64,
-}
-
 /// Port of `github.service.getReviews`: keep the latest *actionable* review per
 /// author (approve / request-changes), then derive the decision.
 ///
@@ -479,34 +471,6 @@ pub(crate) fn aggregate_reviews(reviews: &[Review]) -> ReviewAggregate {
         approval_count,
         changes_requested_count,
     }
-}
-
-/// Port of `github.service.getCheckRuns` counting: pending when not completed,
-/// passed for success/neutral, failed otherwise.
-pub(crate) fn summarize_check_runs(runs: &[CheckRun]) -> CheckRunSummary {
-    let mut summary = CheckRunSummary {
-        total: runs.len() as i64,
-        passed: 0,
-        failed: 0,
-        pending: 0,
-    };
-    for r in runs {
-        match r.state {
-            CheckState::Pending => summary.pending += 1,
-            CheckState::Success | CheckState::Neutral => summary.passed += 1,
-            CheckState::Failure | CheckState::Cancelled => summary.failed += 1,
-        }
-    }
-    summary
-}
-
-/// Names of failing check runs (failure / cancelled) for the `ws.pr.snapshot`
-/// `checks.failedNames` list, in run order.
-pub(crate) fn failed_check_names(runs: &[CheckRun]) -> Vec<String> {
-    runs.iter()
-        .filter(|r| matches!(r.state, CheckState::Failure | CheckState::Cancelled))
-        .map(|r| r.name.clone())
-        .collect()
 }
 
 /// Comment tallies for the `ws.pr.snapshot` `comments` block: the total number
@@ -899,12 +863,28 @@ pub(crate) async fn fetch_merge_requirements_detailed(
     number: u64,
 ) -> Result<(PullRequest, MergeRequirements, i64)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
+    let (requirements, review_comments) =
+        merge_requirements_for_pr(sc, repo_ref, number, &pr).await;
+    Ok((pr, requirements, review_comments))
+}
 
+/// [`fetch_merge_requirements_detailed`] for a [`PullRequest`] the caller
+/// already read — the composition shared by the PR monitor and the one-shot
+/// `ws.pr.snapshot`, so both surfaces describe a PR with the same object.
+/// Infallible: every forge sub-read degrades on its own (see
+/// [`fetch_merge_requirements`]). Returns the checklist plus the
+/// review-comment count from the same thread fetch.
+pub(crate) async fn merge_requirements_for_pr(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    pr: &PullRequest,
+) -> (MergeRequirements, i64) {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
     );
-    let signals = signals
+    let mut signals = signals
         .inspect_err(|e| {
             tracing::debug!(
                 error = %e,
@@ -914,6 +894,29 @@ pub(crate) async fn fetch_merge_requirements_detailed(
         })
         .ok();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
+
+    // The probe carries the forge's `reviewDecision`; when it did not — no
+    // probe at all, or a host reporting the rest without the verdict — the
+    // standalone read supplies it, so the decision never degrades to the
+    // aggregate merely because the probe is unavailable. A failing read
+    // degrades to `None` (aggregate-derived decision).
+    if signals.as_ref().is_none_or(|s| s.review_decision.is_none()) {
+        let decision = sc
+            .review_decision(repo_ref, number)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(
+                    error = %e,
+                    pr_number = number,
+                    "merge requirements: review_decision fetch failed, falling back to aggregate"
+                );
+            })
+            .ok()
+            .flatten();
+        if let Some(decision) = decision {
+            signals.get_or_insert_with(Default::default).review_decision = Some(decision);
+        }
+    }
 
     // The REST check-runs are only needed when the probe carried no rollup.
     let rollup_known = signals.as_ref().is_some_and(|s| s.checks_known);
@@ -929,21 +932,39 @@ pub(crate) async fn fetch_merge_requirements_detailed(
         _ => Vec::new(),
     };
 
-    let (review_comments, unresolved) =
-        match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
-            Ok((threads, _, _)) => count_thread_comments(&threads),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    pr_number = number,
-                    "merge requirements: review threads unavailable, reporting zero unresolved"
-                );
-                (0, 0)
+    // Inline review comments: threads via GraphQL when available, else the
+    // flat REST list grouped by reply parent. Resolution state is unavailable
+    // on the fallback path, so every fallback thread counts as unresolved —
+    // both degradations are logged at `warn` so they are visible at the
+    // default log level instead of silently skewing the unresolved count.
+    let (review_comments, unresolved) = match fetch_all_pages(|p| {
+        sc.get_review_threads(repo_ref, number, p)
+    })
+    .await
+    {
+        Ok((threads, _, _)) => count_thread_comments(&threads),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pr_number = number,
+                "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count may be inflated)"
+            );
+            match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
+                Ok((comments, _, _)) => count_thread_comments(&fallback_threads(comments)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        pr_number = number,
+                        "merge requirements: review comments unavailable, reporting zero unresolved"
+                    );
+                    (0, 0)
+                }
             }
-        };
+        }
+    };
 
-    let requirements = merge_requirements(&pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    Ok((pr, requirements, review_comments))
+    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    (requirements, review_comments)
 }
 
 // ===========================================================================
@@ -1275,60 +1296,6 @@ mod tests {
         let agg = aggregate_reviews(&[]);
         assert_eq!(agg.approval_count, 0);
         assert_eq!(agg.changes_requested_count, 0);
-    }
-
-    #[test]
-    fn summarizes_check_runs() {
-        let runs = vec![
-            CheckRun {
-                name: "a".into(),
-                state: CheckState::Success,
-                url: None,
-            },
-            CheckRun {
-                name: "b".into(),
-                state: CheckState::Neutral,
-                url: None,
-            },
-            CheckRun {
-                name: "c".into(),
-                state: CheckState::Failure,
-                url: None,
-            },
-            CheckRun {
-                name: "d".into(),
-                state: CheckState::Cancelled,
-                url: None,
-            },
-            CheckRun {
-                name: "e".into(),
-                state: CheckState::Pending,
-                url: None,
-            },
-        ];
-        let s = summarize_check_runs(&runs);
-        assert_eq!((s.total, s.passed, s.failed, s.pending), (5, 2, 2, 1));
-    }
-
-    #[test]
-    fn failed_check_names_lists_failure_and_cancelled_in_order() {
-        let mk = |name: &str, state: CheckState| CheckRun {
-            name: name.into(),
-            state,
-            url: None,
-        };
-        let runs = vec![
-            mk("build", CheckState::Success),
-            mk("test", CheckState::Failure),
-            mk("lint", CheckState::Pending),
-            mk("e2e", CheckState::Cancelled),
-            mk("docs", CheckState::Neutral),
-        ];
-        assert_eq!(
-            failed_check_names(&runs),
-            vec!["test".to_string(), "e2e".to_string()]
-        );
-        assert!(failed_check_names(&[]).is_empty());
     }
 
     #[test]

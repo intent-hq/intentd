@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -5333,6 +5333,92 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_run_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
+    /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
+    /// fetched merge-requirements checklist. `repo` is an optional
+    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
+    /// — monitors are agent-owned, so there is no wire registration method.
+    fn pr_monitor_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, pr_number, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_start not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.unmonitor`: cancel the calling agent's own active monitor on
+    /// `(repo, pr_number)`. MCP-only, and never self-wakes the owner.
+    fn pr_monitor_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, pr_number, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_stop not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.monitors` / wire `prMonitor.list`: monitors as
+    /// `{ monitors: [...] }`. `agent_id` narrows to one owning agent (the MCP
+    /// caller's own); `None` is the workspace-wide FE view. Cancelled rows are
+    /// excluded, `completed` rows retained so merged PRs stay visible.
+    fn pr_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `prMonitor.cancel`: cancel any monitor in the workspace by id and
+    /// notify the owning agent that its monitor is gone (the FE path — the
+    /// agent path is `pr_monitor_stop`, which never self-wakes).
+    fn pr_monitor_cancel_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_cancel_by_id not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `prMonitor.flush`: deliver a monitor's pending consolidated wake
+    /// now, bypassing the remaining debounce window. A no-op
+    /// (`{ ok: true, flushed: false }`) when nothing is pending.
+    fn pr_monitor_flush_pending(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_flush_pending not implemented".to_string(),
             ))
         })
     }

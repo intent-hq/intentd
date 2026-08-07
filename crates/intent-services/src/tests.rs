@@ -7746,14 +7746,15 @@ mod pr {
 
     #[tokio::test]
     async fn merge_requirements_survives_a_failing_thread_read() {
-        // A GraphQL thread failure reports zero unresolved rather than
-        // failing the whole checklist.
+        // A GraphQL thread failure falls back to the flat REST comments
+        // (resolution state unavailable, so each fallback thread counts as
+        // unresolved) rather than failing the whole checklist.
         let req = merge_requirements_of(StubForge {
             fail_threads: true,
             ..Default::default()
         })
         .await;
-        assert_eq!(req.threads.unresolved, 0);
+        assert_eq!(req.threads.unresolved, 1);
         assert_eq!(req.state, "open");
     }
 

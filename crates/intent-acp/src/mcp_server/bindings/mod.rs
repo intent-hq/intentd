@@ -58,6 +58,7 @@ pub fn prelude() -> String {
 /// background hook scheduler in `intent-services` installs the same gated
 /// environment its owning session's `workspace_api` bridge would.
 pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
+    let pr = pr::prelude_for(features);
     let mut fragments: Vec<&str> = vec![
         help::PRELUDE,
         workspace::PRELUDE,
@@ -66,7 +67,7 @@ pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
         comment::PRELUDE,
         primitive::PRELUDE,
         cross_workspace::PRELUDE,
-        pr::PRELUDE,
+        pr.as_str(),
     ];
     if features.browser_automation {
         fragments.push(browser::PRELUDE);
@@ -150,7 +151,9 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("pr.") {
-        return pr::dispatch(api, workspace_id, rest, args).await.map(Some);
+        return pr::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+            .await
+            .map(Some);
     }
     if let Some(rest) = method.strip_prefix("browser.") {
         return browser::dispatch(api, workspace_id, caller_agent_id, rest, args)
