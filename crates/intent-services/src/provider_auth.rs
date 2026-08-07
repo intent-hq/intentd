@@ -488,6 +488,35 @@ mod tests {
         assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
     }
 
+    /// Behavioral pin for auggie's routing: `check_provider_auth_cli` under
+    /// `provider_id: "auggie"` must land on the generic exit-code arm — the
+    /// outcome follows the exit status alone, and the stub's stdout (standing
+    /// in for the auth session secret `auggie token print` emits) never
+    /// influences it. A future refactor that gave auggie a capturing arm would
+    /// break this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auggie_probe_rides_generic_exit_code_arm() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("auggie-exit-code");
+        // Both stubs print secret-shaped output; only the exit code differs.
+        for (name, exit, expected) in [
+            ("auggie-in", 0, CliAuthProbe::Authenticated),
+            ("auggie-out", 1, CliAuthProbe::NotAuthenticated),
+        ] {
+            let stub = dir.path().join(name);
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho 'sess-secret-must-not-be-read'\nexit {exit}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let probe =
+                check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+            assert_eq!(probe, expected, "stub {name}");
+        }
+    }
+
     #[test]
     fn opencode_ready_requires_provider_model_line() {
         assert!(opencode_models_ready("anthropic/claude-sonnet-4\n"));
