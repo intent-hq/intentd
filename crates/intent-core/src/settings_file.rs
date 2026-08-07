@@ -90,6 +90,10 @@ pub struct ModelSettings {
     pub default: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
+    /// `model.defaultReasoningEffort` — fallback reasoning effort for new
+    /// agents. Stored as-is (providers own the vocabulary); an empty value
+    /// reads as unset.
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
@@ -914,6 +918,8 @@ paths = {}
 # default = "claude-sonnet-4-5"
 # Provider default models -- default model per provider.
 providerDefaults = {}
+# Default reasoning effort -- fallback reasoning effort for new agents.
+# defaultReasoningEffort = "high"
 
 [backgroundAgents]
 # Background default model -- model for background agents.
@@ -1137,6 +1143,7 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.background_agents.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
@@ -1524,6 +1531,31 @@ mod tests {
             }))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn model_default_reasoning_effort_parses_as_an_optional_string() {
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"m0\"\ndefaultReasoningEffort = \"xhigh\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+
+        // Stored as-is: the daemon never normalizes the provider vocabulary.
+        let parsed = SettingsFile::parse_str("[model]\ndefaultReasoningEffort = \"Medium\"\n")
+            .expect("parse");
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("Medium")
+        );
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_reasoning_effort, None);
     }
 
     #[test]

@@ -538,3 +538,82 @@ async fn workspace_api_settings_round_trip_over_wss() {
     .await;
     assert_eq!(resp["result"]["value"], json!(true));
 }
+
+/// `model.defaultReasoningEffort` over WSS (per AGENTS.md testing gate): the
+/// TOML-backed optional string appears in `settings.list` with no
+/// `defaultValue`, round-trips verbatim through `settings.update` /
+/// `settings.get` / `settings.reset`, and rejects non-string values with
+/// `-32602`.
+#[tokio::test]
+async fn model_default_reasoning_effort_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let path = "model.defaultReasoningEffort";
+
+    // settings.list — advertised as a string with no default, unset value.
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == path)
+        .unwrap_or_else(|| panic!("{path} missing from settings.list"));
+    assert_eq!(entry["type"], json!("string"));
+    assert_eq!(entry["category"], json!("providers"));
+    assert!(entry.get("defaultValue").is_none(), "{entry}");
+    assert_eq!(entry["value"], Value::Null);
+    assert_eq!(entry["origin"], json!("default"));
+
+    // Update → stored as-is, read back with `file` origin.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "xhigh" }] }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "update errored: {resp}");
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 1, "{resp}");
+    assert_eq!(applied[0]["value"], json!("xhigh"));
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": path })).await;
+    assert_eq!(resp["result"]["value"], json!("xhigh"));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // Non-string values reject with -32602.
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": 3 }] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+
+    // Reset restores the unset default.
+    let resp = wss_rpc(&mut ws, 5, "settings.reset", json!({ "path": path })).await;
+    assert_eq!(resp["result"]["value"], Value::Null);
+    let resp = wss_rpc(&mut ws, 6, "settings.get", json!({ "path": path })).await;
+    assert_eq!(resp["result"]["value"], Value::Null);
+    assert_eq!(resp["result"]["origin"], json!("default"));
+}
