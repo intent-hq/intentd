@@ -2233,6 +2233,23 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
         "an unsupported settings level is dropped, leaving the effort unset: {created}"
     );
 
+    // Boundary check: a present-but-blank `reasoningEffort` is an explicit
+    // clear that must survive the router (`opt_str`, not `opt_nonempty_str`)
+    // and suppress the settings default instead of being collapsed to absent.
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit clear","reasoningEffort":""}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "a blank `reasoningEffort` is an explicit clear, not a fall-through: {created}"
+    );
+
     srv.ws.stop().await;
 }
 

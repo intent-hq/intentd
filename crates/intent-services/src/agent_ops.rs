@@ -5194,14 +5194,22 @@ impl Services {
         };
         // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
         // effort > specialist frontmatter > unset, validated against the
-        // cached catalog's `effortLevels` for the effective model (the
-        // explicit `model`, else the specialist's own pin). Runs BEFORE the
-        // child is created so a `-32602` rejection is side-effect free.
+        // cached catalog's `effortLevels` for the effective model. The
+        // effective model must be the one `agent_create_op` will actually
+        // pin — the explicit `model`, else the full default-model resolution
+        // (specialist frontmatter pin, then the settings chain) — so a
+        // specialist whose `modelOptions` entry keys on the settings default
+        // model still gets its option effort selected. Runs BEFORE the child
+        // is created so a `-32602` rejection is side-effect free.
         let effective_model = input.model.clone().or_else(|| {
-            input.specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            resolve_agent_default_model(
+                self,
+                input.specialist.as_deref(),
+                workspace_path.as_deref(),
+                delegate_provider.as_deref(),
+                // Delegated children are always background agents.
+                true,
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,
@@ -7303,11 +7311,25 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
+        // Same effective-model rule as `agent.delegate`: fall through to the
+        // full default-model resolution (specialist pin, then the settings
+        // chain) so a `modelOptions` entry keyed on the settings default
+        // model is still matched. `is_background` mirrors what
+        // `build_create_metadata` will persist (default `true`).
         let effort_model = model.clone().or_else(|| {
-            specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            let is_background = create_opts
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("isBackground"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            resolve_agent_default_model(
+                self,
+                specialist.as_deref(),
+                workspace_path.as_deref(),
+                provider.as_deref(),
+                is_background,
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,

@@ -250,6 +250,44 @@ async fn specialist_efforts_outrank_the_settings_default() {
     }
 }
 
+/// A specialist whose `modelOptions` entry keys on the *settings default*
+/// model (it pins no `model` of its own) still gets that option's effort:
+/// the delegate/wakeOrCreate effort seam resolves the effective model through
+/// the full default-model chain, not just the specialist's own pin.
+#[tokio::test]
+async fn model_option_keyed_on_the_settings_default_model_is_selected() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.defaultReasoningEffort", json!("high"));
+    set(&svc, "providers.active", json!("mock"));
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    write_specialist(
+        spec_dir.path(),
+        "unpinned",
+        "modelOptions:\n  - model: \"auggie:fable-5\"\n    reasoningEffort: \"low\"\n",
+    );
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("unpinned".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let id = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        effort_of(&svc, id).await.as_deref(),
+        Some("low"),
+        "the option keyed on the settings default model must win over the settings effort"
+    );
+}
+
 /// Settings-chain leniency: a level the resolved model's cached
 /// `effortLevels` does not list is dropped (unset), not `-32602`.
 #[tokio::test]
