@@ -549,6 +549,14 @@ impl Services {
                 .iter_mut()
                 .find(|s| s.id == subscription_id)
             {
+                // `report_delivered` is an UNGROUPED-only flag: the agent-waiting
+                // classification excludes such watches (issue
+                // intent-hq/monorepo#1643), so marking a grouped watch would
+                // silently declassify an open `after_all` waiting edge.
+                debug_assert!(
+                    watch.group_id.is_none(),
+                    "report_delivered must not be set on a grouped watch"
+                );
                 watch.report_delivered = true;
                 true
             } else {

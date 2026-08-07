@@ -11404,6 +11404,71 @@ async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
     );
 }
 
+/// Chained inline retirement (issue intent-hq/monorepo#1643): A holds a
+/// `report_delivered` watch on B and B one on C, with A and B both
+/// deferred. C's idle must cascade — retiring B's watch backstops B's
+/// completion, which retires A's watch and backstops A's — so Z, watching A,
+/// settles from a single event. Pins the recursion contract (one marker
+/// consumed per hop, each watch removed before recursing) as bounded and
+/// wake-exactly-once.
+#[tokio::test]
+async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher() {
+    let (_t, svc, ws) = setup().await;
+    let z = create_agent(&svc, &ws, "Z").await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, z.clone(), "Z".into(), a.clone(), None)
+        .expect("Z watches A");
+    let ab = svc
+        .register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&ab));
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // Defer B, then A, via queue-interim idles; drain both queues so only the
+    // watch retirements remain as triggers.
+    for agent in [&b, &a] {
+        let (queued, _) =
+            svc.enqueue_message(agent, "follow-up".into(), None, None, None, None, false);
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            agent,
+            json!({ "agentId": agent.0 }),
+        ))
+        .await;
+        svc.take_queued_message(agent, &queued.id)
+            .expect("drain queue");
+    }
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        0,
+        "Z defers until A settles"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        1,
+        "one cascade delivers exactly one wake to Z"
+    );
+    assert!(svc.find_watches_for_child(&a).is_empty());
+    assert!(svc.find_watches_for_child(&b).is_empty());
+    assert!(svc.find_watches_for_child(&c).is_empty());
+}
+
 /// A `report_delivered` watch is not an agent-waiting reason, in both the live
 /// and the durable (persisted-row) classification: it can only ever deliver a
 /// failure/deletion signal, so its holder's idle must not defer on its account

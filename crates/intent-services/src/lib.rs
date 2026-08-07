@@ -3054,6 +3054,11 @@ impl Services {
     /// holder is waiting FOR. Counting it deferred the holder's own completion
     /// with no future trigger, stranding its `after_all` group forever.
     ///
+    /// This does not weaken the "grouped watches count too" rule above:
+    /// `report_delivered` is only ever set on UNGROUPED watches, because
+    /// `agent.reportToParent` filters `group_id.is_none()` before marking
+    /// (see `mark_watch_report_delivered`, which `debug_assert!`s it).
+    ///
     /// The waiting classification is exposed as a reusable predicate so the
     /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
