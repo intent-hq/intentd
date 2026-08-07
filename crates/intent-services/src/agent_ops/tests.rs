@@ -21085,3 +21085,258 @@ async fn requeue_front_batch_preserves_order_ahead_of_existing_entries() {
     let contents: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
     assert_eq!(contents, vec![json!("a"), json!("b"), json!("later")]);
 }
+
+// ---- ws.agent.snapshot (state snapshot op + injection line) ----
+
+/// An idle agent with no hooks/watches/queue/subscriptions/children/questions
+/// and no pending attention yields the trivial snapshot: `time` only in the
+/// wire object, and NO injection line (`time` alone never forces one).
+#[tokio::test]
+async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Idle").await;
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    let obj = v.as_object().expect("object");
+    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    let time = v["time"].as_str().expect("time string");
+    assert!(
+        time.ends_with('Z') && !time.contains('.'),
+        "whole-second UTC: {time}"
+    );
+
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "trivial snapshot must not inject"
+    );
+}
+
+/// A populated snapshot reports the approved camelCase fields with correct
+/// counts, and the injection line is the single-line JSON prefixed with
+/// `current ws.agent.snapshot() => `.
+#[tokio::test]
+async fn agent_snapshot_populated_counts_and_injection_line() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+
+    // Parent linkage: `child` is an unsettled delegate of `parent`.
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("link child");
+
+    // One completion watch, two queued messages, one event subscription.
+    svc.agent_watch_op(ws.clone(), parent.clone(), other.clone())
+        .await
+        .expect("watch");
+    svc.enqueue_message(&parent, "m1".into(), None, None, None, None, false);
+    svc.enqueue_message(&parent, "m2".into(), None, None, None, None, false);
+    svc.register_event_subscription(
+        &ws,
+        Some(parent.clone()),
+        &["note:*".to_string()],
+        None,
+        None,
+    )
+    .await;
+    // Pending attention request.
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck".into(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("blocker");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(v["time"].is_string());
+    assert_eq!(v["agentWatches"], json!(1));
+    assert_eq!(v["queuedMessages"], json!(2));
+    assert_eq!(v["eventSubscriptions"], json!(1));
+    assert_eq!(v["runningSubAgents"], json!(1));
+    assert_eq!(v["pendingAttention"], json!("blocker"));
+    // Zero-count fields stay omitted.
+    let obj = v.as_object().expect("object");
+    assert!(!obj.contains_key("hooks"), "zero hooks omitted: {v}");
+    assert!(
+        !obj.contains_key("numQuestionsAsked"),
+        "zero questions omitted: {v}"
+    );
+
+    let line = svc
+        .agent_state_snapshot_line(&parent)
+        .await
+        .expect("non-trivial snapshot injects");
+    assert!(
+        line.starts_with("current ws.agent.snapshot() => {"),
+        "prefix: {line}"
+    );
+    assert!(!line.contains('\n'), "single line: {line}");
+    let json_part = line
+        .strip_prefix("current ws.agent.snapshot() => ")
+        .expect("JSON payload");
+    let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
+    assert_eq!(parsed["queuedMessages"], json!(2));
+    assert_eq!(parsed["pendingAttention"], json!("blocker"));
+}
+
+/// A settled (terminal) child no longer counts toward `runningSubAgents`.
+#[tokio::test]
+async fn agent_snapshot_excludes_settled_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    child_session.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("settle child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("runningSubAgents"),
+        "settled child must not count: {v}"
+    );
+}
+
+/// An unsettled child delegated into ANOTHER workspace (Chief cross-workspace
+/// delegation) still counts toward `runningSubAgents` — child discovery keys
+/// on `parent_agent_id` alone, never on the parent's home workspace.
+#[tokio::test]
+async fn agent_snapshot_counts_cross_workspace_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Chief").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    let child = create_agent(&svc, &other_ws, "Remote Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&other_ws, &child_session)
+        .await
+        .expect("link cross-workspace child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["runningSubAgents"],
+        json!(1),
+        "cross-workspace child must count: {v}"
+    );
+}
+
+/// Workspace scoping: a snapshot for an agent homed elsewhere fails closed
+/// with `NotFound` (defense-in-depth against bare-id probes).
+#[tokio::test]
+async fn agent_snapshot_rejects_workspace_mismatch() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Scoped").await;
+    let foreign = WorkspaceId::new();
+    let err = svc
+        .agent_snapshot_op(foreign, agent)
+        .await
+        .expect_err("cross-workspace probe must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+}
+
+/// `numQuestionsAsked` counts pending questions from BOTH sources: the
+/// turn-attachment registry (asked this turn, awaiting the turn-end drain)
+/// and the trailing assistant message's question blocks (presented, awaiting
+/// an answer); a user answer supersedes the tail count and a dismissal
+/// clears it.
+#[tokio::test]
+async fn agent_snapshot_counts_pending_questions() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Asker").await;
+
+    // In-turn: one question registered in the turn-attachment registry.
+    svc.turn_attachments().register(
+        &agent,
+        intent_core::TurnAttachment {
+            id: intent_core::new_attachment_id(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "intent-question://tar-test".to_string(),
+            name: "Q".to_string(),
+            text: "{}".to_string(),
+        },
+    );
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(1), "registry count: {v}");
+    svc.turn_attachments().finish_turn(&agent);
+
+    // Presented: trailing assistant message carrying two question blocks.
+    let question_block = json!({
+        "type": "resource",
+        "resource": {
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "uri": "intent-question://q-1",
+            "text": "{}"
+        }
+    });
+    let msg = svc
+        .store()
+        .append_agent_message(
+            &agent,
+            "assistant",
+            &json!([question_block, question_block]),
+            &now_iso(),
+        )
+        .await
+        .expect("append questions");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(2), "tail count: {v}");
+
+    // Dismissal clears the tail count.
+    svc.agent_dismiss_questions_op(ws.clone(), agent.clone(), msg.id.clone())
+        .await
+        .expect("dismiss");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("numQuestionsAsked"),
+        "dismissed questions must not count: {v}"
+    );
+}

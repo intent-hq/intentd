@@ -2,7 +2,7 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      eight `agentFeatures.*` paths (defaults on).
+//      nine `agentFeatures.*` paths (defaults on).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
@@ -43,8 +43,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The eight `agentFeatures.*` settings paths (all default on).
-const FEATURE_PATHS: [&str; 8] = [
+/// The nine `agentFeatures.*` settings paths (all default on).
+const FEATURE_PATHS: [&str; 9] = [
     "agentFeatures.backgroundHooks",
     "agentFeatures.hostExec",
     "agentFeatures.scripts",
@@ -53,6 +53,7 @@ const FEATURE_PATHS: [&str; 8] = [
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
+    "agentFeatures.stateSnapshot",
 ];
 
 struct Daemon {
