@@ -3552,13 +3552,16 @@ impl Services {
                 // The agent exists but the append failed (e.g. duplicate
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
-                // path's behavior.
+                // path's behavior. `message_metadata` rides along too: an
+                // answer auto-queued after a failed write must keep its
+                // `question_answers` tag, or the drain persist can no longer
+                // clear the pending-questions marker and the hold wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
                     image_blocks,
                     file_blocks,
-                    None,
+                    message_metadata,
                     None,
                     false,
                 );
@@ -3690,7 +3693,10 @@ impl Services {
     /// continuation) and hold when the first non-system row is an
     /// un-dismissed question-bearing assistant message. A marker written as
     /// the empty string is authoritative ("nothing pending") and does NOT
-    /// fall back.
+    /// fall back. A hold derived that way is immediately MATERIALIZED as a
+    /// marker so it survives the very next user message: the tail walk stops
+    /// seeing the question once a plain user row lands, which is exactly the
+    /// disappearance this contract exists to prevent.
     ///
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
@@ -3704,13 +3710,20 @@ impl Services {
                 None => false,
             };
         }
-        self.question_hold_active_from_tail(agent_id).await
+        let Some(pending) = self.question_hold_active_from_tail(agent_id).await else {
+            return false;
+        };
+        self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+            .await;
+        true
     }
 
     /// Legacy transcript tail-walk hold derivation, retained as the
     /// pre-upgrade fallback for sessions with no persisted pending-questions
-    /// marker (see [`Services::question_hold_active`]).
-    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> bool {
+    /// marker (see [`Services::question_hold_active`]). Returns the id of the
+    /// question-bearing assistant message holding the session, so the caller
+    /// can materialize it as the marker.
+    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> Option<String> {
         // Page back over the tail, growing the window while every fetched
         // row is `system`-role, so an arbitrarily long run of trailing
         // system markers (e.g. repeated interruption notices) can never hide
@@ -3723,23 +3736,23 @@ impl Services {
         let mut tail = HOLD_DERIVATION_TAIL_START;
         let last = loop {
             let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
-                return false;
+                return None;
             };
             if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
                 break last.clone();
             }
             if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
-                return false;
+                return None;
             }
             tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return false;
+            return None;
         }
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return false;
+            return None;
         };
-        session.dismissed_questions_message_id() != Some(last.id.as_str())
+        (session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id)
     }
 
     /// Persist the pending-questions marker for `message_id` — the assistant
