@@ -2274,29 +2274,32 @@ impl Services {
         // only affect new agents created afterwards; existing agents change
         // model only via explicit agent.setModel.
         let model_explicit = model.is_some();
+        // SECURITY: derive workspace_path from the stored workspace record
+        // rather than trusting the client-supplied value (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+        // workspacePath and read specialist files from other workspaces.
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (model
+        // resolution and/or the specialist reasoning-effort rungs below).
+        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+            true => self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w)),
+            false => None,
+        };
         let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
             Some(m) => (Some(m), DefaultModelSource::Explicit),
-            None => {
-                // SECURITY: derive workspace_path from the stored workspace record
-                // rather than trusting the client-supplied value (review thread
-                // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-                // workspacePath and read specialist files from other workspaces.
-                // Use worktree_path if available, otherwise repository_path.
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
-                resolve_agent_default_model_with_source(
-                    self,
-                    specialist.as_deref(),
-                    wp.as_deref(),
-                    provider.as_deref(),
-                    is_background,
-                )
-            }
+            None => resolve_agent_default_model_with_source(
+                self,
+                specialist.as_deref(),
+                spec_wp.as_deref(),
+                provider.as_deref(),
+                is_background,
+            ),
         };
 
         // Initialize provider from the model's compound prefix if not explicitly
@@ -2376,12 +2379,29 @@ impl Services {
                 }
             }
         }
-        // Reasoning effort (PROTOCOL §5.5): validate the requested level
-        // against the *resolved* model's cached `effortLevels`, with the same
-        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
-        // no evidence means the value passes through, since providers own the
-        // vocabulary. Runs before the session is persisted so a `-32602`
-        // rejection is side-effect free.
+        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
+        // `agent.create` naming a specialist consults the same model-option >
+        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
+        // model that was actually resolved above. Those seams pre-decide the
+        // effort and pass it down as a param, so this only fires for callers
+        // that did not (`reasoning_effort_decided == false`) — which is also
+        // what keeps the specialist rungs ahead of the settings default below.
+        let reasoning_effort = match reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_delegate_reasoning_effort(
+                self,
+                None,
+                specialist.as_deref(),
+                resolved_model.as_deref(),
+                spec_wp.as_deref(),
+            ),
+        };
+        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
+        // model's cached `effortLevels`, with the same probe-free,
+        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
+        // means the value passes through, since providers own the vocabulary.
+        // Runs before the session is persisted so a `-32602` rejection is
+        // side-effect free.
         if let Some(effort) = reasoning_effort.as_deref() {
             ensure_effort_supported_by_model(
                 "agent.create",
@@ -2390,10 +2410,10 @@ impl Services {
                 effort,
             )?;
         }
-        // Last rung: the settings default effort, applied only when nothing
-        // decided the effort AND the model itself came from the settings
+        // Last rung: the settings default effort, applied only when no rung
+        // above decided the effort AND the model itself came from the settings
         // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = match reasoning_effort_decided {
+        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
             true => reasoning_effort,
             false => resolve_settings_default_reasoning_effort(
                 self,

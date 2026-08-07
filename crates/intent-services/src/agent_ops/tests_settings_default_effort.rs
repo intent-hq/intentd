@@ -288,6 +288,80 @@ async fn model_option_keyed_on_the_settings_default_model_is_selected() {
     );
 }
 
+/// A *direct* `agent.create` naming a specialist consults the same specialist
+/// rungs the delegate seam does, so frontmatter `reasoningEffort` (and a
+/// `modelOptions` entry keyed on the settings default model) still outranks
+/// the settings default even though the model resolved from the settings
+/// chain.
+#[tokio::test]
+async fn direct_create_specialist_efforts_outrank_the_settings_default() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.defaultReasoningEffort", json!("high"));
+    write_specialist(spec_dir.path(), "fm", "reasoningEffort: \"low\"\n");
+    write_specialist(
+        spec_dir.path(),
+        "opt",
+        "modelOptions:\n  - model: \"auggie:fable-5\"\n    reasoningEffort: \"low\"\n",
+    );
+
+    for spec in ["fm", "opt"] {
+        let id = create(&svc, &ws, None, Some(spec), AgentCreateExtra::default()).await;
+        let session = svc.agent_get_session_op(id).await.expect("get session");
+        assert_eq!(session.model.as_deref(), Some("auggie:fable-5"));
+        assert_eq!(
+            session.reasoning_effort.as_deref(),
+            Some("low"),
+            "specialist effort must outrank the settings default on direct create ({spec})"
+        );
+    }
+}
+
+/// A specialist that declares no effort at all still falls through to the
+/// settings default, so wiring the specialist rungs into the create seam does
+/// not shadow the new rung.
+#[tokio::test]
+async fn direct_create_specialist_without_effort_falls_through_to_the_setting() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.defaultReasoningEffort", json!("high"));
+    write_specialist(spec_dir.path(), "plain", "");
+
+    let id = create(&svc, &ws, None, Some("plain"), AgentCreateExtra::default()).await;
+    assert_eq!(effort_of(&svc, id).await.as_deref(), Some("high"));
+}
+
+/// A specialist effort the resolved model provably does not support is a
+/// caller-side decision, not the settings chain, so it still rejects with
+/// `-32602` rather than being dropped.
+#[tokio::test]
+async fn direct_create_unsupported_specialist_effort_is_rejected() {
+    let (_t, svc, ws, spec_dir, _cfg) = setup().await;
+    seed_catalog(&svc);
+    set(&svc, "model.default", json!("auggie:fable-5"));
+    write_specialist(spec_dir.path(), "bad", "reasoningEffort: \"xhigh\"\n");
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Agent".into()),
+            None,
+            Some("bad".into()),
+            None,
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("unsupported specialist effort must reject");
+    assert!(
+        format!("{err}").contains("reasoningEffort"),
+        "expected an invalid-params rejection naming reasoningEffort, got: {err}"
+    );
+}
+
 /// Settings-chain leniency: a level the resolved model's cached
 /// `effortLevels` does not list is dropped (unset), not `-32602`.
 #[tokio::test]
