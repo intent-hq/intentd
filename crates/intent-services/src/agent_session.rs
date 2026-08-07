@@ -2292,7 +2292,18 @@ impl Services {
         };
         let message_id = transcript.message_id.clone();
         match mapped {
-            MappedUpdate::Chunk { content, text } => {
+            MappedUpdate::Chunk {
+                content,
+                text,
+                thought,
+            } => {
+                // Thought chunks map now (intent-acp carries the marker) but
+                // have no transcript/stream handling yet: dropped here rather
+                // than persisted as assistant text. Wiring them into
+                // interleaved thinking blocks is the follow-on change.
+                if thought {
+                    return false;
+                }
                 // Accumulate into the transcript and compute the block index this
                 // chunk lands at; consecutive text chunks coalesce onto one index
                 // (and thus one stable block id), a non-text block starts a new one.
