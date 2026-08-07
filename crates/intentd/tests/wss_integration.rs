@@ -3073,12 +3073,23 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
     // read whose probe fails serves the same last-good list labeled
     // `stale: true` + `warning` — exactly `{ models, source, stale, warning }`
     // with `source: "auggie"`, never a silent static fallback. The fake
-    // auggie always fails.
+    // auggie appends to a counter file per invocation and always fails,
+    // making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-stale-");
+    let count = dir.path().join("count");
     let bin = dir.path().join("auggie");
-    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = || {
+        std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
     let last_good = serde_json::json!({
         "version": 1,
         "entries": {
@@ -3119,6 +3130,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source"], "{resp}");
+    assert_eq!(calls(), 0, "non-forced cache hit must not spawn the CLI");
 
     // Forced: the probe runs, fails, and the last-good list is served stale.
     let frame =
@@ -3142,6 +3154,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
+    assert!(calls() > 0, "forced read must spawn the CLI");
     srv.ws.stop().await;
 }
 
