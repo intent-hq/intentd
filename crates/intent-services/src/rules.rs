@@ -288,11 +288,18 @@ pub(crate) struct SpecialistPromptInjection {
 ///   workspace dir, so all agents get a microVM isolation block. Checked first:
 ///   the session's sandbox fields hold host-side paths that are meaningless
 ///   inside the guest.
-/// - Sandboxed implementor (session.sandbox_path present + specialist="implementor"):
-///   isolation context block with sandbox path, branch, base commit, caches-warm
-///   notice, branch-switching warning, and conflict-bounce resolution instructions.
-/// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
-///   direct-mode + cow_supported=true): parallel delegation safety guidance.
+/// - Sandboxed agent (session.sandbox_path present, any specialist): isolation
+///   context block with sandbox path, branch, base commit, caches-warm notice,
+///   branch-switching warning, and conflict-bounce resolution instructions. Keyed
+///   off sandbox_path alone — every sandboxed agent must know about the no-branch-
+///   switch constraint and the bounce protocol, not just implementors.
+/// - Coordinator in a sandbox-eligible CoW-capable workspace (specialist
+///   "coordinator"/"spec-writer" + cow_supported=true + the workspace satisfies the
+///   same delegate sandbox-eligibility predicate as agent_ops delegation: direct
+///   mode, or a standalone Cow/Direct checkout): parallel delegation safety
+///   guidance. CoW-checkout workspaces get an extra line clarifying that the
+///   checkout itself is a standalone CoW clone while per-agent sandboxes apply to
+///   delegates.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
 fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
@@ -323,8 +330,11 @@ fn build_isolation_hint(
         ));
     }
 
-    // Case 2: Sandboxed implementor — inject isolation context
-    if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
+    // Case 2: Sandboxed agent — inject isolation context. Keyed off
+    // session.sandbox_path presence alone: any sandboxed agent (implementor or
+    // not, specialist absent or not) must know it is in a sandbox, must not
+    // switch branches, and must understand the conflict-bounce protocol.
+    if is_sandboxed {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
@@ -350,18 +360,35 @@ fn build_isolation_hint(
         ));
     }
 
-    // Case 3: Coordinator in CoW-enabled direct-mode workspace
-    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
+    // Case 3: Coordinator in a sandbox-eligible CoW-capable workspace.
+    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE).
+    // Eligibility mirrors the delegate sandbox path in agent_ops.rs: direct-mode
+    // workspaces (no worktree or skip_worktree=true, with a repository path) AND
+    // standalone-checkout workspaces (checkoutMode == cow|direct with a
+    // worktree_path) provision delegate sandboxes — the coordinator hint must
+    // fire for both, or a CoW-checkout coordinator is never told its delegates
+    // are sandboxed.
     if specialist_name.eq_ignore_ascii_case("coordinator")
         || specialist_name.eq_ignore_ascii_case("spec-writer")
     {
         if let Some(ws) = workspace {
-            // Direct mode: skip_worktree=true OR worktree_path=None
-            let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
+            let is_direct_mode =
+                (ws.skip_worktree || ws.worktree_path.is_none()) && ws.repository_path.is_some();
+            let is_standalone_checkout = matches!(
+                ws.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            ) && ws.worktree_path.is_some();
             let cow_supported = ws.cow_supported.unwrap_or(false);
 
-            if is_direct_mode && cow_supported {
-                return Some(
+            if (is_direct_mode || is_standalone_checkout) && cow_supported {
+                let checkout_note = if ws.checkout_mode == Some(intent_core::CheckoutMode::Cow) {
+                    "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
+                         source repository (checkout-level isolation); the per-agent CoW sandboxes \
+                         described above apply to your delegated agents, sourced from this checkout."
+                } else {
+                    ""
+                };
+                return Some(format!(
                     "## Agent Delegation & Isolation\n\n\
                      Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
                      use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
@@ -376,8 +403,8 @@ fn build_isolation_hint(
                      **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
                      overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
                      with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
-                     to commit/stash their WIP, then manually merge.".to_string()
-                );
+                     to commit/stash their WIP, then manually merge.{checkout_note}"
+                ));
             }
         }
     }
