@@ -2960,9 +2960,9 @@ async fn dispatch(
         "hook.cancel" => {
             let ws = require_ws_note(params)?;
             let hook_id = require_str_param(params, "hookId")?;
-            // FE cancel (`by_owner = false`): the owning agent is woken with
-            // a cancellation notice.
-            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), false)
+            // FE cancel (no agent caller): any hook can be cancelled and the
+            // owning agent is woken with a cancellation notice.
+            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), None)
                 .await
                 .map_err(domain_to_rpc)
         }
