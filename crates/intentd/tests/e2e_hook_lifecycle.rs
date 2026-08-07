@@ -796,6 +796,9 @@ async fn hook_lifecycle_over_wss() {
         .find(|h| h["name"] == json!("dispatcher"))
         .unwrap_or_else(|| panic!("dispatcher in hook.list: {listed}"));
     assert_eq!(dispatcher["state"], "dispatched");
+    // A one-shot hook's sole fire is still counted: `dispatchCount` means
+    // "fires so far" for every hook, not just perpetual ones.
+    assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
 
     // FE trigger: hook.runNow drives run-started + run-completed (still
     // scheduled — the note has no EVICT marker yet).

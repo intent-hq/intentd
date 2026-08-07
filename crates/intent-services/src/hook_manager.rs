@@ -538,13 +538,33 @@ impl Services {
                 // one-shot, where the hook never schedules.
                 if hook.perpetual {
                     hook.dispatch_count = 1;
-                    hook.state = HookState::Scheduled;
-                    hook.next_run_at = Some(next_run_at_iso(delay_ms));
+                    // In-flight-run-at-expiry parity: a validation run can
+                    // outlive a short TTL, so a dispatch landing at/after
+                    // `expiresAt` must expire the hook instead of persisting
+                    // a re-armed active schedule — matching the
+                    // scheduler-loop dispatch path, which resolves this
+                    // exact race the same way. The dispatch still wins (the
+                    // owner is woken below regardless).
+                    let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
+                    hook.state = if expired {
+                        HookState::Expired
+                    } else {
+                        HookState::Scheduled
+                    };
+                    hook.next_run_at = if expired {
+                        None
+                    } else {
+                        Some(next_run_at_iso(delay_ms))
+                    };
                     self.store.insert_hook(&hook).await?;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                     let message = with_wake_logs(&message, hook.last_logs.as_deref());
                     self.wake_hook_owner(&hook, &message, "dispatched").await;
                     self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
+                    if expired {
+                        self.finish_expiry(&hook).await;
+                        return Ok(json!({ "hook": hook, "dispatched": true }));
+                    }
                     self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
                         .await;
                     self.spawn_hook_task(hook.clone());
@@ -554,6 +574,7 @@ impl Services {
                     return Ok(json!({ "hook": hook, "dispatched": true }));
                 }
                 hook.state = HookState::Dispatched;
+                hook.dispatch_count = 1;
                 self.store.insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
@@ -1166,12 +1187,16 @@ impl Services {
                     return Ok(true);
                 }
                 self.store
+                    .increment_hook_dispatch_count(&hook.hook_id)
+                    .await?;
+                self.store
                     .update_hook_state(&hook.hook_id, HookState::Dispatched)
                     .await?;
                 hook.state = HookState::Dispatched;
                 hook.last_run_at = Some(last_run_at);
                 hook.next_run_at = None;
                 hook.run_count += 1;
+                hook.dispatch_count += 1;
                 hook.last_logs = logs;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
@@ -1397,7 +1422,12 @@ impl Services {
             "reason": reason,
         });
         let state_note = match reason {
-            "dispatched" if hook.perpetual => Some(format!(
+            // A perpetual dispatch that also lands at/after `expiresAt` is
+            // terminalized (Expired), not re-armed — the caller sends a
+            // separate `finish_expiry` wake for that, so this note must NOT
+            // claim the hook "remains active" (it would contradict the
+            // immediately-following expiry notice).
+            "dispatched" if hook.perpetual && hook.state != HookState::Expired => Some(format!(
                 "[This hook has now fired, and it is PERPETUAL — it remains active and \
                  will keep running on its cadence until its TTL{}. Cancel it via \
                  ws.hook.cancel if you no longer need this watch.]",
@@ -1942,6 +1972,10 @@ mod tests {
         assert_eq!(out["dispatched"], json!(true));
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.state, HookState::Dispatched);
+        // A one-shot hook's sole fire must still be counted (monorepo review
+        // nit): `dispatchCount` means "fires so far" for every hook, not
+        // just perpetual ones.
+        assert_eq!(hook.dispatch_count, 1);
         assert!(!svc.hook_task_alive(&hook.hook_id), "no task spawned");
         // Owner was woken with the dispatch message (store-only path — no
         // AgentManager attached in tests).
@@ -1997,6 +2031,55 @@ mod tests {
         let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_SCHEDULED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
+    }
+
+    /// Schedule-time counterpart to `perpetual_dispatch_at_expiry_wakes_then_expires`:
+    /// a perpetual validation run can outlive a very short TTL, and a
+    /// dispatch landing at/after `expiresAt` must expire the hook instead of
+    /// persisting a re-armed active schedule — the dispatch still wins (the
+    /// owner is woken), but the hook never gets a scheduler task and its own
+    /// wake must not contradict the immediately-following expiry notice.
+    #[tokio::test]
+    async fn perpetual_schedule_time_dispatch_at_expiry_expires_instead_of_scheduling() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
+        // Skew "now" past the deadline before the validation run even
+        // starts, so the dispatching first run is provably at/after expiry.
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "perpetual-expiring",
+                    "code": "return { dispatch: true, message: 'last gasp at schedule' };",
+                    "delayMs": 10_000,
+                    "ttlMs": 10_000,
+                    "perpetual": true,
+                }),
+            )
+            .await
+            .expect("schedule perpetual dispatcher at expiry");
+        // The dispatch still wins (owner woken, dispatch counted)...
+        assert_eq!(out["dispatched"], json!(true));
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        // ...but the hook is terminalized, not re-armed.
+        assert_eq!(hook.state, HookState::Expired);
+        assert!(hook.next_run_at.is_none(), "no reschedule after expiry");
+        assert_eq!(hook.dispatch_count, 1, "the fire still counted");
+        assert!(!svc.hook_task_alive(&hook.hook_id), "no task spawned");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Expired);
+        // The dispatch wake must not contradict the expiry notice.
+        let dispatch_wake = wait_for_wake(&svc, &owner, "last gasp at schedule").await;
+        assert!(!dispatch_wake.contains("remains active"), "{dispatch_wake}");
+        let expiry_wake = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        assert!(expiry_wake.contains("1 run, 1 dispatch"), "{expiry_wake}");
+        let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_EXPIRED]).await;
+        assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        assert!(!types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
     }
 
     #[tokio::test]
@@ -2095,8 +2178,12 @@ mod tests {
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
         assert!(expired.next_run_at.is_none(), "no reschedule after expiry");
-        // The dispatch wake landed, then the expiry notice.
-        wait_for_wake(&svc, &owner, "last gasp").await;
+        // The dispatch wake landed, then the expiry notice. A perpetual fire
+        // that lands at/after expiry is terminalized, not re-armed, so its
+        // own wake must NOT claim "remains active" (that would contradict
+        // the immediately-following expiry notice).
+        let dispatch_wake = wait_for_wake(&svc, &owner, "last gasp").await;
+        assert!(!dispatch_wake.contains("remains active"), "{dispatch_wake}");
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
         // Perpetual expiry reports runs AND dispatches.
         assert!(text.contains("1 run, 1 dispatch"), "{text}");
@@ -2200,6 +2287,9 @@ mod tests {
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 2);
         assert!(hook.next_run_at.is_none());
+        // The one-shot hook's sole fire must be counted (monorepo review
+        // nit): `dispatchCount` means "fires so far" for every hook.
+        assert_eq!(hook.dispatch_count, 1);
         let text = wait_for_wake(&svc, &owner, "CI is green").await;
         // The scheduler-run dispatch wake ends with the terminal note.
         assert!(text.contains("retired — it will not run again"), "{text}");
