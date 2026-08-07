@@ -726,6 +726,52 @@ pub async fn merge_sandbox_with(
     outcome
 }
 
+/// How old an abandoned `.git/index.lock` must be before the merge path
+/// breaks it. A legitimate git operation holds the lock for seconds; a lock
+/// this old has no plausible live holder (crashed git process, killed agent
+/// command) and would otherwise fail every merge retry until a human deletes
+/// the file.
+pub const STALE_GIT_LOCK_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Detect and handle an abandoned `.git/index.lock` in `repo` before a merge
+/// mutates its index. No lock → Ok. A lock older than `max_age` (per mtime)
+/// is broken (removed, WARN) so the merge self-heals. A younger lock
+/// plausibly has a live holder: return an actionable error naming the lock
+/// path so the caller's retry path reports something a human can act on.
+/// `repo_label` names which side is locked (`"canonical"` / `"sandbox"`).
+fn break_stale_git_lock(
+    repo: &git2::Repository,
+    repo_label: &str,
+    max_age: Duration,
+) -> Result<()> {
+    let lock_path = repo.path().join("index.lock");
+    let Ok(meta) = std::fs::metadata(&lock_path) else {
+        return Ok(()); // no lock
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    if age >= max_age {
+        std::fs::remove_file(&lock_path)
+            .map_err(|e| Error::Internal(format!("break stale git lock failed: {e}")))?;
+        tracing::warn!(
+            lock = %lock_path.display(),
+            age_secs = age.as_secs(),
+            repo = repo_label,
+            "broke stale git index.lock (no plausible live holder)"
+        );
+        return Ok(());
+    }
+    Err(Error::Internal(format!(
+        "{repo_label} repository is locked: {} exists (age {}s) — another git process may be \
+         running; if none is, delete the lock file and retry the merge",
+        lock_path.display(),
+        age.as_secs()
+    )))
+}
+
 /// The synchronous git section of [`merge_sandbox_with`]: dirty-state commit,
 /// canonical-overlap check, fetch, cherry-pick. Runs on the blocking pool.
 /// Logs per-phase wall-clock timings (dirty-commit, fetch, cherry-pick) so a
@@ -746,6 +792,13 @@ fn merge_sandbox_git(
             .map_err(|e| Error::Internal(format!("open canonical repo failed: {e}")))?;
         let sandbox_repo = git2::Repository::open(sandbox_path)
             .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+
+        // Abandoned index locks (crashed git process) would fail every index
+        // write below; break stale ones up front, error actionably on fresh
+        // ones. Both sides mutate their index (sandbox: dirty auto-commit;
+        // canonical: cherry-pick).
+        break_stale_git_lock(&canonical_repo, "canonical", STALE_GIT_LOCK_MAX_AGE)?;
+        break_stale_git_lock(&sandbox_repo, "sandbox", STALE_GIT_LOCK_MAX_AGE)?;
 
         // Handle dirty sandbox state per the caller's policy: commit it
         // (preserving agent attribution) or refuse the merge outright.
@@ -938,9 +991,62 @@ fn merge_start_sha(sandbox: &Sandbox) -> &String {
         .unwrap_or(&sandbox.base_commit_sha)
 }
 
+/// Stable patch-id of a commit's change (parent→commit diff), the same
+/// semantic-identity notion as `git patch-id --stable`: identical patches
+/// committed as different SHAs (different author/date/message/parent) share
+/// an id. `None` when the diff cannot be computed (e.g. missing objects) —
+/// callers treat that as "unknown", never as a match.
+fn patch_id_of(repo: &git2::Repository, oid: git2::Oid) -> Option<git2::Oid> {
+    let commit = repo.find_commit(oid).ok()?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let tree = commit.tree().ok()?;
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .ok()?;
+    diff.patchid(None).ok()
+}
+
+/// Patch-ids of the canonical commits the sandbox range will be applied on
+/// top of (start..canonical HEAD when `start` is a canonical ancestor, else
+/// a bounded walk from HEAD). Used to skip sandbox commits whose change
+/// already landed in canonical — see [`apply_sandbox_commits`].
+fn canonical_patch_ids(
+    canonical_repo: &git2::Repository,
+    start_sha: &str,
+    canonical_head: git2::Oid,
+) -> std::collections::HashSet<git2::Oid> {
+    // Bound the fallback walk: already-merged detection is best-effort and
+    // recent history is where a duplicated change plausibly lives.
+    const FALLBACK_WALK_LIMIT: usize = 200;
+
+    let mut ids = std::collections::HashSet::new();
+    let Ok(mut revwalk) = canonical_repo.revwalk() else {
+        return ids;
+    };
+    if revwalk.push(canonical_head).is_err() {
+        return ids;
+    }
+    let hidden = git2::Oid::from_str(start_sha)
+        .ok()
+        .is_some_and(|start| revwalk.hide(start).is_ok());
+    for (i, oid) in revwalk.flatten().enumerate() {
+        if !hidden && i >= FALLBACK_WALK_LIMIT {
+            break;
+        }
+        if let Some(id) = patch_id_of(canonical_repo, oid) {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
 /// Cherry-pick the sandbox commits (post-last-merge, post-snapshot, or
 /// post-base) onto the canonical HEAD. Assumes the sandbox branch objects are
 /// already present in the canonical ODB (fetched by [`merge_sandbox`]).
+/// Commits whose patch-id already exists in canonical (the same change landed
+/// independently, or a previous merge was only partially recorded) are
+/// skipped — reported inside the Merged range, with no duplicate/empty commit
+/// and no false conflict.
 fn apply_sandbox_commits(
     canonical_repo: &git2::Repository,
     sandbox_repo: &git2::Repository,
@@ -976,6 +1082,10 @@ fn apply_sandbox_commits(
         });
     }
 
+    // Already-merged detection: patch-ids of the canonical commits since the
+    // range start. A sandbox commit whose patch-id matches is skipped below.
+    let canonical_ids = canonical_patch_ids(canonical_repo, start_sha, canonical_head_commit.id());
+
     // Cherry-pick each commit onto canonical
     let canonical_oid = canonical_head_commit.id();
     let mut current_oid = canonical_oid;
@@ -986,6 +1096,19 @@ fn apply_sandbox_commits(
         let commit = canonical_repo
             .find_commit(commit_oid)
             .map_err(|e| Error::Internal(format!("find commit failed: {e}")))?;
+
+        // Skip commits whose exact change already landed in canonical
+        // (identical patch-id): re-applying is at best an empty commit and
+        // at worst a false conflict.
+        if let Some(id) = patch_id_of(canonical_repo, commit_oid) {
+            if canonical_ids.contains(&id) {
+                tracing::info!(
+                    commit = %commit_sha,
+                    "sandbox merge: commit already applied in canonical (patch-id match); skipping"
+                );
+                continue;
+            }
+        }
 
         let current_commit = canonical_repo
             .find_commit(current_oid)
@@ -1278,11 +1401,18 @@ fn signature_or_fallback(
 }
 
 /// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).
+///
+/// Submodules are excluded: the merge-back only moves gitlink POINTERS via
+/// tree-level cherry-pick and never touches a submodule worktree, so
+/// submodule worktree state (uninitialized/absent directory, or a checked-out
+/// sha that differs from the committed gitlink — common in cache-hydrated
+/// checkouts) must not make the repo look dirty and block/bounce a merge.
 fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false);
+        .include_ignored(false)
+        .exclude_submodules(true);
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
@@ -1333,12 +1463,14 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
     Ok(oid.to_string())
 }
 
-/// Get the list of changed files in a repository (dirty state).
+/// Get the list of changed files in a repository (dirty state). Submodules
+/// are excluded for the same reason as [`is_dirty`] — keep both in sync.
 fn get_changed_files(repo: &git2::Repository) -> Result<Vec<String>> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false);
+        .include_ignored(false)
+        .exclude_submodules(true);
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
@@ -3682,6 +3814,344 @@ mod tests {
                 assert!(canonical_path.join("agent.txt").exists());
             }
             _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_already_applied_commit_is_skipped_not_duplicated() {
+        // Regression (dev-seat merge-verification round): a sandbox commit
+        // whose change ALREADY landed in canonical (e.g. the user applied the
+        // same fix, or a previous partially-recorded merge) must be detected
+        // as already-merged — outcome Merged with NO new (empty) commit on
+        // canonical — instead of duplicating an empty commit or bouncing a
+        // false conflict.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("already-applied");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{}", branch_name))
+                .unwrap();
+        }
+
+        // The SAME change lands independently on both sides (different SHAs,
+        // identical patch).
+        commit_file(&sandbox_path, "shared.txt", "same fix", "Sandbox fix");
+        commit_file(&canonical_path, "shared.txt", "same fix", "Canonical fix");
+
+        let canonical_head_before = {
+            let repo = git2::Repository::open(&canonical_path).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            head.to_string()
+        };
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("already-applied commit must not be an internal error");
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            other => panic!("already-applied change must report Merged, got {:?}", other),
+        }
+
+        // No duplicate/empty commit: canonical HEAD is unchanged.
+        let canonical_head_after = {
+            let repo = git2::Repository::open(&canonical_path).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            head.to_string()
+        };
+        assert_eq!(
+            canonical_head_before, canonical_head_after,
+            "already-applied commit must be skipped, not duplicated as an empty commit"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn patch_id_matches_identical_change_across_commits() {
+        // Same patch committed twice (different SHAs, different messages)
+        // yields the same patch-id; a different patch yields a different id.
+        let (_dir, repo_path) = temp_repo("patch-id");
+        commit_file(&repo_path, "f.txt", "one", "add f");
+        let a = commit_file(&repo_path, "g.txt", "same content", "first copy");
+        // Revert g.txt then re-add it identically as a new commit.
+        {
+            let repo = git2::Repository::open(&repo_path).unwrap();
+            fs::remove_file(repo_path.join("g.txt")).unwrap();
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new("g.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "remove g", &tree, &[&parent])
+                .unwrap();
+        }
+        let b = commit_file(&repo_path, "g.txt", "same content", "second copy");
+        let c = commit_file(&repo_path, "h.txt", "different", "unrelated");
+
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let id_a = patch_id_of(&repo, git2::Oid::from_str(&a).unwrap()).expect("patch id for a");
+        let id_b = patch_id_of(&repo, git2::Oid::from_str(&b).unwrap()).expect("patch id for b");
+        let id_c = patch_id_of(&repo, git2::Oid::from_str(&c).unwrap()).expect("patch id for c");
+        assert_eq!(id_a, id_b, "identical patches must share a patch-id");
+        assert_ne!(id_a, id_c, "different patches must differ");
+    }
+
+    #[test]
+    fn stale_index_lock_is_broken() {
+        // Regression (dev-seat merge-verification round): an abandoned
+        // .git/index.lock (crashed git process) must be broken when it is
+        // older than the threshold, so merges self-heal instead of failing
+        // every retry until a human deletes the file.
+        let (_dir, repo_path) = temp_repo("stale-lock");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let lock_path = repo.path().join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+
+        // Age zero => everything is stale: the lock must be removed.
+        break_stale_git_lock(&repo, "canonical", Duration::ZERO)
+            .expect("stale lock must be broken, not error");
+        assert!(!lock_path.exists(), "stale index.lock must be removed");
+    }
+
+    #[test]
+    fn fresh_index_lock_yields_actionable_error() {
+        // A fresh lock plausibly has a live holder: do NOT break it; fail
+        // with an error that names the lock file and what to do.
+        let (_dir, repo_path) = temp_repo("fresh-lock");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let lock_path = repo.path().join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+
+        let err = break_stale_git_lock(&repo, "canonical", Duration::from_secs(3600))
+            .expect_err("fresh lock must not be broken");
+        let msg = err.to_string();
+        assert!(msg.contains("index.lock"), "must name the lock: {msg}");
+        assert!(
+            msg.contains("canonical"),
+            "must name which repo is locked: {msg}"
+        );
+        assert!(lock_path.exists(), "fresh lock must be left in place");
+    }
+
+    #[tokio::test]
+    async fn test_merge_breaks_stale_canonical_index_lock() {
+        // End-to-end: a stale index.lock in the canonical repo must not fail
+        // the merge — the lock is broken and the merge lands.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("merge-stale-lock");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{}", branch_name))
+                .unwrap();
+        }
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        // Abandoned lock, backdated past the staleness threshold (touch -t
+        // avoids a filetime dev-dependency; any timestamp older than the
+        // threshold works).
+        let lock_path = canonical_path.join(".git").join("index.lock");
+        fs::write(&lock_path, "").unwrap();
+        let touch = std::process::Command::new("touch")
+            .arg("-m")
+            .arg("-t")
+            .arg("202001010000")
+            .arg(&lock_path)
+            .output()
+            .unwrap();
+        assert!(touch.status.success(), "backdating the lock must succeed");
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("stale lock must be broken, not fail the merge");
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                assert!(canonical_path.join("agent.txt").exists());
+            }
+            other => panic!("Expected Merged outcome, got {:?}", other),
+        }
+        assert!(!lock_path.exists(), "stale lock must be gone after merge");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_identical_submodule_pointer_is_not_a_conflict() {
+        // Regression (dev-seat merge-verification round): a sandbox commit
+        // that bumps a submodule gitlink to the SAME sha the canonical repo
+        // already has must merge cleanly (empty pick), not bounce the agent
+        // with a false conflict on the submodule path. The submodule worktree
+        // is deliberately absent (gitlink committed, directory never
+        // materialized — the drifted state cache-hydrated checkouts exhibit):
+        // submodule worktree state does not participate in the cherry-pick
+        // tree merge, so it must not trip the dirty/overlap checks either.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("submodule-identical");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        // Fabricate a gitlink entry (mode 160000) at `mysub` pointing at an
+        // arbitrary commit sha — submodule pointers are plain shas, no object
+        // required in the superproject ODB. Commit it as the shared base.
+        let sub_old = git2::Oid::from_str(&base_sha).unwrap();
+        let add_gitlink = |repo_path: &Path, target: git2::Oid, message: &str| -> String {
+            let repo = git2::Repository::open(repo_path).unwrap();
+            let mut index = repo.index().unwrap();
+            let entry = git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: target,
+                flags: 0,
+                flags_extended: 0,
+                path: b"mysub".to_vec(),
+            };
+            index.add(&entry).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+                .unwrap()
+                .to_string()
+        };
+        let base_with_sub = add_gitlink(&canonical_path, sub_old, "Add submodule at old sha");
+
+        // Sandbox = clone of canonical at the shared base.
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{}", branch_name))
+                .unwrap();
+        }
+
+        // BOTH sides bump the gitlink to the SAME new sha.
+        let sub_new = git2::Oid::from_str(&base_with_sub).unwrap();
+        add_gitlink(&canonical_path, sub_new, "canonical: bump submodule");
+        add_gitlink(&sandbox_path, sub_new, "sandbox: bump submodule");
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_with_sub,
+            snapshot_commit_sha: None,
+            last_merged_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            merge_on_turn_end: true,
+            conflicting_paths: Vec::new(),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("identical submodule bump must not be an internal error");
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            other => panic!(
+                "identical submodule pointer must merge cleanly, got {:?}",
+                other
+            ),
         }
 
         let _ = fs::remove_dir_all(&test_root);
