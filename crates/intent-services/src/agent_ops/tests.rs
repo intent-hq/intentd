@@ -20753,6 +20753,41 @@ async fn agent_snapshot_excludes_settled_children() {
     );
 }
 
+/// An unsettled child delegated into ANOTHER workspace (Chief cross-workspace
+/// delegation) still counts toward `runningSubAgents` — child discovery keys
+/// on `parent_agent_id` alone, never on the parent's home workspace.
+#[tokio::test]
+async fn agent_snapshot_counts_cross_workspace_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Chief").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    let child = create_agent(&svc, &other_ws, "Remote Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&other_ws, &child_session)
+        .await
+        .expect("link cross-workspace child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["runningSubAgents"],
+        json!(1),
+        "cross-workspace child must count: {v}"
+    );
+}
+
 /// Workspace scoping: a snapshot for an agent homed elsewhere fails closed
 /// with `NotFound` (defense-in-depth against bare-id probes).
 #[tokio::test]

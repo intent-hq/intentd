@@ -3649,27 +3649,18 @@ impl Services {
     /// `numQuestionsAsked` snapshot field alongside the turn-attachment
     /// registry count ([`Services::pending_question_count`]).
     pub(crate) async fn pending_question_tail_count(&self, agent_id: &AgentId) -> usize {
-        // Page back over the tail, growing the window while every fetched
-        // row is `system`-role, so an arbitrarily long run of trailing
-        // system markers (e.g. repeated interruption notices) can never hide
-        // a still-pending question underneath it. Stops as soon as a
-        // non-system row is found, the fetched page comes back shorter than
-        // requested (the whole transcript was system rows or empty — no
-        // hold), or the safety cap is hit (fails open to `0`).
-        const HOLD_DERIVATION_TAIL_START: i64 = 10;
-        const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
-        let mut tail = HOLD_DERIVATION_TAIL_START;
-        let last = loop {
-            let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
-                return 0;
-            };
-            if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
-                break last.clone();
-            }
-            if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
-                return 0;
-            }
-            tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
+        // Trailing `system` rows are transparent to the derivation, so the
+        // anchor is simply the newest non-system row — resolved by the store
+        // in one index-backed statement that decodes at most ONE message
+        // ([`Store::get_last_non_system_message`]), never by paging full
+        // rows back through the tail. This runs on every turn prompt (the
+        // snapshot's `numQuestionsAsked`), so bounded cost matters. An empty
+        // or all-system transcript has no hold; store errors fail open.
+        let Ok(last) = self.store.get_last_non_system_message(agent_id).await else {
+            return 0;
+        };
+        let Some(last) = last else {
+            return 0;
         };
         if last.role != "assistant" {
             return 0;
@@ -6014,32 +6005,23 @@ impl Services {
     /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
     /// behind `ws.agent.snapshot()` and the turn-prompt injection line
     /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
-    /// every field reads a per-agent registry or a per-agent store lookup —
-    /// no workspace-wide scans beyond the one summary listing that resolves
-    /// the agent's unsettled children.
+    /// every field reads a per-agent registry or a bounded per-agent store
+    /// statement — no workspace-wide scans, no transcript hydration.
     pub(crate) async fn build_agent_snapshot(&self, agent_id: &AgentId) -> Result<AgentSnapshot> {
         let session = self.store.get_agent_session_summary(agent_id).await?;
         let hooks = self.active_hooks_for_agent(agent_id).await.len();
         let agent_watches = self.list_watches_for_parent(agent_id).len();
         let queued_messages = self.queue_snapshot(agent_id).len();
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
-        // Delegated children not yet settled: sessions parented by this agent
-        // whose status is still non-terminal. One message-free summary read
-        // over the agent's home workspace (children are created there).
+        // Delegated children not yet settled: one aggregate statement over
+        // the `parent_agent_id` index, unscoped by workspace so a Chief
+        // parent's cross-workspace delegates count too — O(this agent's
+        // children), never O(workspace sessions). Fails open to 0.
         let running_sub_agents = self
             .store
-            .list_agent_session_summaries(&session.workspace_id)
+            .count_unsettled_child_agents(agent_id)
             .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|s| {
-                s.parent_agent_id.as_ref() == Some(agent_id)
-                    && !matches!(
-                        s.status,
-                        AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
-                    )
-            })
-            .count();
+            .unwrap_or(0) as usize;
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Whole-second UTC timestamp — the snapshot line is injected into
         // every turn prompt, so sub-second precision only spends tokens.
