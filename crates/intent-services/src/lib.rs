@@ -83,6 +83,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod note_ops;
+mod one_shot_acp;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
