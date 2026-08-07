@@ -10853,6 +10853,252 @@ mod file_tracking {
         );
     }
 
+    /// Regression (monorepo#1648, ladder rung 2): steady-state sequential
+    /// reads cost no working-tree scan at all — the first read scans, the
+    /// rest serve the cached status.
+    #[tokio::test]
+    async fn git_status_repeat_reads_serve_the_cached_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                svc.git_status(ws_id.clone()).await.unwrap(),
+                first,
+                "cached reads return the same status"
+            );
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
+        // The other scan-backed reads serve the same entry.
+        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.accept_changes_get_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "git.changes / accept-changes.getStatus share the cached scan"
+        );
+    }
+
+    /// A daemon-owned git mutation invalidates the cache inline, so the next
+    /// read reflects it rather than serving the pre-mutation snapshot.
+    #[tokio::test]
+    async fn git_mutation_invalidates_the_cached_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        assert!(
+            before.files.iter().any(|f| !f.staged),
+            "the edit starts unstaged"
+        );
+        svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        let after = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the mutation forced a rescan"
+        );
+        assert!(
+            after.files.iter().all(|f| f.staged),
+            "the post-stage read reflects the mutation: {after:?}"
+        );
+    }
+
+    /// The fallback TTL bounds staleness for changes no daemon signal reports:
+    /// an out-of-band edit is picked up once the cached entry expires.
+    #[tokio::test]
+    async fn git_status_cache_expires_after_its_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc
+            .with_git_status_cache_ttl(std::time::Duration::from_millis(50))
+            .with_git_status_scan_probe({
+                let scans = Arc::clone(&scans);
+                Arc::new(move || {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+
+        assert!(svc
+            .git_status(ws_id.clone())
+            .await
+            .unwrap()
+            .files
+            .is_empty());
+        // Out-of-band edit: no `file:*` event, no daemon mutation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        assert!(
+            svc.git_status(ws_id.clone())
+                .await
+                .unwrap()
+                .files
+                .is_empty(),
+            "still inside the TTL: the cached (now stale) status is served"
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let expired = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "TTL expiry re-authorized a scan"
+        );
+        assert!(
+            expired.files.iter().any(|f| f.path == "seed.txt"),
+            "the out-of-band edit surfaces after the TTL"
+        );
+    }
+
+    /// Invalidation landing *during* a scan wins: that scan cannot be trusted
+    /// to describe the post-change tree, so its result must not be cached —
+    /// the next read rescans instead of serving it.
+    #[tokio::test]
+    async fn invalidation_during_a_scan_is_not_overwritten_by_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The change lands mid-scan: whatever the in-flight scan observes, it
+        // started against the pre-change generation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the stale snapshot was not cached"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the mid-scan change"
+        );
+    }
+
+    /// A reader that joins an in-flight scan *after* an invalidation must not
+    /// publish that scan's (pre-change) result: only the leader caches, and
+    /// only against the generation it snapshotted when it was elected.
+    #[tokio::test]
+    async fn follower_joining_after_invalidation_does_not_cache_the_leaders_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+
+        // Joins after the invalidation, so its generation is the new one — but
+        // the result it receives is the leader's pre-change scan.
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the flight", || {
+            svc.git_status_waiters(&repo.dir) > 0
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the follower must not have cached the leader's stale snapshot"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the change the coalesced scan predated"
+        );
+    }
+
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
     #[tokio::test]
