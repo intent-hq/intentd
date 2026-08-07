@@ -16,13 +16,10 @@ use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
 pub(crate) const PRELUDE: &str = r#"
     globalThis.ws = globalThis.ws || {};
     ws.event = {
-        recentFiles: (limit) => host({ method: 'event.recentFiles', args: { limit } }),
         agentActivity: (agentId, minutesAgo) =>
             host({ method: 'event.agentActivity', args: { agentId, minutesAgo } }),
         workspaceSummary: (minutesAgo) =>
             host({ method: 'event.workspaceSummary', args: { minutesAgo } }),
-        directoryChanges: (dir, limit) =>
-            host({ method: 'event.directoryChanges', args: { dir, limit } }),
         query: (options) => host({ method: 'event.query', args: { ...(options || {}) } }),
         subscribe: (eventTypes, opts) =>
             host({ method: 'event.subscribe', args: { eventTypes, ...(opts || {}) } }),
@@ -39,28 +36,13 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "recentFiles" => recent_files(api, ws, args).await,
         "agentActivity" => agent_activity(api, ws, args).await,
         "workspaceSummary" => workspace_summary(api, ws, args).await,
-        "directoryChanges" => directory_changes(api, ws, args).await,
         "query" => query(api, ws, args).await,
         "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
         other => Err(format!("host: unknown method `event.{other}`")),
     }
-}
-
-async fn recent_files(
-    api: &Arc<dyn WorkspaceApi>,
-    ws: &WorkspaceId,
-    args: &Value,
-) -> Result<Value, String> {
-    let limit = args.get("limit").and_then(Value::as_i64);
-    let rows = api
-        .event_recent_files(ws.clone(), limit)
-        .await
-        .map_err(map_err)?;
-    serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
 async fn agent_activity(
@@ -86,20 +68,6 @@ async fn workspace_summary(
         .await
         .map_err(map_err)?;
     serde_json::to_value(summary).map_err(|e| e.to_string())
-}
-
-async fn directory_changes(
-    api: &Arc<dyn WorkspaceApi>,
-    ws: &WorkspaceId,
-    args: &Value,
-) -> Result<Value, String> {
-    let dir = req_str(args, "dir").map_err(|_| "Directory path is required".to_string())?;
-    let limit = args.get("limit").and_then(Value::as_i64);
-    let rows = api
-        .event_directory_changes(ws.clone(), dir, limit)
-        .await
-        .map_err(map_err)?;
-    serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
 async fn query(

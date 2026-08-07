@@ -307,8 +307,10 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             name: build (aarch64-apple-darwin, macos-14)
+          # TEMP: self-hosted Windows runner 5090pc offline — revert to
+          # [self-hosted, Windows, X64] when it is back.
           - target: x86_64-pc-windows-msvc
-            os: [self-hosted, Windows, X64]
+            os: windows-latest
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names (instead of the default matrix-value join) so
     # the required-check contexts in the main ruleset stay stable even when a

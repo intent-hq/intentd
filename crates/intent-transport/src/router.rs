@@ -941,14 +941,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        "event.recentFiles" => {
-            let ws = require_ws_note(params)?;
-            let result = api
-                .event_recent_files(ws, opt_int(params, "limit"))
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
-        }
         "event.agentActivity" => {
             let ws = require_ws_note(params)?;
             let agent_id = opt_str(params, "agentId");
@@ -963,15 +955,6 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .event_workspace_summary(ws, opt_int(params, "minutesAgo"))
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
-        }
-        "event.directoryChanges" => {
-            let ws = require_ws_note(params)?;
-            let dir = require_str_param(params, "dir")?;
-            let result = api
-                .event_directory_changes(ws, dir, opt_int(params, "limit"))
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

@@ -9,10 +9,16 @@
 //! [`Subscription`] whose per-subscriber delivery task applies the
 //! [`SubscriptionFilter`] and coalesces matched events within `batch_window`
 //! (the TS `batchFlushWorker`: the timer starts on the first matched event).
+//!
+//! `file:*` events are the one family with hybrid persistence (see
+//! [`is_transient_file_event`]): only agent-attributed file changes are durable
+//! (they feed `event.agentActivity` / `event.workspaceSummary`); watcher-observed
+//! changes attributed to the system/user are broadcast-only, since they are
+//! high-volume noise that no read path queries back out of the log.
 
 use std::sync::Arc;
 
-use intent_core::{Error, Event, Result};
+use intent_core::{ActorType, Error, Event, Result};
 use intent_store::{NewEvent, Store};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -102,7 +108,23 @@ impl EventBus {
     /// live subscribers. Round-trips through the writer task that coalesces
     /// high-volume inserts into batched transactions. Returns an error if the
     /// writer task has shut down or the send fails.
+    ///
+    /// Non-agent `file:*` events are downgraded to a transient broadcast
+    /// ([`is_transient_file_event`]) so watcher noise never reaches SQLite;
+    /// callers see the same `Ok(Event)` shape either way.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
+        if is_transient_file_event(ev) {
+            let event = self.publish_transient(ev);
+            // The persisted path awaits `writer_tx.send()`, which yields and lets
+            // delivery tasks drain the broadcast buffer. The transient path never
+            // pends, so a non-collapsing burst (e.g. the watcher's shutdown
+            // `flush_all`) could otherwise push past BROADCAST_CAPACITY in one
+            // non-yielding loop and lag every subscriber off events that — being
+            // transient — are not recoverable from the log. Yield to keep the
+            // publish loop cooperative.
+            tokio::task::yield_now().await;
+            return Ok(event);
+        }
         let (tx, rx) = oneshot::channel();
         let req = (ev.clone(), tx);
         self.writer_tx
@@ -318,6 +340,18 @@ async fn delivery_task(
             }
         }
     }
+}
+
+/// Whether `ev` is a `file:*` event that must be broadcast-only.
+///
+/// Hybrid `file:*` persistence: agent-attributed file changes stay durable
+/// because `event.agentActivity` and `event.workspaceSummary` read them back out
+/// of the log. Everything else (the watcher's system-attributed changes, user
+/// edits) is broadcast to live subscribers and dropped — high-volume rows with
+/// no reader.
+pub(crate) fn is_transient_file_event(ev: &NewEvent) -> bool {
+    ev.event_type.starts_with(intent_core::events::FILE_PREFIX)
+        && ev.actor.actor_type != ActorType::Agent
 }
 
 /// Returns a persistence copy of `ev` with its `data` bounded to

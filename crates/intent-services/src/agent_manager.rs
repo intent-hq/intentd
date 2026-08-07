@@ -3672,7 +3672,14 @@ impl AgentManager {
             .await;
         // The persisted user row supersedes a pending question tail, which
         // can retire the workspace's needs_attention displayStatus (§6.5
-        // step 0): recompute-and-compare.
+        // step 0): recompute-and-compare. This recompute ALSO produces the
+        // visible `failed → in_progress` transition on the errored-agent
+        // redrive path (a fresh sendMessage to a non-poisoned Error session):
+        // the earlier recompute inside `try_begin`'s `agent_activity_begin`
+        // still reads `status = Error` (persisted to Active only afterwards)
+        // and is a no-op, so removing or reordering this call would leave the
+        // redriven turn stuck on `failed` for its whole duration. Pinned by
+        // `send_message_redrive_emits_failed_to_in_progress`.
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
             .await;
@@ -4809,6 +4816,11 @@ impl AgentManager {
         // Route through persist_status_with_stop_reason to ensure the agent:status-changed
         // event carries stopReason: null.
         self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
+            .await;
+        // Clearing the Error park retires the `failed` displayStatus rung
+        // (§6.5 step 0): recompute-and-compare so the demotion emits.
+        self.services
+            .maybe_emit_display_status_changed(workspace_id)
             .await;
         Ok(())
     }
@@ -7548,6 +7560,14 @@ async fn persist_error_and_requeue(
             workspace_id,
             mgr.services.queue_snapshot(agent_id),
         )
+        .await;
+
+    // A top-level agent parked in Error drives the `failed` displayStatus
+    // rung (§6.5 step 0): recompute-and-compare so the promotion emits.
+    // Deliberately AFTER the requeue: clients key on status-changed →
+    // queue-updated ordering, and the recompute must not widen that window.
+    mgr.services
+        .maybe_emit_display_status_changed(workspace_id)
         .await;
 
     // Durable transcript record of the terminal failure: a system-role message

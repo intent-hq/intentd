@@ -444,17 +444,6 @@ impl Store {
         self.delete_ephemeral_events_before(cutoff).await
     }
 
-    /// Most-recent `file:changed` events for a workspace (newest first).
-    pub async fn recent_files(&self, workspace_id: &WorkspaceId, limit: i64) -> Result<Vec<Event>> {
-        self.query_events(&EventQuery {
-            workspace_id: Some(workspace_id.clone()),
-            event_types: vec![intent_core::events::FILE_CHANGED.to_string()],
-            limit: Some(limit),
-            ..Default::default()
-        })
-        .await
-    }
-
     /// Most-recent events for a workspace regardless of type (newest first).
     pub async fn events_by_workspace(
         &self,
@@ -479,23 +468,6 @@ impl Store {
         self.query_events(&EventQuery {
             workspace_id: Some(workspace_id.clone()),
             event_types: vec![event_type.to_string()],
-            limit: Some(limit),
-            ..Default::default()
-        })
-        .await
-    }
-
-    /// Most-recent `file:changed` events under a directory prefix (newest first).
-    pub async fn directory_changes(
-        &self,
-        workspace_id: &WorkspaceId,
-        dir_prefix: &str,
-        limit: i64,
-    ) -> Result<Vec<Event>> {
-        self.query_events(&EventQuery {
-            workspace_id: Some(workspace_id.clone()),
-            event_types: vec![intent_core::events::FILE_CHANGED.to_string()],
-            path_prefix: Some(dir_prefix.to_string()),
             limit: Some(limit),
             ..Default::default()
         })
