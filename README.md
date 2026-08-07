@@ -304,10 +304,13 @@ Channels follow a **promotion model** — channel routing does not depend on pre
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
 
 - **Beta**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the beta channel automatically.
+  The GitHub release is published as a **Pre-release** (also on the mirror).
 - **Stable**: a manual **promotion** of an existing release — run the
   [Promote stable](.github/workflows/promote-stable.yml) workflow (Actions → Promote
-  stable) with the version to promote; it validates that the release exists and updates
-  the stable channel manifest to point at it.
+  stable) with the version to promote; it validates that the release exists and is not a
+  draft, updates the stable channel manifest to point at it, and clears the Pre-release
+  flag while marking that release **Latest** on this repo and on the mirror. The Latest
+  badge therefore always tracks the newest stable version.
 
 ### Cutting a release
 
