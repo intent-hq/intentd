@@ -1620,9 +1620,12 @@ impl AgentManager {
         let child_pid = child.id();
         let connection = Arc::new(connection);
 
-        let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
-            crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
-        );
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
+            Arc::new(crate::PtyTerminalHost::with_shell_mode(
+                self.services.pty(),
+                self.services.settings_registry(),
+                opts.provider.terminal_requires_shell,
+            ));
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
