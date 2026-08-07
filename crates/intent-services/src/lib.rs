@@ -17652,7 +17652,8 @@ impl WorkspaceApi for Services {
                     self.agent_validate_edit_target_op(&agent_id, &message_id)
                         .await?;
                     if let Some(model_id) = model {
-                        self.agent_set_model_op(agent_id.clone(), model_id).await?;
+                        self.agent_set_model_op(agent_id.clone(), model_id, None)
+                            .await?;
                     }
                     let truncated_count =
                         self.agent_edit_truncate_op(&agent_id, &message_id).await?;
@@ -17768,8 +17769,12 @@ impl WorkspaceApi for Services {
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_set_model_op(agent_id, model_id).await })
+        Box::pin(async move {
+            self.agent_set_model_op(agent_id, model_id, provider_id)
+                .await
+        })
     }
 
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {

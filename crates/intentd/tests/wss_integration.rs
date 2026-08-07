@@ -1324,6 +1324,160 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     srv.ws.stop().await;
 }
 
+/// `agent.setModel` optional `providerId` param over the real WSS wire
+/// (monorepo#1657, PROTOCOL §5.5): a bare model claimed by another
+/// provider's cached catalog is rejected -32602 without `providerId` (the
+/// message carries the pass-providerId hint), succeeds WITH the owning
+/// `providerId` and reconciles the served `provider`, an unknown
+/// `providerId` is -32602, and a compound `modelId` conflicting with
+/// `providerId` is -32602 with the session untouched.
+#[tokio::test]
+async fn wss_agent_set_model_provider_id_param() {
+    let dir = test_tempdir("intentd-wss-setmodel-pid-");
+    // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
+    // version key must match each provider's current one ("" — no pin).
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
+            },
+            "grok": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS SetModel ProviderId"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Pid","model":"auggie:sonnet4.5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Without providerId the bare grok-claimed model is rejected against the
+    // session's auggie provider — and the message carries the hint.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "bare mismatch without providerId must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("pass providerId"),
+        "rejection must hint at providerId: {rejected}"
+    );
+
+    // Unknown explicit providerId → -32602 before any mutation.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"nonexistent"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // Compound modelId whose prefix conflicts with providerId → -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"auggie:sonnet4.5","providerId":"grok"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "conflicting providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("names provider auggie but providerId is grok"),
+        "error must name both providers: {rejected}"
+    );
+
+    // All rejections left the session untouched.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("auggie:sonnet4.5"),
+        "model must be unchanged after the rejections: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("auggie"),
+        "provider must be unchanged after the rejections: {got}"
+    );
+
+    // With the owning providerId the same bare model passes, and the served
+    // provider reconciles to it.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+    );
+    let accepted = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        accepted.get("error").is_none(),
+        "bare model with owning providerId must pass: {accepted}"
+    );
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("grok-4-fast"),
+        "model must be updated: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("grok"),
+        "provider must reconcile to the explicit providerId: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Regression for monorepo#607 (dynamic gap) over the real WSS wire: with a
 /// warm auggie catalog cached (seeded through the persisted models-cache
 /// file) that claims the dynamic-only `fable-5` and a grok catalog without

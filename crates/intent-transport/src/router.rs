@@ -1310,9 +1310,13 @@ async fn dispatch(
         "agent.setModel" => {
             let agent_id = require_agent_id(params)?;
             let model_id = require_str_param(params, "modelId")?;
+            // Optional explicit provider (additive, PROTOCOL §5.5): empty /
+            // whitespace-only is treated as absent so older clients sending
+            // a blank field keep the historical behavior.
+            let provider_id = opt_nonempty_str(params, "providerId").map(|s| s.trim().to_string());
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_set_model(ws, agent_id, model_id)
+                .agent_set_model(ws, agent_id, model_id, provider_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
