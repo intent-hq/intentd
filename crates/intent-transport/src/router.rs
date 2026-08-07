@@ -744,7 +744,7 @@ async fn dispatch(
             let acceptance_criteria = normalize_acceptance_criteria(params);
             let effort = opt_str(params, "effort");
             let result = api
-                .mark_as_task(ws, note_id, status, acceptance_criteria, effort)
+                .mark_as_task(ws, note_id, status, acceptance_criteria, effort, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -766,7 +766,7 @@ async fn dispatch(
             let content = opt_str(params, "content");
             let status = opt_str(params, "status");
             let result = api
-                .create_prerequisite(ws, dependent_note_id, title, content, status)
+                .create_prerequisite(ws, dependent_note_id, title, content, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)

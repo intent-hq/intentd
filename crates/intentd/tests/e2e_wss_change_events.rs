@@ -703,7 +703,8 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
     assert_eq!(evt["data"]["noteTitle"], json!("Plain"));
     assert_eq!(evt["data"]["status"], json!("not_started"));
 
-    // Re-marking an already-task note is a status move, not a creation.
+    // Re-marking an already-task note is a status move, not a creation: it
+    // takes the same `task:status-changed` `task.updateNoteStatus` publishes.
     wss_rpc(
         &mut rpc,
         6,
@@ -711,6 +712,11 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": plain_id, "status": "in_progress" }),
     )
     .await;
+
+    let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(plain_id));
+    assert_eq!(evt["data"]["previousStatus"], json!("not_started"));
+    assert_eq!(evt["data"]["newStatus"], json!("in_progress"));
 
     // Path 3 — `task.createPrerequisite`. Because the stream is ordered, the
     // next `task:created` being the prerequisite's proves the re-mark above

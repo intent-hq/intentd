@@ -14498,6 +14498,7 @@ impl WorkspaceApi for Services {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
         let services = self.clone();
@@ -14507,7 +14508,7 @@ impl WorkspaceApi for Services {
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let now = now_iso();
-            let was_task = note.metadata.task.is_some();
+            let previous_status = note.metadata.task.as_ref().map(|t| t.status);
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
@@ -14526,8 +14527,9 @@ impl WorkspaceApi for Services {
                     note.metadata.task = Some(task);
                 }
             }
-            note.updated_at = now;
+            note.updated_at = now.clone();
             store.update_note(&note).await?;
+            let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
             // The note's metadata changed, so subscribers need to refetch it
             // (§6.5) — without this a task-ness flip is invisible until the
             // next unrelated note write.
@@ -14542,23 +14544,55 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
-            // Only a note that was not already a task is "created" as one;
-            // re-marking an existing task is a status move, not a creation.
-            if !was_task {
-                publish_event(
-                    &services.event_bus,
-                    task_created_event(
-                        &note.workspace_id,
-                        &note.id,
-                        &note.title,
-                        new_status,
-                        &note.updated_at,
-                        // `task.markAsTask` carries no caller-agent context on
-                        // the trait, so the emission stays system-attributed.
-                        None,
-                    ),
-                )
-                .await;
+            match previous_status {
+                // Only a note that was not already a task is "created" as one.
+                None => {
+                    publish_event(
+                        &services.event_bus,
+                        task_created_event(
+                            &note.workspace_id,
+                            &note.id,
+                            &note.title,
+                            new_status,
+                            &note.updated_at,
+                            agent,
+                        ),
+                    )
+                    .await;
+                }
+                // Re-marking an existing task is a status move, so it takes the
+                // same `task:status-changed` + ready-set recompute pair
+                // `task.updateNoteStatus` publishes.
+                Some(previous) if previous != new_status => {
+                    publish_event(
+                        &services.event_bus,
+                        task_status_changed_event(
+                            &note.workspace_id,
+                            &note.id,
+                            &note.title,
+                            previous,
+                            new_status,
+                            &now,
+                            agent,
+                        ),
+                    )
+                    .await;
+                    let all = store.list_notes(&note.workspace_id).await?;
+                    let ready_task_ids = compute_ready_task_ids(&all);
+                    publish_event(
+                        &services.event_bus,
+                        ready_tasks_changed_event(
+                            &note.workspace_id,
+                            ready_task_ids,
+                            &note.id,
+                            previous,
+                            new_status,
+                            &now_iso(),
+                        ),
+                    )
+                    .await;
+                }
+                Some(_) => {}
             }
             // Marking a note as a task (or moving its status) can move the
             // derived displayStatus rollup (§6.5).
@@ -14597,6 +14631,7 @@ impl WorkspaceApi for Services {
         title: String,
         content: Option<String>,
         status: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
@@ -14621,10 +14656,7 @@ impl WorkspaceApi for Services {
                     content.unwrap_or_default(),
                     task_status,
                     None,
-                    // `task.createPrerequisite` carries no caller-agent
-                    // context on the trait, so the emission stays
-                    // system-attributed.
-                    None,
+                    caller_agent_id.as_ref(),
                 )
                 .await?;
             // A fresh spec-child task can move the derived rollup (§6.5),
