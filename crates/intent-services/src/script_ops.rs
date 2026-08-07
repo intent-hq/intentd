@@ -1603,37 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_args_uses_dash_c_for_sh_and_login_for_bash_zsh() {
-        assert_eq!(crate::shell::shell_args("/bin/sh", "echo hi"), vec!["-c", "echo hi"]);
-        assert_eq!(
-            shell_args("/bin/bash", "echo hi"),
-            vec!["-l", "-c", "echo hi"]
-        );
-        assert_eq!(
-            shell_args("/opt/homebrew/bin/zsh", "echo hi"),
-            vec!["-l", "-c", "echo hi"]
-        );
-        // Unknown shell base falls through the login-shell default arm.
-        assert_eq!(crate::shell::shell_args("/bin/fish", "x"), vec!["-l", "-c", "x"]);
-    }
-
-    #[test]
-    fn shell_args_for_windows_uses_command_for_powershell_and_slash_c_for_cmd() {
-        let ps = ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command", "x"];
-        assert_eq!(crate::shell::shell_args_for("pwsh", "x", true), ps);
-        assert_eq!(crate::shell::shell_args_for("powershell.exe", "x", true), ps);
-        assert_eq!(
-            crate::shell::shell_args_for(r"C:\Program Files\PowerShell\7\pwsh.exe", "x", true),
-            ps
-        );
-        assert_eq!(crate::shell::shell_args_for("cmd.exe", "x", true), vec!["/c", "x"]);
-        assert_eq!(
-            crate::shell::shell_args_for(r"C:\Windows\system32\cmd.exe", "x", true),
-            vec!["/c", "x"]
-        );
-    }
-
-    #[test]
     fn spawn_overlay_scrubs_only_inherited_npm_config_prefix_and_enhances_path() {
         let env = spawn_env_overlay(None);
         assert!(scrubbed_env_vars_except(&env)

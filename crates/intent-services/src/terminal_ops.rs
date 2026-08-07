@@ -1982,13 +1982,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_shell_mode_accepts_packed_bash_lc_command() {
+    async fn acp_shell_mode_accepts_packed_shell_command() {
         let pty = host();
         let adapter = PtyTerminalHost::with_shell_mode(pty.clone(), None, true);
         let params = TerminalCreateParams {
             session_id: "sess-shell".to_string(),
-            // Grok-style packed shell line (would ENOENT under argv-only spawn).
-            command: "/bin/bash -lc 'printf shell-mode-ok\\n'".to_string(),
+            // Grok-style packed shell line (would ENOENT under argv-only
+            // spawn). `/bin/sh` rather than a hard-coded `/bin/bash` so the
+            // test is portable to hosts without bash.
+            command: "/bin/sh -c 'printf shell-mode-ok\\n'".to_string(),
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
@@ -2004,7 +2006,6 @@ mod tests {
             out.output
         );
     }
-
 
     #[tokio::test]
     async fn acp_kill_terminates_tracked_terminal() {

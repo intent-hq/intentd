@@ -56,7 +56,6 @@ fn default_shell_for(
     }
 }
 
-
 /// Build argv for running `command` under `shell` (platform-aware `-c` /
 /// PowerShell `-Command` / `cmd /c`). Shared by saved-script runs and ACP
 /// `terminal/create` when a provider sets `terminal_requires_shell`.
@@ -75,10 +74,7 @@ pub(crate) fn shell_args_for(shell: &str, command: &str, is_windows: bool) -> Ve
     // On a real Windows host `Path::file_name` already splits on `\`; this
     // extra split only matters when the Windows arm runs under a POSIX test.
     let file = if is_windows {
-        file.rsplit(|c| c == '\\' || c == '/')
-            .next()
-            .unwrap_or(&file)
-            .to_string()
+        file.rsplit(['\\', '/']).next().unwrap_or(&file).to_string()
     } else {
         file
     };
@@ -106,8 +102,18 @@ pub(crate) fn shell_args_for(shell: &str, command: &str, is_windows: bool) -> Ve
 /// Node-style `shell: true` packaging for an ACP terminal request: join the
 /// program and args into one command line, then wrap with [`shell_args`].
 /// Returns `(shell_program, shell_args)`.
+///
+/// POSIX matches Node's `shell: true` exactly: always `/bin/sh -c`, never the
+/// user's login shell (the packed line already names its own shell when one is
+/// wanted, e.g. Grok's `/bin/bash -lc '…'`). Windows keeps the native-shell
+/// resolution (PowerShell `-Command` / `cmd /c`) since `/bin/sh` doesn't exist
+/// there.
 pub(crate) fn shell_true_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
-    let shell = default_shell();
+    let shell = if cfg!(windows) {
+        default_shell()
+    } else {
+        "/bin/sh".to_string()
+    };
     let line = if args.is_empty() {
         command.to_string()
     } else {
@@ -184,34 +190,69 @@ mod tests {
     }
 
     #[test]
-    fn shell_args_posix_sh_uses_c_only() {
+    fn shell_args_posix_sh_and_dash_use_c_only() {
         assert_eq!(
             shell_args_for("/bin/sh", "echo hi", false),
+            vec!["-c", "echo hi"]
+        );
+        assert_eq!(
+            shell_args_for("/bin/dash", "echo hi", false),
             vec!["-c", "echo hi"]
         );
     }
 
     #[test]
-    fn shell_args_posix_bash_uses_login_c() {
+    fn shell_args_posix_login_shells_use_login_c() {
         assert_eq!(
             shell_args_for("/bin/bash", "echo hi", false),
             vec!["-l", "-c", "echo hi"]
+        );
+        assert_eq!(
+            shell_args_for("/opt/homebrew/bin/zsh", "echo hi", false),
+            vec!["-l", "-c", "echo hi"]
+        );
+        // Unknown shell base falls through the login-shell default arm.
+        assert_eq!(
+            shell_args_for("/bin/fish", "x", false),
+            vec!["-l", "-c", "x"]
         );
     }
 
     #[test]
     fn shell_args_windows_powershell_and_cmd() {
         let ps = ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command", "x"];
+        assert_eq!(shell_args_for("pwsh", "x", true), ps);
         assert_eq!(shell_args_for("powershell.exe", "x", true), ps);
+        assert_eq!(
+            shell_args_for(r"C:\Program Files\PowerShell\7\pwsh.exe", "x", true),
+            ps
+        );
+        // Forward-slash Windows paths (e.g. MSYS-style COMSPEC) split too.
+        assert_eq!(
+            shell_args_for("C:/Program Files/PowerShell/7/pwsh.exe", "x", true),
+            ps
+        );
         assert_eq!(shell_args_for("cmd.exe", "x", true), vec!["/c", "x"]);
+        assert_eq!(
+            shell_args_for(r"C:\Windows\system32\cmd.exe", "x", true),
+            vec!["/c", "x"]
+        );
     }
 
     #[test]
     fn shell_true_invocation_preserves_packed_command_line() {
-        let (_shell, args) = shell_true_invocation("/bin/bash -lc 'echo hi'", &[]);
+        let (shell, args) = shell_true_invocation("/bin/bash -lc 'echo hi'", &[]);
         assert_eq!(
             args.last().map(String::as_str),
             Some("/bin/bash -lc 'echo hi'")
         );
+        // POSIX matches Node shell:true — /bin/sh -c, never a login shell.
+        #[cfg(not(windows))]
+        {
+            assert_eq!(shell, "/bin/sh");
+            assert_eq!(args, vec!["-c", "/bin/bash -lc 'echo hi'"]);
+        }
+        #[cfg(windows)]
+        let _ = shell;
     }
 }

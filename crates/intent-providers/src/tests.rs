@@ -1514,7 +1514,10 @@ fn non_env_config_providers_ignore_mcp_json() {
 fn only_grok_requires_terminal_shell_by_default() {
     for p in crate::ACP_PROVIDERS {
         if p.id == "grok" {
-            assert!(p.terminal_requires_shell, "grok must shell-wrap ACP terminals");
+            assert!(
+                p.terminal_requires_shell,
+                "grok must shell-wrap ACP terminals"
+            );
         } else {
             assert!(
                 !p.terminal_requires_shell,

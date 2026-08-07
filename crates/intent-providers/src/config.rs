@@ -172,8 +172,9 @@ pub struct ProviderConfig {
     /// `opencode` alone is misleading when the Unsloth CLI isn't installed.
     pub requires_secondary_binary: Option<&'static str>,
     /// When true, ACP `terminal/create` requests from this provider are spawned
-    /// via a shell (`sh -c` / PowerShell `-Command` / `cmd /c`) rather than as
-    /// raw argv. Needed for agents that pack a full shell line into the
+    /// via a shell (`/bin/sh -c` on POSIX; PowerShell `-Command` / `cmd /c` on
+    /// Windows) rather than as raw argv. Needed for agents that pack a full
+    /// shell line into the
     /// `command` field with empty `args` (Node-style `shell: true` semantics).
     /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
     /// argv-only clients (most providers) leave this false.
