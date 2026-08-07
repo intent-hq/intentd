@@ -11034,6 +11034,71 @@ mod file_tracking {
         );
     }
 
+    /// A reader that joins an in-flight scan *after* an invalidation must not
+    /// publish that scan's (pre-change) result: only the leader caches, and
+    /// only against the generation it snapshotted when it was elected.
+    #[tokio::test]
+    async fn follower_joining_after_invalidation_does_not_cache_the_leaders_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+
+        // Joins after the invalidation, so its generation is the new one — but
+        // the result it receives is the leader's pre-change scan.
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the flight", || {
+            svc.git_status_waiters(&repo.dir) > 0
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the follower must not have cached the leader's stale snapshot"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the change the coalesced scan predated"
+        );
+    }
+
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
     #[tokio::test]

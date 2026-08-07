@@ -18,10 +18,12 @@
 //! rather than running a competing scan. [`STATUS_CACHE_TTL`] is the backstop
 //! for changes no daemon signal covers.
 //!
-//! Invalidation races the scan it interrupts: a scan captures the entry's
+//! Invalidation races the scan it interrupts: the leader captures the entry's
 //! generation before it starts and stores its result only if the generation is
 //! unchanged, so a change landing mid-scan is never overwritten by the older
-//! snapshot — the next read misses and rescans. Failed scans are never stored.
+//! snapshot — the next read misses and rescans. Followers never store: they
+//! joined a flight whose generation is the leader's, not theirs. Failed scans
+//! are never stored.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -100,7 +102,7 @@ impl GitStatusCache {
     /// otherwise a scan (coalesced per worktree) whose result is cached.
     pub(crate) async fn get(&self, worktree: &Path, probe: ScanProbe) -> Result<Arc<GitStatus>> {
         let key = git_status_singleflight::status_key(worktree);
-        let generation = {
+        {
             let mut slots = self.slots.lock().unwrap();
             let slot = slots.entry(key.clone()).or_default();
             if let Some((status, at)) = &slot.cached {
@@ -111,11 +113,8 @@ impl GitStatusCache {
                 // stale value behind to be served again.
                 slot.cached = None;
             }
-            slot.generation
-        };
-        let scanned = self.scan(&key, worktree, probe).await?;
-        self.store(&key, generation, &scanned);
-        Ok(scanned)
+        }
+        self.scan(&key, worktree, probe).await
     }
 
     /// Discard the cached status for `worktree` and repopulate it with a fresh
@@ -124,6 +123,16 @@ impl GitStatusCache {
     pub async fn refresh(&self, worktree: &Path) -> Result<Arc<GitStatus>> {
         self.invalidate(worktree);
         self.get(worktree, None).await
+    }
+
+    /// The entry's current generation, snapshotted before a scan starts.
+    fn generation(&self, key: &StatusKey) -> u64 {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .generation
     }
 
     /// Store `status` only if the entry has not been invalidated since the
@@ -142,6 +151,11 @@ impl GitStatusCache {
     /// the same worktree await it instead of re-walking the tree. A leader
     /// that vanishes without publishing frees the flight, so the result of a
     /// failed or cancelled scan is never reused.
+    ///
+    /// Only the leader caches its result, and only against the generation it
+    /// snapshotted *after* being elected: a follower's own generation says
+    /// nothing about when the leader's scan started, so a follower that joined
+    /// after an invalidation must not publish the leader's older snapshot.
     async fn scan(
         &self,
         key: &StatusKey,
@@ -151,6 +165,9 @@ impl GitStatusCache {
         loop {
             match self.flights.join(key) {
                 Join::Leader(flight) => {
+                    // Snapshot after election, so anything that invalidated
+                    // before this scan started is already reflected.
+                    let generation = self.generation(key);
                     // A libgit2 working-tree scan is unbounded CPU on a big
                     // repo; never run it on a Tokio worker.
                     let scan_path = worktree.to_path_buf();
@@ -166,6 +183,7 @@ impl GitStatusCache {
                     return match scanned {
                         Ok(status) => {
                             let shared = Arc::new(status);
+                            self.store(key, generation, &shared);
                             flight.finish(Ok(Arc::clone(&shared)));
                             Ok(shared)
                         }

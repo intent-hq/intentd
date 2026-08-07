@@ -16416,12 +16416,13 @@ impl WorkspaceApi for Services {
                 GIT_PULL_TIMEOUT,
             )
             .await?;
-            if outcome.ok {
-                // Merged commits moved HEAD and possibly the tree
-                // (monorepo#1648). Invalidated regardless of whether a
-                // workspace row resolves below — the cache is worktree-keyed.
-                status_cache.invalidate(std::path::Path::new(&repo_path));
-            }
+            // Merged commits moved HEAD and possibly the tree
+            // (monorepo#1648). Invalidated regardless of whether a workspace
+            // row resolves below (the cache is worktree-keyed) and regardless
+            // of `outcome.ok`: a pull that fetched successfully and then
+            // failed to rebase or pop its stash has already changed
+            // `origin/<branch>` and possibly the worktree.
+            status_cache.invalidate(std::path::Path::new(&repo_path));
             // Best-effort workspace resolution: `git.pull` is path-scoped (the
             // workspace-create auto-pull runs before the workspace row exists),
             // so we look up any workspace pointing at this worktree and skip
@@ -20458,22 +20459,37 @@ impl Services {
         let locks = self.worktree_locks.clone();
         locks
             .with_lock(&worktree, || async {
-                self.ac_run_pipeline(
-                    &workspace_id,
-                    &worktree,
-                    &branch,
-                    action,
-                    files,
-                    commit_message,
-                    pr_title,
-                    pr_body,
-                    target_branch,
-                    stage_unstaged,
-                    push_after,
-                    create_pr_after,
-                    extras,
-                )
-                .await
+                let outcome = self
+                    .ac_run_pipeline(
+                        &workspace_id,
+                        &worktree,
+                        &branch,
+                        action,
+                        files,
+                        commit_message,
+                        pr_title,
+                        pr_body,
+                        target_branch,
+                        stage_unstaged,
+                        push_after,
+                        create_pr_after,
+                        extras,
+                    )
+                    .await;
+                // A failing pipeline short-circuits *after* earlier steps may
+                // already have mutated the worktree (staged then failed to
+                // commit, committed then failed to push), and it never reaches
+                // `ac_emit_after_mutation` (monorepo#1648). Invalidate on every
+                // non-success outcome so the next read rescans rather than
+                // serving the pre-mutation snapshot until the TTL.
+                let succeeded = matches!(
+                    &outcome,
+                    Ok(v) if v.get("success").and_then(|s| s.as_bool()) == Some(true)
+                );
+                if !succeeded {
+                    self.git_status_cache.invalidate(&worktree);
+                }
+                outcome
             })
             .await
     }
