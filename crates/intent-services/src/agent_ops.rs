@@ -77,6 +77,9 @@ mod tests_specialist_frontmatter;
 #[cfg(test)]
 mod tests_delegate_provider_resolution;
 
+#[cfg(test)]
+mod tests_settings_default_effort;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000):
@@ -145,6 +148,25 @@ fn resolve_default_model_from_settings(
     None
 }
 
+/// Which rung of [`resolve_agent_default_model`] produced the resolved model.
+/// Creation-time reasoning-effort resolution needs the provenance: the
+/// settings default effort (`model.defaultReasoningEffort`) is a strict
+/// companion to the settings default *model*, so it applies only when the
+/// model itself came from [`Settings`](DefaultModelSource::Settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultModelSource {
+    /// Step 1 — a caller-supplied `model`. Never returned by the resolver
+    /// (which only runs when the caller supplied none); stamped by the create
+    /// seam so the effort resolution can tell a pinned model apart.
+    Explicit,
+    /// Step 2 — specialist frontmatter `model`.
+    Specialist,
+    /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
+    Settings,
+    /// Step 4 — nothing resolved; the provider CLI default applies.
+    CliDefault,
+}
+
 /// Single daemon-side default-model resolver (spec "New resolution policy").
 /// Applied by every creation path — `agent.create`, `agent.delegate`,
 /// `agent.wakeOrCreate`, `workspace.create` initialAgent — via
@@ -171,6 +193,26 @@ pub(crate) fn resolve_agent_default_model(
     provider: Option<&str>,
     is_background: bool,
 ) -> Option<String> {
+    resolve_agent_default_model_with_source(
+        services,
+        specialist,
+        workspace_path,
+        provider,
+        is_background,
+    )
+    .0
+}
+
+/// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
+/// produced the value, for callers that must distinguish a settings-chain
+/// default from a specialist pin (creation-time effort resolution).
+pub(crate) fn resolve_agent_default_model_with_source(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+    provider: Option<&str>,
+    is_background: bool,
+) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default (model.default
@@ -196,7 +238,7 @@ pub(crate) fn resolve_agent_default_model(
         // owned by another provider falls through instead of leaking.
         if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
             if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-                return Some(m);
+                return (Some(m), DefaultModelSource::Specialist);
             }
             tracing::debug!(
                 model = m,
@@ -210,9 +252,13 @@ pub(crate) fn resolve_agent_default_model(
     // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
-    let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
+    let Some(m) =
+        resolve_default_model_from_settings(services, is_background, specialist, provider)
+    else {
+        return (None, DefaultModelSource::CliDefault);
+    };
     if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return Some(m);
+        return (Some(m), DefaultModelSource::Settings);
     }
     tracing::warn!(
         model = m,
@@ -221,7 +267,7 @@ pub(crate) fn resolve_agent_default_model(
          falling back to the CLI default"
     );
     // Step 4: None → provider CLI default.
-    None
+    (None, DefaultModelSource::CliDefault)
 }
 
 /// Ownership guard for resolver-derived defaults (never explicit client
@@ -345,11 +391,67 @@ fn ensure_effort_supported_by_model(
     )))
 }
 
+/// Pick the settings default reasoning effort (`model.defaultReasoningEffort`)
+/// for a creation whose effort is still unresolved after the explicit /
+/// model-option / frontmatter rungs.
+///
+/// The setting is a strict companion to the settings *default model*: it
+/// applies only when the session's model itself resolved from the settings
+/// chain ([`DefaultModelSource::Settings`]) — a caller-supplied model, a
+/// specialist pin, or a fall-through to the provider CLI default all leave the
+/// session effort unset.
+///
+/// Settings-chain leniency (mirroring the bare-model settings-chain fallback):
+/// a level the resolved model's cached `effortLevels` provably does not list
+/// is dropped with a warn, never a `-32602` — only caller-supplied efforts
+/// reject. With no cached evidence the level passes through, matching
+/// [`ensure_effort_supported_by_model`].
+fn resolve_settings_default_reasoning_effort(
+    services: &Services,
+    model_source: DefaultModelSource,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if model_source != DefaultModelSource::Settings {
+        return None;
+    }
+    let settings = services.effective_settings();
+    let level = settings
+        .model
+        .default_reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())?;
+    match ensure_effort_supported_by_model(
+        "agent.create",
+        &services.models_catalog,
+        resolved_model,
+        level,
+    ) {
+        Ok(()) => Some(level.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                effort = level,
+                model = resolved_model.unwrap_or_default(),
+                error = %e,
+                "configured default reasoning effort is not supported by the \
+                 resolved default model; leaving the session effort unset"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the effective `reasoningEffort` for a delegated/woken child
 /// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
 /// the chosen model option's declared effort, then the specialist's
-/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
-/// params collapse to unset without falling through — an explicit clear.
+/// `reasoningEffort` frontmatter scalar, then unset.
+///
+/// An empty/whitespace-only `param` is an explicit clear and is returned
+/// verbatim rather than as `None`: the create seam reads a present-but-blank
+/// value as "the caller decided", so it neither falls through to the
+/// specialist rungs here nor to the settings default
+/// ([`resolve_settings_default_reasoning_effort`]) there. `None` means "no
+/// rung resolved", which is what lets the settings default apply.
 fn resolve_delegate_reasoning_effort(
     services: &Services,
     param: Option<&str>,
@@ -358,7 +460,7 @@ fn resolve_delegate_reasoning_effort(
     workspace_path: Option<&Path>,
 ) -> Option<String> {
     if let Some(param) = param {
-        return (!param.trim().is_empty()).then(|| param.to_string());
+        return Some(param.to_string());
     }
     let spec_id = specialist?;
     let specialists_svc = services.specialists_service();
@@ -2138,9 +2240,13 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // Empty/whitespace collapses to None (an explicit clear); a non-empty
-        // level is validated against the resolved model below, once the model
-        // resolution has settled.
+        // A present value — even blank — means the effort was decided by the
+        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
+        // so the settings default below must not fill it in. Empty/whitespace
+        // then collapses to None (an explicit clear); a non-empty level is
+        // validated against the resolved model once the model resolution has
+        // settled.
+        let reasoning_effort_decided = reasoning_effort.is_some();
         let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -2168,9 +2274,9 @@ impl Services {
         // only affect new agents created afterwards; existing agents change
         // model only via explicit agent.setModel.
         let model_explicit = model.is_some();
-        let mut resolved_model = match model {
+        let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
-            Some(m) => Some(m),
+            Some(m) => (Some(m), DefaultModelSource::Explicit),
             None => {
                 // SECURITY: derive workspace_path from the stored workspace record
                 // rather than trusting the client-supplied value (review thread
@@ -2183,7 +2289,7 @@ impl Services {
                     .await
                     .ok()
                     .and_then(|w| crate::git_ops::worktree_path(&w));
-                resolve_agent_default_model(
+                resolve_agent_default_model_with_source(
                     self,
                     specialist.as_deref(),
                     wp.as_deref(),
@@ -2265,6 +2371,7 @@ impl Services {
                              falling back to the CLI default"
                         );
                         resolved_model = None;
+                        model_source = DefaultModelSource::CliDefault;
                     }
                 }
             }
@@ -2283,6 +2390,17 @@ impl Services {
                 effort,
             )?;
         }
+        // Last rung: the settings default effort, applied only when nothing
+        // decided the effort AND the model itself came from the settings
+        // default chain (see `resolve_settings_default_reasoning_effort`).
+        let reasoning_effort = match reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_settings_default_reasoning_effort(
+                self,
+                model_source,
+                resolved_model.as_deref(),
+            ),
+        };
         let session = AgentSession {
             id,
             workspace_id,
@@ -5092,7 +5210,9 @@ impl Services {
             effective_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.delegate",
                 &self.models_catalog,
@@ -7199,7 +7319,9 @@ impl Services {
             effort_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.wakeOrCreate",
                 &self.models_catalog,
