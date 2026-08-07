@@ -159,9 +159,10 @@ async fn drive_one_shot(
         "sessionId": session_id,
         "prompt": [{ "type": "text", "text": prompt }],
     });
-    // The transport's own request timeout is left generous; `prompt_timeout`
-    // below is the real bound. Dropping the request future on timeout is
-    // cancel-safe — the transport's drop guard removes the pending entry.
+    // `prompt_timeout` is passed as the transport request timeout, so it is
+    // the single bound on the prompt phase. Dropping the request future on
+    // timeout is cancel-safe — the transport's drop guard removes the
+    // pending entry.
     let prompt_fut = conn.request_timeout("session/prompt", params, prompt_timeout);
     tokio::pin!(prompt_fut);
 
