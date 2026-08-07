@@ -9,13 +9,23 @@
 //! workspace's watch roots at runtime, `workspace:deleted`/`workspace:closed`
 //! tear them down. Each watcher keeps its own debounce/fingerprint semantics;
 //! the registry only routes lifecycle transitions.
+//!
+//! Archive/unarchive is a fifth transition. §6.5 has no `workspace:archived`,
+//! so `archive_workspace`/`unarchive_workspace` publish `workspace:updated`
+//! with an `archived` boolean in the delta; the registry subscribes to that
+//! event and treats `archived: true` as a suspend (all watch roots torn down —
+//! otherwise every archived workspace leaks its FSEvents streams until daemon
+//! restart) and `archived: false` as a resume. Resume additionally runs a
+//! catch-up so derived state changed while unwatched is not silently lost: a
+//! `GitStatusRefresher::trigger` plus the skills/specialists rescan (both
+//! fingerprint-checked, so an untouched tree emits nothing).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::events::{
-    WORKSPACE_CLOSED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_OPENED,
+    WORKSPACE_CLOSED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_OPENED, WORKSPACE_UPDATED,
 };
 use intent_core::{Event, WorkspaceApi, WorkspaceId};
 use tokio::task::JoinHandle;
@@ -63,6 +73,7 @@ impl WatcherRegistry {
                 WORKSPACE_OPENED.to_string(),
                 WORKSPACE_DELETED.to_string(),
                 WORKSPACE_CLOSED.to_string(),
+                WORKSPACE_UPDATED.to_string(),
             ],
             ..SubscriptionFilter::default()
         });
@@ -147,6 +158,58 @@ fn start_git_metadata_watch(
     }
 }
 
+/// Start (or replace) the file + `.git` metadata watches for one workspace.
+/// `suffix` distinguishes the triggering transition in the logs.
+fn start_watches(
+    bus: &EventBus,
+    refresher: &Arc<GitStatusRefresher>,
+    file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
+    git_watchers: &mut HashMap<WorkspaceId, GitMetadataWatcher>,
+    ws_id: &WorkspaceId,
+    path: &std::path::Path,
+    suffix: &str,
+) {
+    match FileWatcher::start(bus.clone(), ws_id.clone(), path.to_path_buf()) {
+        Ok(w) => {
+            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files{suffix}");
+            file_watchers.insert(ws_id.clone(), w);
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "file watcher start failed")
+        }
+    }
+    if let Some(w) = start_git_metadata_watch(refresher, ws_id.clone(), path.to_path_buf(), suffix)
+    {
+        git_watchers.insert(ws_id.clone(), w);
+    }
+}
+
+/// Drop the file + `.git` metadata watches for one workspace (the OS
+/// subscriptions end with the watcher handles). `reason` names the transition
+/// in the logs.
+fn stop_watches(
+    file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
+    git_watchers: &mut HashMap<WorkspaceId, GitMetadataWatcher>,
+    ws_id: &WorkspaceId,
+    reason: &str,
+) {
+    if file_watchers.remove(ws_id).is_some() {
+        tracing::info!(workspace = %ws_id, "workspace file watcher stopped ({reason})");
+    }
+    if git_watchers.remove(ws_id).is_some() {
+        tracing::info!(workspace = %ws_id, "workspace git metadata watcher stopped ({reason})");
+    }
+}
+
+/// Read the `archived` boolean out of a `workspace:updated` delta
+/// (`data.changes.archived`). `None` for every other update.
+fn archived_delta(ev: &Event) -> Option<bool> {
+    ev.data
+        .get("changes")
+        .and_then(|c| c.get("archived"))
+        .and_then(|v| v.as_bool())
+}
+
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_loop(
@@ -168,36 +231,85 @@ async fn lifecycle_loop(
                         tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
                         continue;
                     };
-                    match FileWatcher::start(bus.clone(), ws_id.clone(), path.clone()) {
-                        Ok(w) => {
-                            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files (runtime registration)");
-                            file_watchers.insert(ws_id.clone(), w);
-                        }
-                        Err(e) => {
-                            tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "file watcher start failed")
-                        }
-                    }
-                    if let Some(w) = start_git_metadata_watch(
+                    start_watches(
+                        &bus,
                         &refresher,
-                        ws_id.clone(),
-                        path.clone(),
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        &path,
                         " (runtime registration)",
-                    ) {
-                        git_watchers.insert(ws_id.clone(), w);
-                    }
+                    );
                     skills.add_workspace(ws_id.clone(), path.clone());
                     specialists.add_workspace(ws_id, path);
                 }
                 WORKSPACE_DELETED | WORKSPACE_CLOSED => {
-                    if file_watchers.remove(&ws_id).is_some() {
-                        tracing::info!(workspace = %ws_id, "workspace file watcher stopped (runtime deregistration)");
-                    }
-                    if git_watchers.remove(&ws_id).is_some() {
-                        tracing::info!(workspace = %ws_id, "workspace git metadata watcher stopped (runtime deregistration)");
-                    }
+                    stop_watches(
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        "runtime deregistration",
+                    );
                     skills.remove_workspace(&ws_id);
                     specialists.remove_workspace(&ws_id);
                 }
+                // Archive/unarchive rides `workspace:updated` (§6.5 has no
+                // `workspace:archived`). Deltas without an `archived` key —
+                // the overwhelming majority — cost one JSON lookup and are
+                // ignored before any path resolution.
+                WORKSPACE_UPDATED => match archived_delta(&ev) {
+                    Some(true) => {
+                        stop_watches(
+                            &mut file_watchers,
+                            &mut git_watchers,
+                            &ws_id,
+                            "workspace archived",
+                        );
+                        skills.pause_workspace(&ws_id);
+                        specialists.pause_workspace(&ws_id);
+                    }
+                    Some(false) if file_watchers.contains_key(&ws_id) => {
+                        // Redundant `archived: false` (a `workspace.update`
+                        // restating the flag, or a double unarchive): the
+                        // watches are live, so replacing them would open a
+                        // brief event-loss window while the OS streams
+                        // restart, for no gain.
+                        tracing::debug!(workspace = %ws_id, "already watching; ignoring redundant unarchive delta");
+                    }
+                    Some(false) => {
+                        let Some(path) = resolve_path(&ev, services.as_ref()).await else {
+                            tracing::debug!(workspace = %ws_id, "unarchived workspace without resolvable path; not watching");
+                            continue;
+                        };
+                        start_watches(
+                            &bus,
+                            &refresher,
+                            &mut file_watchers,
+                            &mut git_watchers,
+                            &ws_id,
+                            &path,
+                            " (workspace unarchived)",
+                        );
+                        // Catch-up for the unwatched window: recompute the
+                        // derived state that missed `file:*`/`.git` events
+                        // would have refreshed. Cost is bounded to one pass
+                        // per workspace, but this is not a strict no-op for an
+                        // untouched workspace. The skills and specialists
+                        // flushes compare against the fingerprint each watcher
+                        // retained at pause and stay silent when nothing
+                        // moved; a workspace archived before daemon start has
+                        // no such baseline (boot seeds only unarchived
+                        // workspaces) and emits one benign extra event.
+                        // `GitStatusRefresher::trigger` always republishes
+                        // `changes:git-status` — it debounces and holds no
+                        // baseline, exactly as it does for any single `file:*`
+                        // event today.
+                        refresher.trigger(ws_id.clone());
+                        skills.resume_workspace(ws_id.clone(), path.clone());
+                        specialists.resume_workspace(ws_id, path);
+                    }
+                    None => {}
+                },
                 _ => {}
             }
         }
@@ -355,6 +467,18 @@ mod tests {
         }
     }
 
+    /// A `workspace:updated` event shaped exactly like the archive/unarchive
+    /// emitters in `lib.rs`: id-only payload plus the applied delta, no
+    /// workspace row (so the registry must resolve the path via the api).
+    fn archive_event(ws: &Workspace, archived: bool) -> NewEvent {
+        let mut ev = lifecycle_event(WORKSPACE_UPDATED, ws, false);
+        ev.data = serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "changes": { "archived": archived },
+        });
+        ev
+    }
+
     async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {
         let db = TempDb::new();
         let store = Store::open(&db.path).await.expect("open store");
@@ -491,6 +615,147 @@ mod tests {
         assert!(
             ev.is_some(),
             "reopened workspace must emit file events (path resolved via services)"
+        );
+    }
+
+    /// Regression: archiving a workspace must tear its watch roots down.
+    /// Before the fix only `workspace:deleted`/`workspace:closed` deregistered,
+    /// so every archived workspace leaked its FSEvents streams until restart.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let root = TempDir::new("archived");
+        let ws = test_workspace("ws-archived", &root.path);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let _registry = start_registry(&bus, api).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        std::fs::write(root.path.join("before-archive.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        assert!(ev.is_some(), "active workspace must emit file events");
+
+        // Archive: `workspace:updated` with `changes.archived = true`.
+        bus.publish(&archive_event(&ws, true))
+            .await
+            .expect("publish archived");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        std::fs::write(root.path.join("while-archived.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
+        assert!(
+            ev.is_none(),
+            "archived workspace must stop emitting file events, got {ev:?}"
+        );
+
+        // Unarchive: watching resumes (path resolved via the api, like
+        // `workspace:opened` — the delta carries no workspace row).
+        bus.publish(&archive_event(&ws, false))
+            .await
+            .expect("publish unarchived");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        std::fs::write(root.path.join("after-unarchive.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        assert!(
+            ev.is_some(),
+            "unarchived workspace must resume emitting file events"
+        );
+    }
+
+    /// A `workspace:updated` with no `archived` key (title rename, status
+    /// message, …) must not disturb the watch roots.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unrelated_workspace_update_leaves_watching_intact() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let root = TempDir::new("updated");
+        let ws = test_workspace("ws-updated", &root.path);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let _registry = start_registry(&bus, api).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let mut ev = lifecycle_event(WORKSPACE_UPDATED, &ws, false);
+        ev.data = serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "changes": { "title": "renamed" },
+        });
+        bus.publish(&ev).await.expect("publish updated");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        std::fs::write(root.path.join("after-update.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        assert!(
+            ev.is_some(),
+            "a non-archive workspace:updated must not stop file watching"
+        );
+    }
+
+    /// Unarchive catch-up: a git workspace whose `.git` changed while archived
+    /// must get a `changes:git-status` refresh even though no `.git` event was
+    /// observed during the unwatched window.
+    #[tokio::test]
+    async fn unarchive_triggers_git_status_catch_up_refresh() {
+        use git2::{Repository, Signature};
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let (_db, bus, _file_sub) = bus_and_sub().await;
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+
+        let root = TempDir::new("git-archived");
+        let repo = Repository::init(&root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+
+        let mut ws = test_workspace("ws-git-archived", &root.path);
+        ws.worktree_path = ws.path.clone();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let _registry = start_registry(&bus, api).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        bus.publish(&archive_event(&ws, true))
+            .await
+            .expect("publish archived");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Change git state while unwatched, then drain anything the archive
+        // transition itself may still have had in flight.
+        repo.set_head("refs/heads/other").unwrap();
+        let _ = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(3)).await;
+
+        bus.publish(&archive_event(&ws, false))
+            .await
+            .expect("publish unarchived");
+
+        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(10)).await;
+        assert!(
+            ev.is_some(),
+            "unarchive must trigger a catch-up git-status refresh"
         );
     }
 
