@@ -6005,13 +6005,31 @@ impl Services {
     /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
     /// behind `ws.agent.snapshot()` and the turn-prompt injection line
     /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
-    /// every field reads a per-agent registry or a bounded per-agent store
-    /// statement — no workspace-wide scans, no transcript hydration.
-    pub(crate) async fn build_agent_snapshot(&self, agent_id: &AgentId) -> Result<AgentSnapshot> {
-        let session = self.store.get_agent_session_summary(agent_id).await?;
-        let hooks = self.active_hooks_for_agent(agent_id).await.len();
+    /// every field reads a per-agent registry length or a bounded per-agent
+    /// count statement — no workspace-wide scans, no transcript or blob
+    /// hydration. `session` is the caller's already-fetched summary row so
+    /// the op path stays at one session read.
+    pub(crate) async fn build_agent_snapshot(
+        &self,
+        session: &AgentSession,
+    ) -> Result<AgentSnapshot> {
+        let agent_id = &session.id;
+        // Count-only aggregate: `active_hooks_for_agent` would hydrate every
+        // hook row the agent ever owned (code + lastState blobs included).
+        let hooks = self
+            .store
+            .count_active_hooks_by_agent(agent_id)
+            .await
+            .unwrap_or(0) as usize;
         let agent_watches = self.list_watches_for_parent(agent_id).len();
-        let queued_messages = self.queue_snapshot(agent_id).len();
+        // Length-only registry read: `queue_snapshot` materializes each
+        // entry's wire JSON (image/file blocks included) just to be counted.
+        let queued_messages = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map_or(0, |q| q.len());
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
         // Delegated children not yet settled: one aggregate statement over
         // the `parent_agent_id` index, unscoped by workspace so a Chief
@@ -6040,7 +6058,7 @@ impl Services {
             event_subscriptions,
             running_sub_agents,
             num_questions_asked,
-            pending_attention: session.attention_request_kind,
+            pending_attention: session.attention_request_kind.clone(),
         })
     }
 
@@ -6059,7 +6077,7 @@ impl Services {
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {agent_id}")));
         }
-        let snapshot = self.build_agent_snapshot(&agent_id).await?;
+        let snapshot = self.build_agent_snapshot(&session).await?;
         serde_json::to_value(&snapshot)
             .map_err(|e| Error::Internal(format!("serialize agent snapshot: {e}")))
     }
@@ -6076,7 +6094,8 @@ impl Services {
         if !self.effective_settings().agent_features.state_snapshot {
             return None;
         }
-        let snapshot = self.build_agent_snapshot(agent_id).await.ok()?;
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        let snapshot = self.build_agent_snapshot(&session).await.ok()?;
         if snapshot.is_trivial() {
             return None;
         }

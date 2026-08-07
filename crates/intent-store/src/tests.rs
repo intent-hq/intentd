@@ -5583,6 +5583,50 @@ async fn hook_list_filters_by_workspace_and_agent() {
     assert!(empty.is_empty());
 }
 
+/// `count_active_hooks_by_agent` counts only `scheduled`/`running` rows for
+/// the given agent — terminal rows and other agents' hooks are excluded, and
+/// an unknown agent counts zero.
+#[tokio::test]
+async fn hook_count_active_by_agent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+    let (ws_other, agent_other) = seed_hook_owner(&store).await;
+
+    let scheduled = sample_hook(&HookId("hook-sched".into()), &ws, &agent, "sched");
+    let mut running = sample_hook(&HookId("hook-run".into()), &ws, &agent, "run");
+    running.state = HookState::Running;
+    let mut done = sample_hook(&HookId("hook-done".into()), &ws, &agent, "done");
+    done.state = HookState::Dispatched;
+    let mut gone = sample_hook(&HookId("hook-gone".into()), &ws, &agent, "gone");
+    gone.state = HookState::Expired;
+    let foreign = sample_hook(
+        &HookId("hook-foreign".into()),
+        &ws_other,
+        &agent_other,
+        "foreign",
+    );
+    for h in [&scheduled, &running, &done, &gone, &foreign] {
+        store.insert_hook(h).await.expect("insert hook");
+    }
+
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&agent)
+            .await
+            .expect("count"),
+        2,
+        "scheduled + running only"
+    );
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&AgentId("agent-none".into()))
+            .await
+            .expect("count none"),
+        0
+    );
+}
+
 /// State transitions, run bookkeeping, and last-error updates persist; every
 /// updater maps an unknown id to `NotFound`.
 #[tokio::test]

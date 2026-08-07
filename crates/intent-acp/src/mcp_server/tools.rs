@@ -1674,6 +1674,10 @@ mod tests {
             denied_feature(&all_off, "agent.reportBlocker"),
             Some("agentFeatures.attentionRequests")
         );
+        // `ws.agent.snapshot()` is NEVER gated: `stateSnapshot` governs only
+        // the turn-prompt injection, so even a session created with the
+        // toggle already off keeps the tool callable.
+        assert_eq!(denied_feature(&all_off, "agent.snapshot"), None);
         // Un-gated namespaces pass even with everything off.
         assert_eq!(denied_feature(&all_off, "note.read"), None);
         assert_eq!(

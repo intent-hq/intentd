@@ -130,6 +130,24 @@ impl Store {
         rows.iter().map(hook_from_row).collect()
     }
 
+    /// Number of ACTIVE (`scheduled`/`running`) hooks owned by an agent —
+    /// a count-only aggregate for per-turn surfaces (the agent state
+    /// snapshot): no `code`/`last_state` blob hydration and no dependence on
+    /// how many terminal rows the agent has accumulated, unlike
+    /// [`Store::list_hooks_by_agent`] + in-memory filtering.
+    pub async fn count_active_hooks_by_agent(&self, agent_id: &AgentId) -> Result<u64> {
+        let n: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM hook \
+             WHERE agent_id = ? AND state IN ('scheduled', 'running')",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("count active hooks failed: {e}")))?
+        .get::<i64, _>("n");
+        Ok(n as u64)
+    }
+
     /// List all hooks owned by an agent, oldest first.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
