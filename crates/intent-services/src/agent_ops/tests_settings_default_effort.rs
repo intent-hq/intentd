@@ -55,18 +55,32 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
         .expect("apply setting");
 }
 
-/// Seed the auggie catalog so `fable-5` has effort evidence and `sonnet5`
+/// Seed a provider catalog so `fable-5` has effort evidence and `sonnet5`
 /// has none.
+///
+/// Both `auggie` and `mock` are seeded: the create-path tests never spawn, so
+/// they can name `auggie`, while the delegate-path tests resolve a *provider*
+/// and must use `mock` — its availability is gated purely on
+/// `MOCK_AGENT_SCRIPT_PATH` ([`EnvGuard`]), so they do not depend on a real
+/// ACP provider binary being installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
-    svc.models_catalog.store_for_test(
-        "auggie",
-        "",
-        vec![
-            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
-                    "effortLevels": ["low", "high"] }),
-            json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie" }),
-        ],
-    );
+    for provider in ["auggie", "mock"] {
+        svc.models_catalog.store_for_test(
+            provider,
+            "",
+            vec![
+                json!({ "id": "fable-5", "name": "Fable 5", "provider": provider,
+                        "effortLevels": ["low", "high"] }),
+                json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": provider }),
+            ],
+        );
+    }
+}
+
+/// Make the `mock` provider available for delegate-path tests, which resolve
+/// and validate a provider before creating the session.
+fn mock_provider_env() -> EnvGuard {
+    EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")])
 }
 
 fn write_specialist(dir: &std::path::Path, id: &str, extra_frontmatter: &str) {
@@ -217,15 +231,14 @@ async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
 async fn specialist_efforts_outrank_the_settings_default() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("mock:fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
-    set(&svc, "providers.active", json!("mock"));
-    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let _env = mock_provider_env();
     write_specialist(spec_dir.path(), "fm", "reasoningEffort: \"low\"\n");
     write_specialist(
         spec_dir.path(),
         "opt",
-        "model: \"auggie:fable-5\"\nmodelOptions:\n  - model: \"auggie:fable-5\"\n    reasoningEffort: \"low\"\n",
+        "model: \"mock:fable-5\"\nmodelOptions:\n  - model: \"mock:fable-5\"\n    reasoningEffort: \"low\"\n",
     );
 
     for spec in ["fm", "opt"] {
@@ -258,14 +271,13 @@ async fn specialist_efforts_outrank_the_settings_default() {
 async fn model_option_keyed_on_the_settings_default_model_is_selected() {
     let (_t, svc, ws, spec_dir, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("mock:fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
-    set(&svc, "providers.active", json!("mock"));
-    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let _env = mock_provider_env();
     write_specialist(
         spec_dir.path(),
         "unpinned",
-        "modelOptions:\n  - model: \"auggie:fable-5\"\n    reasoningEffort: \"low\"\n",
+        "modelOptions:\n  - model: \"mock:fable-5\"\n    reasoningEffort: \"low\"\n",
     );
 
     let resp = svc
@@ -411,8 +423,9 @@ async fn blank_settings_default_effort_leaves_the_session_unset() {
 async fn delegate_applies_the_settings_default_effort() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     seed_catalog(&svc);
-    set(&svc, "model.default", json!("auggie:fable-5"));
+    set(&svc, "model.default", json!("mock:fable-5"));
     set(&svc, "model.defaultReasoningEffort", json!("high"));
+    let _env = mock_provider_env();
 
     let resp = svc
         .agent_delegate_op(
