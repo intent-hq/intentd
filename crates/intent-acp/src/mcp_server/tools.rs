@@ -52,6 +52,10 @@ pub struct SpecialistModelOption {
 pub struct SpecialistModelOptions {
     /// Specialist id (the `specialist` param of delegate/create).
     pub specialist: String,
+    /// Compound id a no-`model` delegate would pin, as resolved by the same
+    /// resolver the `resolvedModel` preview uses; `None` when resolution
+    /// yields the provider CLI default.
+    pub default_model: Option<String>,
     /// Ordered options as authored in the winning tier's frontmatter.
     pub options: Vec<SpecialistModelOption>,
 }
@@ -258,8 +262,8 @@ API:
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
-  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
@@ -469,8 +473,8 @@ API:
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
-  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
@@ -819,7 +823,9 @@ pub fn workspace_api_description_with_model_options(
 }
 
 /// Render the injected continuation block: one header line plus one line per
-/// specialist listing its options as `` `<compound id>` (<hint>) `` entries
+/// specialist naming its resolved default (`` default `<compound id>` ``, or
+/// `default: provider default` when resolution yields the provider CLI
+/// default) followed by its options as `` `<compound id>` (<hint>) `` entries
 /// (the hint parenthetical is omitted when empty, and an option's declared
 /// reasoning effort is appended to it as `effort: <level>`). All lines are
 /// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
@@ -839,24 +845,24 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
         block.push_str("      ");
         block.push_str(&flat(&spec.specialist));
         block.push_str(": ");
-        let entries: Vec<String> = spec
-            .options
-            .iter()
-            .map(|o| {
-                let mut paren: Vec<String> = Vec::new();
-                if !o.hint.is_empty() {
-                    paren.push(flat(&o.hint));
-                }
-                if !o.reasoning_effort.is_empty() {
-                    paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
-                }
-                if paren.is_empty() {
-                    format!("`{}`", flat(&o.model))
-                } else {
-                    format!("`{}` ({})", flat(&o.model), paren.join("; "))
-                }
-            })
-            .collect();
+        let mut entries: Vec<String> = vec![match spec.default_model.as_deref() {
+            Some(m) => format!("default `{}`", flat(m)),
+            None => "default: provider default".to_string(),
+        }];
+        entries.extend(spec.options.iter().map(|o| {
+            let mut paren: Vec<String> = Vec::new();
+            if !o.hint.is_empty() {
+                paren.push(flat(&o.hint));
+            }
+            if !o.reasoning_effort.is_empty() {
+                paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
+            }
+            if paren.is_empty() {
+                format!("`{}`", flat(&o.model))
+            } else {
+                format!("`{}` ({})", flat(&o.model), paren.join("; "))
+            }
+        }));
         block.push_str(&entries.join(", "));
         block.push('\n');
     }
@@ -1704,6 +1710,7 @@ mod tests {
         vec![
             SpecialistModelOptions {
                 specialist: "implementor".to_string(),
+                default_model: Some("auggie:claude-opus-5".to_string()),
                 options: vec![
                     SpecialistModelOption {
                         model: "opencode:kimi-k3".to_string(),
@@ -1717,8 +1724,10 @@ mod tests {
                     },
                 ],
             },
+            // No resolved default → the provider CLI default label.
             SpecialistModelOptions {
                 specialist: "verifier".to_string(),
+                default_model: None,
                 options: vec![SpecialistModelOption {
                     model: "grok:grok-5".to_string(),
                     hint: "fast reviews".to_string(),
@@ -1749,9 +1758,9 @@ mod tests {
     }
 
     // Options are injected as continuation lines directly under the
-    // `ws.agent.delegate` doc entry: compound id + hint per specialist, the
-    // hint parenthetical omitted when empty, and the next method line
-    // (`ws.agent.send`) still follows.
+    // `ws.agent.delegate` doc entry: the resolved default first, then compound
+    // id + hint per specialist, the hint parenthetical omitted when empty, and
+    // the next method line (`ws.agent.send`) still follows.
     #[test]
     fn model_options_injected_into_delegate_docs() {
         let features = AgentFeaturesSettings::default();
@@ -1766,12 +1775,17 @@ mod tests {
                 "chief={is_chief}: header missing"
             );
             assert!(
-                got.contains("implementor: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+                got.contains(
+                    "implementor: default `auggie:claude-opus-5`, \
+                     `opencode:kimi-k3` (cheap), `auggie:opus`"
+                ),
                 "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
             );
+            // An unresolved default renders the provider-CLI-default label
+            // rather than a fabricated id.
             assert!(
-                got.contains("verifier: `grok:grok-5` (fast reviews)"),
-                "chief={is_chief}: verifier options line missing"
+                got.contains("verifier: default: provider default, `grok:grok-5` (fast reviews)"),
+                "chief={is_chief}: verifier options line missing/miswritten:\n{got}"
             );
             // The block sits between the delegate entry and the next method
             // line, i.e. inside the delegate docs.
@@ -1808,6 +1822,7 @@ mod tests {
     fn model_options_block_renders_per_option_effort() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
+            default_model: None,
             options: vec![
                 SpecialistModelOption {
                     model: "fable-5".to_string(),
@@ -1828,7 +1843,8 @@ mod tests {
         );
         assert!(
             got.contains(
-                "implementor: `fable-5` (hard tasks; effort: high), `sonnet5` (effort: low)"
+                "implementor: default: provider default, `fable-5` (hard tasks; effort: high), \
+                 `sonnet5` (effort: low)"
             ),
             "per-option effort not rendered:\n{got}"
         );
@@ -1846,7 +1862,7 @@ mod tests {
         let got = workspace_api_description_with_model_options(false, &features, &sample_options());
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
-            got.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
             "options block missing on a pruned description"
         );
     }
@@ -1857,6 +1873,7 @@ mod tests {
     fn model_options_flatten_multiline_hints() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
+            default_model: Some("auggie:claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
                 model: "opencode:kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),

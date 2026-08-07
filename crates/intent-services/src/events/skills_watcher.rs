@@ -49,9 +49,7 @@ impl SkillsWatcher {
         let mut user_watchers = Vec::new();
         let user_roots = get_user_skill_roots();
         for root in user_roots {
-            if let Ok(watcher) = watch_directory(root, None, raw_tx.clone()) {
-                user_watchers.push(watcher);
-            }
+            user_watchers.push(watch_directory(root, None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -87,6 +85,28 @@ impl SkillsWatcher {
         }
     }
 
+    /// Await every registered root watch actually being established. Watch
+    /// registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating the watched directories.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: Duration) {
+        for watch in &self._user_watchers {
+            watch.wait_established(timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_up = self
+                .workspace_watchers
+                .lock()
+                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
+                .unwrap_or(true);
+            if all_up || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watches and drop any pending flush so it stops emitting.
     pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
@@ -105,9 +125,11 @@ fn start_project_watchers(
 ) -> Vec<RootWatch> {
     let mut watchers = Vec::new();
     for root in get_project_skill_roots(workspace_path) {
-        if let Ok(watcher) = watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
-            watchers.push(watcher);
-        }
+        watchers.push(watch_directory(
+            root,
+            Some(workspace_id.clone()),
+            raw_tx.clone(),
+        ));
     }
     watchers
 }
@@ -132,7 +154,7 @@ fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SkillsMsg>,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     watch_root(root, is_skill_md, move || {
         let _ = tx.send(SkillsMsg::Change(workspace_id.clone()));
     })
@@ -402,9 +424,11 @@ mod tests {
         // before the SKILL.md is created, which under nextest's oversubscribed
         // parallelism a 250ms warm-up can lose.
         let watcher = SkillsWatcher::start(bus.clone(), vec![]);
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // A project-tier SKILL.md created after registration emits for the
