@@ -538,11 +538,14 @@ pub async fn discard_sandbox(
 }
 
 /// Preserve a conflicted sandbox's commits in the canonical repo: fetch the
-/// sandbox branch into canonical as a local branch of the same name
-/// (`sb/<agentId>`), forced, so the agent's entire output — including its
-/// non-conflicting files — stays recoverable with normal git tooling even if
-/// the sandbox directory is later lost. Ref-only (no checkout, canonical
-/// worktree untouched). Returns the recovery branch name.
+/// sandbox branch into canonical as a local
+/// `sb/<agentId>-recovery-<timestamp>` branch so the agent's entire output —
+/// including its non-conflicting files — stays recoverable with normal git
+/// tooling even if the sandbox directory is later lost. The unique suffix
+/// keeps each conflict's snapshot (a later bounce-and-reconcile cycle never
+/// clobbers an earlier one) and never collides with the sandbox's own
+/// `sb/<agentId>` merge branch. Ref-only (no checkout, canonical worktree
+/// untouched). Returns the recovery branch name.
 pub async fn push_conflict_recovery_branch(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -556,9 +559,16 @@ pub async fn push_conflict_recovery_branch(
     let canonical_path = resolve_user_directory(&workspace)?;
     let sandbox_path = sandbox.path.clone();
     let branch = sandbox.branch.clone();
+    // Ref-safe timestamp: now_iso's digits only (colons are illegal in refs).
+    let timestamp: String = now_iso()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(14)
+        .collect();
+    let recovery_branch = format!("{branch}-recovery-{timestamp}");
 
     tokio::task::spawn_blocking(move || {
-        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        let refspec = format!("+refs/heads/{branch}:refs/heads/{recovery_branch}");
         let out = std::process::Command::new("git")
             .arg("fetch")
             .arg("--no-tags")
@@ -576,7 +586,7 @@ pub async fn push_conflict_recovery_branch(
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
-        Ok(branch)
+        Ok(recovery_branch)
     })
     .await
     .map_err(|e| Error::Internal(format!("recovery branch task failed: {e}")))?

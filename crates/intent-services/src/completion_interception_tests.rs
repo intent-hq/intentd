@@ -860,13 +860,22 @@ mod tests {
         assert_eq!(sandbox.status, SandboxStatus::Conflict);
         assert_eq!(sandbox.conflicting_paths, vec!["file.txt".to_string()]);
 
-        // Assert: the sandbox's commits were preserved in canonical on the
-        // sb/<agentId> recovery branch (canonical worktree untouched).
+        // Assert: the sandbox's commits were preserved in canonical on a
+        // sb/<agentId>-recovery-<timestamp> branch (canonical worktree
+        // untouched).
         let canonical_repo = Repository::open(&repo_path).unwrap();
-        let recovery_ref = canonical_repo
-            .find_reference(&format!("refs/heads/sb/{}", child_id.0))
+        let recovery_prefix = format!("sb/{}-recovery-", child_id.0);
+        let recovery_tip = canonical_repo
+            .branches(Some(git2::BranchType::Local))
+            .unwrap()
+            .flatten()
+            .find_map(|(b, _)| {
+                let name = b.name().ok()??.to_string();
+                name.starts_with(&recovery_prefix)
+                    .then(|| b.get().peel_to_commit().ok())
+                    .flatten()
+            })
             .expect("recovery branch must exist in canonical");
-        let recovery_tip = recovery_ref.peel_to_commit().unwrap();
         assert_eq!(recovery_tip.message().unwrap_or(""), "Sandbox");
 
         // Clean up
@@ -1625,11 +1634,21 @@ mod tests {
             canonical_content, "canonical version",
             "Canonical must stay pristine on conflict"
         );
-        // Work preserved: recovery branch in canonical carries the sandbox tip.
-        let recovery_ref = canonical_repo
-            .find_reference(&format!("refs/heads/sb/{}", agent_id.0))
-            .expect("recovery branch must exist in canonical");
-        assert!(recovery_ref.peel_to_commit().is_ok());
+        // Work preserved: sb/<agentId>-recovery-<timestamp> branch in
+        // canonical carries the sandbox tip.
+        let recovery_prefix = format!("sb/{}-recovery-", agent_id.0);
+        let recovery_found = canonical_repo
+            .branches(Some(git2::BranchType::Local))
+            .unwrap()
+            .flatten()
+            .any(|(b, _)| {
+                b.name()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|n| n.starts_with(&recovery_prefix))
+                    && b.get().peel_to_commit().is_ok()
+            });
+        assert!(recovery_found, "recovery branch must exist in canonical");
 
         // Terminal rows leave the retry queue: the next sweep does not touch it.
         let summary2 = services.sweep_merge_pending_sandboxes().await;
