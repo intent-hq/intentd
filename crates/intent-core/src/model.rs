@@ -2977,6 +2977,15 @@ pub struct Hook {
     /// never expire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Perpetual hooks stay active after a dispatch (the owner is woken and
+    /// the hook returns to `scheduled`), running on their cadence until TTL
+    /// expiry, cancel, or eviction. `false` is the one-shot default.
+    #[serde(default)]
+    pub perpetual: bool,
+    /// How many runs signalled a dispatch. Always ≤ 1 for a one-shot hook;
+    /// perpetual hooks accumulate across fires.
+    #[serde(default)]
+    pub dispatch_count: i64,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that

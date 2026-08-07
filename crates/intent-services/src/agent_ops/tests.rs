@@ -10550,6 +10550,8 @@ async fn seed_active_hook(
         last_logs: None,
         last_state: None,
         expires_at: Some("2026-08-02T15:00:00Z".to_string()),
+        perpetual: false,
+        dispatch_count: 0,
     };
     svc.store().insert_hook(&hook).await.expect("insert hook");
     hook
