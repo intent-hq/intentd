@@ -3287,15 +3287,140 @@ async fn wss_agent_complete_once_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Write an executable stand-in for a non-auggie provider's ACP adapter: a
+/// shell wrapper that execs the deterministic `mock-acp-agent.mjs` fixture
+/// with `MOCK_AGENT_BEHAVIOR` pinned in the wrapper itself (never in the test
+/// process env, which parallel tests share). `behavior` is the fixture's JSON
+/// behavior document.
+#[cfg(unix)]
+fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = test_tempdir(&format!("intentd-wss-acp-{tag}-"));
+    let bin = dir.path().join("codex-acp");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\nMOCK_AGENT_BEHAVIOR='{behavior}' exec node {fixture:?} \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin)
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
-    // Provider-neutrality gate: with a non-auggie active provider,
-    // agent.completeOnce returns a typed `{ available: false, reason }`
-    // result instead of an error.
+async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() {
+    // Provider-neutral routing (§5.32): with codex as the effective default
+    // provider the daemon runs an EPHEMERAL ACP session (initialize →
+    // session/new → one session/prompt → reap) against the mock agent and
+    // returns the same `{ text }` envelope the auggie route does — the
+    // streamed reply cleaned by `cleanAgentMessage`.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping non-auggie completeOnce e2e: node not on PATH");
+        return;
+    }
+    let (_adapter_dir, bin) =
+        fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":48,"method":"agent.completeOnce","params":{"prompt":"slug for login fix"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 48);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "text": "fix-login-flow" }),
+        "the ACP route returns the §5.32 `{{ text }}` envelope, like the auggie route"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
+    // A RESOLVED adapter that dies before completing the turn is a hard
+    // -32603 (§5.32), not `{ available: false }` — the unavailable result is
+    // reserved for routing/resolution, and the reason is prefixed with the
+    // provider id. The daemon reaps the child on this path.
+    use std::os::unix::fs::PermissionsExt;
+    let adapter_dir = test_tempdir("intentd-wss-acp-dead-");
+    let bin = adapter_dir.path().join("codex-acp");
+    std::fs::write(&bin, "#!/bin/sh\nexit 9\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": bin.to_string_lossy() }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":49,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 49);
+    assert_eq!(resp["error"]["code"], -32603);
+    let data = resp["error"]["data"].as_str().unwrap_or_default();
+    assert!(data.starts_with("codex: "), "unexpected data: {data}");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
+    // The resolution tier of the gate: a one-shot-capable provider whose
+    // adapter resolves to nothing (no binary, no npx for the pinned fallback
+    // package) returns `{ available: false, reason }`, never an error.
+    // Environment-gated — npx or an installed codex-acp both make the launch
+    // resolvable, and neither can be hidden hermetically.
+    if intent_providers::find_npx().is_some()
+        || intent_providers::find_provider_binary("codex", "codex-acp", None).is_some()
+    {
+        eprintln!("skipping unresolvable-adapter e2e: npx or codex-acp is installed");
+        return;
+    }
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("codex"));
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":50,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 50);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "codex: no adapter could be resolved (binary not found and npx unavailable)"
+        })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_unavailable_when_provider_has_no_one_shot() {
+    // Routing gate: claude-code / codex / pi run the ephemeral ACP route, but
+    // a provider with no one-shot support returns a typed
+    // `{ available: false, reason }` result instead of an error.
     let (_auggie_dir, bin) = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    srv.set_setting("providers.active", serde_json::json!("opencode"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3308,7 +3433,7 @@ async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce requires auggie as the effective default provider"
+            "reason": "completeOnce is not supported for the effective default provider: opencode"
         })
     );
     srv.ws.stop().await;
@@ -3331,7 +3456,7 @@ async fn wss_agent_complete_once_unavailable_when_settings_unset() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce requires auggie as the effective default provider"
+            "reason": "completeOnce requires a decidable effective default provider"
         }),
         "unset provider settings resolve the gate closed, not open via the positional fallback"
     );
@@ -3346,9 +3471,10 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
     let (_auggie_dir, bin) = fake_auggie_script("prefix-complete", "printf '🤖\\nvia-prefix\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
 
-    // Direction 1: claude-code prefix outranks auggie active → gate closes.
+    // Direction 1: an opencode prefix (no one-shot route) outranks auggie
+    // active → the auggie CLI path is not taken.
     srv.set_setting("providers.active", serde_json::json!("auggie"));
-    srv.set_setting("model.default", serde_json::json!("claude-code:sonnet4.5"));
+    srv.set_setting("model.default", serde_json::json!("opencode:some-model"));
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3360,13 +3486,13 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "completeOnce requires auggie as the effective default provider"
+            "reason": "completeOnce is not supported for the effective default provider: opencode"
         }),
         "non-auggie model.default prefix outranks auggie providers.active"
     );
 
-    // Direction 2: auggie prefix outranks claude-code active → gate passes.
-    srv.set_setting("providers.active", serde_json::json!("claude-code"));
+    // Direction 2: auggie prefix outranks a non-auggie active provider.
+    srv.set_setting("providers.active", serde_json::json!("opencode"));
     srv.set_setting("model.default", serde_json::json!("auggie:sonnet4.5"));
     let resp = wss_call(
         srv.port,
