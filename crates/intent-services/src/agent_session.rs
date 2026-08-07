@@ -2258,9 +2258,11 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
-        // Same clamped per-turn delta, folded into the per-minute rate
-        // history behind `stats.getRateHistory` (§5.39). All-zero deltas are
-        // skipped — they add nothing and would only churn the capped table.
+        // Same clamped per-turn delta, spread evenly across every per-minute
+        // bucket the turn spanned in `stats.getRateHistory` (§5.39) so a
+        // multi-minute turn reads as a plateau rather than a lone end-minute
+        // spike. All-zero deltas (and all-zero split parts) are skipped — they
+        // add nothing and would only churn the capped table.
         let rate_delta = intent_store::UsageRateDelta {
             input_tokens: tokens.input_tokens,
             output_tokens: tokens.output_tokens,
@@ -2268,9 +2270,15 @@ impl Services {
             cache_creation_tokens: tokens.cache_creation_tokens,
         };
         if !rate_delta.is_zero() {
-            let minute = crate::usage_rate::minute_bucket_utc(now);
-            if let Err(e) = self.store.add_usage_rate(&minute, &rate_delta).await {
-                tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+            for (bucket, part) in
+                crate::usage_rate::split_delta_across_minutes(now, turn_duration, &rate_delta)
+            {
+                if part.is_zero() {
+                    continue;
+                }
+                if let Err(e) = self.store.add_usage_rate(&bucket, &part).await {
+                    tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+                }
             }
         }
     }
