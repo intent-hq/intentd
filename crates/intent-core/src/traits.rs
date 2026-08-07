@@ -981,6 +981,10 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.markAsTask`: attach/replace task metadata on a note (PROTOCOL §5.4).
+    ///
+    /// `caller_agent_id` attributes the resulting `task:created` /
+    /// `task:status-changed` event to the invoking agent (the MCP front door
+    /// passes it); `None` → system-attributed.
     fn mark_as_task(
         &self,
         workspace_id: WorkspaceId,
@@ -988,8 +992,16 @@ pub trait WorkspaceApi: Send + Sync {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
-        let _ = (workspace_id, note_id, status, acceptance_criteria, effort);
+        let _ = (
+            workspace_id,
+            note_id,
+            status,
+            acceptance_criteria,
+            effort,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mark_as_task not implemented".to_string(),
@@ -1017,6 +1029,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.createPrerequisite`: create a child task note (PROTOCOL §5.4).
+    ///
+    /// `caller_agent_id` attributes the child's `task:created` event to the
+    /// invoking agent (the MCP front door passes it); `None` → system.
     fn create_prerequisite(
         &self,
         workspace_id: WorkspaceId,
@@ -1024,8 +1039,16 @@ pub trait WorkspaceApi: Send + Sync {
         title: String,
         content: Option<String>,
         status: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
-        let _ = (workspace_id, dependent_note_id, title, content, status);
+        let _ = (
+            workspace_id,
+            dependent_note_id,
+            title,
+            content,
+            status,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_prerequisite not implemented".to_string(),

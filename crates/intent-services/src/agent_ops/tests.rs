@@ -4486,6 +4486,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
         "in_progress".into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("markAsTask");
@@ -4541,9 +4542,16 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
         )
         .await
         .expect("create note");
-    svc.mark_as_task(ws.clone(), note.id.clone(), "complete".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "complete".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
 
     let created = svc
         .agent_create_op(
@@ -4606,6 +4614,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         note.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -4804,6 +4813,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
         foreign.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -14408,6 +14418,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
         "not_started".into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("markAsTask");
@@ -18644,6 +18655,7 @@ async fn link_task_note(
         note.id.clone(),
         status.into(),
         vec![],
+        None,
         None,
     )
     .await
