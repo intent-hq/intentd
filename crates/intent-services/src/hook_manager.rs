@@ -15,7 +15,10 @@
 //! the
 //! contract: `{ dispatch: true, message }` wakes the owning agent (queued
 //! behind an in-flight turn via the automatic-delivery `agent.sendMessage`
-//! path) and terminates the hook; `{ dispatch: false }` / `undefined` sleeps
+//! path) and terminates the hook — unless the hook is `perpetual`, in which
+//! case it counts the fire (`dispatch_count`) and returns to `scheduled`,
+//! running on its cadence until TTL expiry, cancel, or eviction;
+//! `{ dispatch: false }` / `undefined` sleeps
 //! `delayMs` and re-runs; a throw or timeout evicts the hook, persists
 //! `last_error`, emits `hook:evicted`, and wakes the owner with the reason.
 //! Scripts may call `console.log/info/warn/error`; the last run's captured
@@ -105,7 +108,8 @@ enum RunOutcome {
         logs: Option<String>,
         state: StateUpdate,
     },
-    /// `{ dispatch: true, message }` — wake the owner, terminate the hook.
+    /// `{ dispatch: true, message }` — wake the owner; terminates the hook
+    /// unless it is perpetual, which stays scheduled.
     Dispatch {
         message: String,
         logs: Option<String>,
@@ -416,7 +420,8 @@ fn waiting_on_hooks_entry(h: Hook) -> Value {
 
 impl Services {
     /// `hook.schedule`: validate, run the script once immediately (a real run
-    /// — a dispatch wakes the owner and never persists a schedule; a failure
+    /// — a dispatch wakes the owner and, for a one-shot hook, never persists
+    /// a schedule; a perpetual hook persists and schedules anyway; a failure
     /// rejects the call), then persist the hook and spawn its scheduler task.
     /// Rejected outright when `agentFeatures.backgroundHooks` is off (services
     /// layer defense in depth behind the MCP dispatch deny); already-active
@@ -462,6 +467,11 @@ impl Services {
         // TTL (spec: 60-minute cap): optional `ttlMs`, clamped — never
         // rejected — into [10s, 60min]; omitted takes the 60-minute default.
         let ttl_ms = clamp_ttl_ms(params.get("ttlMs").and_then(Value::as_i64));
+        // Perpetual hooks survive a dispatch; omitted defaults to one-shot.
+        let perpetual = params
+            .get("perpetual")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // Per-agent cap on active hooks (`[hooks] maxPerAgent`).
         let cap = self.hooks_max_per_agent as usize;
         let active = self
@@ -499,6 +509,8 @@ impl Services {
             last_logs: None,
             last_state: None,
             expires_at: Some(expires_at),
+            perpetual,
+            dispatch_count: 0,
         };
 
         // Validation run (spec decision 4): a REAL run, before anything
@@ -517,11 +529,31 @@ impl Services {
                 state,
             } => {
                 let mut hook = hook;
-                hook.state = HookState::Dispatched;
                 hook.last_run_at = Some(now_iso());
                 hook.run_count = 1;
                 hook.last_logs = logs;
                 state.apply(&mut hook);
+                // Perpetual (spec decision 4b): a dispatching validation run
+                // wakes the owner AND persists the ACTIVE schedule — unlike
+                // one-shot, where the hook never schedules.
+                if hook.perpetual {
+                    hook.dispatch_count = 1;
+                    hook.state = HookState::Scheduled;
+                    hook.next_run_at = Some(next_run_at_iso(delay_ms));
+                    self.store.insert_hook(&hook).await?;
+                    self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
+                    let message = with_wake_logs(&message, hook.last_logs.as_deref());
+                    self.wake_hook_owner(&hook, &message, "dispatched").await;
+                    self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
+                    self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
+                        .await;
+                    self.spawn_hook_task(hook.clone());
+                    // A newly persisted active hook can promote the derived
+                    // displayStatus to `in_progress` (§6.5).
+                    self.maybe_emit_display_status_changed(workspace_id).await;
+                    return Ok(json!({ "hook": hook, "dispatched": true }));
+                }
+                hook.state = HookState::Dispatched;
                 self.store.insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
@@ -1082,6 +1114,47 @@ impl Services {
                     .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                     .await?;
                 self.persist_hook_state(hook, state).await?;
+                // A perpetual hook survives its own dispatch: count the fire,
+                // wake the owner, then return to `scheduled` and keep the
+                // loop alive. `hook:dispatched` is non-terminal here and may
+                // fire once per cadence tick.
+                if hook.perpetual {
+                    self.store
+                        .increment_hook_dispatch_count(&hook.hook_id)
+                        .await?;
+                    hook.last_run_at = Some(last_run_at);
+                    hook.next_run_at = None;
+                    hook.run_count += 1;
+                    hook.dispatch_count += 1;
+                    hook.last_logs = logs;
+                    self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
+                    let message = with_wake_logs(&message, hook.last_logs.as_deref());
+                    self.wake_hook_owner(hook, &message, "dispatched").await;
+                    self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
+                    // In-flight-run-at-expiry: the dispatch still wins (the
+                    // owner was woken above), but a fire at/after `expiresAt`
+                    // expires the hook instead of rescheduling it.
+                    if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
+                        self.store
+                            .update_hook_state(&hook.hook_id, HookState::Expired)
+                            .await?;
+                        hook.state = HookState::Expired;
+                        self.finish_expiry(hook).await;
+                        return Ok(false);
+                    }
+                    let next_run_at = next_run_at_iso(hook.delay_ms);
+                    self.store
+                        .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
+                        .await?;
+                    self.store
+                        .update_hook_state(&hook.hook_id, HookState::Scheduled)
+                        .await?;
+                    hook.state = HookState::Scheduled;
+                    hook.next_run_at = Some(next_run_at.clone());
+                    self.emit_hook_event(HOOK_SCHEDULED, hook, Some(next_run_at))
+                        .await;
+                    return Ok(true);
+                }
                 self.store
                     .update_hook_state(&hook.hook_id, HookState::Dispatched)
                     .await?;
@@ -1237,16 +1310,31 @@ impl Services {
     /// shape parity with `hook:cancelled`) and wake the owner so the model
     /// can consciously reschedule. The wake names the hook, its run count,
     /// and the reschedule option, with `[hook logs]` per the existing wake
-    /// conventions (`reason: "expired"` in messageMetadata).
+    /// conventions (`reason: "expired"` in messageMetadata). A perpetual
+    /// hook may have fired repeatedly before expiring, so its notice reports
+    /// runs AND dispatches instead of "without a dispatch".
     async fn finish_expiry(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
+        let plural = |n: i64| if n == 1 { "" } else { "s" };
+        let tally = if hook.perpetual {
+            format!(
+                "{} run{}, {} dispatch{}",
+                hook.run_count,
+                plural(hook.run_count),
+                hook.dispatch_count,
+                if hook.dispatch_count == 1 { "" } else { "es" }
+            )
+        } else {
+            format!(
+                "{} run{} completed without a dispatch",
+                hook.run_count,
+                plural(hook.run_count)
+            )
+        };
         let notice = format!(
-            "Your background hook \"{}\" expired after reaching its TTL ({} run{} completed \
-             without a dispatch). Schedule a new hook via ws.hook.schedule if the condition \
-             is still worth watching.",
+            "Your background hook \"{}\" expired after reaching its TTL ({tally}). Schedule a \
+             new hook via ws.hook.schedule if the condition is still worth watching.",
             hook.name,
-            hook.run_count,
-            if hook.run_count == 1 { "" } else { "s" }
         );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
@@ -1284,11 +1372,13 @@ impl Services {
     /// deferred completion watches (a successful wake makes the backstop a
     /// no-op — the queued/running wake turn owns the settlement).
     ///
-    /// `dispatched` / `evicted` wakes additionally end with a terminal-state
-    /// note (after any `[hook logs]` section) telling the owner the hook is
+    /// `dispatched` / `evicted` wakes additionally end with a state note
+    /// (after any `[hook logs]` section) telling the owner the hook is
     /// retired and will not run again, with a reschedule pointer — the
     /// expiry notice states this explicitly in its own wording, and
-    /// cancellation implies it.
+    /// cancellation implies it. A PERPETUAL dispatch is the one non-terminal
+    /// wake: its note states both facts — the hook fired, and it stays active
+    /// on its cadence until `expiresAt` — with a `ws.hook.cancel` pointer.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
         let metadata = json!({
             "type": "hook_wake",
@@ -1296,22 +1386,33 @@ impl Services {
             "hookName": hook.name,
             "reason": reason,
         });
-        let terminal_note = match reason {
+        let state_note = match reason {
+            "dispatched" if hook.perpetual => Some(format!(
+                "[This hook has now fired, and it is PERPETUAL — it remains active and \
+                 will keep running on its cadence until its TTL{}. Cancel it via \
+                 ws.hook.cancel if you no longer need this watch.]",
+                hook.expires_at
+                    .as_deref()
+                    .map(|e| format!(" (expiresAt {e})"))
+                    .unwrap_or_default()
+            )),
             "dispatched" => Some(
                 "[This hook has now fired and is retired — it will not run again. \
                  Schedule a new hook via ws.hook.schedule if you still need to watch \
-                 this condition.]",
+                 this condition.]"
+                    .to_string(),
             ),
             "evicted" => Some(
                 "[This hook will not run again. Schedule a new hook via \
-                 ws.hook.schedule if the condition is still worth watching.]",
+                 ws.hook.schedule if the condition is still worth watching.]"
+                    .to_string(),
             ),
             _ => None,
         };
         let mut content = format!("[Background hook \"{}\"] {message}", hook.name);
-        if let Some(note) = terminal_note {
+        if let Some(note) = state_note {
             content.push_str("\n\n");
-            content.push_str(note);
+            content.push_str(&note);
         }
         if let Err(e) = self
             .deliver_wake_message(
@@ -1663,6 +1764,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_persists_perpetual_flag_and_defaults() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                    "perpetual": true,
+                }),
+            )
+            .await
+            .expect("schedule perpetual");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(hook.perpetual);
+        assert_eq!(hook.dispatch_count, 0);
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert!(stored.perpetual);
+        // `hook.list` carries both fields (camelCase).
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let hooks = listed["hooks"].as_array().unwrap();
+        assert_eq!(hooks[0]["perpetual"], json!(true));
+        assert_eq!(hooks[0]["dispatchCount"], json!(0));
+
+        // Omitting `perpetual` keeps the one-shot default.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "one-shot",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule one-shot");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(!hook.perpetual);
+        assert!(!svc.store().get_hook(&hook.hook_id).await.unwrap().perpetual);
+    }
+
+    #[tokio::test]
     async fn schedule_runs_immediately_and_registers_task() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         let out = svc
@@ -1795,6 +1941,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perpetual_schedule_time_dispatch_persists_active_schedule() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "perpetual-now",
+                    "code": "return { dispatch: true, message: 'fired at once' };",
+                    "delayMs": 10_000,
+                    "perpetual": true,
+                }),
+            )
+            .await
+            .expect("schedule perpetual dispatcher");
+        // Unlike one-shot, a dispatching validation run still schedules.
+        assert_eq!(out["dispatched"], json!(true));
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.state, HookState::Scheduled);
+        assert!(hook.next_run_at.is_some(), "nextRunAt persisted");
+        assert_eq!(hook.dispatch_count, 1);
+        assert!(svc.hook_task_alive(&hook.hook_id), "task spawned");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Scheduled);
+        assert_eq!(stored.dispatch_count, 1);
+        // The wake states BOTH facts: it fired, and it stays active to TTL.
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let last = session.messages.last().expect("wake message persisted");
+        let text = serde_json::to_string(&last.content).unwrap();
+        assert!(text.contains("fired at once"), "{text}");
+        assert!(text.contains("has now fired"), "{text}");
+        assert!(text.contains("PERPETUAL"), "{text}");
+        assert!(text.contains("remains active"), "{text}");
+        assert!(text.contains("expiresAt"), "{text}");
+        assert!(text.contains("ws.hook.cancel"), "{text}");
+        // Never the one-shot retirement wording.
+        assert!(!text.contains("is retired"), "{text}");
+        let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_SCHEDULED]).await;
+        assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
+    }
+
+    #[tokio::test]
+    async fn perpetual_dispatch_reschedules_and_counts_each_fire() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // The validation run sees "wait" and continues; flipping the note to
+        // "go" makes every subsequent `runNow` dispatch — a perpetual hook
+        // must survive each one.
+        let mut probe = note(&ws, "perp-note", "wait");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "perp-watch",
+                    "code": "const n = await ws.note.read('perp-note'); \
+                             if (n.content.includes('go')) { \
+                               return { dispatch: true, message: 'still green' }; \
+                             } \
+                             return { dispatch: false };",
+                    "delayMs": 10_000,
+                    "perpetual": true,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.state, HookState::Scheduled);
+        assert_eq!(hook.dispatch_count, 0);
+        probe.content = "go".to_string();
+        svc.store().update_note(&probe).await.unwrap();
+
+        for fire in 1..=2 {
+            svc.hook_run_now_op(&ws, &hook.hook_id)
+                .await
+                .expect("runNow");
+            // Each fire counts, then returns the hook to an active,
+            // rescheduled state with its task still alive.
+            wait_for_hook(&svc, &hook.hook_id, |h| h.dispatch_count == fire).await;
+            let h = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Scheduled).await;
+            assert_eq!(h.run_count, fire + 1, "validation run plus {fire} fires");
+            assert!(h.next_run_at.is_some(), "fresh nextRunAt after fire {fire}");
+            assert!(svc.hook_task_alive(&hook.hook_id), "task alive after fire");
+        }
+        let text = wait_for_wake(&svc, &owner, "still green").await;
+        assert!(text.contains("remains active"), "{text}");
+        assert!(!text.contains("is retired"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn perpetual_dispatch_at_expiry_wakes_then_expires() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Same clock choreography as `in_flight_dispatch_at_expiry_still_wins`:
+        // the dispatch wins (owner woken, dispatch counted), but a perpetual
+        // fire at/after `expiresAt` expires instead of rescheduling.
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
+        let mut gate = note(&ws, "perp-exp-gate", "wait");
+        svc.store().insert_note(&gate).await.unwrap();
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "perp-slow-dispatch".to_string(),
+            code: "for (;;) { \
+                     const n = await ws.note.read('perp-exp-gate'); \
+                     if (n.content.includes('go')) { \
+                       return { dispatch: true, message: 'last gasp' }; \
+                     } \
+                   }"
+            .to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(60_000)),
+            perpetual: true,
+            dispatch_count: 0,
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        gate.content = "go".to_string();
+        svc.store().update_note(&gate).await.unwrap();
+        let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(expired.run_count, 1);
+        assert_eq!(expired.dispatch_count, 1, "the fire still counted");
+        assert!(expired.next_run_at.is_none(), "no reschedule after expiry");
+        // The dispatch wake landed, then the expiry notice.
+        wait_for_wake(&svc, &owner, "last gasp").await;
+        let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
+        // Perpetual expiry reports runs AND dispatches.
+        assert!(text.contains("1 run, 1 dispatch"), "{text}");
+        assert!(!text.contains("without a dispatch"), "{text}");
+        let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_EXPIRED]).await;
+        assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
+        assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
+        // Task deregistered after the terminal outcome.
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        while svc.hook_task_alive(&hook.hook_id) {
+            assert!(std::time::Instant::now() < deadline, "task not removed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn schedule_rejects_when_first_run_throws() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         let err = svc
@@ -1914,6 +2216,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -1951,6 +2255,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -2504,6 +2810,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         let scheduled = mk("sched", HookState::Scheduled, &owner);
         let running = mk("mid-run", HookState::Running, &owner);
@@ -2678,6 +2986,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -2901,6 +3211,8 @@ mod tests {
             last_logs: None,
             last_state: Some("{\"n\":7}".to_string()),
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -2976,6 +3288,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -3117,6 +3431,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(300)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -3165,6 +3481,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(60_000)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         // Skewed past the deadline before rehydration: the boot pass expires
@@ -3216,6 +3534,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(60_000)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -3276,6 +3596,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(next_run_at_iso(60_000)),
+            perpetual: false,
+            dispatch_count: 0,
         };
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
@@ -3316,6 +3638,8 @@ mod tests {
             last_logs: None,
             last_state: None,
             expires_at: Some(expires_at),
+            perpetual: false,
+            dispatch_count: 0,
         };
         // Expired while the daemon was down vs. still inside its TTL.
         let stale = mk("stale", next_run_at_iso(-60_000));
