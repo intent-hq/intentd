@@ -1691,7 +1691,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
-    /// cache (5-minute TTL, version-keyed), returning
+    /// cache (version-keyed, served indefinitely; a probe runs only on a
+    /// miss or forced read), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(
