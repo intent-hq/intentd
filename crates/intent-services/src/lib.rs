@@ -11898,6 +11898,12 @@ impl WorkspaceApi for Services {
             // baseline so the in-memory map does not leak for the daemon's
             // lifetime (and a same-id recreate seeds fresh).
             services.evict_display_status_baseline(&id);
+            // Same for the cached git status: a dirty repo's `files` vec is
+            // unbounded, so the deleted worktree's last scan must not be
+            // retained for the daemon's lifetime (monorepo#1648).
+            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
+                services.git_status_cache.evict(&worktree);
+            }
             // Fast-ack: the client receives `{ success: true }` here while the
             // worktree and workspace-directory cleanup proceeds asynchronously
             // in the background. Bounded latency regardless of checkout size

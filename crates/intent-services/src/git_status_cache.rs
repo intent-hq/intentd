@@ -92,10 +92,24 @@ impl GitStatusCache {
     /// the pre-change snapshot it is about to produce.
     pub fn invalidate(&self, worktree: &Path) {
         let key = git_status_singleflight::status_key(worktree);
-        let mut slots = self.slots.lock().unwrap();
-        let slot = slots.entry(key).or_default();
-        slot.generation = slot.generation.wrapping_add(1);
-        slot.cached = None;
+        // `get_mut`, not `entry().or_default()`: with no slot there is nothing
+        // cached and no in-flight store to guard against — `get` creates the
+        // slot before a scan starts, so every leader already has one. Avoids
+        // allocating for paths that are only ever mutated, never read (the
+        // `git.pull` invalidation runs against arbitrary repo paths, including
+        // ones with no workspace row).
+        if let Some(slot) = self.slots.lock().unwrap().get_mut(&key) {
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.cached = None;
+        }
+    }
+
+    /// Drop the slot for `worktree` entirely — for a worktree that is going
+    /// away (workspace deletion), where [`Self::invalidate`] would keep an
+    /// empty slot around forever.
+    pub fn evict(&self, worktree: &Path) {
+        let key = git_status_singleflight::status_key(worktree);
+        self.slots.lock().unwrap().remove(&key);
     }
 
     /// The current status for `worktree`: the cached value when one is live,
@@ -229,5 +243,39 @@ impl GitStatusCache {
     pub(crate) fn waiters(&self, worktree: &Path) -> usize {
         self.flights
             .waiters(&git_status_singleflight::status_key(worktree))
+    }
+
+    /// Test seam: number of slots currently held.
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invalidating a path that was never read allocates nothing — mutation
+    /// paths run against arbitrary repo paths (`git.pull` before a workspace
+    /// row exists).
+    #[test]
+    fn invalidating_an_unread_path_allocates_no_slot() {
+        let cache = GitStatusCache::new();
+        cache.invalidate(Path::new("/tmp/intentd-never-read"));
+        assert_eq!(cache.slot_count(), 0);
+    }
+
+    /// Eviction drops the slot outright, so a deleted worktree's last scan is
+    /// not retained for the daemon's lifetime.
+    #[test]
+    fn evict_drops_the_slot() {
+        let cache = GitStatusCache::new();
+        let path = Path::new("/tmp/intentd-evict-me");
+        let key = git_status_singleflight::status_key(path);
+        cache.slots.lock().unwrap().entry(key).or_default();
+        assert_eq!(cache.slot_count(), 1);
+        cache.evict(path);
+        assert_eq!(cache.slot_count(), 0);
     }
 }
