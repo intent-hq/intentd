@@ -10802,11 +10802,11 @@ async fn external_hook_cancel_settles_deferred_watch() {
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 
-    // FE cancels the hook (by_owner = false). In this store-only wiring the
+    // FE cancels the hook (no agent caller). In this store-only wiring the
     // owner wake persists directly (no runtime turn), so the terminal-
     // transition backstop synthesizes the child's completion and the
     // deferred watch fires.
-    svc.hook_cancel_op(&ws, &hook.hook_id, false)
+    svc.hook_cancel_op(&ws, &hook.hook_id, None)
         .await
         .expect("cancel hook");
     assert!(

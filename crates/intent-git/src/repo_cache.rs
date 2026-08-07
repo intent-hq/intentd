@@ -257,10 +257,10 @@ where
 /// 2. Copy the cache's remote-tracking refs (`refs/remotes/origin/*`, the
 ///    GitHub branches) into the clone so `base_ref` resolution sees every
 ///    upstream branch, not just the cache's default.
-/// 3. Retarget `origin` from the cache path to `origin_url` (the real GitHub
-///    URL), so pushes/fetches in the checkout never touch the cache.
-/// 4. Create + check out `branch` from `base_ref` (same resolution and
+/// 3. Create + check out `branch` from `base_ref` (same resolution and
 ///    branch-reuse semantics as the CoW checkout path) and hard-reset to it.
+/// 4. Retarget `origin` from the cache path to `origin_url` (the real GitHub
+///    URL), so pushes/fetches in the checkout never touch the cache.
 ///
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
@@ -269,6 +269,42 @@ pub fn provision_direct_checkout(
     cache_path: &Path,
     checkout_path: &Path,
     origin_url: &str,
+    branch: &str,
+    base_ref: Option<&str>,
+) -> Result<String> {
+    provision_plain_clone_checkout(
+        cache_path,
+        checkout_path,
+        OriginTarget::Url(origin_url),
+        branch,
+        base_ref,
+    )
+}
+
+/// What the provisioned clone's `origin` remote must point at once the local
+/// clone has served its purpose as the object source. Either way the clone
+/// never keeps a reference to `source_path`.
+pub(crate) enum OriginTarget<'a> {
+    /// Retarget `origin` at this URL (the real upstream).
+    Url(&'a str),
+    /// Drop the `origin` remote: the source has no upstream of its own, so
+    /// leaving the clone's `origin` in place would pin it to the source path.
+    Remove,
+}
+
+/// Shared body of the standalone plain-clone provisioners: local `git clone`
+/// of `source_path`, overlay of the source's remote-tracking refs, branch +
+/// checkout + hard reset, then `origin` retargeted per `origin`. The origin
+/// step runs last because [`OriginTarget::Remove`] drops the remote's
+/// tracking refs along with it, and `base_ref` resolution needs them.
+///
+/// Returns the SHA the checkout lands on. On failure after the clone, the
+/// partially provisioned `checkout_path` is removed best-effort. Blocking —
+/// callers run it on the blocking pool.
+pub(crate) fn provision_plain_clone_checkout(
+    source_path: &Path,
+    checkout_path: &Path,
+    origin: OriginTarget<'_>,
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {
@@ -285,14 +321,14 @@ pub fn provision_direct_checkout(
     let args: Vec<&std::ffi::OsStr> = vec![
         "clone".as_ref(),
         "--".as_ref(),
-        cache_path.as_os_str(),
+        source_path.as_os_str(),
         dir_name,
     ];
     run_git_os(parent, &args, None, CACHE_CLONE_TIMEOUT)?;
     (|| {
-        // The local clone only maps the cache's refs/heads/* (its default
-        // branch) into refs/remotes/origin/*; overlay the cache's own
-        // remote-tracking refs so every GitHub branch resolves as a base ref.
+        // The local clone only maps the source's refs/heads/* into
+        // refs/remotes/origin/*; overlay the source's own remote-tracking refs
+        // so every upstream branch resolves as a base ref.
         run_git(
             checkout_path,
             &[
@@ -303,11 +339,14 @@ pub fn provision_direct_checkout(
             None,
             CACHE_FETCH_TIMEOUT,
         )?;
+        let sha =
+            crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
-        repo.remote_set_url("origin", origin_url)
-            .map_err(map_git_err)?;
-        drop(repo);
-        crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")
+        match origin {
+            OriginTarget::Url(url) => repo.remote_set_url("origin", url).map_err(map_git_err)?,
+            OriginTarget::Remove => repo.remote_delete("origin").map_err(map_git_err)?,
+        }
+        Ok(sha)
     })()
     .inspect_err(|_| {
         let _ = std::fs::remove_dir_all(checkout_path);

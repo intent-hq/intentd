@@ -829,7 +829,18 @@ impl Services {
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
-    /// per-agent `workspace_api` tool description at bridge creation.
+    /// per-agent `workspace_api` tool description at bridge creation. Each
+    /// listed specialist also carries the default a no-`model`
+    /// `agent.delegate` would pin, computed by
+    /// [`agent_ops::resolve_agent_default_model`] against the *same*
+    /// per-specialist provider [`agent_ops::resolve_delegate_provider_preview`]
+    /// resolves (mirroring [`agent_ops::resolve_delegate_provider`], the
+    /// provider `agent.delegate` itself spawns on) — not a single
+    /// settings-derived provider shared across every specialist, so a
+    /// specialist pinned to another provider (frontmatter `codingAgent` or a
+    /// compound `model` prefix) still shows the default it actually pins.
+    /// `is_background = true` matches `agent.delegate` always marking its
+    /// children background, so `backgroundAgents.*` settings apply here too.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -871,8 +882,17 @@ impl Services {
                 if options.is_empty() {
                     return None;
                 }
+                let provider =
+                    agent_ops::resolve_delegate_provider_preview(self, Some(id), workspace_path);
                 Some(intent_acp::SpecialistModelOptions {
                     specialist: id.to_string(),
+                    default_model: agent_ops::resolve_agent_default_model(
+                        self,
+                        Some(id),
+                        workspace_path,
+                        Some(&provider),
+                        true,
+                    ),
                     options,
                 })
             })
@@ -5948,6 +5968,31 @@ fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
 /// dir holding any content is never touched; errors are ignored.
 fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
+}
+
+/// Drop the `repositoryPath` a `workspace.duplicate` of a **standalone**
+/// source copied from the source row, after checkout provisioning failed
+/// (intent-hq/monorepo#1560).
+///
+/// On success the duplicate's `repositoryPath` is repointed at its own
+/// checkout, because for a standalone source that value is the *source's*
+/// checkout directory. Without a checkout there is nothing to repoint it at,
+/// and leaving the copied value would have the worktree-less duplicate row
+/// reference a directory that dangles once the source workspace is deleted —
+/// the metadata echo of the live-reference bug. `repositoryName` is kept so
+/// the row still identifies its repo; the FE's "continue without worktree"
+/// path treats the missing path as "not provisioned yet".
+fn clear_standalone_repository_path(ws: &mut Workspace, source_standalone: bool) {
+    if !source_standalone {
+        return;
+    }
+    if let Some(stale) = ws.repository_path.take() {
+        tracing::warn!(
+            workspace = %ws.id.as_str(),
+            stale_repository_path = %stale,
+            "workspace.duplicate: cleared repositoryPath inherited from a standalone source after provisioning failed"
+        );
+    }
 }
 
 /// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
@@ -12144,18 +12189,89 @@ impl WorkspaceApi for Services {
             // non-repo `repositoryPath`s. Provisioning failures are logged
             // and swallowed — the FE reference continues on worktree failure
             // ("Continue without worktree - user can create it manually").
-            let repo_dir = ws
-                .repository_path
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from);
+            //
+            // Exception (intent-hq/monorepo#1560): when the SOURCE's checkout
+            // is standalone (`cow`/`direct`) the duplicate must never hold a
+            // live filesystem reference into the source workspace's directory
+            // — a linked worktree rooted there is orphaned when the source is
+            // deleted, and deleting the duplicate mutates the source. Such a
+            // duplicate is always standalone too (CoW clone, else a plain
+            // local clone), `workspace.cowIsolation` is ignored (parity with
+            // cache-hydrated create), and the source checkout — not the
+            // source's `repositoryPath` — is the clone source.
+            let source_standalone = matches!(
+                source.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            );
+            // For a hydrated standalone source the checkout is `worktreePath`;
+            // for an `isNewRepo` `direct` source there is none and the
+            // repository itself IS the checkout.
+            let repo_dir = source_standalone
+                .then(|| {
+                    source
+                        .worktree_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                })
+                .flatten()
+                .or_else(|| {
+                    ws.repository_path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                });
             if let Some(repo_dir) = repo_dir {
                 if !ws.is_remote && !ws.skip_worktree && repo_dir.join(".git").exists() {
                     let repo_name =
                         known_repo_name(ws.repository_name.as_deref(), &repo_dir.to_string_lossy());
                     let ws_dir = workspaces_root.join(&ws.id.0);
                     let wt_path = ws_dir.join(worktree_folder_slug(&repo_name));
-                    let mode = if cow_isolation && repo_dir.join(".git").is_file() {
+                    let mode = if source_standalone {
+                        // Standalone source: probe CoW from the source
+                        // checkout and fall back to a plain local clone —
+                        // never a linked worktree. A gitfile `.git` skips the
+                        // probe (CoW-cloning it would rewrite the source
+                        // checkout on the branch switch + hard reset) and goes
+                        // straight to the clone, which is safe from any
+                        // checkout shape.
+                        if repo_dir.join(".git").is_file() {
+                            tracing::warn!(
+                                source_checkout = %repo_dir.display(),
+                                "workspace.duplicate: standalone source checkout has a gitfile .git; provisioning a plain local clone instead of a CoW clone"
+                            );
+                            intent_core::CheckoutMode::Direct
+                        } else {
+                            std::fs::create_dir_all(&ws_dir).map_err(|e| {
+                                Error::Internal(format!(
+                                    "cannot create workspace dir for CoW probe: {e}"
+                                ))
+                            })?;
+                            let probe_repo = repo_dir.clone();
+                            let probe_dst = ws_dir.clone();
+                            let support = tokio::task::spawn_blocking(move || {
+                                intent_git::cow_probe(&probe_repo, &probe_dst)
+                            })
+                            .await
+                            .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?;
+                            match support {
+                                Ok(intent_git::CowSupport::Supported) => {
+                                    intent_core::CheckoutMode::Cow
+                                }
+                                Ok(intent_git::CowSupport::Unsupported) => {
+                                    intent_core::CheckoutMode::Direct
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        source_checkout = %repo_dir.display(),
+                                        error = %e,
+                                        "workspace.duplicate: CoW probe failed; duplicating the standalone source via a local clone (direct)"
+                                    );
+                                    intent_core::CheckoutMode::Direct
+                                }
+                            }
+                        }
+                    } else if cow_isolation && repo_dir.join(".git").is_file() {
                         // A linked worktree's `.git` is a gitfile pointing
                         // into the original repository's
                         // `.git/worktrees/<name>`: CoW-cloning it would give
@@ -12288,13 +12404,19 @@ impl WorkspaceApi for Services {
                                                 "origin",
                                             )
                                         }
-                                        // Duplicates never select `direct`: the
-                                        // decision matrix above only yields
-                                        // Cow or Worktree.
-                                        intent_core::CheckoutMode::Direct => Err(Error::Internal(
-                                            "direct checkout mode is not provisioned by workspace.duplicate"
-                                                .to_string(),
-                                        )),
+                                        // Standalone (`cow`/`direct`) sources
+                                        // fall back to a self-contained plain
+                                        // local clone of the source checkout
+                                        // rather than a linked worktree
+                                        // rooted in it (monorepo#1560).
+                                        intent_core::CheckoutMode::Direct => {
+                                            intent_git::cow_checkout::provision_local_clone_checkout(
+                                                &repo,
+                                                &wt,
+                                                &provision_branch,
+                                                base_ref.as_deref(),
+                                            )
+                                        }
                                     })
                                     .await;
                                     tracing::info!(
@@ -12317,18 +12439,23 @@ impl WorkspaceApi for Services {
                         {
                             // Safety net (create parity): the pre-provisioning
                             // probe passed but the clone itself was still
-                            // unsupported. Retry as a linked worktree; the
+                            // unsupported. Retry — as a plain local clone for
+                            // a standalone source (never a worktree rooted in
+                            // its checkout), else as a linked worktree; the
                             // #774 empty-dir cleanup runs between attempts.
+                            let retry_mode = if source_standalone {
+                                intent_core::CheckoutMode::Direct
+                            } else {
+                                intent_core::CheckoutMode::Worktree
+                            };
                             tracing::warn!(
                                 repository_path = %repo_dir.display(),
                                 reason = %reason,
-                                "workspace.duplicate: CoW checkout provisioning unsupported despite a passing probe; retrying as a linked worktree"
+                                retry_mode = ?retry_mode,
+                                "workspace.duplicate: CoW checkout provisioning unsupported despite a passing probe; retrying"
                             );
                             remove_workspace_dir_if_empty(&ws_dir);
-                            (
-                                intent_core::CheckoutMode::Worktree,
-                                provision(intent_core::CheckoutMode::Worktree).await,
-                            )
+                            (retry_mode, provision(retry_mode).await)
                         }
                         other => (mode, other),
                     };
@@ -12392,6 +12519,17 @@ impl WorkspaceApi for Services {
                             ws.worktree_path = Some(wt_path.to_string_lossy().to_string());
                             ws.base_commit_sha = Some(sha);
                             ws.checkout_mode = Some(mode);
+                            if source_standalone {
+                                // Self-contained duplicate (monorepo#1560,
+                                // create-hydration parity): the workspace
+                                // checkout IS the repository, so
+                                // `repositoryPath` must point at it rather
+                                // than at the source workspace's directory —
+                                // which dangles once the source is deleted
+                                // and breaks repo-config reads and
+                                // duplicate-of-a-duplicate.
+                                ws.repository_path = Some(wt_path.to_string_lossy().to_string());
+                            }
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(
@@ -12402,12 +12540,13 @@ impl WorkspaceApi for Services {
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree returned Err").await;
                             }
-                            if cow_isolation {
+                            clear_standalone_repository_path(&mut ws, source_standalone);
+                            if cow_isolation || source_standalone {
                                 // The CoW probe pre-created `<root>/<wsId>`
                                 // (both for a CoW checkout and for the
-                                // worktree fallback); drop it if it is left
-                                // empty (#774). The metadata write below
-                                // recreates the dir with content for the
+                                // worktree/local-clone fallback); drop it if
+                                // it is left empty (#774). The metadata write
+                                // below recreates the dir with content for the
                                 // (worktree-less) duplicate row.
                                 remove_workspace_dir_if_empty(&ws_dir);
                             }
@@ -12421,7 +12560,8 @@ impl WorkspaceApi for Services {
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree task JoinError").await;
                             }
-                            if cow_isolation {
+                            clear_standalone_repository_path(&mut ws, source_standalone);
+                            if cow_isolation || source_standalone {
                                 remove_workspace_dir_if_empty(&ws_dir);
                             }
                         }
@@ -19789,15 +19929,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
     }
 
-    /// `hook.cancel`: stop an active hook; a non-owner (FE) cancel wakes the
-    /// owning agent with a notice.
+    /// `hook.cancel`: stop an active hook; an agent caller may only cancel
+    /// its own hooks, while the FE path (`caller = None`) cancels any hook
+    /// and wakes the owning agent with a notice.
     fn hook_cancel(
         &self,
         workspace_id: WorkspaceId,
         hook_id: intent_core::HookId,
-        by_owner: bool,
+        caller: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.hook_cancel_op(&workspace_id, &hook_id, by_owner).await })
+        Box::pin(async move {
+            self.hook_cancel_op(&workspace_id, &hook_id, caller.as_ref())
+                .await
+        })
     }
 
     /// `hook.runNow`: trigger an immediate run of an active hook.
