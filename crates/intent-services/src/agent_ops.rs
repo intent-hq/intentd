@@ -384,7 +384,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 /// Evidence stays asymmetric: a cached-catalog claim by another provider
 /// rejects only when the requested provider's ownership is affirmatively
 /// *disproven* — its own cached catalog exists but lacks the id. With no
-/// cache entry for the requested provider (cold start, expired pin), the
+/// cache entry for the requested provider (cold start, bumped pin), the
 /// bare id passes — absence of evidence is not a mismatch.
 ///
 /// Two spawn-parity carve-outs:
@@ -1094,10 +1094,6 @@ pub(crate) async fn fetch_auggie_models(
         .collect();
     Ok(Some(models))
 }
-
-/// How long a successful `models.list` CLI fetch stays fresh (PROTOCOL §5.30),
-/// porting the reference app's 5-minute provider-model cache.
-pub(crate) const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Parse `auggie model list --json` output into rich wire `ModelInfo` rows
 /// (PROTOCOL §5.30), porting the TS `parseModelListJson`: expects
@@ -3293,10 +3289,11 @@ impl Services {
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
-    /// path — auggie CLI (JSON → plain-text fallback) with a 5-minute success
-    /// cache, degrading to an empty list (`source: "static"`) when the CLI is
-    /// unavailable; `forceRefresh` skips the cache read. With a `providerId`
-    /// the request goes through the generic per-provider cache
+    /// path — auggie CLI (JSON → plain-text fallback) with an indefinitely
+    /// served success cache (probe only on miss or `forceRefresh`), degrading
+    /// to an empty list (`source: "static"`) when the CLI is unavailable;
+    /// `forceRefresh` skips the cache read. With a `providerId` the request
+    /// goes through the generic per-provider cache
     /// ([`crate::model_catalog`]): registered sources are probed and cached
     /// per (provider, version key); unknown providers degrade to an empty
     /// list with a `warning` — never an error.
@@ -3365,8 +3362,8 @@ impl Services {
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
-    /// (the unit-test seam). Delegates all cache policy — TTL, negative
-    /// window, single-flight, last-good fallback — to
+    /// (the unit-test seam). Delegates all cache policy — indefinite serving,
+    /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
     /// resolved rows onto the legacy wire shape.
     async fn models_list_auggie_with<F>(
