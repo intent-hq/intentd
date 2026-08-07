@@ -289,7 +289,10 @@ async fn dispatch(
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
-            let ws = api.archive_workspace(id).await.map_err(workspace_err)?;
+            let ws = api
+                .archive_workspace(id, None)
+                .await
+                .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
         "workspace.unarchive" => {
