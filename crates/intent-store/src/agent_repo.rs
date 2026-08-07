@@ -170,6 +170,11 @@ pub struct InterruptedAgent {
     pub interrupted_at: String,
     pub agent_name: Option<String>,
     pub workspace_name: Option<String>,
+    /// Machine-readable interruption reason (the `InterruptReason` wire string,
+    /// e.g. `system_suspend`), or `None` for rows enrolled without one (the
+    /// daemon-restart / heal paths). The wake-resume orchestrator resumes ONLY
+    /// `system_suspend` rows.
+    pub reason: Option<String>,
 }
 
 /// Per-session message inputs for the `AgentLite` projection (monorepo#958):
@@ -1962,6 +1967,7 @@ impl Store {
                         cache_creation_tokens: b
                             .cache_creation_tokens
                             .saturating_add(s.cache_creation_tokens),
+                        thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
                         // Cost is cumulative per ACP session exactly like the
                         // counters, so the fold banks it the same way (§5.23).
                         cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
@@ -2704,12 +2710,38 @@ impl Store {
         prev_status: &str,
         interrupted_at: &str,
     ) -> Result<bool> {
+        self.insert_interrupted_agent_with_reason(
+            agent_id,
+            workspace_id,
+            prev_status,
+            interrupted_at,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`insert_interrupted_agent`], but tags the row with a
+    /// machine-readable interruption `reason` (the `InterruptReason` wire
+    /// string). The wake-resume orchestrator enumerates only `system_suspend`
+    /// rows, so the sleep-induced enrollment path supplies `Some("system_suspend")`
+    /// while the daemon-restart / heal paths pass `None` (untouched by
+    /// auto-resume). The idempotent upsert refreshes the reason too, so a row
+    /// re-enrolled under a new reason carries the latest one.
+    pub async fn insert_interrupted_agent_with_reason(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        prev_status: &str,
+        interrupted_at: &str,
+        reason: Option<&str>,
+    ) -> Result<bool> {
         let sql =
-            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
-                   VALUES (?, ?, ?, ?) \
+            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at, reason) \
+                   VALUES (?, ?, ?, ?, ?) \
                    ON CONFLICT(agent_id) DO UPDATE SET \
                        prev_status = excluded.prev_status, \
                        interrupted_at = excluded.interrupted_at, \
+                       reason = excluded.reason, \
                        resolution = 'pending', \
                        resolved_at = NULL";
         let res = sqlx::query(sql)
@@ -2717,6 +2749,7 @@ impl Store {
             .bind(&workspace_id.0)
             .bind(prev_status)
             .bind(interrupted_at)
+            .bind(reason)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
@@ -2727,7 +2760,7 @@ impl Store {
     /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
-                          ag.name AS agent_name, w.title AS workspace_name \
+                          ia.reason, ag.name AS agent_name, w.title AS workspace_name \
                    FROM interrupted_agent ia \
                    INNER JOIN agent_session ag ON ia.agent_id = ag.id \
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
@@ -2745,6 +2778,7 @@ impl Store {
                     interrupted_at: col(row, "interrupted_at")?,
                     agent_name: col(row, "agent_name")?,
                     workspace_name: col(row, "workspace_name")?,
+                    reason: col(row, "reason")?,
                 })
             })
             .collect()
@@ -2756,7 +2790,7 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<Option<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
-                          ag.name AS agent_name, w.title AS workspace_name \
+                          ia.reason, ag.name AS agent_name, w.title AS workspace_name \
                    FROM interrupted_agent ia \
                    INNER JOIN agent_session ag ON ia.agent_id = ag.id \
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
@@ -2775,6 +2809,7 @@ impl Store {
                 interrupted_at: col(r, "interrupted_at")?,
                 agent_name: col(r, "agent_name")?,
                 workspace_name: col(r, "workspace_name")?,
+                reason: col(r, "reason")?,
             })),
         }
     }
@@ -3124,6 +3159,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3135,6 +3171,7 @@ mod tests {
             output_tokens: 80,
             cache_read_tokens: 45,
             cache_creation_tokens: 6,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3294,6 +3331,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 5,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3327,6 +3365,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_creation_tokens: 40,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3350,6 +3389,7 @@ mod tests {
                 output_tokens: 60,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 45,
+                thought_tokens: 0,
                 cost: None,
             }),
             "second recreate accumulates onto the baseline"
@@ -3403,6 +3443,7 @@ mod tests {
             output_tokens: 8,
             cache_read_tokens: 9,
             cache_creation_tokens: 10,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3444,6 +3485,7 @@ mod tests {
             output_tokens: 4,
             cache_read_tokens: 5,
             cache_creation_tokens: 6,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -3520,6 +3562,7 @@ mod tests {
             output_tokens: 22,
             cache_read_tokens: 33,
             cache_creation_tokens: 44,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -3630,6 +3673,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3685,6 +3729,7 @@ mod tests {
             output_tokens: 6,
             cache_read_tokens: 7,
             cache_creation_tokens: 8,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3762,6 +3807,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                thought_tokens: 0,
                 cost: None,
             };
             store
@@ -3796,6 +3842,7 @@ mod tests {
                 output_tokens: 120,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                thought_tokens: 0,
                 cost: None,
             }),
             "every fold landed exactly once"
@@ -3819,6 +3866,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         {
@@ -4009,6 +4057,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -4253,6 +4302,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store

@@ -2637,6 +2637,431 @@ async fn post_output_transport_death_keeps_terminal_events() {
     assert_eq!(messages.len(), 1, "partial output persisted");
 }
 
+/// Mock agent whose `session/prompt` streams `updates`, then resolves with a
+/// JSON-RPC ERROR object (rather than a result) carrying `message` — used to
+/// force a deterministic, classifier-shaped `AcpError::Rpc` (e.g. a transient
+/// connection reset vs a terminal 4xx) for the sleep-resume enrollment path.
+fn spawn_mock_agent_with_prompt_rpc_error<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
+/// error carrying `error_message` (after streaming `updates`).
+fn connect_with_prompt_rpc_error(
+    updates: Vec<String>,
+    error_message: &str,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent_with_prompt_rpc_error(
+        c2a_agent,
+        a2c_agent,
+        updates,
+        error_message.to_string(),
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
+/// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the
+/// sleep-resume enrollment tests: reports a fixed overlap answer regardless of
+/// the queried window.
+struct FakeSuspend(Option<Duration>);
+
+impl crate::agent_session::SuspendOverlapQuery for FakeSuspend {
+    fn did_suspend_overlap(
+        &self,
+        _start: std::time::Instant,
+        _end: std::time::Instant,
+    ) -> Option<Duration> {
+        self.0
+    }
+}
+
+/// A `session/update` text chunk for the sleep-resume tests.
+fn suspend_chunk(text: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }
+    })
+    .to_string()
+}
+
+/// Task C happy path: a transient upstream disconnect whose active window
+/// overlapped a detected host suspend is ENROLLED as interrupted, not surfaced
+/// terminally. `run_prompt_turn` returns the suspend-interrupt marker error,
+/// emits the interrupted terminal `agent:stream:end` (`stopReason:
+/// "interrupted"`, `interruptReason: "system_suspend"`) and NO `agent:failed`,
+/// persists the partial turn tagged with the interrupt reason, and writes an
+/// `interrupted_agent` row for the wake orchestrator (Task D).
+#[tokio::test]
+async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_failure() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+    // Stream a partial chunk, then fail with a connection-reset RPC error.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a suspend-overlapping transient failure still returns Err");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg)
+                if msg.starts_with(crate::agent_session::PROMPT_SUSPEND_INTERRUPT_PREFIX)
+        ),
+        "sleep-induced failure carries the suspend-interrupt marker: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "no agent:failed for a sleep-induced interruption"
+    );
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("interrupted terminal stream:end emitted");
+    assert_eq!(end.data["stopReason"], json!("interrupted"));
+    assert_eq!(end.data["interruptReason"], json!("system_suspend"));
+
+    // The partial turn persisted, tagged with the interrupt reason.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "partial turn persisted on suspend enroll"
+    );
+    assert_eq!(
+        messages[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("interruptReason").and_then(Value::as_str)),
+        Some("system_suspend"),
+        "persisted row tagged suspend-induced"
+    );
+
+    // The interrupted_agent row is written for the wake orchestrator (Task D).
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.iter().any(|ia| ia.agent_id == agent_id),
+        "interrupted_agent row enrolled for wake-resume"
+    );
+}
+
+/// Task C boundary: the SAME transient failure with NO overlapping suspend
+/// (the tracker reports `None`) is NOT enrolled — it keeps today's terminal
+/// behavior (ordinary `session/prompt failed:` wrapper, `agent:failed` emitted,
+/// no `interrupted_agent` row).
+#[tokio::test]
+async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("an awake-time transient failure fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")
+        ),
+        "awake-time failure keeps the ordinary wrapper: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:failed"),
+        "awake-time failure surfaces agent:failed"
+    );
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.is_empty(),
+        "no interrupted_agent row for an awake-time failure"
+    );
+}
+
+/// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
+/// when a suspend overlapped — the classifier rejects it, so the turn surfaces
+/// terminally with `agent:failed` and no `interrupted_agent` row.
+#[tokio::test]
+async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(Vec::new(), "HTTP 401 Unauthorized");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a terminal 4xx fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")
+        ),
+        "a non-transient error keeps the ordinary wrapper even during suspend: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:failed"),
+        "a non-transient error surfaces agent:failed even during suspend"
+    );
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.is_empty(),
+        "no interrupted_agent row for a non-transient error"
+    );
+}
+
+/// Task D end-to-end: a turn ENROLLED by Task C's classifier (a suspend-
+/// overlapping transient disconnect via the real `run_prompt_turn` path) is
+/// resumed by the wake-triggered sweep. The enrolled row is tagged
+/// `system_suspend`, the sweep resumes exactly it, and its atomic claim leaves
+/// the row resolved (no longer pending).
+#[tokio::test]
+async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+
+    // Task C: a transient disconnect overlapping a suspend enrolls the turn.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("suspend-overlapping transient failure returns the interrupt marker");
+
+    // The enrolled row carries the system_suspend reason (only these auto-resume).
+    let row = bus
+        .store()
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // The mid-turn session had an open ACP session id (required to reload).
+    bus.store()
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .expect("mark session resumable");
+
+    // Simulated host wake: the sweep resumes the enrolled row.
+    let resumed = services.resume_suspend_interrupted_agents().await;
+    assert_eq!(resumed, 1, "the enrolled suspend turn is resumed on wake");
+    assert!(
+        bus.store()
+            .get_interrupted_agent(&agent_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the enrolled row is claimed and resolved by the wake sweep"
+    );
+}
+
+/// Finding 2 (late-enrollment self-heal): a row enrolled AFTER the one-shot wake
+/// sweep must not stay stranded until the next host wake. Enrollment fires a
+/// gated, debounced resume directly, so WITHOUT any wake broadcast (the test
+/// never calls `resume_suspend_interrupted_agents`) the enrolled row still
+/// resolves on its own. The `INTENTD_WAKE_RESUME_SELF_HEAL_MS` seam compresses
+/// the debounce so the test need not wait the production window.
+#[tokio::test]
+async fn suspend_enrollment_self_heals_resume_without_wake_broadcast() {
+    // Compress the self-heal debounce for the test (guard restores the env).
+    let _env = EnvGuard::set_all(&[("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "50")]);
+
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+
+    // The mid-turn session had an open ACP session id (required for the
+    // self-heal sweep to consider the row resumable). Set it BEFORE the turn so
+    // the debounced resume — which may fire moments after enrollment — sees it.
+    bus.store()
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .expect("mark session resumable");
+
+    // A transient disconnect overlapping a suspend enrolls the turn AND schedules
+    // the self-heal resume.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("suspend-overlapping transient failure returns the interrupt marker");
+
+    // The row is enrolled and (initially) pending — the wake broadcast has NOT run.
+    let row = bus
+        .store()
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // Poll: the enrollment-driven self-heal resumes the row on its own, with no
+    // call to `resume_suspend_interrupted_agents` from the test.
+    let mut resolved = false;
+    for _ in 0..40 {
+        if bus
+            .store()
+            .get_interrupted_agent(&agent_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            resolved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        resolved,
+        "the row enrolled after the sweep still resumes via the enrollment self-heal (no wake broadcast)"
+    );
+}
+
 /// Warn-and-continue (idle timeout, silent turn): a prompt that goes the
 /// whole idle window with zero `session/update` traffic resolves with the
 /// idle-timeout error under the ORDINARY wrapper (no streamed-output suffix),
@@ -2782,25 +3207,24 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
 }
 
 /// Warn-and-continue (idle timeout after an UNMAPPED update): a
-/// `session/update` variant with no canonical turn mapping (here a thought
-/// chunk — same class as plan/mode/usage) still reset the idle timer, so it
+/// `session/update` variant with no canonical turn mapping (here a plan
+/// update — same class as mode/commands) still reset the idle timer, so it
 /// counts as intervening activity: the wrapped error carries the
 /// streamed-output suffix even though nothing was applied to the transcript.
 #[tokio::test]
 async fn idle_timeout_after_unmapped_update_marks_streamed() {
     let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    let thought = json!({
+    let plan = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "sessionId": ACP_SID,
-            "update": { "sessionUpdate": "agent_thought_chunk",
-                "content": { "type": "text", "text": "thinking" } }
+            "update": { "sessionUpdate": "plan", "entries": [] }
         }
     })
     .to_string();
-    let (conn, mut note_rx, _agent) = connect_silent(vec![thought]);
+    let (conn, mut note_rx, _agent) = connect_silent(vec![plan]);
     let _sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -3738,5 +4162,178 @@ async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
         activities[1].data["lastAgentResponse"],
         json!("Hello"),
         "tool-arm pings carry the same live preview fields as chunk-arm pings"
+    );
+}
+
+// --- Thinking blocks (streamed reasoning) ---------------------------------
+
+fn thought_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+fn message_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+/// Consecutive thought chunks coalesce into ONE `thinking` block, and a
+/// thought↔text switch (either direction) closes the open block and starts a
+/// new one — so thought → text → thought persists three interleaved blocks in
+/// stream order.
+#[tokio::test]
+async fn thought_chunks_coalesce_and_interleave_with_text() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        thought_note("Let me "),
+        thought_note("think."),
+        message_note("Answer: "),
+        message_note("42."),
+        thought_note("Double-checking."),
+    ] {
+        assert!(
+            services
+                .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+                .await,
+            "every chunk (thought or text) is a turn update"
+        );
+    }
+
+    let blocks = transcript.into_blocks();
+    assert_eq!(
+        blocks,
+        vec![
+            json!({ "type": "thinking", "id": "m1:0", "text": "Let me think." }),
+            json!({ "type": "text", "id": "m1:1", "text": "Answer: 42." }),
+            json!({ "type": "thinking", "id": "m1:2", "text": "Double-checking." }),
+        ],
+        "consecutive thoughts merge; each thought↔text switch opens a new block"
+    );
+}
+
+/// A tool call breaks an open `thinking` block exactly as it breaks a text
+/// block, and the thought resumed after it lands in a fresh block.
+#[tokio::test]
+async fn tool_call_breaks_an_open_thinking_block() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let tool = IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "bash: ls", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "ls" } }
+        }),
+    };
+    for note in [thought_note("Plan it."), tool, thought_note("Read it.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let types: Vec<&str> = blocks
+        .iter()
+        .map(|b| b["type"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(types, vec!["thinking", "tool_use", "thinking"]);
+    assert_eq!(blocks[0]["text"], json!("Plan it."));
+    assert_eq!(blocks[2]["text"], json!("Read it."));
+}
+
+/// Thought chunks stream as `chat:stream:delta` with `blockType: "thinking"`
+/// on their own stable block id, and never leak into the
+/// `agent:stream:activity` live preview (`lastAgentResponse`/`digest`).
+#[tokio::test]
+async fn thought_deltas_carry_thinking_block_type_and_skip_live_previews() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("Reasoning...\n"), thought_note("more\n")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let deltas: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "chat:stream:delta")
+        .collect();
+    assert_eq!(deltas.len(), 2, "one delta per thought chunk");
+    for d in &deltas {
+        assert_eq!(d.data["blockType"], json!("thinking"));
+        assert_eq!(d.data["blockIndex"], json!(0), "coalesced onto one block");
+        assert_eq!(d.data["blockId"], json!("m1:0"));
+    }
+    assert_eq!(deltas[0].data["content"], json!("Reasoning...\n"));
+
+    for a in events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+    {
+        assert!(
+            a.data.get("lastAgentResponse").is_none() && a.data.get("digest").is_none(),
+            "thought text never feeds the live preview: {:?}",
+            a.data
+        );
+    }
+}
+
+/// Thought text is excluded from the text-block extraction the agent-list
+/// previews read, while assistant text in the same turn still counts.
+#[tokio::test]
+async fn thought_text_is_absent_from_text_block_extraction() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("secret reasoning"), message_note("Done.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+    assert_eq!(transcript.text_block_strings(), vec!["Done.".to_string()]);
+
+    // A turn that streamed ONLY reasoning contributes no preview text and
+    // leaves no open final text block.
+    let mut thought_only = super::Transcript::new("m2".to_string());
+    services
+        .route_notification(
+            &thought_note("only reasoning"),
+            &agent_id,
+            &workspace_id,
+            &mut thought_only,
+        )
+        .await;
+    assert!(thought_only.text_block_strings().is_empty());
+    assert!(!thought_only.final_text_block_open());
+    assert_eq!(
+        thought_only.snapshot_blocks(),
+        vec![json!({ "type": "thinking", "id": "m2:0", "text": "only reasoning" })],
+        "the live-turn snapshot carries the in-flight thinking block"
     );
 }

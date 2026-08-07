@@ -578,7 +578,10 @@ impl ChatDeltaState {
             };
             self.seen_ids.insert(bid.to_string());
             self.emitted_ids.insert(bid.to_string());
-            if block.get("type").and_then(Value::as_str) == Some("text") {
+            if matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("text") | Some("thinking")
+            ) {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
                     self.text_acc.insert(bid.to_string(), text.to_string());
                 }
@@ -711,7 +714,8 @@ impl ChatDeltaState {
     }
 
     /// Map a `chat:stream:delta`: accumulate the chunk and emit the full block
-    /// (D2/D4). Text chunks coalesce onto one `blockId` (`updated` on growth);
+    /// (D2/D4). Text chunks — and the `thinking` chunks streamed reasoning
+    /// flushes into — coalesce onto one `blockId` (`updated` on growth);
     /// non-text chunks pass through as the full block (`added`), stamped with the
     /// same id the persisted block carries.
     fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
@@ -721,11 +725,11 @@ impl ChatDeltaState {
         self.message_id = Some(message_id.clone());
         let block_type = d.get("blockType").and_then(Value::as_str).unwrap_or("text");
         let content = d.get("content")?;
-        let block = if block_type == "text" {
+        let block = if block_type == "text" || block_type == "thinking" {
             let chunk = content.as_str().unwrap_or_default();
             let acc = self.text_acc.entry(block_id.clone()).or_default();
             acc.push_str(chunk);
-            json!({ "type": "text", "id": block_id, "text": acc.clone() })
+            json!({ "type": block_type, "id": block_id, "text": acc.clone() })
         } else {
             let mut obj = content.as_object()?.clone();
             obj.insert("id".to_string(), Value::String(block_id.clone()));

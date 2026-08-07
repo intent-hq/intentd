@@ -74,6 +74,7 @@ pub fn turn_token_delta(
         cache_creation_tokens: next
             .cache_creation_tokens
             .saturating_sub(prev.cache_creation_tokens),
+        thought_tokens: next.thought_tokens.saturating_sub(prev.thought_tokens),
         // Usage stats (§5.36) track token counters only — cost has no bucket
         // there, so the delta carries none.
         cost: None,
@@ -402,6 +403,7 @@ mod tests {
             output_tokens: o,
             cache_read_tokens: cr,
             cache_creation_tokens: cc,
+            thought_tokens: 0,
             cost: None,
         }
     }
@@ -451,6 +453,19 @@ mod tests {
         let prev = totals(100, 40, 20, 10);
         let next = totals(150, 70, 20, 25);
         assert_eq!(turn_token_delta(Some(&prev), &next), totals(50, 30, 0, 15));
+    }
+
+    #[test]
+    fn delta_subtracts_thought_tokens_too() {
+        let with_thoughts = |t: u64| TokenUsageTotals {
+            thought_tokens: t,
+            ..totals(100, 40, 0, 0)
+        };
+        let delta = turn_token_delta(Some(&with_thoughts(30)), &with_thoughts(75));
+        assert_eq!(delta.thought_tokens, 45);
+        // A regression clamps like the other counters.
+        let clamped = turn_token_delta(Some(&with_thoughts(75)), &with_thoughts(30));
+        assert_eq!(clamped.thought_tokens, 0);
     }
 
     #[test]

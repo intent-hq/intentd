@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
     DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
 use crate::error::{Error, Result};
@@ -66,6 +67,7 @@ pub struct SettingsFile {
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
+    pub wake_resume: WakeResumeSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -676,6 +678,26 @@ impl Default for AgentFeaturesSettings {
     }
 }
 
+/// `[wakeResume]` — host sleep/wake detection + resume (`wakeResume.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WakeResumeSettings {
+    /// `wakeResume.enabled` — detect host sleep/wake and resume work on wake.
+    pub enabled: bool,
+    /// `wakeResume.thresholdSeconds` — minimum suspend duration (seconds) that
+    /// counts as a sleep; also the resume/enrollment gate.
+    pub threshold_seconds: u32,
+}
+
+impl Default for WakeResumeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_WAKE_RESUME_ENABLED,
+            threshold_seconds: DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -1139,6 +1161,13 @@ attentionRequests = true
 # prompts; unlike the other toggles this applies to the next turn of every
 # session (live), existing sessions included.
 stateSnapshot = true
+
+[wakeResume]
+# Wake resume enabled -- detect host sleep/wake and resume work on wake.
+enabled = true
+# Wake resume threshold seconds -- minimum suspend duration (in seconds) that
+# counts as a sleep; also the resume/enrollment gate.
+thresholdSeconds = 10
 "##;
 
 #[cfg(test)]
@@ -1239,6 +1268,11 @@ mod tests {
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
+        assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
+        assert_eq!(
+            d.wake_resume.threshold_seconds,
+            DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS
+        );
     }
 
     #[test]
@@ -1636,6 +1670,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("server.port"), "{err}");
+    }
+
+    #[test]
+    fn sleep_resume_defaults_enabled_with_threshold_ten() {
+        // A file with no [wakeResume] section resolves to the feature-on
+        // defaults (enabled = true, thresholdSeconds = 10).
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 10);
+        // The default template ships the commented [wakeResume] section and
+        // parses back to the same defaults.
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[wakeResume]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(templated.wake_resume.enabled);
+        assert_eq!(templated.wake_resume.threshold_seconds, 10);
+    }
+
+    #[test]
+    fn sleep_resume_explicit_override_parses() {
+        let parsed =
+            SettingsFile::parse_str("[wakeResume]\nenabled = false\nthresholdSeconds = 45\n")
+                .expect("override parses");
+        assert!(!parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 45);
+    }
+
+    #[test]
+    fn sleep_resume_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[wakeResume]\nthreshholdSeconds = 20\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wakeResume"), "names the table: {msg}");
+        assert!(
+            msg.contains("threshholdSeconds"),
+            "names the bad key: {msg}"
+        );
+    }
+
+    #[test]
+    fn sleep_resume_wrong_type_is_rejected() {
+        let err =
+            SettingsFile::parse_str("[wakeResume]\nthresholdSeconds = \"soon\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("wakeResume.thresholdSeconds"),
+            "names the key: {err}"
+        );
     }
 
     #[test]

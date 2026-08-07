@@ -8875,6 +8875,88 @@ fn validate_message_role(role: &str) -> Result<()> {
 }
 
 impl Services {
+    /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
+    /// daemon's resume orchestrator calls this to resume every turn Task C
+    /// enrolled as `system_suspend`-interrupted. It enumerates ONLY pending
+    /// `interrupted_agent` rows tagged [`InterruptReason::SystemSuspend`] — rows a
+    /// user left pending for any other reason (daemon restart, agent stop, manual
+    /// interrupt) are never touched — and drives each through the existing
+    /// [`Services::resume_interrupted_agent`] path, whose atomic claim dedupes
+    /// against a concurrent `agent.resolveInterrupted` / `--resume-all`.
+    ///
+    /// Guard: an agent whose persisted session has no `acpSessionId` cannot be
+    /// reloaded via `session/load`, so it is skipped and left pending for today's
+    /// manual retry (the cheap static half of the `supports_load_session` gate;
+    /// the capability half is re-checked inside the resume path). A per-agent
+    /// resume failure is logged and never aborts the sweep — the row is reset to
+    /// pending by `resume_interrupted_agent` and retried on the next wake or
+    /// manually.
+    ///
+    /// Returns the number of agents successfully resumed by this sweep.
+    pub async fn resume_suspend_interrupted_agents(&self) -> usize {
+        let rows = match self.store.list_interrupted_agents().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "wake-resume: failed to list interrupted agents");
+                return 0;
+            }
+        };
+        let suspend_reason = crate::agent_session::InterruptReason::SystemSuspend.as_str();
+        let mut resumed = 0usize;
+        for interrupted in rows {
+            // Never blanket-resume rows a user left pending for another reason.
+            if interrupted.reason.as_deref() != Some(suspend_reason) {
+                continue;
+            }
+            let agent_id = interrupted.agent_id.clone();
+            // Guard: `session/load` needs a persisted acpSessionId; without one
+            // the provider cannot reload, so leave the row pending for manual
+            // retry rather than re-running the whole turn unattended.
+            match self.store.get_agent_session(&agent_id).await {
+                Ok(session) if session.acp_session_id.is_none() => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        "wake-resume: no resumable acpSessionId; leaving pending for manual retry"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: session lookup failed; leaving row pending"
+                    );
+                    continue;
+                }
+            }
+            match self.resume_interrupted_agent(&agent_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        workspace = %interrupted.workspace_id,
+                        "wake-resume: resumed suspend-interrupted agent"
+                    );
+                    resumed += 1;
+                }
+                // A concurrent resolveInterrupted / --resume-all may have claimed
+                // the row first (atomic claim → "already resolved"): that is the
+                // expected dedupe outcome, not an error, so log it quietly.
+                Err(e) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: resume skipped (already resolved or transient failure)"
+                    );
+                }
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "wake-resume: sweep complete");
+        }
+        resumed
+    }
+
     /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
     /// parent completion watch when delegated, then deliver a continuation message.
     ///
