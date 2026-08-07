@@ -3993,13 +3993,16 @@ impl Services {
                     return SandboxMergeDisposition::propagate_with("conflict");
                 }
 
-                // Bounce: update status, increment retry, fetch canonical, wake agent
+                // Bounce: update status (persisting the conflicting paths on
+                // the row so pollers see WHY it bounced), increment retry,
+                // fetch canonical, wake agent
                 let _ = self
                     .store
-                    .update_sandbox_status(
+                    .set_sandbox_status_with_conflicts(
                         workspace_id,
                         agent_id,
                         SandboxStatus::ConflictBounced,
+                        &conflicting_paths,
                         &now_iso(),
                     )
                     .await;
@@ -4300,9 +4303,17 @@ impl Services {
     ) {
         use intent_store::SandboxStatus;
 
+        // Single write clears any stale conflicting_paths left by an earlier
+        // bounce along with landing the merged status.
         let _ = self
             .store
-            .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merged, &now_iso())
+            .set_sandbox_status_with_conflicts(
+                workspace_id,
+                agent_id,
+                SandboxStatus::Merged,
+                &[],
+                &now_iso(),
+            )
             .await;
 
         let event = NewEvent {
@@ -4356,6 +4367,8 @@ impl Services {
         conflicting_paths: &[String],
         canonical_head: &str,
     ) {
+        use intent_store::SandboxStatus;
+
         // Recovery branch FIRST: fetch the sandbox branch into canonical as a
         // local sb/<agentId> branch (ref-only, worktree untouched) so the
         // agent's output survives even if the sandbox directory is later lost.
@@ -4380,7 +4393,13 @@ impl Services {
 
         if let Err(e) = self
             .store
-            .set_sandbox_conflict(workspace_id, agent_id, conflicting_paths, &now_iso())
+            .set_sandbox_status_with_conflicts(
+                workspace_id,
+                agent_id,
+                SandboxStatus::Conflict,
+                conflicting_paths,
+                &now_iso(),
+            )
             .await
         {
             tracing::error!(

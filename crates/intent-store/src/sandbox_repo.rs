@@ -87,9 +87,10 @@ pub struct Sandbox {
     /// the sandbox live at turn end; merging happens only via the manual
     /// `sandbox.cow.merge` RPC. The retry sweep also skips such sandboxes.
     pub merge_on_turn_end: bool,
-    /// Conflicting paths persisted when the sandbox lands in the terminal
-    /// `conflict` status; empty otherwise. Serialized on the wire so clients
-    /// see what conflicted without re-running the merge.
+    /// Conflicting paths persisted whenever a merge attempt conflicts: on
+    /// `conflict_bounced` (agent reconciling, next attempt overwrites them)
+    /// and on the terminal `conflict` status; empty otherwise. Serialized on
+    /// the wire so clients see what conflicted without re-running the merge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicting_paths: Vec<String>,
     pub created_at: String,
@@ -169,13 +170,16 @@ impl Store {
         Ok(())
     }
 
-    /// Persist the terminal `conflict` status together with the conflicting
-    /// paths in one write, so the status row and its explanation can never
-    /// disagree. Passing an empty slice stores NULL (no stale paths).
-    pub async fn set_sandbox_conflict(
+    /// Persist a status together with the conflicting paths in one write, so
+    /// the status row and its explanation can never disagree. Used for
+    /// `conflict` (terminal) and `conflict_bounced` (agent reconciling) with
+    /// the clash's paths, and for `merged` with an empty slice — which
+    /// stores NULL, clearing any stale paths from an earlier bounce.
+    pub async fn set_sandbox_status_with_conflicts(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
+        status: SandboxStatus,
         conflicting_paths: &[String],
         updated_at: &str,
     ) -> Result<()> {
@@ -188,7 +192,7 @@ impl Store {
             "UPDATE sandbox SET status = ?, conflicting_paths = ?, updated_at = ? \
              WHERE workspace_id = ? AND agent_id = ?",
         )
-        .bind(SandboxStatus::Conflict.to_db())
+        .bind(status.to_db())
         .bind(paths_json)
         .bind(updated_at)
         .bind(&workspace_id.0)

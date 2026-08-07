@@ -537,9 +537,15 @@ mod tests {
             "Canonical should be pristine"
         );
 
-        // Assert: sandbox status is ConflictBounced
+        // Assert: sandbox status is ConflictBounced with the conflicting
+        // paths persisted on the row (pollers see WHY it bounced)
         let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
         assert_eq!(sandbox.status, SandboxStatus::ConflictBounced);
+        assert_eq!(
+            sandbox.conflicting_paths,
+            vec!["conflict.txt".to_string()],
+            "Conflicting paths persisted on the bounced row"
+        );
 
         // Assert: retry_count was incremented
         assert_eq!(
