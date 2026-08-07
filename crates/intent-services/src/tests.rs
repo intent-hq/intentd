@@ -10680,6 +10680,62 @@ mod file_tracking {
         assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
     }
 
+    /// A coalesced follower surfaces the *same* error as the leader: the shared
+    /// failure travels as the inner message, so the follower's re-wrap does not
+    /// produce a doubled `internal error:` prefix.
+    #[tokio::test]
+    async fn git_status_failed_scan_reports_the_same_error_to_followers() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        std::fs::remove_file(repo.dir.join(".git").join("HEAD")).unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let leader_err = leader.await.unwrap().unwrap_err().to_string();
+        let follower_err = follower.await.unwrap().unwrap_err().to_string();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        assert_eq!(follower_err, leader_err, "identical error message");
+        assert_eq!(
+            follower_err.matches("internal error:").count(),
+            1,
+            "no doubled prefix: {follower_err}"
+        );
+    }
+
     /// The git reads degrade to empty results for a workspace with no worktree
     /// (mirrors the `git.status` empty fallbacks).
     #[tokio::test]

@@ -1199,7 +1199,15 @@ impl Services {
                             Ok(shared)
                         }
                         Err(e) => {
-                            flight.finish(Err(e.to_string()));
+                            // Publish the inner message: every scan error is
+                            // `Error::Internal` (map_git_err), and the follower
+                            // re-wraps as `Error::Internal`, so coalesced
+                            // callers observe the same variant and message (no
+                            // double "internal error:" prefix).
+                            flight.finish(Err(match &e {
+                                Error::Internal(msg) => msg.clone(),
+                                other => other.to_string(),
+                            }));
                             Err(e)
                         }
                     };
