@@ -9,77 +9,79 @@
 //! [`GitStatusRefresher::trigger`] (the same debounced recompute path as the
 //! `file:*` bridge). No `file:*` events are ever emitted for `.git` paths.
 //!
-//! Watch roots: the `.git` directory itself and `.git/refs`, both
-//! non-recursive. Watching the directories rather than the `HEAD`/`index`
-//! files directly keeps the watch alive across git's atomic
-//! write-lock-then-rename updates (an inode-level file watch dies with the
-//! replaced inode on inotify). Events are then filtered to the metadata of
-//! interest: `HEAD`, `index`, `packed-refs`, and anything under `refs/`.
+//! The detection rides the recursive stream [`SharedWatchHub`] already keeps
+//! for the workspace root (the same stream the main watcher consumes), so no
+//! `.git` streams of its own are created: it subscribes to that root and keeps
+//! only the events whose paths are the metadata of interest — `HEAD`, `index`,
+//! `packed-refs`, and anything under `refs/`. Path-based filtering (rather than
+//! watching the `HEAD`/`index` files directly) is what keeps detection alive
+//! across git's atomic write-lock-then-rename updates.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::WorkspaceId;
 use notify::event::EventKind;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::task::JoinHandle;
 
 use super::git_status_refresher::GitStatusRefresher;
+use super::shared_watch::{SharedWatchHub, SubHandle};
 
-/// A live `.git` metadata watch for one workspace. Holds only the `notify`
-/// watcher — the OS subscription ends when it drops (clean-shutdown contract
-/// shared with the other watchers); debouncing lives in the refresher.
+/// A live `.git` metadata watch for one workspace: a subscription to the shared
+/// workspace-root stream plus the filtering task. Both end when it drops
+/// (clean-shutdown contract shared with the other watchers); debouncing lives
+/// in the refresher.
 pub struct GitMetadataWatcher {
-    _watcher: RecommendedWatcher,
+    _sub: SubHandle,
+    task: JoinHandle<()>,
+}
+
+impl Drop for GitMetadataWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl GitMetadataWatcher {
-    /// Start the narrow `.git` metadata watch on `root`, routing detections
-    /// to `refresher` for `workspace_id`. Returns `Ok(None)` when `root` has
-    /// no `.git` directory (not a git repo, or a gitfile worktree) — a
-    /// legitimate state, not an error.
-    pub fn start(
+    /// Start the `.git` metadata detection for `root`, routing detections to
+    /// `refresher` for `workspace_id`. Returns `None` when `root` has no `.git`
+    /// directory (not a git repo, or a gitfile worktree) — a legitimate state,
+    /// not an error.
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
         refresher: Arc<GitStatusRefresher>,
         workspace_id: WorkspaceId,
         root: PathBuf,
-    ) -> notify::Result<Option<Self>> {
-        // Canonicalize so the prefix strip works against the paths the OS
-        // reports (macOS FSEvents resolves `/var/...` → `/private/var/...`).
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+    ) -> Option<Self> {
+        // `subscribe` returns the canonical root it demuxes against, so the
+        // prefix strip works against the paths the OS reports (macOS FSEvents
+        // resolves `/var/...` → `/private/var/...`).
+        let (sub, mut rx, root) = hub.subscribe(&root);
         let git_dir = root.join(".git");
         if !git_dir.is_dir() {
-            return Ok(None);
+            return None;
         }
-        let filter_dir = git_dir.clone();
-        // `GitStatusRefresher::trigger` is a synchronous unbounded send, so
-        // the notify callback (off-runtime) can call it directly — no
-        // channel/task of our own is needed.
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(event) => {
-                    if is_mutation_kind(&event.kind)
-                        && event
-                            .paths
-                            .iter()
-                            .any(|p| is_git_metadata_path(&filter_dir, p))
-                    {
-                        refresher.trigger(workspace_id.clone());
-                    }
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if is_mutation_kind(&event.kind)
+                    && event
+                        .paths
+                        .iter()
+                        .any(|p| is_git_metadata_path(&git_dir, p))
+                {
+                    refresher.trigger(workspace_id.clone());
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "git metadata watcher callback error; external git operations may be missed"
-                    );
-                }
-            })?;
-        watcher.watch(&git_dir, RecursiveMode::NonRecursive)?;
-        // `refs` is a subdirectory, invisible to the non-recursive `.git`
-        // watch; a second non-recursive watch covers loose-ref churn there.
-        let refs_dir = git_dir.join("refs");
-        if refs_dir.is_dir() {
-            watcher.watch(&refs_dir, RecursiveMode::NonRecursive)?;
-        }
-        Ok(Some(Self { _watcher: watcher }))
+            }
+        });
+        Some(Self { _sub: sub, task })
+    }
+
+    /// Await the shared watch on this workspace's root actually being
+    /// established. Registration is deferred off the caller's thread
+    /// (monorepo#1572), so tests must wait for it before mutating `.git`.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: std::time::Duration) {
+        self._sub.wait_established(timeout).await;
     }
 }
 
@@ -333,13 +335,24 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
         let refresher = Arc::new(GitStatusRefresher::start(bus, api));
 
-        let watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start must not error on a non-git root");
+        let watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        );
         assert!(watcher.is_none(), "no `.git` dir → no watch");
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn external_git_operation_triggers_status_refresh_without_file_events() {
+        // Serialized with the other real-watcher tests: these now ride shared
+        // streams, and running several of them concurrently delays registration
+        // enough to blow the delivery timeouts below.
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut status_sub, mut file_sub) = bus_and_subs().await;
         let root = TempDir::new("repo");
         let repo = init_repo(&root.path);
@@ -347,19 +360,35 @@ mod tests {
         let ws = test_workspace("ws-repo", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
         let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
-        let _watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start git metadata watcher")
-            .expect("git repo must gain a metadata watch");
+        let _watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        )
+        .expect("git repo must gain a metadata watch");
         // Let the OS watch settle before mutating.
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
-        // (HEAD rewrite; no worktree change).
-        repo.set_head("refs/heads/other").unwrap();
-
-        let ev = next_event(&mut status_sub, &ws.id, Duration::from_secs(10))
-            .await
-            .expect("external HEAD change must yield a changes:git-status event");
+        // (HEAD rewrite; no worktree change). Retried because the shared stream
+        // can begin delivering a little after registration lands, and a HEAD
+        // rewrite that predates delivery leaves nothing to observe.
+        let mut ev = None;
+        for i in 0..20 {
+            let target = if i % 2 == 0 {
+                "refs/heads/other"
+            } else {
+                "refs/heads/main"
+            };
+            repo.set_head(target).unwrap();
+            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        let ev = ev.expect("external HEAD change must yield a changes:git-status event");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
         assert!(ev.data["status"].get("uncommittedCount").is_some());
@@ -377,7 +406,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn irrelevant_git_file_does_not_trigger_refresh() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut status_sub, _file_sub) = bus_and_subs().await;
         let root = TempDir::new("quiet");
         let _repo = init_repo(&root.path);
@@ -385,9 +418,14 @@ mod tests {
         let ws = test_workspace("ws-quiet", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
         let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
-        let _watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start git metadata watcher")
-            .expect("git repo must gain a metadata watch");
+        let _watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        )
+        .expect("git repo must gain a metadata watch");
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.

@@ -53,6 +53,7 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'agent.removeQueuedMessage', args: { agentId, messageId } }),
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
+        snapshot: () => host({ method: 'agent.snapshot', args: {} }),
         wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort) =>
             host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
         readConversation: (agentId, opts) =>
@@ -107,6 +108,7 @@ pub(crate) async fn dispatch(
         "getQueue" => get_queue(api, ws, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
         "diagnostics" => diagnostics(api, ws, args).await,
+        "snapshot" => snapshot(api, ws, caller).await,
         "wakeOrCreate" => wake_or_create(api, ws, caller, args).await,
         "readConversation" => read_conversation(api, ws, args).await,
         "summary" => summary(api, ws, args).await,
@@ -570,6 +572,21 @@ async fn diagnostics(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// `ws.agent.snapshot()` — the CALLER's own state digest (no target
+/// argument; always self-scoped). Deliberately never gated by
+/// `agentFeatures.stateSnapshot`: the toggle governs only the per-turn
+/// prompt injection, the tool stays callable.
+async fn snapshot(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "snapshot requires an agent caller identity".to_string())?;
+    api.agent_snapshot(ws.clone(), caller.clone())
+        .await
+        .map_err(map_err)
 }
 
 async fn wake_or_create(
