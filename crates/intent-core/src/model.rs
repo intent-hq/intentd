@@ -406,9 +406,9 @@ impl UsageCost {
     }
 }
 
-/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1),
-/// plus the optional provider-reported cost. Reused for the per-agent,
-/// per-model, and workspace-wide rollups.
+/// The consumption counters of a token tally (PROTOCOL §5.23 / §19.1), plus
+/// the optional provider-reported cost. Reused for the per-agent, per-model,
+/// and workspace-wide rollups.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageTotals {
@@ -416,14 +416,24 @@ pub struct TokenUsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Cumulative reasoning ("thought") tokens, reported by providers that
+    /// break them out of `outputTokens` via ACP `usage_update.thoughtTokens`.
+    /// Omitted (not `0`) when nothing reported any, so clients that predate
+    /// the field see the previous shape byte-for-byte.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub thought_tokens: u64,
     /// Cumulative cost, present only when at least one contributing session
     /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<UsageCost>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl TokenUsageTotals {
-    /// Whether all four consumption counters are zero, i.e. this tally carries
+    /// Whether every consumption counter is zero, i.e. this tally carries
     /// no token report at all. A persisted session snapshot in that state is a
     /// cost-only report (§5.23) and MUST NOT suppress the per-message token
     /// fallback for a provider that never sends an end-of-turn token report.
@@ -432,6 +442,7 @@ impl TokenUsageTotals {
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
             && self.cache_creation_tokens == 0
+            && self.thought_tokens == 0
     }
 }
 
@@ -3614,6 +3625,7 @@ mod tests {
                 output_tokens: 3400,
                 cache_read_tokens: 8000,
                 cache_creation_tokens: 1200,
+                thought_tokens: 0,
                 cost: None,
             },
         );
@@ -3635,8 +3647,52 @@ mod tests {
         // Absent cost is OMITTED (not null) so existing clients see the
         // pre-cost shape byte-for-byte.
         assert!(v["totals"].get("cost").is_none());
+        // Same for an unreported thought count — zero omits the key.
+        assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// Reported reasoning tokens serialize as the additive camelCase
+    /// `thoughtTokens` counter on every `TokenUsage` bucket and round-trip
+    /// (§5.23).
+    #[test]
+    fn token_usage_thought_tokens_wire_shape() {
+        let totals = TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            thought_tokens: 42,
+            ..TokenUsageTotals::default()
+        };
+        let mut by_agent_id = BTreeMap::new();
+        by_agent_id.insert("agent-123".to_string(), totals.clone());
+        let mut by_model = BTreeMap::new();
+        by_model.insert("opus-4.8".to_string(), totals.clone());
+        let usage = TokenUsage {
+            by_agent_id,
+            totals,
+            by_model,
+            last_scan_at: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["totals"]["thoughtTokens"], 42);
+        assert_eq!(v["byAgentId"]["agent-123"]["thoughtTokens"], 42);
+        assert_eq!(v["byModel"]["opus-4.8"]["thoughtTokens"], 42);
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    /// A thought-only tally still counts as a token report, so it does not
+    /// fall through to the per-message usage fallback (§5.23).
+    #[test]
+    fn thought_tokens_alone_count_as_a_report() {
+        let thought_only = TokenUsageTotals {
+            thought_tokens: 5,
+            ..TokenUsageTotals::default()
+        };
+        assert!(!thought_only.counters_are_zero());
+        assert!(token_usage_reported(None, Some(&thought_only)));
+        assert!(TokenUsageTotals::default().counters_are_zero());
     }
 
     /// A reported cost serializes as camelCase `cost: { amount, currency }`
@@ -3646,12 +3702,11 @@ mod tests {
         let totals = TokenUsageTotals {
             input_tokens: 10,
             output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
             cost: Some(UsageCost {
                 amount: 1.25,
                 currency: "USD".to_string(),
             }),
+            ..TokenUsageTotals::default()
         };
         let mut by_agent_id = BTreeMap::new();
         by_agent_id.insert("agent-123".to_string(), totals.clone());

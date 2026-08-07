@@ -20980,9 +20980,7 @@ mod turn_token_usage {
                     &intent_core::TokenUsageTotals {
                         input_tokens: (i + 1) * 10,
                         output_tokens: i + 1,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        cost: None,
+                        ..Default::default()
                     },
                 )
                 .await

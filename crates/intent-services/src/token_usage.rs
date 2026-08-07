@@ -50,6 +50,7 @@ fn add_totals(lhs: &mut TokenUsageTotals, rhs: &TokenUsageTotals) {
     lhs.cache_creation_tokens = lhs
         .cache_creation_tokens
         .saturating_add(rhs.cache_creation_tokens);
+    lhs.thought_tokens = lhs.thought_tokens.saturating_add(rhs.thought_tokens);
 }
 
 /// Currency-aware cost accumulator for one roll-up bucket (`totals`, one
@@ -161,10 +162,10 @@ pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
 /// still Draft; if the semantics flip to per-turn deltas later, this function
 /// (and its callers' replace-vs-add choice) is the single place to change.
 ///
-/// Field mapping: `cachedReadTokens` → `cacheReadTokens` and
-/// `cachedWriteTokens` → `cacheCreationTokens`; absent optional counters map
-/// to zero. `thoughtTokens` has no slot in [`TokenUsageTotals`] and is
-/// intentionally dropped (as is `totalTokens`, which is derivable).
+/// Field mapping: `cachedReadTokens` → `cacheReadTokens`,
+/// `cachedWriteTokens` → `cacheCreationTokens` and `thoughtTokens` →
+/// `thoughtTokens`; absent optional counters map to zero. `totalTokens` is
+/// dropped (it is derivable).
 ///
 /// **Recreate baseline** (monorepo#737): counters are cumulative per *ACP*
 /// session, so when the resume-impossible fallback recreates the ACP session,
@@ -179,6 +180,7 @@ pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cached_read_tokens.unwrap_or(0),
         cache_creation_tokens: usage.cached_write_tokens.unwrap_or(0),
+        thought_tokens: usage.thought_tokens.unwrap_or(0),
         // Cost rides on a separate ACP `usage_update` notification, not the
         // end-of-turn report; the caller stamps it onto the snapshot.
         cost: None,
@@ -267,6 +269,7 @@ fn extract_message_usage(content: &Value) -> Option<TokenUsageTotals> {
         output_tokens: field("outputTokens"),
         cache_read_tokens: field("cacheReadTokens"),
         cache_creation_tokens: field("cacheCreationTokens"),
+        thought_tokens: field("thoughtTokens"),
         // Legacy per-message metadata never carried a cost figure.
         cost: None,
     })
@@ -282,7 +285,15 @@ mod tests {
             output_tokens: o,
             cache_read_tokens: r,
             cache_creation_tokens: c,
+            thought_tokens: 0,
             cost: None,
+        }
+    }
+
+    fn totals_with_thoughts(i: u64, o: u64, r: u64, c: u64, t: u64) -> TokenUsageTotals {
+        TokenUsageTotals {
+            thought_tokens: t,
+            ..totals(i, o, r, c)
         }
     }
 
@@ -467,6 +478,11 @@ mod tests {
         assert_eq!(extract_message_usage(&top), Some(totals(12, 3, 0, 0)));
         let meta = serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 7 } } });
         assert_eq!(extract_message_usage(&meta), Some(totals(0, 0, 7, 0)));
+        let thoughts = serde_json::json!({ "usage": { "thoughtTokens": 9 } });
+        assert_eq!(
+            extract_message_usage(&thoughts),
+            Some(totals_with_thoughts(0, 0, 0, 0, 9))
+        );
         assert_eq!(
             extract_message_usage(&serde_json::json!({ "content": "hi" })),
             None
@@ -485,7 +501,10 @@ mod tests {
             "cachedWriteTokens": 4
         }))
         .expect("usage deserializes");
-        assert_eq!(snapshot_from_turn_usage(&usage), totals(70, 50, 30, 4));
+        assert_eq!(
+            snapshot_from_turn_usage(&usage),
+            totals_with_thoughts(70, 50, 30, 4, 8)
+        );
 
         // Absent optional counters map to zero.
         let sparse: Usage = serde_json::from_value(serde_json::json!({
@@ -495,6 +514,42 @@ mod tests {
         }))
         .expect("sparse usage deserializes");
         assert_eq!(snapshot_from_turn_usage(&sparse), totals(2, 1, 0, 0));
+    }
+
+    /// `thoughtTokens` folds through the same baseline+snapshot combine and
+    /// per-agent/per-model/workspace roll-up as the other counters (§5.23).
+    #[test]
+    fn thought_tokens_fold_through_the_tally() {
+        let baseline = totals_with_thoughts(100, 80, 10, 2, 40);
+        let snapshot = totals_with_thoughts(5, 3, 1, 1, 7);
+        let tally = agent_token_tally(
+            "agent-t",
+            Some("opus-4.8"),
+            Some(&baseline),
+            Some(&snapshot),
+            &[],
+        );
+        assert_eq!(tally.totals, totals_with_thoughts(105, 83, 11, 3, 47));
+        let usage = aggregate_token_usage(&[tally]);
+        assert_eq!(usage.totals.thought_tokens, 47);
+        assert_eq!(usage.by_agent_id["agent-t"].thought_tokens, 47);
+        assert_eq!(usage.by_model["opus-4.8"].thought_tokens, 47);
+    }
+
+    /// A snapshot that only reports reasoning tokens is still a token report:
+    /// it must not fall back to the per-message usage sum.
+    #[test]
+    fn thought_only_snapshot_is_a_report() {
+        let snapshot = totals_with_thoughts(0, 0, 0, 0, 12);
+        let contents = vec![serde_json::json!({ "usage": { "inputTokens": 999 } })];
+        let tally = agent_token_tally(
+            "agent-t",
+            Some("opus-4.8"),
+            None,
+            Some(&snapshot),
+            &contents,
+        );
+        assert_eq!(tally.totals, snapshot);
     }
 
     #[test]

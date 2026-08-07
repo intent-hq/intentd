@@ -7,7 +7,7 @@
 //! append-only transcript (publish/accumulate live in `intent-services`, which
 //! owns the store + bus; the mapping stays side-effect free here). Variants
 //! without a canonical `WorkspaceEvent` in `events/types.ts`
-//! (plan/mode/thought/commands/…) map to `None`: emitting invented event
+//! (plan/mode/commands/…) map to `None`: emitting invented event
 //! strings would break wire parity with the live iOS client. `usage_update`
 //! emits no event either, but its cumulative `cost` is mapped so the service
 //! layer can fold it into the workspace `TokenUsage` tally (§5.23).
@@ -300,15 +300,20 @@ pub fn supports_load_session(init: &InitializeResponse) -> bool {
 /// canonical `WorkspaceEvent` and accumulate the assistant transcript (§6.6).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MappedUpdate {
-    /// `agent_message_chunk` → `chat:stream:delta` (+ the throttled
-    /// `agent:stream:activity` signal) + transcript accumulation. `content` is
-    /// the event payload (`content: any`); `text` is the extracted text for
-    /// text blocks (used to coalesce the accumulated transcript).
+    /// `agent_message_chunk` / `agent_thought_chunk` → `chat:stream:delta` (+
+    /// the throttled `agent:stream:activity` signal) + transcript
+    /// accumulation. `content` is the event payload (`content: any`); `text` is
+    /// the extracted text for text blocks (used to coalesce the accumulated
+    /// transcript).
     Chunk {
         /// The `data.content` carried on the `chat:stream:delta` event.
         content: Value,
         /// Extracted text for text blocks; `None` for non-text content.
         text: Option<String>,
+        /// `true` for `agent_thought_chunk` (streamed reasoning), `false` for
+        /// `agent_message_chunk`. Thought chunks travel the same path as
+        /// message chunks with this marker set, mirroring Zed's `is_thought`.
+        thought: bool,
     },
     /// `tool_call` / `tool_call_update` → `agent:tool:call`.
     ToolCall(MappedToolCall),
@@ -350,13 +355,25 @@ pub struct MappedToolCall {
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
 /// no canonical `WorkspaceEvent` and nothing else to accumulate
-/// (plan/mode/thought/commands/…) (§6.6). `usage_update` maps only when it
+/// (plan/mode/commands/…) (§6.6). `usage_update` maps only when it
 /// carries a `cost` object (§5.23).
 pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             let (content, text) = map_content(&chunk.content);
-            Some(MappedUpdate::Chunk { content, text })
+            Some(MappedUpdate::Chunk {
+                content,
+                text,
+                thought: false,
+            })
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            let (content, text) = map_content(&chunk.content);
+            Some(MappedUpdate::Chunk {
+                content,
+                text,
+                thought: true,
+            })
         }
         SessionUpdate::ToolCall(tool_call) => {
             Some(MappedUpdate::ToolCall(map_tool_call(tool_call)))

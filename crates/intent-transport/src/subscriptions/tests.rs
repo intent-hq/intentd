@@ -801,6 +801,70 @@ fn chat_seed_from_snapshot_primes_in_flight_message_state() {
     assert_eq!(d["updated"][0]["block"]["text"], "Hello, world");
 }
 
+/// `thinking` chunks accumulate like text ones: one block id, `added` then
+/// `updated` with the full reasoning so far, and the block keeps its
+/// `thinking` type.
+#[test]
+fn chat_chunk_delta_accumulates_thinking_blocks() {
+    let mut s = ChatDeltaState::new(&agent());
+    let d1 = s
+        .chunk_delta(&chunk_event(
+            "msg-6",
+            "msg-6:0",
+            "thinking",
+            json!("Let me "),
+        ))
+        .expect("thinking chunk delta");
+    assert_eq!(d1["added"][0]["block"]["type"], "thinking");
+    assert_eq!(d1["added"][0]["block"]["text"], "Let me ");
+    let d2 = s
+        .chunk_delta(&chunk_event(
+            "msg-6",
+            "msg-6:0",
+            "thinking",
+            json!("think."),
+        ))
+        .expect("thinking chunk delta 2");
+    assert!(d2["added"].as_array().unwrap().is_empty());
+    assert_eq!(d2["updated"][0]["block"]["text"], "Let me think.");
+    assert_eq!(d2["updated"][0]["block"]["type"], "thinking");
+    // The text block that follows the reasoning is a separate accumulator.
+    let d3 = s
+        .chunk_delta(&chunk_event("msg-6", "msg-6:1", "text", json!("42.")))
+        .expect("text chunk delta");
+    assert_eq!(d3["added"][0]["block"]["type"], "text");
+    assert_eq!(d3["added"][0]["block"]["text"], "42.");
+}
+
+/// A mid-turn `chat.subscribe` seeds the accumulator from `thinking` blocks
+/// too, so the resumed reasoning stream is not truncated to its tail.
+#[test]
+fn chat_seed_from_snapshot_primes_thinking_blocks() {
+    let mut s = ChatDeltaState::new(&agent());
+    s.seed_from_snapshot(&json!({
+        "agentId": "agent-1",
+        "messages": [{
+            "id": "msg-live",
+            "role": "assistant",
+            "isStreaming": true,
+            "contentBlocks": [
+                { "id": "msg-live:0", "type": "thinking", "text": "Let me " }
+            ]
+        }],
+    }));
+    let d = s
+        .chunk_delta(&chunk_event(
+            "msg-live",
+            "msg-live:0",
+            "thinking",
+            json!("think."),
+        ))
+        .expect("post-seed thinking chunk");
+    assert!(d["added"].as_array().unwrap().is_empty());
+    assert_eq!(d["updated"][0]["block"]["text"], "Let me think.");
+    assert_eq!(d["updated"][0]["block"]["type"], "thinking");
+}
+
 #[test]
 fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
     let mut s = ChatDeltaState::new(&agent());
