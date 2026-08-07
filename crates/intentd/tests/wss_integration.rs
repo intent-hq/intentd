@@ -2140,6 +2140,119 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
     srv.ws.stop().await;
 }
 
+/// `model.defaultReasoningEffort` as the last rung of the creation-time
+/// effort resolution, over the real WSS transport: a no-model `agent.create`
+/// whose model resolves from the settings chain pins the configured effort,
+/// an explicit `model` (which pins the model itself) suppresses it, and a
+/// level the resolved model's cached `effortLevels` does not list is dropped
+/// with a warn rather than rejected — settings-chain leniency, so the create
+/// still succeeds with the effort omitted from the `AgentLite` payload.
+#[tokio::test]
+async fn wss_agent_create_applies_settings_default_reasoning_effort() {
+    let dir = test_tempdir("intentd-wss-settings-effort-");
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Settings Effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings default"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("auggie:fable-5"),
+        "settings default model pinned: {created}"
+    );
+    assert_eq!(
+        created["result"]["agent"]["reasoningEffort"],
+        Value::from("high"),
+        "settings default effort pinned alongside the settings default model: {created}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit model","model":"auggie:fable-5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an explicitly pinned model suppresses the settings default effort: {created}"
+    );
+
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("xhigh"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Unsupported"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created.get("error").is_none(),
+        "an unsupported settings level must never reject the create: {created}"
+    );
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an unsupported settings level is dropped, leaving the effort unset: {created}"
+    );
+
+    // Boundary check: a present-but-blank `reasoningEffort` is an explicit
+    // clear that must survive the router (`opt_str`, not `opt_nonempty_str`)
+    // and suppress the settings default instead of being collapsed to absent.
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit clear","reasoningEffort":""}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "a blank `reasoningEffort` is an explicit clear, not a fall-through: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
 /// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
@@ -2628,6 +2741,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
                 output_tokens: 40,
                 cache_read_tokens: 20,
                 cache_creation_tokens: 10,
+                thought_tokens: 12,
             },
         )
         .await
@@ -2638,6 +2752,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
             &bucket_key(now),
             &intent_store::UsageRateDelta {
                 input_tokens: 1,
+                thought_tokens: 3,
                 ..Default::default()
             },
         )
@@ -2679,6 +2794,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert!(s["outputTokens"].is_u64(), "{s}");
         assert!(s["cacheReadTokens"].is_u64(), "{s}");
         assert!(s["cacheCreationTokens"].is_u64(), "{s}");
+        assert!(s["thoughtTokens"].is_u64(), "{s}");
     }
     let buckets: Vec<&str> = samples
         .iter()
@@ -2696,6 +2812,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert_eq!(cur["outputTokens"], 40, "{resp}");
         assert_eq!(cur["cacheReadTokens"], 20, "{resp}");
         assert_eq!(cur["cacheCreationTokens"], 10, "{resp}");
+        assert_eq!(cur["thoughtTokens"], 15, "{resp}");
     } else {
         panic!("current-minute bucket missing from window: {resp}");
     }
@@ -2703,6 +2820,9 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         .expect("minute-2 bucket inside the window");
     assert_eq!(mid["inputTokens"], 7, "{resp}");
     assert_eq!(mid["outputTokens"], 2, "{resp}");
+    // A minute recorded without any reasoning tokens still carries the field
+    // (dense samples), reading back as the additive column's 0 default.
+    assert_eq!(mid["thoughtTokens"], 0, "{resp}");
     // Untouched minutes are zero-filled; the 30-minute-old row is outside.
     assert!(
         !samples.iter().any(|s| s["inputTokens"] == 999),

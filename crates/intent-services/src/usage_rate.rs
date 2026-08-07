@@ -41,7 +41,7 @@ pub fn minute_bucket_utc(t: OffsetDateTime) -> String {
 /// to UTC minutes — instead of folding it all into the turn-end minute. Buckets
 /// are returned oldest-first; the newest is always `turn_end`'s minute.
 ///
-/// Each of the four counters is split independently by integer division, and
+/// Each counter is split independently by integer division, and
 /// the remainder is distributed one token per bucket to the EARLIEST buckets,
 /// so the per-counter sum across the returned parts exactly equals the input
 /// counter (no tokens lost or invented).
@@ -79,6 +79,7 @@ pub fn split_delta_across_minutes(
     let (out_base, out_rem) = split(delta.output_tokens);
     let (cr_base, cr_rem) = split(delta.cache_read_tokens);
     let (cc_base, cc_rem) = split(delta.cache_creation_tokens);
+    let (th_base, th_rem) = split(delta.thought_tokens);
 
     (0..m)
         .map(|i| {
@@ -90,6 +91,7 @@ pub fn split_delta_across_minutes(
                 output_tokens: out_base + extra(out_rem),
                 cache_read_tokens: cr_base + extra(cr_rem),
                 cache_creation_tokens: cc_base + extra(cc_rem),
+                thought_tokens: th_base + extra(th_rem),
             };
             (bucket, part)
         })
@@ -136,6 +138,7 @@ pub fn rate_history_json(rows: &[UsageRateRow], limit: u32, now_utc: OffsetDateT
                 "outputTokens": r.output_tokens,
                 "cacheReadTokens": r.cache_read_tokens,
                 "cacheCreationTokens": r.cache_creation_tokens,
+                "thoughtTokens": r.thought_tokens,
             })
         })
         .collect();
@@ -151,19 +154,26 @@ mod tests {
         OffsetDateTime::parse(s, &Rfc3339).expect("parse test timestamp")
     }
 
-    fn delta(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> UsageRateDelta {
+    fn delta(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        thought: u64,
+    ) -> UsageRateDelta {
         UsageRateDelta {
             input_tokens: input,
             output_tokens: output,
             cache_read_tokens: cache_read,
             cache_creation_tokens: cache_creation,
+            thought_tokens: thought,
         }
     }
 
     #[test]
     fn split_single_minute_turn_yields_one_bucket() {
         let end = parse("2026-07-30T14:07:42Z");
-        let d = delta(100, 40, 7, 3);
+        let d = delta(100, 40, 7, 3, 12);
         // Zero-duration and a sub-minute turn wholly inside 14:07 both collapse
         // to the single end-minute bucket carrying the full delta.
         for dur in [
@@ -184,7 +194,7 @@ mod tests {
         let parts = split_delta_across_minutes(
             end,
             std::time::Duration::from_secs(20),
-            &delta(10, 0, 0, 0),
+            &delta(10, 0, 0, 0, 0),
         );
         let buckets: Vec<&str> = parts.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(buckets, ["2026-07-30T14:06:00Z", "2026-07-30T14:07:00Z"]);
@@ -199,7 +209,7 @@ mod tests {
         let parts = split_delta_across_minutes(
             end,
             std::time::Duration::from_millis(60_200),
-            &delta(9, 0, 0, 0),
+            &delta(9, 0, 0, 0, 0),
         );
         let buckets: Vec<&str> = parts.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(
@@ -222,7 +232,7 @@ mod tests {
         let parts = split_delta_across_minutes(
             end,
             std::time::Duration::from_secs(180),
-            &delta(40, 0, 0, 0),
+            &delta(40, 0, 0, 0, 0),
         );
         let buckets: Vec<&str> = parts.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(
@@ -244,13 +254,14 @@ mod tests {
     fn split_remainder_goes_to_earliest_buckets_and_conserves_each_counter() {
         let end = parse("2026-07-30T14:07:30Z");
         // Non-divisible per counter: input 13 (base 3, rem 1), output 14
-        // (base 3, rem 2), cache_read 4 (base 1, rem 0), cache_creation 5.
-        let d = delta(13, 14, 4, 5);
+        // (base 3, rem 2), cache_read 4 (base 1, rem 0), cache_creation 5,
+        // thought 6 (base 1, rem 2).
+        let d = delta(13, 14, 4, 5, 6);
         let parts = split_delta_across_minutes(end, std::time::Duration::from_secs(180), &d);
         assert_eq!(parts.len(), 4);
         // Earliest bucket absorbs the +1 tokens.
-        assert_eq!(parts[0].1, delta(4, 4, 1, 2));
-        assert_eq!(parts[3].1, delta(3, 3, 1, 1));
+        assert_eq!(parts[0].1, delta(4, 4, 1, 2, 2));
+        assert_eq!(parts[3].1, delta(3, 3, 1, 1, 1));
         // Every counter's parts sum back to the original — nothing lost/invented.
         let sum = parts
             .iter()
@@ -259,6 +270,7 @@ mod tests {
                 acc.output_tokens += p.output_tokens;
                 acc.cache_read_tokens += p.cache_read_tokens;
                 acc.cache_creation_tokens += p.cache_creation_tokens;
+                acc.thought_tokens += p.thought_tokens;
                 acc
             });
         assert_eq!(sum, d);
@@ -269,7 +281,7 @@ mod tests {
         let end = parse("2026-07-30T14:07:30Z");
         // A pathologically long turn (100 days) must not explode the loop.
         let dur = std::time::Duration::from_secs(100 * 24 * 60 * 60);
-        let parts = split_delta_across_minutes(end, dur, &delta(10_000, 0, 0, 0));
+        let parts = split_delta_across_minutes(end, dur, &delta(10_000, 0, 0, 0, 0));
         assert_eq!(parts.len(), MAX_RATE_HISTORY_LIMIT as usize);
         // Even capped, the counter is fully conserved across the buckets.
         let total: u64 = parts.iter().map(|(_, p)| p.input_tokens).sum();
@@ -278,11 +290,12 @@ mod tests {
         assert_eq!(parts.last().expect("last").0, "2026-07-30T14:07:00Z");
     }
 
-    fn row(bucket: &str, input: u64, output: u64) -> UsageRateRow {
+    fn row(bucket: &str, input: u64, output: u64, thought: u64) -> UsageRateRow {
         UsageRateRow {
             bucket_utc: bucket.to_string(),
             input_tokens: input,
             output_tokens: output,
+            thought_tokens: thought,
             ..Default::default()
         }
     }
@@ -326,23 +339,28 @@ mod tests {
         // Newest minute populated, one mid-window minute populated, the
         // rest missing; a row outside the window must be ignored.
         let rows = vec![
-            row("2026-07-30T14:07:00Z", 100, 40),
-            row("2026-07-30T14:05:00Z", 7, 2),
-            row("2026-07-30T13:00:00Z", 999, 999),
+            row("2026-07-30T14:07:00Z", 100, 40, 15),
+            row("2026-07-30T14:05:00Z", 7, 2, 0),
+            row("2026-07-30T13:00:00Z", 999, 999, 999),
         ];
         let v = rate_history_json(&rows, 5, now);
         let samples = v["samples"].as_array().expect("samples");
         assert_eq!(samples.len(), 5);
         assert_eq!(samples[0]["bucketUtc"], "2026-07-30T14:03:00Z");
         assert_eq!(samples[0]["inputTokens"], 0);
+        assert_eq!(samples[0]["thoughtTokens"], 0);
         assert_eq!(samples[2]["bucketUtc"], "2026-07-30T14:05:00Z");
         assert_eq!(samples[2]["inputTokens"], 7);
         assert_eq!(samples[2]["outputTokens"], 2);
+        // A minute whose provider never broke reasoning out still emits 0 —
+        // samples are dense, the field is never omitted.
+        assert_eq!(samples[2]["thoughtTokens"], 0);
         assert_eq!(samples[4]["bucketUtc"], "2026-07-30T14:07:00Z");
         assert_eq!(samples[4]["inputTokens"], 100);
         assert_eq!(samples[4]["outputTokens"], 40);
         assert_eq!(samples[4]["cacheReadTokens"], 0);
         assert_eq!(samples[4]["cacheCreationTokens"], 0);
+        assert_eq!(samples[4]["thoughtTokens"], 15);
         assert!(
             !samples.iter().any(|s| s["inputTokens"] == 999),
             "out-of-window row leaked into the history"
@@ -363,6 +381,7 @@ mod tests {
             assert_eq!(s["outputTokens"], 0);
             assert_eq!(s["cacheReadTokens"], 0);
             assert_eq!(s["cacheCreationTokens"], 0);
+            assert_eq!(s["thoughtTokens"], 0);
         }
     }
 }
