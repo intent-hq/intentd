@@ -168,7 +168,8 @@ pub(crate) fn host_status_json(
 /// filesystem / subprocess work on a blocking thread so the async runtime stays
 /// free; `checkAuggie` consults `api.settings_get` for `context.auggiePath` and
 /// `providers.paths.auggie` before falling back to the canonical resolver in
-/// `intent_services::auggie_discovery`. `findBinary` / `findApp` require a
+/// `intent_services::auggie_discovery`, and is resolution-only (`{ available,
+/// path? }` — no `--version` spawn). `findBinary` / `findApp` require a
 /// `name` param (`-32602` when absent); `env` is secret-safe (names only, no
 /// values); `findApp` / `listInstalledEditors` return only app names + paths.
 /// `reverse` is the connection's reverse-RPC channel, consumed by the
