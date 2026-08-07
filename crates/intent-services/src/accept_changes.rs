@@ -188,11 +188,16 @@ pub(crate) fn build_git_status_value_with(
     }
 
     let started = std::time::Instant::now();
-    let status = match scanned {
-        Some(s) => s,
-        None => std::sync::Arc::new(intent_git::status::status(worktree)?),
+    // `status_ms` only attributes a scan this call actually ran; with an
+    // injected status the scan was paid by (or shared with) another caller's
+    // flight, so it logs as absent rather than a misleading ~0.
+    let (status, status_ms) = match scanned {
+        Some(s) => (s, None),
+        None => {
+            let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
+            (s, Some(started.elapsed().as_millis() as u64))
+        }
     };
-    let status_ms = started.elapsed().as_millis() as u64;
     let branch = if status.branch.is_empty() {
         ws.branch.clone()
     } else {

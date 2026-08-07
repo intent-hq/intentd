@@ -10680,6 +10680,123 @@ mod file_tracking {
         assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
     }
 
+    /// `git.changes` runs the same working-tree scan, so it shares the flight
+    /// with a concurrent `git.status` for the same worktree (monorepo#1648)
+    /// while still projecting only the file list.
+    #[tokio::test]
+    async fn git_changes_shares_the_scan_with_git_status() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let status = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let changes = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_changes(ws).await }
+        });
+        wait_until("git.changes to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let full = status.await.unwrap().unwrap();
+        let value = changes.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        // Wire shape unchanged: still the bare `status.files` projection.
+        assert_eq!(value, serde_json::to_value(&full.files).unwrap());
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "seed.txt"));
+    }
+
+    /// A leader that vanishes before publishing (cancelled RPC) wakes its
+    /// followers to elect a new leader rather than hanging them — the
+    /// service-level counterpart of the module's dropped-leader test.
+    #[tokio::test]
+    async fn git_status_aborted_leader_lets_a_follower_retry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let park = Arc::new(AtomicBool::new(true));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let park = Arc::clone(&park);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while park.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        // Cancel the leader: its guard drops without publishing, closing the
+        // channel so the follower re-joins and leads its own scan.
+        leader.abort();
+        park.store(false, Ordering::SeqCst);
+        let retried = follower.await.unwrap().unwrap();
+        assert!(
+            retried.files.iter().any(|f| f.path == "seed.txt"),
+            "follower's retry produced a real status"
+        );
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "follower led its own scan after the leader vanished"
+        );
+    }
+
     /// A coalesced follower surfaces the *same* error as the leader: the shared
     /// failure travels as the inner message, so the follower's re-wrap does not
     /// produce a doubled `internal error:` prefix.

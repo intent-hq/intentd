@@ -16802,12 +16802,12 @@ impl WorkspaceApi for Services {
     }
 
     fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
+        let svc = self.clone();
         Box::pin(async move {
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
             // empty list), but projecting only the working-tree file list.
             let empty = serde_json::json!([]);
-            let ws = match store.get_workspace(&workspace_id).await {
+            let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
@@ -16821,14 +16821,11 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            // libgit2 status on the blocking pool (same as git_status).
-            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
-                .await
-                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
-            match status {
-                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
-                Err(e) => Err(e),
-            }
+            // The same working-tree scan `git.status` pays, so it goes through
+            // the shared per-worktree single-flight (monorepo#1648): a burst
+            // mixing `git.changes` with `git.status` walks the tree once.
+            let status = svc.scan_git_status(&path).await?;
+            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
         })
     }
 
