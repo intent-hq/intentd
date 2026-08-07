@@ -656,6 +656,162 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
     }
 }
 
+const MERGE_REQUIREMENTS_QUERY: &str = r#"
+query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $prNumber) {
+      mergeStateStatus
+      reviewDecision
+      baseRefName
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                    isRequired(pullRequestNumber: $prNumber)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// The GraphQL pointer to the PR's status-check rollup contexts (the last
+/// commit on the PR is its head).
+const ROLLUP_CONTEXTS_POINTER: &str =
+    "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts/nodes";
+
+/// Map a legacy commit-status `state` (`StatusState`) onto [`CheckState`].
+/// `EXPECTED`/`PENDING` are still running; `ERROR`/`FAILURE` fail.
+fn derive_status_context_state(state: &str) -> CheckState {
+    match state {
+        "SUCCESS" => CheckState::Success,
+        "EXPECTED" | "PENDING" => CheckState::Pending,
+        _ => CheckState::Failure,
+    }
+}
+
+/// Map one `statusCheckRollup.contexts` node onto a [`RollupCheck`]. GraphQL
+/// `CheckRun` carries `status`/`conclusion` in SCREAMING_SNAKE_CASE (unlike
+/// the lowercase REST payload [`derive_check_state`] expects), so the values
+/// are lowercased before mapping; `StatusContext` uses the legacy `state`.
+fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
+    let is_required = value
+        .get("isRequired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let url = |key: &str| value.get(key).and_then(Value::as_str).map(String::from);
+    match value.get("__typename").and_then(Value::as_str) {
+        Some("StatusContext") => Some(RollupCheck {
+            name: value
+                .get("context")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            state: derive_status_context_state(
+                value
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            is_required,
+            url: url("targetUrl"),
+        }),
+        Some("CheckRun") => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let conclusion = value
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase);
+            Some(RollupCheck {
+                name: value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                state: derive_check_state(&status, conclusion.as_deref()),
+                is_required,
+                url: url("detailsUrl"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Map the `GET /repos/{o}/{r}/rules/branches/{branch}` payload (a flat array
+/// of the rules that apply to the branch) onto the merge-relevant subset.
+/// Unknown rule types are ignored; the strictest value wins when several
+/// rulesets impose the same rule.
+fn map_branch_rules(value: &Value) -> BranchRules {
+    let mut rules = BranchRules::default();
+    let Some(items) = value.as_array() else {
+        return rules;
+    };
+    for item in items {
+        let params = item.get("parameters");
+        match item.get("type").and_then(Value::as_str) {
+            Some("pull_request") => {
+                if let Some(count) = params
+                    .and_then(|p| p.get("required_approving_review_count"))
+                    .and_then(Value::as_u64)
+                {
+                    let count = count as u32;
+                    rules.required_approving_review_count = Some(
+                        rules
+                            .required_approving_review_count
+                            .map_or(count, |prev| prev.max(count)),
+                    );
+                }
+                if let Some(required) = params
+                    .and_then(|p| p.get("required_review_thread_resolution"))
+                    .and_then(Value::as_bool)
+                {
+                    rules.required_conversation_resolution =
+                        Some(rules.required_conversation_resolution.unwrap_or(false) || required);
+                }
+            }
+            Some("required_status_checks") => {
+                let checks = params
+                    .and_then(|p| p.get("required_status_checks"))
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for check in checks {
+                    if let Some(context) = check.get("context").and_then(Value::as_str) {
+                        if !rules.required_status_checks.iter().any(|c| c == context) {
+                            rules.required_status_checks.push(context.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rules
+}
+
 const REVIEW_THREADS_QUERY: &str = r#"
 query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
@@ -1014,6 +1170,70 @@ impl SourceControl for GitHubSourceControl {
         let resp: Value = self.client.graphql(&payload).await?;
         let data = graphql_data(resp)?;
         Ok(parse_review_decision(&data))
+    }
+
+    async fn merge_requirements(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<MergeRequirementSignals> {
+        let payload = json!({
+            "query": MERGE_REQUIREMENTS_QUERY,
+            "variables": {
+                "owner": repo.owner,
+                "repo": repo.name,
+                "prNumber": number,
+            },
+        });
+        let resp: Value = self.client.graphql(&payload).await?;
+        let data = graphql_data(resp)?;
+        let pr = data.pointer("/repository/pullRequest");
+        let merge_state_status = pr
+            .and_then(|p| p.get("mergeStateStatus"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        let rollup = data
+            .pointer(ROLLUP_CONTEXTS_POINTER)
+            .and_then(Value::as_array);
+        let checks = rollup
+            .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
+            .unwrap_or_default();
+
+        // The base branch's rules are a separate REST read whose endpoint may
+        // be unreadable (older GHES, a token without the scope); that degrades
+        // to `None` instead of failing the probe.
+        let branch_rules = match pr
+            .and_then(|p| p.get("baseRefName"))
+            .and_then(Value::as_str)
+            .filter(|b| !b.is_empty())
+        {
+            Some(base) => {
+                let route = Self::repo_path(
+                    repo,
+                    &format!("/rules/branches/{}", encode_path_segments(base)),
+                );
+                match self.client.get::<Value, _, ()>(&route, None::<&()>).await {
+                    Ok(v) => Some(map_branch_rules(&v)),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            pr_number = number,
+                            "merge_requirements: branch rules unreadable, degrading"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        Ok(MergeRequirementSignals {
+            merge_state_status,
+            review_decision: parse_review_decision(&data),
+            checks,
+            checks_known: rollup.is_some(),
+            branch_rules,
+        })
     }
 
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
@@ -1487,6 +1707,126 @@ mod tests {
         assert_eq!(
             parse_review_decision(&json!({ "repository": { "pullRequest": null } })),
             None
+        );
+    }
+
+    #[test]
+    fn maps_rollup_contexts_from_both_variants() {
+        let check = map_rollup_context(&json!({
+            "__typename": "CheckRun",
+            "name": "build",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://ci/run/1",
+            "isRequired": true
+        }))
+        .unwrap();
+        assert_eq!(check.name, "build");
+        assert_eq!(check.state, CheckState::Success);
+        assert!(check.is_required);
+        assert_eq!(check.url.as_deref(), Some("https://ci/run/1"));
+
+        // An in-flight check-run is pending regardless of conclusion.
+        let pending = map_rollup_context(&json!({
+            "__typename": "CheckRun",
+            "name": "e2e",
+            "status": "IN_PROGRESS",
+            "conclusion": null,
+            "isRequired": false
+        }))
+        .unwrap();
+        assert_eq!(pending.state, CheckState::Pending);
+        assert!(!pending.is_required);
+
+        let status = map_rollup_context(&json!({
+            "__typename": "StatusContext",
+            "context": "ci/legacy",
+            "state": "FAILURE",
+            "targetUrl": "https://ci/legacy",
+            "isRequired": true
+        }))
+        .unwrap();
+        assert_eq!(status.name, "ci/legacy");
+        assert_eq!(status.state, CheckState::Failure);
+        assert!(status.is_required);
+
+        // Unknown union members are skipped rather than mis-mapped.
+        assert!(map_rollup_context(&json!({ "__typename": "Something" })).is_none());
+    }
+
+    #[test]
+    fn maps_branch_rules_subset_and_ignores_unknown_types() {
+        let rules = map_branch_rules(&json!([
+            { "type": "deletion" },
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 1,
+                    "required_review_thread_resolution": true
+                }
+            },
+            {
+                "type": "pull_request",
+                "parameters": { "required_approving_review_count": 2 }
+            },
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        { "context": "build" },
+                        { "context": "test" },
+                        { "context": "build" }
+                    ]
+                }
+            }
+        ]));
+        // The strictest approval count across rulesets wins; contexts dedupe.
+        assert_eq!(rules.required_approving_review_count, Some(2));
+        assert_eq!(rules.required_conversation_resolution, Some(true));
+        assert_eq!(
+            rules.required_status_checks,
+            vec!["build".to_string(), "test".to_string()]
+        );
+
+        // An empty ruleset array reports no rules (not an error).
+        assert_eq!(map_branch_rules(&json!([])), BranchRules::default());
+        assert_eq!(map_branch_rules(&json!({})), BranchRules::default());
+    }
+
+    #[test]
+    fn merge_requirement_signals_serialize_camel_case() {
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("BLOCKED".into()),
+            review_decision: Some(ReviewDecision::ReviewRequired),
+            checks: vec![RollupCheck {
+                name: "build".into(),
+                state: CheckState::Pending,
+                is_required: true,
+                url: None,
+            }],
+            checks_known: true,
+            branch_rules: Some(BranchRules {
+                required_approving_review_count: Some(1),
+                required_conversation_resolution: Some(true),
+                required_status_checks: vec!["build".into()],
+            }),
+        };
+        let wire = serde_json::to_value(&signals).unwrap();
+        assert_eq!(wire["mergeStateStatus"], "BLOCKED");
+        assert_eq!(wire["reviewDecision"], "review_required");
+        assert_eq!(wire["checksKnown"], true);
+        assert_eq!(wire["checks"][0]["isRequired"], true);
+        assert_eq!(
+            wire["branchRules"]["requiredApprovingReviewCount"],
+            json!(1)
+        );
+        assert_eq!(
+            wire["branchRules"]["requiredConversationResolution"],
+            json!(true)
+        );
+        assert_eq!(
+            wire["branchRules"]["requiredStatusChecks"],
+            json!(["build"])
         );
     }
 
