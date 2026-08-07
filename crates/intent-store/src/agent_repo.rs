@@ -1967,6 +1967,7 @@ impl Store {
                         cache_creation_tokens: b
                             .cache_creation_tokens
                             .saturating_add(s.cache_creation_tokens),
+                        thought_tokens: b.thought_tokens.saturating_add(s.thought_tokens),
                         // Cost is cumulative per ACP session exactly like the
                         // counters, so the fold banks it the same way (§5.23).
                         cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
@@ -3081,6 +3082,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3092,6 +3094,7 @@ mod tests {
             output_tokens: 80,
             cache_read_tokens: 45,
             cache_creation_tokens: 6,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3251,6 +3254,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 5,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3284,6 +3288,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_creation_tokens: 40,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3307,6 +3312,7 @@ mod tests {
                 output_tokens: 60,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 45,
+                thought_tokens: 0,
                 cost: None,
             }),
             "second recreate accumulates onto the baseline"
@@ -3360,6 +3366,7 @@ mod tests {
             output_tokens: 8,
             cache_read_tokens: 9,
             cache_creation_tokens: 10,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3401,6 +3408,7 @@ mod tests {
             output_tokens: 4,
             cache_read_tokens: 5,
             cache_creation_tokens: 6,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -3477,6 +3485,7 @@ mod tests {
             output_tokens: 22,
             cache_read_tokens: 33,
             cache_creation_tokens: 44,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -3587,6 +3596,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3642,6 +3652,7 @@ mod tests {
             output_tokens: 6,
             cache_read_tokens: 7,
             cache_creation_tokens: 8,
+            thought_tokens: 0,
             cost: None,
         };
         store
@@ -3719,6 +3730,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                thought_tokens: 0,
                 cost: None,
             };
             store
@@ -3753,6 +3765,7 @@ mod tests {
                 output_tokens: 120,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                thought_tokens: 0,
                 cost: None,
             }),
             "every fold landed exactly once"
@@ -3776,6 +3789,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         {
@@ -3966,6 +3980,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
 
@@ -4210,6 +4225,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            thought_tokens: 0,
             cost: None,
         };
         store

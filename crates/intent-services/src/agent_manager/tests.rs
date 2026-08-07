@@ -9667,8 +9667,7 @@ mod harness_wake_tests {
             method: "session/update".to_string(),
             params: json!({
                 "sessionId": "acp-wake",
-                "update": { "sessionUpdate": "agent_thought_chunk",
-                    "content": { "type": "text", "text": "thinking" } }
+                "update": { "sessionUpdate": "plan", "entries": [] }
             }),
         }
     }

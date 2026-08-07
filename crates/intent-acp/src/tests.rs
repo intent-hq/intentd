@@ -734,6 +734,7 @@ mod session_tests {
             Some(MappedUpdate::Chunk {
                 content: json!("tok"),
                 text: Some("tok".to_string()),
+                thought: false,
             })
         );
     }
@@ -1448,13 +1449,32 @@ mod session_tests {
         assert_eq!(tc.input, json!({ "arguments": "text", "tool": "x" }));
     }
 
+    /// `agent_thought_chunk` travels the same path as a message chunk with the
+    /// `thought` marker set (Zed's `is_thought`), carrying the extracted text.
     #[test]
-    fn unmapped_variants_return_none() {
+    fn maps_thought_chunk_with_thought_marker() {
         let thought =
             SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::v1::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("thinking")),
             ));
-        assert_eq!(session::map_session_update(&thought), None);
+        assert_eq!(
+            session::map_session_update(&thought),
+            Some(MappedUpdate::Chunk {
+                content: json!("thinking"),
+                text: Some("thinking".to_string()),
+                thought: true,
+            })
+        );
+    }
+
+    #[test]
+    fn unmapped_variants_return_none() {
+        let plan: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "plan",
+            "entries": []
+        }))
+        .expect("plan update deserializes");
+        assert_eq!(session::map_session_update(&plan), None);
     }
 
     #[test]
@@ -1474,6 +1494,7 @@ mod session_tests {
             Some(MappedUpdate::Chunk {
                 content: json!("hi"),
                 text: Some("hi".to_string()),
+                thought: false,
             })
         );
 

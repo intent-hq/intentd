@@ -12677,3 +12677,199 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
         "activity payload never carries transcript content: {first}"
     );
 }
+
+/// Streamed reasoning over the real WSS transport: two `agent_thought_chunk`
+/// updates coalesce into ONE `thinking` block on the live `chat.subscribe`
+/// channel, the assistant text that follows opens a separate `text` block,
+/// and both persist in stream order under the same ids `agent.getConversation`
+/// returns.
+#[tokio::test]
+async fn thinking_blocks_stream_and_persist_over_wss() {
+    let Some(script) = gate("WSS thinking-block E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The mock echoes the canned thought chunks before its response text.
+    let behavior = json!({
+        "response": "The answer is 42.",
+        "rawUpdates": [
+            { "sessionUpdate": "agent_thought_chunk",
+              "content": { "type": "text", "text": "Let me " } },
+            { "sessionUpdate": "agent_thought_chunk",
+              "content": { "type": "text", "text": "think." } }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "think then answer" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect live blocks until the turn's terminal (streamingComplete) delta.
+    // Single total deadline (per-frame reads would reset on heartbeat Pings).
+    let live: Vec<Value> = timeout(Duration::from_secs(30), async {
+        // Latest-wins per block id: the accumulating chunk deltas re-send the
+        // whole block, so the last copy seen is the complete one.
+        let mut blocks: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            let mut terminal = false;
+            for entity in delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                // The echoed user message rides the same channel and is
+                // complete on arrival; only the assistant turn ends the loop.
+                .filter(|e| {
+                    !e["messageId"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("user-msg"))
+                })
+            {
+                terminal |= entity.get("streamingComplete") == Some(&Value::Bool(true));
+                let block = entity["block"].clone();
+                match blocks.iter_mut().find(|b| b["id"] == block["id"]) {
+                    Some(existing) => *existing = block,
+                    None => blocks.push(block),
+                }
+            }
+            if terminal {
+                return blocks;
+            }
+        }
+    })
+    .await
+    .expect("turn reached its terminal delta in time");
+
+    let thinking = live
+        .iter()
+        .find(|b| b["type"] == "thinking")
+        .unwrap_or_else(|| panic!("a thinking block reached the chat channel: {live:?}"));
+    assert_eq!(
+        thinking["text"],
+        json!("Let me think."),
+        "consecutive thought chunks coalesce into one block: {thinking}"
+    );
+    let thinking_id = thinking["id"].as_str().expect("thinking id").to_string();
+    let text = live
+        .iter()
+        .find(|b| b["type"] == "text")
+        .expect("the assistant text block reached the chat channel");
+    assert_ne!(
+        text["id"].as_str(),
+        Some(thinking_id.as_str()),
+        "assistant text opens a block of its own: {text}"
+    );
+
+    // The persisted transcript holds both blocks in stream order under the
+    // SAME ids the live channel used.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let assistant = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant row persisted");
+    let persisted = assistant["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks array");
+    let types: Vec<&str> = persisted
+        .iter()
+        .filter_map(|b| b["type"].as_str())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["thinking", "text"],
+        "reasoning persists before the answer: {assistant}"
+    );
+    assert_eq!(persisted[0]["text"], json!("Let me think."));
+    assert_eq!(
+        persisted[0]["id"].as_str(),
+        Some(thinking_id.as_str()),
+        "live and persisted thinking-block ids agree: {assistant}"
+    );
+    assert!(
+        persisted[1]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("The answer is 42.")),
+        "the answer persists as assistant text: {assistant}"
+    );
+    // Reasoning never leaks into the agent-list preview.
+    let listed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let preview = listed["agent"]["lastAgentResponse"].as_str().unwrap_or("");
+    assert!(
+        !preview.contains("Let me think."),
+        "thought text stays out of lastAgentResponse: {listed}"
+    );
+}

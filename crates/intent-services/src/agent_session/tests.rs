@@ -3207,25 +3207,24 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
 }
 
 /// Warn-and-continue (idle timeout after an UNMAPPED update): a
-/// `session/update` variant with no canonical turn mapping (here a thought
-/// chunk — same class as plan/mode/usage) still reset the idle timer, so it
+/// `session/update` variant with no canonical turn mapping (here a plan
+/// update — same class as mode/commands) still reset the idle timer, so it
 /// counts as intervening activity: the wrapped error carries the
 /// streamed-output suffix even though nothing was applied to the transcript.
 #[tokio::test]
 async fn idle_timeout_after_unmapped_update_marks_streamed() {
     let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    let thought = json!({
+    let plan = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "sessionId": ACP_SID,
-            "update": { "sessionUpdate": "agent_thought_chunk",
-                "content": { "type": "text", "text": "thinking" } }
+            "update": { "sessionUpdate": "plan", "entries": [] }
         }
     })
     .to_string();
-    let (conn, mut note_rx, _agent) = connect_silent(vec![thought]);
+    let (conn, mut note_rx, _agent) = connect_silent(vec![plan]);
     let _sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -4163,5 +4162,178 @@ async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
         activities[1].data["lastAgentResponse"],
         json!("Hello"),
         "tool-arm pings carry the same live preview fields as chunk-arm pings"
+    );
+}
+
+// --- Thinking blocks (streamed reasoning) ---------------------------------
+
+fn thought_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+fn message_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+/// Consecutive thought chunks coalesce into ONE `thinking` block, and a
+/// thought↔text switch (either direction) closes the open block and starts a
+/// new one — so thought → text → thought persists three interleaved blocks in
+/// stream order.
+#[tokio::test]
+async fn thought_chunks_coalesce_and_interleave_with_text() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        thought_note("Let me "),
+        thought_note("think."),
+        message_note("Answer: "),
+        message_note("42."),
+        thought_note("Double-checking."),
+    ] {
+        assert!(
+            services
+                .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+                .await,
+            "every chunk (thought or text) is a turn update"
+        );
+    }
+
+    let blocks = transcript.into_blocks();
+    assert_eq!(
+        blocks,
+        vec![
+            json!({ "type": "thinking", "id": "m1:0", "text": "Let me think." }),
+            json!({ "type": "text", "id": "m1:1", "text": "Answer: 42." }),
+            json!({ "type": "thinking", "id": "m1:2", "text": "Double-checking." }),
+        ],
+        "consecutive thoughts merge; each thought↔text switch opens a new block"
+    );
+}
+
+/// A tool call breaks an open `thinking` block exactly as it breaks a text
+/// block, and the thought resumed after it lands in a fresh block.
+#[tokio::test]
+async fn tool_call_breaks_an_open_thinking_block() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let tool = IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "bash: ls", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "ls" } }
+        }),
+    };
+    for note in [thought_note("Plan it."), tool, thought_note("Read it.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let types: Vec<&str> = blocks
+        .iter()
+        .map(|b| b["type"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(types, vec!["thinking", "tool_use", "thinking"]);
+    assert_eq!(blocks[0]["text"], json!("Plan it."));
+    assert_eq!(blocks[2]["text"], json!("Read it."));
+}
+
+/// Thought chunks stream as `chat:stream:delta` with `blockType: "thinking"`
+/// on their own stable block id, and never leak into the
+/// `agent:stream:activity` live preview (`lastAgentResponse`/`digest`).
+#[tokio::test]
+async fn thought_deltas_carry_thinking_block_type_and_skip_live_previews() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("Reasoning...\n"), thought_note("more\n")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let deltas: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "chat:stream:delta")
+        .collect();
+    assert_eq!(deltas.len(), 2, "one delta per thought chunk");
+    for d in &deltas {
+        assert_eq!(d.data["blockType"], json!("thinking"));
+        assert_eq!(d.data["blockIndex"], json!(0), "coalesced onto one block");
+        assert_eq!(d.data["blockId"], json!("m1:0"));
+    }
+    assert_eq!(deltas[0].data["content"], json!("Reasoning...\n"));
+
+    for a in events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+    {
+        assert!(
+            a.data.get("lastAgentResponse").is_none() && a.data.get("digest").is_none(),
+            "thought text never feeds the live preview: {:?}",
+            a.data
+        );
+    }
+}
+
+/// Thought text is excluded from the text-block extraction the agent-list
+/// previews read, while assistant text in the same turn still counts.
+#[tokio::test]
+async fn thought_text_is_absent_from_text_block_extraction() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("secret reasoning"), message_note("Done.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+    assert_eq!(transcript.text_block_strings(), vec!["Done.".to_string()]);
+
+    // A turn that streamed ONLY reasoning contributes no preview text and
+    // leaves no open final text block.
+    let mut thought_only = super::Transcript::new("m2".to_string());
+    services
+        .route_notification(
+            &thought_note("only reasoning"),
+            &agent_id,
+            &workspace_id,
+            &mut thought_only,
+        )
+        .await;
+    assert!(thought_only.text_block_strings().is_empty());
+    assert!(!thought_only.final_text_block_open());
+    assert_eq!(
+        thought_only.snapshot_blocks(),
+        vec![json!({ "type": "thinking", "id": "m2:0", "text": "only reasoning" })],
+        "the live-turn snapshot carries the in-flight thinking block"
     );
 }
