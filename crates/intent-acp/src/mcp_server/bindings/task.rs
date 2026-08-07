@@ -64,9 +64,9 @@ pub(crate) async fn dispatch(
         "updateNoteStatus" => update_note_status(api, ws, args).await,
         "update" => update(api, ws, args).await,
         "getMyTask" => get_my_task(api, ws, args).await,
-        "markAsTask" => mark_as_task(api, ws, args).await,
+        "markAsTask" => mark_as_task(api, ws, caller_agent_id, args).await,
         "convertBlocks" => convert_blocks(api, ws, caller_agent_id, args).await,
-        "createPrerequisite" => create_prerequisite(api, ws, args).await,
+        "createPrerequisite" => create_prerequisite(api, ws, caller_agent_id, args).await,
         "assignAgent" => assign_agent(api, ws, args).await,
         other => Err(format!("host: unknown method `task.{other}`")),
     }
@@ -169,6 +169,7 @@ async fn get_my_task(
 async fn mark_as_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId")?;
@@ -188,6 +189,7 @@ async fn mark_as_task(
             status.clone(),
             acceptance_criteria,
             effort,
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
@@ -218,6 +220,7 @@ async fn convert_blocks(
 async fn create_prerequisite(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let dependent_note_id = req_str(args, "dependentNoteId")?;
@@ -231,6 +234,7 @@ async fn create_prerequisite(
             title,
             content,
             status,
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;
