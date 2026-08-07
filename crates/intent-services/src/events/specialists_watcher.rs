@@ -65,9 +65,7 @@ impl SpecialistsWatcher {
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
         if let Some(root) = &user_dir {
-            if let Ok(watcher) = watch_directory(root.clone(), None, raw_tx.clone()) {
-                user_watchers.push(watcher);
-            }
+            user_watchers.push(watch_directory(root.clone(), None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -101,6 +99,28 @@ impl SpecialistsWatcher {
         let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watchers);
+        }
+    }
+
+    /// Await every registered root watch actually being established. Watch
+    /// registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating the watched directories.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: Duration) {
+        for watch in &self._user_watchers {
+            watch.wait_established(timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_up = self
+                .workspace_watchers
+                .lock()
+                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
+                .unwrap_or(true);
+            if all_up || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -153,10 +173,11 @@ fn start_project_watchers(
     raw_tx: &mpsc::UnboundedSender<SpecialistsMsg>,
 ) -> Vec<RootWatch> {
     let root = project_dir(workspace_path);
-    match watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
-        Ok(watcher) => vec![watcher],
-        Err(_) => Vec::new(),
-    }
+    vec![watch_directory(
+        root,
+        Some(workspace_id.clone()),
+        raw_tx.clone(),
+    )]
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -185,7 +206,7 @@ fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SpecialistsMsg>,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     watch_root(root, is_md, move || {
         let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
     })
@@ -501,6 +522,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
@@ -546,6 +568,7 @@ mod tests {
         // to match) to tolerate fsevents detection + forward-task latency under
         // load. Behavior under test is unchanged; only the headroom before the
         // "no event" verdict.
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
@@ -591,6 +614,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -638,6 +662,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -681,6 +706,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved
@@ -732,9 +758,11 @@ mod tests {
         // Start with NO workspaces; register at runtime (#611).
         let watcher =
             SpecialistsWatcher::start_with_user_dir(bus.clone(), vec![], Some(user.path.clone()));
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Registration alone must not emit (fingerprint primed at add time).

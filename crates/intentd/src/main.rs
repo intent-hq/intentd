@@ -982,11 +982,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // like the pre-#592 fetch bug). First tick fires immediately so stuck
     // sandboxes self-heal on startup. Aborted on clean shutdown.
     let merge_retry_task = spawn_sandbox_merge_retry_loop(services.clone());
-    // External MCP servers (§18.3): start every enabled, non-disabled server,
-    // then run the health monitor (periodic ping + auto-restart pushing
-    // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
-    // server processes remain (PTY-host reaping parity).
-    services.start_enabled_mcp_servers().await;
+    // External MCP servers (§18.3): the health monitor (periodic ping +
+    // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
+    // starting the enabled servers themselves is deferred to the background
+    // init below because each handshake can take seconds. The hub is reaped on
+    // shutdown so no orphan server processes remain (PTY-host reaping parity).
     let mcp_hub = services.mcp_hub();
     let mcp_monitor = mcp_hub.spawn_health_monitor();
 
@@ -999,16 +999,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
     let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
-    // Start the watcher registry (#611): seeds a filesystem watcher per active
-    // workspace (debounced `file:*` events), a narrow `.git` metadata watch per
-    // git workspace (external git operations → git-status refresh, monorepo#1397),
-    // the skills watcher (`skills:changed`), and the specialists watcher
-    // (`specialists:changed`), then follows workspace lifecycle events so
-    // workspaces created/opened after boot gain watching and deleted/closed
-    // workspaces are torn down without a restart. The handle is held for the
-    // lifetime of `serve` and torn down on return.
-    let _watcher_registry =
-        WatcherRegistry::start(bus.clone(), api.clone(), Arc::clone(&git_status_refresher)).await;
+    // Slow initializations run in the background so the listeners below bind —
+    // and `system.status` answers — without waiting on them (monorepo#1581):
+    // enabled MCP servers (started serially, each handshake up to a multi-second
+    // timeout) and the watcher registry (serial FSEvents registrations, which on
+    // a loaded macOS `fseventsd` cost seconds each). Both handles are aborted on
+    // clean shutdown, which drops the registry and every watcher it owns.
+    let mut mcp_start_task = {
+        let services = services.clone();
+        tokio::spawn(async move { services.start_enabled_mcp_servers().await })
+    };
+    let watcher_init_task =
+        spawn_watcher_registry_init(bus.clone(), api.clone(), Arc::clone(&git_status_refresher));
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1123,24 +1125,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
     // Valid external edits update the registry, run the same server runtime
     // hooks as `settings.update`, and emit `settings:changed`; invalid edits
-    // keep last-good values. Held for the lifetime of `serve`; dropping it on
-    // return tears the watch down with the daemon.
-    let watcher_services = services.clone();
-    let _config_watcher =
-        match intent_services::ConfigWatcher::start(settings_registry.clone(), move |notice| {
-            let services = watcher_services.clone();
-            async move { services.apply_external_settings_change(&notice).await }
-        }) {
-            Ok(watcher) => Some(watcher),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "config.toml live-reload watcher failed to start; \
-                     external edits will require a daemon restart"
-                );
-                None
-            }
-        };
+    // keep last-good values. Registration is a synchronous FSEvents call, so
+    // it too runs in the background (monorepo#1581) with the guard held by the
+    // task for the lifetime of `serve`; aborting the handle at shutdown drops
+    // the guard and tears the watch down with the daemon.
+    let config_watcher_task =
+        spawn_config_watcher_init(settings_registry.clone(), services.clone());
 
     // Boot-time secure WSS listener auto-start when the effective
     // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
@@ -1278,8 +1268,30 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     }
     idempotency_reap_task.abort();
     merge_retry_task.abort();
+    // Drop the watcher registry (and every filesystem/skills/specialists watch
+    // it owns) plus the config.toml live-reload watch by aborting the tasks
+    // that hold them.
+    watcher_init_task.abort();
+    config_watcher_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
-    // group so no orphan stdio servers survive the daemon (§18.3).
+    // group so no orphan stdio servers survive the daemon (§18.3). The deferred
+    // start task is JOINED (bounded) rather than merely aborted: a server still
+    // mid-handshake is not in the hub map yet, so cancelling it there would drop
+    // the child outside the process-group reap and its grandchildren would
+    // survive (`kill_on_drop` only covers the direct child). Letting the sweep
+    // settle first puts every child it spawned in the map, so `shutdown` reaps
+    // them. Only if the grace expires do we abort and accept the drop path.
+    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!(
+                grace_ms = MCP_START_JOIN_GRACE.as_millis() as u64,
+                "deferred MCP start sweep did not settle within the shutdown grace; \
+                 aborting it — a server mid-handshake may leave orphan grandchildren"
+            );
+            mcp_start_task.abort();
+        }
+    }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
@@ -2386,6 +2398,128 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
     })
 }
 
+/// Test hook: artificial delay (milliseconds) before the watcher registry is
+/// started, standing in for a macOS `fseventsd` that takes seconds per
+/// `FSEventStreamStart` registration. Lets e2e tests prove the listeners bind
+/// off the watcher-init critical path (monorepo#1581). NOTE: this seam is
+/// compiled into release binaries too (release-mode e2e runs need it); it is
+/// inert unless the namespaced env var is set to a positive integer.
+const TEST_WATCHER_INIT_DELAY_MS_ENV: &str = "INTENTD_TEST_WATCHER_INIT_DELAY_MS";
+
+/// Bounded wait for the deferred MCP start sweep to settle at shutdown, so a
+/// server spawned mid-handshake lands in the hub map and is covered by the
+/// process-group reap (monorepo#1581). Sized to absorb an in-flight handshake
+/// while staying well inside the FE sidecar's kill grace.
+const MCP_START_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Parse the watcher-init delay override; anything unset, non-numeric, or
+/// non-positive disables the hook.
+fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// Start the watcher registry (#611) in the background and hold it for the
+/// task's lifetime: a filesystem watcher per active workspace (debounced
+/// `file:*` events), a narrow `.git` metadata watch per git workspace
+/// (external git operations → git-status refresh, monorepo#1397), the skills
+/// watcher (`skills:changed`), and the specialists watcher
+/// (`specialists:changed`), then workspace lifecycle following so workspaces
+/// created/opened after boot gain watching and deleted/closed workspaces are
+/// torn down without a restart.
+///
+/// Spawned rather than awaited inline because each FSEvents registration is a
+/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
+/// which would otherwise delay the UDS bind past the FE sidecar's probe window
+/// (monorepo#1581), and run under `block_in_place` so the blocking registration
+/// cannot starve the worker driving `cmd_serve` either. The task parks after
+/// startup so it owns the registry; aborting the returned handle drops it,
+/// tearing down every watcher.
+fn spawn_watcher_registry_init(
+    bus: EventBus,
+    api: Arc<dyn WorkspaceApi>,
+    refresher: Arc<GitStatusRefresher>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // `block_in_place`, not a bare `spawn`: the registrations inside are
+        // synchronous `fseventsd` IPC that block the calling *thread*, so
+        // spawning alone would only move them onto another Tokio worker — on a
+        // saturated (or single-worker) runtime that can still be the worker
+        // driving `cmd_serve` toward the UDS bind. `block_in_place` hands this
+        // worker's remaining tasks to another thread for the duration.
+        let registry = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Some(delay) = test_watcher_init_delay(
+                    std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    tracing::warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "watcher registry startup: artificial delay (test seam)"
+                    );
+                    // A *blocking* sleep, standing in for the synchronous
+                    // FSEvents call: a yielding `tokio::time::sleep` would not
+                    // exercise worker starvation at all.
+                    std::thread::sleep(delay);
+                }
+                WatcherRegistry::start(bus, api, refresher).await
+            })
+        });
+        tracing::info!("watcher registry ready");
+        // Park forever so the registry (and every watcher it owns) stays alive
+        // until the handle is aborted at shutdown.
+        std::future::pending::<()>().await;
+        drop(registry);
+    })
+}
+
+/// Start the `config.toml` live-reload watcher (§9.8) in the background and
+/// hold it for the task's lifetime.
+///
+/// Spawned rather than started inline for the same reason as
+/// [`spawn_watcher_registry_init`]: `notify`'s FSEvents registration is a
+/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
+/// which would otherwise delay the UDS bind past the FE sidecar's probe window
+/// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
+/// task parks after startup so it owns the watcher guard; aborting the returned
+/// handle drops it, ending the OS subscription.
+fn spawn_config_watcher_init(
+    registry: Arc<intent_services::SettingsRegistry>,
+    services: Services,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let watcher_services = services.clone();
+        // `ConfigWatcher::start` is synchronous and its `notify` registration
+        // blocks the calling thread on `fseventsd` IPC, so it runs under
+        // `block_in_place` for the same reason as the watcher registry above.
+        // It stays inside the runtime context, so the watcher's own
+        // `tokio::spawn` of its debounce loop keeps working.
+        let started = tokio::task::block_in_place(|| {
+            intent_services::ConfigWatcher::start(registry, move |notice| {
+                let services = watcher_services.clone();
+                async move { services.apply_external_settings_change(&notice).await }
+            })
+        });
+        let watcher = match started {
+            Ok(watcher) => watcher,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "config.toml live-reload watcher failed to start; \
+                     external edits will require a daemon restart"
+                );
+                return;
+            }
+        };
+        tracing::info!("config.toml live-reload watcher ready");
+        // Park forever so the watch stays alive until the handle is aborted.
+        std::future::pending::<()>().await;
+        drop(watcher);
+    })
+}
+
 async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
     let config = resolve_config()?;
     let params: Value = match params {
@@ -3275,6 +3409,30 @@ mod tests {
     fn boot_ws_listener_follows_ws_api_enabled_when_secure() {
         assert_eq!(boot_ws_listener(false, true), BootWsListener::SecureWss);
         assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
+    }
+
+    // test_watcher_init_delay takes the raw env value as a parameter, so the
+    // seam is testable without process-env mutation races.
+    #[test]
+    fn watcher_init_delay_parses_positive_milliseconds() {
+        assert_eq!(
+            test_watcher_init_delay(Some("250")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            test_watcher_init_delay(Some(" 5000 ")),
+            Some(Duration::from_millis(5000))
+        );
+    }
+
+    #[test]
+    fn watcher_init_delay_inert_unless_positive_integer() {
+        // Unset, non-numeric, negative, and zero all leave the hook off.
+        assert_eq!(test_watcher_init_delay(None), None);
+        assert_eq!(test_watcher_init_delay(Some("")), None);
+        assert_eq!(test_watcher_init_delay(Some("soon")), None);
+        assert_eq!(test_watcher_init_delay(Some("-1")), None);
+        assert_eq!(test_watcher_init_delay(Some("0")), None);
     }
 
     // resolve_ws_listener_port is pure (the env value is a parameter), so the

@@ -5277,16 +5277,18 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. When the
-    /// cancel does not come from the owning agent (`by_owner = false`, the FE
-    /// path) the owner is additionally woken with a cancellation notice.
+    /// `ws.hook.cancel` / wire `hook.cancel`: stop an active hook. `caller`
+    /// is the cancelling agent (MCP): an agent may only cancel its own hooks
+    /// — a non-owner is rejected — and an owner cancel delivers no self-wake.
+    /// `None` is the FE path: any hook can be cancelled and the owner is
+    /// additionally woken with a cancellation notice.
     fn hook_cancel(
         &self,
         workspace_id: WorkspaceId,
         hook_id: HookId,
-        by_owner: bool,
+        caller: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, hook_id, by_owner);
+        let _ = (workspace_id, hook_id, caller);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_cancel not implemented".to_string(),
