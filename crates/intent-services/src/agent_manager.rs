@@ -6546,6 +6546,42 @@ async fn run_message_worker(
                             .await;
                             mgr.release_in_flight_slot(&agent_id).await;
                             break 'outer;
+                        } else if suspend_interrupt_error(&e) {
+                            // Sleep-induced interruption (Task C):
+                            // `run_prompt_turn` already enrolled the turn as
+                            // interrupted (partial persisted with
+                            // `InterruptReason::SystemSuspend` + an
+                            // `interrupted_agent` row) and emitted the
+                            // interrupted terminal `agent:stream:end` — NOT
+                            // `agent:failed`. Suppress the terminal-failure path
+                            // (no Error status, no manual-retry surface): settle
+                            // the session to idle and stop the worker, leaving
+                            // the enrolled turn for the wake orchestrator (Task
+                            // D) to resume. Placed before the pre-output redrive
+                            // arm so a suspend-overlapping pre-output failure is
+                            // resumed via `session/load` (preserving the partial
+                            // turn) rather than silently redriven on a fresh
+                            // child.
+                            tracing::info!(
+                                agent = %agent_id,
+                                error = %e,
+                                "turn interrupted by system suspend — enrolled for wake-resume, suppressing terminal failure"
+                            );
+                            // Tear down the local provider child (mirrors the
+                            // silent-redrive branch below): the upstream API
+                            // stream dropped, but the claude-code/auggie child
+                            // and its IPC connection survive the disconnect. If
+                            // the handle is left live, the wake/self-heal resume
+                            // routes through `ensure_started`'s live-child reuse
+                            // branch and returns the stale `acpSessionId`
+                            // WITHOUT issuing `session/load` — skipping the very
+                            // recovery the enrollment promises. Removing the
+                            // handle here forces the resume to spawn a fresh
+                            // child and reload the persisted session via
+                            // `session/load` (or the recreate fallback).
+                            mgr.kill_child_only(&agent_id).await;
+                            mgr.end_turn(&agent_id).await;
+                            break 'outer;
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt
@@ -7826,6 +7862,24 @@ fn pre_output_transport_failure(err: &Error) -> bool {
         err,
         Error::Internal(msg)
             if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
+}
+
+/// Whether a `run_turn` error carries the sleep-induced interrupt marker from
+/// `run_prompt_turn` (Task C): the turn died with a transient upstream
+/// disconnect whose active window overlapped a detected host suspend.
+/// `run_prompt_turn` already enrolled the turn as interrupted (persisted the
+/// partial with `InterruptReason::SystemSuspend` + an `interrupted_agent` row)
+/// and emitted the interrupted terminal `agent:stream:end` (NOT `agent:failed`),
+/// so the worker must SUPPRESS the terminal-failure path — no Error status, no
+/// manual-retry surface — and leave the enrolled turn for the wake orchestrator
+/// (Task D) to resume. Prefix-anchored for the same mid-string reason as the
+/// other markers.
+fn suspend_interrupt_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_SUSPEND_INTERRUPT_PREFIX)
     )
 }
 

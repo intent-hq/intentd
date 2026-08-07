@@ -1422,6 +1422,233 @@ fn track_mock_agent_inner(
     (agent, ())
 }
 
+/// Mock agent that streams one `agent_message_chunk`, then answers
+/// `session/prompt` with a JSON-RPC ERROR carrying `error_message` (a
+/// transient-shaped `-32603`), while answering the lifecycle methods normally.
+/// Drives the suspend-enrollment turn worker path: a suspend-overlapping
+/// transient disconnect that `run_prompt_turn` enrolls for wake-resume.
+fn spawn_mock_agent_erroring_on_prompt<R, W>(
+    read: R,
+    write: W,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                // A pre-failure warning chunk, then the transient error.
+                let note = json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "existing-id",
+                        "update": { "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": "partial " } }
+                    }
+                });
+                write
+                    .write_all(format!("{note}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": MGR_ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// Track a live handle wired to [`spawn_mock_agent_erroring_on_prompt`]: the
+/// child is alive and reusable, but its `session/prompt` fails transiently.
+fn track_mock_agent_prompt_rpc_error(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+) -> JoinHandle<()> {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent =
+        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string());
+    let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+    let connection = Arc::new(Connection::new(
+        c2a_client,
+        a2c_client,
+        None,
+        ConnectionHooks {
+            notifications: Some(note_tx),
+            ..ConnectionHooks::default()
+        },
+    ));
+    mgr.handles.lock().unwrap().insert(
+        id.clone(),
+        AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
+            thought_level: None,
+            wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_listener: None,
+        },
+    );
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    agent
+}
+
+/// Injectable overlap query that reports a fixed suspend overlap for ANY window,
+/// so a transient turn failure is always classified as suspend-induced.
+struct AlwaysSuspended(Duration);
+
+impl crate::agent_session::SuspendOverlapQuery for AlwaysSuspended {
+    fn did_suspend_overlap(
+        &self,
+        _start: std::time::Instant,
+        _end: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(self.0)
+    }
+}
+
+/// Finding 1 (suspend-enrollment tears down the provider child): the suspend
+/// branch of the turn worker must `kill_child_only` on enrollment, exactly like
+/// the adjacent silent-redrive branch. Otherwise the live child + IPC connection
+/// survive the upstream disconnect and the resume routes through
+/// `ensure_started`'s live-child reuse — returning the stale `acpSessionId`
+/// WITHOUT a `session/load`. This drives a real suspend-overlapping turn failure
+/// through the worker and asserts (a) the handle is torn down, and (b) the
+/// resume then issues `session/load` against the persisted id.
+#[tokio::test]
+async fn suspend_enrollment_kills_child_so_resume_issues_session_load() {
+    // Keep the enrollment self-heal (finding 2) from firing mid-test: we observe
+    // the suspend branch's own teardown and drive the resume manually.
+    let _env = EnvGuard::set_all(&[("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "600000")]);
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-suspend-kill"));
+    seed_agent(&mgr, &ws, &id).await;
+    // A persisted ACP session id makes the mid-turn child reusable (the
+    // live-child reuse hazard the fix guards against) and reloadable on resume.
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+
+    // A live child that fails its prompt transiently while a suspend overlaps.
+    let _agent = track_mock_agent_prompt_rpc_error(&mgr, &id, "Connection reset by peer");
+    assert!(
+        mgr.contains(&id),
+        "the child handle is live before the turn"
+    );
+
+    // Drive the turn: the worker reuses the live child, streams, then the prompt
+    // fails → suspend-overlap classifier enrolls it → suspend branch runs.
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "hi".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message starts the turn worker");
+
+    // (a) The suspend branch tore down the provider child — no live handle
+    // survives for the resume to reuse.
+    let mut torn_down = false;
+    for _ in 0..60 {
+        if !mgr.contains(&id) {
+            torn_down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        torn_down,
+        "suspend enrollment must kill_child_only so the resume cannot reuse the live child"
+    );
+
+    // The turn was enrolled as system_suspend (not surfaced terminally).
+    let row = mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // (b) Resume: with the child gone, session establishment issues `session/load`
+    // against the persisted id (the recovery the enrollment promises) — proven by
+    // a fresh child's request log, NOT the live-child reuse path.
+    let (_agent2, log) = track_mock_agent_with_log(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume establishes a session");
+    assert_eq!(
+        sid, "existing-id",
+        "resume reloads the persisted session id"
+    );
+    let sent: Vec<String> = log.lock().unwrap().iter().map(|(m, _)| m.clone()).collect();
+    assert!(
+        sent.iter().any(|m| m == "session/load"),
+        "resume goes through session/load (fresh spawn), not live-child reuse: {sent:?}"
+    );
+}
+
 /// A test provider that skips `authenticate` (deterministic handshake).
 fn test_provider() -> intent_providers::ProviderConfig {
     intent_providers::ProviderConfig {

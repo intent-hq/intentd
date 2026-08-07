@@ -170,6 +170,11 @@ pub struct InterruptedAgent {
     pub interrupted_at: String,
     pub agent_name: Option<String>,
     pub workspace_name: Option<String>,
+    /// Machine-readable interruption reason (the `InterruptReason` wire string,
+    /// e.g. `system_suspend`), or `None` for rows enrolled without one (the
+    /// daemon-restart / heal paths). The wake-resume orchestrator resumes ONLY
+    /// `system_suspend` rows.
+    pub reason: Option<String>,
 }
 
 /// Per-session message inputs for the `AgentLite` projection (monorepo#958):
@@ -2627,12 +2632,38 @@ impl Store {
         prev_status: &str,
         interrupted_at: &str,
     ) -> Result<bool> {
+        self.insert_interrupted_agent_with_reason(
+            agent_id,
+            workspace_id,
+            prev_status,
+            interrupted_at,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`insert_interrupted_agent`], but tags the row with a
+    /// machine-readable interruption `reason` (the `InterruptReason` wire
+    /// string). The wake-resume orchestrator enumerates only `system_suspend`
+    /// rows, so the sleep-induced enrollment path supplies `Some("system_suspend")`
+    /// while the daemon-restart / heal paths pass `None` (untouched by
+    /// auto-resume). The idempotent upsert refreshes the reason too, so a row
+    /// re-enrolled under a new reason carries the latest one.
+    pub async fn insert_interrupted_agent_with_reason(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        prev_status: &str,
+        interrupted_at: &str,
+        reason: Option<&str>,
+    ) -> Result<bool> {
         let sql =
-            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
-                   VALUES (?, ?, ?, ?) \
+            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at, reason) \
+                   VALUES (?, ?, ?, ?, ?) \
                    ON CONFLICT(agent_id) DO UPDATE SET \
                        prev_status = excluded.prev_status, \
                        interrupted_at = excluded.interrupted_at, \
+                       reason = excluded.reason, \
                        resolution = 'pending', \
                        resolved_at = NULL";
         let res = sqlx::query(sql)
@@ -2640,6 +2671,7 @@ impl Store {
             .bind(&workspace_id.0)
             .bind(prev_status)
             .bind(interrupted_at)
+            .bind(reason)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
@@ -2650,7 +2682,7 @@ impl Store {
     /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
-                          ag.name AS agent_name, w.title AS workspace_name \
+                          ia.reason, ag.name AS agent_name, w.title AS workspace_name \
                    FROM interrupted_agent ia \
                    INNER JOIN agent_session ag ON ia.agent_id = ag.id \
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
@@ -2668,6 +2700,7 @@ impl Store {
                     interrupted_at: col(row, "interrupted_at")?,
                     agent_name: col(row, "agent_name")?,
                     workspace_name: col(row, "workspace_name")?,
+                    reason: col(row, "reason")?,
                 })
             })
             .collect()
@@ -2679,7 +2712,7 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<Option<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
-                          ag.name AS agent_name, w.title AS workspace_name \
+                          ia.reason, ag.name AS agent_name, w.title AS workspace_name \
                    FROM interrupted_agent ia \
                    INNER JOIN agent_session ag ON ia.agent_id = ag.id \
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
@@ -2698,6 +2731,7 @@ impl Store {
                 interrupted_at: col(r, "interrupted_at")?,
                 agent_name: col(r, "agent_name")?,
                 workspace_name: col(r, "workspace_name")?,
+                reason: col(r, "reason")?,
             })),
         }
     }

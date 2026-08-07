@@ -30,6 +30,7 @@ mod git_credential;
 mod import;
 mod legacy_import;
 mod rpc_profile;
+mod suspend;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -763,6 +764,21 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // subscribers on another (§10).
     let legacy_import_store = store.clone();
     let assets_root = config.data_dir.join("assets");
+
+    // Suspend/wake detector (clock-skew): infers host sleep/resume with no OS
+    // integration and exposes a shared tracker. Spawned in the common serve
+    // path (covers UDS/WSS/insecure/headless); skipped entirely when
+    // wakeResume.enabled is false. The tracker feeds two consumers: Task C
+    // enrollment (injected into `Services` as the `SuspendOverlapQuery` below)
+    // and the Task D wake-triggered resume orchestrator (subscribes to its
+    // resume-event stream further down).
+    let suspend_tracker: Option<Arc<suspend::SuspendTracker>> =
+        config.wake_resume_enabled.then(|| {
+            suspend::spawn_suspend_detector(Duration::from_secs(
+                config.wake_resume_threshold_seconds as u64,
+            ))
+        });
+
     let services = Services::new(store)
         .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
@@ -771,6 +787,33 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    // Inject the suspend-overlap query so Task C can recognize sleep-induced
+    // turn failures and enroll them for wake-resume. Left unset when wakeResume
+    // is disabled, keeping today's terminal behavior for transient disconnects.
+    //
+    // §13.1 E2E seam: `INTENTD_TEST_FORCE_SUSPEND_OVERLAP_SECS` swaps in a
+    // `ForcedSuspendOverlap` query (any transient disconnect counts as
+    // suspend-overlapping) so the WSS e2e can drive enrollment + the
+    // self-heal resume deterministically without a real host sleep. The real
+    // tracker still drives the wake orchestrator; it simply never records a
+    // suspend, so the enrolled row recovers via the self-heal, not a broadcast.
+    let suspend_overlap_query: Option<Arc<dyn intent_services::SuspendOverlapQuery>> =
+        match std::env::var("INTENTD_TEST_FORCE_SUSPEND_OVERLAP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0 && config.wake_resume_enabled)
+        {
+            Some(secs) => Some(Arc::new(suspend::ForcedSuspendOverlap::new(
+                Duration::from_secs(secs),
+            ))),
+            None => suspend_tracker
+                .clone()
+                .map(|t| t as Arc<dyn intent_services::SuspendOverlapQuery>),
+        };
+    let services = match suspend_overlap_query {
+        Some(query) => services.with_suspend_tracker(query),
+        None => services,
+    };
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -1067,6 +1110,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
+
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -1231,6 +1275,60 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                 failed = failed.len(),
                 "--resume-all: auto-resume sweep complete"
             );
+        });
+    }
+
+    // Wake-triggered auto-resume (sleep-resume Task D). When wakeResume is
+    // enabled, subscribe to the suspend detector's resume-event stream and, on
+    // each host wake, resume the turns Task C enrolled as
+    // `system_suspend`-interrupted (only those). A burst of wake ticks (sleep
+    // flaps) is debounced into a single sweep, and the per-row atomic claim in
+    // `resume_interrupted_agent` dedupes against a concurrent
+    // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
+    // wakeResume is disabled (no tracker exists), honoring the config gate.
+    if let Some(tracker) = suspend_tracker.clone() {
+        let services_clone = services.clone();
+        let mut resume_rx = tracker.subscribe();
+        // Coalesce wake events landing within this window into one sweep.
+        const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match resume_rx.recv().await {
+                    Ok(ev) => {
+                        tracing::info!(
+                            suspended_for_secs = ev.suspended_for.as_secs(),
+                            "wake-resume: host wake detected; scheduling resume sweep"
+                        );
+                        // Debounce flaps: drain any further wake events that
+                        // arrive within the window before running one sweep.
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
+                                drained = resume_rx.recv() => match drained {
+                                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                                    Err(RecvError::Closed) => break,
+                                },
+                            }
+                        }
+                        services_clone.resume_suspend_interrupted_agents().await;
+                    }
+                    // A lag means we dropped some wake events; the sweep is
+                    // idempotent (it re-enumerates pending rows), so run a
+                    // catch-up sweep rather than missing a wake.
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "wake-resume: resume stream lagged; running a catch-up sweep"
+                        );
+                        services_clone.resume_suspend_interrupted_agents().await;
+                    }
+                    Err(RecvError::Closed) => {
+                        tracing::debug!("wake-resume: resume stream closed; orchestrator exiting");
+                        break;
+                    }
+                }
+            }
         });
     }
 
@@ -3323,6 +3421,9 @@ mod tests {
             idle_reap_minutes: 30,
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            wake_resume_enabled: intent_core::config::DEFAULT_WAKE_RESUME_ENABLED,
+            wake_resume_threshold_seconds:
+                intent_core::config::DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
             data_dir: dir,
         }
     }
