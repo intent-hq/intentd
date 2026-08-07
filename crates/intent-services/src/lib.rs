@@ -11902,7 +11902,11 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+    fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
@@ -11944,9 +11948,25 @@ impl WorkspaceApi for Services {
             // subsequent drain/wake parks behind the archived gates — so the
             // sweep accepts it rather than adding a post-claim re-check to
             // the hot drain path.
+            //
+            // The initiating agent (`caller_agent_id`, set on the agent-facing
+            // `ws.workspace.archive` host — the MCP front door and the
+            // background-hook runtime, which builds the same host for the
+            // hook owner; the JSON-RPC front door passes `None`) is excluded.
+            // On the MCP path the caller is necessarily mid-turn — blocked
+            // awaiting this very tool call — so interrupting it aborts the
+            // worker that owns the in-flight MCP dispatch: the tool result
+            // never reaches the child, the turn never settles, and the busy
+            // slot leaks (workspace activity stays `agent_running`). The
+            // caller's turn ends normally once the tool result is delivered.
+            // On the hook path the "caller" is the hook owner, which may have
+            // an independent in-flight turn that this sweep now skips; that
+            // turn runs to completion in the freshly archived workspace and
+            // every subsequent drain/wake parks behind the archived gates —
+            // the same benign-runaway trade-off as the residual race above.
             if let Some(manager) = manager {
                 for (agent_id, agent_ws) in manager.list_busy() {
-                    if agent_ws == id {
+                    if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
                         manager.interrupt(&agent_id).await;
                     }
                 }

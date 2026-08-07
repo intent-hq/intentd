@@ -173,7 +173,14 @@ impl WorkspaceApi for FakeApi {
             Ok(())
         })
     }
-    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+    fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        // The RPC front door has no calling agent: the sweep interrupts every
+        // in-flight turn in the workspace.
+        assert!(caller_agent_id.is_none(), "router passes no caller agent");
         Box::pin(async move {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
