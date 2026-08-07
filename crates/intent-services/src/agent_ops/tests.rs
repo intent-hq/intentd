@@ -5501,6 +5501,141 @@ async fn delegate_explicit_isolation_overrides_setting() {
     );
 }
 
+/// Execution-environment authority, direction 1: a workspace persisted with
+/// `execution_environment: direct` stays shared even after the global
+/// `workspace.cowIsolation` setting is flipped ON — the setting cannot turn
+/// per-agent sandboxing on inside an existing workspace.
+#[tokio::test]
+async fn delegate_setting_flip_on_does_not_sandbox_direct_environment_workspace() {
+    let (_t, svc, _ws) = setup().await;
+    // Sandbox-eligible by the legacy predicate (direct mode: repo path +
+    // skip_worktree) so only the persisted environment can be what gates it.
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Direct);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    svc.settings_update(json!([{
+        "path": "workspace.cowIsolation",
+        "value": true
+    }]))
+    .await
+    .expect("enable cowIsolation");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert!(
+        out.get("effectiveIsolation").is_none(),
+        "direct execution environment must ignore the flipped-on cowIsolation setting"
+    );
+}
+
+/// Execution-environment authority, direction 2: a workspace persisted with
+/// `execution_environment: cow` keeps provisioning per-agent sandboxes with
+/// the global setting OFF (its default), and an explicit `isolation:
+/// "shared"` param cannot turn sandboxing off either.
+#[tokio::test]
+async fn delegate_setting_off_does_not_unsandbox_cow_environment_workspace() {
+    let (_t, svc, _ws) = setup().await;
+    // The cow path reaches real (background) provisioning — pin a hermetic
+    // workspaces root so the test never touches $HOME/intent/workspaces.
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    // workspace.cowIsolation defaults to false — deliberately left OFF.
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Cow);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    // Provisioning runs in the background (monorepo#871), so the delegate
+    // reports "pending" — the point is that it provisions at all with the
+    // global setting off.
+    assert_eq!(
+        out.get("effectiveIsolation").and_then(|v| v.as_str()),
+        Some("pending"),
+        "cow execution environment must sandbox with the global setting off"
+    );
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                isolation: Some("shared".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert_eq!(
+        out.get("effectiveIsolation").and_then(|v| v.as_str()),
+        Some("pending"),
+        "isolation:\"shared\" param cannot turn sandboxing off in a cow environment"
+    );
+}
+
+/// Execution-environment authority: an explicit `isolation: "cow"` param on a
+/// workspace persisted with `execution_environment: direct` does NOT sandbox
+/// — there is no turning CoW on on the fly within a workspace.
+#[tokio::test]
+async fn delegate_cow_param_does_not_sandbox_direct_environment_workspace() {
+    let (_t, svc, _ws) = setup().await;
+    let ws = WorkspaceId::new();
+    let mut w = workspace(&ws);
+    w.repository_path = Some("/test/repo".into());
+    w.skip_worktree = true;
+    w.cow_supported = Some(true);
+    w.execution_environment = Some(intent_core::SandboxType::Direct);
+    svc.store().insert_workspace(&w).await.expect("ws");
+
+    let out = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                isolation: Some("cow".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+
+    assert!(
+        out.get("effectiveIsolation").is_none(),
+        "isolation:\"cow\" param must not sandbox a direct execution environment workspace"
+    );
+}
+
 /// The top-level (RPC / user) front door stays parentless and is never
 /// subject to the depth guard even when a foreground parent exists.
 #[tokio::test]

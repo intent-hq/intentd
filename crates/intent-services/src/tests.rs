@@ -14387,6 +14387,77 @@ mod rules {
             prompt.contains("standalone CoW clone"),
             "checkout-level isolation clarification for cow checkoutMode"
         );
+        assert!(
+            prompt.contains("apply to your delegated agents"),
+            "legacy CoW checkout (no persisted cow environment): delegate-scoped wording"
+        );
+
+        // Uniform per-agent isolation variant: executionEnvironment=cow means
+        // EVERY agent (top-level included) is sandboxed at spawn — the
+        // clarification must say so instead of the delegate-scoped wording.
+        let workspace_uniform = intent_core::Workspace {
+            execution_environment: Some(intent_core::SandboxType::Cow),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_uniform),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            prompt.contains("**Every agent** in this"),
+            "cow execution environment: uniform per-agent isolation wording"
+        );
+        assert!(
+            !prompt.contains("apply to your delegated agents"),
+            "delegate-scoped wording replaced under uniform isolation"
+        );
+        assert!(
+            prompt.contains("per-agent isolation is"),
+            "cow execution environment: lead states isolation is unconditional"
+        );
+        assert!(
+            !prompt.contains("`cowIsolation` setting defaults it"),
+            "cow execution environment: param/setting-driven lead wording replaced"
+        );
+
+        // Execution-environment authority: a persisted `direct` environment
+        // suppresses the hint even though the derived predicate (direct mode
+        // + cow_supported) would fire — the param/setting cannot sandbox
+        // delegates in such a workspace, so the prompt must not claim it.
+        let workspace_direct_env = intent_core::Workspace {
+            execution_environment: Some(intent_core::SandboxType::Direct),
+            ..workspace.clone()
+        };
+        let prompt = crate::rules::assemble_system_prompt(
+            &store,
+            Some(&tree.0),
+            "task-loop",
+            Some(&injection),
+            true,
+            false,
+            false,
+            &intent_core::settings_file::AgentFeaturesSettings::default(),
+            Some(&workspace_direct_env),
+            Some(&agent_session),
+        )
+        .await
+        .expect("assembled prompt");
+
+        assert!(
+            !prompt.contains("## Agent Delegation & Isolation"),
+            "no delegation hint when execution environment is direct"
+        );
 
         // Direct-checkout variant (checkoutMode=direct) also fires, but
         // without the CoW-checkout clarification line.

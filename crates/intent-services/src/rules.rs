@@ -293,13 +293,16 @@ pub(crate) struct SpecialistPromptInjection {
 ///   branch-switching warning, and conflict-bounce resolution instructions. Keyed
 ///   off sandbox_path alone — every sandboxed agent must know about the no-branch-
 ///   switch constraint and the bounce protocol, not just implementors.
-/// - Coordinator in a sandbox-eligible CoW-capable workspace (specialist
-///   "coordinator"/"spec-writer" + cow_supported=true + the workspace satisfies the
-///   same delegate sandbox-eligibility predicate as agent_ops delegation: direct
-///   mode, or a standalone Cow/Direct checkout): parallel delegation safety
-///   guidance. CoW-checkout workspaces get an extra line clarifying that the
-///   checkout itself is a standalone CoW clone while per-agent sandboxes apply to
-///   delegates.
+/// - Coordinator in a sandbox-eligible workspace (specialist
+///   "coordinator"/"spec-writer"): parallel delegation safety guidance.
+///   Eligibility keys off the persisted `execution_environment` where set —
+///   the same authority the delegate path resolves isolation from — so prompt
+///   and provisioning cannot disagree: `cow` fires (uniform per-agent
+///   isolation; the hint states EVERY agent runs in its own sandbox and the
+///   param/setting are ignored), `direct`/`worktree` suppress. Legacy rows
+///   (unset environment) keep the derived predicate (cow_supported=true +
+///   direct mode or a standalone Cow/Direct checkout) and the delegate-scoped,
+///   param/setting-driven wording.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
 fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
@@ -362,12 +365,16 @@ fn build_isolation_hint(
 
     // Case 3: Coordinator in a sandbox-eligible CoW-capable workspace.
     // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE).
-    // Eligibility mirrors the delegate sandbox path in agent_ops.rs: direct-mode
-    // workspaces (no worktree or skip_worktree=true, with a repository path) AND
-    // standalone-checkout workspaces (checkoutMode == cow|direct with a
-    // worktree_path) provision delegate sandboxes — the coordinator hint must
-    // fire for both, or a CoW-checkout coordinator is never told its delegates
-    // are sandboxed.
+    // Eligibility keys off the workspace's persisted `execution_environment`
+    // where available — the same authority the delegate path in agent_ops.rs
+    // resolves isolation from — so prompt and provisioning cannot disagree:
+    // `cow` fires the hint (every agent is sandboxed there; `microvm` never
+    // reaches Case 3 — Case 1 returns first), `direct`/`worktree` suppress it
+    // (no delegate sandboxes regardless of param or setting). Legacy rows
+    // (`execution_environment` unset, pre-v3.3) keep the derived predicate:
+    // direct-mode workspaces (no worktree or skip_worktree=true, with a
+    // repository path) AND standalone-checkout workspaces (checkoutMode ==
+    // cow|direct with a worktree_path) provision delegate sandboxes there.
     if specialist_name.eq_ignore_ascii_case("coordinator")
         || specialist_name.eq_ignore_ascii_case("spec-writer")
     {
@@ -379,19 +386,49 @@ fn build_isolation_hint(
                 Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
             ) && ws.worktree_path.is_some();
             let cow_supported = ws.cow_supported.unwrap_or(false);
+            let eligible = match ws.execution_environment {
+                Some(intent_core::SandboxType::Cow) => true,
+                Some(_) => false,
+                None => (is_direct_mode || is_standalone_checkout) && cow_supported,
+            };
 
-            if (is_direct_mode || is_standalone_checkout) && cow_supported {
-                let checkout_note = if ws.checkout_mode == Some(intent_core::CheckoutMode::Cow) {
+            if eligible {
+                // `executionEnvironment: cow` workspaces provision a per-agent
+                // sandbox for EVERY agent at spawn (`ensure_started`), not
+                // just delegates — the clarification must say so. A legacy
+                // CoW checkout without the persisted `cow` environment keeps
+                // the delegate-scoped wording (only delegates are sandboxed
+                // there).
+                let uniform_isolation =
+                    ws.execution_environment == Some(intent_core::SandboxType::Cow);
+                let checkout_note = if uniform_isolation {
+                    "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
+                         source repository (checkout-level isolation). **Every agent** in this \
+                         workspace — including you and top-level agents, not just delegates — \
+                         runs in its own per-agent CoW sandbox sourced from this checkout and \
+                         merged back on turn end."
+                } else if ws.checkout_mode == Some(intent_core::CheckoutMode::Cow) {
                     "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
                          source repository (checkout-level isolation); the per-agent CoW sandboxes \
                          described above apply to your delegated agents, sourced from this checkout."
                 } else {
                     ""
                 };
+                // The lead sentence must match how isolation is actually
+                // resolved: in an `executionEnvironment: cow` workspace the
+                // param/setting are ignored (sandboxing is unconditional);
+                // legacy rows keep the param-then-setting wording.
+                let lead = if uniform_isolation {
+                    "Delegated agents in this workspace **always** run in isolated CoW sandboxes \
+                     — the workspace's execution environment is `cow`, so per-agent isolation is \
+                     unconditional (the `isolation` param and global settings do not change it)."
+                } else {
+                    "Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
+                     use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it)."
+                };
                 return Some(format!(
                     "## Agent Delegation & Isolation\n\n\
-                     Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
-                     use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
+                     {lead} \
                      Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
                      so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
                      stomp each other's work.\n\n\

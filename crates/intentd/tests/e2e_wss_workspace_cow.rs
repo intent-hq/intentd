@@ -28,6 +28,9 @@
 //!   leaves the source repository untouched.
 //! - `workspace.duplicate` of a CoW workspace provisions a fresh standalone
 //!   CoW clone for the duplicate (same decision matrix as create).
+//! - Uniform per-agent isolation (`executionEnvironment: "cow"`): a TOP-LEVEL
+//!   `agent.create` agent provisions a per-agent sandbox at first spawn, runs
+//!   with the sandbox as its cwd, and merges back on turn end like a delegate.
 //!
 //! Gated on `git` on PATH plus a CoW-capable filesystem via
 //! `intent_git::cow_probe` (APFS/Btrfs/XFS-reflink); skips cleanly
@@ -1739,6 +1742,173 @@ async fn workspace_create_explicit_cow_never_falls_back_over_wss() {
         "structured payload instead of a silent worktree fallback: {err}"
     );
     assert_eq!(err["data"]["environment"], json!("cow"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario I — uniform per-agent isolation in `executionEnvironment: "cow"`
+/// workspaces: a TOP-LEVEL `agent.create` agent (not a delegate) provisions a
+/// per-agent CoW sandbox synchronously at first spawn, runs with the sandbox
+/// as its cwd (mock `echoCwd`), and its work merges back into the workspace
+/// checkout on turn end (`sandbox:cow:merged`) exactly like a delegate's.
+/// Gated on git + CoW + node/mock fixture.
+#[tokio::test]
+async fn top_level_agent_in_cow_workspace_gets_sandbox_and_merges_over_wss() {
+    const TEST: &str = "agent.create cow-workspace per-agent sandbox WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let Some(script) = mock_gate(TEST) else {
+        return;
+    };
+    let root = scratch_dir("sbtop");
+    // Delay the turn so the test can write a file into the sandbox while the
+    // turn is still in flight (before agent:idle triggers the auto-merge).
+    let behavior =
+        json!({ "delayMs": 8000, "response": "top-level done", "echoCwd": true }).to_string();
+    let extra: [(&str, &str); 2] = [
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let (daemon, port, cfg) = boot(&root, &extra).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    set_sandbox_setting(&mut rpc, 1, "sandbox.cow.enabled", json!(true)).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Uniform Isolation E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "executionEnvironment": "cow",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let workspace = &created["workspace"];
+    let ws_id = workspace["id"].as_str().expect("workspace id").to_string();
+    assert_eq!(workspace["executionEnvironment"], json!("cow"));
+    let checkout = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+
+    // SUBSCRIBER conn — sandbox:* BEFORE the turn starts.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["sandbox:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // TOP-LEVEL create (no delegation, no isolation param anywhere).
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Top Level", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "do isolated work" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // ensure_started provisions synchronously at spawn, so the sandbox
+    // directory appears at the deterministic per-agent layout well before the
+    // (delayed) turn ends.
+    let sandbox_path = root
+        .join(&ws_id)
+        .join("sandboxes")
+        .join(&agent_id)
+        .join("source-repo");
+    let mut provisioned = false;
+    for _ in 0..120 {
+        if sandbox_path.join(".git").is_dir() {
+            provisioned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        provisioned,
+        "top-level agent's per-agent sandbox provisioned at {}",
+        sandbox_path.display()
+    );
+
+    // Write a change INTO the sandbox while the delayed turn is in flight —
+    // the turn-end auto-merge must carry it back to the workspace checkout.
+    std::fs::write(
+        sandbox_path.join("top-level-work.txt"),
+        "from the sandbox\n",
+    )
+    .expect("write into sandbox");
+
+    // sandbox:cow:merged — turn-end merge-back applies to top-level agents.
+    let mut canonical_head = None;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "sandbox:cow:merged" {
+            assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
+            assert_eq!(ev["data"]["agentId"], json!(agent_id));
+            canonical_head = Some(
+                ev["data"]["canonicalHead"]
+                    .as_str()
+                    .expect("canonicalHead")
+                    .to_string(),
+            );
+            break;
+        }
+    }
+    let canonical_head = canonical_head.expect("sandbox:cow:merged event delivered");
+
+    assert!(
+        checkout.join("top-level-work.txt").exists(),
+        "top-level agent's sandbox work merged into the workspace checkout"
+    );
+    assert_eq!(
+        run_git(&["rev-parse", "HEAD"], &checkout),
+        canonical_head,
+        "checkout HEAD is the post-merge canonicalHead"
+    );
+    assert_ne!(
+        canonical_head, head_sha,
+        "merge advanced the canonical HEAD past the base"
+    );
+
+    // The agent actually RAN in the sandbox: the mock child echoed its cwd.
+    let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
+    let expected = std::fs::canonicalize(&sandbox_path).expect("sandbox exists");
+    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+    assert_eq!(
+        actual, expected,
+        "top-level agent spawned with the sandbox as cwd, got {echoed}"
+    );
+
+    // Persistent lifecycle: the sandbox survives the clean merge.
+    assert!(
+        sandbox_path.exists(),
+        "sandbox directory persists after a clean merge"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

@@ -4853,26 +4853,47 @@ impl Services {
         // sandbox fields and the `sandbox:cow:created` event.
         let mut effective_isolation: Option<&str> = None;
 
-        // Provision sandbox if isolation=cow is requested (Task 3).
-        // Check if isolation is "cow" (explicit or defaulted from workspace setting).
-        // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
-        // isolation parameter was provided (Task 5).
-        let mut isolation = input.isolation.clone();
-        if isolation.is_none() {
-            // Check workspace.cowIsolation setting
-            // `settings_get` returns the `{ path, value, definition }`
-            // envelope (§5.9) — read the nested `value`.
-            if let Ok(setting) = self
-                .settings_get("workspace.cowIsolation".to_string())
-                .await
-            {
-                if setting["value"].as_bool().unwrap_or(false) {
-                    isolation = Some("cow".to_string());
-                }
+        // Resolve the delegate's isolation mode. Once a workspace is set up,
+        // its persisted `execution_environment` is THE authority for
+        // isolation — the global `workspace.cowIsolation` setting and the
+        // per-call `isolation` param cannot turn per-agent sandboxing on or
+        // off inside an existing workspace:
+        // - `cow` / `microvm` ⇒ every agent is sandboxed (uniform per-agent
+        //   isolation; the spawn path provisions unconditionally anyway, the
+        //   delegate-time resolution just keeps provisioning off the critical
+        //   path via the background clone below).
+        // - `direct` / `worktree` ⇒ shared checkout, no sandbox — even when
+        //   the caller passes `isolation: "cow"` or the global setting is on.
+        // - Legacy rows (`execution_environment` unset, pre-v3.3): preserve
+        //   the original param-then-setting resolution so pre-existing
+        //   workspaces keep their behavior.
+        let workspace = self.store.get_workspace(&workspace_id).await.ok();
+        let execution_env = workspace.as_ref().and_then(|w| w.execution_environment);
+        let isolation: Option<String> = match execution_env {
+            Some(intent_core::SandboxType::Cow) | Some(intent_core::SandboxType::Microvm) => {
+                Some("cow".to_string())
             }
-        }
+            Some(intent_core::SandboxType::Direct) | Some(intent_core::SandboxType::Worktree) => {
+                None
+            }
+            None => {
+                let mut isolation = input.isolation.clone();
+                if isolation.is_none() {
+                    // `settings_get` returns the `{ path, value, definition }`
+                    // envelope (§5.9) — read the nested `value`.
+                    if let Ok(setting) = self
+                        .settings_get("workspace.cowIsolation".to_string())
+                        .await
+                    {
+                        if setting["value"].as_bool().unwrap_or(false) {
+                            isolation = Some("cow".to_string());
+                        }
+                    }
+                }
+                isolation
+            }
+        };
         if isolation.as_deref() == Some("cow") {
-            let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
                 // Sandbox-eligible: direct-mode workspaces (no worktree or
                 // skip_worktree=true; sandbox sourced from the user's repo folder),

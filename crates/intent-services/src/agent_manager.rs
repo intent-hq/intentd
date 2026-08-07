@@ -5446,23 +5446,47 @@ impl AgentManager {
         self.services.await_sandbox_provisioning(agent_id).await;
         let mut session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        // microVM workspaces (monorepo#1120, EE-5): every agent REQUIRES its
-        // own CoW sandbox clone — the VM virtio-fs-mounts it as `/workspace`,
-        // and a shared-checkout fallback would break isolation. Provision
-        // synchronously on first spawn (unlike the CoW delegate path, which
-        // provisions in the background and tolerates fallback); failure is a
-        // hard error, not a silent host fallback.
-        let is_microvm_ws = workspace
-            .as_ref()
-            .map(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm))
-            .unwrap_or(false);
-        if is_microvm_ws && session.sandbox_path.is_none() {
-            match self
-                .services
-                .provision_sandbox(workspace_id, agent_id)
-                .await?
-            {
-                crate::sandbox_ops::ProvisionOutcome::Supported { path, branch, .. } => {
+        // Per-agent isolation execution environments: every agent in the
+        // workspace — top-level `agent.create` included, not just delegates —
+        // gets its own CoW sandbox clone, provisioned synchronously on first
+        // spawn (unlike the CoW delegate path, which provisions in the
+        // background) and persisted inline onto the session.
+        //
+        // - microVM (monorepo#1120, EE-5): the VM virtio-fs-mounts the clone
+        //   as `/workspace`, so a shared-checkout fallback would break
+        //   isolation — Unsupported/failure is a hard error.
+        // - cow: isolation is a collaboration convenience, not a mount
+        //   requirement — Unsupported/failure WARNs and falls back to the
+        //   shared workspace checkout so the agent still spawns.
+        let execution_env = workspace.as_ref().and_then(|w| w.execution_environment);
+        let is_microvm_ws = execution_env == Some(intent_core::SandboxType::Microvm);
+        let is_cow_ws = execution_env == Some(intent_core::SandboxType::Cow);
+        if (is_microvm_ws || is_cow_ws) && session.sandbox_path.is_none() {
+            let outcome = if is_microvm_ws {
+                self.services
+                    .provision_sandbox(workspace_id, agent_id)
+                    .await
+                    .map(Some)?
+            } else {
+                match self
+                    .services
+                    .provision_sandbox(workspace_id, agent_id)
+                    .await
+                {
+                    Ok(outcome) => Some(outcome),
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %workspace_id,
+                            agent = %agent_id,
+                            error = %e,
+                            "per-agent CoW sandbox provisioning failed; falling back to the shared workspace checkout"
+                        );
+                        None
+                    }
+                }
+            };
+            match outcome {
+                Some(crate::sandbox_ops::ProvisionOutcome::Supported { path, branch, .. }) => {
                     // Persist the sandbox fields onto the session (the
                     // delegate path does this in its background settle;
                     // here provisioning is synchronous so persist inline).
@@ -5478,7 +5502,7 @@ impl AgentManager {
                         .update_agent_session(workspace_id, &session)
                         .await?;
                 }
-                crate::sandbox_ops::ProvisionOutcome::Unsupported => {
+                Some(crate::sandbox_ops::ProvisionOutcome::Unsupported) if is_microvm_ws => {
                     return Err(Error::ExecutionEnvironmentUnavailable {
                         environment: "microvm".to_string(),
                         reason: "per-agent CoW sandbox provisioning is unavailable for this \
@@ -5486,6 +5510,14 @@ impl AgentManager {
                             .to_string(),
                     });
                 }
+                Some(crate::sandbox_ops::ProvisionOutcome::Unsupported) => {
+                    tracing::warn!(
+                        workspace = %workspace_id,
+                        agent = %agent_id,
+                        "per-agent CoW sandbox unsupported for this workspace; falling back to the shared workspace checkout"
+                    );
+                }
+                None => {}
             }
         }
         let settings = self.services.effective_settings();
@@ -9138,6 +9170,420 @@ mod dead_child_respawn_tests {
             );
         }
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod uniform_isolation_tests {
+    //! Uniform per-agent isolation for `executionEnvironment: cow` workspaces:
+    //! `ensure_started` provisions a per-agent CoW sandbox for EVERY agent
+    //! (top-level `agent.create` agents included, not just delegates), spawns
+    //! the child with the sandbox as its cwd, and — unlike the microVM arm —
+    //! falls back to the shared workspace checkout on `Unsupported`/error
+    //! instead of hard-erroring. Direct/worktree workspaces and the microVM
+    //! hard-error are unchanged.
+
+    use super::role_reminder_tests::session;
+    use super::tests::EnvGuard;
+    use super::*;
+    use crate::events::EventBus;
+    use crate::sandbox_ops::{TEST_PROVISION_DELAY_MS_ENV, TEST_PROVISION_ERROR_ENV};
+    use intent_core::{Workspace, WorkspaceActivity, WorkspaceStatus};
+    use intent_store::Store;
+
+    /// Path to the deterministic mock ACP agent fixture.
+    fn mock_agent_script() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
+            .canonicalize()
+            .expect("mock-acp-agent.mjs fixture exists")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Pin the mock provider env AND neutralize the sandbox provisioning test
+    /// seams for one test (single guard — see [`EnvGuard`]).
+    fn mock_env(script: &str, provision_error: bool) -> EnvGuard {
+        EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script)),
+            ("MOCK_AGENT_BEHAVIOR", None),
+            ("MOCK_AGENT_ATTEMPT_FILE", None),
+            (TEST_PROVISION_DELAY_MS_ENV, None),
+            (
+                TEST_PROVISION_ERROR_ENV,
+                if provision_error { Some("1") } else { None },
+            ),
+        ])
+    }
+
+    /// Create a test root + git repo (one commit) under `target/` so the
+    /// workspaces root and the repo share a volume (required for CoW clones).
+    fn repo_in_target(name: &str) -> (PathBuf, PathBuf) {
+        let workspace_root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .to_path_buf();
+        let test_root = workspace_root
+            .join("target")
+            .join(format!("test-uniform-iso-{}", uuid::Uuid::new_v4()));
+        let repo_path = test_root.join(name);
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+        (test_root, repo_path)
+    }
+
+    /// Workspace whose checkout is `checkout_path` with the given persisted
+    /// execution environment and checkout mode.
+    fn workspace_with_env(
+        id: &WorkspaceId,
+        checkout_path: &Path,
+        checkout_mode: intent_core::CheckoutMode,
+        env: intent_core::SandboxType,
+    ) -> Workspace {
+        let ts = now_iso();
+        Workspace {
+            id: id.clone(),
+            title: "Uniform ISO WS".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: Some("test-repo".to_string()),
+            worktree_path: Some(checkout_path.to_string_lossy().to_string()),
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: Some(true),
+            display_status: None,
+            checkout_mode: Some(checkout_mode),
+            execution_environment: Some(env),
+            disk_usage: None,
+        }
+    }
+
+    /// Manager wired with a workspaces root (for `provision_sandbox`), the
+    /// given workspace, and one mock-provider agent session.
+    async fn manager_for(
+        ws: &Workspace,
+        agent_id: &AgentId,
+        workspaces_root: PathBuf,
+    ) -> (AgentManager, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-ui-");
+        let store = Store::open(&db_dir.path().join("store.db"))
+            .await
+            .expect("open store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root);
+        store.insert_workspace(ws).await.unwrap();
+        let mut s = session(agent_id, &ws.id, None);
+        s.provider = Some("mock".to_string());
+        store.insert_agent_session(&s).await.unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (AgentManager::new(services, sink, 4), db_dir)
+    }
+
+    /// (a) Top-level agent in an `executionEnvironment: cow` workspace:
+    /// `ensure_started` synchronously provisions a per-agent sandbox, persists
+    /// the session sandbox fields, records the sandbox with
+    /// `merge_on_turn_end` defaulted true, and resolves the spawn cwd to the
+    /// sandbox. Gated on CoW filesystem support.
+    #[tokio::test]
+    async fn cow_workspace_provisions_sandbox_for_top_level_agent() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script, false);
+        let (test_root, checkout) = repo_in_target("cow-uniform");
+        let workspaces_root = test_root.join("workspaces");
+        std::fs::create_dir_all(&workspaces_root).unwrap();
+        if intent_git::cow_probe(&checkout, &workspaces_root)
+            .map(|s| s == intent_git::CowSupport::Unsupported)
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "skipping cow_workspace_provisions_sandbox_for_top_level_agent: CoW unsupported"
+            );
+            let _ = std::fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws_id = WorkspaceId::from("ws-cow-uniform");
+        let agent_id = AgentId::from("agent-top-level");
+        let ws = workspace_with_env(
+            &ws_id,
+            &checkout,
+            intent_core::CheckoutMode::Cow,
+            intent_core::SandboxType::Cow,
+        );
+        let (mgr, _db) = manager_for(&ws, &agent_id, workspaces_root.clone()).await;
+
+        mgr.ensure_started(&agent_id, &ws_id)
+            .await
+            .expect("cow-workspace top-level spawn succeeds");
+
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        let sandbox_path = session
+            .sandbox_path
+            .clone()
+            .expect("sandbox provisioned for top-level agent");
+        assert!(
+            PathBuf::from(&sandbox_path).is_dir(),
+            "sandbox directory exists: {sandbox_path}"
+        );
+        assert_eq!(
+            session.sandbox_branch.as_deref(),
+            Some(format!("sb/{}", agent_id.0).as_str()),
+            "sandbox snapshot branch persisted"
+        );
+        let record = mgr
+            .services
+            .store
+            .get_sandbox(&ws_id, &agent_id)
+            .await
+            .unwrap()
+            .expect("sandbox record persisted");
+        assert!(
+            record.merge_on_turn_end,
+            "turn-end merge-back applies by default"
+        );
+
+        // The spawn cwd resolves to the sandbox, not the shared checkout.
+        let settings = mgr.services.effective_settings();
+        let resolved = resolve_spawn(&session, Some(&ws), &settings, None).unwrap();
+        assert_eq!(
+            resolved.cwd,
+            PathBuf::from(&sandbox_path),
+            "spawn cwd is the per-agent sandbox"
+        );
+
+        mgr.stop(&agent_id).await;
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// (b) Provisioning FAILURE in a cow workspace (test seam): the agent
+    /// still spawns — WARN + fallback to the shared checkout, no sandbox
+    /// fields, no sandbox record. Unlike microVM, never a hard error.
+    #[tokio::test]
+    async fn cow_workspace_falls_back_to_shared_checkout_on_provisioning_error() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script, true);
+        let (test_root, checkout) = repo_in_target("cow-fallback-err");
+        let workspaces_root = test_root.join("workspaces");
+        std::fs::create_dir_all(&workspaces_root).unwrap();
+
+        let ws_id = WorkspaceId::from("ws-cow-err");
+        let agent_id = AgentId::from("agent-err");
+        let ws = workspace_with_env(
+            &ws_id,
+            &checkout,
+            intent_core::CheckoutMode::Cow,
+            intent_core::SandboxType::Cow,
+        );
+        let (mgr, _db) = manager_for(&ws, &agent_id, workspaces_root).await;
+
+        mgr.ensure_started(&agent_id, &ws_id)
+            .await
+            .expect("provisioning failure falls back to the shared checkout");
+
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(
+            session.sandbox_path.is_none() && session.sandbox_branch.is_none(),
+            "no sandbox fields after fallback"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_sandbox(&ws_id, &agent_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no sandbox record after fallback"
+        );
+        let settings = mgr.services.effective_settings();
+        let resolved = resolve_spawn(&session, Some(&ws), &settings, None).unwrap();
+        assert_eq!(
+            resolved.cwd, checkout,
+            "fallback spawn cwd is the shared workspace checkout"
+        );
+
+        mgr.stop(&agent_id).await;
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// (b) `ProvisionOutcome::Unsupported` in a cow workspace: same fallback.
+    /// The checkout is given a linked-worktree shape (gitfile `.git`), which
+    /// `provision_sandbox` reports as Unsupported on every platform.
+    #[tokio::test]
+    async fn cow_workspace_falls_back_to_shared_checkout_when_unsupported() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script, false);
+        let (test_root, checkout) = repo_in_target("cow-fallback-unsup");
+        // Replace the `.git` dir with a gitfile: linked-worktree shape →
+        // Unsupported (cloning it would alias the original repo).
+        let git_dir = checkout.join(".git");
+        let real_git = test_root.join("real-git");
+        std::fs::rename(&git_dir, &real_git).unwrap();
+        std::fs::write(&git_dir, format!("gitdir: {}\n", real_git.display())).unwrap();
+        let workspaces_root = test_root.join("workspaces");
+        std::fs::create_dir_all(&workspaces_root).unwrap();
+
+        let ws_id = WorkspaceId::from("ws-cow-unsup");
+        let agent_id = AgentId::from("agent-unsup");
+        let ws = workspace_with_env(
+            &ws_id,
+            &checkout,
+            intent_core::CheckoutMode::Cow,
+            intent_core::SandboxType::Cow,
+        );
+        let (mgr, _db) = manager_for(&ws, &agent_id, workspaces_root).await;
+
+        mgr.ensure_started(&agent_id, &ws_id)
+            .await
+            .expect("unsupported CoW falls back to the shared checkout");
+
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(
+            session.sandbox_path.is_none(),
+            "no sandbox fields when CoW is unsupported"
+        );
+
+        mgr.stop(&agent_id).await;
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// (d) microVM semantics unchanged: `Unsupported` provisioning is still a
+    /// hard `ExecutionEnvironmentUnavailable` error, never a shared-checkout
+    /// fallback.
+    #[tokio::test]
+    async fn microvm_workspace_still_hard_errors_when_unsupported() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script, false);
+        let (test_root, checkout) = repo_in_target("mvm-hard-error");
+        let git_dir = checkout.join(".git");
+        let real_git = test_root.join("real-git");
+        std::fs::rename(&git_dir, &real_git).unwrap();
+        std::fs::write(&git_dir, format!("gitdir: {}\n", real_git.display())).unwrap();
+        let workspaces_root = test_root.join("workspaces");
+        std::fs::create_dir_all(&workspaces_root).unwrap();
+
+        let ws_id = WorkspaceId::from("ws-mvm-err");
+        let agent_id = AgentId::from("agent-mvm");
+        let ws = workspace_with_env(
+            &ws_id,
+            &checkout,
+            intent_core::CheckoutMode::Cow,
+            intent_core::SandboxType::Microvm,
+        );
+        let (mgr, _db) = manager_for(&ws, &agent_id, workspaces_root).await;
+
+        let err = mgr
+            .ensure_started(&agent_id, &ws_id)
+            .await
+            .expect_err("microVM unsupported provisioning must hard-error");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, .. }
+                if environment == "microvm"),
+            "got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// (d) Worktree workspaces unchanged: no provisioning branch fires — the
+    /// agent spawns in the shared checkout with no sandbox fields or record.
+    #[tokio::test]
+    async fn worktree_workspace_spawns_without_sandbox() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script, false);
+        let (test_root, checkout) = repo_in_target("worktree-unchanged");
+        let workspaces_root = test_root.join("workspaces");
+        std::fs::create_dir_all(&workspaces_root).unwrap();
+
+        let ws_id = WorkspaceId::from("ws-worktree");
+        let agent_id = AgentId::from("agent-wt");
+        let ws = workspace_with_env(
+            &ws_id,
+            &checkout,
+            intent_core::CheckoutMode::Worktree,
+            intent_core::SandboxType::Worktree,
+        );
+        let (mgr, _db) = manager_for(&ws, &agent_id, workspaces_root).await;
+
+        mgr.ensure_started(&agent_id, &ws_id)
+            .await
+            .expect("worktree spawn unchanged");
+
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(
+            session.sandbox_path.is_none(),
+            "worktree workspaces never provision per-agent sandboxes"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_sandbox(&ws_id, &agent_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no sandbox record in worktree mode"
+        );
+
+        mgr.stop(&agent_id).await;
+        let _ = std::fs::remove_dir_all(&test_root);
     }
 }
 

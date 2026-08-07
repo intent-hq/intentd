@@ -386,6 +386,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_top_level_agent_sandbox_merges_on_turn_end() {
+        // Uniform per-agent isolation (executionEnvironment=cow): a TOP-LEVEL
+        // agent — no parent, no completion watch — with a sandbox still gets
+        // the turn-end merge-back: its commit lands in the canonical checkout,
+        // the sandbox transitions to Merged, and sandbox:cow:merged fires.
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("top-level-merge");
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let mut ws = workspace_for_repo(&repo_path);
+        ws.execution_environment = Some(intent_core::SandboxType::Cow);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId::from("agent-top-level");
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        create_agent_session(&store, &ws.id, &agent_id, None, None).await;
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(&agent_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", agent_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        // Clean commit in the sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("top_level.txt"), "top-level work").unwrap();
+        let mut index = sandbox_repo.index().unwrap();
+        index.add_path(Path::new("top_level.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+        let parent_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Top-level work",
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap();
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root.clone());
+
+        let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
+
+        // No completion watch registered: the top-level agent has no parent.
+        let event = completion_event(&ws.id, &agent_id);
+        services.handle_completion_event(&event).await;
+
+        assert!(
+            repo_path.join("top_level.txt").exists(),
+            "Top-level agent's commit must land in the canonical checkout"
+        );
+        let sandbox = store
+            .get_sandbox(&ws.id, &agent_id)
+            .await
+            .unwrap()
+            .expect("Sandbox must persist after merge");
+        assert_eq!(sandbox.status, SandboxStatus::Merged);
+        let merged_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
+        assert!(
+            merged_event.is_ok(),
+            "sandbox:cow:merged event should be emitted for a top-level agent"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
     async fn test_conflict_suppresses_completion_and_bounces_agent() {
         // Scenario (b): Conflict → completion NOT delivered to parent;
         // agent has queued bounce message with conflicting paths;
