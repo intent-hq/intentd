@@ -885,6 +885,19 @@ pub async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
+    let (_, requirements, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    Ok(requirements)
+}
+
+/// [`fetch_merge_requirements`] plus the two by-products the PR monitor needs
+/// for its own snapshot — the [`PullRequest`] the checklist was composed from
+/// (title / url / head SHA) and the review-comment count from the same thread
+/// fetch — so a poll never repeats the `get_pr` / thread reads.
+pub(crate) async fn fetch_merge_requirements_detailed(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<(PullRequest, MergeRequirements, i64)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
 
     let (signals, reviews) = tokio::join!(
@@ -916,25 +929,21 @@ pub async fn fetch_merge_requirements(
         _ => Vec::new(),
     };
 
-    let unresolved = match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
-        Ok((threads, _, _)) => count_thread_comments(&threads).1,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                pr_number = number,
-                "merge requirements: review threads unavailable, reporting zero unresolved"
-            );
-            0
-        }
-    };
+    let (review_comments, unresolved) =
+        match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
+            Ok((threads, _, _)) => count_thread_comments(&threads),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    pr_number = number,
+                    "merge requirements: review threads unavailable, reporting zero unresolved"
+                );
+                (0, 0)
+            }
+        };
 
-    Ok(merge_requirements(
-        &pr,
-        signals.as_ref(),
-        &fallback_runs,
-        &agg,
-        unresolved,
-    ))
+    let requirements = merge_requirements(&pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    Ok((pr, requirements, review_comments))
 }
 
 // ===========================================================================
