@@ -744,7 +744,7 @@ async fn dispatch(
             let acceptance_criteria = normalize_acceptance_criteria(params);
             let effort = opt_str(params, "effort");
             let result = api
-                .mark_as_task(ws, note_id, status, acceptance_criteria, effort)
+                .mark_as_task(ws, note_id, status, acceptance_criteria, effort, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -766,7 +766,7 @@ async fn dispatch(
             let content = opt_str(params, "content");
             let status = opt_str(params, "status");
             let result = api
-                .create_prerequisite(ws, dependent_note_id, title, content, status)
+                .create_prerequisite(ws, dependent_note_id, title, content, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1101,9 +1101,17 @@ async fn dispatch(
             // rejected rather than silently dropped because a dropped value
             // would flip the persisted flag's default.
             let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
+            // `reasoningEffort` deliberately uses `opt_str`, not
+            // `opt_nonempty_str`: at creation a present-but-blank value is an
+            // explicit clear, and the service seam distinguishes it from an
+            // absent param (absent is what lets the settings default
+            // `model.defaultReasoningEffort` apply). Collapsing `""` here
+            // would silently promote a caller's clear into the settings
+            // default. The blank is dropped downstream, so the persisted
+            // field is still `NULL` either way.
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
@@ -1302,9 +1310,23 @@ async fn dispatch(
         "agent.setModel" => {
             let agent_id = require_agent_id(params)?;
             let model_id = require_str_param(params, "modelId")?;
+            // Optional explicit provider (additive, PROTOCOL §5.5): empty /
+            // whitespace-only (and JSON null) are treated as absent so older
+            // clients sending a blank field keep the historical behavior; a
+            // present non-string value is a malformed request — reject it
+            // rather than silently falling back to the legacy path.
+            match params.get("providerId") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => {
+                    return Err(invalid_params(
+                        "agent.setModel: providerId must be a string",
+                    ))
+                }
+            }
+            let provider_id = opt_nonempty_str(params, "providerId").map(|s| s.trim().to_string());
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_set_model(ws, agent_id, model_id)
+                .agent_set_model(ws, agent_id, model_id, provider_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1489,9 +1511,13 @@ async fn dispatch(
                 .map_err(|e| {
                     invalid_params(format!("agent.wakeOrCreate: invalid `create` payload: {e}"))
                 })?;
+            // `reasoningEffort` uses `opt_str` for the same reason as
+            // `agent.create` above: on the create branch a present-but-blank
+            // value is an explicit clear that must not fall through to the
+            // settings default.
             let input = AgentWakeOrCreateInput {
                 model: opt_nonempty_str(params, "model"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
@@ -2956,6 +2982,29 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let hook_id = require_str_param(params, "hookId")?;
             api.hook_run_now(ws, intent_core::HookId::from(hook_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        // Centralized PR monitors (§6.9): the FE reads, cancels and flushes
+        // monitors; there is NO wire registration method — monitors are
+        // agent-owned via the `ws.pr.monitor` MCP binding only.
+        "prMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            api.pr_monitor_list(ws, None).await.map_err(domain_to_rpc)
+        }
+        "prMonitor.cancel" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            // FE cancel: any monitor can be cancelled and the owning agent is
+            // woken with a cancellation notice.
+            api.pr_monitor_cancel_by_id(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "prMonitor.flush" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            api.pr_monitor_flush_pending(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
                 .await
                 .map_err(domain_to_rpc)
         }

@@ -74,6 +74,12 @@ fn registry_field_parity() {
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
     assert!(auggie.can_be_disabled);
     assert_eq!(auggie.login_command_hint, Some("auggie login"));
+    // `auggie token print` exits 0 iff logged in; its output is the auth
+    // session secret, so the probe must ride the generic exit-code arm.
+    assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
+    // Installed-but-logged-out auggie needs a login affordance on the generic
+    // provider row, which reads the catalog's `login_docs_url`.
+    assert!(auggie.login_docs_url.is_some());
 
     let cc = find_provider("claude-code").unwrap();
     assert_eq!(cc.command, "claude-agent-acp");
@@ -129,6 +135,7 @@ fn registry_field_parity() {
     assert_eq!(grok.display_name, "Grok Build");
     assert_eq!(grok.command, "grok");
     assert_eq!(grok.base_args, &["agent", "stdio"]);
+    assert!(grok.terminal_requires_shell);
     // Grok selects models after session creation via session/set_model — no
     // CLI model flag.
     assert!(grok.model_flag.is_none() && grok.supports_set_model);
@@ -225,7 +232,7 @@ fn pi_resolves_in_registry_with_pinned_npx_package() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.31");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.33");
     assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
@@ -969,7 +976,7 @@ fn injection_mechanism_registry() {
         find_provider("claude-code").unwrap().injection_mechanism,
         SessionMeta
     );
-    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.7)
+    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.14)
     // ignores `_meta.developerInstructions` (#479).
     assert_eq!(
         find_provider("codex").unwrap().injection_mechanism,
@@ -1500,5 +1507,23 @@ fn non_env_config_providers_ignore_mcp_json() {
             !env.contains_key("OPENCODE_CONFIG_CONTENT"),
             "{id} unexpectedly emitted OPENCODE_CONFIG_CONTENT"
         );
+    }
+}
+
+#[test]
+fn only_grok_requires_terminal_shell_by_default() {
+    for p in crate::ACP_PROVIDERS {
+        if p.id == "grok" {
+            assert!(
+                p.terminal_requires_shell,
+                "grok must shell-wrap ACP terminals"
+            );
+        } else {
+            assert!(
+                !p.terminal_requires_shell,
+                "{} should not require terminal shell wrap",
+                p.id
+            );
+        }
     }
 }

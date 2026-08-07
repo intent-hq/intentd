@@ -34,6 +34,7 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::git_metadata_watcher::GitMetadataWatcher;
 use super::git_status_refresher::GitStatusRefresher;
+use super::shared_watch::SharedWatchHub;
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
@@ -43,6 +44,10 @@ use super::watcher::FileWatcher;
 /// owns (clean shutdown, matching the previous boot-time handles).
 pub struct WatcherRegistry {
     task: JoinHandle<()>,
+    /// Retained only so tests can await watch establishment; the lifecycle task
+    /// owns the hub for production purposes.
+    #[cfg(test)]
+    hub: Arc<SharedWatchHub>,
 }
 
 impl Drop for WatcherRegistry {
@@ -93,34 +98,39 @@ impl WatcherRegistry {
             }
         };
 
+        // All four families share the hub's streams, so the steady-state
+        // FSEvents stream count follows the number of distinct parent
+        // directories the workspace roots live under, not the workspace count
+        // times the number of watch roots each one used to register.
+        let hub = SharedWatchHub::new();
+
         let mut file_watchers: HashMap<WorkspaceId, FileWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
-            match FileWatcher::start(bus.clone(), ws_id.clone(), path.clone()) {
-                Ok(w) => {
-                    tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files");
-                    file_watchers.insert(ws_id.clone(), w);
-                }
-                Err(e) => {
-                    tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "file watcher start failed")
-                }
-            }
+            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files");
+            file_watchers.insert(
+                ws_id.clone(),
+                FileWatcher::start(&hub, bus.clone(), ws_id.clone(), path.clone()),
+            );
         }
         tracing::info!(count = file_watchers.len(), "file watchers started");
 
         let mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
-            if let Some(w) = start_git_metadata_watch(&refresher, ws_id.clone(), path.clone(), "") {
+            if let Some(w) =
+                start_git_metadata_watch(&hub, &refresher, ws_id.clone(), path.clone(), "")
+            {
                 git_watchers.insert(ws_id.clone(), w);
             }
         }
         tracing::info!(count = git_watchers.len(), "git metadata watchers started");
 
-        let skills = SkillsWatcher::start(bus.clone(), initial.clone());
+        let skills = SkillsWatcher::start(&hub, bus.clone(), initial.clone());
         tracing::info!("skills watcher started");
-        let specialists = SpecialistsWatcher::start(bus.clone(), initial);
+        let specialists = SpecialistsWatcher::start(&hub, bus.clone(), initial);
         tracing::info!("specialists watcher started");
 
         let task = tokio::spawn(lifecycle_loop(
+            Arc::clone(&hub),
             bus,
             services,
             refresher,
@@ -130,29 +140,54 @@ impl WatcherRegistry {
             skills,
             specialists,
         ));
-        Self { task }
+        Self {
+            task,
+            #[cfg(test)]
+            hub,
+        }
+    }
+
+    /// Await every requested shared watch actually being registered with the
+    /// OS. Registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating a watched tree.
+    /// `expect_roots` is the number of watched roots the caller expects to
+    /// exist, so a wait issued before the registry has subscribed does not
+    /// return immediately against an empty hub.
+    #[cfg(test)]
+    async fn wait_established(&self, expect_roots: usize, timeout: std::time::Duration) {
+        self.hub.wait_all_established(expect_roots, timeout).await;
+    }
+
+    /// Registration state of one specific root — see
+    /// [`SharedWatchHub::root_established`].
+    #[cfg(test)]
+    fn root_established(&self, root: &std::path::Path) -> Option<bool> {
+        self.hub.root_established(root)
+    }
+
+    /// Live shared FSEvents stream count — the consolidation metric.
+    #[cfg(test)]
+    fn stream_count(&self) -> usize {
+        self.hub.stream_count()
     }
 }
 
 /// Start the `.git` metadata watch for one workspace, logging the outcome.
-/// `None` covers both the quiet non-git case and a start failure.
+/// `None` covers the quiet non-git case.
 fn start_git_metadata_watch(
+    hub: &Arc<SharedWatchHub>,
     refresher: &Arc<GitStatusRefresher>,
     ws_id: WorkspaceId,
     path: PathBuf,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
-    match GitMetadataWatcher::start(Arc::clone(refresher), ws_id.clone(), path.clone()) {
-        Ok(Some(w)) => {
+    match GitMetadataWatcher::start(hub, Arc::clone(refresher), ws_id.clone(), path.clone()) {
+        Some(w) => {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
             Some(w)
         }
-        Ok(None) => {
+        None => {
             tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "git metadata watcher start failed");
             None
         }
     }
@@ -160,7 +195,9 @@ fn start_git_metadata_watch(
 
 /// Start (or replace) the file + `.git` metadata watches for one workspace.
 /// `suffix` distinguishes the triggering transition in the logs.
+#[allow(clippy::too_many_arguments)]
 fn start_watches(
+    hub: &Arc<SharedWatchHub>,
     bus: &EventBus,
     refresher: &Arc<GitStatusRefresher>,
     file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
@@ -169,16 +206,13 @@ fn start_watches(
     path: &std::path::Path,
     suffix: &str,
 ) {
-    match FileWatcher::start(bus.clone(), ws_id.clone(), path.to_path_buf()) {
-        Ok(w) => {
-            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files{suffix}");
-            file_watchers.insert(ws_id.clone(), w);
-        }
-        Err(e) => {
-            tracing::warn!(workspace = %ws_id, path = %path.display(), error = %e, "file watcher start failed")
-        }
-    }
-    if let Some(w) = start_git_metadata_watch(refresher, ws_id.clone(), path.to_path_buf(), suffix)
+    tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files{suffix}");
+    file_watchers.insert(
+        ws_id.clone(),
+        FileWatcher::start(hub, bus.clone(), ws_id.clone(), path.to_path_buf()),
+    );
+    if let Some(w) =
+        start_git_metadata_watch(hub, refresher, ws_id.clone(), path.to_path_buf(), suffix)
     {
         git_watchers.insert(ws_id.clone(), w);
     }
@@ -213,6 +247,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_loop(
+    hub: Arc<SharedWatchHub>,
     bus: EventBus,
     services: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
@@ -232,6 +267,7 @@ async fn lifecycle_loop(
                         continue;
                     };
                     start_watches(
+                        &hub,
                         &bus,
                         &refresher,
                         &mut file_watchers,
@@ -282,6 +318,7 @@ async fn lifecycle_loop(
                             continue;
                         };
                         start_watches(
+                            &hub,
                             &bus,
                             &refresher,
                             &mut file_watchers,
@@ -515,8 +552,67 @@ mod tests {
 
     /// Start a registry with its own refresher (the production wiring shape).
     async fn start_registry(bus: &EventBus, api: Arc<dyn WorkspaceApi>) -> WatcherRegistry {
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api.clone(),
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
         WatcherRegistry::start(bus.clone(), api, refresher).await
+    }
+
+    /// Wait until `root` is watched-and-established (`want = true`) or absent
+    /// from the hub entirely (`want = false`), before mutating a watched tree.
+    /// Registration is deliberately off the runtime (monorepo#1572), so waiting
+    /// on the hub's own establishment signal — rather than guessing with a fixed
+    /// sleep — is what makes these tests deterministic. The check is per-root
+    /// rather than a total count because the skills/specialists tier roots share
+    /// the hub, so a count can be satisfied by the wrong root and let a test
+    /// race ahead of the registration it actually cares about. The short
+    /// trailing sleep is the usual FSEvents/inotify settle margin: `watch()` has
+    /// returned, but the backend needs a moment before it reports changes.
+    async fn wait_for_root(registry: &WatcherRegistry, root: &std::path::Path, want: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ready = match registry.root_established(root) {
+                Some(established) => want && established,
+                None => !want,
+            };
+            if ready || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// Actively confirm `ws_id`'s watch is live: rewrite a throwaway probe file
+    /// under `root` until an event for it comes back. Preferable to a fixed
+    /// warm-up wherever a test then asserts the ABSENCE of an event, since a
+    /// warm-up that lost the establishment race would make that absence
+    /// vacuously true.
+    async fn confirm_watch_live(
+        sub: &mut super::super::bus::Subscription,
+        ws_id: &WorkspaceId,
+        root: &std::path::Path,
+    ) {
+        let probe = root.join(".watch-probe");
+        for attempt in 0..40 {
+            std::fs::write(&probe, format!("{attempt}")).expect("write probe");
+            if next_file_event(sub, ws_id, Duration::from_millis(500))
+                .await
+                .is_some()
+            {
+                let _ = std::fs::remove_file(&probe);
+                // Drain the removal's own event so it cannot be mistaken for a
+                // later assertion's subject.
+                while next_file_event(sub, ws_id, Duration::from_millis(500))
+                    .await
+                    .is_some()
+                {}
+                return;
+            }
+        }
+        panic!("watch for {ws_id} never became live");
     }
 
     #[tokio::test]
@@ -531,7 +627,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
 
@@ -549,7 +645,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Nothing is watched yet: the boot seed is empty.
 
         // Register a workspace at runtime via `workspace:created` (payload
         // carries the workspace row per §6.7).
@@ -558,7 +654,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
             .await
             .expect("publish created");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-create.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
@@ -571,7 +667,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, false).await;
 
         std::fs::write(root.path.join("after-delete.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -596,25 +692,172 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         // Simulate close → open: after close the watchers are gone, and the
         // reopen path exercises the get_workspace lookup.
         bus.publish(&lifecycle_event(WORKSPACE_CLOSED, &ws, false))
             .await
             .expect("publish closed");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, false).await;
 
         bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
             .await
             .expect("publish opened");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
         assert!(
             ev.is_some(),
             "reopened workspace must emit file events (path resolved via services)"
+        );
+    }
+
+    /// Consolidation regression: two workspaces whose roots sit under the same
+    /// parent share one FSEvents stream, so the in-process demux is the only
+    /// thing keeping them apart. Each must publish `file:*` events for its own
+    /// paths only — a leak here would attribute one workspace's edits to the
+    /// other.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn workspaces_sharing_a_consolidated_root_receive_only_their_own_file_events() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        // Sibling roots under one parent: the hub groups them onto a single
+        // shared stream.
+        let parent = TempDir::new("shared");
+        let root_a = parent.path.join("ws-a");
+        let root_b = parent.path.join("ws-b");
+        std::fs::create_dir_all(&root_a).expect("mk ws-a");
+        std::fs::create_dir_all(&root_b).expect("mk ws-b");
+        let ws_a = test_workspace("ws-shared-a", &root_a);
+        let ws_b = test_workspace("ws-shared-b", &root_b);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws_a.clone(), ws_b.clone()]));
+
+        let _registry = start_registry(&bus, api).await;
+        // Both watches must be confirmed live before the isolation assertions:
+        // the negative one below would pass vacuously against an unestablished
+        // watch.
+        confirm_watch_live(&mut sub, &ws_a.id, &root_a).await;
+        confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
+
+        std::fs::write(root_a.join("in-a.txt"), "hi").expect("write in a");
+        let ev = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(10))
+            .await
+            .expect("workspace a must emit for its own file");
+        assert_eq!(ev.data["relativePath"], "in-a.txt");
+
+        // Nothing for b: it shares the stream but not the path prefix.
+        let leaked = next_file_event(&mut sub, &ws_b.id, Duration::from_secs(2)).await;
+        assert!(
+            leaked.is_none(),
+            "a sibling workspace must not receive events for another's paths, got {leaked:?}"
+        );
+
+        // The reverse direction too, so the assertion is not just about
+        // ordering.
+        std::fs::write(root_b.join("in-b.txt"), "hi").expect("write in b");
+        let ev = next_file_event(&mut sub, &ws_b.id, Duration::from_secs(10))
+            .await
+            .expect("workspace b must emit for its own file");
+        assert_eq!(ev.data["relativePath"], "in-b.txt");
+    }
+
+    /// The consolidation metric itself: many workspaces must not scale the
+    /// stream count. Before this change each workspace registered its own file
+    /// watcher, `.git` watcher (two roots) and four project-tier skills /
+    /// specialists watches — roughly five or six OS streams each, so eight
+    /// workspaces meant ~40+. Now every root under a shared parent joins ONE
+    /// stream, so the count follows the number of distinct parent directories.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn many_workspaces_share_a_single_stream_per_parent_directory() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let parent = TempDir::new("count");
+        let workspaces: Vec<_> = (0..8)
+            .map(|i| {
+                let root = parent.path.join(format!("ws-{i}"));
+                std::fs::create_dir_all(&root).expect("mk ws");
+                test_workspace(&format!("ws-count-{i}"), &root)
+            })
+            .collect();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(workspaces.clone()));
+
+        let registry = start_registry(&bus, api).await;
+        registry
+            .wait_established(workspaces.len(), Duration::from_secs(10))
+            .await;
+
+        assert_eq!(
+            registry.stream_count(),
+            1,
+            "8 sibling workspaces must consolidate onto a single shared stream"
+        );
+    }
+
+    /// Consolidation regression for the archive lifecycle: archiving one of two
+    /// workspaces on a SHARED stream must drop only that workspace from the
+    /// demux, leaving its co-tenant emitting throughout, and unarchiving must
+    /// put it back. The single-workspace case is covered by
+    /// `archived_workspace_stops_watching_and_unarchive_resumes_it`; what is
+    /// specific here is that the stream itself stays up for the sibling, so
+    /// exclusion can only come from the demux table.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn archiving_one_workspace_leaves_its_shared_stream_co_tenant_watched() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let parent = TempDir::new("shared-archive");
+        let root_a = parent.path.join("ws-a");
+        let root_b = parent.path.join("ws-b");
+        std::fs::create_dir_all(&root_a).expect("mk ws-a");
+        std::fs::create_dir_all(&root_b).expect("mk ws-b");
+        let ws_a = test_workspace("ws-shared-arch-a", &root_a);
+        let ws_b = test_workspace("ws-shared-arch-b", &root_b);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws_a.clone(), ws_b.clone()]));
+
+        let _registry = start_registry(&bus, api).await;
+        confirm_watch_live(&mut sub, &ws_a.id, &root_a).await;
+        confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
+
+        // Archive a only.
+        bus.publish(&archive_event(&ws_a, true))
+            .await
+            .expect("publish archived");
+        wait_for_root(&_registry, &root_a, false).await;
+
+        std::fs::write(root_a.join("while-archived.txt"), "hi").expect("write in a");
+        let leaked = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(2)).await;
+        assert!(
+            leaked.is_none(),
+            "archived workspace must be excluded from the demux, got {leaked:?}"
+        );
+
+        // b never stopped: the shared stream is still up and still demuxing.
+        // Probed rather than written once, because dropping a root rebuilds the
+        // group's FSEvents stream — the co-tenant stays watched, but delivery
+        // resumes a moment after `unwatch` returns.
+        confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
+
+        // Unarchive a: it rejoins the demux.
+        bus.publish(&archive_event(&ws_a, false))
+            .await
+            .expect("publish unarchived");
+        wait_for_root(&_registry, &root_a, true).await;
+
+        std::fs::write(root_a.join("after-unarchive.txt"), "hi").expect("write in a");
+        let ev = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(10)).await;
+        assert!(
+            ev.is_some(),
+            "unarchived workspace must rejoin the demux and resume emitting"
         );
     }
 
@@ -633,17 +876,16 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-
-        std::fs::write(root.path.join("before-archive.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
-        assert!(ev.is_some(), "active workspace must emit file events");
+        // Probed rather than written once: the negative assertion after the
+        // archive would be vacuous if delivery had never started, and delivery
+        // can lag establishment by more than a single write's budget.
+        confirm_watch_live(&mut sub, &ws.id, &root.path).await;
 
         // Archive: `workspace:updated` with `changes.archived = true`.
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, false).await;
 
         std::fs::write(root.path.join("while-archived.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -657,7 +899,7 @@ mod tests {
         bus.publish(&archive_event(&ws, false))
             .await
             .expect("publish unarchived");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-unarchive.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
@@ -681,7 +923,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         let mut ev = lifecycle_event(WORKSPACE_UPDATED, &ws, false);
         ev.data = serde_json::json!({
@@ -689,7 +931,7 @@ mod tests {
             "changes": { "title": "renamed" },
         });
         bus.publish(&ev).await.expect("publish updated");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-update.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
@@ -703,10 +945,14 @@ mod tests {
     /// must get a `changes:git-status` refresh even though no `.git` event was
     /// observed during the unwatched window.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn unarchive_triggers_git_status_catch_up_refresh() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
 
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -736,12 +982,12 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, false).await;
 
         // Change git state while unwatched, then drain anything the archive
         // transition itself may still have had in flight.
@@ -760,10 +1006,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn git_workspace_created_after_start_gains_metadata_watch_and_deletion_stops_it() {
         use git2::{Repository, Signature};
         use intent_core::events::CHANGES_GIT_STATUS;
 
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -773,7 +1023,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake.clone();
 
         let _registry = start_registry(&bus, api).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Nothing is watched yet: the boot seed is empty.
 
         // Real repo with a seed commit, registered at runtime. The refresher
         // resolves the worktree via `get_workspace`, so the api must know the
@@ -802,7 +1052,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
             .await
             .expect("publish created");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, true).await;
 
         // External `git checkout`-style HEAD rewrite → debounced refresh.
         repo.set_head("refs/heads/other").unwrap();
@@ -816,7 +1066,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_for_root(&_registry, &root.path, false).await;
 
         repo.set_head("refs/heads/main").unwrap();
         let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(3)).await;

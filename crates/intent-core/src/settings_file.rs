@@ -35,9 +35,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
 use crate::error::{Error, Result};
 
@@ -68,6 +69,7 @@ pub struct SettingsFile {
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
+    pub pr_monitor: PrMonitorSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -653,6 +655,16 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.attentionRequests` — expose attention requests
     /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
     pub attention_requests: bool,
+    /// `agentFeatures.stateSnapshot` — inject the per-turn agent state
+    /// snapshot line (`current ws.agent.snapshot() => {...}`) into outbound
+    /// turn prompts. Unlike the other toggles this is read LIVE each turn —
+    /// flipping it affects the very next turn of every session, existing
+    /// ones included. The `ws.agent.snapshot()` MCP tool itself is never
+    /// gated.
+    pub state_snapshot: bool,
+    /// `agentFeatures.prMonitor` — expose centralized PR monitoring
+    /// (`ws.pr.monitor` / `ws.pr.unmonitor`) to agents.
+    pub pr_monitor: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -666,6 +678,8 @@ impl Default for AgentFeaturesSettings {
             rich_chat_blocks: true,
             structured_questions: true,
             attention_requests: true,
+            state_snapshot: true,
+            pr_monitor: true,
         }
     }
 }
@@ -686,6 +700,29 @@ impl Default for WakeResumeSettings {
         Self {
             enabled: DEFAULT_WAKE_RESUME_ENABLED,
             threshold_seconds: DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+        }
+    }
+}
+
+/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). Both
+/// values are read live by the monitor loop, so a change applies without a
+/// daemon restart; sub-floor values are clamped at read time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrMonitorSettings {
+    /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
+    /// before its consolidated wake is delivered.
+    pub debounce_seconds: u64,
+    /// `prMonitor.pollSeconds` — poll cadence for the centralized monitor
+    /// loop (config-file key; not exposed in the Settings UI).
+    pub poll_seconds: u64,
+}
+
+impl Default for PrMonitorSettings {
+    fn default() -> Self {
+        Self {
+            debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+            poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
         }
     }
 }
@@ -1149,6 +1186,13 @@ structuredQuestions = true
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
+# State snapshot -- inject the per-turn agent state snapshot line into turn
+# prompts; unlike the other toggles this applies to the next turn of every
+# session (live), existing sessions included.
+stateSnapshot = true
+# PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
+# ws.pr.unmonitor) to agents.
+prMonitor = true
 
 [wakeResume]
 # Wake resume enabled -- detect host sleep/wake and resume work on wake.
@@ -1156,6 +1200,14 @@ enabled = true
 # Wake resume threshold seconds -- minimum suspend duration (in seconds) that
 # counts as a sleep; also the resume/enrollment gate.
 thresholdSeconds = 10
+
+[prMonitor]
+# PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
+# observe before its consolidated wake is delivered (minimum 10).
+debounceSeconds = 60
+# PR monitor poll seconds -- how often (in seconds) the centralized loop polls
+# each monitored PR (minimum 10).
+pollSeconds = 30
 "##;
 
 #[cfg(test)]
@@ -1255,6 +1307,7 @@ mod tests {
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
+        assert!(d.agent_features.state_snapshot);
         assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
         assert_eq!(
             d.wake_resume.threshold_seconds,
@@ -1289,6 +1342,8 @@ mod tests {
         assert!(parsed.agent_features.browser_automation);
         assert!(parsed.agent_features.structured_questions);
         assert!(parsed.agent_features.attention_requests);
+        assert!(parsed.agent_features.state_snapshot);
+        assert!(parsed.agent_features.pr_monitor);
     }
 
     #[test]
@@ -1680,6 +1735,45 @@ mod tests {
                 .expect("override parses");
         assert!(!parsed.wake_resume.enabled);
         assert_eq!(parsed.wake_resume.threshold_seconds, 45);
+    }
+
+    #[test]
+    fn pr_monitor_defaults_and_template_round_trip() {
+        // A file with no [prMonitor] section resolves to the shipped defaults,
+        // and `agentFeatures.prMonitor` defaults on.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(parsed.agent_features.pr_monitor);
+        assert_eq!(
+            parsed.pr_monitor.debounce_seconds,
+            DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS
+        );
+        assert_eq!(
+            parsed.pr_monitor.poll_seconds,
+            DEFAULT_PR_MONITOR_POLL_SECONDS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.pr_monitor, parsed.pr_monitor);
+        assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn pr_monitor_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\n",
+        )
+        .expect("override parses");
+        assert!(!parsed.agent_features.pr_monitor);
+        assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
+        assert_eq!(parsed.pr_monitor.poll_seconds, 90);
+    }
+
+    #[test]
+    fn pr_monitor_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[prMonitor]\ndebounceSecs = 30\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prMonitor"), "names the table: {msg}");
+        assert!(msg.contains("debounceSecs"), "names the bad key: {msg}");
     }
 
     #[test]

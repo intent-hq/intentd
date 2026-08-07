@@ -1218,7 +1218,7 @@ mod workspace_needs_attention {
     }
 
     /// Assistant content carrying one structured-question resource block
-    /// (the shape `has_question_blocks` matches).
+    /// (the shape `question_block_count` matches).
     pub(super) fn question_content() -> serde_json::Value {
         json!([{
             "type": "resource",
@@ -2067,6 +2067,7 @@ mod display_status_events {
                 h.ws.clone(),
                 NoteId::from("spec"),
                 "Fresh prerequisite".to_string(),
+                None,
                 None,
                 None,
             )

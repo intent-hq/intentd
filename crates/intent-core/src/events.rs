@@ -174,6 +174,13 @@ pub const NOTE_DELETED: &str = "note:deleted";
 pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 
 // Task events.
+// Emitted once per note becoming a task, across every creation path
+// (`@@@task` block conversion, `task.createPrerequisite`, and
+// `task.markAsTask` on a note that was not previously a task). The
+// self-sufficient payload `{ noteId, noteTitle, status, createdAt, agentId? }`
+// parallels `task:status-changed` so a feed renders the new task without a
+// follow-up read.
+pub const TASK_CREATED: &str = "task:created";
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
 // Task↔agent linkage events (new in intentd; PROTOCOL §5.4 / §6.5). Migrate
@@ -219,6 +226,18 @@ pub const HOOK_DISPATCHED: &str = "hook:dispatched";
 pub const HOOK_EVICTED: &str = "hook:evicted";
 pub const HOOK_CANCELLED: &str = "hook:cancelled";
 pub const HOOK_EXPIRED: &str = "hook:expired";
+
+// PR-monitor lifecycle events (`ws.pr.monitor`). Emitted by the centralized
+// monitor loop: `prMonitor:registered` (a monitor armed or re-armed),
+// `prMonitor:changed` (a poll detected changes; they accumulate for the
+// debounce window), `prMonitor:emitted` (the consolidated wake was
+// delivered), `prMonitor:completed` (the PR merged/closed; monitoring
+// stopped), and `prMonitor:cancelled` (agent- or FE-initiated cancel).
+pub const PR_MONITOR_REGISTERED: &str = "prMonitor:registered";
+pub const PR_MONITOR_CHANGED: &str = "prMonitor:changed";
+pub const PR_MONITOR_EMITTED: &str = "prMonitor:emitted";
+pub const PR_MONITOR_COMPLETED: &str = "prMonitor:completed";
+pub const PR_MONITOR_CANCELLED: &str = "prMonitor:cancelled";
 
 // Test events.
 pub const TEST_STARTED: &str = "test:started";
@@ -423,6 +442,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_UPDATED,
     NOTE_DELETED,
     LINE_ATTRIBUTION_UPDATED,
+    TASK_CREATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TASK_AGENT_LINKED,
@@ -441,6 +461,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOOK_EVICTED,
     HOOK_CANCELLED,
     HOOK_EXPIRED,
+    PR_MONITOR_REGISTERED,
+    PR_MONITOR_CHANGED,
+    PR_MONITOR_EMITTED,
+    PR_MONITOR_COMPLETED,
+    PR_MONITOR_CANCELLED,
     TEST_STARTED,
     TEST_COMPLETED,
     BUILD_STARTED,

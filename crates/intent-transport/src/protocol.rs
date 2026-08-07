@@ -44,9 +44,13 @@
 //! v3.0/v5.0 removal precedent): both are superseded end-to-end by the
 //! hybrid `file:*` event persistence introduced in the same change, and now
 //! return `-32601` (method not found) — no other method-catalog change.
+//! Version 6.1 adds the PR-monitor FE surface (additive; §5.42):
+//! `prMonitor.list`, `prMonitor.cancel` and `prMonitor.flush` router methods
+//! backing the agent-side `ws.pr.monitor` engine, plus the `prMonitor:*`
+//! event category — 270 router methods, 307 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.0";
+pub const PROTOCOL_VERSION: &str = "6.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

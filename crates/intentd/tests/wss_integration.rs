@@ -379,7 +379,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "6.0",
+        sess[0]["result"]["protocolVersion"], "6.1",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1324,6 +1324,195 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     srv.ws.stop().await;
 }
 
+/// `agent.setModel` optional `providerId` param over the real WSS wire
+/// (monorepo#1657, PROTOCOL §5.5): a bare model claimed by another
+/// provider's cached catalog is rejected -32602 without `providerId` (the
+/// message carries the pass-providerId hint), succeeds WITH the owning
+/// `providerId` and reconciles the served `provider`, an unknown
+/// `providerId` is -32602, a non-string `providerId` is -32602 at the
+/// router boundary, and a compound `modelId` conflicting with `providerId`
+/// is -32602 with the session untouched. Every response is checked for the
+/// JSON-RPC envelope (`jsonrpc: "2.0"` + request-id correlation).
+#[tokio::test]
+async fn wss_agent_set_model_provider_id_param() {
+    /// Assert the JSON-RPC response envelope: version and id correlation.
+    fn assert_envelope(resp: &Value, id: i64) {
+        assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
+        assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
+    }
+    let dir = test_tempdir("intentd-wss-setmodel-pid-");
+    // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
+    // version key must match each provider's current one ("" — no pin).
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
+            },
+            "grok": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS SetModel ProviderId"}}"#,
+    )
+    .await;
+    assert_envelope(&created_ws, 1);
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Pid","model":"auggie:sonnet4.5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&created, 2);
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Without providerId the bare grok-claimed model is rejected against the
+    // session's auggie provider — and the message carries the hint.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 3);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "bare mismatch without providerId must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("pass providerId"),
+        "rejection must hint at providerId: {rejected}"
+    );
+
+    // Unknown explicit providerId → -32602 before any mutation.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"nonexistent"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 4);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // Compound modelId whose prefix conflicts with providerId → -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"auggie:sonnet4.5","providerId":"grok"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 5);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "conflicting providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("names provider auggie but providerId is grok"),
+        "error must name both providers: {rejected}"
+    );
+
+    // A present non-string providerId is malformed — -32602 at the router
+    // boundary, not a silent fall-back to the legacy session-provider path.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":42}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 6);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "non-string providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: providerId must be a string"),
+        "error must name the malformed param: {rejected}"
+    );
+
+    // All rejections left the session untouched.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_envelope(&got, 7);
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("auggie:sonnet4.5"),
+        "model must be unchanged after the rejections: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("auggie"),
+        "provider must be unchanged after the rejections: {got}"
+    );
+
+    // With the owning providerId the same bare model passes, and the served
+    // provider reconciles to it.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+    );
+    let accepted = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&accepted, 8);
+    assert!(
+        accepted.get("error").is_none(),
+        "bare model with owning providerId must pass: {accepted}"
+    );
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_envelope(&got, 9);
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("grok-4-fast"),
+        "model must be updated: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["provider"],
+        Value::from("grok"),
+        "provider must reconcile to the explicit providerId: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Regression for monorepo#607 (dynamic gap) over the real WSS wire: with a
 /// warm auggie catalog cached (seeded through the persisted models-cache
 /// file) that claims the dynamic-only `fable-5` and a grok catalog without
@@ -2140,6 +2329,119 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
     srv.ws.stop().await;
 }
 
+/// `model.defaultReasoningEffort` as the last rung of the creation-time
+/// effort resolution, over the real WSS transport: a no-model `agent.create`
+/// whose model resolves from the settings chain pins the configured effort,
+/// an explicit `model` (which pins the model itself) suppresses it, and a
+/// level the resolved model's cached `effortLevels` does not list is dropped
+/// with a warn rather than rejected — settings-chain leniency, so the create
+/// still succeeds with the effort omitted from the `AgentLite` payload.
+#[tokio::test]
+async fn wss_agent_create_applies_settings_default_reasoning_effort() {
+    let dir = test_tempdir("intentd-wss-settings-effort-");
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Settings Effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings default"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("auggie:fable-5"),
+        "settings default model pinned: {created}"
+    );
+    assert_eq!(
+        created["result"]["agent"]["reasoningEffort"],
+        Value::from("high"),
+        "settings default effort pinned alongside the settings default model: {created}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit model","model":"auggie:fable-5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an explicitly pinned model suppresses the settings default effort: {created}"
+    );
+
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("xhigh"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Unsupported"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created.get("error").is_none(),
+        "an unsupported settings level must never reject the create: {created}"
+    );
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an unsupported settings level is dropped, leaving the effort unset: {created}"
+    );
+
+    // Boundary check: a present-but-blank `reasoningEffort` is an explicit
+    // clear that must survive the router (`opt_str`, not `opt_nonempty_str`)
+    // and suppress the settings default instead of being collapsed to absent.
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit clear","reasoningEffort":""}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "a blank `reasoningEffort` is an explicit clear, not a fall-through: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
 /// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
@@ -2628,6 +2930,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
                 output_tokens: 40,
                 cache_read_tokens: 20,
                 cache_creation_tokens: 10,
+                thought_tokens: 12,
             },
         )
         .await
@@ -2638,6 +2941,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
             &bucket_key(now),
             &intent_store::UsageRateDelta {
                 input_tokens: 1,
+                thought_tokens: 3,
                 ..Default::default()
             },
         )
@@ -2679,6 +2983,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert!(s["outputTokens"].is_u64(), "{s}");
         assert!(s["cacheReadTokens"].is_u64(), "{s}");
         assert!(s["cacheCreationTokens"].is_u64(), "{s}");
+        assert!(s["thoughtTokens"].is_u64(), "{s}");
     }
     let buckets: Vec<&str> = samples
         .iter()
@@ -2696,6 +3001,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert_eq!(cur["outputTokens"], 40, "{resp}");
         assert_eq!(cur["cacheReadTokens"], 20, "{resp}");
         assert_eq!(cur["cacheCreationTokens"], 10, "{resp}");
+        assert_eq!(cur["thoughtTokens"], 15, "{resp}");
     } else {
         panic!("current-minute bucket missing from window: {resp}");
     }
@@ -2703,6 +3009,9 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         .expect("minute-2 bucket inside the window");
     assert_eq!(mid["inputTokens"], 7, "{resp}");
     assert_eq!(mid["outputTokens"], 2, "{resp}");
+    // A minute recorded without any reasoning tokens still carries the field
+    // (dense samples), reading back as the additive column's 0 default.
+    assert_eq!(mid["thoughtTokens"], 0, "{resp}");
     // Untouched minutes are zero-filled; the 30-minute-old row is outside.
     assert!(
         !samples.iter().any(|s| s["inputTokens"] == 999),
@@ -2945,19 +3254,31 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
 
 #[cfg(unix)]
 #[tokio::test]
-async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe() {
-    // models.list legacy path staleness contract (§5.30) over the real WSS
-    // transport: a NON-forced read whose cache entry is past the 5-minute TTL
-    // and whose re-probe fails serves the last-good list labeled
+async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
+    // models.list legacy path contract (§5.30) over the real WSS transport:
+    // cached entries are served indefinitely — a NON-forced read whose
+    // persisted entry is arbitrarily old (fetchedAtMs: 0) serves it plainly
+    // (`{ models, source }`, no `stale`, no `warning`, no probe). A FORCED
+    // read whose probe fails serves the same last-good list labeled
     // `stale: true` + `warning` — exactly `{ models, source, stale, warning }`
-    // with `source: "auggie"`, never a silent static fallback. The last-good
-    // entry is seeded through the persisted cache file (fetchedAtMs: 0 →
-    // expired but present) and the fake auggie always fails.
+    // with `source: "auggie"`, never a silent static fallback. The fake
+    // auggie appends to a counter file per invocation and always fails,
+    // making CLI spawns observable.
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("intentd-wss-models-stale-");
+    let count = dir.path().join("count");
     let bin = dir.path().join("auggie");
-    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = || {
+        std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
     let last_good = serde_json::json!({
         "version": 1,
         "entries": {
@@ -2980,9 +3301,31 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
     )
     .await;
 
+    // Non-forced: the arbitrarily old persisted entry is a plain cache hit.
     let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
     let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
     assert_eq!(resp["id"], 45);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
+    assert_eq!(calls(), 0, "non-forced cache hit must not spawn the CLI");
+
+    // Forced: the probe runs, fails, and the last-good list is served stale.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":46,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 46);
     assert!(resp.get("error").is_none(), "{resp}");
     assert_eq!(resp["result"]["source"], "auggie");
     assert_eq!(resp["result"]["stale"], true, "{resp}");
@@ -3000,6 +3343,7 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
+    assert!(calls() > 0, "forced read must spawn the CLI");
     srv.ws.stop().await;
 }
 

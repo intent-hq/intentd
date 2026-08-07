@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -981,6 +981,10 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.markAsTask`: attach/replace task metadata on a note (PROTOCOL §5.4).
+    ///
+    /// `caller_agent_id` attributes the resulting `task:created` /
+    /// `task:status-changed` event to the invoking agent (the MCP front door
+    /// passes it); `None` → system-attributed.
     fn mark_as_task(
         &self,
         workspace_id: WorkspaceId,
@@ -988,8 +992,16 @@ pub trait WorkspaceApi: Send + Sync {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
-        let _ = (workspace_id, note_id, status, acceptance_criteria, effort);
+        let _ = (
+            workspace_id,
+            note_id,
+            status,
+            acceptance_criteria,
+            effort,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mark_as_task not implemented".to_string(),
@@ -1017,6 +1029,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `task.createPrerequisite`: create a child task note (PROTOCOL §5.4).
+    ///
+    /// `caller_agent_id` attributes the child's `task:created` event to the
+    /// invoking agent (the MCP front door passes it); `None` → system.
     fn create_prerequisite(
         &self,
         workspace_id: WorkspaceId,
@@ -1024,8 +1039,16 @@ pub trait WorkspaceApi: Send + Sync {
         title: String,
         content: Option<String>,
         status: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
-        let _ = (workspace_id, dependent_note_id, title, content, status);
+        let _ = (
+            workspace_id,
+            dependent_note_id,
+            title,
+            content,
+            status,
+            caller_agent_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::create_prerequisite not implemented".to_string(),
@@ -1627,13 +1650,19 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
+    /// `provider_id` optionally names the intended provider explicitly
+    /// (additive param): absent keeps the historical behavior; present it
+    /// must be a registered provider, must agree with a compound
+    /// `model_id`'s prefix, and owns the validation of a bare `model_id`
+    /// (session.provider is reconciled to it on success).
     fn agent_set_model(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, model_id);
+        let _ = (workspace_id, agent_id, model_id, provider_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_set_model not implemented".to_string(),
@@ -1662,7 +1691,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
-    /// cache (5-minute TTL, version-keyed), returning
+    /// cache (version-keyed, served indefinitely; a probe runs only on a
+    /// miss or forced read), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(
@@ -1896,6 +1926,27 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_diagnostics not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.agent.snapshot` (MCP-only, PROTOCOL §7.1): the calling agent's own
+    /// compact state digest — active hooks, completion watches, queued
+    /// messages, event subscriptions, unsettled children, pending structured
+    /// questions, pending attention request, current UTC time. Zero-count and
+    /// null fields are omitted from the returned object; `time` is always
+    /// present. Never gated by `agentFeatures.stateSnapshot` (the toggle
+    /// governs only the per-turn prompt injection). A workspace mismatch
+    /// surfaces `NotFound` (defense-in-depth against bare-id probes).
+    fn agent_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_snapshot not implemented".to_string(),
             ))
         })
     }
@@ -5289,6 +5340,92 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_run_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
+    /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
+    /// fetched merge-requirements checklist. `repo` is an optional
+    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
+    /// — monitors are agent-owned, so there is no wire registration method.
+    fn pr_monitor_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, pr_number, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_start not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.unmonitor`: cancel the calling agent's own active monitor on
+    /// `(repo, pr_number)`. MCP-only, and never self-wakes the owner.
+    fn pr_monitor_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, pr_number, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_stop not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.pr.monitors` / wire `prMonitor.list`: monitors as
+    /// `{ monitors: [...] }`. `agent_id` narrows to one owning agent (the MCP
+    /// caller's own); `None` is the workspace-wide FE view. Cancelled rows are
+    /// excluded, `completed` rows retained so merged PRs stay visible.
+    fn pr_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `prMonitor.cancel`: cancel any monitor in the workspace by id and
+    /// notify the owning agent that its monitor is gone (the FE path — the
+    /// agent path is `pr_monitor_stop`, which never self-wakes).
+    fn pr_monitor_cancel_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_cancel_by_id not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `prMonitor.flush`: deliver a monitor's pending consolidated wake
+    /// now, bypassing the remaining debounce window. A no-op
+    /// (`{ ok: true, flushed: false }`) when nothing is pending.
+    fn pr_monitor_flush_pending(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_monitor_flush_pending not implemented".to_string(),
             ))
         })
     }

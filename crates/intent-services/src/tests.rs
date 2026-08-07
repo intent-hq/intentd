@@ -1346,6 +1346,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             "not_started".into(),
             vec!["criterion one".into()],
             Some("M".into()),
+            None,
         )
         .await
         .expect("markAsTask");
@@ -1379,6 +1380,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             id.clone(),
             "Child Step".into(),
             Some("details".into()),
+            None,
             None,
         )
         .await
@@ -1507,9 +1509,16 @@ async fn task_list_and_get_project_workspace_tasks() {
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
-    svc.mark_as_task(ws.clone(), id.clone(), "not_started".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
         .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
@@ -4273,6 +4282,365 @@ mod change_event_parity {
         );
     }
 
+    /// Drain every published event until the bus goes quiet, flattening
+    /// batches into one ordered list of wire-JSON envelopes.
+    async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                out.push(serde_json::to_value(&ev).expect("serialize event"));
+            }
+        }
+        out
+    }
+
+    fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+        events
+            .iter()
+            .filter(|e| e["type"] == event_type)
+            .collect::<Vec<_>>()
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_emits_task_created_and_note_updated() {
+        let h = harness().await;
+        let n = note(&h.ws, "plain-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+
+        let updated = of_type(&events, "note:updated");
+        assert_eq!(updated.len(), 1, "markAsTask must emit note:updated");
+        assert_eq!(updated[0]["data"]["noteId"], "plain-1");
+
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "exactly one task:created");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], "plain-1");
+        assert_eq!(ev["data"]["noteTitle"], "Title");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+        assert!(ev["data"].get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_emits_status_changed_not_created() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "already-task", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(
+            of_type(&events, "task:created").is_empty(),
+            "re-marking an existing task is a status move, not a creation"
+        );
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        // A status move takes the same pair `task.updateNoteStatus` publishes.
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "exactly one task:status-changed");
+        assert_envelope(changed[0], &h.ws.0, "task:status-changed");
+        assert_eq!(changed[0]["data"]["noteId"], "already-task");
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        let ready = of_type(&events, "task:ready-tasks-changed");
+        assert_eq!(ready.len(), 1, "ready-set recompute follows the transition");
+        assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], "already-task");
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_same_status_emits_no_task_event() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "same-status", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(of_type(&events, "task:created").is_empty());
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_emits_task_created_per_child() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-1",
+            "intro\n@@@task\n# Build API\nBuild it.\n@@@\ntail",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .convert_task_blocks(h.ws.clone(), n.id.clone(), None)
+            .await
+            .expect("convertBlocks");
+        assert_eq!(r.created_note_ids.len(), 1);
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "one task:created per converted block");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], r.created_note_ids[0]);
+        assert_eq!(ev["data"]["noteTitle"], "Build API");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_task_created_carries_agent_id() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-agent",
+            "intro\n@@@task\n# Agent Task\nbody\n@@@",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-conv"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Conv".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let mut sub = subscribe(&h);
+        h.services
+            .convert_task_blocks(
+                h.ws.clone(),
+                n.id.clone(),
+                Some(AgentId::from("agent-conv")),
+            )
+            .await
+            .expect("convertBlocks");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-conv");
+        assert_eq!(
+            created[0]["actor"],
+            json!({ "type": "agent", "id": "agent-conv", "name": "Conv" })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_prerequisite_emits_task_created() {
+        let h = harness().await;
+        let n = note(&h.ws, "dependent-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .create_prerequisite(
+                h.ws.clone(),
+                n.id.clone(),
+                "Prereq".to_string(),
+                None,
+                Some("not_started".to_string()),
+                None,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_envelope(created[0], &h.ws.0, "task:created");
+        assert_eq!(created[0]["data"]["noteId"], r.prerequisite_note_id.0);
+        assert_eq!(created[0]["data"]["noteTitle"], "Prereq");
+        assert_eq!(created[0]["data"]["status"], "not_started");
+    }
+
+    /// LC-1 parity for the two `task.*` paths that now thread the caller:
+    /// `markAsTask` and `createPrerequisite` attribute their emissions to the
+    /// invoking agent when the MCP front door supplies one.
+    #[tokio::test]
+    async fn mark_as_task_and_create_prerequisite_carry_agent_id() {
+        let h = harness().await;
+        let plain = note(&h.ws, "plain-agent", "body");
+        h.store.insert_note(&plain).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-task"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Tasker".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let caller = Some(AgentId::from("agent-task"));
+        let agent_actor = json!({ "type": "agent", "id": "agent-task", "name": "Tasker" });
+
+        // markAsTask on a plain note → agent-attributed task:created.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
+
+        // markAsTask on the now-task note → agent-attributed status change.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-task");
+        assert_eq!(changed[0]["actor"], agent_actor);
+
+        // createPrerequisite → the child's task:created is agent-attributed.
+        let mut sub = subscribe(&h);
+        h.services
+            .create_prerequisite(
+                h.ws.clone(),
+                plain.id.clone(),
+                "Prereq".to_string(),
+                None,
+                None,
+                caller,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
+    }
+
     #[tokio::test]
     async fn ready_tasks_changed_payload() {
         let h = harness().await;
@@ -6726,10 +7094,11 @@ mod pr {
     use async_trait::async_trait;
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
-        AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
-        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
-        PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
-        Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor,
+        Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
+        MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+        PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment,
+        ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck,
         ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
@@ -6795,6 +7164,10 @@ mod pr {
         /// When true, `review_decision` fails, exercising the degrade-to-
         /// aggregate path of `pr_state`.
         fail_review_decision: bool,
+        /// What the merge-requirements probe reports. `None` mirrors a host
+        /// without the signals (the trait default `Unsupported`), exercising
+        /// the degraded checklist path.
+        merge_signals: Option<MergeRequirementSignals>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -7054,6 +7427,16 @@ mod pr {
                 },
             ])
         }
+        async fn merge_requirements(
+            &self,
+            _: &RepoRef,
+            _: u64,
+        ) -> ScResult<MergeRequirementSignals> {
+            match &self.merge_signals {
+                Some(signals) => Ok(signals.clone()),
+                None => Err(ScError::Unsupported("merge requirements probe".into())),
+            }
+        }
         async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
             Ok(vec![Comment {
                 id: "1".into(),
@@ -7276,6 +7659,115 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
         let services = Services::new(store).with_source_control(Arc::new(forge));
         (tmp, services, ws_id)
+    }
+
+    // ---- merge-requirements checklist over the stubbed forge -------------
+
+    /// Drive `pr_ops::fetch_merge_requirements` against a stub forge.
+    async fn merge_requirements_of(forge: StubForge) -> crate::MergeRequirements {
+        let sc: Arc<dyn SourceControl> = Arc::new(forge);
+        let repo = RepoRef::new("o", "r");
+        crate::fetch_merge_requirements(sc.as_ref(), &repo, 42)
+            .await
+            .expect("merge requirements")
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_composes_probe_and_snapshot() {
+        // The stub's sample PR is open/clean with one approval (alice) and one
+        // unresolved review thread (RT1).
+        let req = merge_requirements_of(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                review_decision: Some(ReviewDecision::ReviewRequired),
+                checks: vec![
+                    RollupCheck {
+                        name: "build".into(),
+                        state: CheckState::Success,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "test".into(),
+                        state: CheckState::Failure,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "flaky".into(),
+                        state: CheckState::Failure,
+                        is_required: false,
+                        url: None,
+                    },
+                ],
+                checks_known: true,
+                branch_rules: Some(BranchRules {
+                    required_approving_review_count: Some(2),
+                    required_conversation_resolution: Some(true),
+                    required_status_checks: vec!["build".into(), "test".into()],
+                }),
+            }),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(req.state, "open");
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        assert!(req.checks.required_known);
+        assert_eq!(req.approvals.decision, "review_required");
+        assert_eq!(req.approvals.have, 1);
+        assert_eq!(req.approvals.needed, Some(2));
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.threads.resolution_required, Some(true));
+        assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
+        assert!(req.rules_known);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_degrades_when_probe_unsupported() {
+        // No probe (the trait default `Unsupported`): the checklist falls back
+        // to the REST check-runs and reports the rules as unknown.
+        let req = merge_requirements_of(StubForge::default()).await;
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 1, 1)
+        );
+        assert!(!req.checks.required_known);
+        assert!(req.checks.failing_required.is_empty());
+        assert!(!req.rules_known);
+        assert_eq!(req.approvals.needed, None);
+        assert_eq!(req.threads.resolution_required, None);
+        // The aggregate still drives the decision (alice approved).
+        assert_eq!(req.approvals.decision, "approved");
+        assert_eq!(req.threads.unresolved, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_survives_a_failing_thread_read() {
+        // A GraphQL thread failure falls back to the flat REST comments
+        // (resolution state unavailable, so each fallback thread counts as
+        // unresolved) rather than failing the whole checklist.
+        let req = merge_requirements_of(StubForge {
+            fail_threads: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.state, "open");
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_reports_conflicts_on_a_dirty_pr() {
+        let req = merge_requirements_of(StubForge {
+            dirty_pr: true,
+            ..Default::default()
+        })
+        .await;
+        assert!(req.has_conflicts);
+        assert_eq!(req.mergeable, Some(false));
+        assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
     }
 
     // ---- github.* browse / auth / identity (PROTOCOL §5.27) -------------
@@ -7631,6 +8123,8 @@ mod pr {
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
         assert_eq!(v["comments"]["totalCount"], 3);
+        // Pin the unified merge-requirements field name on the snapshot shape.
+        assert!(v["requirements"].is_object());
     }
 
     #[tokio::test]
@@ -10117,6 +10611,618 @@ mod file_tracking {
         unstaged.await.unwrap().unwrap();
         staged.await.unwrap().unwrap();
         assert_eq!(walks.load(Ordering::SeqCst), 2, "no coalescing across keys");
+    }
+
+    /// Regression (monorepo#1648): concurrent `git.status` calls for one
+    /// worktree run the underlying libgit2 scan once and every caller gets
+    /// that result. The probe parks the leader's scan on the blocking pool
+    /// until the followers have provably joined, so the overlap is
+    /// deterministic.
+    #[tokio::test]
+    async fn git_status_concurrent_calls_coalesce_into_one_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        // The leader is inside the scan (flight registered, probe parked).
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let followers: Vec<_> = (0..3)
+            .map(|_| {
+                let svc = svc.clone();
+                let ws = ws_id.clone();
+                tokio::spawn(async move { svc.git_status(ws).await })
+            })
+            .collect();
+        wait_until("followers to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 3
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let first = leader.await.unwrap().unwrap();
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap(), first, "shared result");
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        assert!(
+            first.files.iter().any(|f| f.path == "seed.txt"),
+            "shared result carries the real status"
+        );
+    }
+
+    /// `accept-changes.getStatus` shares the working-tree scan with a
+    /// concurrent `git.status` for the same worktree (monorepo#1648): its
+    /// extra history/remote work still runs per call, but the common scan
+    /// happens once.
+    #[tokio::test]
+    async fn accept_changes_get_status_shares_the_scan_with_git_status() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let status = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let accept = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.accept_changes_get_status(ws).await }
+        });
+        wait_until("accept-changes to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        status.await.unwrap().unwrap();
+        let value = accept.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        // Wire shape unchanged: the coalesced scan still feeds the documented
+        // §5.18 counts.
+        assert_eq!(value["uncommittedCount"], 1);
+        assert_eq!(value["stagedCount"], 0);
+    }
+
+    /// Concurrent status scans for *different* worktrees never coalesce — they
+    /// must not serialize against each other.
+    #[tokio::test]
+    async fn git_status_distinct_worktrees_run_their_own_scans() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo_a = init_git_repo();
+        let repo_b = init_git_repo();
+        let (_ta, svc, ws_a) = svc_with_repo(&repo_a).await;
+        let ws_b = WorkspaceId::new();
+        let mut other = workspace(&ws_b);
+        other.worktree_path = Some(repo_b.dir.to_string_lossy().to_string());
+        svc.store().insert_workspace(&other).await.unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.git_status(ws_a).await }
+        });
+        wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.git_status(ws_b).await }
+        });
+        // The other worktree must start its own scan while the first is parked.
+        wait_until("second independent scan", || {
+            scans.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2, "no cross-worktree sharing");
+    }
+
+    /// A failed scan is never cached: after the flight settles, the next call
+    /// runs a fresh scan.
+    #[tokio::test]
+    async fn git_status_failed_scan_is_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        // Keep `.git` present (so the handler reaches the scan) but corrupt it
+        // so `Repository::open` fails.
+        std::fs::remove_file(repo.dir.join(".git").join("HEAD")).unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(svc.git_status(ws_id.clone()).await.is_err());
+        assert!(svc.git_status(ws_id).await.is_err());
+        assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
+    }
+
+    /// `git.changes` runs the same working-tree scan, so it shares the flight
+    /// with a concurrent `git.status` for the same worktree (monorepo#1648)
+    /// while still projecting only the file list.
+    #[tokio::test]
+    async fn git_changes_shares_the_scan_with_git_status() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let status = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let changes = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_changes(ws).await }
+        });
+        wait_until("git.changes to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let full = status.await.unwrap().unwrap();
+        let value = changes.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        // Wire shape unchanged: still the bare `status.files` projection.
+        assert_eq!(value, serde_json::to_value(&full.files).unwrap());
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "seed.txt"));
+    }
+
+    /// A leader that vanishes before publishing (cancelled RPC) wakes its
+    /// followers to elect a new leader rather than hanging them — the
+    /// service-level counterpart of the module's dropped-leader test.
+    #[tokio::test]
+    async fn git_status_aborted_leader_lets_a_follower_retry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let park = Arc::new(AtomicBool::new(true));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let park = Arc::clone(&park);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while park.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        // Cancel the leader: its guard drops without publishing, closing the
+        // channel so the follower re-joins and leads its own scan.
+        leader.abort();
+        park.store(false, Ordering::SeqCst);
+        let retried = follower.await.unwrap().unwrap();
+        assert!(
+            retried.files.iter().any(|f| f.path == "seed.txt"),
+            "follower's retry produced a real status"
+        );
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "follower led its own scan after the leader vanished"
+        );
+    }
+
+    /// A coalesced follower surfaces the *same* error as the leader: the shared
+    /// failure travels as the inner message, so the follower's re-wrap does not
+    /// produce a doubled `internal error:` prefix.
+    #[tokio::test]
+    async fn git_status_failed_scan_reports_the_same_error_to_followers() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        std::fs::remove_file(repo.dir.join(".git").join("HEAD")).unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let leader_err = leader.await.unwrap().unwrap_err().to_string();
+        let follower_err = follower.await.unwrap().unwrap_err().to_string();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        assert_eq!(follower_err, leader_err, "identical error message");
+        assert_eq!(
+            follower_err.matches("internal error:").count(),
+            1,
+            "no doubled prefix: {follower_err}"
+        );
+    }
+
+    /// Regression (monorepo#1648, ladder rung 2): steady-state sequential
+    /// reads cost no working-tree scan at all — the first read scans, the
+    /// rest serve the cached status.
+    #[tokio::test]
+    async fn git_status_repeat_reads_serve_the_cached_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                svc.git_status(ws_id.clone()).await.unwrap(),
+                first,
+                "cached reads return the same status"
+            );
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
+        // The other scan-backed reads serve the same entry.
+        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.accept_changes_get_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "git.changes / accept-changes.getStatus share the cached scan"
+        );
+    }
+
+    /// A daemon-owned git mutation invalidates the cache inline, so the next
+    /// read reflects it rather than serving the pre-mutation snapshot.
+    #[tokio::test]
+    async fn git_mutation_invalidates_the_cached_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        assert!(
+            before.files.iter().any(|f| !f.staged),
+            "the edit starts unstaged"
+        );
+        svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        let after = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the mutation forced a rescan"
+        );
+        assert!(
+            after.files.iter().all(|f| f.staged),
+            "the post-stage read reflects the mutation: {after:?}"
+        );
+    }
+
+    /// The fallback TTL bounds staleness for changes no daemon signal reports:
+    /// an out-of-band edit is picked up once the cached entry expires.
+    #[tokio::test]
+    async fn git_status_cache_expires_after_its_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc
+            .with_git_status_cache_ttl(std::time::Duration::from_millis(50))
+            .with_git_status_scan_probe({
+                let scans = Arc::clone(&scans);
+                Arc::new(move || {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+
+        assert!(svc
+            .git_status(ws_id.clone())
+            .await
+            .unwrap()
+            .files
+            .is_empty());
+        // Out-of-band edit: no `file:*` event, no daemon mutation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        assert!(
+            svc.git_status(ws_id.clone())
+                .await
+                .unwrap()
+                .files
+                .is_empty(),
+            "still inside the TTL: the cached (now stale) status is served"
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let expired = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "TTL expiry re-authorized a scan"
+        );
+        assert!(
+            expired.files.iter().any(|f| f.path == "seed.txt"),
+            "the out-of-band edit surfaces after the TTL"
+        );
+    }
+
+    /// Invalidation landing *during* a scan wins: that scan cannot be trusted
+    /// to describe the post-change tree, so its result must not be cached —
+    /// the next read rescans instead of serving it.
+    #[tokio::test]
+    async fn invalidation_during_a_scan_is_not_overwritten_by_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The change lands mid-scan: whatever the in-flight scan observes, it
+        // started against the pre-change generation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the stale snapshot was not cached"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the mid-scan change"
+        );
+    }
+
+    /// A reader that joins an in-flight scan *after* an invalidation must not
+    /// publish that scan's (pre-change) result: only the leader caches, and
+    /// only against the generation it snapshotted when it was elected.
+    #[tokio::test]
+    async fn follower_joining_after_invalidation_does_not_cache_the_leaders_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+
+        // Joins after the invalidation, so its generation is the new one — but
+        // the result it receives is the leader's pre-change scan.
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the flight", || {
+            svc.git_status_waiters(&repo.dir) > 0
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the follower must not have cached the leader's stale snapshot"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the change the coalesced scan predated"
+        );
     }
 
     /// The git reads degrade to empty results for a workspace with no worktree

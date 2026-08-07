@@ -928,7 +928,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.31) reads to override the `pi` binary it spawns
+/// Env var pi-acp (0.0.33) reads to override the `pi` binary it spawns
 /// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
 /// `create_agent` points it at the generated wrapper script.
 const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
@@ -1620,9 +1620,12 @@ impl AgentManager {
         let child_pid = child.id();
         let connection = Arc::new(connection);
 
-        let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
-            crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
-        );
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
+            Arc::new(crate::PtyTerminalHost::with_shell_mode(
+                self.services.pty(),
+                self.services.settings_registry(),
+                opts.provider.terminal_requires_shell,
+            ));
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
@@ -2595,6 +2598,20 @@ impl AgentManager {
                 }
                 _ => prompt_text,
             },
+        };
+        // Per-turn agent state snapshot (`current ws.agent.snapshot() =>
+        // {...}`): the outermost RECURRING per-turn decoration — before
+        // context/naming/reminder, after only the fire-once FirstTurnPrepend
+        // below. Rebuilt every turn for ALL agents (specialist and
+        // non-specialist, unlike the role reminder) and never persisted.
+        // `agent_state_snapshot_line` reads `agentFeatures.stateSnapshot`
+        // LIVE and returns `None` when the toggle is off or the snapshot is
+        // trivial (all counts zero, no pending attention), leaving the
+        // prompt byte-identical to pre-feature output.
+        let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        let prompt_text = match snapshot_line {
+            Some(line) => format!("{line}\n\n{prompt_text}"),
+            None => prompt_text,
         };
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
@@ -4208,7 +4225,7 @@ impl AgentManager {
         let pre_truncate = async {
             if let Some(model_id) = model {
                 self.services
-                    .agent_set_model_op(agent_id.clone(), model_id)
+                    .agent_set_model_op(agent_id.clone(), model_id, None)
                     .await?;
             }
             self.services
@@ -8463,6 +8480,200 @@ mod role_reminder_tests {
             .await,
         );
         assert_eq!(text, "hello");
+    }
+
+    // ---- Per-turn agent state snapshot injection ----
+
+    /// Like [`manager_with`] but with a writable TOML-backed settings
+    /// registry wired, so tests can flip `agentFeatures.stateSnapshot` and
+    /// observe the live per-turn read.
+    async fn manager_with_registry() -> (AgentManager, AgentId, tempfile::TempDir, tempfile::TempDir)
+    {
+        let db_dir = crate::tests::test_tempdir("intentd-snap-");
+        let path = db_dir.path().join("store.db");
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let workspace_id = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-1");
+        store
+            .insert_workspace(&workspace(&workspace_id))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&session(&agent_id, &workspace_id, None))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (
+            AgentManager::new(services, sink, 4),
+            agent_id,
+            db_dir,
+            config_dir,
+        )
+    }
+
+    /// Make the agent's snapshot non-trivial (one pending queued message).
+    fn make_snapshot_nontrivial(mgr: &AgentManager, agent_id: &AgentId) {
+        mgr.services
+            .enqueue_message(agent_id, "pending".into(), None, None, None, None, false);
+    }
+
+    /// A trivial snapshot (all counts zero, no attention) never injects:
+    /// prompts stay byte-identical to pre-feature output, for specialist and
+    /// non-specialist agents alike.
+    #[tokio::test]
+    async fn snapshot_skipped_when_trivial() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "plain message",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "plain message");
+    }
+
+    /// A non-trivial snapshot injects `current ws.agent.snapshot() => {...}`
+    /// on EVERY turn (rebuilt per turn like the role reminder), including for
+    /// non-specialist agents, and also after a session recreate.
+    #[tokio::test]
+    async fn snapshot_injected_every_turn_for_all_agents() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        for _ in 0..2 {
+            let text = prompt_text(
+                &mgr.build_turn_prompt(
+                    &agent_id,
+                    &WorkspaceId::from("ws-1"),
+                    "do the thing",
+                    &TurnOptions::default(),
+                )
+                .await,
+            );
+            assert!(
+                text.starts_with("current ws.agent.snapshot() => {"),
+                "missing snapshot prefix: {text:?}"
+            );
+            assert!(text.contains("\"queuedMessages\":1"), "counts: {text:?}");
+            assert!(text.ends_with("do the thing"));
+        }
+        // Session-recreate turns keep the injection too.
+        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "resume",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with("current ws.agent.snapshot() => {"),
+            "missing snapshot prefix on recreate: {text:?}"
+        );
+    }
+
+    /// Ordering: the snapshot line is the outermost RECURRING decoration —
+    /// before the `Context:` block, naming instruction, and role reminder —
+    /// while the fire-once FirstTurnPrepend `<system>` block stays outermost
+    /// overall.
+    #[tokio::test]
+    async fn snapshot_ordering_outermost_recurring_after_first_turn_prepend() {
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        set_system_prompt(&mgr, &agent_id, "SP").await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let opts = TurnOptions {
+            stdin_context: Some("ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "do it", &opts)
+                .await,
+        );
+        assert!(
+            text.starts_with("<system>\nSP\n</system>\n\ncurrent ws.agent.snapshot() => {"),
+            "FirstTurnPrepend outermost, snapshot next: {text:?}"
+        );
+        let snapshot_pos = text.find("current ws.agent.snapshot()").unwrap();
+        let context_pos = text.find("Context:\nctx").expect("Context block");
+        let reminder_pos = text.find("[Role Reminder:").expect("role reminder");
+        assert!(snapshot_pos < context_pos && context_pos < reminder_pos);
+        // Second turn: prepend consumed, snapshot line now outermost.
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "again", &opts)
+                .await,
+        );
+        assert!(
+            text.starts_with("current ws.agent.snapshot() => {"),
+            "snapshot outermost once the prepend is consumed: {text:?}"
+        );
+    }
+
+    /// Live-read toggle: flipping `agentFeatures.stateSnapshot` off removes
+    /// the injection from the very next turn of the SAME session (prompt
+    /// byte-identical to pre-feature output), and flipping it back restores
+    /// it — no session recreation involved.
+    #[tokio::test]
+    async fn snapshot_toggle_is_read_live_each_turn() {
+        let (mgr, agent_id, _db, _cfg) = manager_with_registry().await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        let ws = WorkspaceId::from("ws-1");
+
+        let on = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert!(on.starts_with("current ws.agent.snapshot() => {"));
+
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(false),
+            )])
+            .expect("apply toggle");
+        let off = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(off, "turn", "toggle off → byte-identical prompt");
+
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(true),
+            )])
+            .expect("apply toggle");
+        let back_on = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert!(
+            back_on.starts_with("current ws.agent.snapshot() => {"),
+            "toggle back on → next turn injects again: {back_on:?}"
+        );
     }
 
     #[test]

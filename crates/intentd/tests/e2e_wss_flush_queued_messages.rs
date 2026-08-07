@@ -325,9 +325,15 @@ fn seed_flush_mode(data_dir: &Path, mode: &str) {
         !path.exists(),
         "seed_flush_mode must run before other config seeding"
     );
+    // stateSnapshot off: drain turns are built while messages are still
+    // queued, so the per-turn snapshot line would otherwise lead the prompt
+    // and break this suite's byte-precise prompt-prefix assertions (the
+    // injection has its own e2e in e2e_wss_agent_state_snapshot.rs).
     std::fs::write(
         &path,
-        format!("[agents]\nflushQueuedMessages = \"{mode}\"\n"),
+        format!(
+            "[agents]\nflushQueuedMessages = \"{mode}\"\n\n[agentFeatures]\nstateSnapshot = false\n"
+        ),
     )
     .expect("seed config.toml with flushQueuedMessages mode");
 }
