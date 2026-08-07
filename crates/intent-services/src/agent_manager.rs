@@ -928,7 +928,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.31) reads to override the `pi` binary it spawns
+/// Env var pi-acp (0.0.33) reads to override the `pi` binary it spawns
 /// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
 /// `create_agent` points it at the generated wrapper script.
 const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
@@ -1620,9 +1620,12 @@ impl AgentManager {
         let child_pid = child.id();
         let connection = Arc::new(connection);
 
-        let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
-            crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
-        );
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
+            Arc::new(crate::PtyTerminalHost::with_shell_mode(
+                self.services.pty(),
+                self.services.settings_registry(),
+                opts.provider.terminal_requires_shell,
+            ));
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
