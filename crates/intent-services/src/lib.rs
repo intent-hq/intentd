@@ -15230,23 +15230,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn event_recent_files(
-        &self,
-        workspace_id: WorkspaceId,
-        limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            // TS `recentFiles(limit)` peer: `limit || 10` (0 is falsy → 10).
-            let limit = limit.filter(|&l| l != 0).unwrap_or(10);
-            let events = store.recent_files(&workspace_id, limit).await?;
-            Ok(events
-                .iter()
-                .map(event_ops::file_activity_combined)
-                .collect())
-        })
-    }
-
     fn event_agent_activity(
         &self,
         workspace_id: WorkspaceId,
@@ -15306,27 +15289,6 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             Ok(event_ops::build_workspace_summary(&events, minutes))
-        })
-    }
-
-    fn event_directory_changes(
-        &self,
-        workspace_id: WorkspaceId,
-        dir: String,
-        limit: Option<i64>,
-    ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            if dir.is_empty() {
-                return Err(Error::Internal("Directory path is required".to_string()));
-            }
-            // TS `directoryChanges(dir, limit || 20)`.
-            let limit = limit.filter(|&l| l != 0).unwrap_or(20);
-            let events = store.directory_changes(&workspace_id, &dir, limit).await?;
-            Ok(events
-                .iter()
-                .map(event_ops::file_activity_combined)
-                .collect())
         })
     }
 

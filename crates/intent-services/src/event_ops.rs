@@ -1,11 +1,10 @@
 //! Pure mapping/aggregation helpers for the `event.*` query methods (§5.10).
 //!
 //! Ported wire-for-wire from `~/src/intent/src/features/events/main/
-//! agent-event-tools.ts`: the `FileActivity` projection (`getRecentFiles` /
-//! `getAgentFiles` / `getDirectoryChanges`), the `getAgentActivity` grouping,
-//! and the `getWorkspaceSummary` aggregation. The store-backed queries that feed
-//! these live in `intent-store`; this module is pure (no IO) so the aggregation
-//! math is unit-testable in isolation.
+//! agent-event-tools.ts`: the `FileActivity` projection (`getAgentFiles`), the
+//! `getAgentActivity` grouping, and the `getWorkspaceSummary` aggregation. The
+//! store-backed queries that feed these live in `intent-store`; this module is
+//! pure (no IO) so the aggregation math is unit-testable in isolation.
 
 use std::collections::{HashMap, HashSet};
 
@@ -50,7 +49,7 @@ fn data_opt(ev: &Event, key: &str) -> Option<Value> {
 }
 
 /// Project a `file:changed` event into a [`FileActivity`] with the combined
-/// `"type:name"` actor (`getRecentFiles` / `getDirectoryChanges` / summary).
+/// `"type:name"` actor (workspace summary `recentFiles`).
 pub fn file_activity_combined(ev: &Event) -> FileActivity {
     FileActivity {
         path: data_str(ev, "path"),
