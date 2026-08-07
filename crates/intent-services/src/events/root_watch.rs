@@ -8,6 +8,13 @@
 //! This avoids parking recursive watches on broad ancestors (workspace root,
 //! or even `$HOME`).
 //!
+//! Watch registration itself never runs on the caller's thread: the OS-level
+//! `notify` call can block indefinitely (macOS FSEvents,
+//! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
+//! socket was bound. Every registration is therefore performed on a detached
+//! OS thread — not the blocking pool, which the runtime waits for on shutdown
+//! — and failures are logged rather than returned.
+//!
 //! Event filtering also lives here: an event is forwarded when any of its
 //! paths falls under the canonical root and either matches the caller's
 //! filename filter or is directory-level (the root itself, an existing
@@ -19,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// A watch on a single intended root that may not exist yet.
@@ -54,38 +61,139 @@ impl RootWatch {
         let inner = self.inner.lock().unwrap();
         inner.watched_path.clone().map(|p| (p, inner.recursive))
     }
+
+    /// Await the deferred registration landing. Tests that mutate the
+    /// filesystem must wait for this instead of a fixed warm-up sleep, since
+    /// registration no longer completes before [`watch_root`] returns.
+    ///
+    /// "Established" means *some* watch is in place: for a missing root that
+    /// is the ancestor watch (the correct sync point for creation detection),
+    /// not the recursive watch on the intended root, which only exists after
+    /// promotion. Panics on timeout so a wedged registration is diagnosed
+    /// here rather than as a downstream "no event" failure.
+    #[cfg(test)]
+    pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.watched().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "watch registration did not establish within {timeout:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
 }
 
 /// Start watching `root`, invoking `on_change` for matching events.
 /// `filename_matches` is the per-watcher file filter (e.g. `SKILL.md`,
 /// `*.md`).
+///
+/// Registration is always deferred to a spawned task, so a `notify` backend
+/// that blocks on registration (macOS FSEvents, intent-hq/monorepo#1572)
+/// cannot stall the caller. A registration failure is logged, not returned.
 pub(super) fn watch_root(
     root: PathBuf,
     filename_matches: fn(&Path) -> bool,
     on_change: impl Fn() + Send + Sync + 'static,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(on_change);
     let inner = Arc::new(Mutex::new(Inner::default()));
-
-    if root.exists() {
-        let watcher = recursive_watcher(&root, filename_matches, on_change)?;
-        store(&inner, watcher, root, true);
-        return Ok(RootWatch { inner, task: None });
-    }
-
-    let task = tokio::spawn(promote_loop(
+    let task = tokio::spawn(watch_loop(
         root,
         filename_matches,
         on_change,
         Arc::clone(&inner),
     ));
-    Ok(RootWatch {
+    RootWatch {
         inner,
         task: Some(task),
-    })
+    }
+}
+
+/// Establish the watch off the caller's thread: an existing root gets its
+/// recursive watch directly, a missing one enters the ancestor/promotion
+/// supervision loop.
+async fn watch_loop(
+    root: PathBuf,
+    filename_matches: fn(&Path) -> bool,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+    inner: Arc<Mutex<Inner>>,
+) {
+    if root.exists() {
+        match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change)).await
+        {
+            Some(Ok(watcher)) => {
+                store(&inner, watcher, root, true);
+                // Registration is deferred, so changes can land between
+                // `watch_root` returning and the watch existing — and callers
+                // prime their fingerprint before that. Flush once so such a
+                // change is not absorbed as pre-existing; the fingerprint
+                // check suppresses the no-op case.
+                on_change();
+                return;
+            }
+            Some(Err(e)) => {
+                // Includes the root being deleted between the `exists` check
+                // and registration landing. Fall through to the supervision
+                // loop: it watches the ancestor and re-promotes on
+                // recreation, or retries once if the root is still there.
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "recursive watch failed; falling back to ancestor supervision"
+                );
+            }
+            None => return,
+        }
+    }
+    promote_loop(root, filename_matches, on_change, inner).await;
+}
+
+/// Run [`recursive_watcher`] off-thread. `None` means the registration never
+/// produced a result, which is already logged.
+async fn spawn_recursive_watcher(
+    root: PathBuf,
+    filename_matches: fn(&Path) -> bool,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+) -> Option<notify::Result<RecommendedWatcher>> {
+    let rx = register_off_thread(move || recursive_watcher(&root, filename_matches, on_change));
+    await_registration(rx).await
+}
+
+/// Perform a `notify` registration on a detached OS thread.
+///
+/// Deliberately not `spawn_blocking`: a started blocking task cannot be
+/// aborted and the runtime waits for the blocking pool while shutting down,
+/// so a registration parked inside the wedged backend this defers
+/// (intent-hq/monorepo#1572) would turn the startup stall into a shutdown
+/// hang. A detached thread is invisible to the runtime, so shutdown stays
+/// prompt; at worst a wedged registration leaks one thread for the lifetime
+/// of the process.
+fn register_off_thread(
+    build: impl FnOnce() -> notify::Result<RecommendedWatcher> + Send + 'static,
+) -> oneshot::Receiver<notify::Result<RecommendedWatcher>> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(build());
+    });
+    rx
+}
+
+/// Await an off-thread registration, logging a lost result.
+async fn await_registration(
+    rx: oneshot::Receiver<notify::Result<RecommendedWatcher>>,
+) -> Option<notify::Result<RecommendedWatcher>> {
+    match rx.await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            tracing::warn!("watch registration thread did not report a result");
+            None
+        }
+    }
 }
 
 /// Build a recursive watcher on an existing `root` with the event filter.
+/// Blocking: `notify`'s registration can park indefinitely on some backends.
 fn recursive_watcher(
     root: &Path,
     filename_matches: fn(&Path) -> bool,
@@ -127,15 +235,18 @@ async fn promote_loop(
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
     loop {
         if root.exists() {
-            match recursive_watcher(&root, filename_matches, Arc::clone(&on_change)) {
-                Ok(watcher) => store(&inner, watcher, root.clone(), true),
-                Err(e) => {
+            match spawn_recursive_watcher(root.clone(), filename_matches, Arc::clone(&on_change))
+                .await
+            {
+                Some(Ok(watcher)) => store(&inner, watcher, root.clone(), true),
+                Some(Err(e)) => {
                     tracing::warn!(
                         root = %root.display(),
                         error = %e,
                         "recursive watch on newly created root failed; leaving stale ancestor watch"
                     );
                 }
+                None => return,
             }
             // Files may have landed inside the root before the recursive
             // watch was established (mkdir -p + immediate writes, or a whole
@@ -147,39 +258,36 @@ async fn promote_loop(
 
         let ancestor = find_existing_ancestor(&root);
         let tx = wake_tx.clone();
-        let watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(_) => {
-                    let _ = tx.send(());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ancestor watcher callback error; root creation may go undetected"
-                    );
-                }
-            });
-        let mut watcher = match watcher {
-            Ok(w) => w,
-            Err(e) => {
+        let watch_target = ancestor.clone();
+        let rx = register_off_thread(move || {
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                    Ok(_) => {
+                        let _ = tx.send(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ancestor watcher callback error; root creation may go undetected"
+                        );
+                    }
+                })?;
+            watcher.watch(&watch_target, RecursiveMode::NonRecursive)?;
+            Ok(watcher)
+        });
+        match await_registration(rx).await {
+            Some(Ok(watcher)) => store(&inner, watcher, ancestor.clone(), false),
+            Some(Err(e)) => {
                 tracing::warn!(
                     root = %root.display(),
+                    ancestor = %ancestor.display(),
                     error = %e,
-                    "ancestor watcher creation failed; root creation will not be detected"
+                    "ancestor watch failed; root creation will not be detected"
                 );
                 return;
             }
-        };
-        if let Err(e) = watcher.watch(&ancestor, RecursiveMode::NonRecursive) {
-            tracing::warn!(
-                root = %root.display(),
-                ancestor = %ancestor.display(),
-                error = %e,
-                "ancestor watch failed; root creation will not be detected"
-            );
-            return;
+            None => return,
         }
-        store(&inner, watcher, ancestor.clone(), false);
 
         // Wait until the root or a nearer ancestor appears. Re-check after
         // the watch is established to close the create-before-watch race.
@@ -343,7 +451,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new("miss");
         let root = dir.path.join(".intent").join("specialists");
-        let watch = watch_root(root, md_only, || {}).expect("watch root");
+        let watch = watch_root(root, md_only, || {});
 
         assert!(
             wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
@@ -369,8 +477,7 @@ mod tests {
         let h = Arc::clone(&hits);
         let watch = watch_root(root.clone(), md_only, move || {
             h.fetch_add(1, Ordering::SeqCst);
-        })
-        .expect("watch root");
+        });
 
         assert!(
             wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
@@ -420,10 +527,17 @@ mod tests {
         std::fs::create_dir_all(root.join("nested")).expect("mk root + nested dir");
         let hits = Arc::new(AtomicUsize::new(0));
         let h = Arc::clone(&hits);
-        let _watch = watch_root(root.clone(), md_only, move || {
+        let watch = watch_root(root.clone(), md_only, move || {
             h.fetch_add(1, Ordering::SeqCst);
-        })
-        .expect("watch root");
+        });
+        assert!(
+            wait_for(
+                || watch.watched() == Some((root.clone(), true)),
+                Duration::from_secs(5)
+            )
+            .await,
+            "recursive watch must establish"
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // No `.md` file ever exists: `rm -rf` surfaces only directory-level
@@ -432,6 +546,80 @@ mod tests {
         assert!(
             wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
             "tier-directory deletion must forward an event"
+        );
+    }
+
+    /// Regression (intent-hq/monorepo#1572): OS watch registration can park
+    /// indefinitely (macOS FSEvents), so `watch_root` must return without
+    /// performing it — the watch is established from a spawned task instead.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn existing_root_registration_does_not_block_the_caller() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("nonblocking");
+        let root = dir.path.join("specialists");
+        std::fs::create_dir_all(&root).expect("mk root");
+
+        let start = std::time::Instant::now();
+        let watch = watch_root(root.clone(), md_only, || {});
+        let elapsed = start.elapsed();
+        // Deterministic only under the current-thread runtime `#[tokio::test]`
+        // defaults to: the spawned `watch_loop` cannot be polled before this
+        // test's first `.await`. Under `flavor = "multi_thread"` a worker
+        // could land registration first and this would flake in the passing
+        // direction of the bug — the `elapsed` bound below is the
+        // flavor-independent part of the assertion.
+        assert!(
+            watch.watched().is_none(),
+            "registration must be deferred, not performed on the caller's thread"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "watch_root must return immediately, took {elapsed:?}"
+        );
+
+        assert!(
+            wait_for(
+                || watch.watched() == Some((root.clone(), true)),
+                Duration::from_secs(10)
+            )
+            .await,
+            "the watch must still establish in the background"
+        );
+    }
+
+    /// Deferred registration opens a window between `watch_root` returning
+    /// and the watch existing. Callers prime their fingerprint before that,
+    /// so a change landing in the window must still be flushed once the
+    /// watch is established — otherwise it is absorbed as pre-existing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn existing_root_flushes_changes_that_land_before_registration() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new("catchup");
+        let root = dir.path.join("specialists");
+        std::fs::create_dir_all(&root).expect("mk root");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let watch = watch_root(root.clone(), md_only, move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        // Written while registration is still pending: no OS event for it can
+        // ever be delivered, so only the catch-up flush can surface it.
+        assert!(
+            watch.watched().is_none(),
+            "registration must still be pending"
+        );
+        std::fs::write(root.join("a.md"), "x").expect("write file");
+
+        assert!(
+            wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
+            "a change landing before registration must still trigger a flush"
         );
     }
 }

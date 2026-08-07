@@ -163,13 +163,15 @@ impl Store {
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
     ///
-    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`)
-    /// hydrates full `agent_message` logs for legacy sessions with neither a
-    /// snapshot nor a baseline, and that work happens while holding the
-    /// daemon's sole write connection and the SQLite write lock. The
-    /// snapshot/baseline hydration skip keeps the common case cheap; a
-    /// workspace of snapshot-less long-history sessions pays the cost on
-    /// every recompute until its sessions report usage once.
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
+    /// `agent_message` for sessions still on the per-message fallback (no
+    /// snapshot/baseline token report), and that work happens while holding
+    /// the daemon's sole write connection and the SQLite write lock. The
+    /// report-backed skip keeps the common case cheap, and the fallback read
+    /// projects each message's usage object in SQL and filters to
+    /// usage-bearing rows off a partial index instead of materializing message
+    /// bodies (monorepo#1571) — so what a workspace of long-history fallback
+    /// sessions pays for is its usage-bearing rows, not its transcript bytes.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,
@@ -287,6 +289,58 @@ impl Store {
             .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("set attention presence check failed: {e}")))?;
+        if col::<i64>(&row, "present")? == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
+    /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
+    /// `last_activity` column — never `updated_at`, never a full-row replace —
+    /// and only when the supplied timestamp is strictly newer than the stored
+    /// one (or the column is NULL / unparseable). Same scoped-update
+    /// discipline as [`Self::set_workspace_attention`].
+    ///
+    /// Backs the debounced `lastActivity` derivation in intent-services so the
+    /// persisted column tracks the derived value and cheap read paths
+    /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
+    /// a fresh timestamp after a restart.
+    ///
+    /// Comparison runs through SQLite's `julianday()` rather than raw TEXT so
+    /// timestamps of differing fractional-second precision order correctly
+    /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
+    /// `last_activity` parses to NULL and is treated as "older" (overwritten);
+    /// a malformed input never writes. Returns whether a row was written;
+    /// `NotFound` when the workspace does not exist.
+    pub async fn bump_workspace_last_activity(
+        &self,
+        id: &WorkspaceId,
+        last_activity: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workspace SET last_activity=? WHERE id=? AND julianday(?) IS NOT NULL \
+             AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
+             OR julianday(last_activity) < julianday(?))",
+        )
+        .bind(last_activity)
+        .bind(&id.0)
+        .bind(last_activity)
+        .bind(last_activity)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("bump last_activity failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Zero rows: either the monotonic guard declined (not newer) or the
+        // workspace is missing — distinguish so callers keep NotFound semantics.
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
+            .bind(&id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("bump last_activity presence check failed: {e}"))
+            })?;
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }

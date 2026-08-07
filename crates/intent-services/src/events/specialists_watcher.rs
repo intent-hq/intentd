@@ -65,9 +65,7 @@ impl SpecialistsWatcher {
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
         if let Some(root) = &user_dir {
-            if let Ok(watcher) = watch_directory(root.clone(), None, raw_tx.clone()) {
-                user_watchers.push(watcher);
-            }
+            user_watchers.push(watch_directory(root.clone(), None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -104,6 +102,28 @@ impl SpecialistsWatcher {
         }
     }
 
+    /// Await every registered root watch actually being established. Watch
+    /// registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating the watched directories.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: Duration) {
+        for watch in &self._user_watchers {
+            watch.wait_established(timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_up = self
+                .workspace_watchers
+                .lock()
+                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
+                .unwrap_or(true);
+            if all_up || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watch and drop any pending flush so it stops emitting.
     pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
@@ -114,6 +134,36 @@ impl SpecialistsWatcher {
             .raw_tx
             .send(SpecialistsMsg::Remove(workspace_id.clone()));
     }
+
+    /// Suspend a workspace (archive): tear down its project-tier watch but
+    /// KEEP the fingerprint, so the [`Self::resume_workspace`] catch-up can
+    /// tell whether the set changed while the workspace was unwatched.
+    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.remove(workspace_id);
+        }
+        let _ = self
+            .raw_tx
+            .send(SpecialistsMsg::Pause(workspace_id.clone()));
+    }
+
+    /// Resume a suspended workspace (unarchive): re-watch the project tier and
+    /// schedule one catch-up flush against the retained fingerprint, so edits
+    /// made while suspended emit exactly one `specialists:changed` and an
+    /// untouched tree emits nothing. That silence holds only when the pause
+    /// happened in this process: a workspace archived before daemon start is
+    /// never seeded (boot lists unarchived workspaces only), so its resume has
+    /// no baseline and emits one benign event.
+    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self.raw_tx.send(SpecialistsMsg::Resume(
+            workspace_id.clone(),
+            workspace_path.clone(),
+        ));
+        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watchers);
+        }
+    }
 }
 
 /// Watch the project-tier specialists root of one workspace.
@@ -123,10 +173,11 @@ fn start_project_watchers(
     raw_tx: &mpsc::UnboundedSender<SpecialistsMsg>,
 ) -> Vec<RootWatch> {
     let root = project_dir(workspace_path);
-    match watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
-        Ok(watcher) => vec![watcher],
-        Err(_) => Vec::new(),
-    }
+    vec![watch_directory(
+        root,
+        Some(workspace_id.clone()),
+        raw_tx.clone(),
+    )]
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -139,6 +190,12 @@ enum SpecialistsMsg {
     Add(WorkspaceId, PathBuf),
     /// Workspace deregistered; its pending flush is dropped.
     Remove(WorkspaceId),
+    /// Workspace suspended (archive): stops emitting like `Remove`, but the
+    /// fingerprint is retained for the later `Resume` catch-up.
+    Pause(WorkspaceId),
+    /// Workspace resumed (unarchive): re-registers the path WITHOUT re-priming
+    /// the fingerprint, plus a flush so changes missed while suspended emit.
+    Resume(WorkspaceId, PathBuf),
 }
 
 /// Watch a single root, forwarding `*.md` and directory-level events.
@@ -149,7 +206,7 @@ fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SpecialistsMsg>,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     watch_root(root, is_md, move || {
         let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
     })
@@ -238,6 +295,18 @@ async fn debounce_loop(
                     workspace_paths.remove(&ws_id);
                     fingerprints.remove(&ws_id);
                     pending.remove(&ws_id);
+                }
+                Some(SpecialistsMsg::Pause(ws_id)) => {
+                    // Path drop stops emission (user-tier fan-out and flushes
+                    // both key on `workspace_paths`); the fingerprint stays.
+                    workspace_paths.remove(&ws_id);
+                    pending.remove(&ws_id);
+                }
+                Some(SpecialistsMsg::Resume(ws_id, path)) => {
+                    workspace_paths.insert(ws_id.clone(), path);
+                    // Catch-up: flush after the normal debounce so the
+                    // re-registered watch's own events coalesce into it.
+                    pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
                 }
                 None => {
                     // All senders dropped: flush and exit
@@ -453,6 +522,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
@@ -498,6 +568,7 @@ mod tests {
         // to match) to tolerate fsevents detection + forward-task latency under
         // load. Behavior under test is unchanged; only the headroom before the
         // "no event" verdict.
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
@@ -543,6 +614,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -590,6 +662,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -633,6 +706,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved
@@ -684,9 +758,11 @@ mod tests {
         // Start with NO workspaces; register at runtime (#611).
         let watcher =
             SpecialistsWatcher::start_with_user_dir(bus.clone(), vec![], Some(user.path.clone()));
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Registration alone must not emit (fingerprint primed at add time).
@@ -730,5 +806,75 @@ mod tests {
             events.is_empty(),
             "deregistered workspace must stop emitting, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pause_retains_fingerprint_so_resume_only_emits_on_real_change() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("pause-user");
+        let ws = TempDir::new("pause-ws");
+        let ws_id = WorkspaceId::from("ws-pause");
+        let proj = project_dir(&ws.path);
+        std::fs::create_dir_all(&proj).expect("mk project tier");
+        let file = proj.join("steady.md");
+        std::fs::write(&file, specialist_md("Steady", "body")).expect("seed specialist");
+
+        let watcher = SpecialistsWatcher::start_with_user_dir(
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+            Some(user.path.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Suspend, change nothing, resume: the retained fingerprint still
+        // matches, so the catch-up flush must stay silent.
+        watcher.pause_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "resume with an unchanged set must not emit, got {events:?}"
+        );
+
+        // Suspend, edit while suspended, resume: the retained fingerprint is
+        // stale, so the catch-up flush emits exactly once.
+        watcher.pause_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::fs::write(&file, specialist_md("Steady", "edited while suspended"))
+            .expect("edit while suspended");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "a suspended workspace must not emit for its own edits, got {events:?}"
+        );
+
+        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "resume after a suspended-window edit must emit exactly one event, got {events:?}"
+        );
+        assert_eq!(events[0].workspace_id, ws_id);
     }
 }

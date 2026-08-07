@@ -516,6 +516,157 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     );
 }
 
+/// Wait up to `secs` for the next `subscription.push` notification on `ws`;
+/// ignore other frames. Returns the `params` sub-object
+/// (`{ subscriptionId, kind, seq, snapshot|delta }`).
+async fn next_subscription_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for subscription.push"
+        );
+        let next = timeout(remaining, ws.next())
+            .await
+            .expect("timeout elapsed");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if v["method"] == json!("subscription.push") {
+                    return v["params"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Persistence case (intent-hq/monorepo#1580): the debounced derivation writes
+/// its result to the workspace row, so the `workspace.subscribe` seq-0 snapshot
+/// — served by the lite list, which never derives `lastActivity` — carries the
+/// same value the `workspace:updated` event announced. Before the fix the
+/// snapshot served the stale stored column (the post-restart regression).
+#[tokio::test]
+async fn last_activity_persisted_for_workspace_subscribe_snapshot() {
+    let Some(script) = gate("WSS lastActivity persistence") else {
+        return;
+    };
+
+    let behavior = json!({ "response": "persisted activity" }).to_string();
+    let (daemon, port, cfg) = boot(&script, &behavior).await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "PersistTest", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut agent_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut agent_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    // Drive activity: create + run an agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "PersistAgent", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().expect("agent id");
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "do work" }),
+    )
+    .await;
+    await_stream_ends(&mut agent_sub, agent_id, 1).await;
+
+    // Take the latest announced lastActivity, draining until the subscription
+    // has been quiet for well over one debounce window so no bump is pending
+    // when the snapshot below is read (same pattern as the positive test).
+    let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
+    let mut announced = evt["data"]["changes"]["lastActivity"]
+        .as_str()
+        .expect("lastActivity string")
+        .to_string();
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while let Some(evt) = try_next_event(
+        &mut sub,
+        &["workspace:updated"],
+        Duration::from_millis(1500),
+    )
+    .await
+    {
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "workspace:updated drain never went quiet within 30s"
+        );
+        if let Some(latest) = evt["data"]["changes"]["lastActivity"].as_str() {
+            announced = latest.to_string();
+        }
+    }
+
+    // A fresh `workspace.subscribe` seq-0 snapshot (lite list — no derivation)
+    // must carry exactly that value, which is only possible if it was persisted.
+    let mut snap_conn = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(&mut snap_conn, 1, "workspace.subscribe", json!({})).await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let push = next_subscription_push(&mut snap_conn, 10).await;
+    assert_eq!(push["subscriptionId"], sub_id.as_str(), "push: {push}");
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    assert_eq!(push["seq"], json!(0), "push: {push}");
+    let row = push["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .iter()
+        .find(|e| e["id"] == json!(ws_id))
+        .cloned()
+        .expect("workspace in snapshot");
+    assert_eq!(
+        row["lastActivity"].as_str(),
+        Some(announced.as_str()),
+        "seq-0 snapshot must serve the persisted derived lastActivity: {row}"
+    );
+}
+
 /// Negative case: no `workspace:updated { lastActivity }` arrives for a
 /// workspace with no activity.
 #[tokio::test]
