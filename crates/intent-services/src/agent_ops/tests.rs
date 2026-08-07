@@ -3323,7 +3323,7 @@ async fn rename_and_set_model_persist() {
         .await
         .expect("rename");
     assert_eq!(r["name"], "New");
-    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
         .expect("setModel");
     let got = svc.agent_get_op(id, None).await.expect("get");
@@ -3364,7 +3364,7 @@ async fn set_model_clears_resolved_display_model() {
         .await
         .expect("read");
     assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
-    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
         .expect("setModel");
     let (model, resolved, _, _) = svc
@@ -3402,7 +3402,7 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
     // Provider is inferred from the compound model on creation.
     assert_eq!(session.provider.as_deref(), Some("auggie"));
     // Set a compound model for a different provider.
-    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into())
+    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into(), None)
         .await
         .expect("setModel");
     // session.provider should now match the compound prefix.
@@ -3442,7 +3442,7 @@ async fn set_model_reconciles_provider_after_first_real_use() {
         .set_acp_session_id(&ws, &id, "acp-first-use")
         .await
         .expect("persist first-use acp session id");
-    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into())
+    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into(), None)
         .await
         .expect("cross-provider setModel after first use");
     let session = svc.agent_get_session_op(id).await.expect("get after");
@@ -3467,7 +3467,7 @@ async fn set_model_preserves_provider_for_bare_or_same_provider() {
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
     let orig_provider = session.provider.clone();
     // Bare model → provider unchanged.
-    svc.agent_set_model_op(id.clone(), "opus4.7".into())
+    svc.agent_set_model_op(id.clone(), "opus4.7".into(), None)
         .await
         .expect("setModel bare");
     let session = svc
@@ -3476,7 +3476,7 @@ async fn set_model_preserves_provider_for_bare_or_same_provider() {
         .expect("get after bare");
     assert_eq!(session.provider, orig_provider);
     // Same-provider compound → provider unchanged (or set to match if None).
-    svc.agent_set_model_op(id.clone(), "auggie:sonnet4.5".into())
+    svc.agent_set_model_op(id.clone(), "auggie:sonnet4.5".into(), None)
         .await
         .expect("setModel same provider");
     let session = svc
@@ -3654,7 +3654,7 @@ async fn set_model_rejects_unknown_provider() {
     let id = create_agent(&svc, &ws, "Guard").await;
     let before = svc.agent_get_session_op(id.clone()).await.expect("get");
     let err = svc
-        .agent_set_model_op(id.clone(), "nonexistent:foo".into())
+        .agent_set_model_op(id.clone(), "nonexistent:foo".into(), None)
         .await
         .expect_err("unknown compound-prefix provider must be rejected");
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
@@ -4013,7 +4013,7 @@ async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
         .expect("persist grok provider");
     let before = svc.agent_get_session_op(id.clone()).await.expect("get");
     let err = svc
-        .agent_set_model_op(id.clone(), "fable-5".into())
+        .agent_set_model_op(id.clone(), "fable-5".into(), None)
         .await
         .expect_err("cached auggie model on a grok session must be rejected");
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
@@ -4065,7 +4065,7 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
     let id = create_agent(&svc, &ws, "BareGuard").await;
     let before = svc.agent_get_session_op(id.clone()).await.expect("get");
     let err = svc
-        .agent_set_model_op(id.clone(), "haiku".into())
+        .agent_set_model_op(id.clone(), "haiku".into(), None)
         .await
         .expect_err("bare claude-code model on an auggie session must be rejected");
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
@@ -4088,7 +4088,7 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
         "provider must be unchanged"
     );
     // Bare id unknown to every cached catalog still passes.
-    svc.agent_set_model_op(id, "some-dynamic-model".into())
+    svc.agent_set_model_op(id, "some-dynamic-model".into(), None)
         .await
         .expect("bare id unknown to every cached catalog");
 }
@@ -4125,13 +4125,13 @@ async fn set_model_normalizes_legacy_provider_aliases() {
         .await
         .expect("persist legacy alias");
     // Bare auggie model on an "acp" session passes (spawn runs auggie).
-    svc.agent_set_model_op(id.clone(), "sonnet4.5".into())
+    svc.agent_set_model_op(id.clone(), "sonnet4.5".into(), None)
         .await
         .expect("bare default-provider model on a legacy-alias session");
     // A bare claude-code model is still rejected — naming the normalized
     // provider, not the raw alias.
     let err = svc
-        .agent_set_model_op(id, "haiku".into())
+        .agent_set_model_op(id, "haiku".into(), None)
         .await
         .expect_err("bare claude-code model on a legacy-alias auggie session");
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
@@ -4140,6 +4140,171 @@ async fn set_model_normalizes_legacy_provider_aliases() {
             .contains("model haiku does not belong to provider auggie"),
         "normalized provider must be named: {err}"
     );
+}
+
+/// `agent.setModel` with an explicit `providerId` validates a bare model
+/// against the GIVEN provider (not the session's effective one) and
+/// reconciles session.provider to it, so the next spawn runs the intended
+/// binary (monorepo#1657). The same bare id WITHOUT `providerId` is rejected
+/// against the session provider — proving the param changes the outcome.
+#[tokio::test]
+async fn set_model_bare_model_with_explicit_provider_id() {
+    let (_t, svc, ws) = setup().await;
+    // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "haiku", "name": "Haiku", "provider": "claude-code" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
+        now,
+    );
+    // create_agent yields an auggie session.
+    let id = create_agent(&svc, &ws, "ExplicitPid").await;
+    // Without providerId the bare claude-code model is rejected against the
+    // session's auggie provider (the monorepo#1657 symptom).
+    svc.agent_set_model_op(id.clone(), "haiku".into(), None)
+        .await
+        .expect_err("bare claude-code model without providerId is rejected");
+    // With the explicit providerId it passes and reconciles the provider.
+    svc.agent_set_model_op(id.clone(), "haiku".into(), Some("claude-code".into()))
+        .await
+        .expect("bare model with explicit owning providerId");
+    let session = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(session.model.as_deref(), Some("haiku"));
+    assert_eq!(
+        session.provider.as_deref(),
+        Some("claude-code"),
+        "session.provider reconciled to the explicit providerId"
+    );
+}
+
+/// `agent.setModel` with a `providerId` that does not own the bare model is
+/// rejected -32602, names the owning provider, carries the pass-providerId
+/// hint, and leaves the session untouched.
+#[tokio::test]
+async fn set_model_rejects_bare_model_not_owned_by_explicit_provider() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "haiku", "name": "Haiku", "provider": "claude-code" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    let id = create_agent(&svc, &ws, "WrongPid").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "haiku".into(), Some("grok".into()))
+        .await
+        .expect_err("providerId that provably does not own the bare model");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.setModel: model haiku does not belong to provider grok"),
+        "validated against the GIVEN provider: {msg}"
+    );
+    assert!(
+        msg.contains("claude-code"),
+        "owning provider must be named: {msg}"
+    );
+    assert!(
+        msg.contains("pass providerId"),
+        "hint must mention providerId: {msg}"
+    );
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
+/// `agent.setModel` rejects an unknown explicit `providerId` with -32602
+/// before any mutation, even when the model id itself is fine.
+#[tokio::test]
+async fn set_model_rejects_unknown_explicit_provider_id() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "UnknownPid").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "opus4.7".into(), Some("nonexistent".into()))
+        .await
+        .expect_err("unknown explicit providerId must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.setModel: unknown provider: nonexistent"),
+        "unexpected err: {err}"
+    );
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
+/// `agent.setModel` rejects a compound `modelId` whose prefix conflicts with
+/// the explicit `providerId` (-32602, no mutation), and accepts one that
+/// agrees with it.
+#[tokio::test]
+async fn set_model_compound_id_vs_explicit_provider_id() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "CompoundPid").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    // Conflict: compound prefix names a different provider than providerId.
+    let err = svc
+        .agent_set_model_op(
+            id.clone(),
+            "opencode:opencode-go/kimi-k3".into(),
+            Some("auggie".into()),
+        )
+        .await
+        .expect_err("conflicting providerId must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string().contains(
+            "agent.setModel: modelId opencode:opencode-go/kimi-k3 names provider \
+             opencode but providerId is auggie"
+        ),
+        "unexpected err: {err}"
+    );
+    let after = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+    // Agreement: same provider in both — succeeds and reconciles.
+    svc.agent_set_model_op(
+        id.clone(),
+        "opencode:opencode-go/kimi-k3".into(),
+        Some("opencode".into()),
+    )
+    .await
+    .expect("agreeing providerId");
+    let session = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("opencode:opencode-go/kimi-k3")
+    );
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
 #[tokio::test]
@@ -4390,7 +4555,7 @@ async fn create_rename_set_model_emit_agent_events() {
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
 
-    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
         .expect("setModel");
     let batch = timeout(Duration::from_secs(2), sub.recv())
@@ -4486,6 +4651,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
         "in_progress".into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("markAsTask");
@@ -4541,9 +4707,16 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
         )
         .await
         .expect("create note");
-    svc.mark_as_task(ws.clone(), note.id.clone(), "complete".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "complete".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
 
     let created = svc
         .agent_create_op(
@@ -4606,6 +4779,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         note.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -4804,6 +4978,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
         foreign.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -6720,11 +6895,7 @@ async fn models_list_returns_non_empty_catalog_with_source() {
         json!({ "id": "m2", "name": "Model Two", "provider": "auggie" }),
     ];
     let fetched = rows.clone();
-    // `saturating_sub(1)` (the `seed_auggie_cache` hedge): the second call
-    // below re-reads `now_ms()`, and `fresh()` rejects entries timestamped
-    // after the read — a backwards wall-clock step between the two reads
-    // must not fall through to the real CLI probe.
-    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
     let res = svc
         .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
         .await
@@ -6739,8 +6910,8 @@ async fn models_list_returns_non_empty_catalog_with_source() {
     assert!(res.get("providerId").is_none());
     assert!(res.get("warning").is_none());
     assert!(res.get("stale").is_none());
-    // A second call through the real entry point is served from the fresh
-    // cache within the TTL window — stable, no CLI probe spawns.
+    // A second call through the real entry point is served from the cache
+    // (entries never expire) — stable, no CLI probe spawns.
     let again = svc
         .models_list_op(None, false)
         .await
@@ -6751,10 +6922,10 @@ async fn models_list_returns_non_empty_catalog_with_source() {
 #[tokio::test]
 async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallback() {
     let (_t, svc, _ws) = setup().await;
-    // Seed the unified cache under the legacy key with a fresh sentinel entry.
+    // Seed the unified cache under the legacy key with a sentinel entry.
     let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
     seed_auggie_cache(&svc, sentinel.clone());
-    // Non-forced: the sentinel is served straight from the fresh cache by
+    // Non-forced: the sentinel is served straight from the cache by
     // the real entry point — no CLI probe spawns.
     let cached = svc.models_list_op(None, false).await.expect("cached");
     assert_eq!(cached["models"], json!(sentinel));
@@ -6802,11 +6973,10 @@ async fn models_list_cortex_is_feature_code_gated() {
 }
 
 /// Seed the unified model cache under the legacy auggie key `("auggie", "")`
-/// so it is fresh at the real clock ([`models_list_op`] uses `now_ms()`).
+/// (the timestamp is irrelevant to serving — entries never expire).
 fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
-    svc.models_catalog
-        .test_store("auggie", "", rows, now.saturating_sub(1));
+    svc.models_catalog.test_store("auggie", "", rows, now);
 }
 
 /// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).
@@ -6982,73 +7152,67 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
 }
 
 #[tokio::test]
-async fn models_list_legacy_negative_window_with_last_good_serves_stale() {
-    // Unification consequence (documented): a non-forced read WITHIN the
-    // negative window that has an expired last-good entry serves it labeled
-    // stale + warning without re-probing — the old legacy path served the
-    // static catalog here.
+async fn models_list_legacy_cache_hit_ignores_negative_window() {
+    // A cached entry is a hit — no probe would run — so a fresh negative
+    // entry (a failed FORCED probe moments ago) never degrades a subsequent
+    // non-forced read to the stale fallback: the entry is served plainly.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
     svc.models_catalog
         .test_store("auggie", "", sentinel.clone(), 0);
-    let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
-    // Expired cache + failed probe arms the negative window.
+    // A forced failed probe arms the negative window (stale fallback).
     let res = svc
-        .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
+        .models_list_auggie_with(true, legacy_now(), || Box::pin(async { None }))
         .await
         .expect("failed fetch");
     assert_eq!(res["stale"], true);
-    // Within the window: same stale last-good, no re-probe.
+    // Within the window: the non-forced read is a plain cache hit, no probe.
     let res = svc
-        .models_list_auggie_with(false, past_ttl + 1, || {
-            panic!("must not re-fetch in negative window")
+        .models_list_auggie_with(false, legacy_now() + 1, || {
+            panic!("must not re-fetch on a cache hit")
         })
         .await
-        .expect("negative-window read");
+        .expect("cache-hit read");
     assert_eq!(res["models"], json!(sentinel));
     assert_eq!(res["source"], "auggie");
-    assert_eq!(res["stale"], true);
-    assert!(res["warning"].is_string());
+    assert!(res["stale"].is_null() || res["stale"] == false, "{res}");
+    assert!(res["warning"].is_null(), "{res}");
 }
 
 #[tokio::test]
-async fn models_list_legacy_expired_cache_failed_probe_serves_last_good_stale() {
-    // Staleness fix from unifying on the generic cache: a NON-forced read
-    // past the TTL whose probe fails serves the last-good list labeled
-    // stale + warning (previously the legacy path fell back to statics).
+async fn models_list_legacy_old_entry_served_without_probe() {
+    // Regression (no more 5-minute TTL): an entry of any age is a cache hit —
+    // a non-forced read must never spawn a CLI probe when an entry exists.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "lg2", "name": "LG2", "provider": "auggie" })];
     svc.models_catalog
         .test_store("auggie", "", sentinel.clone(), 0);
-    let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
     let res = svc
-        .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
+        .models_list_auggie_with(false, legacy_now(), || {
+            panic!("must not probe when an entry exists")
+        })
         .await
-        .expect("expired failure");
+        .expect("old-entry read");
     assert_eq!(res["models"], json!(sentinel));
     assert_eq!(res["source"], "auggie");
-    assert_eq!(res["stale"], true);
-    assert!(res["warning"].is_string());
+    assert!(res["stale"].is_null() || res["stale"] == false, "{res}");
+    assert!(res["warning"].is_null(), "{res}");
 }
 
 #[tokio::test]
 async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
     // The dual-cache divergence is gone: rows fetched via the legacy path are
-    // served to `providerId: "auggie"` reads within the TTL, and vice versa.
+    // served to `providerId: "auggie"` reads, and vice versa.
     let (_t, svc, _ws) = setup().await;
     let rows = vec![json!({ "id": "shared", "name": "Shared", "provider": "auggie" })];
     let fetched = rows.clone();
-    // Real clock minus 1ms (the `seed_auggie_cache` hedge): the entry the
-    // legacy fetch stores must be fresh for the per-provider read below,
-    // which re-reads `now_ms()` — and `fresh()` rejects entries timestamped
-    // after the read, so a backwards wall-clock step must not trigger a probe.
-    let now = crate::model_catalog::ModelCatalogCache::now_ms().saturating_sub(1);
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
     let res = svc
         .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
         .await
         .expect("legacy fetch");
     assert_eq!(res["models"], json!(rows));
-    // The per-provider path reads the same entry — a fresh hit, no probe.
+    // The per-provider path reads the same entry — a cache hit, no probe.
     let res = svc
         .models_list_op(Some("auggie".to_string()), false)
         .await
@@ -10550,6 +10714,8 @@ async fn seed_active_hook(
         last_logs: None,
         last_state: None,
         expires_at: Some("2026-08-02T15:00:00Z".to_string()),
+        perpetual: false,
+        dispatch_count: 0,
     };
     svc.store().insert_hook(&hook).await.expect("insert hook");
     hook
@@ -11270,6 +11436,255 @@ async fn after_all_group_waits_for_agent_waiting_child() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// Regression (issue intent-hq/monorepo#1643): a grouped `after_all` child (B)
+/// whose only outgoing watch is a `report_delivered` one on C must settle its
+/// group. Such a watch can never deliver an idle wake (the report-time wake
+/// already fired) and it retires INLINE on C's idle without a wake, so a B
+/// deferred on its account would have no future trigger and would strand the
+/// group at `delivered = 0` forever.
+#[tokio::test]
+async fn report_delivered_watch_does_not_strand_agent_waiting_group_member() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch P to B");
+    // C already reported to B, so B's watch on C survives only for a
+    // failure/deletion signal — C's idle retires it with no wake.
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B's real completion, emitted while the report_delivered watch is armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    // P idles: the group seals.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &p,
+        json!({ "agentId": p.0 }),
+    ))
+    .await;
+    // C idles: B's watch on C retires inline (report already delivered).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &p).await,
+        1,
+        "group settles despite B's report_delivered watch"
+    );
+    let text = parent_messages_text(&svc, &p).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Regression (issue intent-hq/monorepo#1643), backstop arm: the inline
+/// retirement of a `report_delivered` watch on its target's idle must run the
+/// watch-removal backstop for the watch's holder — otherwise a holder whose
+/// own idle was deferred for another reason (here a queue-interim idle whose
+/// queue then drained out-of-band) never settles its watcher.
+#[tokio::test]
+async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B idles with a ready-to-send entry: queue-interim, so A's watch defers
+    // and the interim-skip marker is recorded.
+    let (queued, _) = svc.enqueue_message(&b, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+    svc.take_queued_message(&b, &queued.id)
+        .expect("drain queue");
+
+    // C idles: B's report_delivered watch retires with no wake, and the
+    // backstop synthesizes B's real completion.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "retiring B's last outgoing watch settles A's deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at the backstop completion"
+    );
+}
+
+/// Chained inline retirement (issue intent-hq/monorepo#1643): A holds a
+/// `report_delivered` watch on B and B one on C, with A and B both
+/// deferred. C's idle must cascade — retiring B's watch backstops B's
+/// completion, which retires A's watch and backstops A's — so Z, watching A,
+/// settles from a single event. Pins the recursion contract (one marker
+/// consumed per hop, each watch removed before recursing) as bounded and
+/// wake-exactly-once.
+#[tokio::test]
+async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher() {
+    let (_t, svc, ws) = setup().await;
+    let z = create_agent(&svc, &ws, "Z").await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, z.clone(), "Z".into(), a.clone(), None)
+        .expect("Z watches A");
+    let ab = svc
+        .register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&ab));
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // Defer B, then A, via queue-interim idles; drain both queues so only the
+    // watch retirements remain as triggers.
+    for agent in [&b, &a] {
+        let (queued, _) =
+            svc.enqueue_message(agent, "follow-up".into(), None, None, None, None, false);
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            agent,
+            json!({ "agentId": agent.0 }),
+        ))
+        .await;
+        svc.take_queued_message(agent, &queued.id)
+            .expect("drain queue");
+    }
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        0,
+        "Z defers until A settles"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        1,
+        "one cascade delivers exactly one wake to Z"
+    );
+    assert!(svc.find_watches_for_child(&a).is_empty());
+    assert!(svc.find_watches_for_child(&b).is_empty());
+    assert!(svc.find_watches_for_child(&c).is_empty());
+}
+
+/// A `report_delivered` watch is not an agent-waiting reason, in both the live
+/// and the durable (persisted-row) classification: it can only ever deliver a
+/// failure/deletion signal, so its holder's idle must not defer on its account
+/// (issue intent-hq/monorepo#1643).
+#[tokio::test]
+async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(
+        svc.agent_is_waiting_on_agents(&b),
+        "a plain outgoing watch is a waiting reason"
+    );
+    assert!(svc.mark_watch_report_delivered(&bc));
+    assert!(
+        !svc.agent_is_waiting_on_agents(&b),
+        "a report_delivered watch is not a waiting reason"
+    );
+
+    // Durable variant: a restarted daemon classifies from persisted rows
+    // BEFORE the watch registry loads, so it must honor the column too.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
+        id: "watch-1643".to_string(),
+        parent_workspace_id: ws.clone(),
+        child_workspace_id: ws.clone(),
+        parent_agent_id: b.clone(),
+        parent_agent_name: "B".into(),
+        child_agent_id: c.clone(),
+        group_id: None,
+        report_delivered,
+        wake_on_attention: false,
+        created_at: now_iso(),
+    };
+    restarted
+        .store()
+        .upsert_completion_watch(&row(false))
+        .await
+        .expect("seed plain row");
+    assert!(
+        restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted plain watch is a waiting reason"
+    );
+    restarted
+        .store()
+        .upsert_completion_watch(&row(true))
+        .await
+        .expect("seed report_delivered row");
+    assert!(
+        !restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted report_delivered watch is not a waiting reason"
+    );
+}
 /// Terminal signals are never agent-waiting-deferred: a watched child that
 /// FAILS while holding an outgoing watch still wakes its watcher immediately.
 #[tokio::test]
@@ -14221,6 +14636,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
         note.id.clone(),
         "not_started".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -18459,6 +18875,7 @@ async fn link_task_note(
         status.into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("mark as task");
@@ -21084,4 +21501,259 @@ async fn requeue_front_batch_preserves_order_ahead_of_existing_entries() {
     let snap = svc.queue_snapshot(&agent);
     let contents: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
     assert_eq!(contents, vec![json!("a"), json!("b"), json!("later")]);
+}
+
+// ---- ws.agent.snapshot (state snapshot op + injection line) ----
+
+/// An idle agent with no hooks/watches/queue/subscriptions/children/questions
+/// and no pending attention yields the trivial snapshot: `time` only in the
+/// wire object, and NO injection line (`time` alone never forces one).
+#[tokio::test]
+async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Idle").await;
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    let obj = v.as_object().expect("object");
+    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    let time = v["time"].as_str().expect("time string");
+    assert!(
+        time.ends_with('Z') && !time.contains('.'),
+        "whole-second UTC: {time}"
+    );
+
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "trivial snapshot must not inject"
+    );
+}
+
+/// A populated snapshot reports the approved camelCase fields with correct
+/// counts, and the injection line is the single-line JSON prefixed with
+/// `current ws.agent.snapshot() => `.
+#[tokio::test]
+async fn agent_snapshot_populated_counts_and_injection_line() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+
+    // Parent linkage: `child` is an unsettled delegate of `parent`.
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("link child");
+
+    // One completion watch, two queued messages, one event subscription.
+    svc.agent_watch_op(ws.clone(), parent.clone(), other.clone())
+        .await
+        .expect("watch");
+    svc.enqueue_message(&parent, "m1".into(), None, None, None, None, false);
+    svc.enqueue_message(&parent, "m2".into(), None, None, None, None, false);
+    svc.register_event_subscription(
+        &ws,
+        Some(parent.clone()),
+        &["note:*".to_string()],
+        None,
+        None,
+    )
+    .await;
+    // Pending attention request.
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck".into(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("blocker");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(v["time"].is_string());
+    assert_eq!(v["agentWatches"], json!(1));
+    assert_eq!(v["queuedMessages"], json!(2));
+    assert_eq!(v["eventSubscriptions"], json!(1));
+    assert_eq!(v["runningSubAgents"], json!(1));
+    assert_eq!(v["pendingAttention"], json!("blocker"));
+    // Zero-count fields stay omitted.
+    let obj = v.as_object().expect("object");
+    assert!(!obj.contains_key("hooks"), "zero hooks omitted: {v}");
+    assert!(
+        !obj.contains_key("numQuestionsAsked"),
+        "zero questions omitted: {v}"
+    );
+
+    let line = svc
+        .agent_state_snapshot_line(&parent)
+        .await
+        .expect("non-trivial snapshot injects");
+    assert!(
+        line.starts_with("current ws.agent.snapshot() => {"),
+        "prefix: {line}"
+    );
+    assert!(!line.contains('\n'), "single line: {line}");
+    let json_part = line
+        .strip_prefix("current ws.agent.snapshot() => ")
+        .expect("JSON payload");
+    let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
+    assert_eq!(parsed["queuedMessages"], json!(2));
+    assert_eq!(parsed["pendingAttention"], json!("blocker"));
+}
+
+/// A settled (terminal) child no longer counts toward `runningSubAgents`.
+#[tokio::test]
+async fn agent_snapshot_excludes_settled_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    child_session.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("settle child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("runningSubAgents"),
+        "settled child must not count: {v}"
+    );
+}
+
+/// An unsettled child delegated into ANOTHER workspace (Chief cross-workspace
+/// delegation) still counts toward `runningSubAgents` — child discovery keys
+/// on `parent_agent_id` alone, never on the parent's home workspace.
+#[tokio::test]
+async fn agent_snapshot_counts_cross_workspace_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Chief").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    let child = create_agent(&svc, &other_ws, "Remote Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&other_ws, &child_session)
+        .await
+        .expect("link cross-workspace child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["runningSubAgents"],
+        json!(1),
+        "cross-workspace child must count: {v}"
+    );
+}
+
+/// Workspace scoping: a snapshot for an agent homed elsewhere fails closed
+/// with `NotFound` (defense-in-depth against bare-id probes).
+#[tokio::test]
+async fn agent_snapshot_rejects_workspace_mismatch() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Scoped").await;
+    let foreign = WorkspaceId::new();
+    let err = svc
+        .agent_snapshot_op(foreign, agent)
+        .await
+        .expect_err("cross-workspace probe must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+}
+
+/// `numQuestionsAsked` counts pending questions from BOTH sources: the
+/// turn-attachment registry (asked this turn, awaiting the turn-end drain)
+/// and the trailing assistant message's question blocks (presented, awaiting
+/// an answer); a user answer supersedes the tail count and a dismissal
+/// clears it.
+#[tokio::test]
+async fn agent_snapshot_counts_pending_questions() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Asker").await;
+
+    // In-turn: one question registered in the turn-attachment registry.
+    svc.turn_attachments().register(
+        &agent,
+        intent_core::TurnAttachment {
+            id: intent_core::new_attachment_id(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "intent-question://tar-test".to_string(),
+            name: "Q".to_string(),
+            text: "{}".to_string(),
+        },
+    );
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(1), "registry count: {v}");
+    svc.turn_attachments().finish_turn(&agent);
+
+    // Presented: trailing assistant message carrying two question blocks.
+    let question_block = json!({
+        "type": "resource",
+        "resource": {
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "uri": "intent-question://q-1",
+            "text": "{}"
+        }
+    });
+    let msg = svc
+        .store()
+        .append_agent_message(
+            &agent,
+            "assistant",
+            &json!([question_block, question_block]),
+            &now_iso(),
+        )
+        .await
+        .expect("append questions");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(2), "tail count: {v}");
+
+    // Dismissal clears the tail count.
+    svc.agent_dismiss_questions_op(ws.clone(), agent.clone(), msg.id.clone())
+        .await
+        .expect("dismiss");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("numQuestionsAsked"),
+        "dismissed questions must not count: {v}"
+    );
 }

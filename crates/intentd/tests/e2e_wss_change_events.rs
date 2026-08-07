@@ -592,6 +592,163 @@ async fn task_block_author_list_assign_flow_over_wss() {
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
 }
 
+/// End-to-end `task:created` over WSS (PROTOCOL.md §6.5): every path where a
+/// note becomes a task publishes exactly one `task:created` carrying
+/// `{ noteId, noteTitle, status, createdAt }`. Drives all three paths on one
+/// subscription — `note.create` with an `@@@task` fence (auto-conversion),
+/// `task.markAsTask` on a plain note (which also emits the `note:updated`
+/// metadata refetch), and `task.createPrerequisite` — with a re-`markAsTask`
+/// in between to prove an already-task note does not emit a second creation
+/// (the next `task:created` observed is the prerequisite's, and the stream is
+/// ordered).
+#[tokio::test]
+async fn task_created_emitted_on_every_creation_path_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "TaskCreated", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:*", "note:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Path 1 — `@@@task` auto-conversion on `note.create`.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Plan",
+            "content": "intro\n@@@task\n# Converted Task\nbody\n@@@",
+        }),
+    )
+    .await;
+    let parent_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let tasks = wss_rpc(
+        &mut rpc,
+        3,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    let child_id = tasks[0]["taskNoteId"]
+        .as_str()
+        .expect("linked task note id")
+        .to_string();
+
+    let evt = next_event(&mut sub, &["task:created"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert!(evt["id"].is_string(), "event id: {evt}");
+    assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
+    assert_eq!(
+        evt["actor"],
+        json!({ "type": "system", "id": "system", "name": "System" })
+    );
+    assert_eq!(evt["data"]["noteId"], json!(child_id));
+    assert_eq!(evt["data"]["noteTitle"], json!("Converted Task"));
+    assert_eq!(evt["data"]["status"], json!("not_started"));
+    assert!(evt["data"]["createdAt"].is_string(), "createdAt: {evt}");
+    // System-attributed creation: no agent provenance on the payload.
+    assert!(evt["data"].get("agentId").is_none(), "agentId: {evt}");
+
+    // Path 2 — `task.markAsTask` promotes a plain note.
+    let plain = wss_rpc(
+        &mut rpc,
+        4,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Plain", "content": "body" }),
+    )
+    .await;
+    let plain_id = plain["note"]["id"].as_str().expect("note id").to_string();
+    let marked = wss_rpc(
+        &mut rpc,
+        5,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": plain_id, "status": "not_started" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], json!(true), "markAsTask: {marked}");
+
+    // The metadata write emits `note:updated` so note-driven refetches fire.
+    // The auto-conversion above left its own parent-rewrite `note:updated` on
+    // the stream, so skip forward to this note's.
+    loop {
+        let evt = next_event(&mut sub, &["note:updated"], 10).await;
+        if evt["data"]["noteId"] == json!(plain_id) {
+            break;
+        }
+    }
+
+    let evt = next_event(&mut sub, &["task:created"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(plain_id));
+    assert_eq!(evt["data"]["noteTitle"], json!("Plain"));
+    assert_eq!(evt["data"]["status"], json!("not_started"));
+
+    // Re-marking an already-task note is a status move, not a creation: it
+    // takes the same `task:status-changed` `task.updateNoteStatus` publishes.
+    wss_rpc(
+        &mut rpc,
+        6,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": plain_id, "status": "in_progress" }),
+    )
+    .await;
+
+    let evt = next_event(&mut sub, &["task:status-changed"], 10).await;
+    assert_eq!(evt["data"]["noteId"], json!(plain_id));
+    assert_eq!(evt["data"]["previousStatus"], json!("not_started"));
+    assert_eq!(evt["data"]["newStatus"], json!("in_progress"));
+
+    // Path 3 — `task.createPrerequisite`. Because the stream is ordered, the
+    // next `task:created` being the prerequisite's proves the re-mark above
+    // published none.
+    let prereq = wss_rpc(
+        &mut rpc,
+        7,
+        "task.createPrerequisite",
+        json!({
+            "workspaceId": ws_id,
+            "dependentNoteId": plain_id,
+            "title": "Prereq",
+            "status": "not_started",
+        }),
+    )
+    .await;
+    let prereq_id = prereq["prerequisiteNoteId"]
+        .as_str()
+        .expect("prerequisite note id")
+        .to_string();
+
+    let evt = next_event(&mut sub, &["task:created"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(prereq_id),
+        "re-marking an existing task must not emit task:created: {evt}"
+    );
+    assert_eq!(evt["data"]["noteTitle"], json!("Prereq"));
+    assert_eq!(evt["data"]["status"], json!("not_started"));
+    assert!(evt["data"]["createdAt"].is_string(), "createdAt: {evt}");
+}
+
 /// End-to-end reference-parity self-heal: a workspace whose `spec` note has
 /// been deleted gets it reseeded on the next `note.list` (reference:
 /// `notes.service.ts getNotes` → `ensureSpecExists`). The reseed emits a

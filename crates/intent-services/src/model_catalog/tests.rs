@@ -1,6 +1,6 @@
 //! Unit tests for the generic per-provider model cache (PROTOCOL §5.30):
-//! TTL, version-key invalidation, forceRefresh bypass, failure fallback,
-//! single-flighting, negative caching, and persistence.
+//! indefinite serving, version-key invalidation, forceRefresh bypass, failure
+//! fallback, single-flighting, negative caching, and persistence.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,52 +57,59 @@ fn counting_fetch(
     }
 }
 
-const TTL_MS: u64 = super::MODELS_CACHE_TTL.as_millis() as u64;
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
+/// An arbitrarily large age (~10 years in ms): cached entries have no TTL,
+/// so an entry this old must still be served without a probe.
+const OLD_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+
 #[tokio::test]
-async fn fresh_cache_hit_within_ttl_skips_fetch() {
+async fn cache_hit_skips_fetch() {
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("cached"), 1_000);
-    let r = resolve_with_cache(
-        &cache,
-        "p",
-        "v1",
-        false,
-        1_000 + TTL_MS - 1,
-        panicking_fetch(),
-    )
-    .await;
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_001, panicking_fetch()).await;
     assert_eq!(r.models, Some(rows("cached")));
     assert!(!r.stale);
     assert!(r.warning.is_none());
 }
 
 #[tokio::test]
-async fn entry_fetched_in_the_future_is_not_fresh() {
-    // System clock moved backwards: an entry stamped ahead of `now` must not
-    // be served as fresh (it could otherwise outlive the TTL indefinitely).
+async fn arbitrarily_old_entry_is_served_without_probe() {
+    // Regression (no more 5-minute TTL): an entry of any age is a cache hit —
+    // a non-forced read must never spawn a probe when an entry exists.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("old"), 1_000);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000 + OLD_MS, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("old")));
+    assert!(!r.stale);
+    assert!(r.warning.is_none());
+}
+
+#[tokio::test]
+async fn entry_fetched_in_the_future_is_still_served() {
+    // System clock moved backwards: with no age-based expiry there is nothing
+    // for a future-stamped entry to outlive, so it is served like any hit.
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("future"), 10_000);
-    let r = resolve_with_cache(&cache, "p", "v1", false, 5_000, ok_fetch("probed")).await;
-    assert_eq!(r.models, Some(rows("probed")));
+    let r = resolve_with_cache(&cache, "p", "v1", false, 5_000, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("future")));
     assert!(!r.stale);
 }
 
 #[tokio::test]
-async fn expired_cache_awaits_fresh_probe_and_stores() {
+async fn cache_miss_awaits_probe_and_stores() {
     let cache = ModelCatalogCache::new(None);
-    cache.store("p", "v1", rows("old"), 1_000);
-    let now = 1_000 + TTL_MS;
+    let now = 1_000;
     let r = resolve_with_cache(&cache, "p", "v1", false, now, ok_fetch("new")).await;
     assert_eq!(r.models, Some(rows("new")));
     assert!(!r.stale);
-    // The fresh result replaced the entry.
-    assert_eq!(cache.fresh("p", "v1", now), Some(rows("new")));
+    // The result was stored: a later read is a hit, no probe.
+    let r = resolve_with_cache(&cache, "p", "v1", false, now + 1, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("new")));
 }
 
 #[tokio::test]
-async fn version_key_bump_invalidates_within_ttl() {
+async fn version_key_bump_invalidates_cached_entry() {
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("pinned-old"), 1_000);
     // Same instant, new version key → cache miss, fetch served + stored.
@@ -116,13 +123,13 @@ async fn version_key_bump_invalidates_within_ttl() {
 }
 
 #[tokio::test]
-async fn force_refresh_bypasses_fresh_cache() {
+async fn force_refresh_bypasses_cache() {
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("cached"), 1_000);
     let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, ok_fetch("forced")).await;
     assert_eq!(r.models, Some(rows("forced")));
     assert!(!r.stale);
-    assert_eq!(cache.fresh("p", "v1", 1_001), Some(rows("forced")));
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("forced")));
 }
 
 #[tokio::test]
@@ -169,9 +176,8 @@ fn persistence_roundtrips_across_instances() {
     let cache = ModelCatalogCache::new(Some(path.clone()));
     cache.store("p", "v1", rows("persisted"), 1_000);
     let reloaded = ModelCatalogCache::new(Some(path.clone()));
-    assert_eq!(reloaded.fresh("p", "v1", 1_001), Some(rows("persisted")));
+    assert_eq!(reloaded.last_good("p", "v1"), Some(rows("persisted")));
     // A version-key bump invalidates the reloaded entry too.
-    assert!(reloaded.fresh("p", "v2", 1_001).is_none());
     assert!(reloaded.last_good("p", "v2").is_none());
     // Corrupt files are ignored, not errors.
     std::fs::write(&path, b"not json").unwrap();
@@ -226,7 +232,8 @@ fn registry_version_keys_follow_adapter_pins() {
 #[tokio::test]
 async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
     // A provider_models probe failure (models: None + warning) adapted via
-    // `from_provider_fetch` must flow into the cache's stale fallback.
+    // `from_provider_fetch` must flow into the cache's stale fallback. Forced
+    // read: a non-forced one would serve the cached entry without probing.
     let cache = ModelCatalogCache::new(None);
     cache.store("droid", "", rows("droid-last-good"), 1_000);
     let failed = || -> BoxFuture<'static, ModelFetchResult> {
@@ -237,7 +244,7 @@ async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
             })
         })
     };
-    let r = resolve_with_cache(&cache, "droid", "", false, 1_000 + TTL_MS, failed).await;
+    let r = resolve_with_cache(&cache, "droid", "", true, 1_001, failed).await;
     assert_eq!(r.models, Some(rows("droid-last-good")));
     assert!(r.stale);
     let warning = r.warning.expect("stale data must be labeled");
@@ -336,27 +343,28 @@ async fn negative_window_suppresses_reprobe_without_last_good() {
 }
 
 #[tokio::test]
-async fn negative_window_serves_last_good_as_stale() {
+async fn cache_hit_ignores_negative_window() {
+    // A cached entry under the current version key is a hit — no probe would
+    // run — so a fresh negative entry (e.g. a failed forced probe moments
+    // ago) never degrades a non-forced read to the stale fallback.
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("last-good"), 1_000);
-    let now = 1_000 + TTL_MS;
-    let r = resolve_with_cache(&cache, "p", "v1", false, now, failing_fetch()).await;
+    let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, failing_fetch()).await;
     assert_eq!(r.models, Some(rows("last-good")));
     assert!(r.stale);
-    // Within the negative window: same stale fallback, no re-probe.
+    // Within the negative window: the entry is served plainly, no re-probe.
     let r = resolve_with_cache(
         &cache,
         "p",
         "v1",
         false,
-        now + NEG_TTL_MS - 1,
+        1_001 + NEG_TTL_MS - 1,
         panicking_fetch(),
     )
     .await;
     assert_eq!(r.models, Some(rows("last-good")));
-    assert!(r.stale);
-    let warning = r.warning.expect("stale data must be labeled");
-    assert!(warning.contains("probe failed"), "{warning}");
+    assert!(!r.stale);
+    assert!(r.warning.is_none());
 }
 
 #[tokio::test]
@@ -381,7 +389,7 @@ async fn force_refresh_bypasses_negative_window() {
     // the negative entry for subsequent non-forced reads.
     let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, ok_fetch("forced")).await;
     assert_eq!(r.models, Some(rows("forced")));
-    assert_eq!(cache.fresh("p", "v1", 1_002), Some(rows("forced")));
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("forced")));
 }
 
 #[tokio::test]
@@ -411,7 +419,7 @@ async fn only_the_leader_records_the_probe_outcome() {
         "follower must not record a negative entry"
     );
     // And the recovered rows were not clobbered.
-    assert_eq!(cache.fresh("p", "v1", 1_001), Some(rows("recovered")));
+    assert_eq!(cache.last_good("p", "v1"), Some(rows("recovered")));
 }
 
 #[tokio::test]

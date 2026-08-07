@@ -335,8 +335,9 @@ async fn crud_mutations_emit_change_events_over_uds() {
         json!({ "noteId": note_id, "title": "Note", "action": "update" })
     );
 
-    // task.markAsTask makes it a task (no event), then task.updateNoteStatus
-    // → task:status-changed with the previous/new status payload.
+    // task.markAsTask makes it a task → note:updated (the metadata write) then
+    // task:created, since the note was not already a task. task.updateNoteStatus
+    // then → task:status-changed with the previous/new status payload.
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -345,6 +346,25 @@ async fn crud_mutations_emit_change_events_over_uds() {
         json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
     )
     .await;
+    let ev = read_json(&mut sub_reader).await;
+    assert_eq!(ev["params"]["event"]["type"], "note:updated");
+    assert_eq!(
+        ev["params"]["event"]["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+    );
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "task:created");
+    assert_eq!(
+        e["actor"],
+        json!({ "type": "system", "id": "system", "name": "System" })
+    );
+    assert_eq!(e["data"]["noteId"], note_id.as_str());
+    assert_eq!(e["data"]["noteTitle"], "Note");
+    assert_eq!(e["data"]["status"], "not_started");
+    assert!(e["data"]["createdAt"].is_string());
+    assert!(e["data"].get("agentId").is_none());
+
     rpc(
         &mut rpc_write,
         &mut rpc_reader,

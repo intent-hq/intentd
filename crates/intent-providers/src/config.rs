@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.60.0"
+        "0.66.0"
     };
 }
 
@@ -34,13 +34,13 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. Matches the
 /// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
 /// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.7";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.14";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
 /// bumping the version is a deliberate code change. Also feeds the pi
 /// model-catalog probe in `intent-services::provider_models`.
-pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.31";
+pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
 
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
@@ -171,6 +171,14 @@ pub struct ProviderConfig {
     /// lifecycle, `unsloth_server.rs`) — reporting availability off
     /// `opencode` alone is misleading when the Unsloth CLI isn't installed.
     pub requires_secondary_binary: Option<&'static str>,
+    /// When true, ACP `terminal/create` requests from this provider are spawned
+    /// via a shell (`/bin/sh -c` on POSIX; PowerShell `-Command` / `cmd /c` on
+    /// Windows) rather than as raw argv. Needed for agents that pack a full
+    /// shell line into the
+    /// `command` field with empty `args` (Node-style `shell: true` semantics).
+    /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
+    /// argv-only clients (most providers) leave this false.
+    pub terminal_requires_shell: bool,
 }
 
 impl ProviderConfig {
@@ -213,6 +221,7 @@ impl ProviderConfig {
             fallback_npx_package: None,
             npx_only_package: None,
             requires_secondary_binary: None,
+            terminal_requires_shell: false,
         }
     }
 
@@ -262,7 +271,13 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "auggie login",
             "please run `auggie login`",
         ]),
+        // `auggie token print` exits 0 when logged in, non-zero when logged
+        // out. Its stdout IS the auth session secret, so the probe must stay on
+        // the generic exit-code arm of `check_provider_auth_cli` (stdout and
+        // stderr nulled) — never captured, logged, or surfaced.
+        auth_check_args: Some(&["token", "print"]),
         login_command_hint: Some("auggie login"),
+        login_docs_url: Some("https://docs.augmentcode.com/cli/overview"),
         short_name: "Auggie",
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
@@ -290,7 +305,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
-        // The pinned @agentclientprotocol/codex-acp adapter (1.1.7) ignores
+        // The pinned @agentclientprotocol/codex-acp adapter (1.1.14) ignores
         // `_meta.developerInstructions` (verified empirically, #479), so the
         // system prompt is delivered via the first-turn `<system>` prepend
         // instead of SessionMeta.
@@ -347,7 +362,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
-        // pi-acp (0.0.31) has no `_meta` system-prompt path and no rules/MCP
+        // pi-acp (0.0.33) has no `_meta` system-prompt path and no rules/MCP
         // CLI flags (it advertises `mcpCapabilities: { http: false, sse:
         // false }` and does not wire `session/new` `mcpServers` into the pi
         // process), so the assembled prompt is prepended on the first turn.
@@ -360,7 +375,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // The adapter's `session/new` result advertises the model as a
         // `configOptions[id="model"]` select; the stored model is applied
         // post-session via `session/set_config_option` (verified against
-        // pi-acp@0.0.31's `setSessionConfigOption`; no CLI model flag).
+        // pi-acp@0.0.33's `setSessionConfigOption`; no CLI model flag).
         supports_config_option_model: true,
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),
@@ -404,6 +419,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         auth_check_args: Some(&["models"]),
         login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
         short_name: "Grok",
+        // Grok's ACP terminal adapter packs `/bin/bash -lc '…'` into `command`
+        // with empty `args` (Node shell:true style). intentd argv-only spawn
+        // would ENOENT that string; shell-wrap on terminal/create instead.
+        terminal_requires_shell: true,
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {

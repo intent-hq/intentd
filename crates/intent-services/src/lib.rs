@@ -16,9 +16,9 @@ use intent_core::events::{
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
-    TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -68,6 +68,8 @@ pub mod events;
 mod file_ops;
 mod git_diff_singleflight;
 mod git_ops;
+mod git_status_cache;
+mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
 
@@ -85,6 +87,7 @@ mod model_catalog;
 mod note_ops;
 mod one_shot_acp;
 mod pagination;
+mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
@@ -140,12 +143,15 @@ pub use agent_manager::{
 pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{
-    EventBus, FileWatcher, GitMetadataWatcher, GitStatusRefresher, SkillsWatcher,
-    SpecialistsWatcher, Subscription, SubscriptionFilter, WatcherRegistry,
-};
+// The individual watcher families are constructed only by `WatcherRegistry`
+// (they now take the crate-private shared-stream hub), so only the registry and
+// the bus/refresher surface leave the crate.
+pub use events::{EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
-pub use pr_ops::PrRefreshOutcome;
+pub use pr_ops::{
+    fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
+    MergeRequirementsChecks, MergeRequirementsThreads, PrRefreshOutcome,
+};
 
 /// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
 /// selector returns `true` for these). After a daemon crash the runtime
@@ -211,7 +217,8 @@ pub struct Services {
     /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
     session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
     /// The one `models.list` model cache (PROTOCOL §5.30): entries keyed by
-    /// provider id + registry-derived version key, 5-minute TTL, persisted in
+    /// provider id + registry-derived version key, served indefinitely (a
+    /// probe runs only on a cache miss or `forceRefresh`), persisted in
     /// the daemon data dir when configured via
     /// [`Services::with_models_cache_dir`]; also holds the per-provider
     /// single-flight and negative-cache state. Both the per-provider path
@@ -563,6 +570,20 @@ pub struct Services {
     /// tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
     git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Event-invalidated per-worktree working-tree status cache, keyed by
+    /// canonical worktree path (monorepo#1648): `git.status` / `git.changes` /
+    /// `accept-changes.getStatus` reads serve the cached [`intent_core::GitStatus`]
+    /// until a daemon-observed change invalidates it or its fallback TTL
+    /// elapses, and a miss runs one single-flighted blocking-pool
+    /// [`intent_git::status::status`] scan that every concurrent caller shares;
+    /// distinct worktrees never serialize. Shared across clones — and with the
+    /// [`GitStatusRefresher`] — so every handle observes one cache.
+    git_status_cache: Arc<git_status_cache::GitStatusCache>,
+    /// Test seam: when set, invoked on the blocking pool immediately before
+    /// each underlying working-tree status scan (counting + parking for
+    /// coalescing tests). Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `with_git_status_scan_probe`.
+    git_status_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
@@ -589,6 +610,24 @@ pub struct Services {
     /// / unit-test wiring, or `wakeResume` disabled) keeps today's terminal
     /// behavior for transient upstream disconnects. Shared across clones.
     suspend_tracker: Option<Arc<dyn agent_session::SuspendOverlapQuery>>,
+    /// Monitors whose next poll must deliver without waiting out the debounce
+    /// window (`ws.pr.monitor` restart catch-up). Populated by
+    /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
+    /// that acts on each entry; shared across clones.
+    pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
+    /// Explicit override for the centralized PR-monitor loop's poll cadence
+    /// (seconds). `None` — the production wiring — reads
+    /// `prMonitor.pollSeconds` live from the settings registry; values below
+    /// the floor are clamped at read time.
+    pr_monitor_poll_seconds: Option<u64>,
+    /// Explicit override for the debounce quiet window (seconds) before a
+    /// changed PR's consolidated wake is delivered. `None` — the production
+    /// wiring — reads `prMonitor.debounceSeconds` live from the settings
+    /// registry; values below the floor are clamped at read time.
+    pr_monitor_debounce_seconds: Option<u64>,
+    /// Cap on concurrently active PR monitors per agent (mirrors
+    /// `[hooks] maxPerAgent`).
+    pr_monitors_max_per_agent: u32,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -669,12 +708,40 @@ impl Services {
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
+            git_status_cache: Arc::new(git_status_cache::GitStatusCache::new()),
+            git_status_scan_probe: None,
             hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             suspend_tracker: None,
+            pr_monitor_catch_up: Arc::new(Mutex::new(HashSet::new())),
+            pr_monitor_poll_seconds: None,
+            pr_monitor_debounce_seconds: None,
+            pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
         }
+    }
+
+    /// Pin the PR-monitor poll cadence, bypassing the live
+    /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
+    /// are clamped when read.
+    pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+        self.pr_monitor_poll_seconds = Some(seconds);
+        self
+    }
+
+    /// Pin the PR-monitor debounce window, bypassing the live
+    /// `prMonitor.debounceSeconds` setting (test wiring). Values below the
+    /// floor are clamped when read.
+    pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
+        self.pr_monitor_debounce_seconds = Some(seconds);
+        self
+    }
+
+    /// Override the per-agent active-monitor cap.
+    pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
+        self.pr_monitors_max_per_agent = cap;
+        self
     }
 
     /// Wire the host suspend-overlap query (Task C): the composition root passes
@@ -1135,6 +1202,56 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn git_diffs_waiters(&self, key: &git_diff_singleflight::DiffKey) -> usize {
         self.git_diffs_inflight.waiters(key)
+    }
+
+    /// Test seam: observe/park the underlying working-tree status scan on the
+    /// blocking pool so single-flight coalescing tests are deterministic.
+    /// Production wiring keeps `None`.
+    #[cfg(test)]
+    pub(crate) fn with_git_status_scan_probe(mut self, probe: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.git_status_scan_probe = Some(probe);
+        self
+    }
+
+    /// Test seam: number of followers currently awaiting the in-flight
+    /// working-tree status scan for `worktree`.
+    #[cfg(test)]
+    pub(crate) fn git_status_waiters(&self, worktree: &Path) -> usize {
+        self.git_status_cache.waiters(worktree)
+    }
+
+    /// Test-only: rebuild the status cache with a compressed fallback TTL so
+    /// expiry coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));
+        self
+    }
+
+    /// The shared event-invalidated working-tree status cache (monorepo#1648),
+    /// handed to the composition root so the [`GitStatusRefresher`]'s
+    /// watcher-driven recompute repopulates the same entries the read path
+    /// serves instead of running a competing scan.
+    pub fn git_status_cache(&self) -> Arc<git_status_cache::GitStatusCache> {
+        Arc::clone(&self.git_status_cache)
+    }
+
+    /// The current working-tree status for `worktree` (monorepo#1648): served
+    /// from the per-worktree cache when live, otherwise one single-flighted
+    /// blocking-pool scan whose result every concurrent caller shares and
+    /// which repopulates the cache.
+    async fn scan_git_status(&self, worktree: &Path) -> Result<Arc<intent_core::GitStatus>> {
+        self.git_status_cache
+            .get(worktree, self.git_status_scan_probe.clone())
+            .await
+    }
+
+    /// Handle on the status cache for a daemon-owned git mutation to
+    /// invalidate once it has changed the worktree, so the next read rescans
+    /// rather than serving the pre-mutation snapshot. Cloned into the mutation
+    /// future because the invalidation happens inside an `async move` block.
+    fn git_status_invalidator(&self) -> Arc<git_status_cache::GitStatusCache> {
+        Arc::clone(&self.git_status_cache)
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -3048,12 +3165,26 @@ impl Services {
     /// stall) — the same class of accepted imprecision as deeper cycles
     /// (A→B→C→A), which the guard does not detect either.
     ///
+    /// `report_delivered` watches are excluded (issue
+    /// intent-hq/monorepo#1643): such a watch has already delivered its
+    /// report-time wake, so the target's `agent:idle` is suppressed and
+    /// retires it inline without waking the holder — it can only ever deliver
+    /// an `agent:failed` / `agent:deleted` signal, which is not something the
+    /// holder is waiting FOR. Counting it deferred the holder's own completion
+    /// with no future trigger, stranding its `after_all` group forever.
+    ///
+    /// This does not weaken the "grouped watches count too" rule above:
+    /// `report_delivered` is only ever set on UNGROUPED watches, because
+    /// `agent.reportToParent` filters `group_id.is_none()` before marking
+    /// (see `mark_watch_report_delivered`, which `debug_assert!`s it).
+    ///
     /// The waiting classification is exposed as a reusable predicate so the
     /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
         let outgoing: Vec<AgentId> = self
             .list_watches_for_parent(agent_id)
             .into_iter()
+            .filter(|w| !w.report_delivered)
             .map(|w| w.child_agent_id)
             .collect();
         let incoming: Vec<AgentId> = self
@@ -3089,7 +3220,7 @@ impl Services {
         };
         let outgoing: Vec<AgentId> = rows
             .iter()
-            .filter(|r| &r.parent_agent_id == agent_id)
+            .filter(|r| &r.parent_agent_id == agent_id && !r.report_delivered)
             .map(|r| r.child_agent_id.clone())
             .collect();
         if outgoing.is_empty() {
@@ -3578,6 +3709,19 @@ impl Services {
                 if self.remove_watch(&watch.id) {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
+                    // Watch-removal backstop (issue intent-hq/monorepo#1643):
+                    // this retirement delivers NO wake, so a holder whose own
+                    // idle was deferred (interim-skip marker recorded) loses
+                    // its last trigger when this was its last outgoing watch.
+                    // Same shape as the `agent.unwatch` /
+                    // `agent.cancelSubscriptions` backstops; the redelivery's
+                    // own guards make it a no-op otherwise. Box::pin breaks
+                    // the async-recursion cycle (deliver -> redeliver ->
+                    // deliver).
+                    Box::pin(
+                        self.redeliver_completion_after_queue_mutation(&watch.parent_agent_id),
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -6330,6 +6474,62 @@ fn note_change_event(
     }
 }
 
+/// Build a `task:created` event with the payload
+/// `{ noteId, noteTitle, status, createdAt, agentId? }` (PROTOCOL §6.5).
+/// Emitted once per note becoming a task, on every creation path. Mirrors
+/// [`task_status_changed_event`]'s actor handling: agent-attributed creations
+/// use an agent actor and carry `agentId`; otherwise the system actor leaves
+/// `agentId` off the payload.
+fn task_created_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    note_title: &str,
+    status: TaskStatus,
+    created_at: &str,
+    agent: Option<(String, Option<String>)>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "noteId": note_id.as_str(),
+        "noteTitle": note_title,
+        "status": status_word(status),
+        "createdAt": created_at,
+    });
+    let actor = match agent {
+        Some((agent_id, name)) => {
+            data["agentId"] = serde_json::json!(agent_id);
+            intent_core::EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id),
+                name,
+                ..Default::default()
+            }
+        }
+        None => system_actor(),
+    };
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_CREATED.to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
+/// Resolve the agent provenance tuple (`id`, display name) an event payload
+/// carries for an attributed caller. `None` stays system-attributed.
+async fn resolve_event_agent(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+) -> Option<(String, Option<String>)> {
+    let agent_id = caller_agent_id?;
+    let name = store.get_agent_session(agent_id).await.ok().map(|s| s.name);
+    Some((agent_id.0.clone(), name))
+}
+
 /// Build a `task:status-changed` change event with the TS-parity payload
 /// `{ noteId, noteTitle, previousStatus, newStatus, changedAt, agentId? }`
 /// (`notes.service.ts`). When the change is agent-attributed (`agent` carries
@@ -7961,6 +8161,7 @@ impl Services {
                             body,
                             TaskStatus::NotStarted,
                             Some(peer_order),
+                            caller_agent_id,
                         )
                         .await?;
                     existing_by_title.insert(normalized, child.id.clone());
@@ -8024,7 +8225,9 @@ impl Services {
 
     /// Create a child task note nested under `parent_id`, marking it a task with
     /// `status` (and optional `peer_order`). Shared by `createPrerequisite` and
-    /// `convertBlocks`.
+    /// `convertBlocks`. `caller_agent_id` attributes the emitted `task:created`
+    /// to the acting agent when the creation is agent-driven.
+    #[allow(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -8033,6 +8236,7 @@ impl Services {
         content: String,
         status: TaskStatus,
         peer_order: Option<i64>,
+        caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
         let now = now_iso();
         let note = Note {
@@ -8066,6 +8270,22 @@ impl Services {
                 &note.title,
                 NOTE_CREATED,
                 "create",
+            ),
+        )
+        .await;
+        // The note is born a task, so the creation also emits `task:created`
+        // (§6.5) — feed/task subscribers see the new task without inferring
+        // task-ness from the `note:created` payload.
+        let agent = resolve_event_agent(&self.store, caller_agent_id).await;
+        publish_event(
+            &self.event_bus,
+            task_created_event(
+                &note.workspace_id,
+                &note.id,
+                &note.title,
+                status,
+                &note.created_at,
+                agent,
             ),
         )
         .await;
@@ -11729,6 +11949,12 @@ impl WorkspaceApi for Services {
             // baseline so the in-memory map does not leak for the daemon's
             // lifetime (and a same-id recreate seeds fresh).
             services.evict_display_status_baseline(&id);
+            // Same for the cached git status: a dirty repo's `files` vec is
+            // unbounded, so the deleted worktree's last scan must not be
+            // retained for the daemon's lifetime (monorepo#1648).
+            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
+                services.git_status_cache.evict(&worktree);
+            }
             // Fast-ack: the client receives `{ success: true }` here while the
             // worktree and workspace-directory cleanup proceeds asynchronously
             // in the background. Bounded latency regardless of checkout size
@@ -14424,6 +14650,7 @@ impl WorkspaceApi for Services {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
         let services = self.clone();
@@ -14433,6 +14660,7 @@ impl WorkspaceApi for Services {
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let now = now_iso();
+            let previous_status = note.metadata.task.as_ref().map(|t| t.status);
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
@@ -14451,8 +14679,73 @@ impl WorkspaceApi for Services {
                     note.metadata.task = Some(task);
                 }
             }
-            note.updated_at = now;
+            note.updated_at = now.clone();
             store.update_note(&note).await?;
+            let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
+            // The note's metadata changed, so subscribers need to refetch it
+            // (§6.5) — without this a task-ness flip is invisible until the
+            // next unrelated note write.
+            publish_event(
+                &services.event_bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            match previous_status {
+                // Only a note that was not already a task is "created" as one.
+                None => {
+                    publish_event(
+                        &services.event_bus,
+                        task_created_event(
+                            &note.workspace_id,
+                            &note.id,
+                            &note.title,
+                            new_status,
+                            &note.updated_at,
+                            agent,
+                        ),
+                    )
+                    .await;
+                }
+                // Re-marking an existing task is a status move, so it takes the
+                // same `task:status-changed` + ready-set recompute pair
+                // `task.updateNoteStatus` publishes.
+                Some(previous) if previous != new_status => {
+                    publish_event(
+                        &services.event_bus,
+                        task_status_changed_event(
+                            &note.workspace_id,
+                            &note.id,
+                            &note.title,
+                            previous,
+                            new_status,
+                            &now,
+                            agent,
+                        ),
+                    )
+                    .await;
+                    let all = store.list_notes(&note.workspace_id).await?;
+                    let ready_task_ids = compute_ready_task_ids(&all);
+                    publish_event(
+                        &services.event_bus,
+                        ready_tasks_changed_event(
+                            &note.workspace_id,
+                            ready_task_ids,
+                            &note.id,
+                            previous,
+                            new_status,
+                            &now_iso(),
+                        ),
+                    )
+                    .await;
+                }
+                Some(_) => {}
+            }
             // Marking a note as a task (or moving its status) can move the
             // derived displayStatus rollup (§6.5).
             services
@@ -14490,6 +14783,7 @@ impl WorkspaceApi for Services {
         title: String,
         content: Option<String>,
         status: Option<String>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
         let services = self.clone();
         Box::pin(async move {
@@ -14514,6 +14808,7 @@ impl WorkspaceApi for Services {
                     content.unwrap_or_default(),
                     task_status,
                     None,
+                    caller_agent_id.as_ref(),
                 )
                 .await?;
             // A fresh spec-child task can move the derived rollup (§6.5),
@@ -15556,11 +15851,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
-        let store = self.store.clone();
+        let svc = self.clone();
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
             // (the TS `getStatus` fallbacks), never an error.
-            let ws = match store.get_workspace(&workspace_id).await {
+            let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
                 Err(e) => return Err(e),
@@ -15574,13 +15869,13 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
-            // Run the libgit2 status scan on the blocking pool so a slow scan
-            // on a big repo cannot stall other RPCs (same runtime-saturation
-            // vector `git_fetch_bounded` closes for `git.fetch`).
+            // The scan runs on the blocking pool under per-worktree
+            // single-flight coalescing, so a slow scan on a big repo neither
+            // stalls other RPCs (the runtime-saturation vector
+            // `git_fetch_bounded` closes for `git.fetch`) nor gets re-walked
+            // once per concurrent caller (monorepo#1648).
             let started = std::time::Instant::now();
-            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
-                .await
-                .map_err(|e| Error::Internal(format!("git.status task failed: {e}")))?;
+            let status = svc.scan_git_status(&path).await;
             if let Ok(s) = &status {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
@@ -15589,7 +15884,7 @@ impl WorkspaceApi for Services {
                     "git.status: working-tree status scan"
                 );
             }
-            status
+            status.map(|s| (*s).clone())
         })
     }
 
@@ -15686,6 +15981,7 @@ impl WorkspaceApi for Services {
         paths: serde_json::Value,
     ) -> BoxFuture<'_, Result<Vec<String>>> {
         let store = self.store.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Reject `.`/`*`/`--all` and parse first (TS `ws.git.stage` order).
             let path_list = git_ops::parse_stage_paths(&paths)?;
@@ -15699,6 +15995,9 @@ impl WorkspaceApi for Services {
                 Error::Internal("Failed to stage files: workspace has no worktree".to_string())
             })?;
             intent_git::stage::stage(&worktree, &path_list)?;
+            // Index moved → the cached scan describes the pre-stage tree
+            // (monorepo#1648).
+            status_cache.invalidate(&worktree);
             Ok(path_list)
         })
     }
@@ -15709,6 +16008,7 @@ impl WorkspaceApi for Services {
         paths: serde_json::Value,
     ) -> BoxFuture<'_, Result<Vec<String>>> {
         let store = self.store.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
             let path_list = git_ops::parse_stage_paths(&paths)?;
@@ -15723,6 +16023,7 @@ impl WorkspaceApi for Services {
             })?;
             // `reset_default` is a no-op on already-unstaged paths → idempotent.
             intent_git::stage::unstage(&worktree, &path_list)?;
+            status_cache.invalidate(&worktree);
             Ok(path_list)
         })
     }
@@ -15733,6 +16034,7 @@ impl WorkspaceApi for Services {
         paths: serde_json::Value,
     ) -> BoxFuture<'_, Result<Vec<String>>> {
         let store = self.store.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
             // top-level string and every array element (closes the array-form
@@ -15755,6 +16057,7 @@ impl WorkspaceApi for Services {
             // Tracked paths → checkout from index; untracked → delete from
             // disk. Idempotent on clean/missing paths (matches reference).
             intent_git::stage::discard(&worktree, &path_list)?;
+            status_cache.invalidate(&worktree);
             Ok(path_list)
         })
     }
@@ -15768,6 +16071,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Wire policy mirrors `git.stage`: every failure surfaces as
             // `-32603`. A missing workspace/worktree stays `Internal`.
@@ -15785,6 +16089,9 @@ impl WorkspaceApi for Services {
             let status_json = locks
                 .with_lock(&worktree, || async {
                     intent_git::stage::stage_hunk(&worktree, &file_path, &hunk_patch)?;
+                    // Tree/index moved under the lock → the cached scan is
+                    // now the pre-mutation snapshot (monorepo#1648).
+                    status_cache.invalidate(&worktree);
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
@@ -15806,6 +16113,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             let ws = store
                 .get_workspace(&workspace_id)
@@ -15819,6 +16127,7 @@ impl WorkspaceApi for Services {
             let status_json = locks
                 .with_lock(&worktree, || async {
                     intent_git::stage::unstage_hunk(&worktree, &file_path, &hunk_patch)?;
+                    status_cache.invalidate(&worktree);
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
@@ -15838,6 +16147,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
         let registry = self.settings_registry.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             let ws = store
                 .get_workspace(&workspace_id)
@@ -15875,6 +16185,9 @@ impl WorkspaceApi for Services {
                         force,
                         token.as_deref(),
                     )?;
+                    // The remote-tracking ref advanced → the cached scan's
+                    // ahead/behind is stale (monorepo#1648).
+                    status_cache.invalidate(&worktree);
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
@@ -15900,6 +16213,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
         let registry = self.settings_registry.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             let ws = store
                 .get_workspace(&workspace_id)
@@ -15928,6 +16242,9 @@ impl WorkspaceApi for Services {
                             )
                         })?;
                     intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())?;
+                    // Remote-tracking refs moved → cached ahead/behind is
+                    // stale (monorepo#1648).
+                    status_cache.invalidate(&worktree);
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
@@ -15948,6 +16265,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
@@ -15962,7 +16280,13 @@ impl WorkspaceApi for Services {
             let name = branch_name.clone();
             locks
                 .with_lock(&worktree, || async {
-                    intent_git::branches::create_branch(&worktree, &name, checkout)
+                    let created = intent_git::branches::create_branch(&worktree, &name, checkout);
+                    if checkout {
+                        // HEAD moved → the cached scan's branch (and diff
+                        // against it) is stale (monorepo#1648).
+                        status_cache.invalidate(&worktree);
+                    }
+                    created
                 })
                 .await?;
             publish_event(&bus, git_branch_event(&ws.id, "create", &branch_name, None)).await;
@@ -15984,6 +16308,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
@@ -15998,7 +16323,10 @@ impl WorkspaceApi for Services {
             let name = branch_name.clone();
             locks
                 .with_lock(&worktree, || async {
-                    intent_git::branches::checkout_branch(&worktree, &name)
+                    let out = intent_git::branches::checkout_branch(&worktree, &name);
+                    // HEAD and the working tree both moved (monorepo#1648).
+                    status_cache.invalidate(&worktree);
+                    out
                 })
                 .await?;
             publish_event(
@@ -16023,6 +16351,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             if old_branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams(
@@ -16054,7 +16383,11 @@ impl WorkspaceApi for Services {
             let new = trimmed_new.clone();
             locks
                 .with_lock(&worktree, || async {
-                    intent_git::branches::rename_branch(&worktree, &old, &new)
+                    let out = intent_git::branches::rename_branch(&worktree, &old, &new);
+                    // Renaming the checked-out branch changes the cached
+                    // scan's `branch` field (monorepo#1648).
+                    status_cache.invalidate(&worktree);
+                    out
                 })
                 .await?;
             publish_event(
@@ -16142,6 +16475,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let event_bus = self.event_bus.clone();
         let registry = self.settings_registry.clone();
+        let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
             // runs *before* the repo is registered, so any existing local git
@@ -16166,6 +16500,13 @@ impl WorkspaceApi for Services {
                 GIT_PULL_TIMEOUT,
             )
             .await?;
+            // Merged commits moved HEAD and possibly the tree
+            // (monorepo#1648). Invalidated regardless of whether a workspace
+            // row resolves below (the cache is worktree-keyed) and regardless
+            // of `outcome.ok`: a pull that fetched successfully and then
+            // failed to rebase or pop its stash has already changed
+            // `origin/<branch>` and possibly the worktree.
+            status_cache.invalidate(std::path::Path::new(&repo_path));
             // Best-effort workspace resolution: `git.pull` is path-scoped (the
             // workspace-create auto-pull runs before the workspace row exists),
             // so we look up any workspace pointing at this worktree and skip
@@ -16297,6 +16638,7 @@ impl WorkspaceApi for Services {
             let op_store = store.clone();
             let event_bus = bus.clone();
             let event_message = message.clone();
+            let status_cache = this.git_status_invalidator();
             with_idempotency(
                 &store,
                 &ws_scope,
@@ -16315,6 +16657,9 @@ impl WorkspaceApi for Services {
                         Error::Internal("Failed to commit: workspace has no worktree".to_string())
                     })?;
                     let outcome = intent_git::commit::commit(&worktree, &message)?;
+                    // Staged content became a commit → the cached scan still
+                    // lists it as pending (monorepo#1648).
+                    status_cache.invalidate(&worktree);
                     // Emissions live inside the idempotency scope so a replayed
                     // commit (same idempotencyKey) returns the cached result
                     // without re-firing events (parity with `workspace:created`
@@ -16450,6 +16795,9 @@ impl WorkspaceApi for Services {
                     linked_note_id.as_ref().map(NoteId::as_str),
                 )?
             };
+            // Staged content became a commit → the cached scan still lists it
+            // as pending (monorepo#1648).
+            this.git_status_cache.invalidate(&worktree);
             if attribution_filtered {
                 // Mirror `ac_commit`: move the committed paths' attribution
                 // rows (staged/unstaged → committed) so the audit trail stays
@@ -16560,12 +16908,12 @@ impl WorkspaceApi for Services {
     }
 
     fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
+        let svc = self.clone();
         Box::pin(async move {
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
             // empty list), but projecting only the working-tree file list.
             let empty = serde_json::json!([]);
-            let ws = match store.get_workspace(&workspace_id).await {
+            let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
@@ -16579,14 +16927,11 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            // libgit2 status on the blocking pool (same as git_status).
-            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
-                .await
-                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
-            match status {
-                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
-                Err(e) => Err(e),
-            }
+            // The same working-tree scan `git.status` pays, so it goes through
+            // the shared per-worktree single-flight (monorepo#1648): a burst
+            // mixing `git.changes` with `git.status` walks the tree once.
+            let status = svc.scan_git_status(&path).await?;
+            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
         })
     }
 
@@ -17386,7 +17731,8 @@ impl WorkspaceApi for Services {
                     self.agent_validate_edit_target_op(&agent_id, &message_id)
                         .await?;
                     if let Some(model_id) = model {
-                        self.agent_set_model_op(agent_id.clone(), model_id).await?;
+                        self.agent_set_model_op(agent_id.clone(), model_id, None)
+                            .await?;
                     }
                     let truncated_count =
                         self.agent_edit_truncate_op(&agent_id, &message_id).await?;
@@ -17502,8 +17848,12 @@ impl WorkspaceApi for Services {
         _workspace_id: WorkspaceId,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.agent_set_model_op(agent_id, model_id).await })
+        Box::pin(async move {
+            self.agent_set_model_op(agent_id, model_id, provider_id)
+                .await
+        })
     }
 
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -17876,6 +18226,14 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_snapshot_op(workspace_id, agent_id).await })
+    }
+
     fn agent_cancel_subscriptions(
         &self,
         workspace_id: WorkspaceId,
@@ -18176,91 +18534,40 @@ impl WorkspaceApi for Services {
                 .mergeable_state
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            let merge_blocked_reason =
-                pr_ops::merge_blocked_reason(state, pr.mergeable, &mergeable_state);
 
-            // Check runs on the PR head (SHA, else source branch). Providers
-            // without check-run support — or a PR whose head cannot be
-            // determined — report an empty tally rather than failing the
-            // whole snapshot.
-            let head_ref = pr
-                .head_sha
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
-            let (check_summary, failed_names) = match &head_ref {
-                Some(git_ref) if sc.capabilities().check_runs => {
-                    let runs = sc
-                        .check_runs(&repo_ref, git_ref)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                    (
-                        pr_ops::summarize_check_runs(&runs),
-                        pr_ops::failed_check_names(&runs),
-                    )
-                }
-                _ => (pr_ops::summarize_check_runs(&[]), Vec::new()),
-            };
-
-            // `list_reviews` and `review_decision` are independent reads;
-            // run them concurrently so the extra `reviewDecision` GraphQL
-            // round-trip doesn't add serial latency to every snapshot (this
-            // handler backs hook polling).
-            let (reviews, review_decision_result) = tokio::join!(
-                sc.list_reviews(&repo_ref, pr_number),
-                sc.review_decision(&repo_ref, pr_number)
-            );
-            let reviews = reviews.map_err(pr_ops::map_sc_err)?;
-            let agg = pr_ops::aggregate_reviews(&reviews);
-            // The forge's authoritative review-requirement verdict (GraphQL
-            // `reviewDecision` on GitHub). A fetch error degrades to `None`
-            // (aggregate-derived decision) rather than failing the snapshot.
-            let provider_decision = review_decision_result
-                .inspect_err(|e| {
-                    tracing::debug!(
-                        error = %e,
-                        pr_number,
-                        "pr.snapshot: review_decision fetch failed, falling back to aggregate"
-                    );
-                })
-                .ok()
-                .flatten();
-            let decision = pr_ops::snapshot_review_decision(&agg, state, provider_decision);
-
-            let conversation = sc
-                .list_comments(&repo_ref, pr_number)
-                .await
-                .map_err(pr_ops::map_sc_err)?;
-            let conversation_count = conversation.len() as i64;
-            // Inline review comments: threads via GraphQL when available,
-            // falling back to the flat REST list grouped by reply parent (the
-            // same fallback as `pr.listReviewComments`). Resolution state is
-            // unavailable on the fallback path, so every fallback thread
-            // counts as unresolved — the fallback is logged at `warn` with the
-            // underlying error so that degradation is visible at the default
-            // log level instead of silently inflating the unresolved count.
-            let threads = match pr_ops::fetch_all_pages(|p| {
-                sc.get_review_threads(&repo_ref, pr_number, p)
-            })
-            .await
-            {
-                Ok((threads, _, _)) => threads,
+            // The one-shot read composes EXACTLY the checklist the PR monitor
+            // works with, so `ws.pr.snapshot`, monitor wakes and
+            // `prMonitor.list` summaries all describe a PR with the same
+            // object — this registers nothing and triggers no monitoring.
+            // Every forge sub-read inside degrades on its own.
+            let (requirements, review_comment_count) =
+                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
+            let unresolved_thread_count = requirements.threads.unresolved;
+            // The conversation-comment count is not part of the checklist; a
+            // failing read reports zero rather than failing the snapshot.
+            let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
+                Ok(comments) => comments.len() as i64,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         pr_number,
-                        "pr.snapshot: get_review_threads fetch failed, falling back to REST comments (thread resolution state unavailable, unresolvedThreadCount may be inflated)"
+                        "pr.snapshot: conversation comments unavailable, reporting zero"
                     );
-                    let (comments, _, _) = pr_ops::fetch_all_pages(|p| {
-                        sc.list_review_comments(&repo_ref, pr_number, p)
-                    })
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                    pr_ops::fallback_threads(comments)
+                    0
                 }
             };
-            let (review_comment_count, unresolved_thread_count) =
-                pr_ops::count_thread_comments(&threads);
+            // The pre-existing compact blocks stay stable for callers that
+            // already read them, but are projected off the checklist rather
+            // than computed a second time. `checks.failedNames` lists every
+            // failing check, in rollup order; `requirements.checks
+            // .failingRequired` narrows it to the required ones.
+            let failed_names: Vec<&str> = requirements
+                .checks
+                .items
+                .iter()
+                .filter(|c| c.status == "failed")
+                .map(|c| c.name.as_str())
+                .collect();
 
             Ok(serde_json::json!({
                 "repo": repo_slug,
@@ -18275,18 +18582,18 @@ impl WorkspaceApi for Services {
                 "updatedAt": pr.updated_at,
                 "mergeable": pr.mergeable,
                 "mergeableState": mergeable_state,
-                "mergeBlockedReason": merge_blocked_reason,
+                "mergeBlockedReason": requirements.merge_blocked_reason,
                 "checks": {
-                    "total": check_summary.total,
-                    "passed": check_summary.passed,
-                    "failed": check_summary.failed,
-                    "pending": check_summary.pending,
+                    "total": requirements.checks.total,
+                    "passed": requirements.checks.passed,
+                    "failed": requirements.checks.failed,
+                    "pending": requirements.checks.pending,
                     "failedNames": failed_names,
                 },
                 "reviews": {
-                    "decision": decision,
-                    "approvals": agg.approval_count,
-                    "changesRequested": agg.changes_requested_count,
+                    "decision": requirements.approvals.decision,
+                    "approvals": requirements.approvals.have,
+                    "changesRequested": requirements.approvals.changes_requested,
                 },
                 "comments": {
                     "conversationCount": conversation_count,
@@ -18294,6 +18601,10 @@ impl WorkspaceApi for Services {
                     "unresolvedThreadCount": unresolved_thread_count,
                     "totalCount": conversation_count + review_comment_count,
                 },
+                // The merge-requirements checklist: the same object
+                // `ws.pr.monitor` returns and monitor wakes / list summaries
+                // carry.
+                "requirements": requirements,
             }))
         })
     }
@@ -19996,6 +20307,68 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.hook_run_now_op(&workspace_id, &hook_id).await })
     }
+
+    /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
+    fn pr_monitor_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+                .await
+        })
+    }
+
+    /// `ws.pr.unmonitor`: cancel the caller's own monitor on a PR.
+    fn pr_monitor_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        pr_number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
+                .await
+        })
+    }
+
+    /// `ws.pr.monitors` / `prMonitor.list`: monitors for one agent or the
+    /// whole workspace.
+    fn pr_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
+                .await
+        })
+    }
+
+    /// `prMonitor.cancel`: the FE cancel path (notifies the owning agent).
+    fn pr_monitor_cancel_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: intent_core::PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
+                .await
+        })
+    }
+
+    /// `prMonitor.flush`: emit the pending debounced changes immediately.
+    fn pr_monitor_flush_pending(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: intent_core::PrMonitorId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.pr_monitor_flush_op(&workspace_id, &monitor_id).await })
+    }
 }
 
 /// Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
@@ -20095,14 +20468,26 @@ impl Services {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
         match git_ops::worktree_path(&ws) {
-            // `build_git_status_value` runs a full status scan plus a bounded
-            // history walk (libgit2); run it on the blocking pool so a slow
-            // scan on a big repo cannot stall other RPCs.
-            Some(worktree) => tokio::task::spawn_blocking(move || {
-                accept_changes::build_git_status_value(&worktree, &ws)
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("accept-changes.getStatus task failed: {e}")))?,
+            Some(worktree) => {
+                // The working-tree scan is the cost `git.status` also pays, so
+                // take it through the shared per-worktree single-flight
+                // (monorepo#1648) and hand the result to the builder. The
+                // remaining libgit2 work (remote/trunk resolve, ahead/behind,
+                // bounded history walk) still runs per call, on the blocking
+                // pool so a slow repo cannot stall other RPCs.
+                let scanned = if worktree.join(".git").exists() {
+                    Some(self.scan_git_status(&worktree).await?)
+                } else {
+                    None
+                };
+                tokio::task::spawn_blocking(move || {
+                    accept_changes::build_git_status_value_with(&worktree, &ws, scanned)
+                })
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
+                })?
+            }
             None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }
@@ -20178,22 +20563,37 @@ impl Services {
         let locks = self.worktree_locks.clone();
         locks
             .with_lock(&worktree, || async {
-                self.ac_run_pipeline(
-                    &workspace_id,
-                    &worktree,
-                    &branch,
-                    action,
-                    files,
-                    commit_message,
-                    pr_title,
-                    pr_body,
-                    target_branch,
-                    stage_unstaged,
-                    push_after,
-                    create_pr_after,
-                    extras,
-                )
-                .await
+                let outcome = self
+                    .ac_run_pipeline(
+                        &workspace_id,
+                        &worktree,
+                        &branch,
+                        action,
+                        files,
+                        commit_message,
+                        pr_title,
+                        pr_body,
+                        target_branch,
+                        stage_unstaged,
+                        push_after,
+                        create_pr_after,
+                        extras,
+                    )
+                    .await;
+                // A failing pipeline short-circuits *after* earlier steps may
+                // already have mutated the worktree (staged then failed to
+                // commit, committed then failed to push), and it never reaches
+                // `ac_emit_after_mutation` (monorepo#1648). Invalidate on every
+                // non-success outcome so the next read rescans rather than
+                // serving the pre-mutation snapshot until the TTL.
+                let succeeded = matches!(
+                    &outcome,
+                    Ok(v) if v.get("success").and_then(|s| s.as_bool()) == Some(true)
+                );
+                if !succeeded {
+                    self.git_status_cache.invalidate(&worktree);
+                }
+                outcome
             })
             .await
     }
@@ -20630,6 +21030,9 @@ impl Services {
             ws.branch.clone()
         };
         intent_git::remote::add_origin(&worktree, trimmed, &desired)?;
+        // Gaining `origin` (and possibly an init + branch rename) changes what
+        // a scan reports (monorepo#1648).
+        self.git_status_cache.invalidate(&worktree);
 
         let status = accept_changes::build_git_status_value(&worktree, &ws)?;
         publish_event(
@@ -21390,7 +21793,18 @@ impl Services {
         .await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
-            if let Ok(status) = accept_changes::build_git_status_value(worktree, &ws) {
+            // The step just mutated the worktree, so the cached scan is the
+            // pre-mutation snapshot (monorepo#1648). Discard it and let this
+            // recompute's scan repopulate it, so the reads that follow an
+            // accept-changes step land on a warm, current entry.
+            self.git_status_cache.invalidate(worktree);
+            let scanned = if worktree.join(".git").exists() {
+                self.scan_git_status(worktree).await.ok()
+            } else {
+                None
+            };
+            if let Ok(status) = accept_changes::build_git_status_value_with(worktree, &ws, scanned)
+            {
                 publish_event(
                     &self.event_bus,
                     changes_git_status_event(workspace_id, status),

@@ -395,3 +395,58 @@ pub struct ScCapabilities {
     pub check_runs: bool,
     pub issues: bool,
 }
+
+/// One entry of the forge's status-check rollup for a pull request, carrying
+/// the per-check "is this required to merge?" flag GitHub only exposes through
+/// GraphQL (`statusCheckRollup.contexts` → `isRequired(pullRequestNumber:)`).
+/// Both check-runs and legacy commit statuses collapse onto this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollupCheck {
+    pub name: String,
+    pub state: CheckState,
+    /// Whether the host reports this check as required for merging. `false`
+    /// when the host says so *and* when the signal is unavailable — callers
+    /// that need the distinction consult [`MergeRequirementSignals`].
+    pub is_required: bool,
+    pub url: Option<String>,
+}
+
+/// Merge-relevant branch rules for a pull request's base branch (GitHub
+/// `GET /repos/{owner}/{repo}/rules/branches/{branch}`). Every field is
+/// optional/empty when the host does not report that rule; an unreadable rules
+/// endpoint yields no [`BranchRules`] at all rather than an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchRules {
+    /// Approvals the base branch requires before merging.
+    pub required_approving_review_count: Option<u32>,
+    /// Whether every review thread must be resolved before merging.
+    pub required_conversation_resolution: Option<bool>,
+    /// Names of the status checks the base branch requires.
+    pub required_status_checks: Vec<String>,
+}
+
+/// Per-PR merge-requirement signals a host can report beyond the plain
+/// [`PullRequest`] snapshot. Hosts without the signals return
+/// [`crate::Error::Unsupported`]; individual fields degrade to `None`/empty
+/// when a sub-read is unavailable rather than failing the whole probe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirementSignals {
+    /// Raw forge merge-state status (GitHub GraphQL `mergeStateStatus`:
+    /// `CLEAN`/`BLOCKED`/`BEHIND`/`DIRTY`/`UNSTABLE`/`DRAFT`/`HAS_HOOKS`/
+    /// `UNKNOWN`). Finer-grained than REST `mergeable_state`.
+    pub merge_state_status: Option<String>,
+    /// The forge's authoritative review verdict, same value the standalone
+    /// [`crate::SourceControl::review_decision`] read returns.
+    pub review_decision: Option<ReviewDecision>,
+    /// The PR head's status-check rollup, with per-check `isRequired`.
+    pub checks: Vec<RollupCheck>,
+    /// Whether the rollup's `isRequired` flags are trustworthy — `false` when
+    /// the host did not report the rollup at all.
+    pub checks_known: bool,
+    /// Base-branch rules, or `None` when they are unreadable (missing scope,
+    /// unsupported endpoint) — a degraded but non-fatal probe.
+    pub branch_rules: Option<BranchRules>,
+}

@@ -956,6 +956,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
         Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
     }
+    // Rehydrate active PR monitors (`ws.pr.monitor`) so watches resume after a
+    // restart; monitors whose owning agent is gone are cancelled. Each resumed
+    // monitor is marked for catch-up, so its first poll delivers any change
+    // detected across the downtime immediately (no debounce). Best-effort: a
+    // failure is logged but never aborts startup.
+    match services.rehydrate_pr_monitors().await {
+        Ok(0) => {}
+        Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
+        Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
+    }
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
@@ -980,6 +990,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
+    // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
+    // pollSeconds` (read live, floor 10s), poll each active monitor, diff it
+    // against its persisted baseline, and deliver one consolidated wake once
+    // the PR has been quiet for the debounce window. Safe when source control
+    // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
+    let pr_monitor_loop = services.spawn_pr_monitor_loop();
     // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
@@ -1041,7 +1057,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
-    let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
+    let git_status_refresher = Arc::new(GitStatusRefresher::start(
+        bus.clone(),
+        api.clone(),
+        services.git_status_cache(),
+    ));
     // Slow initializations run in the background so the listeners below bind —
     // and `system.status` answers — without waiting on them (monorepo#1581):
     // enabled MCP servers (started serially, each handshake up to a multi-second
@@ -1354,6 +1374,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
     control.stop_ws_listener().await;
     pr_refresh.abort();
+    pr_monitor_loop.abort();
     token_usage_scan.abort();
     completion_delivery.abort();
     auto_commit_loop.abort();

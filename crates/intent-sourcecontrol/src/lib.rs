@@ -24,10 +24,11 @@ pub use device_flow::{DeviceAuthorization, DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
-    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
-    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams,
-    PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Review, ReviewComment,
-    ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, ScCapabilities, UserIdentity,
+    AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
+    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
+    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
@@ -145,6 +146,24 @@ pub trait SourceControl: Send + Sync {
         _number: u64,
     ) -> Result<Option<ReviewDecision>> {
         Ok(None)
+    }
+
+    /// Per-PR merge-requirement signals beyond the plain [`PullRequest`]
+    /// snapshot: the host's merge-state status, its authoritative review
+    /// decision, the head's status-check rollup with per-check
+    /// "required to merge" flags, and the base branch's merge rules.
+    ///
+    /// Sub-reads degrade individually — unreadable branch rules yield
+    /// `branch_rules: None`, a missing rollup yields `checks_known: false` —
+    /// so a partially-visible forge still produces a usable probe. Hosts
+    /// without the signals return [`Error::Unsupported`] (the default
+    /// implementation).
+    async fn merge_requirements(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+    ) -> Result<MergeRequirementSignals> {
+        Err(Error::Unsupported("merge requirements probe".to_string()))
     }
 
     /// List issue/PR (conversation) comments.

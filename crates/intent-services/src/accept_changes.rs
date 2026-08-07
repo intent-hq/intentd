@@ -168,6 +168,18 @@ fn existing_pr_value(ws: &Workspace) -> Option<Value> {
 /// is the `trunk..HEAD` first-parent range with attribution; `existingPR` reflects
 /// the workspace's linked-PR snapshot.
 pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<Value> {
+    build_git_status_value_with(worktree, ws, None)
+}
+
+/// [`build_git_status_value`] with an optional pre-computed working-tree
+/// status, so callers that already paid (or coalesced onto) a
+/// [`intent_git::status::status`] scan do not run a second one. `None` scans
+/// inline.
+pub(crate) fn build_git_status_value_with(
+    worktree: &Path,
+    ws: &Workspace,
+    scanned: Option<std::sync::Arc<intent_core::GitStatus>>,
+) -> Result<Value> {
     let trunk = trunk_branch(ws);
 
     // No git dir → the minimal status (branch from the workspace, zeros).
@@ -176,8 +188,16 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
     }
 
     let started = std::time::Instant::now();
-    let status = intent_git::status::status(worktree)?;
-    let status_ms = started.elapsed().as_millis() as u64;
+    // `status_ms` only attributes a scan this call actually ran; with an
+    // injected status the scan was paid by (or shared with) another caller's
+    // flight, so it logs as absent rather than a misleading ~0.
+    let (status, status_ms) = match scanned {
+        Some(s) => (s, None),
+        None => {
+            let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
+            (s, Some(started.elapsed().as_millis() as u64))
+        }
+    };
     let branch = if status.branch.is_empty() {
         ws.branch.clone()
     } else {

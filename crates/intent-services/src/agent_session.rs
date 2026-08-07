@@ -932,7 +932,7 @@ fn version_bearing_display<'a>(candidates: impl IntoIterator<Item = &'a str>) ->
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
 /// use other mechanisms — codex moved to the first-turn prepend fallback because
-/// the pinned codex-acp adapter (1.1.7) ignores `_meta.developerInstructions`,
+/// the pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`,
 /// #479).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
@@ -2529,6 +2529,7 @@ impl Services {
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
         };
         if !rate_delta.is_zero() {
             for (bucket, part) in
