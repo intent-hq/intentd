@@ -269,14 +269,16 @@ impl Services {
     /// - `blocked` — a top-level pending `blocker` attention request.
     /// - `needs_attention` — a top-level pending non-blocker attention
     ///   request (`discussion`), pending structured questions
-    ///   ([`Services::question_hold_active`]), or the workspace `attention`
-    ///   flag at `review_required`.
+    ///   ([`Services::question_hold_active`] — pending until answered or
+    ///   dismissed, so a question the user walked away from keeps the
+    ///   workspace flagged across the agent's later turns and daemon
+    ///   restarts), or the workspace `attention` flag at `review_required`.
     /// - `unread` — the workspace `attention` flag at `unread`.
     ///
     /// Child/background sessions never count — their attention surface is
     /// the parent/subscriber (attention-retire taxonomy). The cheap metadata
-    /// checks run over every candidate first, so transcript tail reads only
-    /// happen when `needs_attention` is still undecided. Best-effort: a
+    /// checks run over every candidate first, so the per-session hold reads
+    /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
     /// (and `question_hold_active` fails open itself) so list/get emission
     /// is never wedged; the flag-derived signals need no store read.
@@ -1350,7 +1352,8 @@ mod workspace_needs_attention {
     async fn superseded_or_dismissed_questions_are_false() {
         let (svc, ws, _tmp) = setup().await;
 
-        // A user reply after the question row supersedes the hold.
+        // Pre-upgrade session (no pending-questions marker): the legacy
+        // tail-walk fallback still reads a trailing user reply as resolving.
         let answered = mk_session(&ws, "agent-answered");
         svc.store.insert_agent_session(&answered).await.unwrap();
         svc.store
@@ -2313,9 +2316,11 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
-    /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
-    /// the persisted user row supersedes the pending question tail
-    /// (store-only `agent.sendMessage` path) and emits the demotion.
+    /// Question-resolution trigger (§6.5 step 0): only the ANSWER — a user
+    /// row tagged `question_answers` for the marked question message — clears
+    /// the pending-questions marker and emits the demotion (store-only
+    /// `agent.sendMessage` path). A PLAIN user message leaves the Q&A pending,
+    /// so the workspace stays `needs_attention` and nothing emits.
     #[tokio::test]
     async fn user_answer_retires_question_hold_and_emits() {
         let h = harness().await;
@@ -2324,7 +2329,8 @@ mod display_status_events {
             .insert_agent_session(&session)
             .await
             .expect("session");
-        h.store
+        let asked = h
+            .store
             .append_agent_message(
                 &session.id,
                 "assistant",
@@ -2333,9 +2339,29 @@ mod display_status_events {
             )
             .await
             .expect("append question");
+        h.services
+            .record_pending_questions_marker(&h.ws, &session.id, &asked.id)
+            .await;
         h.services.maybe_emit_display_status_changed(&h.ws).await;
 
         let mut sub = subscribe(&h);
+        h.services
+            .agent_send_message_op(
+                session.id.clone(),
+                "unrelated aside".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("send plain message");
+        assert!(
+            h.services.question_hold_active(&session.id).await,
+            "a plain user message must not resolve the pending Q&A"
+        );
+        assert_silent(&mut sub).await;
+
         h.services
             .agent_send_message_op(
                 session.id.clone(),
@@ -2343,7 +2369,10 @@ mod display_status_events {
                 None,
                 None,
                 None,
-                None,
+                Some(json!({
+                    "type": "question_answers",
+                    "answeredQuestionsMessageId": asked.id,
+                })),
             )
             .await
             .expect("send answer");

@@ -2025,6 +2025,21 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
+/// Metadata key under which the pending-questions marker is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// assistant message whose trailing question resource blocks are still
+/// awaiting an answer. Written at turn end when the persisted assistant tail
+/// bears question blocks (a newer question-bearing turn overwrites it —
+/// single-slot), and cleared (written as the empty string, which reads back as
+/// absent) when the answer for that exact message id persists or the
+/// transcript is truncated by `agent.editAndRegenerate`. Stored-on-write so
+/// the hold derivation stays a bounded metadata read and pendingness survives
+/// later user messages, agent turns, and daemon restarts. No schema migration
+/// — the marker rides the existing free-form `metadata` column. Read back by
+/// [`AgentSession::pending_questions_message_id`] /
+/// [`AgentSession::pending_questions_marker_written`].
+pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -2035,13 +2050,14 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately (a user
-/// message supersedes any pending Q&A). Everything else (MCP front-door
-/// sends, reportToParent / completion-watch / event-subscription wakes,
+/// user-originated entry point — which always delivers immediately; it
+/// bypasses the hold but does NOT release it (only an answer-tagged row or
+/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
+/// reportToParent / completion-watch / event-subscription wakes,
 /// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
 /// `Automatic` and is held in the queue while the target agent's question
 /// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than dismissing a pending Q&A.
+/// fail closed (held) rather than burying a pending Q&A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
     /// FE-originated `agent.sendMessage` (typed message or wizard answers):
@@ -2236,6 +2252,37 @@ impl AgentSession {
             .and_then(|m| m.get(DISMISSED_QUESTIONS_MESSAGE_ID_KEY))
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
+    }
+
+    /// The pending-questions marker persisted under
+    /// [`PENDING_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
+    /// `metadata`: `Some` only when the metadata is an object carrying a
+    /// non-empty string under that key. The question-hold derivation reads it
+    /// directly (no transcript walk) — a set marker that differs from
+    /// [`AgentSession::dismissed_questions_message_id`] means questions are
+    /// still pending. Cleared markers are written as the empty string, which
+    /// reads back as `None` here while
+    /// [`AgentSession::pending_questions_marker_written`] stays `true`.
+    pub fn pending_questions_message_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_QUESTIONS_MESSAGE_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// `true` when the pending-questions marker key is PRESENT in the
+    /// session's metadata at all (set or cleared-to-empty). Distinguishes a
+    /// session the marker-based derivation has already written (an empty
+    /// marker authoritatively means "nothing pending") from a pre-upgrade
+    /// session that never saw a marker write, where the hold derivation must
+    /// fall back to the transcript tail walk so a live hold is not lost
+    /// across the upgrade.
+    pub fn pending_questions_marker_written(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_QUESTIONS_MESSAGE_ID_KEY))
+            .is_some_and(serde_json::Value::is_string)
     }
 
     /// The per-conversation seen marker persisted under
