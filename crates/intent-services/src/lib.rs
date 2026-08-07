@@ -4415,8 +4415,8 @@ impl Services {
             None => {
                 // Question hold (PROTOCOL §5.5): parent wakes are automatic —
                 // an active hold parks the wake in the queue instead of
-                // appending the user row that would supersede the pending
-                // Q&A (mirrors the manager path's `send_message` gate).
+                // appending a user row that would bury the pending Q&A
+                // (mirrors the manager path's `send_message` gate).
                 if self.question_hold_active(&parent_agent_id).await {
                     let (queued, position) = self.enqueue_message(
                         &parent_agent_id,
@@ -11928,84 +11928,119 @@ impl WorkspaceApi for Services {
             ws.archived_at = Some(now.clone());
             ws.updated_at = now;
             store.update_workspace(&ws).await?;
-            // Gracefully interrupt every in-flight turn in the workspace —
-            // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
-            // turn cancelled over the wire, draining worker aborted, terminal
-            // `agent:stream:end` emitted, provider child + ACP session kept
-            // alive. Unlike `delete_workspace` nothing is deleted: session
-            // rows, transcripts, completion watches, and pending message
-            // queues all survive so unarchive can resume work. Runs AFTER the
-            // archived row is persisted so any concurrent queue-drain kick
-            // observes the archived flag and parks instead of respawning a
-            // turn (see the archived gate in `try_drain_queue`).
-            //
-            // Residual race (deliberate trade-off): a drain that read the
-            // workspace row BEFORE the persist above can still claim the
-            // in-flight slot after the `list_busy` snapshot below, spawning
-            // one stray turn in the freshly archived workspace that this
-            // sweep misses. The window is a few statements wide and the
-            // failure is benign — that turn runs to completion once and every
-            // subsequent drain/wake parks behind the archived gates — so the
-            // sweep accepts it rather than adding a post-claim re-check to
-            // the hot drain path.
-            //
-            // The initiating agent (`caller_agent_id`, set on the agent-facing
-            // `ws.workspace.archive` host — the MCP front door and the
-            // background-hook runtime, which builds the same host for the
-            // hook owner; the JSON-RPC front door passes `None`) is excluded.
-            // On the MCP path the caller is necessarily mid-turn — blocked
-            // awaiting this very tool call — so interrupting it aborts the
-            // worker that owns the in-flight MCP dispatch: the tool result
-            // never reaches the child, the turn never settles, and the busy
-            // slot leaks (workspace activity stays `agent_running`). The
-            // caller's turn ends normally once the tool result is delivered.
-            // On the hook path the "caller" is the hook owner, which may have
-            // an independent in-flight turn that this sweep now skips; that
-            // turn runs to completion in the freshly archived workspace and
-            // every subsequent drain/wake parks behind the archived gates —
-            // the same benign-runaway trade-off as the residual race above.
-            if let Some(manager) = manager {
-                for (agent_id, agent_ws) in manager.list_busy() {
-                    if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
-                        manager.interrupt(&agent_id).await;
+            // Everything below the persist runs on a DETACHED task
+            // (intent-hq/monorepo#1577): the sweeps can cancel this very
+            // caller. A background hook whose script calls
+            // `ws.workspace.archive()` is itself swept by
+            // `cancel_workspace_hooks` below, which aborts the hook's
+            // scheduler task — i.e. the task awaiting this future. Inline,
+            // that abort dropped the rest of the tail mid-flight and the
+            // §6.5 `workspace:updated` delta was never published, leaving
+            // clients stale on an archived workspace. Spawning detaches the
+            // tail's lifetime from the caller's: aborting the caller only
+            // drops the `JoinHandle` (never the task), so the sweeps, the
+            // derived fields, and the emit always complete. On the hook path
+            // the abort means `archive()` never returns to the script, which
+            // stops running for good — the hook is `cancelled` by the sweep
+            // like any other hook in the workspace.
+            let id_for_log = id.clone();
+            let tail = tokio::spawn(async move {
+                let mut ws = ws;
+                // Gracefully interrupt every in-flight turn in the workspace —
+                // the `agent.stop` keep-alive semantics (`AgentManager::interrupt`):
+                // turn cancelled over the wire, draining worker aborted, terminal
+                // `agent:stream:end` emitted, provider child + ACP session kept
+                // alive. Unlike `delete_workspace` nothing is deleted: session
+                // rows, transcripts, completion watches, and pending message
+                // queues all survive so unarchive can resume work. Runs AFTER the
+                // archived row is persisted so any concurrent queue-drain kick
+                // observes the archived flag and parks instead of respawning a
+                // turn (see the archived gate in `try_drain_queue`).
+                //
+                // Residual race (deliberate trade-off): a drain that read the
+                // workspace row BEFORE the persist above can still claim the
+                // in-flight slot after the `list_busy` snapshot below, spawning
+                // one stray turn in the freshly archived workspace that this
+                // sweep misses. The window is a few statements wide and the
+                // failure is benign — that turn runs to completion once and every
+                // subsequent drain/wake parks behind the archived gates — so the
+                // sweep accepts it rather than adding a post-claim re-check to
+                // the hot drain path.
+                //
+                // The initiating agent (`caller_agent_id`, set on the agent-facing
+                // `ws.workspace.archive` host — the MCP front door and the
+                // background-hook runtime, which builds the same host for the
+                // hook owner; the JSON-RPC front door passes `None`) is excluded.
+                // On the MCP path the caller is necessarily mid-turn — blocked
+                // awaiting this very tool call — so interrupting it aborts the
+                // worker that owns the in-flight MCP dispatch: the tool result
+                // never reaches the child, the turn never settles, and the busy
+                // slot leaks (workspace activity stays `agent_running`). The
+                // caller's turn ends normally once the tool result is delivered.
+                // On the hook path the "caller" is the hook owner, which may have
+                // an independent in-flight turn that this sweep now skips; that
+                // turn runs to completion in the freshly archived workspace and
+                // every subsequent drain/wake parks behind the archived gates —
+                // the same benign-runaway trade-off as the residual race above.
+                if let Some(manager) = manager {
+                    for (agent_id, agent_ws) in manager.list_busy() {
+                        if agent_ws == id && Some(&agent_id) != caller_agent_id.as_ref() {
+                            manager.interrupt(&agent_id).await;
+                        }
                     }
                 }
-            }
-            // Cancel every active background hook in the workspace: task
-            // aborted, state persisted to `cancelled`, `hook:cancelled`
-            // emitted, owner woken with a notice. Unarchive does NOT
-            // resurrect cancelled hooks — the notice tells the owner to
-            // reschedule if the condition still matters. Runs AFTER the
-            // archived row is persisted so the cancel wakes park behind the
-            // archived gate in `deliver_wake_message` (queued at most, no
-            // turn spawned) — the same reason the interrupt sweep above
-            // runs post-persist.
-            this.cancel_workspace_hooks(&id).await;
-            // Derive `lastActivity` (§9.1) so archive callers get the
-            // authoritative wire shape without a follow-up `workspace.get`.
-            this.derive_last_activity(&mut ws).await;
-            // Derive `activity` from live agent state (§9.9) so the mutation
-            // response carries `agent_running` when agents are in-flight,
-            // not the stale default `idle` from the persisted row.
-            ws.activity = this.workspace_activity(&ws.id);
-            // §6.5 has no `workspace:archived`; mirror the reference emitter and
-            // publish `workspace:updated` with the full applied delta
-            // (`archived`/`status`/`archivedAt`) so subscribers flip state
-            // without a re-read. `archivedAt` is the same timestamp persisted
-            // on the row above.
-            publish_event(
-                &bus,
-                workspace_updated_event(
-                    &ws.id,
-                    serde_json::json!({
-                        "archived": true,
-                        "status": ws.status,
-                        "archivedAt": ws.archived_at,
-                    }),
-                ),
-            )
-            .await;
-            Ok(ws)
+                // Cancel every active background hook in the workspace: task
+                // aborted, state persisted to `cancelled`, `hook:cancelled`
+                // emitted, owner woken with a notice. Unarchive does NOT
+                // resurrect cancelled hooks — the notice tells the owner to
+                // reschedule if the condition still matters. Runs AFTER the
+                // archived row is persisted so the cancel wakes park behind the
+                // archived gate in `deliver_wake_message` (queued at most, no
+                // turn spawned) — the same reason the interrupt sweep above
+                // runs post-persist.
+                this.cancel_workspace_hooks(&id).await;
+                // Derive `lastActivity` (§9.1) so archive callers get the
+                // authoritative wire shape without a follow-up `workspace.get`.
+                this.derive_last_activity(&mut ws).await;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the persisted row.
+                ws.activity = this.workspace_activity(&ws.id);
+                // §6.5 has no `workspace:archived`; mirror the reference emitter and
+                // publish `workspace:updated` with the full applied delta
+                // (`archived`/`status`/`archivedAt`) so subscribers flip state
+                // without a re-read. `archivedAt` is the same timestamp persisted
+                // on the row above.
+                publish_event(
+                    &bus,
+                    workspace_updated_event(
+                        &ws.id,
+                        serde_json::json!({
+                            "archived": true,
+                            "status": ws.status,
+                            "archivedAt": ws.archived_at,
+                        }),
+                    ),
+                )
+                .await;
+                ws
+            });
+            // Awaiting the handle keeps the caller-visible contract intact
+            // (the archived workspace is returned only after the tail ran);
+            // a cancelled caller simply drops this await while the detached
+            // tail runs on. A `JoinError` means the tail itself panicked —
+            // the row is already archived, so surface it rather than
+            // reporting a bogus success shape.
+            tail.await.map_err(|e| {
+                // The `JoinError` text names no workspace, so log the id —
+                // otherwise a panicked tail is undiagnosable from daemon logs.
+                tracing::error!(
+                    workspace = %id_for_log.as_str(),
+                    error = %e,
+                    "workspace.archive: post-persist tail task failed; row is archived"
+                );
+                Error::Internal(format!("archive tail task failed: {e}"))
+            })
         })
     }
 
@@ -17189,10 +17224,10 @@ impl WorkspaceApi for Services {
                 }
                 None => {
                     // Question hold (PROTOCOL §5.5): the store-only fallback
-                    // must honor the automatic-delivery gate too — persisting
-                    // the row would supersede the pending Q&A. User-originated
-                    // sends pass through (a user answer/typed message is the
-                    // documented hold release).
+                    // must honor the automatic-delivery gate too — the row it
+                    // persists would bury the pending Q&A. User-originated
+                    // sends pass through (never held; only an answer-tagged
+                    // row or `agent.dismissQuestions` releases the hold).
                     if !origin.is_user() && self.question_hold_active(&agent_id).await {
                         self.require_agent_session(&agent_id).await?;
                         let (queued, position) = self.enqueue_message(

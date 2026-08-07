@@ -2472,6 +2472,27 @@ impl Store {
         row.as_ref().map(map_message_row).transpose()
     }
 
+    /// One message of an agent's log by row id, hydrated as a single row —
+    /// the pending-questions marker resolver (PROTOCOL §5.5). One statement
+    /// over the primary key, at most ONE decoded message regardless of
+    /// transcript size. `None` when the id is unknown or belongs to a
+    /// different agent.
+    pub async fn get_agent_message_by_id(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<AgentMessage>> {
+        let sql =
+            format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .bind(message_id)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent message by id failed: {e}")))?;
+        row.as_ref().map(map_message_row).transpose()
+    }
+
     /// Number of live delegated children of `parent_agent_id`: sessions
     /// carrying this `parent_agent_id` whose status is still non-terminal
     /// (not `Completed`/`error`/`deleted`). Deliberately UNSCOPED by

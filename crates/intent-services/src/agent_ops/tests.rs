@@ -6188,6 +6188,63 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
     assert_eq!(queue["queue"][0]["fileBlocks"], file_blocks);
 }
 
+/// The auto-queue fallback must preserve `message_metadata` too: an answer
+/// queued after a failed append keeps its `question_answers` tag, so the later
+/// drain persist can still clear the pending-questions marker instead of
+/// wedging the hold forever.
+#[tokio::test]
+async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AnswerQueue").await;
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    assert!(svc.question_hold_active(&id).await, "hold armed");
+
+    svc.agent_send_message_op(
+        id.clone(),
+        "first".into(),
+        Some("dup-id".into()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first send");
+    let metadata = answer_metadata(&asked_id);
+    let r = svc
+        .agent_send_message_op(
+            id.clone(),
+            "Q: x\nA: y".into(),
+            Some("dup-id".into()),
+            None,
+            None,
+            Some(metadata.clone()),
+        )
+        .await
+        .expect("send");
+    assert_eq!(r["queued"], true);
+    assert_eq!(r["queuedMessage"]["messageMetadata"], metadata);
+    assert!(
+        svc.question_hold_active(&id).await,
+        "hold stays until the queued answer actually persists"
+    );
+
+    let queued_id = r["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued id")
+        .to_string();
+    svc.agent_send_queued_message_now_op(id.clone(), queued_id)
+        .await
+        .expect("drain queued answer");
+    assert!(
+        !svc.question_hold_active(&id).await,
+        "the drained answer must clear the hold"
+    );
+}
+
 /// STAB-133: `agent_send_message_op` must persist FE-supplied image and file
 /// blocks into the transcript row (after the text block) so the conversation
 /// view can render them.
@@ -18669,13 +18726,22 @@ fn question_blocks() -> serde_json::Value {
     ])
 }
 
+/// Pre-upgrade fallback coverage: these rows are appended straight through the
+/// store, so the session never gets a pending-questions marker and
+/// `question_hold_active` exercises the legacy transcript tail walk (the
+/// upgrade path that keeps a live hold from being lost). A hold derived that
+/// way is MATERIALIZED as a marker on the spot, so the very next plain user
+/// row cannot make it disappear — the tail walk alone would stop seeing the
+/// question behind that row.
 #[tokio::test]
-async fn question_hold_derivation_pending_superseded_dismissed_reask() {
+async fn question_hold_tail_fallback_materializes_marker_and_survives_user_row() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
 
-    // Empty transcript → no hold.
+    // Empty transcript → no hold, and nothing materialized.
     assert!(!svc.question_hold_active(&id).await);
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(!session.pending_questions_marker_written());
 
     // Plain assistant message (no question blocks) → no hold.
     svc.store()
@@ -18689,38 +18755,41 @@ async fn question_hold_derivation_pending_superseded_dismissed_reask() {
         .expect("append plain");
     assert!(!svc.question_hold_active(&id).await);
 
-    // Trailing question resource blocks on the LAST assistant message → hold.
+    // Trailing question resource blocks on the LAST assistant message → hold,
+    // materialized as the pending-questions marker.
     let asked = svc
         .store()
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
     assert!(svc.question_hold_active(&id).await);
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked.id.as_str()),
+        "the tail-walk hold must be materialized as a marker"
+    );
+
+    // A later plain user row must NOT drop the hold: the marker outlives it,
+    // where the bare tail walk would have stopped seeing the question.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "unrelated chatter" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "a materialized legacy hold must survive a plain user row"
+    );
 
     // Dismissal marker naming that message releases the hold.
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
         .await
         .expect("dismiss");
-    assert!(!svc.question_hold_active(&id).await);
-
-    // Re-ask: a NEW question message (different id) re-arms the hold — the
-    // stale marker does not suppress it.
-    svc.store()
-        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
-        .await
-        .expect("append re-ask");
-    assert!(svc.question_hold_active(&id).await);
-
-    // A later user message supersedes the questions → hold flips false.
-    svc.store()
-        .append_agent_message(
-            &id,
-            "user",
-            &json!([{ "type": "text", "text": "answers" }]),
-            &now_iso(),
-        )
-        .await
-        .expect("append user");
     assert!(!svc.question_hold_active(&id).await);
 }
 
@@ -18738,10 +18807,11 @@ async fn question_hold_survives_trailing_system_row() {
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
-    assert!(svc.question_hold_active(&id).await, "hold armed");
 
     // A system marker lands after the question message (the resume path's
-    // interruption notice) — hold must remain active.
+    // interruption notice) — the tail walk must page past it. The hold is
+    // derived for the first time here, so the walk (not a marker) is what
+    // answers.
     svc.store()
         .append_agent_message(
             &id,
@@ -18760,20 +18830,21 @@ async fn question_hold_survives_trailing_system_row() {
         "trailing system row must not defeat the hold"
     );
 
-    // A later USER message still supersedes the questions even past the
-    // system row.
-    svc.store()
-        .append_agent_message(
-            &id,
-            "user",
-            &json!([{ "type": "text", "text": "answers" }]),
-            &now_iso(),
-        )
+    // An explicit dismissal past the system row still releases it.
+    let asked = svc
+        .store()
+        .get_agent_session(&id)
         .await
-        .expect("append user");
+        .expect("session")
+        .pending_questions_message_id()
+        .expect("materialized marker")
+        .to_string();
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked)
+        .await
+        .expect("dismiss");
     assert!(
         !svc.question_hold_active(&id).await,
-        "user message past the system row must supersede"
+        "dismissal past the system row must release the hold"
     );
 }
 
@@ -18786,14 +18857,16 @@ async fn question_hold_survives_many_trailing_system_rows() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
 
-    svc.store()
+    let asked = svc
+        .store()
         .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
         .await
         .expect("append question");
-    assert!(svc.question_hold_active(&id).await, "hold armed");
 
     // Pile up more system rows than the original fixed 10-row tail so a
-    // naive small-window derivation would miss the question underneath.
+    // naive small-window derivation would miss the question underneath. The
+    // hold is derived for the first time after they land, so the paging walk
+    // (not a marker) is what answers.
     for i in 0..25 {
         svc.store()
             .append_agent_message(
@@ -18814,20 +18887,13 @@ async fn question_hold_survives_many_trailing_system_rows() {
         "hold must survive 25 trailing system rows"
     );
 
-    // A later user message still supersedes the questions past all the
-    // system rows.
-    svc.store()
-        .append_agent_message(
-            &id,
-            "user",
-            &json!([{ "type": "text", "text": "answers" }]),
-            &now_iso(),
-        )
+    // An explicit dismissal past all the system rows still releases it.
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
         .await
-        .expect("append user");
+        .expect("dismiss");
     assert!(
         !svc.question_hold_active(&id).await,
-        "user message past many system rows must supersede"
+        "dismissal past many system rows must release the hold"
     );
 }
 
@@ -19027,6 +19093,272 @@ async fn dismiss_questions_fails_closed() {
         svc.agent_dismiss_questions_op(ws, id, oversized).await,
         Err(Error::InvalidParams(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Persisted pending-questions marker (PROTOCOL §5.5, question hold)
+// ---------------------------------------------------------------------------
+
+/// A `question_answers` `messageMetadata` tag naming `answered`.
+fn answer_metadata(answered: &str) -> serde_json::Value {
+    json!({ "type": "question_answers", "answeredQuestionsMessageId": answered })
+}
+
+/// The marker is written on a question-bearing append, is OVERWRITTEN (not
+/// appended to) by a newer question set, and survives an intervening plain
+/// user row and a question-free assistant turn — the whole point of the
+/// stored-on-write derivation.
+#[tokio::test]
+async fn pending_marker_written_overwritten_and_survives_later_rows() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str())
+    );
+    assert!(svc.question_hold_active(&id).await, "hold armed by marker");
+
+    // A plain (untagged) user row does NOT resolve the questions.
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".to_string(),
+        json!([{ "type": "text", "text": "unrelated chatter" }]),
+        None,
+    )
+    .await
+    .expect("append plain user");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "a plain user row must not release the hold"
+    );
+
+    // A question-FREE assistant turn does not clear the marker either.
+    svc.agent_append_message_op(
+        id.clone(),
+        "assistant".to_string(),
+        json!([{ "type": "text", "text": "still thinking" }]),
+        None,
+    )
+    .await
+    .expect("append plain assistant");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "question-free turn end must not clear the marker"
+    );
+
+    // A NEWER question set overwrites the marker (single slot).
+    let reask = svc
+        .agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append re-ask");
+    let reask_id = reask["message"]["id"].as_str().expect("id").to_string();
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(reask_id.as_str()),
+        "newer question set supersedes the older marker"
+    );
+    assert!(svc.question_hold_active(&id).await);
+}
+
+/// A user row tagged `question_answers` for EXACTLY the marked message clears
+/// the marker (releasing the hold); a stale/foreign `answeredQuestionsMessageId`
+/// is a no-op.
+#[tokio::test]
+async fn pending_marker_cleared_by_matching_answer_only() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+
+    // Stale answer id → no-op, hold stays armed.
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".to_string(),
+        json!([{ "type": "text", "text": "Q: x\nA: y" }]),
+        Some(answer_metadata("some-other-message")),
+    )
+    .await
+    .expect("append stale answer");
+    assert!(
+        svc.question_hold_active(&id).await,
+        "a stale answer id must not release the hold"
+    );
+
+    // Matching answer id → marker cleared, hold released. The marker key stays
+    // present (as the empty string) so the tail-walk fallback stays off.
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".to_string(),
+        json!([{ "type": "text", "text": "Q: x\nA: y" }]),
+        Some(answer_metadata(&asked_id)),
+    )
+    .await
+    .expect("append answer");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
+    assert!(session.pending_questions_marker_written());
+    assert!(!svc.question_hold_active(&id).await);
+}
+
+/// `agent.dismissQuestions` neutralizes the marker without clearing it: the
+/// derivation compares the two markers, so dismissing the marked message
+/// releases the hold while a LATER question set re-arms it.
+#[tokio::test]
+async fn dismissal_neutralizes_pending_marker() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    assert!(svc.question_hold_active(&id).await);
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_id.clone())
+        .await
+        .expect("dismiss");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "dismissal neutralizes rather than clears the pending marker"
+    );
+    assert!(!svc.question_hold_active(&id).await);
+
+    // A newer question set re-arms the hold past the stale dismissal.
+    svc.agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append re-ask");
+    assert!(svc.question_hold_active(&id).await);
+}
+
+/// `agent.editAndRegenerate` truncation re-mints row ids, so the marker is
+/// re-derived from the post-truncation transcript instead of being left
+/// dangling (which would wedge the hold forever).
+#[tokio::test]
+async fn edit_truncate_reconciles_pending_marker() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".to_string(),
+        json!([{ "type": "text", "text": "first" }]),
+        None,
+    )
+    .await
+    .expect("append first user");
+    svc.agent_append_message_op(id.clone(), "assistant".to_string(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let target = svc
+        .agent_append_message_op(
+            id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "second" }]),
+            None,
+        )
+        .await
+        .expect("append second user");
+    let target_id = target["message"]["id"].as_str().expect("id").to_string();
+    assert!(svc.question_hold_active(&id).await, "hold armed");
+
+    // Truncating at the LAST user row keeps the question message, so the
+    // re-derived marker names its new (re-minted) id and the hold stays armed.
+    svc.agent_edit_truncate_op(&id, &target_id)
+        .await
+        .expect("truncate");
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let question_id = messages.last().expect("question row").id.clone();
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(question_id.as_str()),
+        "marker re-derived against the re-minted row id"
+    );
+    assert!(svc.question_hold_active(&id).await);
+
+    // Truncating past the question row drops it: the marker clears and the
+    // hold releases (never a dangling marker).
+    let first_id = messages.first().expect("first row").id.clone();
+    svc.agent_edit_truncate_op(&id, &first_id)
+        .await
+        .expect("truncate to empty");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
+    assert!(!svc.question_hold_active(&id).await);
+}
+
+/// Re-derivation answer matching: a tag naming a row still present in the
+/// post-swap transcript is a LIVE foreign reference — it answers that other
+/// question set, so it must not release the newer pending one. A tag naming a
+/// row the swap dropped/re-minted is dangling and does resolve the question
+/// above it (ids are re-minted by every swap, so equality alone would never
+/// match).
+#[tokio::test]
+async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "assistant", "contentBlocks": question_blocks() },
+            { "role": "assistant", "contentBlocks": question_blocks() },
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "Q: x\nA: y" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+    let messages = svc
+        .store()
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let (q0, q1) = (messages[0].id.clone(), messages[1].id.clone());
+
+    // Live foreign reference (answers Q0 while Q1 is newer) → hold stays.
+    let mut rows = messages.clone();
+    rows[2].metadata = Some(answer_metadata(&q0));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(q1.as_str()),
+        "an answer naming a still-present OTHER question set must not release the newer one"
+    );
+    assert!(svc.question_hold_active(&id).await);
+
+    // Dangling reference (the swap re-minted ids) → resolves Q1.
+    rows[2].metadata = Some(answer_metadata("dropped-by-the-swap"));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
+    assert!(!svc.question_hold_active(&id).await);
+
+    // Exact match → resolves Q1 too.
+    rows[2].metadata = Some(answer_metadata(&q1));
+    svc.reconcile_pending_questions_marker(&ws, &id, &rows)
+        .await;
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.pending_questions_message_id(), None);
 }
 
 // -------------------------------------------------------------------------
@@ -19649,7 +19981,8 @@ async fn arm_question_hold(svc: &Services, id: &AgentId) {
 
 /// Store-only `agent_send_message` (Automatic origin) is held: no user row is
 /// appended, the message parks in the queue with `heldForQuestions: true`.
-/// A User-origin send passes through and releases the hold (superseded).
+/// A User-origin send passes through, but an UNTAGGED one leaves the hold
+/// armed — only a `question_answers` tag (or a dismissal) retires it.
 #[tokio::test]
 async fn hold_gates_store_only_automatic_send_but_not_user_send() {
     let (_t, svc, ws) = setup().await;
@@ -19683,12 +20016,13 @@ async fn hold_gates_store_only_automatic_send_but_not_user_send() {
     );
     assert_eq!(svc.queue_snapshot(&id).len(), 1, "message parked in queue");
 
-    // User origin passes through — the answer supersedes the questions.
+    // User origin passes through, but an untagged row does not resolve the
+    // questions — that is the persistence this contract adds.
     let r = svc
         .agent_send_message(
             ws.clone(),
             id.clone(),
-            "user answer".into(),
+            "unrelated chatter".into(),
             None,
             None,
             None,
@@ -19703,8 +20037,8 @@ async fn hold_gates_store_only_automatic_send_but_not_user_send() {
         .expect("user send succeeds");
     assert_eq!(r["queued"], json!(false), "user send is never held");
     assert!(
-        !svc.question_hold_active(&id).await,
-        "user row supersedes the questions"
+        svc.question_hold_active(&id).await,
+        "an untagged user row must not supersede the questions"
     );
 }
 

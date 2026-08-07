@@ -1648,6 +1648,10 @@ impl Services {
         // count as activity for the streak accounting too.
         let idle_timeout_streamed =
             prompt_idle_timeout && (any_update_received || !blocks.is_empty());
+        // Whether this turn's persisted content carries question resource
+        // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
+        // `blocks`, used for the pending-questions marker write below.
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -1662,12 +1666,23 @@ impl Services {
             self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
         }
-        // The new assistant tail moves the question-hold derivation (§6.5
-        // step 0): a trailing question resource block RAISES the workspace's
-        // needs_attention displayStatus; a question-free tail after a prior
-        // question message RETIRES it. Recompute-and-compare (transition-only
-        // emission inside) so steady-state question-free turns stay silent.
-        if message_persisted {
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
+        // hold): a question-bearing assistant tail arms the hold under this
+        // turn's message id (a newer question set overwrites an older marker
+        // — single-slot). A question-FREE turn end deliberately does NOT
+        // clear the marker: pendingness survives the agent's later turns
+        // until the user answers or dismisses.
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
+        }
+        // A question-bearing tail arms the marker above and so RAISES the
+        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare. A question-FREE tail no longer moves the
+        // derivation at all — pendingness now survives the agent's later
+        // turns — so those turn ends skip the workspace-wide probe entirely
+        // instead of relying on the dedup cache to stay silent.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -1701,6 +1716,12 @@ impl Services {
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
             let turn_duration = turn_started.elapsed();
+            // Capture the turn-end wall clock next to the duration so the two
+            // stay consistent: the bookkeeping task below may queue behind a
+            // predecessor before it records, and a later clock read would push
+            // both the hourly bucket and the per-minute spread window past the
+            // real turn end.
+            let turn_end = time::OffsetDateTime::now_utc();
             let turn_usage = turn_usage.take();
             let prev = self
                 .turn_bookkeeping
@@ -1717,6 +1738,7 @@ impl Services {
                         &workspace_id_task,
                         turn_usage.as_ref(),
                         turn_duration,
+                        turn_end,
                         run_completed,
                     )
                     .await;
@@ -1976,6 +1998,7 @@ impl Services {
         }
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -2001,9 +2024,16 @@ impl Services {
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
-        // Same §6.5 step-0 recompute as the prompt-turn persist: the new
-        // assistant tail moves the question-hold derivation either way.
-        if message_persisted {
+        // Same stored-on-write pending-questions marker as the prompt-turn
+        // persist: a question-bearing wake tail arms the hold (question-free
+        // tails leave the marker untouched).
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
+        }
+        // Same §6.5 step-0 recompute as the prompt-turn persist: only a
+        // question-bearing tail moves the question-hold derivation.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         self.clear_live_turn(agent_id);
@@ -2176,6 +2206,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         usage: Option<&session::Usage>,
         turn_duration: std::time::Duration,
+        turn_end: time::OffsetDateTime,
         run_completed: bool,
     ) {
         if usage.is_none() && !run_completed {
@@ -2214,7 +2245,11 @@ impl Services {
             },
             ..Default::default()
         };
-        let now = time::OffsetDateTime::now_utc();
+        // `turn_end` is captured at the same instant as `turn_duration` at the
+        // call site, before this task is spawned/awaited — reading the clock
+        // here instead would drift the hourly bucket and the per-minute spread
+        // window past the real turn end by however long the bookkeeping queued.
+        let now = turn_end;
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike
@@ -2235,9 +2270,11 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
-        // Same clamped per-turn delta, folded into the per-minute rate
-        // history behind `stats.getRateHistory` (§5.39). All-zero deltas are
-        // skipped — they add nothing and would only churn the capped table.
+        // Same clamped per-turn delta, spread evenly across every per-minute
+        // bucket the turn spanned in `stats.getRateHistory` (§5.39) so a
+        // multi-minute turn reads as a plateau rather than a lone end-minute
+        // spike. All-zero deltas (and all-zero split parts) are skipped — they
+        // add nothing and would only churn the capped table.
         let rate_delta = intent_store::UsageRateDelta {
             input_tokens: tokens.input_tokens,
             output_tokens: tokens.output_tokens,
@@ -2245,9 +2282,15 @@ impl Services {
             cache_creation_tokens: tokens.cache_creation_tokens,
         };
         if !rate_delta.is_zero() {
-            let minute = crate::usage_rate::minute_bucket_utc(now);
-            if let Err(e) = self.store.add_usage_rate(&minute, &rate_delta).await {
-                tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+            for (bucket, part) in
+                crate::usage_rate::split_delta_across_minutes(now, turn_duration, &rate_delta)
+            {
+                if part.is_zero() {
+                    continue;
+                }
+                if let Err(e) = self.store.add_usage_rate(&bucket, &part).await {
+                    tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+                }
             }
         }
     }

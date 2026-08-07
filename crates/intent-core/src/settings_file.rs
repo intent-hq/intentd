@@ -90,6 +90,11 @@ pub struct ModelSettings {
     pub default: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
+    /// `model.defaultReasoningEffort` — fallback reasoning effort for new
+    /// agents. Stored as-is (providers own the vocabulary); a blank value
+    /// reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
@@ -696,6 +701,17 @@ where
     deserializer.deserialize_any(V)
 }
 
+/// Normalize a blank optional string to `None`, so a key left as `""` in the
+/// file (or cleared with an empty string over the wire) reads as unset rather
+/// than as an explicit empty value.
+fn de_blank_as_none<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
+}
+
 /// Dotted wire paths that older daemons persisted in `config.toml` but that
 /// have since moved back to the SQLite `settings` table or been removed from
 /// the product entirely. A file containing one of these still parses via
@@ -922,6 +938,9 @@ paths = {}
 # default = "claude-sonnet-4-5"
 # Provider default models -- default model per provider.
 providerDefaults = {}
+# Default reasoning effort -- fallback reasoning effort for new agents; the
+# value is provider-defined and stored as-is, and a blank value means unset.
+# defaultReasoningEffort = "high"
 
 [backgroundAgents]
 # Background default model -- model for background agents.
@@ -1149,6 +1168,7 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.background_agents.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
@@ -1538,6 +1558,41 @@ mod tests {
             }))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn model_default_reasoning_effort_parses_as_an_optional_string() {
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"m0\"\ndefaultReasoningEffort = \"xhigh\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+
+        // Stored as-is: the daemon never normalizes the provider vocabulary.
+        let parsed = SettingsFile::parse_str("[model]\ndefaultReasoningEffort = \"Medium\"\n")
+            .expect("parse");
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("Medium")
+        );
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_reasoning_effort, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty effort.
+        for text in [
+            "[model]\ndefaultReasoningEffort = \"\"\n",
+            "[model]\ndefaultReasoningEffort = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_reasoning_effort, None, "{text}");
+        }
     }
 
     #[test]

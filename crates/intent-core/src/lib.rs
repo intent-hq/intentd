@@ -53,6 +53,7 @@ pub use model::MessageOrigin;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
+pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{chief_workspace, is_chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};

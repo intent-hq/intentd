@@ -770,6 +770,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(json!({})),
         ),
         string(
+            "model.defaultReasoningEffort",
+            "Default reasoning effort",
+            "Fallback reasoning effort for new agents (provider-defined value, stored as-is; blank means unset)",
+            "providers",
+            None,
+        ),
+        string(
             "backgroundAgents.defaultModel",
             "Background default model",
             "Model for background agents",
@@ -2661,6 +2668,109 @@ mod tests {
             store.get_setting(path).await.expect("read settings table"),
             None,
             "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Reset restores the unset default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `model.defaultReasoningEffort` is a TOML-backed optional string (no
+    /// default — unset means no global effort preference), stored as-is under
+    /// `[model]`; it round-trips through `settings.update` / `settings.reset`
+    /// to config.toml (never SQLite), and a blank string clears it to unset.
+    #[tokio::test]
+    async fn model_default_reasoning_effort_is_a_toml_backed_optional_string() {
+        let path = "model.defaultReasoningEffort";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "providers");
+        assert_eq!(def.default_value, None);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-effort-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-effort-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Unset by default with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        // A stored level persists verbatim to config.toml, never SQLite.
+        svc.update(&json!([{ "path": path, "value": "xhigh" }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!("xhigh"));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("defaultReasoningEffort"), "{text}");
+        assert!(text.contains("xhigh"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // A fresh registry over the same file reads the value back (round-trip).
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(reloaded.get(path), Some(json!("xhigh")));
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .effective
+                .model
+                .default_reasoning_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+
+        // An empty string clears it back to unset: the effective value is
+        // `None` and the wire value reads `null`, so no client (and no future
+        // resolution step) ever observes an explicit empty effort.
+        svc.update(&json!([{ "path": path, "value": "" }]))
+            .await
+            .expect("clear with empty string");
+        let got = svc.get(path).await.expect("get after clear");
+        assert_eq!(
+            got["value"],
+            serde_json::Value::Null,
+            "an empty string must read as unset"
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .model
+                .default_reasoning_effort
+                .as_deref(),
+            None,
+            "an empty string must read as unset"
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.get(path),
+            Some(serde_json::Value::Null),
+            "a blank value in the file must read as unset"
         );
 
         // Reset restores the unset default.

@@ -2152,6 +2152,132 @@ mod tests {
         assert!(text.contains("cancelled"), "{text}");
     }
 
+    /// Persisted `workspace:updated` archive deltas for a workspace,
+    /// oldest-first: only the events whose `changes` carry `archived: true`.
+    /// Event persistence is asynchronous relative to the store writes tests
+    /// gate on, so callers poll.
+    async fn archive_delta_events(svc: &Services, ws: &WorkspaceId) -> Vec<Value> {
+        let mut evs = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![intent_core::events::WORKSPACE_UPDATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:updated events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data)
+            .filter(|d| d["changes"]["archived"] == json!(true))
+            .collect()
+    }
+
+    /// Regression (intent-hq/monorepo#1577): a hook script calling
+    /// `ws.workspace.archive()` is itself swept by the archive's own hook
+    /// cancellation, so the post-persist tail — sweeps, derived fields, and
+    /// the §6.5 `workspace:updated` emit — must survive the caller's
+    /// cancellation. Contract pinned here: the workspace is archived, the
+    /// archive delta is published exactly once, and BOTH the initiating hook
+    /// and an unrelated bystander hook end `cancelled` (the initiator does
+    /// not keep polling an archived workspace, and its `archive()` call never
+    /// returns to the script).
+    #[tokio::test]
+    async fn hook_initiated_archive_publishes_the_archive_delta() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // An unrelated active hook: the sweep must still cancel it.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "bystander",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule bystander");
+        let bystander: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+
+        // The archiving hook polls a note: the schedule-time validation run
+        // sees "wait" and continues, then flipping the note and driving a
+        // `runNow` makes the scheduled run archive the workspace.
+        let mut probe = note(&ws, "archive-gate", "wait");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "archiver",
+                    "code": "const n = await ws.note.read('archive-gate'); \
+                             if (n.content.includes('go')) { \
+                               await ws.workspace.archive(); \
+                             } \
+                             return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule archiver");
+        let archiver: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(archiver.state, HookState::Scheduled);
+        probe.content = "go".to_string();
+        svc.store().update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &archiver.hook_id)
+            .await
+            .expect("runNow");
+
+        // The archive lands in the store...
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        loop {
+            let row = svc.store().get_workspace(&ws).await.expect("get workspace");
+            if row.archived {
+                assert_eq!(row.status, WorkspaceStatus::Archived);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hook-initiated archive never persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // ...and the §6.5 delta is published exactly once, in full.
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deltas = loop {
+            let deltas = archive_delta_events(&svc, &ws).await;
+            if !deltas.is_empty() {
+                break deltas;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hook-initiated archive published no workspace:updated delta"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(deltas.len(), 1, "exactly one archive delta: {deltas:?}");
+        let changes = &deltas[0]["changes"];
+        assert_eq!(changes["status"], json!("Archived"), "{changes}");
+        assert!(
+            changes["archivedAt"].is_string(),
+            "delta carries archivedAt: {changes}"
+        );
+
+        // Both hooks end cancelled: the sweep terminalizes the bystander and
+        // the initiator alike, so neither keeps polling an archived
+        // workspace.
+        for (label, id) in [
+            ("bystander", &bystander.hook_id),
+            ("archiver", &archiver.hook_id),
+        ] {
+            let hook = wait_for_hook(&svc, id, |h| h.state == HookState::Cancelled).await;
+            assert!(hook.next_run_at.is_none(), "{label} has no nextRunAt");
+            assert!(!svc.hook_task_alive(id), "{label} task aborted");
+        }
+    }
+
     /// `workspace.delete` aborts the workspace's live hook scheduler tasks
     /// EAGERLY — the task is gone the moment delete returns, not lazily at
     /// its next tick — and the store cascade drops the row.
