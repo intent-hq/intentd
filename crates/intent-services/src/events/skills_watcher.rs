@@ -12,7 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{events::SKILLS_CHANGED, now_iso, ActorType, EventActor, WorkspaceId};
@@ -23,14 +23,21 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::root_watch::{watch_root, RootWatch};
+use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
+///
+/// The four user tiers keep a [`RootWatch`] each — they are shared once per
+/// daemon, so they do not scale with the workspace count. The three project
+/// tiers per workspace no longer own streams at all: they ride the shared
+/// workspace-root stream via [`watch_tiers`].
 pub struct SkillsWatcher {
+    hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
-    workspace_watchers: Mutex<HashMap<WorkspaceId, Vec<RootWatch>>>,
+    workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
     raw_tx: mpsc::UnboundedSender<SkillsMsg>,
     task: JoinHandle<()>,
 }
@@ -44,7 +51,11 @@ impl Drop for SkillsWatcher {
 impl SkillsWatcher {
     /// Start watching skills directories for all workspaces.
     /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
-    pub fn start(bus: EventBus, workspaces: Vec<(WorkspaceId, PathBuf)>) -> Self {
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
+        bus: EventBus,
+        workspaces: Vec<(WorkspaceId, PathBuf)>,
+    ) -> Self {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
@@ -55,17 +66,18 @@ impl SkillsWatcher {
         }
 
         // Start project-tier watchers (per-workspace)
-        let mut workspace_watchers: HashMap<WorkspaceId, Vec<RootWatch>> = HashMap::new();
+        let mut workspace_watchers: HashMap<WorkspaceId, TierWatch> = HashMap::new();
         for (ws_id, ws_path) in &workspaces {
             workspace_watchers.insert(
                 ws_id.clone(),
-                start_project_watchers(ws_id, ws_path, &raw_tx),
+                start_project_watch(hub, ws_id, ws_path, &raw_tx),
             );
         }
 
         let task = tokio::spawn(debounce_loop(bus, workspaces, raw_rx));
 
         Self {
+            hub: Arc::clone(hub),
             _user_watchers: user_watchers,
             workspace_watchers: Mutex::new(workspace_watchers),
             raw_tx,
@@ -81,31 +93,21 @@ impl SkillsWatcher {
         let _ = self
             .raw_tx
             .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
-        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
-            map.insert(workspace_id, watchers);
+            map.insert(workspace_id, watch);
         }
     }
 
-    /// Await every registered root watch actually being established. Watch
+    /// Await every user-tier root watch actually being established. Their
     /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating the watched directories.
+    /// tests must wait for it before mutating those directories. Project tiers
+    /// ride the shared stream and need no separate sync point — subscribing is
+    /// synchronous bookkeeping.
     #[cfg(test)]
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let all_up = self
-                .workspace_watchers
-                .lock()
-                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
-                .unwrap_or(true);
-            if all_up || tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -142,28 +144,33 @@ impl SkillsWatcher {
             workspace_id.clone(),
             workspace_path.clone(),
         ));
-        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
-            map.insert(workspace_id, watchers);
+            map.insert(workspace_id, watch);
         }
     }
 }
 
-/// Watch the project-tier skill roots of one workspace.
-fn start_project_watchers(
+/// Watch all three project-tier skill roots of one workspace over the shared
+/// workspace-root stream — one subscription, no streams of its own (previously
+/// three [`RootWatch`]es, each its own stream even when the tier was missing).
+fn start_project_watch(
+    hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
     raw_tx: &mpsc::UnboundedSender<SkillsMsg>,
-) -> Vec<RootWatch> {
-    let mut watchers = Vec::new();
-    for root in get_project_skill_roots(workspace_path) {
-        watchers.push(watch_directory(
-            root,
-            Some(workspace_id.clone()),
-            raw_tx.clone(),
-        ));
-    }
-    watchers
+) -> TierWatch {
+    let ws_id = workspace_id.clone();
+    let tx = raw_tx.clone();
+    watch_tiers(
+        hub,
+        workspace_path,
+        PROJECT_SKILL_TIERS,
+        is_skill_md,
+        move || {
+            let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
+        },
+    )
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -226,13 +233,8 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn get_project_skill_roots(workspace_path: &Path) -> Vec<PathBuf> {
-    vec![
-        workspace_path.join(".agents").join("skills"),
-        workspace_path.join(".intent").join("skills"),
-        workspace_path.join(".augment").join("skills"),
-    ]
-}
+/// Project-tier skill roots, relative to the workspace root.
+const PROJECT_SKILL_TIERS: &[&str] = &[".agents/skills", ".intent/skills", ".augment/skills"];
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -513,7 +515,7 @@ mod tests {
         // 250ms -> 500ms so the runtime registration + its OS watch establish
         // before the SKILL.md is created, which under nextest's oversubscribed
         // parallelism a 250ms warm-up can lose.
-        let watcher = SkillsWatcher::start(bus.clone(), vec![]);
+        let watcher = SkillsWatcher::start(&SharedWatchHub::new(), bus.clone(), vec![]);
         watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -572,7 +574,11 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
         std::fs::write(skill_dir.join("SKILL.md"), skill_md("seed-skill")).expect("seed skill");
 
-        let watcher = SkillsWatcher::start(bus.clone(), vec![(ws_id.clone(), ws.path.clone())]);
+        let watcher = SkillsWatcher::start(
+            &SharedWatchHub::new(),
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Suspend, then add a skill and let an unrelated reader refresh the

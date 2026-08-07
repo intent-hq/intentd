@@ -322,7 +322,7 @@ fn event_matches(event: &notify::Event, root: &Path, filename_matches: fn(&Path)
 /// longer exists (deletions cannot be stat'ed — `rm -rf` of a tier dir may
 /// surface only directory paths). Existing non-matching files stay filtered
 /// out.
-fn directory_level(path: &Path) -> bool {
+pub(super) fn directory_level(path: &Path) -> bool {
     match path.symlink_metadata() {
         Ok(meta) => meta.is_dir(),
         Err(_) => true,
