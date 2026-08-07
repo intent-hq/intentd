@@ -16,7 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{events::SPECIALISTS_CHANGED, now_iso, ActorType, EventActor, WorkspaceId};
@@ -27,15 +27,22 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::root_watch::{watch_root, RootWatch};
+use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 use crate::specialists::SpecialistsService;
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Holds watchers for all specialist directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
+///
+/// The user tier keeps a [`RootWatch`] — it is shared once per daemon, so it
+/// does not scale with the workspace count. The project tier per workspace no
+/// longer owns a stream at all: it rides the shared workspace-root stream via
+/// [`watch_tiers`].
 pub struct SpecialistsWatcher {
+    hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
-    workspace_watchers: Mutex<HashMap<WorkspaceId, Vec<RootWatch>>>,
+    workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
     raw_tx: mpsc::UnboundedSender<SpecialistsMsg>,
     task: JoinHandle<()>,
 }
@@ -49,13 +56,18 @@ impl Drop for SpecialistsWatcher {
 impl SpecialistsWatcher {
     /// Start watching specialist directories for all workspaces.
     /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
-    pub fn start(bus: EventBus, workspaces: Vec<(WorkspaceId, PathBuf)>) -> Self {
-        Self::start_with_user_dir(bus, workspaces, default_user_dir())
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
+        bus: EventBus,
+        workspaces: Vec<(WorkspaceId, PathBuf)>,
+    ) -> Self {
+        Self::start_with_user_dir(hub, bus, workspaces, default_user_dir())
     }
 
     /// Like [`Self::start`] but with an explicit user-tier root (tests inject a
     /// temp dir for hermetic coverage; production passes the default).
     fn start_with_user_dir(
+        hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         workspaces: Vec<(WorkspaceId, PathBuf)>,
         user_dir: Option<PathBuf>,
@@ -69,17 +81,18 @@ impl SpecialistsWatcher {
         }
 
         // Start project-tier watchers (per-workspace)
-        let mut workspace_watchers: HashMap<WorkspaceId, Vec<RootWatch>> = HashMap::new();
+        let mut workspace_watchers: HashMap<WorkspaceId, TierWatch> = HashMap::new();
         for (ws_id, ws_path) in &workspaces {
             workspace_watchers.insert(
                 ws_id.clone(),
-                start_project_watchers(ws_id, ws_path, &raw_tx),
+                start_project_watch(hub, ws_id, ws_path, &raw_tx),
             );
         }
 
         let task = tokio::spawn(debounce_loop(bus, workspaces, user_dir, raw_rx));
 
         Self {
+            hub: Arc::clone(hub),
             _user_watchers: user_watchers,
             workspace_watchers: Mutex::new(workspace_watchers),
             raw_tx,
@@ -96,31 +109,21 @@ impl SpecialistsWatcher {
             workspace_id.clone(),
             workspace_path.clone(),
         ));
-        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
-            map.insert(workspace_id, watchers);
+            map.insert(workspace_id, watch);
         }
     }
 
-    /// Await every registered root watch actually being established. Watch
+    /// Await the user-tier root watch actually being established. Its
     /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating the watched directories.
+    /// tests must wait for it before mutating that directory. The project tier
+    /// rides the shared stream and needs no separate sync point — subscribing is
+    /// synchronous bookkeeping.
     #[cfg(test)]
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let all_up = self
-                .workspace_watchers
-                .lock()
-                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
-                .unwrap_or(true);
-            if all_up || tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -159,25 +162,27 @@ impl SpecialistsWatcher {
             workspace_id.clone(),
             workspace_path.clone(),
         ));
-        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
-            map.insert(workspace_id, watchers);
+            map.insert(workspace_id, watch);
         }
     }
 }
 
-/// Watch the project-tier specialists root of one workspace.
-fn start_project_watchers(
+/// Watch the project-tier specialists root of one workspace over the shared
+/// workspace-root stream — one subscription, no stream of its own (previously a
+/// [`RootWatch`], its own stream even when the tier was missing).
+fn start_project_watch(
+    hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
     raw_tx: &mpsc::UnboundedSender<SpecialistsMsg>,
-) -> Vec<RootWatch> {
-    let root = project_dir(workspace_path);
-    vec![watch_directory(
-        root,
-        Some(workspace_id.clone()),
-        raw_tx.clone(),
-    )]
+) -> TierWatch {
+    let ws_id = workspace_id.clone();
+    let tx = raw_tx.clone();
+    watch_tiers(hub, workspace_path, PROJECT_TIERS, is_md, move || {
+        let _ = tx.send(SpecialistsMsg::Change(Some(ws_id.clone())));
+    })
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -221,7 +226,11 @@ fn default_user_dir() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".intent").join("specialists"))
 }
 
+/// The project-tier specialists directory, relative to the workspace root.
+const PROJECT_TIERS: &[&str] = &[".intent/specialists"];
+
 /// The project-tier specialists directory for a workspace.
+#[cfg(test)]
 fn project_dir(workspace_path: &Path) -> PathBuf {
     workspace_path.join(".intent").join("specialists")
 }
@@ -518,6 +527,7 @@ mod tests {
             .expect("seed specialist");
 
         let _watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
@@ -554,6 +564,7 @@ mod tests {
         // The project tier does NOT exist when the watcher starts.
 
         let _watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
@@ -610,6 +621,7 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("mk project tier");
 
         let _watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
@@ -655,6 +667,7 @@ mod tests {
         let ws2_id = WorkspaceId::from("ws-fanout-2");
 
         let _watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![
                 (ws1_id.clone(), ws1.path.clone()),
@@ -702,6 +715,7 @@ mod tests {
         std::fs::write(&file, &content).expect("seed specialist");
 
         let _watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
@@ -756,8 +770,12 @@ mod tests {
             .expect("seed specialist");
 
         // Start with NO workspaces; register at runtime (#611).
-        let watcher =
-            SpecialistsWatcher::start_with_user_dir(bus.clone(), vec![], Some(user.path.clone()));
+        let watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
+            bus.clone(),
+            vec![],
+            Some(user.path.clone()),
+        );
         watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -824,6 +842,7 @@ mod tests {
         std::fs::write(&file, specialist_md("Steady", "body")).expect("seed specialist");
 
         let watcher = SpecialistsWatcher::start_with_user_dir(
+            &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),

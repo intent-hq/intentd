@@ -134,10 +134,10 @@ pub use agent_manager::{
 };
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{
-    EventBus, FileWatcher, GitMetadataWatcher, GitStatusRefresher, SkillsWatcher,
-    SpecialistsWatcher, Subscription, SubscriptionFilter, WatcherRegistry,
-};
+// The individual watcher families are constructed only by `WatcherRegistry`
+// (they now take the crate-private shared-stream hub), so only the registry and
+// the bus/refresher surface leave the crate.
+pub use events::{EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
