@@ -230,10 +230,12 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cow_supported: Option<bool>,
     /// How the workspace checkout was provisioned by `workspace.create` (§5.1):
-    /// `worktree` (linked git worktree) or `cow` (standalone copy-on-write
-    /// clone). Omitted for rows without a daemon-provisioned checkout
-    /// (`skipWorktree`, remote, caller-supplied `worktreePath`, non-git repo
-    /// paths, pre-existing rows).
+    /// `worktree` (linked git worktree), `cow` (standalone copy-on-write
+    /// clone), or `direct` (standalone plain repository — a local git clone
+    /// hydrated from the repo cache, or an `isNewRepo` initialization working
+    /// directly in the repository folder). Omitted for rows without a
+    /// daemon-provisioned checkout (`skipWorktree`, remote, caller-supplied
+    /// `worktreePath`, non-git repo paths, pre-existing rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_mode: Option<CheckoutMode>,
     /// The execution environment selected for this workspace at creation
@@ -263,6 +265,10 @@ pub enum CheckoutMode {
     Worktree,
     /// Standalone copy-on-write clone of the source repository directory.
     Cow,
+    /// Standalone plain git repository: a local clone hydrated from the repo
+    /// cache (non-CoW filesystems), or an `isNewRepo` initialization working
+    /// directly in the repository folder (no worktree provisioned).
+    Direct,
 }
 
 /// Disk footprint of a workspace's daemon-managed directory
@@ -357,15 +363,95 @@ pub fn is_chief_workspace(id: &WorkspaceId) -> bool {
     id.0 == CHIEF_WORKSPACE_ID
 }
 
-/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1).
-/// Reused for the per-agent, per-model, and workspace-wide rollups.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A monetary cost figure attached to a token tally (PROTOCOL §5.23), sourced
+/// from the ACP `usage_update` session notification's `cost` object. `amount`
+/// is the cumulative spend and `currency` an ISO 4217 code (e.g. `"USD"`).
+/// Only providers that report cost populate it — absence is never coerced to
+/// zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl UsageCost {
+    /// Pairwise cost merge used where at most two figures combine (the
+    /// recreate baseline fold and the `baseline + snapshot` per-agent tally):
+    /// matching currencies sum, a (pathological) mismatch keeps the larger
+    /// amount (ties keep `lhs`, the banked baseline). Absent operands
+    /// contribute nothing.
+    ///
+    /// The mismatch arm is deliberately lossy and, unlike the bucket roll-up
+    /// (which sums per currency before picking the dominant one), it is
+    /// applied iteratively: each ACP session recreate re-merges into the
+    /// banked baseline, so an agent that switches to a cheaper-per-session
+    /// currency discards the new currency's spend one fold at a time. That is
+    /// an accepted consequence of storing a single figure — a cross-currency
+    /// numeric comparison is semantically meaningless and the daemon never
+    /// invents a conversion rate.
+    pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
+        match (lhs, rhs) {
+            (None, None) => None,
+            (Some(c), None) | (None, Some(c)) => Some(c.clone()),
+            (Some(a), Some(b)) => Some(if a.currency == b.currency {
+                UsageCost {
+                    amount: a.amount + b.amount,
+                    currency: a.currency.clone(),
+                }
+            } else if b.amount > a.amount {
+                b.clone()
+            } else {
+                a.clone()
+            }),
+        }
+    }
+}
+
+/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1),
+/// plus the optional provider-reported cost. Reused for the per-agent,
+/// per-model, and workspace-wide rollups.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Cumulative cost, present only when at least one contributing session
+    /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<UsageCost>,
+}
+
+impl TokenUsageTotals {
+    /// Whether all four consumption counters are zero, i.e. this tally carries
+    /// no token report at all. A persisted session snapshot in that state is a
+    /// cost-only report (§5.23) and MUST NOT suppress the per-message token
+    /// fallback for a provider that never sends an end-of-turn token report.
+    pub fn counters_are_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
+    }
+}
+
+/// Whether a session's persisted recreate `baseline` / current-session
+/// `snapshot` pair carries an actual token report, i.e. whether the per-agent
+/// tally uses it instead of falling back to summing per-message usage
+/// metadata (§5.23). An all-zero-counter part counts as "no report": a
+/// cost-only `usage_update` persist writes exactly that shape, and treating it
+/// as a report would silently zero the counters of a provider that never sends
+/// the end-of-turn token report. Shared by the store's usage-row fetch (which
+/// hydrates message contents only for fallback sessions, monorepo#738) and the
+/// tally itself, so the two decisions can never drift apart.
+pub fn token_usage_reported(
+    baseline: Option<&TokenUsageTotals>,
+    snapshot: Option<&TokenUsageTotals>,
+) -> bool {
+    let reported = |t: Option<&TokenUsageTotals>| t.is_some_and(|t| !t.counters_are_zero());
+    reported(baseline) || reported(snapshot)
 }
 
 /// Durable token-usage snapshot returned by `workspace.getTokenUsage` and pushed
@@ -373,7 +459,7 @@ pub struct TokenUsageTotals {
 /// are `agent-{uuid}`; `byModel` keys are the effective model name (`"unknown"`
 /// fallback); `lastScanAt` is the RFC-3339 timestamp of the last internal scan
 /// (`null` before the first scan).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     pub by_agent_id: BTreeMap<String, TokenUsageTotals>,
@@ -2052,6 +2138,12 @@ pub struct AgentSession {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level requested for this session (PROTOCOL §5.5,
+    /// Option B). Stored as-is (providers interpret the vocabulary; the
+    /// daemon never normalizes it) and applied on the next prompt send.
+    /// `None` = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2284,6 +2376,10 @@ pub struct AgentLite {
     pub name_explicitly_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level for the session (PROTOCOL §5.5, Option B);
+    /// mirrors [`AgentSession::reasoning_effort`]. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub status: AgentStatus,
@@ -2430,6 +2526,7 @@ impl AgentLite {
             name: session.name,
             name_explicitly_set: session.name_explicitly_set,
             model: session.model,
+            reasoning_effort: session.reasoning_effort,
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
@@ -2478,6 +2575,10 @@ impl AgentLite {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
     pub provider: Option<String>,
+    /// Reasoning-effort level persisted on the created session (PROTOCOL
+    /// §5.5, Option B). Stored as-is when a non-empty string; empty /
+    /// whitespace-only values collapse to `None` at the boundary.
+    pub reasoning_effort: Option<String>,
     pub agent_type: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub workspace_path: Option<String>,
@@ -2507,6 +2608,11 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
+    /// Wins over the chosen model option's `reasoningEffort` and the
+    /// specialist's frontmatter scalar; validated against the cached model
+    /// catalog's `effortLevels` evidence when the resolved model has any.
+    pub reasoning_effort: Option<String>,
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
@@ -2586,6 +2692,10 @@ pub struct AgentWakeCreateOptions {
     pub provider: Option<String>,
     pub agent_type: Option<String>,
     pub model: Option<String>,
+    /// Reasoning-effort level for the created child (PROTOCOL §5.5/§5.11),
+    /// used only on the create branch. Overridden by the wake-level
+    /// [`AgentWakeOrCreateInput::reasoning_effort`] when both are present.
+    pub reasoning_effort: Option<String>,
     pub context_references: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub skip_auto_commit: Option<bool>,
@@ -2603,6 +2713,9 @@ pub struct AgentWakeCreateOptions {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentWakeOrCreateInput {
     pub model: Option<String>,
+    /// Reasoning-effort override for the create branch (PROTOCOL §5.5/§5.11);
+    /// wins over `create.reasoningEffort` and the specialist frontmatter.
+    pub reasoning_effort: Option<String>,
     pub caller_agent_id: Option<AgentId>,
     pub delegation_depth: Option<i64>,
     pub message_metadata: Option<serde_json::Value>,
@@ -2758,7 +2871,8 @@ pub enum ScriptStatus {
 
 /// In-memory runtime state of a script process — the `script.status` result and
 /// the `runtime` field of a `script.list` entry (ported from the TS
-/// `ScriptRuntimeState`). Not persisted.
+/// `ScriptRuntimeState`). Not persisted, except the `was_running` marker
+/// behind `previously_running` (stored-on-write on the `script` row).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuntimeState {
@@ -2776,6 +2890,13 @@ pub struct ScriptRuntimeState {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_url: Option<String>,
+    /// `Some(true)` on a hydrated `idle` state whose service-mode script was
+    /// running when the previous daemon process died (the persisted
+    /// `was_running` marker), so clients can re-render its tab after a
+    /// restart. Omitted otherwise (presence-detected additive convention,
+    /// PROTOCOL §5.8); cleared once the script is started or stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previously_running: Option<bool>,
 }
 
 impl Default for ScriptRuntimeState {
@@ -2789,6 +2910,7 @@ impl Default for ScriptRuntimeState {
             restart_count: 0,
             error: None,
             detected_url: None,
+            previously_running: None,
         }
     }
 }
@@ -2856,7 +2978,7 @@ pub enum HookState {
 /// A background hook: a small agent-owned script the daemon runs periodically
 /// (fixed `delayMs` between runs) until it signals a dispatch, fails, is
 /// cancelled, or its TTL expires. Persisted to the `hook` table so schedules
-/// survive a daemon restart; the name length cap (≤19 chars) is enforced at
+/// survive a daemon restart; the name length cap (≤50 chars) is enforced at
 /// the service layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3024,6 +3146,22 @@ mod tests {
         );
         let back: ScriptStatus = serde_json::from_value(json!("restarting")).unwrap();
         assert_eq!(back, ScriptStatus::Restarting);
+    }
+
+    #[test]
+    fn checkout_mode_wire_values_round_trip() {
+        // `Workspace.checkoutMode` wire values are lowercase strings:
+        // `worktree`, `cow`, and `direct` (standalone plain repo — cache
+        // hydration fallback or isNewRepo initialization).
+        for (mode, wire) in [
+            (CheckoutMode::Worktree, "worktree"),
+            (CheckoutMode::Cow, "cow"),
+            (CheckoutMode::Direct, "direct"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
+            let back: CheckoutMode = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, mode);
+        }
     }
 
     #[test]
@@ -3523,6 +3661,7 @@ mod tests {
                 output_tokens: 3400,
                 cache_read_tokens: 8000,
                 cache_creation_tokens: 1200,
+                cost: None,
             },
         );
         let mut by_model = BTreeMap::new();
@@ -3540,8 +3679,75 @@ mod tests {
         assert_eq!(v["byModel"]["opus-4.8"]["outputTokens"], 3400);
         assert_eq!(v["totals"]["inputTokens"], 12000);
         assert_eq!(v["lastScanAt"], serde_json::Value::Null);
+        // Absent cost is OMITTED (not null) so existing clients see the
+        // pre-cost shape byte-for-byte.
+        assert!(v["totals"].get("cost").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// A reported cost serializes as camelCase `cost: { amount, currency }`
+    /// on every `TokenUsage` bucket and round-trips (§5.23).
+    #[test]
+    fn token_usage_cost_wire_shape() {
+        let totals = TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: Some(UsageCost {
+                amount: 1.25,
+                currency: "USD".to_string(),
+            }),
+        };
+        let mut by_agent_id = BTreeMap::new();
+        by_agent_id.insert("agent-123".to_string(), totals.clone());
+        let mut by_model = BTreeMap::new();
+        by_model.insert("opus-4.8".to_string(), totals.clone());
+        let usage = TokenUsage {
+            by_agent_id,
+            totals,
+            by_model,
+            last_scan_at: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["totals"]["cost"]["amount"], 1.25);
+        assert_eq!(v["totals"]["cost"]["currency"], "USD");
+        assert_eq!(v["byAgentId"]["agent-123"]["cost"]["amount"], 1.25);
+        assert_eq!(v["byModel"]["opus-4.8"]["cost"]["currency"], "USD");
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    /// `UsageCost::merge`: matching currencies sum, a mismatch keeps the
+    /// larger amount, and absent operands contribute nothing.
+    #[test]
+    fn usage_cost_merge_rules() {
+        let usd = |amount: f64| UsageCost {
+            amount,
+            currency: "USD".to_string(),
+        };
+        let eur = |amount: f64| UsageCost {
+            amount,
+            currency: "EUR".to_string(),
+        };
+        assert_eq!(UsageCost::merge(None, None), None);
+        assert_eq!(UsageCost::merge(Some(&usd(1.0)), None), Some(usd(1.0)));
+        assert_eq!(UsageCost::merge(None, Some(&usd(2.0))), Some(usd(2.0)));
+        assert_eq!(
+            UsageCost::merge(Some(&usd(1.5)), Some(&usd(2.5))),
+            Some(usd(4.0))
+        );
+        assert_eq!(
+            UsageCost::merge(Some(&usd(1.0)), Some(&eur(9.0))),
+            Some(eur(9.0)),
+            "mismatched currencies keep the larger amount"
+        );
+        assert_eq!(
+            UsageCost::merge(Some(&usd(2.0)), Some(&eur(2.0))),
+            Some(usd(2.0)),
+            "an equal-amount cross-currency tie keeps the lhs (banked baseline)"
+        );
     }
 
     /// `SetupScript` serializes with the camelCase `updatedAt`/`generatedBy` keys
@@ -3743,6 +3949,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".to_string()),
@@ -3821,6 +4028,7 @@ mod tests {
             name: "Builder".to_string(),
             name_explicitly_set: true,
             model: Some("opus".to_string()),
+            reasoning_effort: None,
             provider: Some("auggie".to_string()),
             system_prompt: None,
             specialist: None,

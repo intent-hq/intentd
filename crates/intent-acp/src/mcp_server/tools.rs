@@ -42,6 +42,9 @@ pub struct SpecialistModelOption {
     pub model: String,
     /// Free-text hint for choosing this option; empty when the author gave none.
     pub hint: String,
+    /// Reasoning-effort level this option implies, passed as `reasoningEffort`
+    /// when the option is chosen; empty when the author declared none.
+    pub reasoning_effort: String,
 }
 
 /// One specialist's resolved `modelOptions` list, injected into the
@@ -137,7 +140,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — working-tree status, stage, commit helpers
+  ws.git.* — git.commit = attributed commit helper
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
@@ -146,7 +149,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -160,7 +163,7 @@ API:
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
 
-  ws.app.question.ask({ question, header, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. Call once per question (aim for at most ~4 questions per turn); `header` is a short topic label; `options` is 2-4 choices [{ label, description? }] — at least 2 required; do NOT add an "Other" option, a free-form answer is always offered automatically; `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
+  ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
   ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
   ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
@@ -203,11 +206,12 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
@@ -222,25 +226,22 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
-  ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
-  ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
-  ws.git.commit(message) → { ok, hash?, files? }  // DEPRECATED. Prefer `ws.git.agentCommit()`. This commits already-staged files and still obeys workspace auto-commit policy.
-  ws.git.agentCommit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // Preferred commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
+  ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
-  ws.git.checkMergeConflicts(targetBranch?) → { hasConflicts, conflictedFiles, targetBranch, currentBranch, ... }  // Checks whether merging into target would conflict.
+    For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
   ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
-  ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters.
+  ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
@@ -258,7 +259,7 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
@@ -284,16 +285,9 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -344,7 +338,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — working-tree status, stage, commit helpers
+  ws.git.* — git.commit = attributed commit helper
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
@@ -352,7 +346,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — PR workflow; pr.snapshot = compact PR watch state
+  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -371,7 +365,7 @@ API:
     Safe usage: list first, then read only the relevant thread slices with `lastN` or `startTurn`/`endTurn`; keep `includeToolCalls` false unless the user explicitly needs raw tool-call details.
   ws.app.agents.waitFor({ agentIds, waitMode? }) → { ok, waitMode, results }  // Chief workspace only. Register to be woken when existing agents (in any workspace) complete — the subscription side of `agent.delegate` without creating agents. `waitMode`: `"immediate"` (default) wakes you as each agent completes; `"after_all"` delivers one aggregated wake once all of them settle. Each result is { agentId, agentName, workspaceId, subscriptionId, groupId }.
   ws.app.proposal.show(proposal) → ProposalCard  // Chief workspace only. Render an app-level proposal card in chat.
-  ws.app.question.ask({ question, header, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. Call once per question (aim for at most ~4 questions per turn); `header` is a short topic label; `options` is 2-4 choices [{ label, description? }] — at least 2 required; do NOT add an "Other" option, a free-form answer is always offered automatically; `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
+  ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
   ws.app.settings.list({ includeValues?, category? }?) → settings[]  // List schema-backed persisted user settings, optionally with current values.
   ws.app.settings.get(path) → setting  // Read a persisted user setting by schema path; sensitive values are redacted.
   ws.app.settings.propose(changes[] | { changes }) → ProposalCard  // Preview settings changes with a diff; never auto-applies.
@@ -432,11 +426,12 @@ API:
 
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
-    You can override specialist defaults with `model` or `behaviorPrompt`.
+    You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
@@ -449,25 +444,22 @@ API:
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
   ws.agent.mergeSandbox(agentId) → { ok, agentId, status, reason? }  // Start a sandbox merge-back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). ASYNC: returns immediately with `status: "started"` (merge runs in the background; large repos take minutes) or `"in_progress"` (a merge already owns the sandbox). Poll `ws.agent.status(agentId).sandboxStatus` for the outcome — `merged`, `conflict` (terminal; work preserved on an `sb/…` branch in the workspace repo), `merge_pending` (blocked/failed; retried automatically), or unchanged on a dirty bounce (uncommitted sandbox changes with workspace auto-commit off). Errors if the agent has no sandbox.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
-  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task.
+  ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
 
-  ws.git.status() → { modified, staged, untracked, deleted, ... }  // Working tree summary with file lists grouped by status.
-  ws.git.stage(paths) → { ok, paths }  // `paths` may be a CSV string or array. Staging all files (`.`, `*`, `--all`) is intentionally blocked; stage only specific files you changed.
-  ws.git.commit(message) → { ok, hash?, files? }  // DEPRECATED. Prefer `ws.git.agentCommit()`. This commits already-staged files and still obeys workspace auto-commit policy.
-  ws.git.agentCommit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // Preferred commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
+  ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
-  ws.git.checkMergeConflicts(targetBranch?) → { hasConflicts, conflictedFiles, targetBranch, currentBranch, ... }  // Checks whether merging into target would conflict.
+    For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
   ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
-  ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters.
+  ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
@@ -483,7 +475,7 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 19 chars. The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
@@ -509,16 +501,9 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.merge({ mergeMethod?, commitTitle?, commitMessage? }?) → { merged, sha, mergeMethod, message, prNumber }  // Requires an active PR. `mergeMethod`: `"merge"`, `"squash"`, or `"rebase"`.
-  ws.pr.status() → { prNumber, title, url, state, mergeable, mergeableState, hasConflicts, isDraft, isMerged, isClosed, summary }  // Requires an active PR.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
     Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-  ws.pr.updateBranch() → { ... }  // Updates the PR branch from its base branch when supported.
-  ws.pr.listReviewComments({ path?, status? }?) → reviewComments  // Inline code review comments (attached to specific lines in a diff). `status`: `"unresolved"`, `"resolved"`, or `"all"`.
-  ws.pr.replyToReviewComment(commentId, body) → { ... }  // Reply to an inline review comment by numeric ID.
-  ws.pr.resolveThread(threadId, action?) → { ... }  // `action`: `"resolve"` or `"unresolve"`.
-  ws.pr.listComments({ count? }?) → comments  // Lists conversation-level PR comments (not inline code comments).
-  ws.pr.postComment(body) → { ... }  // Posts a conversation-level PR comment.
+    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -927,16 +912,20 @@ fn microvm_hints_block(hints: &MicrovmSpawnHints) -> String {
 
 /// Render the injected continuation block: one header line plus one line per
 /// specialist listing its options as `` `<compound id>` (<hint>) `` entries
-/// (the hint parenthetical is omitted when empty). All lines are indented ≥4
-/// so the `[agentFeatures]` pruning treats them as continuation lines of the
-/// `ws.agent.delegate` entry. Author-supplied text is flattened onto one line
-/// so a multi-line hint cannot break the description's line structure.
+/// (the hint parenthetical is omitted when empty, and an option's declared
+/// reasoning effort is appended to it as `effort: <level>`). All lines are
+/// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
+/// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
+/// onto one line so a multi-line hint cannot break the description's line
+/// structure.
 fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (pass the compound id as `model` to \
          `ws.agent.delegate`/`ws.agent.create`; omit `model` to use the \
-         specialist's default):\n",
+         specialist's default; on `ws.agent.delegate` an option's `effort` is \
+         applied automatically unless you pass an explicit `reasoningEffort` — \
+         `ws.agent.create` applies only the `reasoningEffort` you pass):\n",
     );
     for spec in model_options {
         block.push_str("      ");
@@ -946,10 +935,17 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
             .options
             .iter()
             .map(|o| {
-                if o.hint.is_empty() {
+                let mut paren: Vec<String> = Vec::new();
+                if !o.hint.is_empty() {
+                    paren.push(flat(&o.hint));
+                }
+                if !o.reasoning_effort.is_empty() {
+                    paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
+                }
+                if paren.is_empty() {
                     format!("`{}`", flat(&o.model))
                 } else {
-                    format!("`{}` ({})", flat(&o.model), flat(&o.hint))
+                    format!("`{}` ({})", flat(&o.model), paren.join("; "))
                 }
             })
             .collect();
@@ -1587,13 +1583,13 @@ mod tests {
             for kept in [
                 "ws.note.read(",
                 "ws.task.updateStatus(",
-                "ws.git.status(",
+                "ws.git.commit(",
                 "ws.file.read(",
                 "ws.crossWorkspace.listSiblings(",
                 "ws.agent.create(",
                 "ws.agent.reportToParent(",
                 "ws.event.subscribe(",
-                "ws.pr.status(",
+                "ws.pr.snapshot(",
             ] {
                 assert!(
                     pruned.contains(kept),
@@ -1872,10 +1868,12 @@ mod tests {
                     SpecialistModelOption {
                         model: "opencode:kimi-k3".to_string(),
                         hint: "cheap".to_string(),
+                        reasoning_effort: String::new(),
                     },
                     SpecialistModelOption {
                         model: "auggie:opus".to_string(),
                         hint: String::new(),
+                        reasoning_effort: String::new(),
                     },
                 ],
             },
@@ -1884,6 +1882,7 @@ mod tests {
                 options: vec![SpecialistModelOption {
                     model: "grok:grok-5".to_string(),
                     hint: "fast reviews".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             },
         ]
@@ -1965,6 +1964,41 @@ mod tests {
         }
     }
 
+    // A declared per-option `reasoningEffort` is rendered inside the option's
+    // parenthetical as `effort: <level>` — appended after a hint when both are
+    // present, and standing alone when the author gave no hint.
+    #[test]
+    fn model_options_block_renders_per_option_effort() {
+        let options = vec![SpecialistModelOptions {
+            specialist: "implementor".to_string(),
+            options: vec![
+                SpecialistModelOption {
+                    model: "fable-5".to_string(),
+                    hint: "hard tasks".to_string(),
+                    reasoning_effort: "high".to_string(),
+                },
+                SpecialistModelOption {
+                    model: "sonnet5".to_string(),
+                    hint: String::new(),
+                    reasoning_effort: "low".to_string(),
+                },
+            ],
+        }];
+        let got = workspace_api_description_with_model_options(
+            false,
+            &AgentFeaturesSettings::default(),
+            true,
+            &options,
+            None,
+        );
+        assert!(
+            got.contains(
+                "implementor: `fable-5` (hard tasks; effort: high), `sonnet5` (effort: low)"
+            ),
+            "per-option effort not rendered:\n{got}"
+        );
+    }
+
     // The injection composes with feature pruning: a bridge with a disabled
     // toggle still gets the options block, and the pruned namespace stays
     // gone.
@@ -1997,6 +2031,7 @@ mod tests {
             options: vec![SpecialistModelOption {
                 model: "opencode:kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),
+                reasoning_effort: String::new(),
             }],
         }];
         let got = workspace_api_description_with_model_options(

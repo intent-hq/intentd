@@ -74,6 +74,9 @@ pub fn turn_token_delta(
         cache_creation_tokens: next
             .cache_creation_tokens
             .saturating_sub(prev.cache_creation_tokens),
+        // Usage stats (§5.36) track token counters only — cost has no bucket
+        // there, so the delta carries none.
+        cost: None,
     }
 }
 
@@ -209,27 +212,29 @@ pub(crate) fn is_placeholder_model(model: Option<&str>) -> bool {
     bare.is_empty() || bare.eq_ignore_ascii_case("default")
 }
 
-/// The `usage_stats_hourly` model key for a session (D13/D14 ladder): a real
-/// (non-placeholder) model normalizes via [`normalize_model_name`] —
-/// preferring the session's `resolved_model` (the display identity resolved
-/// from the provider's `configOptions[id="model"]` for an explicit pick,
-/// D14) over the raw stored id, so explicit picks land in the same row as
-/// resolved defaults; a placeholder/absent model falls back to `provider_id`
-/// — the session's *resolved* provider id (callers compute it with
-/// [`crate::agent_session::resolve_provider_id`] when the session row is
-/// readable, and pass `None` when even the provider is unknowable, e.g. the
-/// row read failed). `"unknown"` only on that unknowable tail.
+/// The `usage_stats_hourly` model key for a session (D13/D14 ladder): the
+/// session's `resolved_model` (the display identity resolved from the
+/// provider's `configOptions[id="model"]` at session open — the effective
+/// model for a placeholder session, D13, or an explicit pick's display name,
+/// D14) wins when present, so both land in the same row as each other; a
+/// real (non-placeholder) model without a resolution normalizes via
+/// [`normalize_model_name`]; a placeholder/absent model without a resolution
+/// falls back to `provider_id` — the session's *resolved* provider id
+/// (callers compute it with [`crate::agent_session::resolve_provider_id`]
+/// when the session row is readable, and pass `None` when even the provider
+/// is unknowable, e.g. the row read failed). `"unknown"` only on that
+/// unknowable tail.
 pub fn stats_model_key(
     raw_model: Option<&str>,
     resolved_model: Option<&str>,
     provider_id: Option<&str>,
 ) -> String {
+    let resolved = resolved_model.map(str::trim).filter(|r| !r.is_empty());
+    if let Some(display) = resolved {
+        return normalize_model_name(display);
+    }
     if !is_placeholder_model(raw_model) {
-        let display = resolved_model
-            .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .or(raw_model);
-        return normalize_model_name(display.unwrap_or(""));
+        return normalize_model_name(raw_model.unwrap_or(""));
     }
     provider_id
         .map(str::trim)
@@ -256,7 +261,10 @@ pub fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// [`stats_model_key`] (normalized model, falling back to the resolved
 /// provider id when no model is resolved at creation time — D13). `provider`
 /// is the session's raw `provider` field; the resolved id follows the spawn
-/// precedence (compound model prefix → provider field → default provider).
+/// precedence (compound model prefix → provider field → configured default
+/// (`providers.active`) → hardcoded default provider), though this call site
+/// has no settings to offer and always passes `None` for the configured
+/// default.
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub async fn record_session_started(
@@ -267,7 +275,7 @@ pub async fn record_session_started(
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider);
+    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider, None);
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
     let model = stats_model_key(raw_model, None, Some(&provider_id));
@@ -313,8 +321,11 @@ pub async fn record_lines_changed(
         .await
     {
         Ok((model, resolved, provider, _)) => {
-            let provider_id =
-                crate::agent_session::resolve_provider_id(model.as_deref(), provider.as_deref());
+            let provider_id = crate::agent_session::resolve_provider_id(
+                model.as_deref(),
+                provider.as_deref(),
+                None,
+            );
             (model, resolved, Some(provider_id))
         }
         Err(e) => {
@@ -391,6 +402,7 @@ mod tests {
             output_tokens: o,
             cache_read_tokens: cr,
             cache_creation_tokens: cc,
+            cost: None,
         }
     }
 
@@ -534,7 +546,7 @@ mod tests {
             "Opus 4.8"
         );
         assert_eq!(stats_model_key(Some("opus-4.8"), None, None), "Opus 4.8");
-        // Placeholder/absent model → resolved provider id.
+        // Placeholder/absent model without a resolution → resolved provider id.
         assert_eq!(
             stats_model_key(Some("claude-code:default"), None, Some("claude-code")),
             "claude-code"
@@ -590,11 +602,29 @@ mod tests {
             ),
             "Sonnet 5"
         );
-        // A stale resolution never rescues a placeholder model — the ladder
-        // still falls back to the provider (setModel clears resolutions, but
-        // the key must be safe regardless).
+        // D13: a placeholder model with a persisted resolution (the effective
+        // model resolved at session open) attributes to the resolved display,
+        // not the provider fallback (monorepo#1534 — `model` itself stays a
+        // placeholder now).
+        assert_eq!(
+            stats_model_key(
+                Some("claude-code:default"),
+                Some("Opus 4.8"),
+                Some("claude-code")
+            ),
+            "Opus 4.8"
+        );
+        assert_eq!(
+            stats_model_key(None, Some("Opus 4.8"), Some("claude-code")),
+            "Opus 4.8"
+        );
         assert_eq!(
             stats_model_key(Some("default"), Some("Fable 5"), Some("claude-code")),
+            "Fable 5"
+        );
+        // Blank resolution on a placeholder → provider fallback as before.
+        assert_eq!(
+            stats_model_key(Some("claude-code:default"), Some("  "), Some("claude-code")),
             "claude-code"
         );
     }

@@ -4,8 +4,9 @@
 //! REST calls go through octocrab's generic `get`/`post`/`patch`/`put` helpers
 //! (returning raw JSON we map ourselves, mirroring the TS ground truth which
 //! parsed raw GitHub payloads), and review-thread resolution uses the GraphQL
-//! client. octocrab does not surface GraphQL-level `errors`, so we validate
-//! them here like `pr-comment.service.ts` did.
+//! client. octocrab unwraps the GraphQL envelope itself (`data` on success,
+//! `errors` mapped onto [`Error::Api`]), so [`graphql_data`] only guards
+//! against a `null` payload.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -471,22 +472,17 @@ fn encode_path_segments(path: &str) -> String {
     out
 }
 
-/// Validate a GraphQL envelope and return its `data` object (parity with
-/// `validateGraphQLResponse` in `pr-comment.service.ts`).
-fn graphql_data(mut resp: Value) -> Result<Value> {
-    if let Some(errors) = resp.get("errors").and_then(Value::as_array) {
-        if !errors.is_empty() {
-            let msg = errors[0]
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown GraphQL error");
-            return Err(Error::Api(format!("graphql error: {msg}")));
-        }
+/// Validate the `data` payload of a GraphQL response.
+///
+/// `octocrab::Octocrab::graphql` already unwraps the envelope — it returns the
+/// `data` object on success and turns an `errors` array into
+/// `octocrab::Error::Graphql` (mapped onto [`Error::Api`]) — so the only
+/// remaining failure mode is a `null` payload with no accompanying error.
+fn graphql_data(data: Value) -> Result<Value> {
+    if data.is_null() {
+        return Err(Error::Api("graphql response returned no data".to_string()));
     }
-    match resp.get_mut("data") {
-        Some(data) if !data.is_null() => Ok(data.take()),
-        _ => Err(Error::Api("graphql response returned no data".to_string())),
-    }
+    Ok(data)
 }
 
 mod dto {
@@ -632,6 +628,31 @@ mod dto {
         #[serde(default, rename = "isResolved")]
         pub is_resolved: bool,
         pub comments: Option<ReviewThreadComments>,
+    }
+}
+
+const REVIEW_DECISION_QUERY: &str = r#"
+query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $prNumber) {
+      reviewDecision
+    }
+  }
+}
+"#;
+
+/// Map the GraphQL `reviewDecision` payload to [`ReviewDecision`]. GitHub
+/// reports `null` when the base branch has no review requirement; that (or
+/// any unrecognized value) maps to `None`.
+fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
+    match data
+        .pointer("/repository/pullRequest/reviewDecision")
+        .and_then(Value::as_str)
+    {
+        Some("APPROVED") => Some(ReviewDecision::Approved),
+        Some("CHANGES_REQUESTED") => Some(ReviewDecision::ChangesRequested),
+        Some("REVIEW_REQUIRED") => Some(ReviewDecision::ReviewRequired),
+        _ => None,
     }
 }
 
@@ -979,6 +1000,20 @@ impl SourceControl for GitHubSourceControl {
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
         self.rest_collect_all(&route, |v| v, map_review).await
+    }
+
+    async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
+        let payload = json!({
+            "query": REVIEW_DECISION_QUERY,
+            "variables": {
+                "owner": repo.owner,
+                "repo": repo.name,
+                "prNumber": number,
+            },
+        });
+        let resp: Value = self.client.graphql(&payload).await?;
+        let data = graphql_data(resp)?;
+        Ok(parse_review_decision(&data))
     }
 
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
@@ -1421,16 +1456,38 @@ mod tests {
     }
 
     #[test]
-    fn graphql_data_extracts_and_validates() {
-        let data = graphql_data(json!({ "data": { "x": 1 } })).unwrap();
-        assert_eq!(data, json!({ "x": 1 }));
+    fn graphql_data_passes_payload_and_rejects_null() {
+        // octocrab hands us the already-unwrapped `data` payload.
+        let data = graphql_data(json!({ "repository": { "x": 1 } })).unwrap();
+        assert_eq!(data, json!({ "repository": { "x": 1 } }));
 
-        let err =
-            graphql_data(json!({ "errors": [{ "message": "boom" }], "data": null })).unwrap_err();
-        assert!(matches!(err, Error::Api(_)));
-
-        let no_data = graphql_data(json!({ "data": null })).unwrap_err();
+        let no_data = graphql_data(Value::Null).unwrap_err();
         assert!(matches!(no_data, Error::Api(_)));
+    }
+
+    #[test]
+    fn parses_review_decision_including_null() {
+        let data = |v: Value| json!({ "repository": { "pullRequest": { "reviewDecision": v } } });
+        assert_eq!(
+            parse_review_decision(&data(json!("APPROVED"))),
+            Some(ReviewDecision::Approved)
+        );
+        assert_eq!(
+            parse_review_decision(&data(json!("CHANGES_REQUESTED"))),
+            Some(ReviewDecision::ChangesRequested)
+        );
+        assert_eq!(
+            parse_review_decision(&data(json!("REVIEW_REQUIRED"))),
+            Some(ReviewDecision::ReviewRequired)
+        );
+        // Null (unprotected base: no review requirement) and unrecognized
+        // values map to None, as does a missing pullRequest node.
+        assert_eq!(parse_review_decision(&data(Value::Null)), None);
+        assert_eq!(parse_review_decision(&data(json!("SOMETHING_NEW"))), None);
+        assert_eq!(
+            parse_review_decision(&json!({ "repository": { "pullRequest": null } })),
+            None
+        );
     }
 
     #[test]

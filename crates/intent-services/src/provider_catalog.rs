@@ -10,9 +10,11 @@
 
 use serde_json::{json, Value};
 
-/// Build the full `providers.catalog` result:
-/// `{ providers: [...], defaultProviderId }`. Gating is evaluated against the
-/// daemon's process environment (see [`provider_visible`]).
+/// Build the full `providers.catalog` result: `{ providers: [...] }`. No
+/// provider carries a default designation — clients derive an effective
+/// default from settings (`model.default` prefix, else `providers.active`).
+/// Gating is evaluated against the daemon's process environment (see
+/// [`provider_visible`]).
 pub fn build_providers_catalog() -> Value {
     build_providers_catalog_with_env(&|var| std::env::var_os(var).is_some())
 }
@@ -25,10 +27,7 @@ fn build_providers_catalog_with_env(env_has: &dyn Fn(&str) -> bool) -> Value {
         .iter()
         .map(|p| provider_row(p, env_has))
         .collect();
-    json!({
-        "providers": providers,
-        "defaultProviderId": intent_providers::default_provider_id(),
-    })
+    json!({ "providers": providers })
 }
 
 /// Whether a provider passes the daemon-side visibility gate. Derived from
@@ -40,16 +39,14 @@ fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str)
 }
 
 /// One catalog row (camelCase on the wire). Optional fields are omitted when
-/// unset, never null; `modelTiers` is present only for providers with a
-/// static tier table (`PROVIDER_MODEL_TIERS` — dynamic-model providers like
-/// opencode/droid/grok are intentionally absent from it).
+/// unset, never null. Model discovery is fully dynamic (`models.list`) — the
+/// row carries no model metadata.
 fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".into(), json!(p.id));
     row.insert("displayName".into(), json!(p.display_name));
     row.insert("shortName".into(), json!(p.short_name));
     row.insert("command".into(), json!(p.command));
-    row.insert("isDefault".into(), json!(p.is_default));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
@@ -67,16 +64,6 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
         row.insert("requiresFeatureCode".into(), json!(code));
     }
     row.insert("visible".into(), json!(provider_visible(p, env_has)));
-    if let Some(tiers) = intent_providers::tiers_for(p.id) {
-        row.insert(
-            "modelTiers".into(),
-            json!({
-                "fast": tiers.fast,
-                "balanced": tiers.balanced,
-                "smart": tiers.smart,
-            }),
-        );
-    }
     Value::Object(row)
 }
 
@@ -89,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn serves_all_providers_in_registry_order_with_default_id() {
+    fn serves_all_providers_in_registry_order_without_default_id() {
         let v = catalog(&|_| false);
         let ids: Vec<&str> = v["providers"]
             .as_array()
@@ -99,9 +86,10 @@ mod tests {
             .collect();
         let expected: Vec<&str> = intent_providers::all_provider_ids();
         assert_eq!(ids, expected, "one row per registry entry, same order");
-        assert_eq!(
-            v["defaultProviderId"].as_str().unwrap(),
-            intent_providers::default_provider_id()
+        // No privileged provider: the payload carries no defaultProviderId.
+        assert!(
+            v.get("defaultProviderId").is_none(),
+            "catalog must not carry defaultProviderId"
         );
     }
 
@@ -113,7 +101,6 @@ mod tests {
         assert_eq!(auggie["displayName"], "Augment Auggie");
         assert_eq!(auggie["shortName"], "Auggie");
         assert_eq!(auggie["command"], "auggie");
-        assert_eq!(auggie["isDefault"], true);
         assert_eq!(auggie["canBeDisabled"], true);
         assert_eq!(auggie["loginCommandHint"], "auggie login");
         assert!(auggie["authErrorPatterns"].is_array());
@@ -121,6 +108,11 @@ mod tests {
         assert!(auggie.get("requiresEnvVar").is_none());
         assert!(auggie.get("requiresFeatureCode").is_none());
         assert!(auggie.get("loginDocsUrl").is_none());
+        // No per-row default designation.
+        assert!(
+            auggie.get("isDefault").is_none(),
+            "rows must not carry isDefault"
+        );
     }
 
     #[test]
@@ -201,31 +193,21 @@ mod tests {
         }
     }
 
+    /// Regression (tier removal): no row carries `modelTiers` or `isDefault`
+    /// for any provider — model discovery is fully dynamic and no provider
+    /// has a default designation.
     #[test]
-    fn model_tiers_present_only_for_static_tier_providers() {
+    fn no_row_carries_model_tiers_or_is_default() {
         let v = catalog(&|_| false);
-        for id in ["auggie", "claude-code", "codex", "cortex"] {
-            let tiers = &row(&v, id)["modelTiers"];
-            assert!(tiers.is_object(), "{id} should carry modelTiers");
-            for tier in ["fast", "balanced", "smart"] {
-                assert!(tiers[tier].is_string(), "{id} modelTiers.{tier}");
-            }
-        }
-        for id in ["opencode", "unsloth", "pi", "droid", "grok", "mock"] {
+        for id in intent_providers::all_provider_ids() {
             assert!(
                 row(&v, id).get("modelTiers").is_none(),
-                "{id} (dynamic models) must omit modelTiers"
+                "{id} must omit modelTiers"
+            );
+            assert!(
+                row(&v, id).get("isDefault").is_none(),
+                "{id} must omit isDefault"
             );
         }
-    }
-
-    #[test]
-    fn tier_values_match_registry_table() {
-        let v = catalog(&|_| false);
-        let auggie_tiers = &row(&v, "auggie")["modelTiers"];
-        let expected = intent_providers::tiers_for("auggie").unwrap();
-        assert_eq!(auggie_tiers["fast"], expected.fast);
-        assert_eq!(auggie_tiers["balanced"], expected.balanced);
-        assert_eq!(auggie_tiers["smart"], expected.smart);
     }
 }

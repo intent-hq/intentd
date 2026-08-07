@@ -65,9 +65,7 @@ impl SpecialistsWatcher {
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
         if let Some(root) = &user_dir {
-            if let Ok(watcher) = watch_directory(root.clone(), None, raw_tx.clone()) {
-                user_watchers.push(watcher);
-            }
+            user_watchers.push(watch_directory(root.clone(), None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -104,6 +102,28 @@ impl SpecialistsWatcher {
         }
     }
 
+    /// Await every registered root watch actually being established. Watch
+    /// registration is deferred off the caller's thread (monorepo#1572), so
+    /// tests must wait for it before mutating the watched directories.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: Duration) {
+        for watch in &self._user_watchers {
+            watch.wait_established(timeout).await;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_up = self
+                .workspace_watchers
+                .lock()
+                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
+                .unwrap_or(true);
+            if all_up || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watch and drop any pending flush so it stops emitting.
     pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
@@ -123,10 +143,11 @@ fn start_project_watchers(
     raw_tx: &mpsc::UnboundedSender<SpecialistsMsg>,
 ) -> Vec<RootWatch> {
     let root = project_dir(workspace_path);
-    match watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
-        Ok(watcher) => vec![watcher],
-        Err(_) => Vec::new(),
-    }
+    vec![watch_directory(
+        root,
+        Some(workspace_id.clone()),
+        raw_tx.clone(),
+    )]
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -149,7 +170,7 @@ fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SpecialistsMsg>,
-) -> notify::Result<RootWatch> {
+) -> RootWatch {
     watch_root(root, is_md, move || {
         let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
     })
@@ -432,7 +453,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn tier_directory_deletion_emits_event() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("rmdir-user");
         let ws = TempDir::new("rmdir-ws");
@@ -449,6 +474,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
@@ -467,7 +493,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn missing_root_promotes_on_creation_and_detects_changes() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("late-user");
         let ws = TempDir::new("late-ws");
@@ -480,14 +510,25 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Warm-up widened 250ms -> 750ms: the missing-root promotion path must
+        // establish its parent watch before the tier dir is created below, and
+        // under nextest's oversubscribed parallelism a 250ms warm-up can lose
+        // that race, so the creation is never observed and the drain returns
+        // empty. The drains' first-event budget is `quiet` (the second arg),
+        // not the total deadline — the loop breaks after one `quiet` window of
+        // silence — so `quiet` is widened 2s -> 8s here (and the total deadline
+        // to match) to tolerate fsevents detection + forward-task latency under
+        // load. Behavior under test is unchanged; only the headroom before the
+        // "no event" verdict.
+        _watcher.wait_established(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
         std::fs::write(proj.join("late.md"), specialist_md("Late", "body"))
             .expect("write specialist");
 
         let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(15))
+            drain_specialists_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20))
                 .await;
         assert!(
             !events.is_empty(),
@@ -499,7 +540,7 @@ mod tests {
         std::fs::write(proj.join("late.md"), specialist_md("Late", "new body"))
             .expect("modify specialist");
         let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+            drain_specialists_events(&mut sub, Duration::from_secs(6), Duration::from_secs(15))
                 .await;
         assert!(
             !events.is_empty(),
@@ -508,7 +549,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn project_tier_burst_debounces_to_one_event() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("debounce-user");
         let ws = TempDir::new("debounce-ws");
@@ -521,6 +566,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -548,7 +594,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn user_tier_change_fans_out_to_all_workspaces() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("fanout-user");
         let ws1 = TempDir::new("fanout-ws1");
@@ -564,6 +614,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -585,7 +636,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn unchanged_set_emits_nothing() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("noop-user");
         let ws = TempDir::new("noop-ws");
@@ -603,6 +658,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
+        _watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved
@@ -635,7 +691,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("dyn-user");
         let ws = TempDir::new("dyn-ws");
@@ -650,9 +710,11 @@ mod tests {
         // Start with NO workspaces; register at runtime (#611).
         let watcher =
             SpecialistsWatcher::start_with_user_dir(bus.clone(), vec![], Some(user.path.clone()));
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.wait_established(Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Registration alone must not emit (fingerprint primed at add time).

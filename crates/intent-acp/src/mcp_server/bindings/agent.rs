@@ -54,8 +54,8 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'agent.removeQueuedMessage', args: { agentId, messageId } }),
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
-        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata) =>
-            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata } }),
+        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort) =>
+            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
@@ -180,6 +180,7 @@ async fn create(
     let extra = AgentCreateExtra {
         metadata: Some(Value::Object(metadata)),
         is_background: Some(is_background),
+        reasoning_effort: opt_str(args, "reasoningEffort"),
         ..AgentCreateExtra::default()
     };
     let created = api
@@ -287,6 +288,7 @@ async fn delegate(
         agent_instructions: opt_str(args, "agentInstructions"),
         specialist: opt_str(args, "specialist"),
         model: opt_str(args, "model"),
+        reasoning_effort: opt_str(args, "reasoningEffort"),
         behavior_prompt: opt_str(args, "behaviorPrompt"),
         wait_mode: opt_str(args, "waitMode"),
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
@@ -700,6 +702,7 @@ async fn wake_or_create(
             context_message,
             AgentWakeOrCreateInput {
                 model: opt_str(args, "model"),
+                reasoning_effort: opt_str(args, "reasoningEffort"),
                 caller_agent_id: caller.cloned(),
                 message_metadata,
                 ..Default::default()

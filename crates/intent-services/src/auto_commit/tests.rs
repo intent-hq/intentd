@@ -145,6 +145,7 @@ fn session(
         name: name.to_string(),
         name_explicitly_set,
         model: None,
+        reasoning_effort: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -276,6 +277,22 @@ async fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<
     let commits = intent_git::history::history(dir, 1).unwrap();
     let head = commits.into_iter().next().expect("at least one commit");
     (head.agent_id, head.linked_note_id, head.message)
+}
+
+/// Registry with `providers.active = "auggie"` so the completeOnce provider
+/// gate is open: unset settings resolve the gate CLOSED, so generation tests
+/// that expect the CLI to be reached must opt in explicitly.
+#[cfg(unix)]
+fn auggie_active_registry() -> (tempfile::TempDir, std::sync::Arc<crate::SettingsRegistry>) {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = std::sync::Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    registry
+        .apply(&[("providers.active".to_string(), json!("auggie"))])
+        .expect("set providers.active");
+    (config_dir, registry)
 }
 
 /// Fake auggie CLI inside an RAII temp dir; keep the returned guard alive for
@@ -572,7 +589,8 @@ async fn generated_message_replaces_fallback_subject() {
         "gen-ok",
         "printf '<<<COMMIT_MESSAGE>>>\\nfeat: implement auto-commit\\n<<</COMMIT_MESSAGE>>>'",
     );
-    let svc = svc.with_auggie_bin(bin);
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
     let agent = session("agent-g1", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-g1").await;
@@ -593,7 +611,11 @@ async fn generation_timeout_falls_back_to_subject() {
     let (_bin_dir, bin) = fake_auggie("timeout", "sleep 60");
     // Compressed generation budget so the timeout-fallback path runs in
     // milliseconds; the hung CLI is group-reaped when the budget elapses.
-    let svc = svc.with_auggie_bin(bin).with_auto_commit_timeout_ms(250);
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250);
     let agent = session("agent-t1", &ws_id, None, false, "Timeout Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
@@ -610,7 +632,8 @@ async fn malformed_output_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let (_bin_dir, bin) = fake_auggie("malformed", "printf 'no tags at all'");
-    let svc = svc.with_auggie_bin(bin);
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
     let agent = session("agent-m1", &ws_id, None, false, "Malformed Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-m1").await;
@@ -652,7 +675,8 @@ async fn generated_message_preserves_trailers() {
         "trailers",
         "printf '<<<COMMIT_MESSAGE>>>\\nchore: generated commit\\n<<</COMMIT_MESSAGE>>>'",
     );
-    let svc = svc.with_auggie_bin(bin);
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
     let agent = session("agent-tr", &ws_id, Some("task-gen"), false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-tr").await;

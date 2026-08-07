@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-08-06
+
+### 🚀 Features
+
+- Sync device-flow token into gh CLI on authorize ([#914](https://github.com/intent-hq/intentd/pull/914))
+- *(acp)* Workspace_api discoverability — capability index, ws.help(), hook guidance, pr.snapshot repo override ([#911](https://github.com/intent-hq/intentd/pull/911))
+- Clarify ws.app.question.ask hints and stabilize timing tests ([#917](https://github.com/intent-hq/intentd/pull/917))
+- *(agents)* Add flushQueuedMessages mode setting (all/systemOnly/off)
+- Interrupt agents and cancel hooks on workspace archive; eager hook-task abort on delete ([#896](https://github.com/intent-hq/intentd/pull/896))
+- *(voice)* Structured voice-no-api-key error data on voice.transcribe ([#902](https://github.com/intent-hq/intentd/pull/902))
+- ModelOptions frontmatter list on specialist definitions ([#900](https://github.com/intent-hq/intentd/pull/900))
+- *(voice)* Add voice.language setting as transcription language fallback ([#901](https://github.com/intent-hq/intentd/pull/901))
+- Surface specialist modelOptions in the workspace_api delegate docs ([#908](https://github.com/intent-hq/intentd/pull/908))
+- *(agent)* Agent.markSeen per-conversation seen marker (protocol 4.5)
+- *(events)* Suppress gitignored paths in the file watcher ([#903](https://github.com/intent-hq/intentd/pull/903))
+- *(search)* Rank archived-workspace matches below active in search.messages ([#906](https://github.com/intent-hq/intentd/pull/906))
+- Log gh CLI out of github.com on github.revoke when its token matches ([#915](https://github.com/intent-hq/intentd/pull/915))
+- Shrink ws.pr.* to snapshot and ws.git.* to commit; point agents at gh/git CLIs ([#918](https://github.com/intent-hq/intentd/pull/918))
+- Persist interruption reason on interrupted rows and stream:end ([#919](https://github.com/intent-hq/intentd/pull/919))
+- [**breaking**] Remove 11 caller-less pr.* router methods; bump protocol to 5.0
+- [**breaking**] Remove model tiers and default-provider designation ([#922](https://github.com/intent-hq/intentd/pull/922))
+- Workspace-derived vocabulary for voice dictation ([#920](https://github.com/intent-hq/intentd/pull/920))
+
+### 🐛 Bug Fixes
+
+- *(services)* Publish subscriptions-changed on resume watch re-registration ([#904](https://github.com/intent-hq/intentd/pull/904))
+- Stop bumping updated_at in markSeen/dismissAttention ([#905](https://github.com/intent-hq/intentd/pull/905))
+- Seal after_all groups on queue-idle regardless of hooks ([#909](https://github.com/intent-hq/intentd/pull/909))
+- Scope attention writes to the attention column ([#912](https://github.com/intent-hq/intentd/pull/912))
+- Load nvm in interactive terminals ([#898](https://github.com/intent-hq/intentd/pull/898))
+- Defer completion-watch settlement for idle children waiting on other agents ([#913](https://github.com/intent-hq/intentd/pull/913))
+- Resolve agent.delegate provider from configured default, not Auggie ([#910](https://github.com/intent-hq/intentd/pull/910))
+
+### 🧪 Testing
+
+- Make opencode bridge-server test host-independent ([#899](https://github.com/intent-hq/intentd/pull/899))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump rand from 0.9.5 to 0.10.2 ([#771](https://github.com/intent-hq/intentd/pull/771))
+- Bump rquickjs from 0.9.0 to 0.12.2 ([#770](https://github.com/intent-hq/intentd/pull/770))
+- Bump tokio-tungstenite from 0.23.1 to 0.30.0 ([#769](https://github.com/intent-hq/intentd/pull/769))
+
+
 ## [0.4.2] - 2026-08-04
 
 ### 🚀 Features

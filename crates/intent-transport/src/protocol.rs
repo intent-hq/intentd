@@ -23,24 +23,33 @@
 //! Version 4.5 adds `agent.markSeen` (additive; §5.5): the per-conversation
 //! seen marker (`lastSeenMessageId` in session metadata, monotonic advance,
 //! `agent:updated` emit, served on the `AgentLite` metadata projection) —
-//! 279 router methods, 316 total.
-//! Version 4.6 adds the execution-environment profile surface (additive;
-//! §5.35): the `sandbox.profiles.list` / `sandbox.profiles.update` /
-//! `sandbox.options` router methods (282 router methods, 319 dispatchable
-//! names) and the `system.capabilities.microvmSupported` field (§5.7).
-//! Version 4.7 adds execution-environment selection at workspace creation
-//! (additive; §5.1): the `workspace.create` `executionEnvironment` param, the
-//! persisted `Workspace.executionEnvironment` field, and the structured
+//! 279 router methods, 316 total. Version 5.0 removes the 11 caller-less
+//! `pr.*` router methods (breaking; §5.7, monorepo#1506) — `pr.capabilities`,
+//! `pr.listComments`, `pr.listReviewComments`, `pr.getReviews`,
+//! `pr.listCheckRuns`, `pr.merge`, `pr.updateBranch`, `pr.postComment`,
+//! `pr.replyToReviewComment`, `pr.resolveThread`, `pr.createReview` — keeping
+//! only `pr.status` and `pr.refresh`; the `github.*` explicit-addressing
+//! surface (§5.27) and the MCP-only `ws.pr.snapshot` engine are unchanged —
+//! 268 router methods, 305 total. Version 5.1 adds workspace-derived
+//! vocabulary for voice dictation (additive; §5.41): the optional
+//! `workspaceId` param on `voice.transcribe` and the new
+//! `voice.getWorkspaceVocabulary` router method, plus the
+//! `voice.workspaceVocabulary.maxTerms` setting — 269 router methods,
+//! 306 total. Version 5.2 adds the first-class `reasoningEffort` session
+//! field (additive; §5.5): accepted on `agent.create`, patchable/clearable
+//! via `agent.update` `changes`, and served on the `AgentSession` /
+//! `AgentLite` projections (omitted when unset) — no method-catalog change.
+//! Version 5.3 adds the execution-environment surface (additive; §5.35,
+//! §5.1, §5.5b): the `sandbox.profiles.list` / `sandbox.profiles.update` /
+//! `sandbox.options` / `sandbox.image.check` router methods, the
+//! `system.capabilities.microvmSupported` field (§5.7), the
+//! `workspace.create` `executionEnvironment` param with the persisted
+//! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9) — no method-catalog change.
-//! Version 4.8 adds the `sandbox.image.check` router method (additive;
-//! §5.5b): a dry-run guest-image validity check — manifest fetch + optional
-//! pin verify + contract check, no rootfs download, no cache mutation —
-//! returning `{ valid, imageId?, version?, arch?, manifestSha256?, error? }`
-//! (283 router methods, 320 dispatchable names).
+//! error payloads (§9) — 273 router methods, 310 dispatchable names.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "4.8";
+pub const PROTOCOL_VERSION: &str = "5.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

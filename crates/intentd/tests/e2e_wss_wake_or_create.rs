@@ -775,11 +775,12 @@ async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
     );
 }
 
-/// TASK-C2: `agent.delegate` with `taskNoteId` + `skipAutoCommit=true` appends
-/// the reference `**Auto-commit is OFF.**` instruction after the scope
-/// directive, byte-for-byte, over the real WSS wire.
+/// Status-neutral commit policy: `agent.delegate` with `taskNoteId` +
+/// `skipAutoCommit=true` delivers a first message that ends at the scope
+/// directive with NO state-specific auto-commit instruction, byte-for-byte,
+/// over the real WSS wire — the opt-out only gates the idle subscriber.
 #[tokio::test]
-async fn delegate_with_skip_auto_commit_appends_commit_instruction_over_wss() {
+async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
     const TITLE: &str = "TASK-C skipAutoCommit task";
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task(TITLE).await;
     let cfg = client_config(&fp);
@@ -821,13 +822,15 @@ async fn delegate_with_skip_auto_commit_appends_commit_instruction_over_wss() {
 **Your Task Note:** \"{TITLE}\" (ID: {task_note_id})\n\
 This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n\
 \n\
-**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.\n\
-\n\
-**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
+**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks."
     );
     assert_eq!(
         initial, expected,
-        "child first message must be byte-exact when skipAutoCommit=true: {initial:?}"
+        "child first message must be byte-exact and status-neutral when skipAutoCommit=true: {initial:?}"
+    );
+    assert!(
+        !initial.contains("Auto-commit is"),
+        "no state-specific auto-commit text over the wire: {initial:?}"
     );
 }
 

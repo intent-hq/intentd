@@ -20,7 +20,9 @@
 //! `last_error`, emits `hook:evicted`, and wakes the owner with the reason.
 //! Scripts may call `console.log/info/warn/error`; the last run's captured
 //! output persists to `last_logs` (overwritten each run, capped) and is
-//! appended to dispatch/evict wake messages. A run may also return a `state`
+//! appended to dispatch/evict wake messages, which end with a terminal-state
+//! note (the hook is retired and will not run again, with a reschedule
+//! pointer). A run may also return a `state`
 //! field: its JSON serialization persists to `last_state` (size-capped) and
 //! is injected into the next run as the `hookState` global.
 
@@ -56,8 +58,8 @@ pub(crate) const MIN_HOOK_DELAY_MS: i64 = 10_000;
 pub(crate) const MAX_HOOK_TTL_MS: i64 = 3_600_000;
 pub(crate) const DEFAULT_HOOK_TTL_MS: i64 = MAX_HOOK_TTL_MS;
 
-/// Maximum hook name length (spec: name > 19 chars fails validation).
-pub(crate) const MAX_HOOK_NAME_LEN: usize = 19;
+/// Maximum hook name length (spec: name > 50 chars fails validation).
+pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 
 /// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
 /// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
@@ -1269,6 +1271,12 @@ impl Services {
     /// owner whose last hook just terminated must still settle the owner's
     /// deferred completion watches (a successful wake makes the backstop a
     /// no-op — the queued/running wake turn owns the settlement).
+    ///
+    /// `dispatched` / `evicted` wakes additionally end with a terminal-state
+    /// note (after any `[hook logs]` section) telling the owner the hook is
+    /// retired and will not run again, with a reschedule pointer — the
+    /// expiry notice states this explicitly in its own wording, and
+    /// cancellation implies it.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
         let metadata = json!({
             "type": "hook_wake",
@@ -1276,7 +1284,23 @@ impl Services {
             "hookName": hook.name,
             "reason": reason,
         });
-        let content = format!("[Background hook \"{}\"] {message}", hook.name);
+        let terminal_note = match reason {
+            "dispatched" => Some(
+                "[This hook has now fired and is retired — it will not run again. \
+                 Schedule a new hook via ws.hook.schedule if you still need to watch \
+                 this condition.]",
+            ),
+            "evicted" => Some(
+                "[This hook will not run again. Schedule a new hook via \
+                 ws.hook.schedule if the condition is still worth watching.]",
+            ),
+            _ => None,
+        };
+        let mut content = format!("[Background hook \"{}\"] {message}", hook.name);
+        if let Some(note) = terminal_note {
+            content.push_str("\n\n");
+            content.push_str(note);
+        }
         if let Err(e) = self
             .deliver_wake_message(
                 &hook.workspace_id,
@@ -1441,6 +1465,7 @@ mod tests {
             name: "Owner".to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -1569,16 +1594,16 @@ mod tests {
     #[tokio::test]
     async fn schedule_validates_name_delay_and_code() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Name too long (20 chars > 19 cap).
+        // Name too long (51 chars > 50 cap).
         let err = svc
             .hook_schedule_op(
                 &ws,
                 &owner,
-                &json!({ "name": "a".repeat(20), "code": "return;", "delayMs": 10_000 }),
+                &json!({ "name": "a".repeat(51), "code": "return;", "delayMs": 10_000 }),
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("at most 19"), "{err}");
+        assert!(err.to_string().contains("at most 50"), "{err}");
         // Delay below the floor.
         let err = svc
             .hook_schedule_op(
@@ -1598,6 +1623,32 @@ mod tests {
         // Nothing persisted by any failed validation.
         let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert!(hooks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schedule_accepts_fifty_char_name() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let name = "b".repeat(50);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": name,
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule with 50-char name");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(hook.name, name);
+        assert_eq!(hook.state, HookState::Scheduled);
+        // Round-trips through list untouched.
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        let hooks = listed["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["name"], json!(name));
     }
 
     #[tokio::test]
@@ -1725,6 +1776,9 @@ mod tests {
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("done already"), "{text}");
+        // The validation-run dispatch wake ends with the terminal note.
+        assert!(text.contains("retired — it will not run again"), "{text}");
+        assert!(text.contains("ws.hook.schedule"), "{text}");
         let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
     }
@@ -1817,7 +1871,9 @@ mod tests {
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 2);
         assert!(hook.next_run_at.is_none());
-        wait_for_wake(&svc, &owner, "CI is green").await;
+        let text = wait_for_wake(&svc, &owner, "CI is green").await;
+        // The scheduler-run dispatch wake ends with the terminal note.
+        assert!(text.contains("retired — it will not run again"), "{text}");
         // Task deregistered after the terminal outcome.
         let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {
@@ -1859,6 +1915,9 @@ mod tests {
         assert!(types.contains(&HOOK_EVICTED.to_string()), "{types:?}");
         let text = wait_for_wake(&svc, &owner, "evicted").await;
         assert!(text.contains("kaput"), "{text}");
+        // The eviction wake ends with the will-not-run-again note.
+        assert!(text.contains("will not run again"), "{text}");
+        assert!(text.contains("ws.hook.schedule"), "{text}");
     }
 
     #[tokio::test]
@@ -1896,7 +1955,9 @@ mod tests {
         // Timeout kills the eval before the console capture can return: the
         // logs from that run are lost and last_logs stays untouched.
         assert_eq!(hook.last_logs, None);
-        wait_for_wake(&svc, &owner, "evicted").await;
+        let text = wait_for_wake(&svc, &owner, "evicted").await;
+        // The eviction wake ends with the will-not-run-again note.
+        assert!(text.contains("will not run again"), "{text}");
     }
 
     #[tokio::test]
@@ -1931,6 +1992,9 @@ mod tests {
         let session = svc.store().get_agent_session(&owner).await.unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(text.contains("cancelled from the app"), "{text}");
+        // Cancellation keeps its own wording — no dispatch/eviction terminal note.
+        assert!(!text.contains("will not run again"), "{text}");
+        assert!(!text.contains("retired"), "{text}");
         // A second cancel fails: the hook is no longer active.
         let err = svc
             .hook_cancel_op(&ws, &hook.hook_id, true)
@@ -2133,10 +2197,8 @@ mod tests {
         )
         .await
         .expect("schedule");
-        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
-        session.attention_request_kind = Some("discussion".to_string());
         svc.store()
-            .update_agent_session(&ws, &session)
+            .set_attention_request(&ws, &owner, "discussion", "need input", &now_iso())
             .await
             .unwrap();
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
@@ -2370,6 +2432,12 @@ mod tests {
         assert_eq!(hook.last_logs.as_deref(), Some("all green"));
         let text = wait_for_wake(&svc, &owner, "[hook logs]").await;
         assert!(text.contains("all green"), "{text}");
+        // The terminal note is the final line — after the [hook logs] section.
+        let logs_at = text.find("[hook logs]").expect("logs section");
+        let note_at = text
+            .find("retired — it will not run again")
+            .expect("terminal note");
+        assert!(note_at > logs_at, "{text}");
     }
 
     #[tokio::test]
@@ -2427,9 +2495,13 @@ mod tests {
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Evicted).await;
         assert!(hook.last_error.as_deref().unwrap().contains("kaput"));
         assert_eq!(hook.last_logs.as_deref(), Some("made it here"));
-        // The evict wake carries the logs section.
+        // The evict wake carries the logs section, with the terminal note
+        // after it.
         let text = wait_for_wake(&svc, &owner, "[hook logs]").await;
         assert!(text.contains("made it here"), "{text}");
+        let logs_at = text.find("[hook logs]").expect("logs section");
+        let note_at = text.find("will not run again").expect("terminal note");
+        assert!(note_at > logs_at, "{text}");
     }
 
     #[tokio::test]
@@ -2865,6 +2937,9 @@ mod tests {
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
         assert!(text.contains("2 runs completed"), "{text}");
         assert!(text.contains("ws.hook.schedule"), "{text}");
+        // Expiry keeps its own wording — no dispatch/eviction terminal note.
+        assert!(!text.contains("will not run again"), "{text}");
+        assert!(!text.contains("retired"), "{text}");
         // Task deregistered after the terminal outcome.
         let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {

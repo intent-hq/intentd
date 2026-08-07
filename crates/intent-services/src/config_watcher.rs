@@ -310,7 +310,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn watcher_detects_rename_style_atomic_save() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
         let _watcher = ConfigWatcher::start(reg.clone(), move |notice| {

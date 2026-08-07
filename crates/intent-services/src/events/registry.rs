@@ -396,7 +396,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn boot_time_workspace_is_watched() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("boot");
         let ws = test_workspace("ws-boot", &root.path);
@@ -412,7 +416,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_created_after_start_gains_watching_and_deletion_stops_it() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -450,7 +458,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn workspace_opened_resolves_path_via_services() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("opened");
         let ws = test_workspace("ws-opened", &root.path);

@@ -32,7 +32,7 @@ use intent_acp::{
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
-    BoxFuture, Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    BoxFuture, Error, EventActor, Result, UsageCost, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::{build_provider_env_with_unsloth, InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
-use crate::agent_session::agent_actor;
+use crate::agent_session::{agent_actor, InterruptReason, InterruptedBy, ThoughtLevelOption};
 use crate::events::EventBus;
 use crate::microvm::{
     self, orchestrator::GUEST_MCP_BRIDGE_PATH, MicrovmSpawnSpec, MicrovmVm, GUEST_WORKSPACE_DIR,
@@ -1102,6 +1102,14 @@ struct AgentHandle {
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
     spawned_provider: String,
+    /// The reasoning-effort (`thought_level`) selector the provider advertised
+    /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
+    /// the adapter is believed to be on — updated on every successful
+    /// `session/set_config_option`. `None` for providers that advertise no such
+    /// option, which makes every effort application a silent no-op. Lets
+    /// `ensure_started` re-apply a mid-session `reasoningEffort` change on the
+    /// LIVE child, so it lands before the next prompt without a respawn.
+    thought_level: Option<ThoughtLevelOption>,
     /// Pause gate for the idle wake listener (monorepo#855): while > 0 the
     /// listener neither locks nor consumes `notifications`. Raised around
     /// `start_session` so a `session/load` replay burst is always drained by
@@ -1813,6 +1821,7 @@ impl AgentManager {
             session_mcp_servers,
             spawned_model: opts.model.map(|s| s.to_string()),
             spawned_provider: opts.provider.command.to_string(),
+            thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -2435,6 +2444,12 @@ impl AgentManager {
         // (claude-code) — see `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
+        // The persisted `reasoningEffort` (PROTOCOL §5.5) feeds the generic
+        // post-session effort application through whatever `thought_level`
+        // config option the provider advertised — see
+        // `install_and_apply_thought_level`.
+        let stored_effort = session_record.reasoning_effort.clone();
+
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
@@ -2495,7 +2510,14 @@ impl AgentManager {
                     stored_model.as_deref(),
                 )
                 .await;
-                self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
+                self.install_and_apply_thought_level(
+                    conn.as_ref(),
+                    agent_id,
+                    &opened.session_id,
+                    opened.thought_level.clone(),
+                    stored_effort.as_deref(),
+                )
+                .await;
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -2540,7 +2562,14 @@ impl AgentManager {
                 stored_model.as_deref(),
             )
             .await;
-            self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
+            self.install_and_apply_thought_level(
+                conn.as_ref(),
+                agent_id,
+                &opened.session_id,
+                opened.thought_level.clone(),
+                stored_effort.as_deref(),
+            )
+            .await;
             return Ok(opened.session_id);
         }
 
@@ -2565,27 +2594,119 @@ impl AgentManager {
             stored_model.as_deref(),
         )
         .await;
-        self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
+        self.install_and_apply_thought_level(
+            conn.as_ref(),
+            agent_id,
+            &opened.session_id,
+            opened.thought_level.clone(),
+            stored_effort.as_deref(),
+        )
+        .await;
         Ok(opened.session_id)
     }
 
-    /// Sync the live handle's `spawned_model` to what `resolve_spawn` will
-    /// yield now that the session open persisted an effective model (D13):
-    /// otherwise the next `ensure_started` would see a model "change"
-    /// (placeholder → effective) that no `agent.setModel` requested and
-    /// pointlessly respawn the child. The stored value mirrors
-    /// `resolve_spawn`'s bare-model filter — an effective display name
-    /// always carries whitespace ("Opus 4.8"), which `resolve_spawn` drops
-    /// to `None` (spawn on the provider default, exactly what the
-    /// placeholder resolved from). No-op when nothing was persisted or the
-    /// handle is gone.
-    fn sync_spawned_model(&self, agent_id: &AgentId, effective_model: Option<&str>) {
-        let Some(effective) = effective_model else {
+    /// Record the `thought_level` selector a freshly opened/resumed session
+    /// advertised on the live handle and apply the session's stored
+    /// `reasoningEffort` through it (PROTOCOL §5.5). Generic by construction:
+    /// the config id comes from the adapter's own `configOptions`
+    /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
+    /// provider capability flag is needed and a provider that advertises no
+    /// such option silently ignores the field. Best-effort — a rejected call
+    /// is logged and never fails session startup.
+    async fn install_and_apply_thought_level(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        acp_session_id: &str,
+        thought_level: Option<ThoughtLevelOption>,
+        stored_effort: Option<&str>,
+    ) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.thought_level = thought_level;
+        }
+        self.apply_thought_level(conn, agent_id, acp_session_id, stored_effort)
+            .await;
+    }
+
+    /// Send the session's `reasoningEffort` to the provider through the
+    /// `thought_level` config option discovered at session open, then update
+    /// the handle's tracked `current_value` so the next call is a no-op until
+    /// the effort actually changes. A CLEARED effort restores the provider's
+    /// own default — the value the adapter reported at session open — so the
+    /// clear takes effect on the live session rather than leaving the last
+    /// applied level in place. No-op when: the provider advertised no such
+    /// option, the adapter is already on that value, or the value is not among
+    /// the ones the select accepts (a stale effort from another provider's
+    /// vocabulary must not be sent). Matching against the advertised values is
+    /// case-insensitive — the stored level keeps the caller's spelling
+    /// (validation is case-insensitive too), so the ADAPTER's spelling is what
+    /// gets sent. Failures are logged at WARN — the provider keeps its current
+    /// effort.
+    async fn apply_thought_level(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        acp_session_id: &str,
+        stored_effort: Option<&str>,
+    ) {
+        let requested = stored_effort.map(str::trim).filter(|e| !e.is_empty());
+        let Some((config_id, value)) = ({
+            let handles = self.handles.lock().unwrap();
+            handles.get(agent_id).and_then(|h| {
+                h.thought_level.as_ref().and_then(|t| {
+                    // The adapter's own spelling of the requested level; with
+                    // no advertised values the stored spelling is all we have.
+                    // A cleared effort targets the provider's opening default.
+                    let value = match requested {
+                        Some(effort) => {
+                            match t.values.iter().find(|v| v.eq_ignore_ascii_case(effort)) {
+                                Some(v) => v.clone(),
+                                None if t.values.is_empty() => effort.to_string(),
+                                None => return None,
+                            }
+                        }
+                        None => t.initial_value.clone(),
+                    };
+                    (!value.is_empty() && !t.current_value.eq_ignore_ascii_case(&value))
+                        .then(|| (t.config_id.clone(), value))
+                })
+            })
+        }) else {
             return;
         };
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
-            handle.spawned_model = Some(effective.to_string())
-                .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
+        let effort = value.as_str();
+        match intent_acp::session::set_session_config_option(
+            conn,
+            acp_session_id,
+            &config_id,
+            effort,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    session_id = acp_session_id,
+                    config_id = %config_id,
+                    effort = %effort,
+                    "session/set_config_option applied reasoning effort"
+                );
+                if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+                    if let Some(t) = handle.thought_level.as_mut() {
+                        t.current_value = effort.to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    session_id = acp_session_id,
+                    config_id = %config_id,
+                    effort = %effort,
+                    error = %e,
+                    "session/set_config_option failed; provider keeps its current reasoning effort"
+                );
+            }
         }
     }
 
@@ -2692,9 +2813,10 @@ impl AgentManager {
     /// pre-spawn provider switch must not be sent). Bare ids are treated as
     /// provider-local; compound ids are stripped to their bare part.
     /// Whitespace-bearing ids are also `None`: real provider option ids never
-    /// contain spaces, so a display name persisted by the effective-model
-    /// resolution (D13, e.g. `claude-code:Opus 4.8`) must not be sent back as
-    /// a `session/set_model` / `session/set_config_option` value.
+    /// contain spaces, so a display name persisted onto `model` by the
+    /// pre-monorepo#1534 effective-model resolution (legacy rows, e.g.
+    /// `claude-code:Opus 4.8`) must not be sent back as a
+    /// `session/set_model` / `session/set_config_option` value.
     fn provider_local_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -2828,8 +2950,13 @@ impl AgentManager {
         }
         // Spell the rename tool the way this session's provider surfaces it;
         // a failed session lookup falls back to the generic phrasing.
+        let configured_default =
+            crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let tool_ref = match self.services.store.get_agent_session(agent_id).await {
-            Ok(s) => workspace_naming_tool_reference(&session_provider_id(&s)),
+            Ok(s) => workspace_naming_tool_reference(&session_provider_id(
+                &s,
+                configured_default.as_deref(),
+            )),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -3092,7 +3219,12 @@ impl AgentManager {
         }
         if let Some(live) = partial_turn {
             self.services
-                .flush_partial_turn_on_interruption(agent_id, live, false)
+                .flush_partial_turn_on_interruption(
+                    agent_id,
+                    live,
+                    InterruptReason::AgentStopped,
+                    None,
+                )
                 .await;
         }
         // Drop any pending recreate/prepend flags: the next spawn re-decides
@@ -3123,20 +3255,36 @@ impl AgentManager {
     /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
     /// whether an agent was found.
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
-        self.interrupt_inner(agent_id, false).await
+        self.interrupt_inner(agent_id, InterruptReason::UserStop, None)
+            .await
+            .0
     }
 
-    /// Shared body of [`AgentManager::interrupt`] with one extra knob:
-    /// `suppress_idle_emit` skips the STAB-28 synthetic `agent:idle`
-    /// (reason: `interrupted`) emit. The only caller passing `true` is
-    /// [`AgentManager::interrupt_send_message`] — an interrupt that carries a
-    /// follow-up message is a preemption, not a settlement: the child is about
-    /// to run the interrupt turn, so waking completion watches here would
-    /// deliver a spurious "child settled" report to the parent. The plain
-    /// `interrupt()` / `agent.stop` keep-alive path passes `false` so STAB-28
-    /// behavior (watches fire on interrupt) is preserved. `agent:stream:end`
-    /// is emitted unconditionally in both paths.
-    async fn interrupt_inner(&self, agent_id: &AgentId, suppress_idle_emit: bool) -> bool {
+    /// Shared body of [`AgentManager::interrupt`], parameterized on the
+    /// interruption cause. `reason` (+ `interrupted_by` sender attribution for
+    /// message preemption) is stamped on the persisted interrupted row and the
+    /// terminal `agent:stream:end` payload. A `PreemptedByMessage` reason also
+    /// skips the STAB-28 synthetic `agent:idle` (reason: `interrupted`) emit —
+    /// the only caller passing it is [`AgentManager::preempt_busy_turn`]: an
+    /// interrupt that carries a follow-up message is a preemption, not a
+    /// settlement: the child is about to run the interrupt turn, so waking
+    /// completion watches here would deliver a spurious "child settled" report
+    /// to the parent. The plain `interrupt()` / `agent.stop` keep-alive path
+    /// passes `UserStop` so STAB-28 behavior (watches fire on interrupt) is
+    /// preserved. `agent:stream:end` is emitted unconditionally in both paths.
+    ///
+    /// Returns `(agent_found, interrupted_row_message_id)` — the second field
+    /// names the interrupted assistant row this call persisted (`None` when
+    /// no live-turn slot was open or the call fell back to the kill path), so
+    /// `preempt_busy_turn` can exclude that row from its combined-delivery
+    /// re-queue check.
+    async fn interrupt_inner(
+        &self,
+        agent_id: &AgentId,
+        reason: InterruptReason,
+        interrupted_by: Option<InterruptedBy>,
+    ) -> (bool, Option<String>) {
+        let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
         let conn = self
@@ -3148,7 +3296,7 @@ impl AgentManager {
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
-            return self.stop(agent_id).await;
+            return (self.stop(agent_id).await, None);
         };
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
@@ -3156,7 +3304,7 @@ impl AgentManager {
         let session = self.services.store.get_agent_session(agent_id).await.ok();
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
-            return self.stop(agent_id).await;
+            return (self.stop(agent_id).await, None);
         };
         // Snapshot the live-turn slot BEFORE aborting the worker: the abort
         // drops the worker future and with it the LiveTurnGuard, which clears
@@ -3169,15 +3317,20 @@ impl AgentManager {
             worker.abort();
         }
         // Persist the streamed-so-far assistant content as an interrupted
-        // assistant row. Runs AFTER the abort (a worker append already in
-        // flight can still land, but the `agent_message.id` PK keeps the
-        // outcome convergent — the flush absorbs the UNIQUE collision) and
-        // BEFORE the terminal `agent:stream:end` emit below so the
-        // chat-channel terminal reconcile sees the persisted row and keeps
-        // the blocks instead of removing them. Only the plain `agent.stop`
-        // path (`!suppress_idle_emit`) opts into persisting an EMPTY row for
-        // a pre-first-token stop — the STAB-114 zero-output combined delivery
-        // in `interrupt_send_message` must never see a phantom row.
+        // assistant row, stamped with the interruption reason (+ sender
+        // attribution on preemption). Runs AFTER the abort (a worker append
+        // already in flight can still land, but the `agent_message.id` PK
+        // keeps the outcome convergent — the flush absorbs the UNIQUE
+        // collision) and BEFORE the terminal `agent:stream:end` emit below so
+        // the chat-channel terminal reconcile sees the persisted row and
+        // keeps the blocks instead of removing them. The row persists even
+        // when nothing streamed yet (empty blocks) — EVERY interruption
+        // leaves a durable marker row; on the message-preemption path the
+        // empty row lands BEFORE `send_message` appends the interrupting
+        // message row, so transcript order reads correctly (this supersedes
+        // the STAB-114 phantom-row-free zero-output preemption; the
+        // combined-delivery re-queue check in `preempt_busy_turn` excludes
+        // this row by id).
         let interrupted_text_blocks = partial_turn
             .as_ref()
             .map(|live| crate::agent_session::text_block_strings(&live.blocks))
@@ -3185,7 +3338,12 @@ impl AgentManager {
         let interrupted_message_id = match partial_turn {
             Some(live) => {
                 self.services
-                    .flush_partial_turn_on_interruption(agent_id, live, !suppress_idle_emit)
+                    .flush_partial_turn_on_interruption(
+                        agent_id,
+                        live,
+                        reason,
+                        interrupted_by.as_ref(),
+                    )
                     .await
             }
             None => None,
@@ -3248,10 +3406,21 @@ impl AgentManager {
         // blocks for the event to mirror; carrying undrained entries would
         // break the byte-identical persisted↔event invariant.
         if let Some(workspace_id) = workspace_id {
+            // `interruptReason`/`interruptedBy` mirror the persisted row's
+            // metadata so clients can render the reason-specific Stopped
+            // indicator live, without refetching the transcript.
             let mut end_data = json!({
                 "agentId": agent_id.0,
                 "stopReason": "interrupted",
+                "interruptReason": reason.as_str(),
             });
+            // Same reason gate as the persisted row: `interruptedBy` is
+            // defined only for message preemption.
+            if reason == InterruptReason::PreemptedByMessage {
+                if let Some(ref by) = interrupted_by {
+                    end_data["interruptedBy"] = by.to_json();
+                }
+            }
             if let Some(ref message_id) = interrupted_message_id {
                 end_data["messageId"] = json!(message_id);
             }
@@ -3314,7 +3483,7 @@ impl AgentManager {
                     .await;
             }
         }
-        true
+        (true, interrupted_message_id)
     }
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
@@ -4625,14 +4794,43 @@ impl AgentManager {
             .map(|live| !live.blocks.is_empty())
             .unwrap_or(false);
 
+        // Sender attribution for the interrupted row / `stream:end` payload:
+        // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
+        // send carries the `messageMetadata` `fromAgentId`/`fromAgentName`
+        // sender-attribution payload (PROTOCOL §5.5). Automatic sends with
+        // no attribution stamp no `interruptedBy` (reason alone suffices).
+        let interrupted_by = if options.origin.is_user() {
+            Some(InterruptedBy::User)
+        } else {
+            options.message_metadata.as_ref().and_then(|md| {
+                md.get("fromAgentId")
+                    .and_then(Value::as_str)
+                    .map(|id| InterruptedBy::Agent {
+                        agent_id: id.to_string(),
+                        name: md
+                            .get("fromAgentName")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+            })
+        };
         // Cancel the turn IMMEDIATELY to prevent it from finishing while
         // we prepare the re-queue logic below. This releases the in-flight
         // slot and aborts the draining worker. The STAB-28 synthetic
-        // `agent:idle` is suppressed: this interrupt carries a
-        // follow-up message (the child is being preempted, not
+        // `agent:idle` is suppressed (`PreemptedByMessage`): this interrupt
+        // carries a follow-up message (the child is being preempted, not
         // settling), so completion watches must not report "child
-        // settled" to the parent here.
-        self.interrupt_inner(agent_id, true).await;
+        // settled" to the parent here. The returned row id names the
+        // interrupted marker row this preemption just persisted (empty
+        // blocks on the zero-output path), excluded from the progress
+        // check below.
+        let (_, interrupted_row_id) = self
+            .interrupt_inner(
+                agent_id,
+                InterruptReason::PreemptedByMessage,
+                interrupted_by,
+            )
+            .await;
 
         if !has_output {
             // Zero-output condition: the provider dropped the preempted
@@ -4645,7 +4843,14 @@ impl AgentManager {
             // messages (assistant/tool/system) exist after the last
             // user message, the turn has already progressed and we
             // should NOT re-deliver (avoids duplicate tool calls or
-            // re-running side effects).
+            // re-running side effects). The EMPTY interrupted marker row
+            // the preemption itself just appended is NOT progress —
+            // exclude it by id, but ONLY while it is actually empty:
+            // `has_output` above is snapshotted several awaits before
+            // `interrupt_inner` re-reads the slot, so a first block
+            // streaming in that window lands in the flushed row — a
+            // NON-empty marker row IS progress and must keep blocking
+            // the combined re-delivery.
             if let Ok(messages) = self
                 .services
                 .store
@@ -4657,10 +4862,11 @@ impl AgentManager {
                         .iter()
                         .rposition(|m| m.id == last_user_msg.id)
                         .unwrap();
-                    let has_non_user_after = messages
-                        .iter()
-                        .skip(last_user_idx + 1)
-                        .any(|m| m.role != "user");
+                    let has_non_user_after = turn_progressed_after(
+                        &messages,
+                        last_user_idx,
+                        interrupted_row_id.as_ref(),
+                    );
 
                     if !has_non_user_after {
                         // Extract text from content blocks (JSON array).
@@ -4862,10 +5068,30 @@ impl AgentManager {
         // that outlast the interrupt drain window): opening on one would
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
+        //
+        // A `usage_update` cost is the one exception: providers commonly emit
+        // the final cost report after the response, so it can lead a buffered
+        // burst. It materializes no transcript content, so it is persisted
+        // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
+        // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
+            Some(intent_acp::session::MappedUpdate::UsageCost(cost)) => {
+                drop(guard);
+                self.services
+                    .persist_cost_only_ordered(
+                        agent_id,
+                        workspace_id,
+                        UsageCost {
+                            amount: cost.amount,
+                            currency: cost.currency,
+                        },
+                    )
+                    .await;
+                return true;
+            }
             _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
@@ -5311,6 +5537,27 @@ impl AgentManager {
                     // and an unchanged identity is a cheap no-op read.
                     self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
                         .await;
+                    // A `reasoningEffort` change needs no respawn: re-apply it
+                    // on the live session through the `thought_level` config
+                    // option discovered at session open, so it takes effect
+                    // for the turn about to run (PROTOCOL §5.5). A no-op when
+                    // the effort is unchanged or the provider advertised no
+                    // such option.
+                    let conn = self
+                        .handles
+                        .lock()
+                        .unwrap()
+                        .get(agent_id)
+                        .map(|h| h.connection.clone());
+                    if let Some(conn) = conn {
+                        self.apply_thought_level(
+                            conn.as_ref(),
+                            agent_id,
+                            &acp,
+                            session.reasoning_effort.as_deref(),
+                        )
+                        .await;
+                    }
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -5388,6 +5635,7 @@ impl AgentManager {
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
+        opts.reasoning_effort = resolved.reasoning_effort.as_deref();
         opts.provider_binary = resolved.provider_binary.as_deref();
         opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
         opts.npx_fallback_package = resolved.npx_fallback_package;
@@ -5479,7 +5727,12 @@ impl AgentManager {
             // degenerate status read/encode failure never drops the content.
             if let Some(live) = partial_turn {
                 self.services
-                    .flush_partial_turn_on_interruption(id, live, false)
+                    .flush_partial_turn_on_interruption(
+                        id,
+                        live,
+                        InterruptReason::DaemonShutdown,
+                        None,
+                    )
                     .await;
             }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
@@ -5916,6 +6169,27 @@ fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
 }
 
+/// STAB-114 combined-delivery progress check (`preempt_busy_turn`): has the
+/// turn progressed past the last user message? Any non-user row after it is
+/// progress, EXCEPT the interrupted marker row the preemption itself just
+/// appended — and that exclusion applies ONLY while the marker row is
+/// actually empty. The caller's zero-output snapshot is taken several awaits
+/// before `interrupt_inner` re-reads the live-turn slot, so a first block
+/// streaming in that window lands in the flushed row: a NON-empty marker row
+/// IS progress and must keep blocking the combined re-delivery (duplicate
+/// tool-call / re-run-side-effect hazard).
+fn turn_progressed_after(
+    messages: &[intent_core::AgentMessage],
+    last_user_idx: usize,
+    interrupted_row_id: Option<&String>,
+) -> bool {
+    messages.iter().skip(last_user_idx + 1).any(|m| {
+        m.role != "user"
+            && !(Some(&m.id) == interrupted_row_id
+                && m.content.as_array().is_some_and(Vec::is_empty))
+    })
+}
+
 /// Port of the FE `contextReferences` → `stdinContext` builder
 /// (`agent-backend-handler.service.ts` — the ~3170–3248 block). Iterates the
 /// raw JSON array in order and emits one context entry per reference,
@@ -6089,6 +6363,11 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
 struct ResolvedSpawn {
     provider: ProviderConfig,
     model: Option<String>,
+    /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
+    /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
+    /// keeps emitting `-c model_reasoning_effort=…` for sessions whose
+    /// compound `{base}/{effort}` model id was split by migration 0080.
+    reasoning_effort: Option<String>,
     cwd: PathBuf,
     provider_binary: Option<PathBuf>,
     extra_env: BTreeMap<String, String>,
@@ -6140,12 +6419,18 @@ fn derive_agent_type(
 /// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
 /// prefix wins over `session.provider`, because a cross-provider model switch
 /// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then the default provider. Delegates to
-/// [`crate::agent_session::resolve_provider_id`], which also guards against
-/// malformed compound ids like `:sonnet` (empty prefixes fall through to the
-/// provider field / default).
-fn session_provider_id(session: &AgentSession) -> String {
-    crate::agent_session::resolve_provider_id(session.model.as_deref(), session.provider.as_deref())
+/// a fallback for bare model ids, then `configured_default` (the settings-
+/// derived default — `model.default` prefix, else `providers.active`), then
+/// the first registered provider (neutral positional last resort).
+/// Delegates to [`crate::agent_session::resolve_provider_id`], which also
+/// guards against malformed compound ids like `:sonnet` (empty prefixes fall
+/// through to the provider field / configured default / last resort).
+fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> String {
+    crate::agent_session::resolve_provider_id(
+        session.model.as_deref(),
+        session.provider.as_deref(),
+        configured_default,
+    )
 }
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
@@ -6186,18 +6471,29 @@ fn resolve_spawn(
     settings: &intent_core::settings_file::SettingsFile,
     chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
-    let provider_id = session_provider_id(session);
-    // Whitespace-bearing bare ids are persisted effective-model display names
-    // (D13, e.g. `claude-code:Opus 4.8`) — stats/attribution values, not
-    // spawnable model ids. They must not reach `SpawnOptions.model` (CLI
-    // `--model` flags, codex config args, opencode env config); dropping them
-    // spawns on the provider default, exactly what the placeholder resolved
-    // from.
+    let provider_id = session_provider_id(
+        session,
+        crate::agent_session::derived_default_provider(settings).as_deref(),
+    );
+    // Whitespace-bearing bare ids are effective-model display names persisted
+    // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows, e.g.
+    // `claude-code:Opus 4.8`) — stats/attribution values, not spawnable model
+    // ids. They must not reach `SpawnOptions.model` (CLI `--model` flags,
+    // codex config args, opencode env config); dropping them spawns on the
+    // provider default, exactly what the placeholder resolved from.
     let model = session
         .model
         .as_ref()
         .map(|m| intent_providers::parse_compound_model_id(m).1)
         .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
+    // Session-level reasoning effort (PROTOCOL §5.5, Option B): threaded to
+    // `SpawnOptions.reasoning_effort` so the codex spawn path applies it as
+    // `-c model_reasoning_effort=…` (an effort embedded in a compound
+    // `{base}/{effort}` model id still wins inside the codex arg builder).
+    let reasoning_effort = session
+        .reasoning_effort
+        .clone()
+        .filter(|e| !e.trim().is_empty());
     // Chief has no worktree/repo on disk, so its children spawn in the
     // dedicated, daemon-owned, empty `<data_dir>/chief-cwd` directory
     // (STAB-50): providers that index their cwd (auggie with
@@ -6278,6 +6574,7 @@ fn resolve_spawn(
         return Ok(ResolvedSpawn {
             provider,
             model: None,
+            reasoning_effort: None,
             cwd,
             provider_binary: None,
             extra_env,
@@ -6307,6 +6604,7 @@ fn resolve_spawn(
         return Ok(ResolvedSpawn {
             provider,
             model,
+            reasoning_effort,
             cwd,
             provider_binary: None,
             extra_env,
@@ -6356,6 +6654,7 @@ fn resolve_spawn(
     Ok(ResolvedSpawn {
         provider,
         model,
+        reasoning_effort,
         cwd,
         provider_binary,
         extra_env,
@@ -6411,6 +6710,7 @@ fn rebuild_spawn_opts<'a>(
 ) -> SpawnOptions<'a> {
     let mut spawn_opts = SpawnOptions::new(opts.provider);
     spawn_opts.model = opts.model;
+    spawn_opts.reasoning_effort = opts.reasoning_effort;
     spawn_opts.cwd = opts.cwd;
     spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
     spawn_opts.quiet = opts.quiet;
@@ -8155,6 +8455,7 @@ mod role_reminder_tests {
             name: "Builder".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -8740,7 +9041,7 @@ mod dead_child_respawn_tests {
     /// writer to stay alive. `spawned_model`/`spawned_provider` match what
     /// `resolve_spawn` yields for the mock provider so the model-change
     /// respawn branch stays cold.
-    fn install_fake_handle(
+    pub(super) fn install_fake_handle(
         mgr: &AgentManager,
         agent_id: &AgentId,
         child: Option<Child>,
@@ -8769,6 +9070,7 @@ mod dead_child_respawn_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
+            thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -8836,6 +9138,211 @@ mod dead_child_respawn_tests {
             );
         }
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod thought_level_tests {
+    //! Generic reasoning-effort application (PROTOCOL §5.5): the session's
+    //! `reasoningEffort` reaches the provider through whatever
+    //! `thought_level`-category config option it advertised at session open,
+    //! under the adapter's own config id — no provider capability flag.
+
+    use super::dead_child_respawn_tests::install_fake_handle;
+    use super::role_reminder_tests::manager_with;
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Answer every request with `{}` while recording the params of each
+    /// `session/set_config_option` the daemon issued.
+    fn spawn_recording_responder(
+        read: tokio::io::DuplexStream,
+        write: tokio::io::DuplexStream,
+    ) -> (JoinHandle<()>, Arc<Mutex<Vec<Value>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let task = tokio::spawn(async move {
+            let mut lines = BufReader::new(read).lines();
+            let mut write = write;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let (Some(id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                if method == "session/set_config_option" {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(value.get("params").cloned().unwrap_or(Value::Null));
+                }
+                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+                if write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = write.flush().await;
+            }
+        });
+        (task, calls)
+    }
+
+    /// Install a live fake handle wired to a recording responder, seeded with
+    /// `thought_level`. Returns the handle's connection plus the recorded
+    /// `session/set_config_option` params.
+    async fn setup(
+        thought_level: Option<ThoughtLevelOption>,
+    ) -> (
+        AgentManager,
+        AgentId,
+        Arc<Connection>,
+        Arc<Mutex<Vec<Value>>>,
+        tempfile::TempDir,
+        JoinHandle<()>,
+    ) {
+        let (mgr, agent_id, db) = manager_with(None, None).await;
+        let (c2a_agent, a2c_agent) = install_fake_handle(&mgr, &agent_id, None);
+        let (task, calls) = spawn_recording_responder(c2a_agent, a2c_agent);
+        let conn = {
+            let mut handles = mgr.handles.lock().unwrap();
+            let handle = handles.get_mut(&agent_id).unwrap();
+            handle.thought_level = thought_level;
+            handle.connection.clone()
+        };
+        (mgr, agent_id, conn, calls, db, task)
+    }
+
+    fn option(current: &str) -> ThoughtLevelOption {
+        ThoughtLevelOption {
+            config_id: "effort".to_string(),
+            initial_value: current.to_string(),
+            current_value: current.to_string(),
+            values: vec!["low".into(), "medium".into(), "high".into()],
+        }
+    }
+
+    /// The stored effort is sent under the adapter's own config id, and the
+    /// handle's tracked current value follows so a repeat is a no-op.
+    #[tokio::test]
+    async fn applies_effort_under_the_discovered_config_id() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one call issued: {recorded:?}");
+        assert_eq!(recorded[0]["configId"], "effort");
+        assert_eq!(recorded[0]["value"], "high");
+        assert_eq!(recorded[0]["sessionId"], "sid-1");
+
+        // Re-applying the same effort is a no-op (tracked value advanced).
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "no redundant re-apply");
+    }
+
+    /// A mid-session change re-applies on the SAME live session — the effort
+    /// takes effect by the next prompt with no respawn.
+    #[tokio::test]
+    async fn reapplies_after_a_mid_session_change() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("low"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("medium"))
+            .await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        let recorded = calls.lock().unwrap().clone();
+        let values: Vec<&str> = recorded
+            .iter()
+            .map(|c| c["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["medium", "high"]);
+    }
+
+    /// The adapter is already on the stored effort → nothing is sent.
+    #[tokio::test]
+    async fn skips_when_the_adapter_is_already_on_that_effort() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("high"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// A provider that advertised no `thought_level` option silently ignores
+    /// the session's `reasoningEffort`.
+    #[tokio::test]
+    async fn absent_option_is_a_silent_no_op() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(None).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// An effort outside the select's vocabulary (e.g. a codex `xhigh` on a
+    /// claude session) is never sent — the adapter would reject it.
+    #[tokio::test]
+    async fn unknown_effort_value_is_not_sent() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("xhigh"))
+            .await;
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// The stored level keeps the caller's spelling, but the ADAPTER's own
+    /// spelling is what reaches `session/set_config_option` — otherwise a
+    /// validated `"HIGH"` would never be applied to a `["low","high"]` select.
+    #[tokio::test]
+    async fn caller_spelling_is_matched_case_insensitively() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("HIGH"))
+            .await;
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one call issued: {recorded:?}");
+        assert_eq!(recorded[0]["value"], "high", "adapter's own spelling sent");
+
+        // The tracked value advanced, so a differently-cased repeat is a no-op.
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("High"))
+            .await;
+        assert_eq!(calls.lock().unwrap().len(), 1, "no redundant re-apply");
+    }
+
+    /// Clearing the effort restores the provider's own opening default on the
+    /// live session, rather than leaving the last applied level in place.
+    #[tokio::test]
+    async fn clearing_the_effort_restores_the_provider_default() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("high"))
+            .await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", None)
+            .await;
+        let values: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["high", "medium"]);
+
+        // Already back on the default → a second clear sends nothing.
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("   "))
+            .await;
+        assert_eq!(calls.lock().unwrap().len(), 2, "no redundant restore");
+    }
+
+    /// No stored effort (or a blank one) while the adapter is still on its
+    /// opening default is a no-op — nothing to restore.
+    #[tokio::test]
+    async fn absent_or_blank_stored_effort_is_a_no_op() {
+        let (mgr, agent_id, conn, calls, _db, _task) = setup(Some(option("medium"))).await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", None)
+            .await;
+        mgr.apply_thought_level(conn.as_ref(), &agent_id, "sid-1", Some("  "))
+            .await;
+        assert!(calls.lock().unwrap().is_empty());
     }
 }
 
@@ -9638,6 +10145,7 @@ mod agent_retry_tests {
             name: "Agent".to_string(),
             name_explicitly_set: false,
             model: Some("model-1".to_string()),
+            reasoning_effort: None,
             provider: Some("provider-1".to_string()),
             system_prompt: None,
             specialist: None,

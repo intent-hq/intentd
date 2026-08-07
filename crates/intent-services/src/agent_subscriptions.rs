@@ -1338,7 +1338,7 @@ impl Services {
                     // predicate as reconcile_group_on_rehydration).
                     let is_idle_complete = if matches!(session.status, AgentStatus::RuntimeIdle) {
                         let has_report = session.completion_report.is_some();
-                        match self.store.get_interrupted_agent(child_id).await {
+                        let settled = match self.store.get_interrupted_agent(child_id).await {
                             Ok(opt) => has_report && opt.is_none(),
                             Err(e) => {
                                 tracing::warn!(
@@ -1348,7 +1348,21 @@ impl Services {
                                 );
                                 false
                             }
+                        };
+                        // Agent-waiting deferral (issue intent-hq/monorepo#1468):
+                        // an idle child that itself holds live outgoing
+                        // completion watches on other agents has not settled —
+                        // it will run again when a watched target completes.
+                        // Record the interim-skip marker (like the live
+                        // delivery path) so the backstops (`agent.unwatch`,
+                        // `agent.cancelSubscriptions`) can synthesize the real
+                        // completion if the last outgoing watch disappears
+                        // without a wake, then leave the watch armed.
+                        if settled && self.agent_is_waiting_on_agents(child_id) {
+                            self.mark_interim_skipped_idle(child_id);
+                            return;
                         }
+                        settled
                     } else {
                         false
                     };
@@ -1385,9 +1399,13 @@ impl Services {
         });
         // Idle-visibility: a synthesized idle carries the same
         // `waitingOnHooks` stamp as a live `agent:idle` emit (omitted when
-        // the child owns no active hook).
+        // the child owns no active hook) and the same emit-time
+        // `isWaitingForOtherAgents` flag (raw pending-watch derivation, no
+        // 2-cycle guard — matching the live emit sites).
         if event_type == intent_core::events::AGENT_IDLE {
             self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            data["isWaitingForOtherAgents"] =
+                serde_json::json!(!self.list_watches_for_parent(child_id).is_empty());
         }
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1587,6 +1605,37 @@ impl Services {
                         {
                             continue;
                         }
+                        // Agent-waiting deferral (issue intent-hq/monorepo#1468):
+                        // an idle child that itself holds live outgoing
+                        // completion watches on other agents has not settled
+                        // either — skip the record (marker recorded, like the
+                        // live grouped branch) so the group waits for the
+                        // child's genuine completion; the watch-removal
+                        // backstops synthesize it if the last outgoing watch
+                        // disappears without a wake. The durable variant is
+                        // required here: groups rehydrate BEFORE the
+                        // completion-watch registry loads at startup, so the
+                        // child's outgoing watches may only exist as
+                        // persisted rows at this point.
+                        if event_type == intent_core::events::AGENT_IDLE
+                            && self.agent_is_waiting_on_agents_durable(&child_id).await
+                        {
+                            self.mark_interim_skipped_idle(&child_id);
+                            continue;
+                        }
+                        // Same emit-time `isWaitingForOtherAgents` stamp as
+                        // the live idle emits. Usually false here (a waiting
+                        // child was skipped above), but not always: the skip
+                        // uses the durable classification WITH the 2-cycle
+                        // guard, while this stamp is the raw in-memory watch
+                        // derivation — a child whose only outgoing watch was
+                        // declassified as a mutual-idle 2-cycle reaches this
+                        // line and stamps `true`.
+                        if event_type == intent_core::events::AGENT_IDLE {
+                            data["isWaitingForOtherAgents"] = serde_json::json!(!self
+                                .list_watches_for_parent(&child_id)
+                                .is_empty());
+                        }
                         let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
@@ -1686,6 +1735,18 @@ impl Services {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|hooks| !hooks.is_empty())
         {
+            return;
+        }
+        // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle
+        // agent that itself holds live outgoing completion watches on other
+        // agents has not settled — it will run again when a watched target
+        // completes, so its group completion must not be recorded yet.
+        // Classified live (with the 2-cycle deadlock guard) rather than from
+        // the emit-time `isWaitingForOtherAgents` stamp, matching the grouped
+        // branch of `deliver_completion_to_watches`; the genuine completion
+        // (post-wait idle, failure, deletion, or the watch-removal backstop
+        // redelivery) records through this path or that branch later.
+        if self.agent_is_waiting_on_agents(agent_id) {
             return;
         }
         // Find which group (if any) this agent belongs to — global lookup,
@@ -1971,6 +2032,7 @@ mod tests {
             name: id.to_string(),
             name_explicitly_set: true,
             model: None,
+            reasoning_effort: None,
             provider: None,
             system_prompt: None,
             specialist: None,

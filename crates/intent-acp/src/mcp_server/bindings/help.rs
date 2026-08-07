@@ -49,7 +49,7 @@ mod tests {
         let index = dispatch(&ws, &features, "get", &json!({})).unwrap();
         assert!(index.as_str().unwrap().starts_with("Namespaces"));
         let pr = dispatch(&ws, &features, "get", &json!({ "namespace": "pr" })).unwrap();
-        assert!(pr.as_str().unwrap().contains("ws.pr.merge("));
+        assert!(pr.as_str().unwrap().contains("ws.pr.snapshot("));
         // Chief workspaces get the chief surface.
         let app = dispatch(
             &WorkspaceId::chief(),

@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_core::{
+    now_iso, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
+};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
@@ -186,13 +189,15 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     engine: Arc<RecordingEngine>,
+    store: Store,
+    workspaces_root: PathBuf,
     _dir: TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry `engine`.
 async fn boot_with_engine(
     engine: Arc<dyn VoiceEngine>,
-) -> (WsApiServer, u16, Arc<ClientConfig>, TempDir) {
+) -> (WsApiServer, u16, Arc<ClientConfig>, Store, PathBuf, TempDir) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-voice-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -202,8 +207,8 @@ async fn boot_with_engine(
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
     let services = Arc::new(
-        Services::new(store)
-            .with_workspaces_root(workspaces_root)
+        Services::new(store.clone())
+            .with_workspaces_root(workspaces_root.clone())
             .with_event_bus(bus.clone())
             .with_voice_engine(engine),
     );
@@ -220,21 +225,78 @@ async fn boot_with_engine(
     let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
-    (ws_srv, port, cfg, TempDir(dir))
+    (ws_srv, port, cfg, store, workspaces_root, TempDir(dir))
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub engine.
 async fn boot() -> Fixture {
     let engine = Arc::new(RecordingEngine::default());
-    let (ws_srv, port, cfg, dir) = boot_with_engine(engine.clone()).await;
+    let (ws_srv, port, cfg, store, workspaces_root, dir) = boot_with_engine(engine.clone()).await;
     Fixture {
         _ws: ws_srv,
         port,
         cfg,
         engine,
+        store,
+        workspaces_root,
         _dir: dir,
     }
+}
+
+/// Seed a workspace row whose worktree points at
+/// `<workspaces_root>/<id>/repo` containing a `README.md` with `readme`, and
+/// return its id.
+async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
+    let ts = now_iso();
+    let id = WorkspaceId::new();
+    let checkout = fx.workspaces_root.join(id.as_str()).join("repo");
+    std::fs::create_dir_all(&checkout).expect("mkdir checkout");
+    std::fs::write(checkout.join("README.md"), readme).expect("write README");
+    let ws = Workspace {
+        id: id.clone(),
+        title: "Vocab".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        status_image_asset_id: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: Some(checkout.to_string_lossy().into_owned()),
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        display_status: None,
+        token_usage: None,
+        cow_supported: None,
+        checkout_mode: None,
+        execution_environment: None,
+        disk_usage: None,
+    };
+    fx.store.insert_workspace(&ws).await.expect("seed ws");
+    id
 }
 
 /// Establish an authenticated WSS connection over pinned TLS (token in the
@@ -450,7 +512,7 @@ async fn provider_override_still_uses_injected_engine() {
 /// unchanged from the pre-structured shape (PROTOCOL §5.41, monorepo#1448).
 #[tokio::test]
 async fn missing_api_key_surfaces_structured_error_data() {
-    let (_srv, port, cfg, _dir) = boot_with_engine(Arc::new(NoKeyEngine)).await;
+    let (_srv, port, cfg, _store, _root, _dir) = boot_with_engine(Arc::new(NoKeyEngine)).await;
     let mut ws = connect(port, cfg).await;
 
     let resp = wss_rpc_raw(
@@ -469,4 +531,161 @@ async fn missing_api_key_surfaces_structured_error_data() {
         "voice not configured: voice: no API key found for elevenlabs \
          (set voice.elevenlabs.apiKey or ELEVENLABS_API_KEY)"
     );
+}
+
+/// A `voice.transcribe` call carrying a known `workspaceId` injects the
+/// workspace's auto-derived vocabulary between the user vocabulary and the
+/// request keyterms (PROTOCOL §5.41, v4.6: user `voice.vocabulary` →
+/// workspace auto-terms → `context.keyterms`).
+#[tokio::test]
+async fn transcribe_with_workspace_id_injects_derived_vocabulary() {
+    let fx = boot().await;
+    let ws_id = seed_vocab_workspace(&fx, "# Repo\nZorblatt tooling and the Quuxify pass.").await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.transcribe",
+        json!({
+            "audio": b64(b"opus"),
+            "workspaceId": ws_id.as_str(),
+            "context": { "keyterms": ["Endara"] },
+        }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+
+    let calls = fx.engine.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let keyterms = &calls[0].keyterms;
+    for expected in ["Zorblatt", "Quuxify"] {
+        assert!(
+            keyterms.contains(&expected.to_string()),
+            "workspace auto-terms injected: {keyterms:?}"
+        );
+    }
+    let vocab_pos = keyterms.iter().position(|t| t == "Intent").expect("vocab");
+    let derived_pos = keyterms
+        .iter()
+        .position(|t| t == "Zorblatt")
+        .expect("derived");
+    let request_pos = keyterms
+        .iter()
+        .position(|t| t == "Endara")
+        .expect("request");
+    assert!(
+        vocab_pos < derived_pos && derived_pos < request_pos,
+        "merge order user vocabulary → workspace auto-terms → request keyterms: {keyterms:?}"
+    );
+}
+
+/// An unknown/stale `workspaceId` on `voice.transcribe` is tolerated — the
+/// call behaves exactly like a no-`workspaceId` call — while a non-string
+/// value rejects with `-32602` / `error.data.code: "invalid-params"` before
+/// the engine is reached (PROTOCOL §5.41, v4.6).
+#[tokio::test]
+async fn unknown_workspace_id_tolerated_non_string_rejects() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.transcribe",
+        json!({ "audio": b64(b"pcm"), "workspaceId": "ws-gone-stale" }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "stale workspaceId must never error: {resp}"
+    );
+    {
+        let calls = fx.engine.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].keyterms.iter().any(|t| t == "Zorblatt"),
+            "no injection for an unknown workspace"
+        );
+    }
+
+    let bad = wss_rpc_raw(
+        &mut ws,
+        2,
+        "voice.transcribe",
+        json!({ "audio": b64(b"pcm"), "workspaceId": 42 }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params", "{bad}");
+    assert_eq!(
+        fx.engine.calls.lock().unwrap().len(),
+        1,
+        "engine never called on a non-string workspaceId"
+    );
+}
+
+/// `voice.getWorkspaceVocabulary` serves the derived terms only (`{ terms }`,
+/// no user vocabulary merged in), respects the
+/// `voice.workspaceVocabulary.maxTerms` setting (0 disables), and an unknown
+/// `workspaceId` is the standard not-found error (`-32602` with
+/// `error.data.code: "not-found"`) (PROTOCOL §5.41, v4.6).
+#[tokio::test]
+async fn get_workspace_vocabulary_serves_derived_terms_and_not_found() {
+    let fx = boot().await;
+    let ws_id = seed_vocab_workspace(&fx, "The Zorblatt pipeline needs a Quuxify pass.").await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let resp = wss_rpc_raw(
+        &mut ws,
+        1,
+        "voice.getWorkspaceVocabulary",
+        json!({ "workspaceId": ws_id.as_str() }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    let terms = resp["result"]["terms"].as_array().expect("terms array");
+    let terms: Vec<&str> = terms.iter().filter_map(Value::as_str).collect();
+    for expected in ["Zorblatt", "Quuxify"] {
+        assert!(terms.contains(&expected), "missing {expected}: {terms:?}");
+    }
+    assert!(
+        !terms.contains(&"Intent"),
+        "derived terms only — user voice.vocabulary is not merged in: {terms:?}"
+    );
+
+    // maxTerms = 0 disables derivation entirely → { terms: [] }.
+    let upd = wss_rpc_raw(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "voice.workspaceVocabulary.maxTerms", "value": 0 }] }),
+    )
+    .await;
+    assert!(upd.get("error").is_none(), "unexpected error: {upd}");
+    let resp = wss_rpc_raw(
+        &mut ws,
+        3,
+        "voice.getWorkspaceVocabulary",
+        json!({ "workspaceId": ws_id.as_str() }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+    assert_eq!(resp["result"]["terms"], json!([]), "{resp}");
+
+    // Unknown workspace → -32602 with data.code "not-found".
+    let missing = wss_rpc_raw(
+        &mut ws,
+        4,
+        "voice.getWorkspaceVocabulary",
+        json!({ "workspaceId": "ws-does-not-exist" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    assert_eq!(missing["error"]["data"]["code"], "not-found", "{missing}");
+
+    // Missing workspaceId → -32602 invalid-params.
+    let none = wss_rpc_raw(&mut ws, 5, "voice.getWorkspaceVocabulary", json!({})).await;
+    assert_eq!(none["error"]["code"], -32602, "{none}");
+    assert_eq!(none["error"]["data"]["code"], "invalid-params", "{none}");
 }

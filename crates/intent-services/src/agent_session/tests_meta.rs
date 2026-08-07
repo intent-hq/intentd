@@ -1,19 +1,20 @@
 //! Tests for `_meta` payload construction (§18.1 system-prompt injection via
 //! ACP extensibility).
 
-use super::{build_session_meta, resolve_provider_id};
+use super::{build_session_meta, derived_default_provider, resolve_provider_id};
+use intent_core::settings_file::SettingsFile;
 
 #[test]
 fn resolve_provider_id_from_compound_model() {
     // Compound model id takes precedence over provider field
-    let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), Some("claude-code"));
+    let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), Some("claude-code"), None);
     assert_eq!(provider_id, "opencode", "compound model prefix wins");
 }
 
 #[test]
 fn resolve_provider_id_from_provider_field() {
     // Bare model id (no colon) falls back to provider field
-    let provider_id = resolve_provider_id(Some("gpt-5.3-codex"), Some("codex"));
+    let provider_id = resolve_provider_id(Some("gpt-5.3-codex"), Some("codex"), None);
     assert_eq!(
         provider_id, "codex",
         "provider field is fallback for bare model"
@@ -23,10 +24,10 @@ fn resolve_provider_id_from_provider_field() {
 #[test]
 fn resolve_provider_id_none_uses_default() {
     // Both None -> default provider
-    let provider_id = resolve_provider_id(None, None);
+    let provider_id = resolve_provider_id(None, None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "None model + None provider -> default"
     );
 }
@@ -34,38 +35,162 @@ fn resolve_provider_id_none_uses_default() {
 #[test]
 fn resolve_provider_id_bare_model_none_provider_uses_default() {
     // Bare model + None provider -> default provider
-    let provider_id = resolve_provider_id(Some("sonnet4.5"), None);
+    let provider_id = resolve_provider_id(Some("sonnet4.5"), None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "bare model + None provider -> default"
+    );
+}
+
+/// A [`SettingsFile`] with the given `model.default` / `providers.active`.
+fn settings(model_default: Option<&str>, providers_active: Option<&str>) -> SettingsFile {
+    let mut s = SettingsFile::default();
+    s.model.default = model_default.map(str::to_string);
+    s.providers.active = providers_active.map(str::to_string);
+    s
+}
+
+#[test]
+fn derived_default_provider_prefix_beats_active() {
+    // model.default compound prefix outranks providers.active.
+    let s = settings(Some("claude-code:sonnet4.5"), Some("codex"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "model.default prefix wins over providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_bare_model_falls_through_to_active() {
+    // A bare model.default (no colon) carries no provider — providers.active wins.
+    let s = settings(Some("sonnet4.5"), Some("claude-code"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "bare model.default falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_malformed_prefix_falls_through() {
+    // ":sonnet" yields an empty prefix — falls through to providers.active.
+    let s = settings(Some(":sonnet"), Some("codex"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("codex"),
+        "malformed compound model.default falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_unknown_prefix_falls_through() {
+    // An unregistered prefix (stale value, typo, foreign-build id) must not
+    // be trusted — providers.active stays reachable.
+    let s = settings(Some("typo:foo"), Some("claude-code"));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "unknown model.default prefix falls through to providers.active"
+    );
+}
+
+#[test]
+fn derived_default_provider_unknown_active_yields_none() {
+    // An unregistered providers.active is not surfaced either.
+    let s = settings(None, Some("not-a-provider"));
+    assert_eq!(
+        derived_default_provider(&s),
+        None,
+        "unknown providers.active is not surfaced"
+    );
+}
+
+#[test]
+fn derived_default_provider_trims_whitespace() {
+    // Padded settings values still resolve to the registered id.
+    let s = settings(None, Some("  claude-code  "));
+    assert_eq!(
+        derived_default_provider(&s).as_deref(),
+        Some("claude-code"),
+        "whitespace-padded providers.active resolves trimmed"
+    );
+}
+
+#[test]
+fn derived_default_provider_both_unset_yields_none() {
+    let s = settings(None, None);
+    assert_eq!(
+        derived_default_provider(&s),
+        None,
+        "neither setting set -> None (callers use the positional last resort)"
     );
 }
 
 #[test]
 fn resolve_provider_id_malformed_compound_falls_back() {
     // Malformed compound id like ":sonnet" yields empty prefix -> falls back to provider field
-    let provider_id = resolve_provider_id(Some(":sonnet"), Some("codex"));
+    let provider_id = resolve_provider_id(Some(":sonnet"), Some("codex"), None);
     assert_eq!(
         provider_id, "codex",
         "malformed compound :sonnet falls back to provider field"
     );
 
     // Malformed compound with no provider field -> default
-    let provider_id = resolve_provider_id(Some(":sonnet"), None);
+    let provider_id = resolve_provider_id(Some(":sonnet"), None, None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "malformed compound :sonnet with no provider -> default"
     );
 
     // Empty provider field falls back to default
-    let provider_id = resolve_provider_id(Some("gpt-4"), Some(""));
+    let provider_id = resolve_provider_id(Some("gpt-4"), Some(""), None);
     assert_eq!(
         provider_id,
-        intent_providers::default_provider_id(),
+        intent_providers::first_provider_id(),
         "empty provider string falls back to default"
     );
+}
+
+/// `configured_default` (spec Decision D2) sits above the hardcoded default
+/// provider (Auggie) when neither the model's compound prefix nor the
+/// `provider` field resolve one.
+#[test]
+fn resolve_provider_id_prefers_configured_default_over_hardcoded_default() {
+    let provider_id = resolve_provider_id(None, None, Some("claude-code"));
+    assert_eq!(
+        provider_id, "claude-code",
+        "configured default wins over the hardcoded default provider"
+    );
+}
+
+/// The model's compound prefix still wins over `configured_default` — a
+/// caller-selected cross-provider model is a stronger signal than the
+/// user's ambient default.
+#[test]
+fn resolve_provider_id_compound_model_wins_over_configured_default() {
+    let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), None, Some("claude-code"));
+    assert_eq!(provider_id, "opencode");
+}
+
+/// The session's `provider` field still wins over `configured_default` — a
+/// persisted session's own provider is a stronger signal than the ambient
+/// default at read time.
+#[test]
+fn resolve_provider_id_provider_field_wins_over_configured_default() {
+    let provider_id = resolve_provider_id(Some("sonnet4.5"), Some("codex"), Some("claude-code"));
+    assert_eq!(provider_id, "codex");
+}
+
+/// An empty `configured_default` is treated the same as `None` — it falls
+/// through to the hardcoded default rather than resolving to an empty
+/// provider id.
+#[test]
+fn resolve_provider_id_empty_configured_default_falls_back_to_hardcoded_default() {
+    let provider_id = resolve_provider_id(None, None, Some(""));
+    assert_eq!(provider_id, intent_providers::first_provider_id());
 }
 
 #[test]
@@ -186,7 +311,7 @@ fn mock_gets_no_meta() {
 #[test]
 fn resolved_provider_with_claude_code_compound_model_gets_meta() {
     // When model is "claude-code:sonnet4.5", resolve_provider_id extracts "claude-code"
-    let provider_id = resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"));
+    let provider_id = resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"), None);
     let meta = build_session_meta(&provider_id, Some("Test prompt"));
     assert!(
         meta.is_some(),
@@ -231,7 +356,7 @@ fn claude_code_no_prompt_still_injects_disallowed_tools() {
 #[test]
 fn resolved_default_provider_with_no_model_no_provider_returns_none() {
     // When both model and provider are None, resolve_provider_id returns default provider
-    let provider_id = resolve_provider_id(None, None);
+    let provider_id = resolve_provider_id(None, None, None);
     // Default provider (auggie) doesn't use _meta
     let meta = build_session_meta(&provider_id, Some("Test prompt"));
     assert!(

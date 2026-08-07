@@ -1,6 +1,6 @@
 [package]
 name = "intent-pty"
-version = "0.4.2"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,8 @@ license.workspace = true
 description = "Unified PTY host for terminals and scripts: scrollback, multi-client attach (§12)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.4.2" }
+intent-core = { path = "../intent-core", version = "0.5.0" }
 nix.workspace = true
 portable-pty.workspace = true
 tokio.workspace = true
+tracing.workspace = true

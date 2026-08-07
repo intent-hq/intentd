@@ -30,8 +30,13 @@ const NO_DISCARD_PATHS_MSG: &str =
     "No file paths provided. Please specify at least one file path to discard.";
 
 /// TS `assertAgentCommitAllowed` rejection message (auto-commit disabled).
-const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace. \
-Use agent_commit_changes with userRequested: true if the user asked you to commit.";
+/// The `Auto-commit is disabled` prefix is load-bearing: `auto_commit.rs`
+/// matches on it (`AUTO_COMMIT_DISABLED_MARK`) to treat the rejection as a
+/// silent skip.
+const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspace: the user \
+has turned off agent commits here and does not want agents committing. Do not work around \
+this gate — do not commit via raw `git commit` or any other means. Retry `ws.git.commit` \
+with `userRequested: true` only if the user has explicitly asked you to commit.";
 
 /// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
 /// auto-commit is disabled, unless `user_requested` bypasses it. The gate
@@ -642,5 +647,24 @@ mod tests {
         git2::Repository::init(&dir).unwrap();
         assert!(validate_repo_path(dir.to_str().unwrap()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disabled_rejection_matches_silent_skip_mark() {
+        // `auto_commit.rs` treats a rejection whose message contains
+        // `AUTO_COMMIT_DISABLED_MARK` as a silent skip; a rewording that
+        // drops the prefix would demote every OFF-state wrap-up attempt to a
+        // WARN-level failure.
+        let err = assert_agent_commit_allowed(false, false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(crate::auto_commit::AUTO_COMMIT_DISABLED_MARK));
+    }
+
+    #[test]
+    fn commit_allowed_when_enabled_or_user_requested() {
+        assert!(assert_agent_commit_allowed(true, false).is_ok());
+        assert!(assert_agent_commit_allowed(false, true).is_ok());
+        assert!(assert_agent_commit_allowed(true, true).is_ok());
     }
 }

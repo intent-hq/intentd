@@ -25,8 +25,9 @@ use crate::Services;
 const SUBJECT_MAX_CHARS: usize = 72;
 const DEFAULT_SUBJECT: &str = "Agent changes";
 /// `assert_agent_commit_allowed` rejection text we treat as a silent skip
-/// (must stay in sync with `git_ops::AUTO_COMMIT_DISABLED_MSG`).
-const AUTO_COMMIT_DISABLED_MARK: &str = "Auto-commit is disabled";
+/// (must stay in sync with `git_ops::AUTO_COMMIT_DISABLED_MSG`; pinned by
+/// `git_ops::tests::disabled_rejection_matches_silent_skip_mark`).
+pub(crate) const AUTO_COMMIT_DISABLED_MARK: &str = "Auto-commit is disabled";
 /// `git_agent_commit` empty-worktree result (§5.6 parity) treated as a silent
 /// skip — there is simply nothing to attribute to the idle agent.
 const NO_CHANGES_MARK: &str = "No uncommitted changes found";

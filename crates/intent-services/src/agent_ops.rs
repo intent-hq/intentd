@@ -3,9 +3,8 @@
 //! Pure projections + the model-catalog helpers that back the `agent.*`
 //! `WorkspaceApi` methods (the trait bodies live in `lib.rs`). The
 //! [`AgentLite`] derivation (`lastAgentResponse`/`digest`) ports the TS
-//! `agent.list`/`agent.get` post-processing; [`static_models`] /
-//! [`parse_model_list_output`] port the `agent.getModels` static-tier fallback
-//! and auggie CLI parser respectively.
+//! `agent.list`/`agent.get` post-processing; [`parse_model_list_output`]
+//! ports the auggie CLI model-list parser.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -46,7 +45,6 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 /// consumers (activity feeds, filters) can trace provenance.
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
-use intent_providers::models::PROVIDER_MODEL_TIERS;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -75,6 +73,9 @@ mod tests_stab115;
 
 #[cfg(test)]
 mod tests_specialist_frontmatter;
+
+#[cfg(test)]
+mod tests_delegate_provider_resolution;
 
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
@@ -117,8 +118,18 @@ fn resolve_default_model_from_settings(
         }
     }
 
-    // 2. Check provider defaults
-    let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
+    // 2. Check provider defaults. With no explicit provider, key the lookup
+    // by the settings-derived default (model.default prefix, else
+    // providers.active), bottoming out at the first registered provider.
+    let derived;
+    let provider_key = match provider {
+        Some(p) => p,
+        None => {
+            derived = crate::agent_session::derived_default_provider(&settings)
+                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+            derived.as_str()
+        }
+    };
     if let Some(model) = settings.model.provider_defaults.get(provider_key) {
         if !model.is_empty() {
             return Some(model.clone());
@@ -161,10 +172,20 @@ pub(crate) fn resolve_agent_default_model(
     is_background: bool,
 ) -> Option<String> {
     // Normalize through provider_config so legacy default-provider aliases
-    // guard as the provider the spawn would actually run.
-    let effective_provider = intent_providers::provider_config(
-        provider.unwrap_or_else(|| intent_providers::default_provider_id()),
-    )
+    // guard as the provider the spawn would actually run. With no explicit
+    // provider, guard against the settings-derived default (model.default
+    // prefix, else providers.active), bottoming out at the first registered
+    // provider.
+    let derived;
+    let effective_provider = intent_providers::provider_config(match provider {
+        Some(p) => p,
+        None => {
+            derived =
+                crate::agent_session::derived_default_provider(&services.effective_settings())
+                    .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+            derived.as_str()
+        }
+    })
     .id;
 
     if let Some(spec_id) = specialist {
@@ -208,8 +229,7 @@ pub(crate) fn resolve_agent_default_model(
 /// provider was requested, where a known compound prefix *becomes* the
 /// resolved provider (`agent_create_op` derives `session.provider` from it).
 /// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
-/// evidence rules (static tiers + cached catalogs; absence of evidence
-/// passes).
+/// evidence rules (cached dynamic catalogs; absence of evidence passes).
 fn default_model_belongs_to_provider(
     services: &Services,
     provider_param: Option<&str>,
@@ -251,26 +271,21 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 /// Reject a bare model id that provably belongs to a different provider with
 /// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
-/// (monorepo#607). Ownership evidence is deterministic and probe-free:
-/// `PROVIDER_MODEL_TIERS` (static tiers) unioned with the in-memory
-/// last-good `ModelCatalogCache` entries under each provider's current
-/// registry version key — never a live fetch, so create/setModel cannot
-/// block on a catalog probe.
+/// (monorepo#607). Ownership evidence is deterministic and probe-free: the
+/// in-memory last-good `ModelCatalogCache` entries under each provider's
+/// current registry version key — never a live fetch, so create/setModel
+/// cannot block on a catalog probe. (The former static-tier evidence path
+/// went with the tier tables.)
 ///
-/// Evidence is asymmetric by strength:
-/// - a **static-tier** claim by another provider rejects outright (the
-///   original #425 rule, unchanged) unless the requested provider itself
-///   claims the id (static or cached);
-/// - a **cached-catalog** claim by another provider rejects only when the
-///   requested provider's ownership is affirmatively *disproven* — no static
-///   claim AND its own cached catalog exists but lacks the id. With no cache
-///   entry for the requested provider (cold start, expired pin), the bare id
-///   passes — absence of evidence is not a mismatch.
+/// Evidence stays asymmetric: a cached-catalog claim by another provider
+/// rejects only when the requested provider's ownership is affirmatively
+/// *disproven* — its own cached catalog exists but lacks the id. With no
+/// cache entry for the requested provider (cold start, expired pin), the
+/// bare id passes — absence of evidence is not a mismatch.
 ///
 /// Two spawn-parity carve-outs:
-/// - the literal `"default"` id is claude-code's smart-tier *sentinel*
-///   ("use the CLI default"), not an ownership claim — it passes for every
-///   provider;
+/// - the literal `"default"` id is a "use the CLI default" *sentinel*, not
+///   an ownership claim — it passes for every provider;
 /// - `provider_id` is normalized through `provider_config` first, so legacy
 ///   default-provider aliases persisted on old sessions (`default`/`acp`/
 ///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
@@ -285,28 +300,154 @@ fn ensure_bare_model_matches_provider(
         return Ok(());
     }
     let effective = intent_providers::provider_config(provider_id).id;
-    let static_owners = intent_providers::providers_claiming_model(model_id);
-    // The requested provider provably owns the id — static tier or its own
-    // current cached catalog — so any other claim is a shared id, not a
-    // mismatch.
+    // The requested provider provably owns the id via its own current cached
+    // catalog — any other claim is a shared id, not a mismatch.
     let requested_cache = cache.cached_catalog_claims(effective, model_id);
-    if static_owners.contains(&effective) || requested_cache == Some(true) {
+    if requested_cache == Some(true) {
         return Ok(());
     }
     let cached_owners = cache.providers_claiming_model_cached(model_id);
-    let reject =
-        !static_owners.is_empty() || (!cached_owners.is_empty() && requested_cache == Some(false));
-    if reject {
-        let mut owners: Vec<String> = static_owners.iter().map(|s| s.to_string()).collect();
-        for owner in cached_owners {
-            if !owners.contains(&owner) {
-                owners.push(owner);
-            }
-        }
+    if !cached_owners.is_empty() && requested_cache == Some(false) {
         return Err(Error::InvalidParams(format!(
             "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
-            owners.join(", ")
+            cached_owners.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a `reasoningEffort` level the resolved model provably does not
+/// support with `-32602` (InvalidParams), naming the valid values. Evidence is
+/// the cached model catalog's `effortLevels` for `model_id`
+/// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
+/// same probe-free, read-only rule as the bare-model ownership guard: with no
+/// evidence (no model, no cached row, or a row declaring no levels) the value
+/// passes through unvalidated, since providers own the effort vocabulary
+/// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
+/// caller's spelling.
+fn ensure_effort_supported_by_model(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogCache,
+    model_id: Option<&str>,
+    effort: &str,
+) -> Result<()> {
+    let Some(levels) = model_id.and_then(|m| cache.cached_effort_levels(m)) else {
+        return Ok(());
+    };
+    if levels.iter().any(|l| l.eq_ignore_ascii_case(effort)) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "{method}: reasoningEffort {effort} is not supported by model {} (valid values: {})",
+        model_id.unwrap_or_default(),
+        levels.join(", ")
+    )))
+}
+
+/// Resolve the effective `reasoningEffort` for a delegated/woken child
+/// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
+/// the chosen model option's declared effort, then the specialist's
+/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
+/// params collapse to unset without falling through — an explicit clear.
+fn resolve_delegate_reasoning_effort(
+    services: &Services,
+    param: Option<&str>,
+    specialist: Option<&str>,
+    model: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Option<String> {
+    if let Some(param) = param {
+        return (!param.trim().is_empty()).then(|| param.to_string());
+    }
+    let spec_id = specialist?;
+    let specialists_svc = services.specialists_service();
+    model
+        .and_then(|m| specialists_svc.resolve_model_option_effort(spec_id, workspace_path, m))
+        .or_else(|| specialists_svc.resolve_reasoning_effort(spec_id, workspace_path))
+}
+
+/// Resolve the provider `agent.delegate` should spawn on when the caller
+/// supplies no explicit `model` (spec Decision D2). The wire has no
+/// `provider` param, so the daemon must derive one itself instead of leaving
+/// `AgentCreateExtra.provider` unset — which would fall through to the
+/// spawn path's positional last resort regardless of the user's actual
+/// configured default.
+///
+/// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
+///    when that is unset — the provider prefix of its compound `model`
+///    (e.g. `opencode:kimi-k3`). Either must be a known, available provider
+///    or the delegate fails with a clear error (never silently substituted).
+/// 2. The settings-derived default (provider of `model.default`, else
+///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
+///    with the same known/available requirement.
+/// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
+///    session's `provider` stays unset, exactly like the pre-existing model
+///    resolution's "no configured default" case. `resolve_provider_id`
+///    (`agent_session.rs`) applies the same configured-default precedence at
+///    spawn time, but with no configured default to offer either, that
+///    precedence bottoms out at the first registered provider (neutral
+///    positional last resort) — this residual, no-config case is the one
+///    scenario where the positional fallback still applies.
+fn resolve_delegate_provider(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> Result<Option<String>> {
+    let settings = services.effective_settings();
+
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            ensure_known_provider("agent.delegate", &provider_id)?;
+            ensure_provider_available("agent.delegate", &provider_id, &settings.providers.paths)?;
+            return Ok(Some(provider_id));
+        }
+    }
+
+    match crate::agent_session::derived_default_provider(&settings) {
+        Some(derived) => {
+            ensure_known_provider("agent.delegate", &derived)?;
+            ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
+            Ok(Some(derived))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Reject a known provider id that the daemon's own provider discovery
+/// reports as unavailable (not installed, or gated off by a missing env
+/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
+/// can toast it — instead of letting the delegate succeed and the spawn fail
+/// later with a raw "No such file or directory" (spec Decision D2 step 3).
+/// Mirrors `resolve_spawn`'s override-aware resolution (monorepo#1065) via
+/// [`intent_providers::discover_providers_with_overrides`], keyed by the
+/// same `providers.paths` settings.
+fn ensure_provider_available(
+    method: &str,
+    provider_id: &str,
+    provider_paths: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let available = intent_providers::discover_providers_with_overrides(&|key| {
+        provider_paths.get(key).cloned()
+    })
+    .into_iter()
+    .find(|p| p.id == provider_id)
+    .is_some_and(|p| p.installed);
+    if !available {
+        let display = intent_providers::provider_config(provider_id).display_name;
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — it is not \
+             installed, or is disabled. Choose an available provider in Settings > Agents, or \
+             install {display}."
         )));
     }
     Ok(())
@@ -642,31 +783,6 @@ fn strip_spans_capture(s: &str, start: &str, end: &str) -> Option<String> {
     Some(after[..j].to_string())
 }
 
-/// The static model catalog used as the `agent.getModels` fallback when the
-/// auggie CLI is unavailable: every `(provider, tier)` model from
-/// `PROVIDER_MODEL_TIERS`, deduped by `provider:model` (PROTOCOL §5.5).
-pub(crate) fn static_models() -> Vec<Value> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for (provider_id, tiers) in PROVIDER_MODEL_TIERS {
-        for (tier, model_id) in [
-            ("fast", tiers.fast),
-            ("balanced", tiers.balanced),
-            ("smart", tiers.smart),
-        ] {
-            let key = format!("{provider_id}:{model_id}");
-            if seen.insert(key) {
-                out.push(json!({
-                    "id": model_id,
-                    "name": format!("{model_id} ({tier})"),
-                    "provider": provider_id,
-                }));
-            }
-        }
-    }
-    out
-}
-
 /// Parse `auggie model list` output into `(value, label, description?)` rows,
 /// porting the TS `parseModelListOutput` (`- Label [model-id]` + an optional
 /// indented description on the next line).
@@ -709,23 +825,14 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
     Some((label, value))
 }
 
-/// The static tier rows for one provider: [`static_models`] filtered to
-/// `provider_id`. Empty for providers absent from `PROVIDER_MODEL_TIERS`
-/// (dynamic-only lists such as opencode/droid).
-pub(crate) fn static_models_for(provider_id: &str) -> Vec<Value> {
-    static_models()
-        .into_iter()
-        .filter(|m| m.get("provider").and_then(Value::as_str) == Some(provider_id))
-        .collect()
-}
-
-/// The per-provider `models.list` static-fallback response (PROTOCOL §5.30):
-/// the provider's static tier rows when it has any, else an empty list —
-/// always labeled with `source: "static"` and a `warning`, never an error.
+/// The per-provider `models.list` fallback response (PROTOCOL §5.30) when no
+/// dynamic discovery succeeded: an empty list labeled `source: "static"` with
+/// a `warning`, never an error. (The former static tier catalog went with the
+/// tier tables — the provider CLI owns model discovery.)
 pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
     json!({
         "providerId": provider_id,
-        "models": static_models_for(provider_id),
+        "models": [],
         "source": "static",
         "warning": warning,
     })
@@ -758,7 +865,7 @@ fn resolve_auggie_bin(auggie_bin: Option<std::path::PathBuf>) -> Option<std::pat
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
 /// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
 /// CLI is unavailable, hangs past [`AUGGIE_MODELS_TIMEOUT`], or yields
-/// nothing, so the caller can fall back to [`static_models`]. The binary
+/// nothing, so the caller can degrade to an empty model list. The binary
 /// comes from [`resolve_auggie_bin`] and runs via [`auggie_output`] (bounded,
 /// exec PATH) so its co-located `node` resolves in a packaged-app
 /// environment.
@@ -911,7 +1018,7 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
 /// then filter legacy models and sort ([`finalize_model_rows`]). Returns
 /// `None` when the CLI is unavailable, hangs past
 /// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
-/// fall back to [`static_models`]. `auggie_bin` overrides discovery
+/// degrade to an empty model list. `auggie_bin` overrides discovery
 /// (the [`crate::Services::with_auggie_bin`] test seam); otherwise the
 /// binary comes from [`resolve_auggie_bin`].
 pub(crate) async fn fetch_auggie_models_rich(
@@ -1954,6 +2061,7 @@ impl Services {
         // `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
+            reasoning_effort,
             agent_type: _,
             metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
@@ -1963,6 +2071,10 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
+        // Empty/whitespace collapses to None (an explicit clear); a non-empty
+        // level is validated against the resolved model below, once the model
+        // resolution has settled.
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
         let meta = metadata.as_ref().and_then(Value::as_object);
@@ -2043,13 +2155,13 @@ impl Services {
                 ensure_known_provider("agent.create", &model_provider)?;
             } else {
                 // A bare model that provably belongs to a different provider
-                // — static tiers or cached dynamic catalogs — must not be
-                // persisted either: the spawn would feed the effective
-                // provider another provider's model id (monorepo#607). The
-                // effective provider mirrors `resolve_provider_id` for a bare
-                // model: provider field → default. Bare ids with no ownership
-                // evidence pass — ownership cannot be proven for dynamic-only
-                // model lists that were never fetched.
+                // (cached dynamic catalogs) must not be persisted either: the
+                // spawn would feed the effective provider another provider's
+                // model id (monorepo#607). The effective provider mirrors
+                // `resolve_provider_id` for a bare model: provider field →
+                // settings-derived default → first registered provider. Bare
+                // ids with no ownership evidence pass — ownership cannot be
+                // proven for model lists that were never fetched.
                 //
                 // Only a *client-supplied* mismatch hard-fails. A mismatch in
                 // a derived default (specialist frontmatter / settings chain
@@ -2058,9 +2170,17 @@ impl Services {
                 // param) would reject a model the caller never sent and make
                 // the provider uncreatable until settings change; drop it to
                 // the CLI default instead (session.model stays None).
-                let effective = provider
-                    .as_deref()
-                    .unwrap_or(intent_providers::default_provider_id());
+                let derived;
+                let effective = match provider.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        derived = crate::agent_session::derived_default_provider(
+                            &self.effective_settings(),
+                        )
+                        .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+                        derived.as_str()
+                    }
+                };
                 match ensure_bare_model_matches_provider(
                     "agent.create",
                     &self.models_catalog,
@@ -2082,6 +2202,20 @@ impl Services {
                 }
             }
         }
+        // Reasoning effort (PROTOCOL §5.5): validate the requested level
+        // against the *resolved* model's cached `effortLevels`, with the same
+        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
+        // no evidence means the value passes through, since providers own the
+        // vocabulary. Runs before the session is persisted so a `-32602`
+        // rejection is side-effect free.
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.create",
+                &self.models_catalog,
+                resolved_model.as_deref(),
+                effort,
+            )?;
+        }
         let session = AgentSession {
             id,
             workspace_id,
@@ -2091,6 +2225,7 @@ impl Services {
             name,
             name_explicitly_set,
             model: resolved_model,
+            reasoning_effort,
             provider,
             system_prompt: None,
             specialist,
@@ -2225,14 +2360,20 @@ impl Services {
         } else {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
-            // model has no prefix: session.provider → default): a bare id
-            // provably owned by another provider — static tiers or cached
-            // dynamic catalogs — is the same misroute vector (monorepo#607).
-            let effective = session
-                .provider
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(intent_providers::default_provider_id());
+            // model has no prefix: session.provider → settings-derived
+            // default → first registered provider): a bare id provably owned
+            // by another provider (cached dynamic catalogs) is the same
+            // misroute vector (monorepo#607).
+            let derived;
+            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => p,
+                None => {
+                    derived =
+                        crate::agent_session::derived_default_provider(&self.effective_settings())
+                            .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+                    derived.as_str()
+                }
+            };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
                 &self.models_catalog,
@@ -2354,7 +2495,7 @@ impl Services {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
-                    workspace_id,
+                    workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
                     event_type: intent_core::events::AGENT_DELETED.to_string(),
                     actor: crate::system_actor(),
@@ -2366,6 +2507,11 @@ impl Services {
                 },
             )
             .await;
+            // Deleting a session can retire a needs_attention hold (a pending
+            // attention request or unanswered question dies with the row):
+            // recompute-and-compare (§6.5 step 0); the dedup cache suppresses
+            // the no-op when nothing derived from this session.
+            self.maybe_emit_display_status_changed(&workspace_id).await;
         }
         Ok(json!({ "success": true }))
     }
@@ -2400,6 +2546,7 @@ impl Services {
             }
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
+        let prior_model = session.model.clone();
         let allowed = [
             "status",
             "isActive",
@@ -2408,6 +2555,7 @@ impl Services {
             "name",
             "nameExplicitlySet",
             "model",
+            "reasoningEffort",
             "provider",
             "systemPrompt",
             "specialist",
@@ -2473,6 +2621,10 @@ impl Services {
                 }
                 "model" => {
                     session.model = update_optional_string(value, "model")?;
+                }
+                "reasoningEffort" => {
+                    session.reasoning_effort = update_optional_string(value, "reasoningEffort")?
+                        .filter(|e| !e.trim().is_empty());
                 }
                 "provider" => {
                     session.provider = update_optional_string(value, "provider")?;
@@ -2544,6 +2696,19 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // The stored model changed, so any persisted display resolution now
+        // names the wrong model — clear it, same anti-staleness contract as
+        // `agent.setModel` (the next session open re-resolves). Best-effort:
+        // the update itself already landed.
+        if obj.contains_key("model") && session.model != prior_model {
+            if let Err(e) = self
+                .store
+                .clear_agent_session_resolved_model(&workspace_id, &agent_id)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
+            }
+        }
         let event_type = if mutated_only_name {
             intent_core::events::AGENT_RENAMED
         } else {
@@ -2563,6 +2728,13 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // `status` / `isBackground` feed the needs_attention derivation (a
+        // deleted or background session's pending request/question no longer
+        // counts): recompute-and-compare (§6.5 step 0); other fields skip the
+        // probe entirely.
+        if obj.contains_key("status") || obj.contains_key("isBackground") {
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }
@@ -2813,25 +2985,25 @@ impl Services {
         Ok(truncated_count)
     }
 
-    /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
+    /// `agent.getModels` (PROTOCOL §5.5): auggie CLI fetch; an unavailable
+    /// CLI yields an empty model list (the provider CLI owns model
+    /// discovery — there is no static fallback catalog).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
-        let models = match fetch_auggie_models(self.auggie_bin.clone()).await? {
-            Some(m) => m,
-            None => static_models(),
-        };
+        let models = fetch_auggie_models(self.auggie_bin.clone())
+            .await?
+            .unwrap_or_default();
         Ok(json!({ "models": models }))
     }
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
     /// path — auggie CLI (JSON → plain-text fallback) with a 5-minute success
-    /// cache, degrading to the static tier catalog (`source: "static"`) when
-    /// the CLI is unavailable, so the result is never empty; `forceRefresh`
-    /// skips the cache read. With a `providerId` the request goes through the
-    /// generic per-provider cache ([`crate::model_catalog`]): registered
-    /// sources are probed and cached per (provider, version key); unknown
-    /// providers degrade to their static tier catalog (or an empty list) with
-    /// a `warning` — never an error.
+    /// cache, degrading to an empty list (`source: "static"`) when the CLI is
+    /// unavailable; `forceRefresh` skips the cache read. With a `providerId`
+    /// the request goes through the generic per-provider cache
+    /// ([`crate::model_catalog`]): registered sources are probed and cached
+    /// per (provider, version key); unknown providers degrade to an empty
+    /// list with a `warning` — never an error.
     pub(crate) async fn models_list_op(
         &self,
         provider_id: Option<String>,
@@ -2843,9 +3015,7 @@ impl Services {
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
-                format!(
-                    "no dynamic model discovery for provider '{provider_id}'; using static catalog"
-                ),
+                format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
         let version_key = (source.version_key)();
@@ -2872,9 +3042,9 @@ impl Services {
             }
             None => Ok(static_provider_response(
                 &provider_id,
-                resolved.warning.unwrap_or_else(|| {
-                    format!("model discovery for '{provider_id}' failed; using static catalog")
-                }),
+                resolved
+                    .warning
+                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
         }
     }
@@ -2884,11 +3054,10 @@ impl Services {
     /// id and same registry-derived version key — so the two can never
     /// diverge: one cache, one single-flight, one negative window. Only the
     /// wire shape differs: the response omits the `providerId` field,
-    /// `source` is `"auggie"` or `"static"`, and the static tier catalog
-    /// (never an empty list) is the fallback when the probe fails with no
-    /// last-good list. A failed probe with a last-good cached list serves it
-    /// labeled `stale: true` + `warning` — never silently — whether or not
-    /// the read was forced.
+    /// `source` is `"auggie"` or `"static"`, and an empty list is the
+    /// fallback when the probe fails with no last-good list. A failed probe
+    /// with a last-good cached list serves it labeled `stale: true` +
+    /// `warning` — never silently — whether or not the read was forced.
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
         let auggie_bin = self.auggie_bin.clone();
         self.models_list_auggie_with(
@@ -2954,7 +3123,7 @@ impl Services {
                 }
                 Ok(out)
             }
-            None => Ok(json!({ "models": static_models(), "source": "static" })),
+            None => Ok(json!({ "models": [], "source": "static" })),
         }
     }
 
@@ -3690,8 +3859,9 @@ impl Services {
 
     /// Deliver the questions-dismissed system notice (`agent.dismissQuestions`,
     /// PROTOCOL §5.5): a system-origin message telling the agent the user
-    /// dismissed its N pending questions without answering, so it proceeds on
-    /// its own judgment instead of waiting for answers that will never come.
+    /// dismissed its N pending questions without answering. The notice is
+    /// informative only: the agent must not re-ask and must not proceed with
+    /// any work — it ends its turn and waits for the user's next message.
     /// Reuses the wake-delivery machinery ([`Services::deliver_wake_message`]):
     /// an idle agent gets the notice as an immediate turn; when it lands in
     /// the queue instead (busy turn, store-append fallback, or a NEWER pending
@@ -3720,8 +3890,9 @@ impl Services {
             n => format!("{n} questions"),
         };
         let content = format!(
-            "User dismissed your {noun} without answering. Do not re-ask; \
-             continue with your best judgment."
+            "User dismissed your {noun} without answering. This is an informative \
+             notice only — do not re-ask and do not proceed with any work; end \
+             your turn and wait for the user's next message."
         );
         let metadata = json!({
             "type": QUESTIONS_DISMISSED_METADATA_TYPE,
@@ -4160,24 +4331,24 @@ impl Services {
         if reason.is_empty() {
             return Err(Error::InvalidParams("reason is required".to_string()));
         }
-        let mut session = self.load_session_internal(&caller).await?;
+        let session = self.load_session_internal(&caller).await?;
         // Scope-guard the caller-supplied `workspace_id` (same shape as
         // `agent_report_to_parent_op`): reject a cross-workspace mismatch with
         // `NotFound` before any state changes.
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
-        // 1. Persist the pending attention request on the session.
+        // 1. Persist the pending attention request on the session via the
+        // narrow attention writer (with `clear_attention_request` the only
+        // post-insert mutator of the attention columns — the full-row
+        // `update_agent_session` excludes them so a racing persist of a stale
+        // session cannot clobber this write).
         let saved_at = now_iso();
-        session.attention_request_kind = Some(kind.clone());
-        session.attention_request_reason = Some(reason.clone());
-        session.attention_request_timestamp = Some(saved_at.clone());
-        session.updated_at = saved_at.clone();
         let workspace_id = session.workspace_id.clone();
         let task_note_id = session.task_note_id.clone();
         let parent = session.parent_agent_id.clone();
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .set_attention_request(&workspace_id, &caller, &kind, &reason, &saved_at)
             .await?;
         self.publish_agent_mutation_event(
             &workspace_id,
@@ -4389,15 +4560,14 @@ impl Services {
         let session_task_note_id = input.task_note_id.clone().or(input.note_id.clone());
         // Harness-owned commits: the effective opt-out is the caller's explicit
         // `skipAutoCommit` OR the workspace's effective auto-commit being off,
-        // so delegated children get the OFF commit instruction (and the idle
-        // subscriber skip) whenever nothing would auto-commit anyway.
-        // Deliberately sticky: the derived opt-out is persisted on the
-        // session, so toggling the workspace back ON via
+        // so delegated children skip the idle subscriber whenever nothing
+        // would auto-commit anyway. Deliberately sticky: the derived opt-out
+        // is persisted on the session, so toggling the workspace back ON via
         // `workspace.setAutoCommit` never re-enables idle commits for
-        // sessions created while it was OFF — their first-message commit
-        // instruction already told the agent commits are manual, and
-        // flipping the harness behavior mid-session would contradict it.
-        // New sessions created after the toggle pick up the ON state.
+        // sessions created while it was OFF. New sessions created after the
+        // toggle pick up the ON state. The child's prompt stays status-neutral
+        // (the `## Commit Policy` clause in `rules.rs`); enforcement lives in
+        // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
         // Resolve the child's first message up front so it can be persisted as
@@ -4435,9 +4605,10 @@ impl Services {
         // APPEND the standard "Your Task Note" block after the user message
         // with a `---` separator so the child knows its note ID/title and the
         // single-task scope contract; without a linked note the message is
-        // delivered verbatim. When `skipAutoCommit` is set, a follow-on
-        // commit instruction is concatenated after the scope directive,
-        // byte-for-byte matching the reference.
+        // delivered verbatim. No state-specific commit instruction is
+        // appended: the child relies on the status-neutral `## Commit Policy`
+        // system-prompt clause, and `skip_auto_commit` only gates the idle
+        // subscriber and the `git_ops` commit gate.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
             // Build the preamble from adjacent string literals (via `concat!`)
@@ -4455,16 +4626,11 @@ impl Services {
                 title = title,
                 note_id = note_id,
             );
-            let commit_instruction = if skip_auto_commit {
-                "\n\n**Auto-commit is OFF.** Do not commit unless the user explicitly asks. If asked, use `agent_commit_changes` with `userRequested: true`."
-            } else {
-                ""
-            };
             message = Some(match message {
                 Some(body) if !body.is_empty() => {
-                    format!("{body}\n\n---\n{preamble}{commit_instruction}")
+                    format!("{body}\n\n---\n{preamble}")
                 }
-                _ => format!("{preamble}{commit_instruction}"),
+                _ => preamble,
             });
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`
@@ -4577,6 +4743,54 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
+        // D2: resolve the provider up front when the caller gave no explicit
+        // `model` — the wire has no `provider` param on `agent.delegate`, so
+        // without this the created session's `provider` stays `None` and the
+        // spawn path falls through to the hardcoded default (Auggie),
+        // regardless of the user's actual configured default. A compound
+        // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
+        // provider via `agent_create_op`'s existing derivation, so D2 is
+        // skipped in that case.
+        // SECURITY: derive workspace_path from the stored workspace record,
+        // never a client-supplied value (same rationale as
+        // `agent_create_op`'s model resolution).
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        let delegate_provider = if input.model.is_none() {
+            resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
+        } else {
+            None
+        };
+        // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
+        // effort > specialist frontmatter > unset, validated against the
+        // cached catalog's `effortLevels` for the effective model (the
+        // explicit `model`, else the specialist's own pin). Runs BEFORE the
+        // child is created so a `-32602` rejection is side-effect free.
+        let effective_model = input.model.clone().or_else(|| {
+            input.specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input.reasoning_effort.as_deref(),
+            input.specialist.as_deref(),
+            effective_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.delegate",
+                &self.models_catalog,
+                effective_model.as_deref(),
+                effort,
+            )?;
+        }
         let mut extra_metadata = serde_json::Map::new();
         if let Some(depth) = delegation_depth {
             extra_metadata.insert("delegationDepth".to_string(), json!(depth));
@@ -4602,6 +4816,8 @@ impl Services {
             extra_metadata.insert("vmResources".to_string(), json!(vm));
         }
         let extra = AgentCreateExtra {
+            provider: delegate_provider,
+            reasoning_effort,
             metadata: (!extra_metadata.is_empty()).then_some(Value::Object(extra_metadata)),
             // Delegated agents carry a task-derived name but stay renameable
             // by the child's opening-turn `ws.workspace.setAgentName`
@@ -4659,15 +4875,18 @@ impl Services {
             let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
                 // Sandbox-eligible: direct-mode workspaces (no worktree or
-                // skip_worktree=true; sandbox sourced from the user's repo folder)
-                // and CoW-checkout workspaces (sourced from the workspace
-                // checkout). Worktree-mode workspaces keep the shared checkout
-                // (no sandbox).
+                // skip_worktree=true; sandbox sourced from the user's repo folder),
+                // CoW-checkout workspaces (sourced from the workspace checkout),
+                // and direct-checkout workspaces (`checkoutMode == "direct"`,
+                // standalone plain repo — cache-hydrated or isNewRepo).
+                // Worktree-mode workspaces keep the shared checkout (no sandbox).
                 let is_direct_mode = (ws.skip_worktree || ws.worktree_path.is_none())
                     && ws.repository_path.is_some();
-                let is_cow_checkout = ws.checkout_mode == Some(intent_core::CheckoutMode::Cow)
-                    && ws.worktree_path.is_some();
-                if is_direct_mode || is_cow_checkout {
+                let is_standalone_checkout = matches!(
+                    ws.checkout_mode,
+                    Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                ) && ws.worktree_path.is_some();
+                if is_direct_mode || is_standalone_checkout {
                     // Same root fallback as `workspace.create` (the intentd
                     // binary configures the root via INTENTD_WORKSPACES_DIR /
                     // `workspaces.root` rather than `.with_workspaces_root`).
@@ -5259,6 +5478,15 @@ impl Services {
         if removed {
             self.publish_subscriptions_changed(&watch.parent_workspace_id, &caller_agent_id)
                 .await;
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // the caller's own `agent:idle` may have been deferred (not fired,
+            // watch armed) because it held this outgoing watch. Removing it
+            // here is outside the wake path, so re-run the mutation-path
+            // redelivery — a no-op unless the caller is idle with no remaining
+            // waiting reason, in which case it synthesizes the caller's real
+            // completion and settles its own deferred watchers.
+            self.redeliver_completion_after_queue_mutation(&caller_agent_id)
+                .await;
         }
         Ok(json!({ "ok": true, "removed": removed }))
     }
@@ -5613,6 +5841,12 @@ impl Services {
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
             }
+            // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+            // dropping every outgoing watch may remove the caller's last
+            // waiting reason, so re-run the mutation-path redelivery to settle
+            // any watch on the caller whose `agent:idle` was deferred.
+            self.redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
             return Ok(json!({ "success": true }));
         }
 
@@ -5679,6 +5913,12 @@ impl Services {
         for anchor in &anchors {
             self.publish_subscriptions_changed(anchor, &agent_id).await;
         }
+        // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
+        // cancelling a scoped outgoing watch may remove the caller's last
+        // waiting reason, so re-run the mutation-path redelivery to settle any
+        // watch on the caller whose `agent:idle` was deferred.
+        self.redeliver_completion_after_queue_mutation(&agent_id)
+            .await;
         Ok(json!({ "success": true }))
     }
 
@@ -6636,6 +6876,42 @@ impl Services {
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
+        // Reasoning effort (PROTOCOL §5.11), create branch only: the
+        // wake-level param wins over `create.reasoningEffort`, then the chosen
+        // model option's effort, then the specialist frontmatter. Validated
+        // against the cached catalog's `effortLevels` for the resolved model
+        // before the child is created, so a `-32602` leaves no orphan.
+        // SECURITY: the project tier comes from the stored workspace record.
+        let workspace_path = self
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .ok()
+            .and_then(|w| crate::git_ops::worktree_path(&w));
+        let effort_model = model.clone().or_else(|| {
+            specialist.as_deref().and_then(|s| {
+                self.specialists_service()
+                    .resolve_model(s, workspace_path.as_deref())
+            })
+        });
+        let reasoning_effort = resolve_delegate_reasoning_effort(
+            self,
+            input
+                .reasoning_effort
+                .as_deref()
+                .or(create_opts.reasoning_effort.as_deref()),
+            specialist.as_deref(),
+            effort_model.as_deref(),
+            workspace_path.as_deref(),
+        );
+        if let Some(effort) = reasoning_effort.as_deref() {
+            ensure_effort_supported_by_model(
+                "agent.wakeOrCreate",
+                &self.models_catalog,
+                effort_model.as_deref(),
+                effort,
+            )?;
+        }
 
         // B5: rich create payload (`name` default `Task: {title}`,
         // `contextReferences` + provenance metadata folded into the persisted
@@ -6662,6 +6938,7 @@ impl Services {
         );
         let extra = AgentCreateExtra {
             provider,
+            reasoning_effort,
             agent_type,
             metadata,
             workspace_path: None,

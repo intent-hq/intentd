@@ -9,7 +9,7 @@
 
 use intent_core::{
     AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    WorkspaceId,
+    UsageCost, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -23,7 +23,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
-    stop_reason_timestamp";
+    stop_reason_timestamp, reasoning_effort";
 
 /// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
 /// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
@@ -33,12 +33,12 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
-    sandbox_branch, stop_reason, stop_reason_timestamp";
+    sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
 /// `message_contents` is non-empty only for sessions whose decoded snapshot
-/// AND baseline are both absent (the per-message fallback path — see
+/// and baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]).
 pub type AgentUsageRow = (
     String,
@@ -52,7 +52,9 @@ pub type AgentUsageRow = (
 /// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
 /// the transactional recompute in `workspace_repo.rs` (write transaction,
 /// monorepo#738) share one implementation. Message contents are hydrated only
-/// when both the decoded snapshot and baseline are absent; a malformed
+/// when neither the decoded snapshot nor the baseline carries a token report
+/// ([`intent_core::token_usage_reported`], which also treats the all-zero
+/// counters of a cost-only persist as "no report"); a malformed
 /// snapshot/baseline decodes to `None` and still hydrates.
 pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
@@ -80,29 +82,31 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        // Message contents feed the tally only when BOTH snapshot and
-        // baseline are absent (`agent_token_tally`'s fallback rule), so the
-        // per-session content fetch is skipped otherwise (monorepo#738).
-        let contents: Vec<serde_json::Value> = if snapshot.is_none() && baseline.is_none() {
-            let message_sql =
-                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
-            let message_rows = sqlx::query(message_sql)
-                .bind(&agent_id)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("get agent messages for usage failed: {e}"))
-                })?;
-            message_rows
-                .iter()
-                .map(|row| {
-                    let content_str: String = row.get("content");
-                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Message contents feed the tally only when neither snapshot nor
+        // baseline carries a token report (`agent_token_tally`'s fallback
+        // rule), so the per-session content fetch is skipped otherwise
+        // (monorepo#738).
+        let contents: Vec<serde_json::Value> =
+            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                let message_sql =
+                    "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+                let message_rows = sqlx::query(message_sql)
+                    .bind(&agent_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("get agent messages for usage failed: {e}"))
+                    })?;
+                message_rows
+                    .iter()
+                    .map(|row| {
+                        let content_str: String = row.get("content");
+                        serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         result.push((agent_id, model, snapshot, baseline, contents));
     }
@@ -338,7 +342,7 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
     .transpose()
 }
 
-/// Bind the full 32-column `agent_session` insert value list onto `query`, in
+/// Bind the full 34-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
@@ -379,7 +383,8 @@ fn bind_session_insert<'q>(
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
-        .bind(&s.stop_reason_timestamp))
+        .bind(&s.stop_reason_timestamp)
+        .bind(&s.reasoning_effort))
 }
 
 impl Store {
@@ -394,7 +399,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -452,7 +457,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1030,81 +1035,53 @@ impl Store {
         Ok(())
     }
 
-    /// Guarded write of a session's effective model resolved at session open
-    /// (D13): sets `model` only while the stored value still equals
-    /// `expected_current` (the placeholder read before the ACP call — `None`
-    /// matches NULL), so a concurrent explicit `agent.setModel` is never
-    /// overwritten. Any stale `resolved_model` is cleared in the same write
-    /// (the effective model IS the display identity — D14). Returns whether
-    /// the write landed; `false` means the guard failed (model changed
-    /// concurrently or the row is absent), which callers treat as a benign
-    /// skip. Scoped to `workspace_id` (defense-in-depth).
-    pub async fn set_agent_session_effective_model(
-        &self,
-        workspace_id: &WorkspaceId,
-        id: &AgentId,
-        expected_current: Option<&str>,
-        effective: &str,
-    ) -> Result<bool> {
-        let res = match expected_current {
-            Some(current) => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                     WHERE id=? AND workspace_id=? AND model=?",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .bind(current)
-                .execute(self.write_pool())
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE agent_session SET model=?, resolved_model=NULL \
-                 WHERE id=? AND workspace_id=? AND model IS NULL",
-                )
-                .bind(effective)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .execute(self.write_pool())
-                .await
-            }
-        }
-        .map_err(|e| Error::Internal(format!("set agent session effective model failed: {e}")))?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    /// Guarded write of a session's *resolved* display model (D14): the
-    /// display identity of an EXPLICITLY selected model id, matched against
-    /// the provider's `configOptions[id="model"]` option list at session
-    /// open. Unlike [`set_agent_session_effective_model`](Store::set_agent_session_effective_model)
-    /// this never touches `model` — the raw option id keeps driving provider
-    /// configuration (spawn flags / `session/set_config_option`); the
-    /// resolution is used ONLY for usage-stats attribution. `resolved` is
-    /// written as given, `None` included — an id that no longer resolves
-    /// must overwrite (not orphan) a previously persisted resolution, or a
-    /// stale display name would keep mis-attributing stats. Writes only
-    /// while `model` still equals `expected_model` (the explicit id read
-    /// before the ACP call), so a resolution is never attached to a model a
+    /// Guarded write of a session's *resolved* display model (D13/D14): the
+    /// display identity resolved against the provider's
+    /// `configOptions[id="model"]` option list at session open — for an
+    /// explicit pick (D14) and for a placeholder/NULL model whose effective
+    /// model the provider reported (D13). This never touches `model` — the
+    /// stored id (or placeholder) keeps driving provider configuration
+    /// (spawn flags / `session/set_config_option`); the resolution is used
+    /// ONLY for usage-stats attribution. `resolved` is written as given,
+    /// `None` included — an id that no longer resolves must overwrite (not
+    /// orphan) a previously persisted resolution, or a stale display name
+    /// would keep mis-attributing stats. Writes only while `model` still
+    /// equals `expected_model` (the value read before the ACP call — `None`
+    /// matches NULL), so a resolution is never attached to a model a
     /// concurrent `agent.setModel` changed. Returns whether the write
     /// landed. Scoped to `workspace_id` (defense-in-depth).
     pub async fn set_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-        expected_model: &str,
+        expected_model: Option<&str>,
         resolved: Option<&str>,
     ) -> Result<bool> {
-        let res = sqlx::query(
-            "UPDATE agent_session SET resolved_model=? WHERE id=? AND workspace_id=? AND model=?",
-        )
-        .bind(resolved)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(expected_model)
-        .execute(self.write_pool())
-        .await
+        let res = match expected_model {
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model=?",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .bind(expected)
+                .execute(self.write_pool())
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE agent_session SET resolved_model=? \
+                     WHERE id=? AND workspace_id=? AND model IS NULL",
+                )
+                .bind(resolved)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+            }
+        }
         .map_err(|e| Error::Internal(format!("set agent session resolved model failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
@@ -1351,15 +1328,20 @@ impl Store {
         if current_acp_session_id.is_some() && s.acp_session_id != current_acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
+        // The attention_request_* columns are deliberately ABSENT from this
+        // full-row UPDATE: a long-lived in-memory `AgentSession` persisted
+        // here mid-race must not resurrect a request that
+        // `clear_attention_request` already NULLed (or clobber one that
+        // `set_attention_request` just wrote). Those two narrow writers are
+        // the only post-insert mutators of the attention columns.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
-             completion_report=?, completion_report_timestamp=?, attention_request_kind=?, \
-             attention_request_reason=?, attention_request_timestamp=?, delegation_depth=?, \
+             completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
              metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
-             stop_reason_timestamp=? \
+             stop_reason_timestamp=?, reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1378,9 +1360,6 @@ impl Store {
         .bind(s.skip_auto_commit as i64)
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
-        .bind(&s.attention_request_kind)
-        .bind(&s.attention_request_reason)
-        .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
@@ -1392,6 +1371,7 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
+        .bind(&s.reasoning_effort)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.write_pool())
@@ -1698,6 +1678,45 @@ impl Store {
         Ok(true)
     }
 
+    /// Persist a pending attention request (`attention_request_kind` /
+    /// `..._reason` / `..._timestamp`): a narrow write of the three attention
+    /// columns plus `updated_at` (refreshed to `timestamp`). Together with
+    /// [`Store::clear_attention_request`] this is the ONLY writer of the
+    /// attention columns after insert — the full-row
+    /// [`Store::update_agent_session`] deliberately excludes them so a stale
+    /// in-memory session persisted mid-race can neither resurrect a cleared
+    /// request nor clobber a fresh one. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session is absent or the
+    /// workspace does not match.
+    pub async fn set_attention_request(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        kind: &str,
+        reason: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=?, \
+             attention_request_reason=?, attention_request_timestamp=?, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(kind)
+        .bind(reason)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set attention request failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Clear the pending attention request (`attention_request_kind` /
     /// `..._reason` / `..._timestamp`) when the agent next receives a message.
     /// Returns `true` if a request was present and cleared, `false` if none
@@ -1917,6 +1936,9 @@ impl Store {
                         cache_creation_tokens: b
                             .cache_creation_tokens
                             .saturating_add(s.cache_creation_tokens),
+                        // Cost is cumulative per ACP session exactly like the
+                        // counters, so the fold banks it the same way (§5.23).
+                        cost: UsageCost::merge(b.cost.as_ref(), s.cost.as_ref()),
                     })
                 }
             };
@@ -1995,6 +2017,7 @@ fn map_session_row_with_system_prompt(
         name: col(row, "name")?,
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
         model: col(row, "model")?,
+        reasoning_effort: col(row, "reasoning_effort")?,
         provider: col(row, "provider")?,
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
@@ -2839,6 +2862,7 @@ mod tests {
             name: "First".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -2952,6 +2976,7 @@ mod tests {
             name: "Usage".to_string(),
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -2998,6 +3023,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &first)
@@ -3008,6 +3034,7 @@ mod tests {
             output_tokens: 80,
             cache_read_tokens: 45,
             cache_creation_tokens: 6,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &second)
@@ -3102,6 +3129,7 @@ mod tests {
             name: "Baseline".to_string(),
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3166,6 +3194,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 5,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap1)
@@ -3198,6 +3227,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_creation_tokens: 40,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap2)
@@ -3220,6 +3250,7 @@ mod tests {
                 output_tokens: 60,
                 cache_read_tokens: 50,
                 cache_creation_tokens: 45,
+                cost: None,
             }),
             "second recreate accumulates onto the baseline"
         );
@@ -3272,6 +3303,7 @@ mod tests {
             output_tokens: 8,
             cache_read_tokens: 9,
             cache_creation_tokens: 10,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3312,6 +3344,7 @@ mod tests {
             output_tokens: 4,
             cache_read_tokens: 5,
             cache_creation_tokens: 6,
+            cost: None,
         };
 
         // Write-once first set: snapshot and baseline stay untouched.
@@ -3387,6 +3420,7 @@ mod tests {
             output_tokens: 22,
             cache_read_tokens: 33,
             cache_creation_tokens: 44,
+            cost: None,
         };
 
         // Malformed snapshot + valid baseline: the fold treats the snapshot
@@ -3496,6 +3530,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3550,6 +3585,7 @@ mod tests {
             output_tokens: 6,
             cache_read_tokens: 7,
             cache_creation_tokens: 8,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3626,6 +3662,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             };
             store
                 .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -3659,6 +3696,7 @@ mod tests {
                 output_tokens: 120,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                cost: None,
             }),
             "every fold landed exactly once"
         );
@@ -3681,6 +3719,7 @@ mod tests {
             output_tokens: 2,
             cache_read_tokens: 3,
             cache_creation_tokens: 4,
+            cost: None,
         };
         {
             let store = Store::open(&tmp).await.expect("create test store");
@@ -3718,6 +3757,134 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline NULL for pre-existing rows");
     }
 
+    /// `reasoning_effort` persists across insert → read (full + summary
+    /// projections) and clears via `update_agent_session` (PROTOCOL §5.5,
+    /// Option B: stored as-is, cleared when absent).
+    #[tokio::test]
+    async fn reasoning_effort_roundtrip_and_clear() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort".to_string());
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let full = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(full.reasoning_effort.as_deref(), Some("high"));
+        let summary = store
+            .get_agent_session_summary(&agent_id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("high"));
+
+        session.reasoning_effort = None;
+        store
+            .update_agent_session(&ws_id, &session)
+            .await
+            .expect("update");
+        let cleared = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(cleared.reasoning_effort, None, "cleared on update");
+    }
+
+    /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
+    /// ids into base model + `reasoning_effort`, guarded on codex evidence
+    /// (provider column, `codex:` prefix, or known effort-variant base) AND a
+    /// known effort suffix — slash-bearing non-codex ids stay untouched.
+    #[tokio::test]
+    async fn migration_0080_splits_codex_compound_model_ids() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-0080".to_string());
+        let mk_id = || AgentId(format!("agent-{}", Uuid::new_v4()));
+        // (model, provider, expected model, expected effort after 0080)
+        let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
+            // codex provider evidence → split.
+            (
+                "gpt-5.3-codex/high",
+                Some("codex"),
+                "gpt-5.3-codex",
+                Some("high"),
+            ),
+            // codex compound prefix evidence → split.
+            (
+                "codex:gpt-5.3-codex/xhigh",
+                None,
+                "codex:gpt-5.3-codex",
+                Some("xhigh"),
+            ),
+            // known effort-variant base evidence → split.
+            (
+                "gpt-5.2-codex/medium",
+                None,
+                "gpt-5.2-codex",
+                Some("medium"),
+            ),
+            // bare codex model: no slash → untouched.
+            ("gpt-5.3-codex", Some("codex"), "gpt-5.3-codex", None),
+            // HuggingFace-style slash id, suffix not an effort level → untouched.
+            (
+                "unsloth/Qwen3-32B",
+                Some("unsloth"),
+                "unsloth/Qwen3-32B",
+                None,
+            ),
+            // effort-shaped suffix but no codex evidence → untouched.
+            ("some-org/high", None, "some-org/high", None),
+        ];
+        let ids: Vec<AgentId> = cases.iter().map(|_| mk_id()).collect();
+        {
+            let store = Store::open(&tmp).await.expect("create test store");
+            store
+                .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+                .await
+                .expect("insert workspace");
+            for (id, (model, provider, _, _)) in ids.iter().zip(&cases) {
+                let mut session = baseline_test_session(id, &ws_id, &ts, None);
+                session.model = Some(model.to_string());
+                session.provider = provider.map(str::to_string);
+                store.insert_agent_session(&session).await.expect("insert");
+            }
+            // Rewind to the pre-0080 schema so the reopen re-runs the
+            // migration against these rows (same pattern as the 0054 test).
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 80")
+                .execute(store.write_pool())
+                .await
+                .expect("forget 0080");
+            sqlx::query("ALTER TABLE agent_session DROP COLUMN reasoning_effort")
+                .execute(store.write_pool())
+                .await
+                .expect("drop reasoning_effort column");
+            store.close().await;
+        }
+
+        let store = Store::open(&tmp).await.expect("reopen applies 0080");
+        for (id, (model, _, expected_model, expected_effort)) in ids.iter().zip(&cases) {
+            let session = store.get_agent_session(id).await.expect("get");
+            assert_eq!(
+                session.model.as_deref(),
+                Some(*expected_model),
+                "model after 0080 for legacy {model}"
+            );
+            assert_eq!(
+                session.reasoning_effort.as_deref(),
+                *expected_effort,
+                "reasoning_effort after 0080 for legacy {model}"
+            );
+        }
+    }
+
     /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
     /// hydrates message contents ONLY when both the decoded snapshot and
     /// baseline are absent — snapshot- and/or baseline-backed sessions return
@@ -3742,6 +3909,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
 
         // Each session gets one message with usage metadata; only the
@@ -3835,6 +4003,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 30,
             cache_creation_tokens: 4,
+            cost: None,
         };
         store
             .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
@@ -4180,6 +4349,7 @@ mod tests {
             name: "Test Agent".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -4336,6 +4506,7 @@ mod tests {
             name: "Test Agent".to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: Some("auggie".to_string()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -4551,6 +4722,7 @@ mod tests {
                 name: format!("Agent {}", agent_id.0),
                 name_explicitly_set: false,
                 model: None,
+                reasoning_effort: None,
                 provider: None,
                 status: AgentStatus::Idle,
                 is_active: false,

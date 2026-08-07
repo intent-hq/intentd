@@ -126,8 +126,6 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.autoFetch` — periodically fetch from the remote.
-    pub auto_fetch: bool,
     /// `workspace.cowIsolation` — CoW workspace provisioning and per-agent
     /// sandboxing (requires CoW filesystem support on the workspaces root;
     /// workspace creation fails when unsupported).
@@ -511,6 +509,8 @@ pub struct VoiceSettings {
     pub language: Option<String>,
     /// `[voice.openai]` — OpenAI provider tuning.
     pub openai: VoiceOpenAiSettings,
+    /// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary.
+    pub workspace_vocabulary: VoiceWorkspaceVocabularySettings,
 }
 
 /// `voice.provider` values.
@@ -541,6 +541,29 @@ pub enum VoiceOpenAiModel {
     Gpt4oMiniTranscribe,
     #[serde(rename = "whisper-1")]
     Whisper1,
+}
+
+/// Default `voice.workspaceVocabulary.maxTerms`.
+pub const DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS: u32 = 50;
+
+/// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary tuning
+/// (`voice.workspaceVocabulary.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct VoiceWorkspaceVocabularySettings {
+    /// `voice.workspaceVocabulary.maxTerms` — cap on the auto-derived
+    /// workspace vocabulary injected into `voice.transcribe` calls carrying a
+    /// `workspaceId` and served by `voice.getWorkspaceVocabulary` (0 disables
+    /// derivation and injection entirely; max 100).
+    pub max_terms: u32,
+}
+
+impl Default for VoiceWorkspaceVocabularySettings {
+    fn default() -> Self {
+        Self {
+            max_terms: DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS,
+        }
+    }
 }
 
 /// `[context]` — context engine (`context.*`).
@@ -811,7 +834,14 @@ where
 /// `server.listenMode` is retired outright: the daemon always serves UDS and
 /// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
 /// discarded (no catalog entry remains) and stripped from the file.
-pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai", "server.listenMode"];
+/// `workspace.autoFetch` is likewise retired outright (the periodic-fetch
+/// feature was removed) — discarded and stripped.
+pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
+    "model.workspaceOverrides",
+    "ai",
+    "server.listenMode",
+    "workspace.autoFetch",
+];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
@@ -955,6 +985,13 @@ impl SettingsFile {
                 format!("must be >= {MIN_MICROVM_MEM_MIB}, got {mem}"),
             ));
         }
+        let terms = self.voice.workspace_vocabulary.max_terms;
+        if terms > 100 {
+            return Err(bad(
+                "voice.workspaceVocabulary.maxTerms",
+                format!("must be between 0 and 100, got {terms}"),
+            ));
+        }
         Ok(())
     }
 
@@ -1063,8 +1100,6 @@ providerSettings = {}
 # sshKeyPath = "~/.ssh/id_ed25519"
 # Default shell -- shell used for terminals/scripts.
 # defaultShell = "/bin/zsh"
-# Auto-fetch -- periodically fetch from the remote.
-autoFetch = false
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
@@ -1188,6 +1223,13 @@ provider = "elevenlabs"
 # "gpt-4o-mini-transcribe", or "whisper-1".
 model = "gpt-4o-transcribe"
 
+[voice.workspaceVocabulary]
+# Workspace vocabulary max terms -- cap on the auto-derived workspace
+# vocabulary injected into voice.transcribe calls carrying a workspaceId and
+# served by voice.getWorkspaceVocabulary (0 disables derivation and injection
+# entirely; max 100).
+maxTerms = 50
+
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -1291,7 +1333,6 @@ mod tests {
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
         assert!(d.background_agents.provider_settings.is_empty());
-        assert!(!d.workspace.auto_fetch);
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert_eq!(d.sandbox.default_type, SandboxType::Worktree);
@@ -1337,6 +1378,10 @@ mod tests {
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);
         assert_eq!(d.voice.openai.model, VoiceOpenAiModel::Gpt4oTranscribe);
+        assert_eq!(
+            d.voice.workspace_vocabulary.max_terms,
+            DEFAULT_VOICE_WORKSPACE_VOCABULARY_MAX_TERMS
+        );
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
@@ -1681,6 +1726,26 @@ mod tests {
         let err = SettingsFile::parse_str("[server]\nlistenMode = \"uds\"\n").unwrap_err();
         assert!(err.to_string().contains("listenMode"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("listenMode"));
+    }
+
+    #[test]
+    fn auto_fetch_is_no_longer_a_schema_key() {
+        // Strict parse rejects the retired key like any other unknown key.
+        let err = SettingsFile::parse_str("[workspace]\nautoFetch = false\n").unwrap_err();
+        assert!(err.to_string().contains("autoFetch"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoFetch"));
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_auto_fetch() {
+        let text = "[workspace]\nautoFetch = false\ncowIsolation = true\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert!(file.workspace.cow_isolation);
+        assert_eq!(
+            legacy.get("workspace.autoFetch"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(legacy.len(), 1);
     }
 
     #[test]

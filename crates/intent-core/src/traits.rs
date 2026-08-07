@@ -1631,8 +1631,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getModels`: `{ models: [{ id, name, provider, description? }] }`
-    /// from the auggie CLI with a static tier fallback; no `workspaceId`
-    /// (PROTOCOL §5.5).
+    /// from the auggie CLI, degrading to an empty list when the CLI is
+    /// unavailable; no `workspaceId` (PROTOCOL §5.5).
     fn agent_get_models(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
@@ -1645,8 +1645,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// `workspaceId` (PROTOCOL §5.30). Without `provider_id` this is the
     /// backward-compatible auggie path —
     /// `{ models: [ModelInfo…], source: "auggie" | "static" }` from
-    /// `auggie model list --json` (plain-text fallback) with the static tier
-    /// catalog when the CLI is unavailable — except that `force_refresh` with
+    /// `auggie model list --json` (plain-text fallback), degrading to an
+    /// empty `source: "static"` list when the CLI is unavailable — except
+    /// that `force_refresh` with
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
@@ -3086,21 +3087,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.capabilities`: the active provider's id + capability flags so
-    /// clients can gate UI on what the host supports. Requires a resolvable
-    /// provider but NOT an active PR (PROTOCOL §5.7 extension).
-    fn pr_capabilities(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_capabilities not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -3126,67 +3112,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.listComments`: conversation-level comments on the active PR, clamped to
-    /// `count` (default 20, max 100) (PROTOCOL §5.7).
-    fn pr_list_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        count: Option<i64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, count);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_comments not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.listReviewComments`: line-anchored review threads on the active PR,
-    /// filtered by `path` / `status` (PROTOCOL §5.7).
-    fn pr_list_review_comments(
-        &self,
-        workspace_id: WorkspaceId,
-        path: Option<String>,
-        status: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, status);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_review_comments not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.getReviews`: the review decision aggregate + reviews for the active PR
-    /// (or `pr_number` when given) (PROTOCOL §5.7 extension).
-    fn pr_get_reviews(
-        &self,
-        workspace_id: WorkspaceId,
-        pr_number: Option<u64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pr_number);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_get_reviews not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.listCheckRuns`: CI check-run tally + runs for `git_ref` (defaults to
-    /// the PR head) (PROTOCOL §5.7 extension).
-    fn pr_list_check_runs(
-        &self,
-        workspace_id: WorkspaceId,
-        git_ref: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, git_ref);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_list_check_runs not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
     /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
     /// mergeability + blocked reason, check-run tally, review decision, and
@@ -3205,105 +3130,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_state not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.merge`: merge the active PR with `merge_method` (default `merge`) and
-    /// optional commit overrides. Requires an active PR (PROTOCOL §5.7).
-    fn pr_merge(
-        &self,
-        workspace_id: WorkspaceId,
-        merge_method: Option<String>,
-        commit_title: Option<String>,
-        commit_message: Option<String>,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (
-            workspace_id,
-            merge_method,
-            commit_title,
-            commit_message,
-            idempotency_key,
-        );
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_merge not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.updateBranch`: update the active PR branch from its base (PROTOCOL §5.7).
-    fn pr_update_branch(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_update_branch not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.postComment`: post a conversation comment on the active PR (PROTOCOL §5.7).
-    fn pr_post_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_post_comment not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.replyToReviewComment`: reply to a review comment on the active PR
-    /// (PROTOCOL §5.7).
-    fn pr_reply_to_review_comment(
-        &self,
-        workspace_id: WorkspaceId,
-        comment_id: u64,
-        body: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, comment_id, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_reply_to_review_comment not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.resolveThread`: resolve/unresolve a review thread (default `resolve`)
-    /// on the active PR (PROTOCOL §5.7).
-    fn pr_resolve_thread(
-        &self,
-        workspace_id: WorkspaceId,
-        thread_id: String,
-        action: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, thread_id, action);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_resolve_thread not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `pr.createReview`: submit a review (`approve` / `request-changes` /
-    /// `comment`) on the active PR (PROTOCOL §5.7 extension).
-    fn pr_create_review(
-        &self,
-        workspace_id: WorkspaceId,
-        verdict: String,
-        body: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, verdict, body);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::pr_create_review not implemented".to_string(),
             ))
         })
     }
@@ -3988,6 +3814,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `voice.getWorkspaceVocabulary`: the auto-derived workspace vocabulary
+    /// — derived terms only, the user's `voice.vocabulary` is not merged in —
+    /// as `{ terms: string[] }` (PROTOCOL §5.41, v4.6). Served from the same
+    /// content-hash cache the `voice.transcribe` injection uses, capped by
+    /// `voice.workspaceVocabulary.maxTerms` (`{ terms: [] }` when the setting
+    /// is `0` or nothing derives). An unknown `workspaceId` → `NotFound`
+    /// (-32602 with `error.data.code: "not-found"` on the wire).
+    fn voice_get_workspace_vocabulary(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::voice_get_workspace_vocabulary not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file-tracking.getChanges`: the filtered tracked-change list
     /// (`{ changes, truncated, totalCount }`) (PROTOCOL §5.19).
     fn file_tracking_get_changes(
@@ -4196,14 +4041,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `providers.catalog`: the static provider registry (monorepo#928) —
-    /// `{ providers: [...], defaultProviderId }`, one row per registered
-    /// provider in registry order, so clients no longer need a local copy of
-    /// the provider config. Each row is `{ id, displayName, shortName,
-    /// command, isDefault, canBeDisabled, loginCommandHint?, loginDocsUrl?,
-    /// authErrorPatterns?, requiresEnvVar?, requiresFeatureCode?, visible,
-    /// modelTiers? }`; `visible` is the daemon-evaluated gating result (env
-    /// var present / no feature code required) while the raw gating fields
-    /// are passed through when set. No params, no workspaceId — static data.
+    /// `{ providers: [...] }`, one row per registered provider in registry
+    /// order, so clients no longer need a local copy of the provider config.
+    /// Each row is `{ id, displayName, shortName, command, canBeDisabled,
+    /// loginCommandHint?, loginDocsUrl?, authErrorPatterns?,
+    /// requiresEnvVar?, requiresFeatureCode?, visible }`; `visible` is the
+    /// daemon-evaluated gating result (env var present / no feature code
+    /// required) while the raw gating fields are passed through when set. No
+    /// default designation and no tier metadata — clients derive an
+    /// effective default from settings (`model.default` prefix, else
+    /// `providers.active`). No params, no workspaceId — static data.
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

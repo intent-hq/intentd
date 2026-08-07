@@ -507,6 +507,7 @@ mod tests {
             name: name.to_string(),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status,
             is_active: false,

@@ -570,26 +570,28 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["result"]["success"], json!(true));
 
-    // (o) agent.getModels (no workspaceId) → non-empty model catalog.
+    // (o) agent.getModels (no workspaceId) → a models array (possibly empty
+    // when no auggie CLI is available — no static fallback catalog remains).
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":22,"method":"agent.getModels"}"#,
     )
     .await;
-    let models = resp["result"]["models"].as_array().expect("models array");
-    assert!(!models.is_empty());
+    resp["result"]["models"].as_array().expect("models array");
 
-    // (o′) models.list (§5.30) → non-empty rich catalog + `source` tag.
+    // (o′) models.list (§5.30) → rich catalog + `source` tag; rows present
+    // carry the id/name/provider triple.
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":93,"method":"models.list"}"#,
     )
     .await;
     let models = resp["result"]["models"].as_array().expect("models array");
-    assert!(!models.is_empty());
-    assert!(models[0]["id"].is_string());
-    assert!(models[0]["name"].is_string());
-    assert!(models[0]["provider"].is_string());
+    for m in models {
+        assert!(m["id"].is_string());
+        assert!(m["name"].is_string());
+        assert!(m["provider"].is_string());
+    }
     let source = resp["result"]["source"].as_str().expect("source");
     assert!(source == "auggie" || source == "static", "source: {source}");
 

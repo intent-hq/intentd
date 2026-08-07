@@ -98,7 +98,7 @@ pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// method); `Ok(Some(v))` on success and `Err(msg)` on a JS-visible failure.
 /// `caller_agent_id` threads the tool-call's agent context so the bindings
 /// that attribute their calls back to the spawning agent
-/// (`workspace.setAgentName` / `git.commit` / `git.agentCommit` /
+/// (`workspace.setAgentName` / `git.commit` /
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods — `create`,
 /// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`,
 /// `requestDiscussion`, `reportBlocker`) can do so.

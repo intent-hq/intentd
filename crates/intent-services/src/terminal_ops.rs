@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
-use crate::shell::default_shell;
+use crate::shell::{default_shell, scrubbed_env_vars_except};
 use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
 
 /// How often the output streamer polls for natural process exit. The broadcast
@@ -71,6 +71,10 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// non-empty daemon inheritance; otherwise a missing or empty effective value
 /// defaults to `xterm-256color`. When `cwd` is omitted the PTY spawns in the
 /// workspace's worktree root (see [`default_cwd`]); an explicit `cwd` wins.
+/// The inherited `npm_config_prefix` launcher variable is scrubbed so nvm can
+/// initialize, while an explicit caller value is preserved. On POSIX, an omitted
+/// command launches zsh/bash with `-l` so login profiles are loaded; explicit
+/// commands and Windows defaults are unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
@@ -84,7 +88,21 @@ pub(crate) async fn create(
     command: Option<String>,
     env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<Value> {
-    let mut spec = SpawnSpec::new(workspace_id.as_str(), command.unwrap_or_else(default_shell));
+    let (command, is_default_shell) = match command {
+        Some(command) => (command, false),
+        None => (default_shell(), true),
+    };
+    let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
+    let mut spawn_env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
+    let inherited_term = std::env::var("TERM").ok();
+    ensure_terminal_term(&mut spawn_env, inherited_term.as_deref());
+    let mut spec = terminal_spawn_spec_for(
+        workspace_id.as_str(),
+        &command,
+        is_default_shell,
+        cfg!(windows),
+        spawn_env,
+    );
     spec.size = PtySize { rows, cols };
     spec.cwd = match cwd {
         Some(cwd) => Some(PathBuf::from(cwd)),
@@ -93,14 +111,48 @@ pub(crate) async fn create(
             None => None,
         },
     };
-    let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
-    spec.env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
-    let inherited_term = std::env::var("TERM").ok();
-    ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
     Ok(json!({ "terminalId": terminal_id }))
+}
+
+/// Base spawn spec for an interactive workspace terminal. Only the omitted-
+/// command path receives login-shell arguments; explicit commands retain their
+/// caller-specified argv (empty for the `terminal.create` wire shape).
+fn terminal_spawn_spec_for(
+    scope: &str,
+    command: &str,
+    is_default_shell: bool,
+    is_windows: bool,
+    env: Vec<(String, String)>,
+) -> SpawnSpec {
+    let mut spec = SpawnSpec::new(scope, command);
+    if is_default_shell {
+        spec.args = interactive_login_args(command, is_windows);
+    }
+    spec.env = env;
+    spec.env_remove = scrubbed_env_vars_except(&spec.env);
+    spec
+}
+
+/// Login arguments for a default interactive POSIX shell. A PTY already makes
+/// the shell interactive, so zsh/bash need only `-l`; plain sh and Windows keep
+/// their existing argument-free behavior.
+fn interactive_login_args(shell: &str, is_windows: bool) -> Vec<String> {
+    if is_windows {
+        return Vec::new();
+    }
+    let base = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    if matches!(base.as_str(), "zsh" | "bash") {
+        vec!["-l".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Default working directory when `terminal.create` omits `cwd`: the
@@ -554,6 +606,7 @@ impl TerminalHost for PtyTerminalHost {
             spec.env = overlay_credential_env(credential, params.env);
             let inherited_term = std::env::var("TERM").ok();
             ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
+            spec.env_remove = scrubbed_env_vars_except(&spec.env);
             spec.cwd = params.cwd;
             if let Some(limit) = params
                 .output_byte_limit
@@ -814,6 +867,35 @@ mod tests {
     #[test]
     fn default_shell_is_nonempty() {
         assert!(!default_shell().is_empty());
+    }
+
+    #[test]
+    fn terminal_spawn_spec_scrubs_only_inherited_env_and_selects_login_argv() {
+        for shell in ["/bin/zsh", "/opt/homebrew/bin/bash"] {
+            let spec = terminal_spawn_spec_for("ws-1", shell, true, false, Vec::new());
+            assert_eq!(spec.command, shell);
+            assert_eq!(spec.args, ["-l"]);
+            assert_eq!(spec.env_remove, ["npm_config_prefix"]);
+        }
+
+        let sh = terminal_spawn_spec_for("ws-1", "/bin/sh", true, false, Vec::new());
+        assert!(sh.args.is_empty());
+
+        let explicit = terminal_spawn_spec_for("ws-1", "/usr/bin/env", false, false, Vec::new());
+        assert_eq!(explicit.command, "/usr/bin/env");
+        assert!(explicit.args.is_empty());
+        assert_eq!(explicit.env_remove, ["npm_config_prefix"]);
+
+        let overlay = vec![("npm_config_prefix".to_string(), "/custom".to_string())];
+        let user_value = terminal_spawn_spec_for("ws-1", "/bin/zsh", true, false, overlay);
+        assert!(user_value.env_remove.is_empty());
+        assert_eq!(
+            user_value.env,
+            [("npm_config_prefix".to_string(), "/custom".to_string())]
+        );
+
+        let windows = terminal_spawn_spec_for("ws-1", "pwsh", true, true, Vec::new());
+        assert!(windows.args.is_empty());
     }
 
     #[test]

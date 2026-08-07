@@ -938,6 +938,50 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_rewrites_claude_code_mcp_titles() {
+        // Claude Code titles MCP tools `mcp__<server>__<tool>`; the title is
+        // rewritten to `{server}_{tool}` and fed through the affix strip —
+        // the same treatment as the codex dot rule.
+        assert_eq!(
+            session::derive_tool_name("mcp__workspace-mcp__workspace_api", None),
+            "workspace_api"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__github__list_issues", None),
+            "github_list_issues"
+        );
+        // Tool names containing single underscores survive intact; the
+        // server segment ends at the first `__`.
+        assert_eq!(
+            session::derive_tool_name("mcp__endara__execute_tools_Endara", None),
+            "endara_execute_tools_Endara"
+        );
+        // Prose titles containing `mcp__` mid-string (with whitespace) never
+        // match.
+        assert_eq!(
+            session::derive_tool_name("Call mcp__github__list_issues now", None),
+            "Call mcp__github__list_issues now"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__workspace-mcp__some tool", None),
+            "mcp__workspace-mcp__some tool"
+        );
+        // Missing server or tool segment → no match, title passes through.
+        assert_eq!(
+            session::derive_tool_name("mcp__server", None),
+            "mcp__server"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp____tool", None),
+            "mcp____tool"
+        );
+        assert_eq!(
+            session::derive_tool_name("mcp__server__", None),
+            "mcp__server__"
+        );
+    }
+
+    #[test]
     fn derive_tool_name_recognizes_opencode_input_shapes() {
         // Captured from opencode 1.18.3: once arguments stream in, titles
         // turn into raw prose (the command line, a file path, a regex), so
@@ -1438,6 +1482,35 @@ mod session_tests {
             params: json!({}),
         };
         assert_eq!(session::map_notification(&other), None);
+    }
+
+    /// `usage_update` maps to [`MappedUpdate::UsageCost`] when it carries a
+    /// `cost` object (§5.23) and to `None` when it reports only the context
+    /// window — a cost-less provider must never fabricate a zero figure.
+    #[test]
+    fn usage_update_maps_only_when_cost_is_reported() {
+        let with_cost: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000,
+            "cost": { "amount": 1.25, "currency": "USD" }
+        }))
+        .expect("usage_update with cost deserializes");
+        assert_eq!(
+            session::map_session_update(&with_cost),
+            Some(MappedUpdate::UsageCost(session::MappedUsageCost {
+                amount: 1.25,
+                currency: "USD".to_string(),
+            }))
+        );
+
+        let without_cost: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "usage_update",
+            "used": 53_000,
+            "size": 200_000
+        }))
+        .expect("usage_update without cost deserializes");
+        assert_eq!(session::map_session_update(&without_cost), None);
     }
 }
 
@@ -4074,25 +4147,32 @@ mod mcp_bridge_tests {
 
     /// Stdio-bridge resilience (monorepo#871, monorepo#908): initial-connect
     /// retry with stdin buffering, mid-session reconnect, and synthesized
-    /// retryable errors while disconnected mid-session. `run_bridge` is driven
+    /// errors while disconnected mid-session — retryable for ids never
+    /// written to the socket, non-retryable outcome-unknown for ids already
+    /// delivered to the listener (monorepo#1530). `run_bridge` is driven
     /// with in-memory duplex streams in place of stdin/stdout and shrunk retry
     /// knobs so tests stay fast.
     mod stdio_bridge_resilience {
         use std::net::SocketAddr;
+        use std::pin::Pin;
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::task::{Context, Poll};
         use std::time::Duration;
 
         use serde_json::{json, Value};
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+        use tokio::io::{
+            AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream,
+        };
         use tokio::net::{TcpListener, TcpStream};
         use tokio::sync::Notify;
         use tokio::task::JoinHandle;
         use tokio::time::{sleep, timeout};
 
         use crate::mcp_bridge::{
-            run_bridge, run_bridge_with, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE,
-            BRIDGE_DISCONNECTED_MESSAGE, INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
+            pump_session, run_bridge, run_bridge_with, BridgeRetryConfig, SessionEnd,
+            BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE, BRIDGE_OUTCOME_UNKNOWN_CODE,
+            BRIDGE_OUTCOME_UNKNOWN_MESSAGE, INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
         };
 
         fn fast_cfg() -> BridgeRetryConfig {
@@ -4170,6 +4250,16 @@ mod mcp_bridge_tests {
             assert_eq!(resp["error"]["code"], json!(BRIDGE_DISCONNECTED_CODE));
             assert_eq!(resp["error"]["message"], json!(BRIDGE_DISCONNECTED_MESSAGE));
             assert_eq!(resp["error"]["data"]["retryable"], json!(true));
+        }
+
+        fn assert_outcome_unknown_error(resp: &Value, id: i64) {
+            assert_eq!(resp["id"], json!(id));
+            assert_eq!(resp["error"]["code"], json!(BRIDGE_OUTCOME_UNKNOWN_CODE));
+            assert_eq!(
+                resp["error"]["message"],
+                json!(BRIDGE_OUTCOME_UNKNOWN_MESSAGE)
+            );
+            assert_eq!(resp["error"]["data"]["retryable"], json!(false));
         }
 
         /// Answer every request line on `stream` with `{"ok":true}`.
@@ -4320,10 +4410,12 @@ mod mcp_bridge_tests {
         }
 
         /// Buffered lines participate in `pending` tracking once flushed: a
-        /// TCP drop right after the flush still synthesizes the retryable
-        /// error for the buffered id (monorepo#908).
+        /// TCP drop right after the flush still synthesizes an error for the
+        /// buffered id (monorepo#908) — and since the line was delivered to
+        /// the listener, it is the non-retryable outcome-unknown error
+        /// (monorepo#1530).
         #[tokio::test]
-        async fn buffered_request_gets_retryable_error_if_tcp_drops_after_flush() {
+        async fn buffered_request_gets_outcome_unknown_error_if_tcp_drops_after_flush() {
             let addr = reserve_free_addr().await;
             let mut bridge = spawn_bridge(addr, fast_cfg());
             bridge.send_request(9).await;
@@ -4347,7 +4439,7 @@ mod mcp_bridge_tests {
             drop(write);
             drop(lines);
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 9);
+            assert_outcome_unknown_error(&resp, 9);
         }
 
         #[tokio::test]
@@ -4571,8 +4663,12 @@ mod mcp_bridge_tests {
             assert_disconnected_error(&resp, 2);
         }
 
+        /// An in-flight id delivered to the listener before the drop is
+        /// answered with the non-retryable outcome-unknown error — the
+        /// listener may have executed it, so a blind retry could double-apply
+        /// a non-idempotent call (monorepo#1530).
         #[tokio::test]
-        async fn in_flight_ids_get_retryable_error_when_connection_drops() {
+        async fn delivered_in_flight_ids_get_outcome_unknown_error_when_connection_drops() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let mut bridge = spawn_bridge(addr, fast_cfg());
@@ -4595,7 +4691,131 @@ mod mcp_bridge_tests {
             drop(lines1);
 
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 9);
+            assert_outcome_unknown_error(&resp, 9);
+        }
+
+        /// An `AsyncWrite` that forwards the first `remaining` `poll_write`
+        /// calls to `inner` and then fails, injecting a deterministic
+        /// mid-flush TCP drop. `write_line` issues two writes per line
+        /// (payload + newline), so `remaining = 2 * n` delivers exactly `n`
+        /// lines before the drop.
+        struct FailAfterWrites<W> {
+            inner: W,
+            remaining: usize,
+        }
+
+        impl<W: AsyncWrite + Unpin> AsyncWrite for FailAfterWrites<W> {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                if self.remaining == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected tcp drop",
+                    )));
+                }
+                self.remaining -= 1;
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        /// A TCP drop *mid-flush* classifies the buffered batch precisely:
+        /// the prefix already written to the socket gets the non-retryable
+        /// outcome-unknown error, the never-written suffix keeps the
+        /// retryable disconnected error (monorepo#1530).
+        #[tokio::test]
+        async fn partial_flush_splits_outcome_unknown_from_retryable() {
+            let (tcp_write, _tcp_sink) = tokio::io::duplex(4096);
+            // Two writes per line: line 1 is delivered, line 2 hits the drop.
+            let tcp_write = FailAfterWrites {
+                inner: tcp_write,
+                remaining: 2,
+            };
+            let (_stdin_write, stdin_read) = tokio::io::duplex(4096);
+            let mut input = BufReader::new(stdin_read).lines();
+            let (mut out_write, out_read) = tokio::io::duplex(4096);
+            let buffered = vec![
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}).to_string(),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}).to_string(),
+            ];
+            let end = timeout(
+                Duration::from_secs(5),
+                pump_session(
+                    tokio::io::empty(),
+                    tcp_write,
+                    buffered,
+                    &mut input,
+                    &mut out_write,
+                ),
+            )
+            .await
+            .expect("pump_session hung")
+            .unwrap();
+            assert!(matches!(end, SessionEnd::TcpDropped));
+            drop(out_write);
+            let mut out_lines = BufReader::new(out_read).lines();
+            let mut by_id = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let line = out_lines.next_line().await.unwrap().unwrap();
+                let resp: Value = serde_json::from_str(&line).unwrap();
+                by_id.insert(resp["id"].as_i64().unwrap(), resp);
+            }
+            assert_outcome_unknown_error(&by_id[&1], 1);
+            assert_disconnected_error(&by_id[&2], 2);
+            assert_eq!(out_lines.next_line().await.unwrap(), None);
+        }
+
+        /// Notifications carry no `id` and get no synthesized response on a
+        /// drop: after a delivered notification and a delivered request, only
+        /// the request is answered.
+        #[tokio::test]
+        async fn notification_gets_no_synthesized_response_on_drop() {
+            let (tcp_write, _tcp_sink) = tokio::io::duplex(4096);
+            let (_stdin_write, stdin_read) = tokio::io::duplex(4096);
+            let mut input = BufReader::new(stdin_read).lines();
+            let (mut out_write, out_read) = tokio::io::duplex(4096);
+            let buffered = vec![
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/call"}).to_string(),
+            ];
+            // The empty TCP read side yields EOF right after the flush, so
+            // the session ends as TcpDropped with both lines delivered.
+            let end = timeout(
+                Duration::from_secs(5),
+                pump_session(
+                    tokio::io::empty(),
+                    tcp_write,
+                    buffered,
+                    &mut input,
+                    &mut out_write,
+                ),
+            )
+            .await
+            .expect("pump_session hung")
+            .unwrap();
+            assert!(matches!(end, SessionEnd::TcpDropped));
+            drop(out_write);
+            let mut out_lines = BufReader::new(out_read).lines();
+            let line = out_lines.next_line().await.unwrap().unwrap();
+            let resp: Value = serde_json::from_str(&line).unwrap();
+            assert_outcome_unknown_error(&resp, 5);
+            assert_eq!(out_lines.next_line().await.unwrap(), None);
         }
 
         #[tokio::test]
@@ -4616,10 +4836,25 @@ mod mcp_bridge_tests {
             drop(conn1);
             drop(listener);
 
+            // Let the bridge observe the drop before sending: a line racing
+            // the not-yet-noticed drop can be written to the dead socket and
+            // classified delivered (-32002) instead of exercising the gap
+            // path this test is about.
+            sleep(Duration::from_millis(50)).await;
+
             // A request during the reconnect gap gets the retryable error.
+            // Tolerate one -32002 in case the request still raced the
+            // not-yet-noticed dead socket (safe at-most-once direction); the
+            // follow-up request is then guaranteed to hit the gap path.
             bridge.send_request(2).await;
             let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 2);
+            if resp["error"]["code"] == json!(BRIDGE_OUTCOME_UNKNOWN_CODE) {
+                bridge.send_request(3).await;
+                let resp = bridge.read_response().await;
+                assert_disconnected_error(&resp, 3);
+            } else {
+                assert_disconnected_error(&resp, 2);
+            }
 
             // Once the reconnect window is exhausted the bridge exits cleanly.
             let result = timeout(Duration::from_secs(5), bridge.handle)
@@ -5355,6 +5590,7 @@ mod workspace_api_tool_tests {
                 options: vec![SpecialistModelOption {
                     model: "opencode:kimi-k3".to_string(),
                     hint: "cheap".to_string(),
+                    reasoning_effort: String::new(),
                 }],
             }]);
         let resp = srv
@@ -6453,7 +6689,7 @@ mod wsapi3_bindings_tests {
     #[tokio::test]
     async fn note_create_passes_caller_idempotency_key_through() {
         // Caller-supplied `idempotencyKey` is adopted verbatim, matching
-        // `pr.merge` / `git.commit`. The JS prelude is positional so the key
+        // `comment.add`. The JS prelude is positional so the key
         // must be supplied via a raw `host({...})` invocation.
         let (srv, api) = server();
         let resp = call(
@@ -6915,44 +7151,22 @@ mod wsapi3_bindings_tests {
 mod wsapi6_bindings_tests {
     use std::sync::{Arc, Mutex};
 
-    use intent_core::{AgentId, BoxFuture, Error, NoteId, Result, WorkspaceApi, WorkspaceId};
+    use intent_core::{AgentId, BoxFuture, NoteId, Result, WorkspaceApi, WorkspaceId};
     use serde_json::{json, Value};
 
     use crate::WorkspaceMcpServer;
 
-    /// `(mergeMethod, commitTitle, commitMessage, idempotencyKey)`.
-    type PrMergeCall = (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    type PrReviewCommentsCall = (Option<String>, Option<String>);
     type PrSnapshotCall = (u64, Option<String>);
-    type PrResolveThreadCall = (String, Option<String>);
-    type PrReplyCall = (u64, String);
     type CrossReadCall = (String, String);
     type BrowserExecCall = (Vec<Value>, Option<String>, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
-        pr_status_calls: Mutex<u32>,
         pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
-        pr_merge_calls: Mutex<Vec<PrMergeCall>>,
-        pr_update_branch_calls: Mutex<u32>,
-        pr_list_review_comments_calls: Mutex<Vec<PrReviewCommentsCall>>,
-        pr_reply_calls: Mutex<Vec<PrReplyCall>>,
-        pr_resolve_thread_calls: Mutex<Vec<PrResolveThreadCall>>,
-        pr_list_comments_calls: Mutex<Vec<Option<i64>>>,
-        pr_post_comment_calls: Mutex<Vec<String>>,
         cross_list_siblings_calls: Mutex<u32>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
-        /// When set, `pr_status` returns this instead of the default shape.
-        pr_status_result: Mutex<Option<Value>>,
-        /// When set, `pr_status` returns this error.
-        pr_status_error: Mutex<Option<String>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -6968,32 +7182,6 @@ mod wsapi6_bindings_tests {
                     _ => Value::Null,
                 };
                 Ok(json!({ "path": path, "value": value }))
-            })
-        }
-
-        fn pr_status(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
-            *self.pr_status_calls.lock().unwrap() += 1;
-            let result = self.pr_status_result.lock().unwrap().clone();
-            let error = self.pr_status_error.lock().unwrap().clone();
-            Box::pin(async move {
-                if let Some(e) = error {
-                    return Err(Error::Internal(e));
-                }
-                Ok(result.unwrap_or_else(|| {
-                    json!({
-                        "prNumber": 42,
-                        "title": "T",
-                        "url": "https://example.com/pr/42",
-                        "state": "open",
-                        "mergeable": true,
-                        "mergeableState": "clean",
-                        "hasConflicts": false,
-                        "isDraft": false,
-                        "isMerged": false,
-                        "isClosed": false,
-                        "summary": "✅ PR is mergeable with no conflicts.",
-                    })
-                }))
             })
         }
 
@@ -7019,108 +7207,6 @@ mod wsapi6_bindings_tests {
                     "comments": { "conversationCount": 0, "reviewCommentCount": 0, "unresolvedThreadCount": 0, "totalCount": 0 },
                 }))
             })
-        }
-
-        fn pr_merge(
-            &self,
-            _ws: WorkspaceId,
-            merge_method: Option<String>,
-            commit_title: Option<String>,
-            commit_message: Option<String>,
-            idempotency_key: Option<String>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_merge_calls.lock().unwrap().push((
-                merge_method.clone(),
-                commit_title,
-                commit_message,
-                idempotency_key,
-            ));
-            Box::pin(async move {
-                Ok(json!({
-                    "merged": true,
-                    "sha": "deadbeef",
-                    "mergeMethod": merge_method.unwrap_or_else(|| "merge".to_string()),
-                    "message": "ok",
-                    "prNumber": 42,
-                }))
-            })
-        }
-
-        fn pr_update_branch(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
-            *self.pr_update_branch_calls.lock().unwrap() += 1;
-            Box::pin(async {
-                Ok(json!({
-                    "method": "merge",
-                    "alreadyUpToDate": false,
-                    "message": "PR branch updated.",
-                    "url": null,
-                }))
-            })
-        }
-
-        fn pr_list_review_comments(
-            &self,
-            _ws: WorkspaceId,
-            path: Option<String>,
-            status: Option<String>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_list_review_comments_calls
-                .lock()
-                .unwrap()
-                .push((path, status));
-            Box::pin(async {
-                Ok(json!({
-                    "threads": [],
-                    "threadCount": 0,
-                    "usingFallback": false,
-                    "pagination": null,
-                    "filter": { "path": null, "status": "unresolved" },
-                    "note": null,
-                }))
-            })
-        }
-
-        fn pr_reply_to_review_comment(
-            &self,
-            _ws: WorkspaceId,
-            comment_id: u64,
-            body: String,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_reply_calls.lock().unwrap().push((comment_id, body));
-            Box::pin(async { Ok(json!({ "id": 999, "htmlUrl": "https://example.com/c/999" })) })
-        }
-
-        fn pr_resolve_thread(
-            &self,
-            _ws: WorkspaceId,
-            thread_id: String,
-            action: Option<String>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_resolve_thread_calls
-                .lock()
-                .unwrap()
-                .push((thread_id.clone(), action.clone()));
-            Box::pin(async move {
-                Ok(json!({
-                    "ok": true,
-                    "threadId": thread_id,
-                    "action": action.unwrap_or_else(|| "resolve".to_string()),
-                }))
-            })
-        }
-
-        fn pr_list_comments(
-            &self,
-            _ws: WorkspaceId,
-            count: Option<i64>,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.pr_list_comments_calls.lock().unwrap().push(count);
-            Box::pin(async { Ok(json!({ "count": 0, "comments": [] })) })
-        }
-
-        fn pr_post_comment(&self, _ws: WorkspaceId, body: String) -> BoxFuture<'_, Result<Value>> {
-            self.pr_post_comment_calls.lock().unwrap().push(body);
-            Box::pin(async { Ok(json!({ "id": 1234, "htmlUrl": "https://example.com/c/1234" })) })
         }
 
         fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
@@ -7317,28 +7403,6 @@ mod wsapi6_bindings_tests {
     // ================================================================
 
     #[tokio::test]
-    async fn pr_status_returns_shape_from_trait() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.status();").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["prNumber"], json!(42));
-        assert_eq!(v["state"], json!("open"));
-        assert_eq!(*api.pr_status_calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn pr_status_surfaces_no_active_pr_error() {
-        let (srv, api) = server();
-        // Simulate the daemon's "No active PR" error surface — parity with
-        // `requirePrContext()` in `ws-pr-api.ts`.
-        *api.pr_status_error.lock().unwrap() = Some("No active PR".to_string());
-        let resp = call(&srv, "return await ws.pr.status();").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("No active PR"));
-    }
-
-    #[tokio::test]
     async fn pr_snapshot_forwards_pr_number_and_returns_shape() {
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.pr.snapshot(42);").await;
@@ -7388,8 +7452,7 @@ mod wsapi6_bindings_tests {
     #[tokio::test]
     async fn pr_snapshot_requires_numeric_pr_number() {
         // Missing, non-positive, and non-numeric prNumber all surface the
-        // same validation error before the trait method is called — parity
-        // with the `replyToReviewComment` commentId pattern.
+        // same validation error before the trait method is called.
         let (srv, api) = server();
         for code in [
             "return await ws.pr.snapshot();",
@@ -7408,169 +7471,29 @@ mod wsapi6_bindings_tests {
     }
 
     #[tokio::test]
-    async fn pr_merge_forwards_options_and_defaults_merge_method() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.merge({ commitTitle: 'ct', commitMessage: 'cm' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["merged"], json!(true));
-        assert_eq!(v["mergeMethod"], json!("merge"));
-        let calls = api.pr_merge_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, None);
-        assert_eq!(calls[0].1.as_deref(), Some("ct"));
-        assert_eq!(calls[0].2.as_deref(), Some("cm"));
-        let key = calls[0]
-            .3
-            .as_deref()
-            .expect("pr.merge must mint an idempotencyKey");
-        assert!(
-            uuid::Uuid::parse_str(key).is_ok(),
-            "minted key {key:?} is not a UUID"
-        );
-    }
-
-    #[tokio::test]
-    async fn pr_merge_passes_caller_idempotency_key_through() {
-        // A caller-supplied idempotencyKey is adopted verbatim so retries of
-        // the same tool call dedupe against the idempotency store; the
-        // services soft-launch warn must never fire for MCP tool calls.
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.merge({ idempotencyKey: 'key-from-caller' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.pr_merge_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].3.as_deref(), Some("key-from-caller"));
-    }
-
-    #[tokio::test]
-    async fn pr_merge_treats_blank_idempotency_key_as_absent() {
-        // A whitespace-only key must be treated as absent so it cannot
-        // collapse dedupe across unrelated requests — parity with
-        // `comment.add`. The binding mints a fresh UUID instead.
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.merge({ idempotencyKey: '   ' });").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.pr_merge_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let key = calls[0]
-            .3
-            .as_deref()
-            .expect("pr.merge must mint an idempotencyKey");
-        assert!(
-            uuid::Uuid::parse_str(key).is_ok(),
-            "minted key {key:?} is not a UUID (got blank passthrough)"
-        );
-    }
-
-    #[tokio::test]
-    async fn pr_merge_rejects_invalid_merge_method() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.merge({ mergeMethod: 'bogus' });").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("mergeMethod must be one of"));
-        assert!(api.pr_merge_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pr_update_branch_calls_trait() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.updateBranch();").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        assert_eq!(*api.pr_update_branch_calls.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn pr_list_review_comments_validates_status() {
+    async fn pr_removed_methods_error_as_unknown() {
+        // The non-snapshot `ws.pr.*` surface was removed in favor of the `gh`
+        // CLI; raw `host({...})` frames for the old methods must fail with the
+        // standard unknown-binding error, not a validation or trait error.
         let (srv, _api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.listReviewComments({ status: 'bogus' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("status must be one of"));
-    }
-
-    #[tokio::test]
-    async fn pr_list_review_comments_forwards_path_and_status() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.listReviewComments({ path: 'src/x.rs', status: 'resolved' });",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let calls = api.pr_list_review_comments_calls.lock().unwrap();
-        assert_eq!(
-            calls[0],
-            (Some("src/x.rs".to_string()), Some("resolved".to_string()))
-        );
-    }
-
-    #[tokio::test]
-    async fn pr_reply_to_review_comment_forwards_id_and_body() {
-        let (srv, api) = server();
-        let resp = call(
-            &srv,
-            "return await ws.pr.replyToReviewComment(123, 'thanks');",
-        )
-        .await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        assert_eq!(v["id"], json!(999));
-        assert_eq!(
-            *api.pr_reply_calls.lock().unwrap(),
-            vec![(123u64, "thanks".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn pr_resolve_thread_defaults_action_and_validates() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.resolveThread('th-1');").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        // Invalid action surfaces before the trait method is called.
-        let bad = call(&srv, "return await ws.pr.resolveThread('th-1', 'bogus');").await;
-        assert_eq!(bad["result"]["isError"], json!(true));
-        assert!(text(&bad).contains("action must be one of"));
-        // The valid call was recorded; the invalid one was not.
-        assert_eq!(api.pr_resolve_thread_calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn pr_list_comments_forwards_count() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.listComments({ count: 5 });").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        assert_eq!(*api.pr_list_comments_calls.lock().unwrap(), vec![Some(5)]);
-    }
-
-    #[tokio::test]
-    async fn pr_post_comment_rejects_empty_body() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.postComment('');").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(api.pr_post_comment_calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pr_post_comment_forwards_body() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.pr.postComment('hi there');").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        assert_eq!(
-            *api.pr_post_comment_calls.lock().unwrap(),
-            vec!["hi there".to_string()]
-        );
+        for method in [
+            "status",
+            "merge",
+            "updateBranch",
+            "listReviewComments",
+            "replyToReviewComment",
+            "resolveThread",
+            "listComments",
+            "postComment",
+        ] {
+            let code = format!("return await host({{ method: 'pr.{method}', args: {{}} }});");
+            let resp = call(&srv, &code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "pr.{method}");
+            assert!(
+                text(&resp).contains(&format!("unknown method `pr.{method}`")),
+                "pr.{method} must surface the unknown-binding error"
+            );
+        }
     }
 
     // ================================================================
@@ -7732,6 +7655,7 @@ mod wsapi4_bindings_tests {
             name: format!("agent-{id}"),
             name_explicitly_set: false,
             model: None,
+            reasoning_effort: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
