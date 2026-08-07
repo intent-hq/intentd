@@ -1716,6 +1716,12 @@ impl Services {
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
             let turn_duration = turn_started.elapsed();
+            // Capture the turn-end wall clock next to the duration so the two
+            // stay consistent: the bookkeeping task below may queue behind a
+            // predecessor before it records, and a later clock read would push
+            // both the hourly bucket and the per-minute spread window past the
+            // real turn end.
+            let turn_end = time::OffsetDateTime::now_utc();
             let turn_usage = turn_usage.take();
             let prev = self
                 .turn_bookkeeping
@@ -1732,6 +1738,7 @@ impl Services {
                         &workspace_id_task,
                         turn_usage.as_ref(),
                         turn_duration,
+                        turn_end,
                         run_completed,
                     )
                     .await;
@@ -2199,6 +2206,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         usage: Option<&session::Usage>,
         turn_duration: std::time::Duration,
+        turn_end: time::OffsetDateTime,
         run_completed: bool,
     ) {
         if usage.is_none() && !run_completed {
@@ -2237,7 +2245,11 @@ impl Services {
             },
             ..Default::default()
         };
-        let now = time::OffsetDateTime::now_utc();
+        // `turn_end` is captured at the same instant as `turn_duration` at the
+        // call site, before this task is spawned/awaited — reading the clock
+        // here instead would drift the hourly bucket and the per-minute spread
+        // window past the real turn end by however long the bookkeeping queued.
+        let now = turn_end;
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike

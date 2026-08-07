@@ -59,12 +59,19 @@ pub fn split_delta_across_minutes(
     delta: &UsageRateDelta,
 ) -> Vec<(String, UsageRateDelta)> {
     let end = turn_end.to_offset(UtcOffset::UTC);
-    // Cap the span in seconds up front so the bucket count can neither overflow
-    // nor exceed retention. (A std::time::Duration is never negative.)
-    let max_secs = i64::from(MAX_RATE_HISTORY_LIMIT) * 60;
-    let dur_secs = turn_duration.as_secs().min(max_secs as u64) as i64;
+    // Cap the span up front so the bucket count can neither overflow nor exceed
+    // retention, then subtract at full (sub-second) precision: a turn ending at
+    // HH:MM:00.xxx after e.g. 60.2s genuinely touched the *previous* minute, so
+    // truncating fractional seconds off either the duration or the end instant
+    // (as whole-second arithmetic would) must not drop that minute. (A
+    // std::time::Duration is never negative.)
+    let max_span = std::time::Duration::from_secs(u64::from(MAX_RATE_HISTORY_LIMIT) * 60);
+    let span = Duration::try_from(turn_duration.min(max_span)).unwrap_or(Duration::ZERO);
+    let start = end - span;
+    // Floor both instants to their UTC minute. `unix_timestamp()` drops the
+    // always-non-negative fractional second, i.e. floors to the whole second.
     let end_min = end.unix_timestamp().div_euclid(60);
-    let start_min = (end.unix_timestamp() - dur_secs).div_euclid(60);
+    let start_min = start.unix_timestamp().div_euclid(60);
     let m = ((end_min - start_min) + 1).clamp(1, i64::from(MAX_RATE_HISTORY_LIMIT)) as usize;
 
     let split = |total: u64| -> (u64, u64) { (total / m as u64, total % m as u64) };
@@ -181,6 +188,31 @@ mod tests {
         );
         let buckets: Vec<&str> = parts.iter().map(|(b, _)| b.as_str()).collect();
         assert_eq!(buckets, ["2026-07-30T14:06:00Z", "2026-07-30T14:07:00Z"]);
+    }
+
+    #[test]
+    fn split_counts_the_minute_touched_by_fractional_seconds() {
+        // Ending at 14:08:00.100 after 60.2s means the turn started at
+        // 14:06:59.900 — it genuinely touched 14:06. Whole-second arithmetic on
+        // a truncated end/duration would compute only 14:07–14:08 and drop it.
+        let end = parse("2026-07-30T14:08:00.100Z");
+        let parts = split_delta_across_minutes(
+            end,
+            std::time::Duration::from_millis(60_200),
+            &delta(9, 0, 0, 0),
+        );
+        let buckets: Vec<&str> = parts.iter().map(|(b, _)| b.as_str()).collect();
+        assert_eq!(
+            buckets,
+            [
+                "2026-07-30T14:06:00Z",
+                "2026-07-30T14:07:00Z",
+                "2026-07-30T14:08:00Z",
+            ]
+        );
+        // Conservation holds across the true span (9 / 3 = 3 each).
+        let total: u64 = parts.iter().map(|(_, p)| p.input_tokens).sum();
+        assert_eq!(total, 9);
     }
 
     #[test]
