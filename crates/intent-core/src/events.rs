@@ -174,6 +174,13 @@ pub const NOTE_DELETED: &str = "note:deleted";
 pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 
 // Task events.
+// Emitted once per note becoming a task, across every creation path
+// (`@@@task` block conversion, `task.createPrerequisite`, and
+// `task.markAsTask` on a note that was not previously a task). The
+// self-sufficient payload `{ noteId, noteTitle, status, createdAt, agentId? }`
+// parallels `task:status-changed` so a feed renders the new task without a
+// follow-up read.
+pub const TASK_CREATED: &str = "task:created";
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
 // Task↔agent linkage events (new in intentd; PROTOCOL §5.4 / §6.5). Migrate
@@ -423,6 +430,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_UPDATED,
     NOTE_DELETED,
     LINE_ATTRIBUTION_UPDATED,
+    TASK_CREATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TASK_AGENT_LINKED,
