@@ -8123,6 +8123,8 @@ mod pr {
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
         assert_eq!(v["comments"]["totalCount"], 3);
+        // Pin the unified merge-requirements field name on the snapshot shape.
+        assert!(v["requirements"].is_object());
     }
 
     #[tokio::test]
