@@ -34,6 +34,12 @@
 //!     (clamped to the 10s floor) — `expiresAt` surfaces in `hook.list`, the
 //!     deadline passes, `hook:expired` fires, the row goes terminal
 //!     (`runNow` → -32602), and the owner is woken with the expiry notice.
+//!  8. Perpetual hooks: agent turn 6 schedules a `perpetual: true` hook whose
+//!     every run dispatches — the validation-run dispatch wakes the owner AND
+//!     persists an ACTIVE schedule (`dispatchCount: 1`), a `hook.runNow` fire
+//!     wakes again and stays `scheduled` (`dispatchCount: 2`), each wake
+//!     articulates "fired + still active", and the TTL finally expires the
+//!     hook with a notice reporting runs AND dispatches.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -507,6 +513,18 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: 'shortttl', code: {}, delayMs: 60000, ttlMs: 1 }});",
         json!("return { dispatch: false };")
     );
+    // Perpetual section: every run dispatches, so the validation run fires and
+    // the hook STILL persists as active. `delayMs: 60000` keeps the cadence out
+    // of the way (fires are driven by `hook.runNow`) while `ttlMs: 20000` makes
+    // the TTL land inside the event-read budget.
+    let perpetual_inner = "const n = (hookState === null) ? 1 : hookState.n + 1; \
+                           return { dispatch: true, message: 'perpetual fire ' + n, \
+                                    state: { n } };";
+    let schedule_perpetual_js = format!(
+        "return await ws.hook.schedule({{ name: 'forever', code: {}, delayMs: 60000, \
+         ttlMs: 20000, perpetual: true }});",
+        json!(perpetual_inner)
+    );
     // `firstTurnDelayMs` holds turn 1 open after the schedule tool call so the
     // dispatch wake stays QUEUED behind the in-flight turn long enough for the
     // `agent.getQueue` assertion; queue-drain turns (the wake text matches no
@@ -563,6 +581,14 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_ttl_js, "summary": "schedule shortttl" },
                 },
                 "response": "scheduled shortttl",
+            },
+            {
+                "ifPromptContains": "SCHEDULE_PERPETUAL",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": schedule_perpetual_js, "summary": "schedule forever" },
+                },
+                "response": "scheduled forever",
             },
         ],
     })
@@ -1159,6 +1185,125 @@ async fn hook_lifecycle_over_wss() {
         &ws_id,
         &agent_id,
         "expired after reaching its TTL",
+    )
+    .await;
+
+    // ── 8. Perpetual: dispatch re-arms until the TTL expires it ───────────
+    let sent = wss_rpc(
+        &mut rpc,
+        800,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SCHEDULE_PERPETUAL" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Schedule-path event order for a PERPETUAL validation-run dispatch:
+    // run-completed, dispatched, THEN hook:scheduled — unlike one-shot, the
+    // dispatching first run still persists an active schedule.
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("forever")).await;
+    assert_eq!(completed["data"]["state"], "scheduled", "{completed}");
+    let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("forever")).await;
+    assert_eq!(dispatched["data"]["state"], "scheduled", "{dispatched}");
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("forever")).await;
+    let forever_id = scheduled["data"]["hookId"]
+        .as_str()
+        .expect("forever hookId")
+        .to_string();
+
+    let find_forever = |listed: &Value| -> Value {
+        listed["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .find(|h| h["hookId"] == json!(forever_id))
+            .unwrap_or_else(|| panic!("forever in hook.list: {listed}"))
+            .clone()
+    };
+
+    // Still ACTIVE after its own dispatch, with the fire counted.
+    let listed = wss_rpc(&mut rpc, 801, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let forever = find_forever(&listed);
+    assert_eq!(forever["state"], "scheduled", "{forever}");
+    assert_eq!(forever["perpetual"], json!(true), "{forever}");
+    assert_eq!(forever["runCount"], 1, "{forever}");
+    assert_eq!(forever["dispatchCount"], 1, "{forever}");
+    assert!(
+        forever["nextRunAt"].is_string(),
+        "re-armed with a fresh nextRunAt: {forever}"
+    );
+
+    // The perpetual fire's wake states BOTH facts — it fired, and it stays
+    // active until its TTL — instead of the one-shot "retired" note.
+    await_conversation_contains(
+        &mut rpc,
+        810,
+        &ws_id,
+        &agent_id,
+        "[Background hook \\\"forever\\\"] perpetual fire 1",
+    )
+    .await;
+    await_conversation_contains(
+        &mut rpc,
+        820,
+        &ws_id,
+        &agent_id,
+        "it is PERPETUAL — it remains active",
+    )
+    .await;
+
+    // A second fire (FE-triggered) wakes again and re-arms again: the hook is
+    // still `scheduled` and `dispatchCount` advances, so `hook:dispatched` is
+    // non-terminal for a perpetual hook.
+    let ran = wss_rpc(
+        &mut rpc,
+        830,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": forever_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "runNow ok: {ran}");
+    let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("forever")).await;
+    assert_eq!(dispatched["data"]["hookId"], json!(forever_id));
+    let rearmed = next_hook_event(&mut sub, "hook:scheduled", Some("forever")).await;
+    assert!(
+        rearmed["data"]["nextRunAt"].is_string(),
+        "re-armed after the second fire: {rearmed}"
+    );
+    let listed = wss_rpc(&mut rpc, 831, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let forever = find_forever(&listed);
+    assert_eq!(forever["state"], "scheduled", "{forever}");
+    assert_eq!(forever["runCount"], 2, "{forever}");
+    assert_eq!(forever["dispatchCount"], 2, "{forever}");
+    await_conversation_contains(
+        &mut rpc,
+        840,
+        &ws_id,
+        &agent_id,
+        "[Background hook \\\"forever\\\"] perpetual fire 2",
+    )
+    .await;
+
+    // TTL still terminates it (ttlMs: 20000, delayMs: 60000 — no cadence run
+    // intervenes), and the expiry notice reports runs AND dispatches rather
+    // than the one-shot "without a dispatch" wording.
+    let expired = next_hook_event(&mut sub, "hook:expired", Some("forever")).await;
+    assert_eq!(expired["data"]["state"], "expired", "{expired}");
+    assert_eq!(expired["data"]["hookId"], json!(forever_id));
+    let err = wss_rpc_raw(
+        &mut rpc,
+        850,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": forever_id }),
+    )
+    .await;
+    assert_eq!(err["error"]["code"], -32602, "expired hook ⇒ -32602: {err}");
+    await_conversation_contains(
+        &mut rpc,
+        860,
+        &ws_id,
+        &agent_id,
+        "expired after reaching its TTL (2 runs, 2 dispatches)",
     )
     .await;
 }
