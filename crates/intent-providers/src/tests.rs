@@ -232,7 +232,7 @@ fn pi_resolves_in_registry_with_pinned_npx_package() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.31");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.33");
     assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
@@ -976,7 +976,7 @@ fn injection_mechanism_registry() {
         find_provider("claude-code").unwrap().injection_mechanism,
         SessionMeta
     );
-    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.7)
+    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.14)
     // ignores `_meta.developerInstructions` (#479).
     assert_eq!(
         find_provider("codex").unwrap().injection_mechanism,
