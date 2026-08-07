@@ -102,25 +102,37 @@ pub(super) struct SubHandle {
     group: PathBuf,
     root: PathBuf,
     id: u64,
-    /// Only tests read this; production code never needs to know when a
-    /// registration landed, which is the whole point of deferring it.
-    #[cfg(test)]
     established: Arc<AtomicBool>,
 }
 
 impl SubHandle {
-    /// Await this subscription's root actually being registered with the OS.
-    /// Registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating the watched tree.
+    /// Await this subscription's root actually being registered with the OS,
+    /// returning on timeout rather than waiting forever. Registration is
+    /// deferred off the caller's thread (monorepo#1572), so a caller whose
+    /// correctness depends on the watch existing — a catch-up flush, or a test
+    /// about to mutate the watched tree — has to wait for it. (In-crate the
+    /// only such caller is [`watch_tiers`], which reads the flag directly; the
+    /// handle-level wrapper exists for the watcher tests.)
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while !self.established.load(Ordering::Acquire) {
-            if tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        wait_established(&self.established, timeout).await;
+    }
+}
+
+/// How long a deferred catch-up waits for its registration before giving up and
+/// flushing anyway: a wedged backend must not suppress the flush entirely.
+const ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll `flag` until the registrar raises it or `timeout` elapses. Returns
+/// either way — the registrar raises the flag even on a failed registration, so
+/// the timeout only covers a backend that never answers at all.
+async fn wait_established(flag: &AtomicBool, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !flag.load(Ordering::Acquire) {
+        if tokio::time::Instant::now() >= deadline {
+            return;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -215,7 +227,6 @@ impl SharedWatchHub {
                 group: group_key,
                 root: root.clone(),
                 id,
-                #[cfg(test)]
                 established,
             },
             rx,
@@ -333,7 +344,17 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
     tx
 }
 
-/// Route one raw event to every sink whose root contains any of its paths.
+/// Route one raw event to every sink whose root contains any of its paths,
+/// carrying only the paths that are actually under that root.
+///
+/// The narrowing matters because one shared stream can report several roots'
+/// paths in a single event: a `notify` rename spanning two co-tenant workspaces
+/// arrives as one event holding both the source and the destination (the inotify
+/// backend pairs `MOVED_FROM`/`MOVED_TO` into a `RenameMode::Both`, which only
+/// exists now that both sides land on the same watcher). Forwarding the event
+/// whole would hand each subscriber its co-tenant's path — every consumer
+/// filters those out downstream, but a sink must not observe them at all, which
+/// is the whole contract that keeps demuxed workspaces isolated.
 ///
 /// The cheap `starts_with` pass runs first and is the only one needed in
 /// practice: the roots are canonicalized at subscribe time and FSEvents reports
@@ -346,9 +367,8 @@ fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
     };
     let mut matched = false;
     for sink in sinks.iter() {
-        if event.paths.iter().any(|p| p.starts_with(&sink.root)) {
+        if send_narrowed(sink, event, &event.paths) {
             matched = true;
-            let _ = sink.tx.send(event.clone());
         }
     }
     if matched {
@@ -360,10 +380,27 @@ fn demux(sinks: &Arc<Mutex<Vec<Sink>>>, event: &notify::Event) {
         .map(|p| canonical_root(p, &find_existing_ancestor(p)))
         .collect();
     for sink in sinks.iter() {
-        if resolved.iter().any(|p| p.starts_with(&sink.root)) {
-            let _ = sink.tx.send(event.clone());
-        }
+        send_narrowed(sink, event, &resolved);
     }
+}
+
+/// Forward `event` to `sink` with its path list narrowed to the entries of
+/// `candidates` that fall under the sink's root, mapped back to the raw paths so
+/// consumers still see what the OS reported. Returns whether anything matched.
+fn send_narrowed(sink: &Sink, event: &notify::Event, candidates: &[PathBuf]) -> bool {
+    let mine: Vec<PathBuf> = candidates
+        .iter()
+        .zip(event.paths.iter())
+        .filter(|(candidate, _)| candidate.starts_with(&sink.root))
+        .map(|(_, raw)| raw.clone())
+        .collect();
+    if mine.is_empty() {
+        return false;
+    }
+    let mut narrowed = event.clone();
+    narrowed.paths = mine;
+    let _ = sink.tx.send(narrowed);
+    true
 }
 
 /// Whether an event should be forwarded for a tier-style watch: any of its
@@ -403,10 +440,13 @@ impl Drop for TierWatch {
 /// skills/specialists project tiers used to own. The ancestor-watch/promotion
 /// dance those needed for missing tier dirs is gone with them: the shared watch
 /// is recursive on the workspace root, so a tier directory created later is
-/// simply seen. `on_change` still fires once up front, matching the catch-up
-/// flush `watch_root` performed, so a change landing before the registration
-/// lands is not absorbed as pre-existing (callers' fingerprint checks suppress
-/// the no-op case).
+/// simply seen.
+///
+/// `on_change` still fires once as a catch-up, matching what `watch_root` did,
+/// and — as there — only **after** the registration has landed. Firing it up
+/// front would leave a gap: a change arriving between the flush and the OS watch
+/// existing produces neither an event nor a catch-up, silently missing a tier
+/// update. Callers' fingerprint checks suppress the no-op case.
 pub(super) fn watch_tiers(
     hub: &Arc<SharedWatchHub>,
     workspace_root: &Path,
@@ -422,8 +462,10 @@ pub(super) fn watch_tiers(
                 .fold(canonical.clone(), |acc, part| acc.join(part))
         })
         .collect();
-    on_change();
+    let established = Arc::clone(&sub.established);
     let task = tokio::spawn(async move {
+        wait_established(&established, ESTABLISH_TIMEOUT).await;
+        on_change();
         while let Some(event) = rx.recv().await {
             if tier_event_matches(&event, &tier_roots, filename_matches) {
                 on_change();
@@ -573,5 +615,68 @@ mod tests {
             0,
             "stream must be retired once nothing consumes it"
         );
+    }
+
+    /// A rename between two co-tenants of one stream arrives as a SINGLE event
+    /// holding both sides' paths, so forwarding it whole would leak the
+    /// co-tenant's path into each sink. Each side must see only its own path —
+    /// and with the original event kind, so the source still reads as a rename
+    /// rather than being reclassified.
+    #[test]
+    fn a_cross_root_rename_is_narrowed_to_each_sink_own_paths() {
+        use notify::event::{EventKind, ModifyKind, RenameMode};
+
+        let a = PathBuf::from("/parent/ws-a");
+        let b = PathBuf::from("/parent/ws-b");
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![
+            Sink {
+                id: 0,
+                root: a.clone(),
+                tx: tx_a,
+            },
+            Sink {
+                id: 1,
+                root: b.clone(),
+                tx: tx_b,
+            },
+        ]));
+
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(a.join("moved.txt"))
+            .add_path(b.join("moved.txt"));
+        demux(&sinks, &event);
+
+        let got_a = rx_a.try_recv().expect("source side must be delivered");
+        assert_eq!(
+            got_a.paths,
+            vec![a.join("moved.txt")],
+            "sink must not observe its co-tenant's path"
+        );
+        assert_eq!(got_a.kind, event.kind, "event kind must survive narrowing");
+        let got_b = rx_b.try_recv().expect("destination side must be delivered");
+        assert_eq!(got_b.paths, vec![b.join("moved.txt")]);
+    }
+
+    /// A path under neither root reaches neither sink, even when it shares the
+    /// group's parent directory.
+    #[test]
+    fn a_group_sibling_outside_every_root_reaches_no_sink() {
+        use notify::event::{CreateKind, EventKind};
+
+        let a = PathBuf::from("/parent/ws-a");
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let sinks = Arc::new(Mutex::new(vec![Sink {
+            id: 0,
+            root: a,
+            tx: tx_a,
+        }]));
+
+        let event = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(PathBuf::from("/parent/loose.txt"));
+        demux(&sinks, &event);
+
+        assert!(rx_a.try_recv().is_err(), "unrelated path must not deliver");
     }
 }
