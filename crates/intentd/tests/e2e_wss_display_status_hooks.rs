@@ -536,10 +536,12 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     assert_eq!(cancelled["hook"]["state"], "cancelled", "{cancelled}");
     assert_eq!(cancelled["hook"]["hookId"], json!(hook_id));
 
-    // Milestones: hook:cancelled, the demotion transition to idle, and the
-    // wake turn's terminal agent:idle (the FE cancel wakes the owner, whose
+    // Milestones: hook:cancelled, the demotion transition, and the wake
+    // turn's terminal agent:idle (the FE cancel wakes the owner, whose
     // follow-up turn may transiently re-promote in_progress — tolerated;
-    // needs_attention never appears).
+    // needs_attention never appears). The demoted status is `unread`, not
+    // `idle`: the completed turns raised the server-owned unread flag
+    // (§9.9), which promotes the idle base (§6.5 step 9).
     let mut hook_cancelled = false;
     let mut demoted = false;
     let mut wake_idle = false;
@@ -562,10 +564,10 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
                     data["displayStatus"], "needs_attention",
                     "hook settlement never raises needs_attention: {ev}"
                 );
-                if data["displayStatus"] == "idle" {
+                if data["displayStatus"] == "unread" {
                     assert_eq!(
                         data,
-                        &json!({ "workspaceId": ws_id, "displayStatus": "idle" }),
+                        &json!({ "workspaceId": ws_id, "displayStatus": "unread" }),
                         "self-sufficient demotion payload (PROTOCOL §6.5): {ev}"
                     );
                     demoted = true;
@@ -577,11 +579,20 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     }
 
     // With the hook settled and the wake turn over, both read paths settle
-    // at the demoted status.
-    poll_display_status(&mut rpc, &ws_id, "idle").await;
+    // at the demoted status. `workspace.markSeen` retires the unread flag
+    // and the rollup lands on the true idle base.
+    poll_display_status(&mut rpc, &ws_id, "unread").await;
     assert_eq!(
         list_display_status(&mut rpc, &ws_id).await,
-        "idle",
+        "unread",
         "workspace.list serves the demoted status after hook.cancel"
     );
+    let seen = wss_rpc(
+        &mut rpc,
+        "workspace.markSeen",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(seen["workspace"]["attention"], "none", "{seen}");
+    poll_display_status(&mut rpc, &ws_id, "idle").await;
 }

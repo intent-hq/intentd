@@ -576,8 +576,9 @@ async fn discussion_request_promotes_and_user_message_retires_over_wss() {
         }
     }
     // And the retired request never re-raises: the read path settles at
-    // `idle` without ever serving needs_attention again.
-    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+    // `unread` (the turn-end blue dot promotes the idle base, §6.5 step 9)
+    // without ever serving needs_attention again.
+    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
 }
 
 /// Scenario 3 — a pending-question tail promotes `needs_attention`: the
@@ -779,7 +780,9 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
             break;
         }
     }
-    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+    // Settles at `unread`: the asker's completed turn raised the turn-end
+    // blue dot, which promotes the idle base (§6.5 step 9).
+    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
 }
 
 /// Scenario 4 — isolation: a DELEGATED (background, task-linked) agent
@@ -908,7 +911,9 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
 
     // The blocker request is still PENDING on the session (nothing retired
     // it), yet the workspace never surfaces it: the read path settles at
-    // `idle` without ever serving needs_attention.
+    // `unread` (the completed turns' blue dot over the idle base) without
+    // ever serving needs_attention — or blocked (child/background blockers
+    // never count).
     let got = wss_rpc(
         &mut rpc,
         "agent.getSession",
@@ -920,7 +925,12 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
         "the delegate's blocker request is still pending: {}",
         got["session"]["attentionRequestKind"]
     );
-    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
+    let status = get_display_status(&mut rpc, &ws_id).await;
+    assert_ne!(
+        status, "blocked",
+        "a delegated/background blocker never promotes the workspace"
+    );
 }
 
 /// Scenario 5 — monorepo#1266: the transcript-mutation RPCs recompute the
@@ -1085,8 +1095,9 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
             break;
         }
     }
-    // … and the read path settles at `idle` without re-serving it.
-    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
+    // … and the read path settles at `unread` (the asker's completed turn
+    // raised the blue dot over the idle base) without re-serving it.
+    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
 
     // ---- Raise over the wire: agent.replaceMessages swaps the transcript
     // back to one ending on the question-bearing assistant row ----

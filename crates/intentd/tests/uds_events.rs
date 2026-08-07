@@ -406,8 +406,10 @@ async fn crud_mutations_emit_change_events_over_uds() {
     );
 
     // Raise then dismiss attention. `workspace.update` now emits
-    // `workspace:updated` (§6.5) with the applied `WorkspaceUpdate` delta;
-    // `workspace.dismissAttention` follows with `workspace:attention-changed`.
+    // `workspace:updated` (§6.5) with the applied `WorkspaceUpdate` delta,
+    // followed by the `workspace:displayStatus-changed` promotion the unread
+    // flag drives (§6.5 step 9); `workspace.dismissAttention` follows with
+    // `workspace:attention-changed` plus the demotion.
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -424,6 +426,13 @@ async fn crud_mutations_emit_change_events_over_uds() {
         e["data"],
         json!({ "workspaceId": ws_id, "changes": { "attention": "unread" } }),
     );
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:displayStatus-changed");
+    assert_eq!(
+        e["data"],
+        json!({ "workspaceId": ws_id, "displayStatus": "unread" })
+    );
 
     rpc(
         &mut rpc_write,
@@ -439,6 +448,13 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(
         e["data"],
         json!({ "workspaceId": ws_id, "attention": "none" })
+    );
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "workspace:displayStatus-changed");
+    assert_eq!(
+        e["data"],
+        json!({ "workspaceId": ws_id, "displayStatus": "idle" })
     );
 
     let _ = shutdown_tx.send(());

@@ -1805,6 +1805,12 @@ impl Services {
     /// blue dot. Persists `attention = level` and emits a self-sufficient
     /// `workspace:attention-changed` only when the value actually changes
     /// (§10.1). Best-effort: a missing workspace surfaces as an error.
+    ///
+    /// Raising `unread` never downgrades a persistent `review_required` flag
+    /// (which only `workspace.dismissAttention` retires): the write is guarded
+    /// on `attention = none`, so a completed turn on a review-required
+    /// workspace is a no-op — no event, no `needs_attention → unread`
+    /// demotion in the derived displayStatus.
     pub(crate) async fn raise_attention(
         &self,
         workspace_id: &WorkspaceId,
@@ -1816,9 +1822,14 @@ impl Services {
         // full-row replace, so a concurrent row mutation is never clobbered —
         // and let the write's row count decide "changed", so the
         // emit-only-on-change choice is atomic rather than read-based.
+        let expected = match level {
+            // Unread only promotes from a clear flag (see doc above).
+            WorkspaceAttention::Unread => Some(WorkspaceAttention::None),
+            _ => None,
+        };
         let changed = self
             .store
-            .set_workspace_attention(workspace_id, level, Some(&now_iso()), None)
+            .set_workspace_attention(workspace_id, level, Some(&now_iso()), expected)
             .await?;
         if !changed {
             return Ok(());
@@ -1830,6 +1841,10 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // The attention flag feeds the derived displayStatus (`unread` /
+        // `review_required` axes, §6.5): recompute-and-compare after the
+        // flag change so the transition emits.
+        self.maybe_emit_display_status_changed(workspace_id).await;
         Ok(())
     }
 
@@ -11318,6 +11333,7 @@ impl WorkspaceApi for Services {
                 || update.pr_status.is_some()
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
+            let attention_changed = update.attention.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -11450,10 +11466,12 @@ impl WorkspaceApi for Services {
             // client mirrors the delta without a follow-up read.
             publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
             // PR link/status changes feed the derived displayStatus (the
-            // `pr_*` rungs sit between activity and taskStats): recompute-
-            // and-compare after the persist so the transition emits (§6.5).
-            // Chief is skipped — virtual, never listed, nothing derives.
-            if !ws.id.is_chief() && pr_fields_changed {
+            // `pr_*` rungs sit between activity and taskStats), and so does
+            // the attention flag (`unread` / `review_required` axes):
+            // recompute-and-compare after the persist so the transition
+            // emits (§6.5). Chief is skipped — virtual, never listed,
+            // nothing derives.
+            if !ws.id.is_chief() && (pr_fields_changed || attention_changed) {
                 this.maybe_emit_display_status_changed(&ws.id).await;
             }
             Ok(ws)
@@ -12798,6 +12816,9 @@ impl WorkspaceApi for Services {
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                // The cleared flag feeds the derived displayStatus (`unread` /
+                // `review_required` axes, §6.5): recompute-and-compare.
+                this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
@@ -12836,6 +12857,9 @@ impl WorkspaceApi for Services {
                 .await?;
             if changed {
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                // The retired unread flag feeds the derived displayStatus
+                // (`unread` axis, §6.5): recompute-and-compare.
+                this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation

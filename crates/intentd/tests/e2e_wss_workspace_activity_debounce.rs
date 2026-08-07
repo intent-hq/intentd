@@ -380,11 +380,13 @@ async fn workspace_activity_changed_debounce() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Drain events until we see the idle workspace activity change plus the
-    // displayStatus demotion to idle that rides the same debounced flip.
+    // displayStatus demotion that rides the same debounced flip. The demoted
+    // status is `unread`, not `idle`: the completed turn raised the
+    // server-owned unread flag (§9.9), which promotes the idle base (§6.5).
     let mut saw_idle = false;
-    let mut saw_status_idle = false;
+    let mut saw_status_unread = false;
     for _ in 0..40 {
-        if saw_idle && saw_status_idle {
+        if saw_idle && saw_status_unread {
             break;
         }
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
@@ -393,9 +395,9 @@ async fn workspace_activity_changed_debounce() {
                 saw_idle = true;
             }
             if ev["type"] == "workspace:displayStatus-changed"
-                && ev["data"]["displayStatus"] == "idle"
+                && ev["data"]["displayStatus"] == "unread"
             {
-                saw_status_idle = true;
+                saw_status_unread = true;
             }
         }
     }
@@ -404,14 +406,14 @@ async fn workspace_activity_changed_debounce() {
         "expected workspace:activity-changed idle after debounce"
     );
     assert!(
-        saw_status_idle,
-        "expected workspace:displayStatus-changed idle after debounce"
+        saw_status_unread,
+        "expected workspace:displayStatus-changed unread after debounce"
     );
 
     // The post-run read path agrees with the event stream.
     let got = uds_rpc(&socket, 4, "workspace.get", json!({ "workspaceId": ws_id })).await;
     assert_eq!(
-        got["result"]["workspace"]["displayStatus"], "idle",
-        "post-run displayStatus is idle: {got}"
+        got["result"]["workspace"]["displayStatus"], "unread",
+        "post-run displayStatus is unread: {got}"
     );
 }
