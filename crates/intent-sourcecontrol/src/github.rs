@@ -656,6 +656,12 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
     }
 }
 
+/// Known ceiling: `contexts(first: 100)` is a single unpaginated page, so a
+/// PR whose rollup exceeds 100 contexts (very large CI matrices) silently
+/// truncates — checks beyond the page are invisible to the requirements
+/// probe, and a monitor diffing two truncated pages can report phantom
+/// "check removed" lines for whatever fell off. Paginating `contexts` is the
+/// complete fix if that ceiling is ever hit in practice.
 const MERGE_REQUIREMENTS_QUERY: &str = r#"
 query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -1236,6 +1242,10 @@ impl SourceControl for GitHubSourceControl {
         })
     }
 
+    // Known ceiling: a single `per_page=100` page (newest first), not a full
+    // pagination walk. Past 100 conversation comments the count plateaus, so
+    // consumers diffing the count for change detection (the PR monitor's
+    // `conversationCount`) stop seeing new-comment changes on such PRs.
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
         let route = Self::repo_path(
             repo,

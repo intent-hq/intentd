@@ -43,6 +43,13 @@ use intent_core::config::{MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_POLL_S
 /// `maxPerAgent` convention).
 pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
+/// Max-latency bound on the debounce hold, in debounce windows: a PR that
+/// never goes quiet (a long CI matrix flipping one check at a time, an active
+/// review conversation) still gets its consolidated wake once the OLDEST
+/// pending change (`pendingSince`) has waited this many windows — standard
+/// debounce-with-max-wait, so a wake can be late but never starved.
+pub(crate) const PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR: i32 = 5;
+
 /// Monitors whose next poll must deliver WITHOUT waiting out the debounce
 /// window: populated by boot rehydration so a baseline that moved (or a
 /// pending emit that was persisted but never delivered) while the daemon was
@@ -562,54 +569,87 @@ impl Services {
         let baseline = serde_json::to_string(&snapshot).ok();
         let now = now_iso();
 
-        let monitor = match existing {
-            Some(mut m) => {
-                self.store
-                    .update_pr_monitor_poll(
-                        &m.monitor_id,
-                        baseline.as_deref(),
-                        &[],
-                        None,
-                        None,
-                        Some(&now),
-                        None,
-                        &now,
-                    )
-                    .await?;
-                m.last_snapshot = baseline;
-                m.pending_changes = Vec::new();
-                m.pending_since = None;
-                m.last_change_at = None;
-                m.last_polled_at = Some(now.clone());
-                m.last_error = None;
-                m.updated_at = now;
-                m
-            }
-            None => {
-                let m = PrMonitor {
-                    monitor_id: PrMonitorId::new(),
-                    workspace_id: workspace_id.clone(),
-                    agent_id: agent_id.clone(),
-                    repo_owner: repo_owner.to_string(),
-                    repo_name: repo_name.to_string(),
-                    pr_number: pr_number as i64,
-                    state: PrMonitorState::Active,
-                    last_snapshot: baseline,
-                    pending_changes: Vec::new(),
-                    pending_since: None,
-                    last_change_at: None,
-                    last_polled_at: Some(now.clone()),
-                    last_error: None,
-                    created_at: now.clone(),
-                    updated_at: now,
-                };
-                self.store.insert_pr_monitor(&m).await?;
-                m
-            }
+        let mut monitor = match existing {
+            Some(m) => self.rearm_pr_monitor(m, baseline.clone(), &now).await?,
+            None => None,
         };
+        if monitor.is_none() {
+            let m = PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: workspace_id.clone(),
+                agent_id: agent_id.clone(),
+                repo_owner: repo_owner.to_string(),
+                repo_name: repo_name.to_string(),
+                pr_number: pr_number as i64,
+                state: PrMonitorState::Active,
+                last_snapshot: baseline.clone(),
+                pending_changes: Vec::new(),
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: Some(now.clone()),
+                last_error: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            if self.store.insert_pr_monitor(&m).await? {
+                monitor = Some(m);
+            } else if let Some(winner) = self
+                .store
+                .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number as i64)
+                .await?
+            {
+                // Lost an insert race against a concurrent register of the
+                // same triple: re-arm the winner's row instead of surfacing
+                // the unique-index violation (the call stays idempotent).
+                monitor = self.rearm_pr_monitor(winner, baseline, &now).await?;
+            }
+        }
+        let monitor = monitor.ok_or_else(|| {
+            Error::Internal(
+                "pr.monitor: registration raced a concurrent monitor mutation; retry".to_string(),
+            )
+        })?;
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
             .await;
         Ok((monitor, snapshot.requirements))
+    }
+
+    /// Re-arm an existing ACTIVE monitor row for an idempotent re-register:
+    /// refresh the baseline, clear the pending state, and reset the debounce
+    /// anchors. Returns `None` when the guarded write loses — the row was
+    /// cancelled/completed/re-registered concurrently — so the caller can
+    /// fall back instead of clobbering.
+    async fn rearm_pr_monitor(
+        &self,
+        mut m: PrMonitor,
+        baseline: Option<String>,
+        now: &str,
+    ) -> Result<Option<PrMonitor>> {
+        let updated = self
+            .store
+            .update_pr_monitor_poll(
+                &m.monitor_id,
+                baseline.as_deref(),
+                &[],
+                None,
+                None,
+                Some(now),
+                None,
+                now,
+                &m.updated_at,
+            )
+            .await?;
+        if !updated {
+            return Ok(None);
+        }
+        m.last_snapshot = baseline;
+        m.pending_changes = Vec::new();
+        m.pending_since = None;
+        m.last_change_at = None;
+        m.last_polled_at = Some(now.to_string());
+        m.last_error = None;
+        m.updated_at = now.to_string();
+        Ok(Some(m))
     }
 
     /// Monitors owned by an agent, oldest first. Cancelled rows are excluded
@@ -673,9 +713,18 @@ impl Services {
             )));
         }
         let now = now_iso();
-        self.store
+        if !self
+            .store
             .update_pr_monitor_state(monitor_id, PrMonitorState::Cancelled, &now)
-            .await?;
+            .await?
+        {
+            // A concurrent cancel/complete won between our read and the
+            // guarded write; the monitor is no longer active either way.
+            return Err(Error::InvalidParams(format!(
+                "pr.unmonitor: monitor {} is not active",
+                monitor_id.0
+            )));
+        }
         monitor.state = PrMonitorState::Cancelled;
         monitor.updated_at = now;
         self.pr_monitor_catch_up.lock().unwrap().remove(monitor_id);
@@ -711,8 +760,7 @@ impl Services {
         if monitor.state != PrMonitorState::Active || monitor.pending_changes.is_empty() {
             return Ok(false);
         }
-        self.emit_pending_changes(&monitor).await?;
-        Ok(true)
+        self.emit_pending_changes(&monitor).await
     }
 
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
@@ -793,12 +841,14 @@ impl Services {
             .map(|prev| diff_snapshots(prev, &fresh))
             .unwrap_or_default();
         // The catch-up marker is set by boot rehydration; the first poll
-        // after a restart consumes it and skips the debounce window.
+        // after a restart skips the debounce window. The marker is only
+        // PEEKED here and consumed after the write-back/emit succeed, so a
+        // transient store failure keeps the restart guarantee for the retry.
         let catch_up = self
             .pr_monitor_catch_up
             .lock()
             .unwrap()
-            .remove(&monitor.monitor_id);
+            .contains(&monitor.monitor_id);
 
         let mut pending = monitor.pending_changes.clone();
         pending.extend(changes.iter().cloned());
@@ -816,7 +866,8 @@ impl Services {
             Some(now.clone())
         };
         let baseline = serde_json::to_string(&fresh).ok();
-        self.store
+        if !self
+            .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 baseline.as_deref(),
@@ -826,8 +877,15 @@ impl Services {
                 Some(&now),
                 None,
                 &now,
+                &monitor.updated_at,
             )
-            .await?;
+            .await?
+        {
+            // The row moved under this sweep's stale image (a concurrent
+            // flush, cancel, or re-register): discard the write and its
+            // side effects; the next tick re-reads and retries.
+            return Ok(());
+        }
         let mut updated = monitor.clone();
         updated.last_snapshot = baseline;
         updated.pending_changes = pending;
@@ -849,23 +907,47 @@ impl Services {
         // Terminal fast-path: a merged/closed PR stops monitoring with an
         // immediate, undebounced final wake.
         if fresh.is_terminal() {
-            return self.complete_pr_monitor(&updated, &fresh).await;
+            self.complete_pr_monitor(&updated, &fresh).await?;
+            self.consume_pr_monitor_catch_up(&monitor.monitor_id);
+            return Ok(());
         }
         if updated.pending_changes.is_empty() {
+            self.consume_pr_monitor_catch_up(&monitor.monitor_id);
             return Ok(());
         }
         // Restart catch-up: anything accumulated across the downtime fires
-        // now. Otherwise hold until the PR has been quiet for the window.
-        if catch_up || self.pr_monitor_debounce_elapsed(&updated) {
-            self.emit_pending_changes(&updated).await?;
+        // now. Otherwise hold until the PR has been quiet for the window
+        // (or the max-latency bound trips on a PR that never goes quiet).
+        if (catch_up || self.pr_monitor_debounce_elapsed(&updated))
+            && self.emit_pending_changes(&updated).await?
+        {
+            self.consume_pr_monitor_catch_up(&monitor.monitor_id);
         }
         Ok(())
     }
 
-    /// Whether the PR has been quiet for the configured debounce window since
-    /// its most recent change. An unparseable/absent anchor emits immediately
-    /// rather than stranding a pending wake forever.
+    /// Consume a monitor's restart catch-up marker once its post-restart
+    /// state has been fully handled (delivered, terminalized, or found to
+    /// have nothing pending).
+    fn consume_pr_monitor_catch_up(&self, monitor_id: &PrMonitorId) {
+        self.pr_monitor_catch_up.lock().unwrap().remove(monitor_id);
+    }
+
+    /// Whether a monitor's pending changes are due for delivery: the PR has
+    /// been quiet for the configured debounce window since its most recent
+    /// change, OR the oldest un-emitted change has waited out the max-latency
+    /// bound ([`PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR`] debounce windows since
+    /// `pending_since`) — a busy PR that never goes quiet still gets its
+    /// consolidated wake, late but never starved. An unparseable/absent
+    /// anchor emits immediately rather than stranding a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
+        let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs() as i64);
+        let now = time::OffsetDateTime::now_utc();
+        if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
+            if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
+                return true;
+            }
+        }
         let Some(anchor) = monitor
             .last_change_at
             .as_deref()
@@ -874,13 +956,17 @@ impl Services {
         else {
             return true;
         };
-        let quiet = time::OffsetDateTime::now_utc() - anchor;
-        quiet >= time::Duration::seconds(self.pr_monitor_debounce().as_secs() as i64)
+        now - anchor >= window
     }
 
     /// Deliver the consolidated wake for a monitor's pending changes and
-    /// reset the debounce state (pending cleared, anchors dropped).
-    async fn emit_pending_changes(&self, monitor: &PrMonitor) -> Result<()> {
+    /// reset the debounce state (pending cleared, anchors dropped). Returns
+    /// `false` without waking when the guarded clear loses — the row moved
+    /// (a concurrent poll appended more lines, or a flush/cancel/re-register
+    /// landed) between the caller's read and the clear — so no change line is
+    /// ever cleared without having been rendered into a delivered wake; the
+    /// surviving pending state re-emits on a later tick.
+    async fn emit_pending_changes(&self, monitor: &PrMonitor) -> Result<bool> {
         let snapshot: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
@@ -888,11 +974,12 @@ impl Services {
         let Some(snapshot) = snapshot else {
             // No baseline to describe: keep the pending changes rather than
             // dropping them; the next poll writes a baseline and emits.
-            return Ok(());
+            return Ok(false);
         };
         let message = render_change_wake(monitor, &monitor.pending_changes, &snapshot);
         let now = now_iso();
-        self.store
+        if !self
+            .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 monitor.last_snapshot.as_deref(),
@@ -902,8 +989,12 @@ impl Services {
                 monitor.last_polled_at.as_deref(),
                 None,
                 &now,
+                &monitor.updated_at,
             )
-            .await?;
+            .await?
+        {
+            return Ok(false);
+        }
         let mut emitted = monitor.clone();
         emitted.pending_changes = Vec::new();
         emitted.pending_since = None;
@@ -913,7 +1004,7 @@ impl Services {
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_EMITTED, &emitted, None)
             .await;
-        Ok(())
+        Ok(true)
     }
 
     /// Terminalize a monitor whose PR merged or closed: persist `completed`
@@ -926,7 +1017,8 @@ impl Services {
     ) -> Result<()> {
         let message = render_terminal_wake(monitor, &monitor.pending_changes, snapshot);
         let now = now_iso();
-        self.store
+        if !self
+            .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 monitor.last_snapshot.as_deref(),
@@ -936,11 +1028,22 @@ impl Services {
                 monitor.last_polled_at.as_deref(),
                 None,
                 &now,
+                &monitor.updated_at,
             )
-            .await?;
-        self.store
+            .await?
+        {
+            // The row moved under us (concurrent flush/cancel/re-register);
+            // skip the wake — the next tick re-detects the terminal state.
+            return Ok(());
+        }
+        if !self
+            .store
             .update_pr_monitor_state(&monitor.monitor_id, PrMonitorState::Completed, &now)
-            .await?;
+            .await?
+        {
+            // A concurrent cancel won; it already delivered its own notice.
+            return Ok(());
+        }
         let mut completed = monitor.clone();
         completed.state = PrMonitorState::Completed;
         completed.pending_changes = Vec::new();
@@ -974,6 +1077,7 @@ impl Services {
                 Some(&now),
                 Some(error),
                 &now,
+                &monitor.updated_at,
             )
             .await
         {
@@ -1993,7 +2097,8 @@ mod tests {
         // The window closes: exactly ONE consolidated wake carries everything.
         let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
         let stale = now_iso();
-        svc.store()
+        assert!(svc
+            .store()
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 held.last_snapshot.as_deref(),
@@ -2003,9 +2108,10 @@ mod tests {
                 Some(&stale),
                 None,
                 &stale,
+                &held.updated_at,
             )
             .await
-            .unwrap();
+            .unwrap());
         svc.poll_pr_monitors().await;
 
         let text = owner_messages(&svc, &owner).await;

@@ -71,12 +71,15 @@ fn monitor_from_row(r: &SqliteRow) -> Result<PrMonitor> {
 }
 
 impl Store {
-    /// Insert a new PR-monitor row.
-    pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<()> {
+    /// Insert a new PR-monitor row. Returns `false` (without inserting) when
+    /// the `idx_pr_monitor_identity` unique index rejects the row — a
+    /// concurrent register already created an ACTIVE monitor for the same
+    /// `(agent, repo, PR)` triple; the caller re-arms that row instead.
+    pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
         let sql = format!(
             "INSERT INTO pr_monitor ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
-        sqlx::query(&sql)
+        match sqlx::query(&sql)
             .bind(&m.monitor_id.0)
             .bind(&m.workspace_id.0)
             .bind(&m.agent_id.0)
@@ -94,8 +97,18 @@ impl Store {
             .bind(&m.updated_at)
             .execute(self.write_pool())
             .await
-            .map_err(|e| intent_core::Error::Internal(format!("insert pr monitor failed: {e}")))?;
-        Ok(())
+        {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(|d| d.is_unique_violation()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(intent_core::Error::Internal(format!(
+                "insert pr monitor failed: {e}"
+            ))),
+        }
     }
 
     /// Get a PR monitor by id; `NotFound` when absent.
@@ -185,36 +198,41 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
-    /// Set a monitor's lifecycle state; `NotFound` when the row is absent.
+    /// Set a monitor's lifecycle state. Every legal transition starts from
+    /// `active`, so the update is guarded on it; returns `false` when the row
+    /// is absent or already terminal (a concurrent cancel/complete won) so
+    /// the caller can skip its side effects instead of resurrecting the row.
     pub async fn update_pr_monitor_state(
         &self,
         monitor_id: &PrMonitorId,
         state: PrMonitorState,
         updated_at: &str,
-    ) -> Result<()> {
-        let res =
-            sqlx::query("UPDATE pr_monitor SET state = ?, updated_at = ? WHERE monitor_id = ?")
-                .bind(state_to_db(state))
-                .bind(updated_at)
-                .bind(&monitor_id.0)
-                .execute(self.write_pool())
-                .await
-                .map_err(|e| {
-                    intent_core::Error::Internal(format!("update pr monitor state failed: {e}"))
-                })?;
-        if res.rows_affected() == 0 {
-            return Err(intent_core::Error::NotFound(format!(
-                "pr monitor {} not found",
-                monitor_id.0
-            )));
-        }
-        Ok(())
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE pr_monitor SET state = ?, updated_at = ? \
+             WHERE monitor_id = ? AND state = 'active'",
+        )
+        .bind(state_to_db(state))
+        .bind(updated_at)
+        .bind(&monitor_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("update pr monitor state failed: {e}"))
+        })?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Write back everything one poll can change: the baseline snapshot, the
     /// accumulated pending changes and their debounce anchors, the poll
     /// timestamp, and the last forge error. One statement so a reader never
     /// observes a baseline that moved without its pending changes.
+    ///
+    /// Optimistic-concurrency guarded: the write only lands when the row is
+    /// still `active` AND its `updated_at` still equals `expected_updated_at`
+    /// (the value the caller read). Returns `false` when the guard fails —
+    /// a concurrent flush/cancel/re-register/poll moved the row, and the
+    /// caller must discard its stale image (skip emits) rather than clobber.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_pr_monitor_poll(
         &self,
@@ -226,11 +244,12 @@ impl Store {
         last_polled_at: Option<&str>,
         last_error: Option<&str>,
         updated_at: &str,
-    ) -> Result<()> {
+        expected_updated_at: &str,
+    ) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE pr_monitor SET last_snapshot = ?, pending_changes = ?, pending_since = ?, \
              last_change_at = ?, last_polled_at = ?, last_error = ?, updated_at = ? \
-             WHERE monitor_id = ?",
+             WHERE monitor_id = ? AND state = 'active' AND updated_at = ?",
         )
         .bind(last_snapshot)
         .bind(pending_to_db(pending_changes))
@@ -240,16 +259,11 @@ impl Store {
         .bind(last_error)
         .bind(updated_at)
         .bind(&monitor_id.0)
+        .bind(expected_updated_at)
         .execute(self.write_pool())
         .await
         .map_err(|e| intent_core::Error::Internal(format!("update pr monitor poll failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(intent_core::Error::NotFound(format!(
-                "pr monitor {} not found",
-                monitor_id.0
-            )));
-        }
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// Delete a PR-monitor row; `NotFound` when absent.
