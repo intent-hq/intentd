@@ -19905,15 +19905,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.hook_list_op(&workspace_id, agent_id.as_ref()).await })
     }
 
-    /// `hook.cancel`: stop an active hook; a non-owner (FE) cancel wakes the
-    /// owning agent with a notice.
+    /// `hook.cancel`: stop an active hook; an agent caller may only cancel
+    /// its own hooks, while the FE path (`caller = None`) cancels any hook
+    /// and wakes the owning agent with a notice.
     fn hook_cancel(
         &self,
         workspace_id: WorkspaceId,
         hook_id: intent_core::HookId,
-        by_owner: bool,
+        caller: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.hook_cancel_op(&workspace_id, &hook_id, by_owner).await })
+        Box::pin(async move {
+            self.hook_cancel_op(&workspace_id, &hook_id, caller.as_ref())
+                .await
+        })
     }
 
     /// `hook.runNow`: trigger an immediate run of an active hook.
