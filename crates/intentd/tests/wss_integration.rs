@@ -1329,10 +1329,17 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 /// provider's cached catalog is rejected -32602 without `providerId` (the
 /// message carries the pass-providerId hint), succeeds WITH the owning
 /// `providerId` and reconciles the served `provider`, an unknown
-/// `providerId` is -32602, and a compound `modelId` conflicting with
-/// `providerId` is -32602 with the session untouched.
+/// `providerId` is -32602, a non-string `providerId` is -32602 at the
+/// router boundary, and a compound `modelId` conflicting with `providerId`
+/// is -32602 with the session untouched. Every response is checked for the
+/// JSON-RPC envelope (`jsonrpc: "2.0"` + request-id correlation).
 #[tokio::test]
 async fn wss_agent_set_model_provider_id_param() {
+    /// Assert the JSON-RPC response envelope: version and id correlation.
+    fn assert_envelope(resp: &Value, id: i64) {
+        assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
+        assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
+    }
     let dir = test_tempdir("intentd-wss-setmodel-pid-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
@@ -1368,6 +1375,7 @@ async fn wss_agent_set_model_provider_id_param() {
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS SetModel ProviderId"}}"#,
     )
     .await;
+    assert_envelope(&created_ws, 1);
     let ws_id = created_ws["result"]["workspace"]["id"]
         .as_str()
         .expect("workspace id")
@@ -1376,6 +1384,7 @@ async fn wss_agent_set_model_provider_id_param() {
         r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Pid","model":"auggie:sonnet4.5"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&created, 2);
     let agent_id = created["result"]["agent"]["id"]
         .as_str()
         .expect("agent id")
@@ -1387,6 +1396,7 @@ async fn wss_agent_set_model_provider_id_param() {
         r#"{{"jsonrpc":"2.0","id":3,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast"}}}}"#
     );
     let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 3);
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
@@ -1403,6 +1413,7 @@ async fn wss_agent_set_model_provider_id_param() {
         r#"{{"jsonrpc":"2.0","id":4,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"nonexistent"}}}}"#
     );
     let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 4);
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
@@ -1421,6 +1432,7 @@ async fn wss_agent_set_model_provider_id_param() {
         r#"{{"jsonrpc":"2.0","id":5,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"auggie:sonnet4.5","providerId":"grok"}}}}"#
     );
     let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 5);
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
@@ -1434,11 +1446,32 @@ async fn wss_agent_set_model_provider_id_param() {
         "error must name both providers: {rejected}"
     );
 
+    // A present non-string providerId is malformed — -32602 at the router
+    // boundary, not a silent fall-back to the legacy session-provider path.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":42}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&rejected, 6);
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "non-string providerId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: providerId must be a string"),
+        "error must name the malformed param: {rejected}"
+    );
+
     // All rejections left the session untouched.
     let get_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
     );
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_envelope(&got, 7);
     assert_eq!(
         got["result"]["agent"]["model"],
         Value::from("auggie:sonnet4.5"),
@@ -1453,17 +1486,19 @@ async fn wss_agent_set_model_provider_id_param() {
     // With the owning providerId the same bare model passes, and the served
     // provider reconciles to it.
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"grok-4-fast","providerId":"grok"}}}}"#
     );
     let accepted = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_envelope(&accepted, 8);
     assert!(
         accepted.get("error").is_none(),
         "bare model with owning providerId must pass: {accepted}"
     );
     let get_frame = format!(
-        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        r#"{{"jsonrpc":"2.0","id":9,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
     );
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_envelope(&got, 9);
     assert_eq!(
         got["result"]["agent"]["model"],
         Value::from("grok-4-fast"),
