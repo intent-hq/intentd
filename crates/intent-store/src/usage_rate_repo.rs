@@ -15,8 +15,8 @@ use sqlx::Row;
 
 use crate::Store;
 
-/// One additive contribution to a `usage_rate_minutely` bucket: the four
-/// token counters of one per-turn delta (the same clamped delta that feeds
+/// One additive contribution to a `usage_rate_minutely` bucket: the token
+/// counters of one per-turn delta (the same clamped delta that feeds
 /// `usage_stats_hourly` — never a raw cumulative snapshot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageRateDelta {
@@ -24,6 +24,7 @@ pub struct UsageRateDelta {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub thought_tokens: u64,
 }
 
 impl UsageRateDelta {
@@ -43,6 +44,7 @@ pub struct UsageRateRow {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub thought_tokens: u64,
 }
 
 impl Store {
@@ -53,19 +55,22 @@ impl Store {
     pub async fn add_usage_rate(&self, bucket_utc: &str, delta: &UsageRateDelta) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_rate_minutely (
-                bucket_utc, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
-             ) VALUES (?,?,?,?,?)
+                bucket_utc, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, thought_tokens
+             ) VALUES (?,?,?,?,?,?)
              ON CONFLICT(bucket_utc) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens",
+                cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+                thought_tokens = thought_tokens + excluded.thought_tokens",
         )
         .bind(bucket_utc)
         .bind(delta.input_tokens as i64)
         .bind(delta.output_tokens as i64)
         .bind(delta.cache_read_tokens as i64)
         .bind(delta.cache_creation_tokens as i64)
+        .bind(delta.thought_tokens as i64)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage rate failed: {e}")))?;
@@ -78,7 +83,7 @@ impl Store {
     pub async fn list_usage_rate_since(&self, since: &str) -> Result<Vec<UsageRateRow>> {
         let rows = sqlx::query(
             "SELECT bucket_utc, input_tokens, output_tokens, cache_read_tokens,
-                    cache_creation_tokens
+                    cache_creation_tokens, thought_tokens
              FROM usage_rate_minutely
              WHERE bucket_utc >= ?
              ORDER BY bucket_utc ASC",
@@ -95,6 +100,7 @@ impl Store {
                 output_tokens: row.get::<i64, _>("output_tokens") as u64,
                 cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
                 cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
+                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
             })
             .collect())
     }
@@ -156,6 +162,7 @@ mod tests {
                     output_tokens: 40,
                     cache_read_tokens: 20,
                     cache_creation_tokens: 10,
+                    thought_tokens: 5,
                 },
             )
             .await
@@ -166,6 +173,7 @@ mod tests {
                 &UsageRateDelta {
                     input_tokens: 50,
                     output_tokens: 10,
+                    thought_tokens: 3,
                     ..Default::default()
                 },
             )
@@ -189,8 +197,12 @@ mod tests {
         assert_eq!(rows[0].output_tokens, 50);
         assert_eq!(rows[0].cache_read_tokens, 20);
         assert_eq!(rows[0].cache_creation_tokens, 10);
+        assert_eq!(rows[0].thought_tokens, 8);
         assert_eq!(rows[1].bucket_utc, "2026-07-30T14:08:00Z");
         assert_eq!(rows[1].input_tokens, 7);
+        // A bucket that never saw a thought-token delta reads back as 0 (the
+        // additive column's default), same as a pre-migration row.
+        assert_eq!(rows[1].thought_tokens, 0);
     }
 
     /// `list_usage_rate_since` is an inclusive lower bound on the RFC-3339
@@ -271,6 +283,12 @@ mod tests {
         assert!(UsageRateDelta::default().is_zero());
         assert!(!UsageRateDelta {
             output_tokens: 1,
+            ..Default::default()
+        }
+        .is_zero());
+        // A thought-only turn is a real contribution, not a skippable no-op.
+        assert!(!UsageRateDelta {
+            thought_tokens: 1,
             ..Default::default()
         }
         .is_zero());

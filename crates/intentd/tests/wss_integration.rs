@@ -2741,6 +2741,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
                 output_tokens: 40,
                 cache_read_tokens: 20,
                 cache_creation_tokens: 10,
+                thought_tokens: 12,
             },
         )
         .await
@@ -2751,6 +2752,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
             &bucket_key(now),
             &intent_store::UsageRateDelta {
                 input_tokens: 1,
+                thought_tokens: 3,
                 ..Default::default()
             },
         )
@@ -2792,6 +2794,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert!(s["outputTokens"].is_u64(), "{s}");
         assert!(s["cacheReadTokens"].is_u64(), "{s}");
         assert!(s["cacheCreationTokens"].is_u64(), "{s}");
+        assert!(s["thoughtTokens"].is_u64(), "{s}");
     }
     let buckets: Vec<&str> = samples
         .iter()
@@ -2809,6 +2812,7 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         assert_eq!(cur["outputTokens"], 40, "{resp}");
         assert_eq!(cur["cacheReadTokens"], 20, "{resp}");
         assert_eq!(cur["cacheCreationTokens"], 10, "{resp}");
+        assert_eq!(cur["thoughtTokens"], 15, "{resp}");
     } else {
         panic!("current-minute bucket missing from window: {resp}");
     }
@@ -2816,6 +2820,9 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
         .expect("minute-2 bucket inside the window");
     assert_eq!(mid["inputTokens"], 7, "{resp}");
     assert_eq!(mid["outputTokens"], 2, "{resp}");
+    // A minute recorded without any reasoning tokens still carries the field
+    // (dense samples), reading back as the additive column's 0 default.
+    assert_eq!(mid["thoughtTokens"], 0, "{resp}");
     // Untouched minutes are zero-filled; the 30-minute-old row is outside.
     assert!(
         !samples.iter().any(|s| s["inputTokens"] == 999),
