@@ -42,8 +42,8 @@ pub(crate) trait BinaryResolver: Send + Sync {
 }
 
 /// Captures the version line from a resolved binary (typically by running
-/// `<path> --version`). Injected so `check_git`/`check_auggie` are unit-testable
-/// without spawning a real subprocess.
+/// `<path> --version`). Injected so `check_git` is unit-testable without
+/// spawning a real subprocess.
 pub(crate) trait VersionProbe: Send + Sync {
     fn probe(&self, path: &Path) -> Option<String>;
 }
@@ -288,19 +288,23 @@ pub(crate) fn check_git() -> Value {
     check_git_with(&OsBinaryResolver, &OsVersionProbe)
 }
 
-/// Build the `host.checkAuggie` result, given a pre-resolved candidate path
-/// (the caller has already applied the user-settings → discovery precedence).
-/// `available:false` when `resolved` is `None` or the version probe fails.
-pub(crate) fn check_auggie_with(resolved: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
-    build_check_result(resolved, probe)
+/// Build the `host.checkAuggie` result `{ available, path? }`, given a
+/// pre-resolved candidate path (the caller has already applied the
+/// user-settings → discovery precedence). Resolution-only: `available` is true
+/// iff the path resolved — no `--version` spawn, no `version` field.
+pub(crate) fn check_auggie_with(resolved: Option<PathBuf>) -> Value {
+    match resolved {
+        Some(path) => json!({ "available": true, "path": path.to_string_lossy() }),
+        None => json!({ "available": false }),
+    }
 }
 
 /// Production `check_auggie` — uses the canonical resolver from
 /// `intent_services::auggie_discovery` (re-export of `intent_context::`
-/// `discovery::find_auggie`) and the real version probe. Settings precedence
-/// is applied by the caller via [`resolve_auggie_path`].
+/// `discovery::find_auggie`). Settings precedence is applied by the caller via
+/// [`resolve_auggie_path`].
 pub(crate) fn check_auggie(configured: Option<&str>) -> Value {
-    check_auggie_with(resolve_auggie_path(configured), &OsVersionProbe)
+    check_auggie_with(resolve_auggie_path(configured))
 }
 
 /// Apply the auggie path precedence: (1) user-configured `configured` path
@@ -317,9 +321,9 @@ pub(crate) fn resolve_auggie_path(configured: Option<&str>) -> Option<PathBuf> {
     intent_services::auggie_discovery::find_auggie()
 }
 
-/// Common `{ available, version?, path? }` body builder shared by `checkGit`
-/// and `checkAuggie`. `path` is `None` ⇒ `available:false`. A successful probe
-/// includes the trimmed `version` + resolver `path`.
+/// `{ available, version?, path? }` body builder for `checkGit`. `path` is
+/// `None` ⇒ `available:false`. A successful probe includes the trimmed
+/// `version` + resolver `path`.
 fn build_check_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
     let Some(path) = path else {
         return json!({ "available": false });
@@ -345,8 +349,8 @@ pub(crate) fn is_safe_binary_name(name: &str) -> bool {
 }
 
 /// Build the `host.findBinary` result `{ available, path?, version? }`. Unlike
-/// `checkGit`/`checkAuggie`, a binary that resolves but does not answer
-/// `--version` is still `available:true` (the `version` is best-effort/optional).
+/// `checkGit`, a binary that resolves but does not answer `--version` is still
+/// `available:true` (the `version` is best-effort/optional).
 fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
     let Some(path) = path else {
         return json!({ "available": false });

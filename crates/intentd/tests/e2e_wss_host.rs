@@ -511,6 +511,44 @@ async fn host_provider_auth_status_over_wss() {
     );
 }
 
+/// host.checkAuggie over the real WSS wire: resolution-only `{ available,
+/// path? }`. Pinning `context.auggiePath` at a plain (non-executable) file
+/// proves both halves of the contract — the settings-precedence path still
+/// wins, and `available` is true purely from resolution with **no** `version`
+/// field, because the retired `--version` probe would have failed on this file
+/// and reported `available:false`.
+#[tokio::test]
+async fn host_check_auggie_is_resolution_only_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    let stub = daemon.data_dir.join("auggie-stub");
+    std::fs::write(&stub, "not an executable\n").expect("write auggie stub");
+
+    let applied = wss_rpc(
+        &mut ws,
+        400,
+        "settings.update",
+        json!({ "changes": [{ "path": "context.auggiePath", "value": stub.to_str().unwrap() }] }),
+    )
+    .await;
+    assert!(
+        applied["applied"].is_array(),
+        "settings.update applied: {applied}"
+    );
+
+    let result = wss_rpc(&mut ws, 401, "host.checkAuggie", json!({})).await;
+    assert_eq!(
+        result["available"], true,
+        "configured file resolves without a version probe: {result}"
+    );
+    assert_eq!(result["path"], stub.to_string_lossy().as_ref());
+    assert!(
+        result.get("version").is_none(),
+        "`version` is retired from host.checkAuggie: {result}"
+    );
+}
+
 /// Seed one workspace with a filesystem root so `host.exec` can enforce the
 /// within-workspace containment guard on `cwd`. Returns `(workspace_id, root)`.
 async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {

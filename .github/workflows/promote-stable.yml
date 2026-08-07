@@ -14,6 +14,14 @@
 # platform URLs point at the mirrored assets. The stable.json published on
 # this repo is unchanged (sitter fallback path + future open-source path).
 #
+# Tagged releases are published as GitHub Pre-releases (v-release.yml), so a
+# promotable release only has to exist and not be a draft. Promotion clears the
+# prerelease flag and marks vX.Y.Z as Latest on this repo and — when the mirror
+# token is configured — on intent-hq/intentd-releases, so the Latest badge
+# tracks the most recently promoted version (a rollback re-promotion moves it
+# back). Both steps are idempotent, so re-promoting the same version just
+# re-applies the flags.
+#
 # As a best-effort extra, promotion also rewrites the `channel-stable` release
 # body with aggregated release notes covering every version since the previous
 # stable (aggregate-stable-notes.sh). Notes steps are fail-soft: they never
@@ -65,19 +73,22 @@ jobs:
             exit 1
           fi
           echo "Version $VERSION is valid"
-      - name: Verify release exists and is a published non-prerelease
+      # Pre-release is the expected state of a beta release, so it is not a
+      # rejection reason here — the promotion clears it below. Drafts are still
+      # rejected: they have no published assets to promote.
+      - name: Verify release exists and is not a draft
         shell: bash
         run: |
-          if ! flags=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv'); then
+          if ! is_draft=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq '.isDraft'); then
             echo "::error::Release v${VERSION} does not exist on $GITHUB_REPOSITORY"
             exit 1
           fi
-          if [[ "$flags" != "false"$'\t'"false" ]]; then
-            echo "::error::Release v${VERSION} is a draft or marked prerelease; only published stable releases can be promoted"
+          if [[ "$is_draft" != "false" ]]; then
+            echo "::error::Release v${VERSION} is a draft; only published releases can be promoted"
             exit 1
           fi
-          echo "Release v${VERSION} exists and is a published non-prerelease"
+          echo "Release v${VERSION} exists and is not a draft"
       # Read the outgoing stable.json before it is rebuilt so the aggregated
       # notes can span (previous stable, promoted]. Fail-soft: a missing
       # asset/release (first promotion) or any error just leaves the previous
@@ -109,6 +120,26 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh stable stable.json
+      # Betas are published as Pre-releases (v-release.yml); promotion clears
+      # the flag and moves the Latest badge onto the promoted version. Uses the
+      # job's GH_TOKEN (contents:write on this repo). Fail-soft and idempotent:
+      # the manifest is already published, and a re-promotion just re-applies
+      # the same flags.
+      - name: Mark release as stable and Latest
+        id: mark-latest
+        continue-on-error: true
+        shell: bash
+        run: |
+          release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}" --jq '.id')
+          # make_latest is a string enum ("true"/"false"/"legacy"), hence -f not -F.
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F prerelease=false -f make_latest=true >/dev/null
+          echo "Release v${VERSION} marked as non-prerelease and Latest on $GITHUB_REPOSITORY"
+      - name: Warn if Latest marking failed
+        if: steps.mark-latest.outcome != 'success'
+        shell: bash
+        run: |
+          echo "::warning::Failed to mark v${VERSION} as non-prerelease/Latest on $GITHUB_REPOSITORY; the stable manifest is published and unaffected. Re-run the promotion for this version to retry the marking."
       # Fail-soft: aggregated notes are a nice-to-have; a failure here must
       # never fail the promotion (the manifest is already published).
       - name: Aggregate stable release notes
@@ -124,6 +155,7 @@ jobs:
         env:
           PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
           NOTES_OUTCOME: ${{ steps.notes.outcome }}
+          MARK_LATEST_OUTCOME: ${{ steps.mark-latest.outcome }}
         run: |
           {
             echo "## Stable promotion"
@@ -131,6 +163,12 @@ jobs:
             echo "**Promoted version:** v$VERSION"
             echo ""
             echo "**Previous stable:** ${PREV_STABLE:-unknown (first promotion?)}"
+            echo ""
+            if [[ "$MARK_LATEST_OUTCOME" == "success" ]]; then
+              echo "**Latest badge:** v$VERSION marked as non-prerelease and Latest"
+            else
+              echo "**Latest badge:** skipped (non-blocking failure; manifest unaffected)"
+            fi
             echo ""
             if [[ "$NOTES_OUTCOME" == "success" ]]; then
               echo "**Aggregated notes:** updated on channel-stable"
@@ -236,3 +274,19 @@ jobs:
           GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
         run: |
           ./scripts/publish-channel-manifest.sh stable mirror/stable.json intent-hq/intentd-releases
+      # Mirror counterpart of "Mark release as stable and Latest": the mirrored
+      # release inherits the source's prerelease state at create time, so the
+      # promotion has to clear it there too. Idempotent; fails loudly like the
+      # other mirror steps.
+      - name: Mark mirrored release as stable and Latest
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          MIRROR_REPO: intent-hq/intentd-releases
+          GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          release_id=$(gh api "repos/${MIRROR_REPO}/releases/tags/v${VERSION}" --jq '.id')
+          # make_latest is a string enum ("true"/"false"/"legacy"), hence -f not -F.
+          gh api -X PATCH "repos/${MIRROR_REPO}/releases/${release_id}" \
+            -F prerelease=false -f make_latest=true >/dev/null
+          echo "Release v${VERSION} marked as non-prerelease and Latest on $MIRROR_REPO"

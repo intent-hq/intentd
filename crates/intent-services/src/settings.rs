@@ -1316,6 +1316,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             true,
         ),
         boolean(
+            "agentFeatures.stateSnapshot",
+            "State snapshot",
+            "Inject the per-turn agent state snapshot line into turn prompts; applies to the next turn of every session (live)",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
             "agentFeatures.prMonitor",
             "PR monitor",
             "Expose centralized PR monitoring (ws.pr.monitor / ws.pr.unmonitor) to agents; applies to new sessions only",
@@ -2401,6 +2408,7 @@ mod tests {
             "agentFeatures.richChatBlocks",
             "agentFeatures.structuredQuestions",
             "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
             "agentFeatures.prMonitor",
         ];
         for path in paths {

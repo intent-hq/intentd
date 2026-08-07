@@ -2529,6 +2529,7 @@ impl Services {
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
         };
         if !rate_delta.is_zero() {
             for (bucket, part) in

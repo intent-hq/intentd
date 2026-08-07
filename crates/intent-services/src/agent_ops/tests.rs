@@ -4486,6 +4486,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
         "in_progress".into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("markAsTask");
@@ -4541,9 +4542,16 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
         )
         .await
         .expect("create note");
-    svc.mark_as_task(ws.clone(), note.id.clone(), "complete".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "complete".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
 
     let created = svc
         .agent_create_op(
@@ -4606,6 +4614,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
         note.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -4804,6 +4813,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
         foreign.id.clone(),
         "in_progress".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -10550,6 +10560,8 @@ async fn seed_active_hook(
         last_logs: None,
         last_state: None,
         expires_at: Some("2026-08-02T15:00:00Z".to_string()),
+        perpetual: false,
+        dispatch_count: 0,
     };
     svc.store().insert_hook(&hook).await.expect("insert hook");
     hook
@@ -11270,6 +11282,255 @@ async fn after_all_group_waits_for_agent_waiting_child() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// Regression (issue intent-hq/monorepo#1643): a grouped `after_all` child (B)
+/// whose only outgoing watch is a `report_delivered` one on C must settle its
+/// group. Such a watch can never deliver an idle wake (the report-time wake
+/// already fired) and it retires INLINE on C's idle without a wake, so a B
+/// deferred on its account would have no future trigger and would strand the
+/// group at `delivered = 0` forever.
+#[tokio::test]
+async fn report_delivered_watch_does_not_strand_agent_waiting_group_member() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch P to B");
+    // C already reported to B, so B's watch on C survives only for a
+    // failure/deletion signal — C's idle retires it with no wake.
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B's real completion, emitted while the report_delivered watch is armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    // P idles: the group seals.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &p,
+        json!({ "agentId": p.0 }),
+    ))
+    .await;
+    // C idles: B's watch on C retires inline (report already delivered).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &p).await,
+        1,
+        "group settles despite B's report_delivered watch"
+    );
+    let text = parent_messages_text(&svc, &p).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Regression (issue intent-hq/monorepo#1643), backstop arm: the inline
+/// retirement of a `report_delivered` watch on its target's idle must run the
+/// watch-removal backstop for the watch's holder — otherwise a holder whose
+/// own idle was deferred for another reason (here a queue-interim idle whose
+/// queue then drained out-of-band) never settles its watcher.
+#[tokio::test]
+async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B idles with a ready-to-send entry: queue-interim, so A's watch defers
+    // and the interim-skip marker is recorded.
+    let (queued, _) = svc.enqueue_message(&b, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+    svc.take_queued_message(&b, &queued.id)
+        .expect("drain queue");
+
+    // C idles: B's report_delivered watch retires with no wake, and the
+    // backstop synthesizes B's real completion.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "retiring B's last outgoing watch settles A's deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at the backstop completion"
+    );
+}
+
+/// Chained inline retirement (issue intent-hq/monorepo#1643): A holds a
+/// `report_delivered` watch on B and B one on C, with A and B both
+/// deferred. C's idle must cascade — retiring B's watch backstops B's
+/// completion, which retires A's watch and backstops A's — so Z, watching A,
+/// settles from a single event. Pins the recursion contract (one marker
+/// consumed per hop, each watch removed before recursing) as bounded and
+/// wake-exactly-once.
+#[tokio::test]
+async fn chained_report_delivered_retirements_cascade_to_the_outermost_watcher() {
+    let (_t, svc, ws) = setup().await;
+    let z = create_agent(&svc, &ws, "Z").await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, z.clone(), "Z".into(), a.clone(), None)
+        .expect("Z watches A");
+    let ab = svc
+        .register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&ab));
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // Defer B, then A, via queue-interim idles; drain both queues so only the
+    // watch retirements remain as triggers.
+    for agent in [&b, &a] {
+        let (queued, _) =
+            svc.enqueue_message(agent, "follow-up".into(), None, None, None, None, false);
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            agent,
+            json!({ "agentId": agent.0 }),
+        ))
+        .await;
+        svc.take_queued_message(agent, &queued.id)
+            .expect("drain queue");
+    }
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        0,
+        "Z defers until A settles"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &z).await,
+        1,
+        "one cascade delivers exactly one wake to Z"
+    );
+    assert!(svc.find_watches_for_child(&a).is_empty());
+    assert!(svc.find_watches_for_child(&b).is_empty());
+    assert!(svc.find_watches_for_child(&c).is_empty());
+}
+
+/// A `report_delivered` watch is not an agent-waiting reason, in both the live
+/// and the durable (persisted-row) classification: it can only ever deliver a
+/// failure/deletion signal, so its holder's idle must not defer on its account
+/// (issue intent-hq/monorepo#1643).
+#[tokio::test]
+async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(
+        svc.agent_is_waiting_on_agents(&b),
+        "a plain outgoing watch is a waiting reason"
+    );
+    assert!(svc.mark_watch_report_delivered(&bc));
+    assert!(
+        !svc.agent_is_waiting_on_agents(&b),
+        "a report_delivered watch is not a waiting reason"
+    );
+
+    // Durable variant: a restarted daemon classifies from persisted rows
+    // BEFORE the watch registry loads, so it must honor the column too.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
+        id: "watch-1643".to_string(),
+        parent_workspace_id: ws.clone(),
+        child_workspace_id: ws.clone(),
+        parent_agent_id: b.clone(),
+        parent_agent_name: "B".into(),
+        child_agent_id: c.clone(),
+        group_id: None,
+        report_delivered,
+        wake_on_attention: false,
+        created_at: now_iso(),
+    };
+    restarted
+        .store()
+        .upsert_completion_watch(&row(false))
+        .await
+        .expect("seed plain row");
+    assert!(
+        restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted plain watch is a waiting reason"
+    );
+    restarted
+        .store()
+        .upsert_completion_watch(&row(true))
+        .await
+        .expect("seed report_delivered row");
+    assert!(
+        !restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted report_delivered watch is not a waiting reason"
+    );
+}
 /// Terminal signals are never agent-waiting-deferred: a watched child that
 /// FAILS while holding an outgoing watch still wakes its watcher immediately.
 #[tokio::test]
@@ -14221,6 +14482,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
         note.id.clone(),
         "not_started".into(),
         vec![],
+        None,
         None,
     )
     .await
@@ -18459,6 +18721,7 @@ async fn link_task_note(
         status.into(),
         vec![],
         None,
+        None,
     )
     .await
     .expect("mark as task");
@@ -21084,4 +21347,259 @@ async fn requeue_front_batch_preserves_order_ahead_of_existing_entries() {
     let snap = svc.queue_snapshot(&agent);
     let contents: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
     assert_eq!(contents, vec![json!("a"), json!("b"), json!("later")]);
+}
+
+// ---- ws.agent.snapshot (state snapshot op + injection line) ----
+
+/// An idle agent with no hooks/watches/queue/subscriptions/children/questions
+/// and no pending attention yields the trivial snapshot: `time` only in the
+/// wire object, and NO injection line (`time` alone never forces one).
+#[tokio::test]
+async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Idle").await;
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    let obj = v.as_object().expect("object");
+    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    let time = v["time"].as_str().expect("time string");
+    assert!(
+        time.ends_with('Z') && !time.contains('.'),
+        "whole-second UTC: {time}"
+    );
+
+    assert_eq!(
+        svc.agent_state_snapshot_line(&agent).await,
+        None,
+        "trivial snapshot must not inject"
+    );
+}
+
+/// A populated snapshot reports the approved camelCase fields with correct
+/// counts, and the injection line is the single-line JSON prefixed with
+/// `current ws.agent.snapshot() => `.
+#[tokio::test]
+async fn agent_snapshot_populated_counts_and_injection_line() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+
+    // Parent linkage: `child` is an unsettled delegate of `parent`.
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("link child");
+
+    // One completion watch, two queued messages, one event subscription.
+    svc.agent_watch_op(ws.clone(), parent.clone(), other.clone())
+        .await
+        .expect("watch");
+    svc.enqueue_message(&parent, "m1".into(), None, None, None, None, false);
+    svc.enqueue_message(&parent, "m2".into(), None, None, None, None, false);
+    svc.register_event_subscription(
+        &ws,
+        Some(parent.clone()),
+        &["note:*".to_string()],
+        None,
+        None,
+    )
+    .await;
+    // Pending attention request.
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "stuck".into(),
+        Some(parent.clone()),
+    )
+    .await
+    .expect("blocker");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(v["time"].is_string());
+    assert_eq!(v["agentWatches"], json!(1));
+    assert_eq!(v["queuedMessages"], json!(2));
+    assert_eq!(v["eventSubscriptions"], json!(1));
+    assert_eq!(v["runningSubAgents"], json!(1));
+    assert_eq!(v["pendingAttention"], json!("blocker"));
+    // Zero-count fields stay omitted.
+    let obj = v.as_object().expect("object");
+    assert!(!obj.contains_key("hooks"), "zero hooks omitted: {v}");
+    assert!(
+        !obj.contains_key("numQuestionsAsked"),
+        "zero questions omitted: {v}"
+    );
+
+    let line = svc
+        .agent_state_snapshot_line(&parent)
+        .await
+        .expect("non-trivial snapshot injects");
+    assert!(
+        line.starts_with("current ws.agent.snapshot() => {"),
+        "prefix: {line}"
+    );
+    assert!(!line.contains('\n'), "single line: {line}");
+    let json_part = line
+        .strip_prefix("current ws.agent.snapshot() => ")
+        .expect("JSON payload");
+    let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
+    assert_eq!(parsed["queuedMessages"], json!(2));
+    assert_eq!(parsed["pendingAttention"], json!("blocker"));
+}
+
+/// A settled (terminal) child no longer counts toward `runningSubAgents`.
+#[tokio::test]
+async fn agent_snapshot_excludes_settled_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    child_session.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &child_session)
+        .await
+        .expect("settle child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("runningSubAgents"),
+        "settled child must not count: {v}"
+    );
+}
+
+/// An unsettled child delegated into ANOTHER workspace (Chief cross-workspace
+/// delegation) still counts toward `runningSubAgents` — child discovery keys
+/// on `parent_agent_id` alone, never on the parent's home workspace.
+#[tokio::test]
+async fn agent_snapshot_counts_cross_workspace_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Chief").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    let child = create_agent(&svc, &other_ws, "Remote Child").await;
+    let mut child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    child_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&other_ws, &child_session)
+        .await
+        .expect("link cross-workspace child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["runningSubAgents"],
+        json!(1),
+        "cross-workspace child must count: {v}"
+    );
+}
+
+/// Workspace scoping: a snapshot for an agent homed elsewhere fails closed
+/// with `NotFound` (defense-in-depth against bare-id probes).
+#[tokio::test]
+async fn agent_snapshot_rejects_workspace_mismatch() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Scoped").await;
+    let foreign = WorkspaceId::new();
+    let err = svc
+        .agent_snapshot_op(foreign, agent)
+        .await
+        .expect_err("cross-workspace probe must fail");
+    assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+}
+
+/// `numQuestionsAsked` counts pending questions from BOTH sources: the
+/// turn-attachment registry (asked this turn, awaiting the turn-end drain)
+/// and the trailing assistant message's question blocks (presented, awaiting
+/// an answer); a user answer supersedes the tail count and a dismissal
+/// clears it.
+#[tokio::test]
+async fn agent_snapshot_counts_pending_questions() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Asker").await;
+
+    // In-turn: one question registered in the turn-attachment registry.
+    svc.turn_attachments().register(
+        &agent,
+        intent_core::TurnAttachment {
+            id: intent_core::new_attachment_id(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "intent-question://tar-test".to_string(),
+            name: "Q".to_string(),
+            text: "{}".to_string(),
+        },
+    );
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(1), "registry count: {v}");
+    svc.turn_attachments().finish_turn(&agent);
+
+    // Presented: trailing assistant message carrying two question blocks.
+    let question_block = json!({
+        "type": "resource",
+        "resource": {
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "uri": "intent-question://q-1",
+            "text": "{}"
+        }
+    });
+    let msg = svc
+        .store()
+        .append_agent_message(
+            &agent,
+            "assistant",
+            &json!([question_block, question_block]),
+            &now_iso(),
+        )
+        .await
+        .expect("append questions");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(v["numQuestionsAsked"], json!(2), "tail count: {v}");
+
+    // Dismissal clears the tail count.
+    svc.agent_dismiss_questions_op(ws.clone(), agent.clone(), msg.id.clone())
+        .await
+        .expect("dismiss");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), agent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("numQuestionsAsked"),
+        "dismissed questions must not count: {v}"
+    );
 }

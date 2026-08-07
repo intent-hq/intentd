@@ -103,6 +103,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
+    "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",

@@ -5,8 +5,10 @@
 //! client can ask the daemon instead. One probe per provider, mirroring the
 //! FE semantics being replaced:
 //!
-//! - **auggie** — `auggie model list`: explicit not-logged-in markers ⇒
-//!   `false`; exit 0 ⇒ `true`; else unknown.
+//! - **auggie** — the real `auggie` CLI with its registry `auth_check_args`
+//!   (`token print`; exit 0 ⇒ authenticated). The command's output IS the auth
+//!   session secret, so it rides the generic exit-code arm where stdout and
+//!   stderr are discarded — never captured, logged, or surfaced.
 //! - **claude-code** — the real `claude` CLI with its registry
 //!   `auth_check_args` (exit 0 ⇒ authenticated).
 //! - **codex** — the real `codex` CLI with `login status` (same exit-code
@@ -55,7 +57,7 @@ pub const AUTH_PROBE_PROVIDERS: &[&str] = &[
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
-/// `grok models` / `auggie model list`). Matches the doctor's historical 8s
+/// `grok models` / `auggie token print`). Matches the doctor's historical 8s
 /// budget; opencode uses [`OPENCODE_READY_TIMEOUT`] and the droid/pi ACP
 /// probes carry their own budgets in [`crate::provider_models`].
 const CLI_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -105,6 +107,9 @@ impl CliAuthProbe {
 /// line beyond exit 0 (credentials may come from `opencode auth login`, env
 /// vars, or a project `.env`). Shared by `intentd doctor` and
 /// `host.providerAuthStatus` so the two cannot drift.
+///
+/// The generic (exit-code) arm nulls stdout and stderr — auggie's `token print`
+/// probe prints the auth session secret, so its output must never be captured.
 pub async fn check_provider_auth_cli(
     provider_id: &str,
     program: &OsStr,
@@ -187,50 +192,6 @@ fn grok_probe_outcome(
     }
 }
 
-/// Explicit not-logged-in markers in `auggie model list` output (parity with
-/// the FE `checkAuggieAuth` regex).
-fn auggie_output_unauthenticated(output: &str) -> bool {
-    let lower = output.to_lowercase();
-    [
-        "not currently logged in",
-        "not logged in",
-        "not authenticated",
-        "login required",
-        "please log in",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-/// auggie probe: `auggie model list` — explicit not-logged-in markers (in
-/// stdout or stderr) ⇒ `false`; a clean exit ⇒ `true`; anything else is
-/// unknown.
-async fn check_auggie_auth(program: &OsStr) -> Option<bool> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(["model", "list"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
-        Ok(Ok(output)) => {
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if auggie_output_unauthenticated(&combined) {
-                Some(false)
-            } else if output.status.success() {
-                Some(true)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Timeout for the opencode readiness probe (`opencode models` can be slower
 /// than a simple auth-file read; parity with the FE's 10s budget).
 const OPENCODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -247,12 +208,11 @@ fn opencode_models_ready(stdout: &str) -> bool {
 /// Run one provider's auth probe. The caller has already gated on the
 /// provider being installed (`program` is its resolved binary; pi passes the
 /// resolved `pi` CLI purely as the install gate — its probe runs the pinned
-/// npx adapter). CLI-probed providers (claude-code, codex, opencode, grok)
-/// share [`check_provider_auth_cli`] with `intentd doctor`.
+/// npx adapter). CLI-probed providers (auggie, claude-code, codex, opencode,
+/// grok) share [`check_provider_auth_cli`] with `intentd doctor`.
 async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) -> Option<bool> {
     match provider_id {
-        "auggie" => check_auggie_auth(&program).await,
-        "claude-code" | "codex" | "opencode" | "grok" => {
+        "auggie" | "claude-code" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
@@ -518,19 +478,43 @@ mod tests {
         assert_eq!(grok_probe_outcome(None, true, false), CliAuthProbe::Failed);
     }
 
+    /// auggie has no bespoke probe any more: it rides the registry
+    /// `auth_check_args` (`token print`) through the generic exit-code arm of
+    /// [`check_provider_auth_cli`], whose stdout/stderr are nulled — the
+    /// command's output is the auth session secret.
     #[test]
-    fn auggie_markers_match_fe_regex() {
-        for output in [
-            "You are NOT currently logged in.",
-            "error: not logged in",
-            "Not authenticated. Run auggie login.",
-            "Login required",
-            "Please log in first",
+    fn auggie_probes_via_registry_auth_check_args() {
+        let auggie = intent_providers::find_provider("auggie").expect("auggie in registry");
+        assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
+    }
+
+    /// Behavioral pin for auggie's routing: `check_provider_auth_cli` under
+    /// `provider_id: "auggie"` must land on the generic exit-code arm — the
+    /// outcome follows the exit status alone, and the stub's stdout (standing
+    /// in for the auth session secret `auggie token print` emits) never
+    /// influences it. A future refactor that gave auggie a capturing arm would
+    /// break this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auggie_probe_rides_generic_exit_code_arm() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("auggie-exit-code");
+        // Both stubs print secret-shaped output; only the exit code differs.
+        for (name, exit, expected) in [
+            ("auggie-in", 0, CliAuthProbe::Authenticated),
+            ("auggie-out", 1, CliAuthProbe::NotAuthenticated),
         ] {
-            assert!(auggie_output_unauthenticated(output), "{output}");
+            let stub = dir.path().join(name);
+            std::fs::write(
+                &stub,
+                format!("#!/bin/sh\necho 'sess-secret-must-not-be-read'\nexit {exit}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let probe =
+                check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+            assert_eq!(probe, expected, "stub {name}");
         }
-        assert!(!auggie_output_unauthenticated("model-a\nmodel-b\n"));
-        assert!(!auggie_output_unauthenticated(""));
     }
 
     #[test]

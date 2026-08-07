@@ -43,8 +43,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The nine `agentFeatures.*` settings paths (all default on).
-const FEATURE_PATHS: [&str; 9] = [
+/// The ten `agentFeatures.*` settings paths (all default on).
+const FEATURE_PATHS: [&str; 10] = [
     "agentFeatures.backgroundHooks",
     "agentFeatures.hostExec",
     "agentFeatures.scripts",
@@ -53,6 +53,7 @@ const FEATURE_PATHS: [&str; 9] = [
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
+    "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
 ];
 
