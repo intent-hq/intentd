@@ -11272,6 +11272,190 @@ async fn after_all_group_waits_for_agent_waiting_child() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// Regression (issue intent-hq/monorepo#1643): a grouped `after_all` child (B)
+/// whose only outgoing watch is a `report_delivered` one on C must settle its
+/// group. Such a watch can never deliver an idle wake (the report-time wake
+/// already fired) and it retires INLINE on C's idle without a wake, so a B
+/// deferred on its account would have no future trigger and would strand the
+/// group at `delivered = 0` forever.
+#[tokio::test]
+async fn report_delivered_watch_does_not_strand_agent_waiting_group_member() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch P to B");
+    // C already reported to B, so B's watch on C survives only for a
+    // failure/deletion signal — C's idle retires it with no wake.
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B's real completion, emitted while the report_delivered watch is armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0, "lastResponseSummary": "done" }),
+    ))
+    .await;
+    // P idles: the group seals.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &p,
+        json!({ "agentId": p.0 }),
+    ))
+    .await;
+    // C idles: B's watch on C retires inline (report already delivered).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &p).await,
+        1,
+        "group settles despite B's report_delivered watch"
+    );
+    let text = parent_messages_text(&svc, &p).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// Regression (issue intent-hq/monorepo#1643), backstop arm: the inline
+/// retirement of a `report_delivered` watch on its target's idle must run the
+/// watch-removal backstop for the watch's holder — otherwise a holder whose
+/// own idle was deferred for another reason (here a queue-interim idle whose
+/// queue then drained out-of-band) never settles its watcher.
+#[tokio::test]
+async fn report_delivered_watch_retirement_runs_watch_removal_backstop() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(svc.mark_watch_report_delivered(&bc));
+
+    // B idles with a ready-to-send entry: queue-interim, so A's watch defers
+    // and the interim-skip marker is recorded.
+    let (queued, _) = svc.enqueue_message(&b, "follow-up".into(), None, None, None, None, false);
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 0);
+    svc.take_queued_message(&b, &queued.id)
+        .expect("drain queue");
+
+    // C idles: B's report_delivered watch retires with no wake, and the
+    // backstop synthesizes B's real completion.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &a).await,
+        1,
+        "retiring B's last outgoing watch settles A's deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&b).is_empty(),
+        "A's watch retires at the backstop completion"
+    );
+}
+
+/// A `report_delivered` watch is not an agent-waiting reason, in both the live
+/// and the durable (persisted-row) classification: it can only ever deliver a
+/// failure/deletion signal, so its holder's idle must not defer on its account
+/// (issue intent-hq/monorepo#1643).
+#[tokio::test]
+async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store);
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    let bc = svc
+        .register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    assert!(
+        svc.agent_is_waiting_on_agents(&b),
+        "a plain outgoing watch is a waiting reason"
+    );
+    assert!(svc.mark_watch_report_delivered(&bc));
+    assert!(
+        !svc.agent_is_waiting_on_agents(&b),
+        "a report_delivered watch is not a waiting reason"
+    );
+
+    // Durable variant: a restarted daemon classifies from persisted rows
+    // BEFORE the watch registry loads, so it must honor the column too.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
+        id: "watch-1643".to_string(),
+        parent_workspace_id: ws.clone(),
+        child_workspace_id: ws.clone(),
+        parent_agent_id: b.clone(),
+        parent_agent_name: "B".into(),
+        child_agent_id: c.clone(),
+        group_id: None,
+        report_delivered,
+        wake_on_attention: false,
+        created_at: now_iso(),
+    };
+    restarted
+        .store()
+        .upsert_completion_watch(&row(false))
+        .await
+        .expect("seed plain row");
+    assert!(
+        restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted plain watch is a waiting reason"
+    );
+    restarted
+        .store()
+        .upsert_completion_watch(&row(true))
+        .await
+        .expect("seed report_delivered row");
+    assert!(
+        !restarted.agent_is_waiting_on_agents_durable(&b).await,
+        "persisted report_delivered watch is not a waiting reason"
+    );
+}
 /// Terminal signals are never agent-waiting-deferred: a watched child that
 /// FAILS while holding an outgoing watch still wakes its watcher immediately.
 #[tokio::test]

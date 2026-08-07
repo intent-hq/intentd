@@ -3046,12 +3046,21 @@ impl Services {
     /// stall) — the same class of accepted imprecision as deeper cycles
     /// (A→B→C→A), which the guard does not detect either.
     ///
+    /// `report_delivered` watches are excluded (issue
+    /// intent-hq/monorepo#1643): such a watch has already delivered its
+    /// report-time wake, so the target's `agent:idle` is suppressed and
+    /// retires it inline without waking the holder — it can only ever deliver
+    /// an `agent:failed` / `agent:deleted` signal, which is not something the
+    /// holder is waiting FOR. Counting it deferred the holder's own completion
+    /// with no future trigger, stranding its `after_all` group forever.
+    ///
     /// The waiting classification is exposed as a reusable predicate so the
     /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
         let outgoing: Vec<AgentId> = self
             .list_watches_for_parent(agent_id)
             .into_iter()
+            .filter(|w| !w.report_delivered)
             .map(|w| w.child_agent_id)
             .collect();
         let incoming: Vec<AgentId> = self
@@ -3087,7 +3096,7 @@ impl Services {
         };
         let outgoing: Vec<AgentId> = rows
             .iter()
-            .filter(|r| &r.parent_agent_id == agent_id)
+            .filter(|r| &r.parent_agent_id == agent_id && !r.report_delivered)
             .map(|r| r.child_agent_id.clone())
             .collect();
         if outgoing.is_empty() {
@@ -3576,6 +3585,19 @@ impl Services {
                 if self.remove_watch(&watch.id) {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
+                    // Watch-removal backstop (issue intent-hq/monorepo#1643):
+                    // this retirement delivers NO wake, so a holder whose own
+                    // idle was deferred (interim-skip marker recorded) loses
+                    // its last trigger when this was its last outgoing watch.
+                    // Same shape as the `agent.unwatch` /
+                    // `agent.cancelSubscriptions` backstops; the redelivery's
+                    // own guards make it a no-op otherwise. Box::pin breaks
+                    // the async-recursion cycle (deliver -> redeliver ->
+                    // deliver).
+                    Box::pin(
+                        self.redeliver_completion_after_queue_mutation(&watch.parent_agent_id),
+                    )
+                    .await;
                 }
                 continue;
             }
