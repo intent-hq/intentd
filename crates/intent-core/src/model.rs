@@ -1825,10 +1825,10 @@ pub struct Event {
 }
 
 /// One file-change activity row (§5.10; `agent-event-tools.ts` `FileActivity`).
-/// Returned by `event.recentFiles` / `event.directoryChanges` and embedded in
-/// `event.workspaceSummary`. `actor` is `"type:name"` for the workspace-wide
-/// helpers and the bare actor name for the per-agent variant; absent optionals
-/// are omitted from the wire to match the TS `JSON.stringify` shape.
+/// Returned by `event.agentActivity` (per-agent variant) and embedded in
+/// `event.workspaceSummary`. `actor` is `"type:name"` in the summary and the bare
+/// actor name for the per-agent variant; absent optionals are omitted from the
+/// wire to match the TS `JSON.stringify` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileActivity {

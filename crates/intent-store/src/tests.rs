@@ -1918,12 +1918,6 @@ async fn event_round_trip_and_queries() {
         .await
         .expect("insert other");
 
-    // recent_files: newest first, scoped to workspace, only file:changed.
-    let recent = store.recent_files(&ws, 10).await.expect("recent");
-    assert_eq!(recent.len(), 2);
-    assert_eq!(recent[0].timestamp, "2026-01-01T00:00:02Z");
-    assert_eq!(recent[1].timestamp, "2026-01-01T00:00:01Z");
-
     // events_by_workspace: all three ws events, newest first; no leak.
     let all = store.events_by_workspace(&ws, 10).await.expect("by ws");
     assert_eq!(all.len(), 3);
@@ -1941,9 +1935,14 @@ async fn event_round_trip_and_queries() {
         .expect("by type tool-call");
     assert_eq!(calls.len(), 1);
 
-    // directory_changes: prefix filter on data.path.
+    // path_prefix: prefix filter on data.path.
     let in_src = store
-        .directory_changes(&ws, "src/", 10)
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![events::FILE_CHANGED.to_string()],
+            path_prefix: Some("src/".to_string()),
+            ..Default::default()
+        })
         .await
         .expect("dir changes");
     assert_eq!(in_src.len(), 1);

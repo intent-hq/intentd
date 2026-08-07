@@ -791,9 +791,8 @@ async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, act
 
 /// Emit a burst summary event for a directory: a single `file:changed` event
 /// with `data.burst = true` and `data.affectedCount` indicating the number of
-/// files affected. FE consumers (event.recentFiles / directoryChanges) can
-/// recognize the burst marker and query the store for recent directory activity
-/// rather than expecting individual per-file rows.
+/// files affected. Subscribers recognize the burst marker and treat it as a
+/// directory-level change rather than expecting individual per-file events.
 async fn publish_burst(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
