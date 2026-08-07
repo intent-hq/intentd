@@ -379,7 +379,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "5.2",
+        sess[0]["result"]["protocolVersion"], "6.0",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -2135,6 +2135,119 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         created["result"]["agent"]["reasoningEffort"],
         Value::from("xhigh"),
         "model without effortLevels evidence passes through: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// `model.defaultReasoningEffort` as the last rung of the creation-time
+/// effort resolution, over the real WSS transport: a no-model `agent.create`
+/// whose model resolves from the settings chain pins the configured effort,
+/// an explicit `model` (which pins the model itself) suppresses it, and a
+/// level the resolved model's cached `effortLevels` does not list is dropped
+/// with a warn rather than rejected — settings-chain leniency, so the create
+/// still succeeds with the effort omitted from the `AgentLite` payload.
+#[tokio::test]
+async fn wss_agent_create_applies_settings_default_reasoning_effort() {
+    let dir = test_tempdir("intentd-wss-settings-effort-");
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Settings Effort"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings default"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("auggie:fable-5"),
+        "settings default model pinned: {created}"
+    );
+    assert_eq!(
+        created["result"]["agent"]["reasoningEffort"],
+        Value::from("high"),
+        "settings default effort pinned alongside the settings default model: {created}"
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit model","model":"auggie:fable-5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an explicitly pinned model suppresses the settings default effort: {created}"
+    );
+
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("xhigh"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Unsupported"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created.get("error").is_none(),
+        "an unsupported settings level must never reject the create: {created}"
+    );
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "an unsupported settings level is dropped, leaving the effort unset: {created}"
+    );
+
+    // Boundary check: a present-but-blank `reasoningEffort` is an explicit
+    // clear that must survive the router (`opt_str`, not `opt_nonempty_str`)
+    // and suppress the settings default instead of being collapsed to absent.
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Explicit clear","reasoningEffort":""}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "a blank `reasoningEffort` is an explicit clear, not a fall-through: {created}"
     );
 
     srv.ws.stop().await;

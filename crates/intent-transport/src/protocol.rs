@@ -39,9 +39,14 @@
 //! field (additive; §5.5): accepted on `agent.create`, patchable/clearable
 //! via `agent.update` `changes`, and served on the `AgentSession` /
 //! `AgentLite` projections (omitted when unset) — no method-catalog change.
+//! Version 6.0 removes the `event.recentFiles` and `event.directoryChanges`
+//! router methods (breaking; §5.10, follow-up to intentd#951, matching the
+//! v3.0/v5.0 removal precedent): both are superseded end-to-end by the
+//! hybrid `file:*` event persistence introduced in the same change, and now
+//! return `-32601` (method not found) — no other method-catalog change.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "5.2";
+pub const PROTOCOL_VERSION: &str = "6.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

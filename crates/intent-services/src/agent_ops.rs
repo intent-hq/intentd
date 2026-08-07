@@ -77,6 +77,9 @@ mod tests_specialist_frontmatter;
 #[cfg(test)]
 mod tests_delegate_provider_resolution;
 
+#[cfg(test)]
+mod tests_settings_default_effort;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000):
@@ -145,6 +148,25 @@ fn resolve_default_model_from_settings(
     None
 }
 
+/// Which rung of [`resolve_agent_default_model`] produced the resolved model.
+/// Creation-time reasoning-effort resolution needs the provenance: the
+/// settings default effort (`model.defaultReasoningEffort`) is a strict
+/// companion to the settings default *model*, so it applies only when the
+/// model itself came from [`Settings`](DefaultModelSource::Settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultModelSource {
+    /// Step 1 — a caller-supplied `model`. Never returned by the resolver
+    /// (which only runs when the caller supplied none); stamped by the create
+    /// seam so the effort resolution can tell a pinned model apart.
+    Explicit,
+    /// Step 2 — specialist frontmatter `model`.
+    Specialist,
+    /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
+    Settings,
+    /// Step 4 — nothing resolved; the provider CLI default applies.
+    CliDefault,
+}
+
 /// Single daemon-side default-model resolver (spec "New resolution policy").
 /// Applied by every creation path — `agent.create`, `agent.delegate`,
 /// `agent.wakeOrCreate`, `workspace.create` initialAgent — via
@@ -171,6 +193,26 @@ pub(crate) fn resolve_agent_default_model(
     provider: Option<&str>,
     is_background: bool,
 ) -> Option<String> {
+    resolve_agent_default_model_with_source(
+        services,
+        specialist,
+        workspace_path,
+        provider,
+        is_background,
+    )
+    .0
+}
+
+/// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
+/// produced the value, for callers that must distinguish a settings-chain
+/// default from a specialist pin (creation-time effort resolution).
+pub(crate) fn resolve_agent_default_model_with_source(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+    provider: Option<&str>,
+    is_background: bool,
+) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default (model.default
@@ -196,7 +238,7 @@ pub(crate) fn resolve_agent_default_model(
         // owned by another provider falls through instead of leaking.
         if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
             if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-                return Some(m);
+                return (Some(m), DefaultModelSource::Specialist);
             }
             tracing::debug!(
                 model = m,
@@ -210,9 +252,13 @@ pub(crate) fn resolve_agent_default_model(
     // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
-    let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
+    let Some(m) =
+        resolve_default_model_from_settings(services, is_background, specialist, provider)
+    else {
+        return (None, DefaultModelSource::CliDefault);
+    };
     if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return Some(m);
+        return (Some(m), DefaultModelSource::Settings);
     }
     tracing::warn!(
         model = m,
@@ -221,7 +267,7 @@ pub(crate) fn resolve_agent_default_model(
          falling back to the CLI default"
     );
     // Step 4: None → provider CLI default.
-    None
+    (None, DefaultModelSource::CliDefault)
 }
 
 /// Ownership guard for resolver-derived defaults (never explicit client
@@ -345,11 +391,67 @@ fn ensure_effort_supported_by_model(
     )))
 }
 
+/// Pick the settings default reasoning effort (`model.defaultReasoningEffort`)
+/// for a creation whose effort is still unresolved after the explicit /
+/// model-option / frontmatter rungs.
+///
+/// The setting is a strict companion to the settings *default model*: it
+/// applies only when the session's model itself resolved from the settings
+/// chain ([`DefaultModelSource::Settings`]) — a caller-supplied model, a
+/// specialist pin, or a fall-through to the provider CLI default all leave the
+/// session effort unset.
+///
+/// Settings-chain leniency (mirroring the bare-model settings-chain fallback):
+/// a level the resolved model's cached `effortLevels` provably does not list
+/// is dropped with a warn, never a `-32602` — only caller-supplied efforts
+/// reject. With no cached evidence the level passes through, matching
+/// [`ensure_effort_supported_by_model`].
+fn resolve_settings_default_reasoning_effort(
+    services: &Services,
+    model_source: DefaultModelSource,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if model_source != DefaultModelSource::Settings {
+        return None;
+    }
+    let settings = services.effective_settings();
+    let level = settings
+        .model
+        .default_reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())?;
+    match ensure_effort_supported_by_model(
+        "agent.create",
+        &services.models_catalog,
+        resolved_model,
+        level,
+    ) {
+        Ok(()) => Some(level.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                effort = level,
+                model = resolved_model.unwrap_or_default(),
+                error = %e,
+                "configured default reasoning effort is not supported by the \
+                 resolved default model; leaving the session effort unset"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the effective `reasoningEffort` for a delegated/woken child
 /// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
 /// the chosen model option's declared effort, then the specialist's
-/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
-/// params collapse to unset without falling through — an explicit clear.
+/// `reasoningEffort` frontmatter scalar, then unset.
+///
+/// An empty/whitespace-only `param` is an explicit clear and is returned
+/// verbatim rather than as `None`: the create seam reads a present-but-blank
+/// value as "the caller decided", so it neither falls through to the
+/// specialist rungs here nor to the settings default
+/// ([`resolve_settings_default_reasoning_effort`]) there. `None` means "no
+/// rung resolved", which is what lets the settings default apply.
 fn resolve_delegate_reasoning_effort(
     services: &Services,
     param: Option<&str>,
@@ -358,7 +460,7 @@ fn resolve_delegate_reasoning_effort(
     workspace_path: Option<&Path>,
 ) -> Option<String> {
     if let Some(param) = param {
-        return (!param.trim().is_empty()).then(|| param.to_string());
+        return Some(param.to_string());
     }
     let spec_id = specialist?;
     let specialists_svc = services.specialists_service();
@@ -566,11 +668,11 @@ pub(crate) struct QueuedMessage {
     /// `true` when the entry carries a USER-originated `agent.sendMessage`
     /// that was parked by a queue-fallback path (busy race, quarantine,
     /// append-failure). The question hold never blocks user messages
-    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
-    /// hold-gated drain paths deliver the first user-origin entry instead
-    /// of suspending — without this marker a user answer parked by the
-    /// turn-end busy race would deadlock against the hold it is supposed
-    /// to release. Persisted so the bypass survives daemon restarts.
+    /// (PROTOCOL §5.5), so the hold-gated drain paths deliver the first
+    /// user-origin entry instead of suspending — without this marker a user
+    /// answer parked by the turn-end busy race would deadlock against the
+    /// hold its answer tag is supposed to release. Persisted so the bypass
+    /// survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
 }
@@ -1240,22 +1342,54 @@ pub(crate) fn user_message_blocks(
 /// hold detection cannot drift from the binding) in a message's content-block
 /// array. Non-array content counts zero.
 pub(crate) fn question_block_count(content: &Value) -> usize {
-    content.as_array().map_or(0, |blocks| {
-        blocks
-            .iter()
-            .filter(|b| {
-                b.get("type").and_then(Value::as_str) == Some("resource")
-                    && b.pointer("/resource/mimeType").and_then(Value::as_str)
-                        == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
-            })
-            .count()
-    })
+    content
+        .as_array()
+        .map_or(0, |blocks| question_block_count_in(blocks))
+}
+
+/// [`question_block_count`] over an already-borrowed block slice, for callers
+/// holding the blocks before they are wrapped into a `Value` (the turn-end
+/// persist).
+pub(crate) fn question_block_count_in(blocks: &[Value]) -> usize {
+    blocks
+        .iter()
+        .filter(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+        .count()
 }
 
 /// `true` iff a message's content-block array carries at least one pending
 /// question resource block.
 pub(crate) fn has_question_blocks(content: &Value) -> bool {
     question_block_count(content) > 0
+}
+
+/// `messageMetadata.type` marker the FE's question wizard stamps on the
+/// flattened Q:/A: answer message (PROTOCOL §5.5, question hold). The daemon
+/// keys the pending-questions marker clear on this structured tag plus
+/// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
+pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
+
+/// Field on a `question_answers` `messageMetadata` naming the assistant
+/// message whose questions the row answers.
+pub(crate) const ANSWERED_QUESTIONS_MESSAGE_ID_FIELD: &str = "answeredQuestionsMessageId";
+
+/// The assistant message id a user row's `messageMetadata` claims to answer:
+/// `Some` only for an object tagged `type: "question_answers"` carrying a
+/// non-empty `answeredQuestionsMessageId` string. Pure; the daemon never
+/// inspects the answer text.
+pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<&str> {
+    let md = metadata?;
+    if md.get("type").and_then(Value::as_str) != Some(QUESTION_ANSWERS_METADATA_TYPE) {
+        return None;
+    }
+    md.get(ANSWERED_QUESTIONS_MESSAGE_ID_FIELD)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -2106,9 +2240,13 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // Empty/whitespace collapses to None (an explicit clear); a non-empty
-        // level is validated against the resolved model below, once the model
-        // resolution has settled.
+        // A present value — even blank — means the effort was decided by the
+        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
+        // so the settings default below must not fill it in. Empty/whitespace
+        // then collapses to None (an explicit clear); a non-empty level is
+        // validated against the resolved model once the model resolution has
+        // settled.
+        let reasoning_effort_decided = reasoning_effort.is_some();
         let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -2136,29 +2274,32 @@ impl Services {
         // only affect new agents created afterwards; existing agents change
         // model only via explicit agent.setModel.
         let model_explicit = model.is_some();
-        let mut resolved_model = match model {
+        // SECURITY: derive workspace_path from the stored workspace record
+        // rather than trusting the client-supplied value (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+        // workspacePath and read specialist files from other workspaces.
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (model
+        // resolution and/or the specialist reasoning-effort rungs below).
+        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+            true => self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w)),
+            false => None,
+        };
+        let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
-            Some(m) => Some(m),
-            None => {
-                // SECURITY: derive workspace_path from the stored workspace record
-                // rather than trusting the client-supplied value (review thread
-                // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-                // workspacePath and read specialist files from other workspaces.
-                // Use worktree_path if available, otherwise repository_path.
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
-                resolve_agent_default_model(
-                    self,
-                    specialist.as_deref(),
-                    wp.as_deref(),
-                    provider.as_deref(),
-                    is_background,
-                )
-            }
+            Some(m) => (Some(m), DefaultModelSource::Explicit),
+            None => resolve_agent_default_model_with_source(
+                self,
+                specialist.as_deref(),
+                spec_wp.as_deref(),
+                provider.as_deref(),
+                is_background,
+            ),
         };
 
         // Initialize provider from the model's compound prefix if not explicitly
@@ -2233,16 +2374,34 @@ impl Services {
                              falling back to the CLI default"
                         );
                         resolved_model = None;
+                        model_source = DefaultModelSource::CliDefault;
                     }
                 }
             }
         }
-        // Reasoning effort (PROTOCOL §5.5): validate the requested level
-        // against the *resolved* model's cached `effortLevels`, with the same
-        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
-        // no evidence means the value passes through, since providers own the
-        // vocabulary. Runs before the session is persisted so a `-32602`
-        // rejection is side-effect free.
+        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
+        // `agent.create` naming a specialist consults the same model-option >
+        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
+        // model that was actually resolved above. Those seams pre-decide the
+        // effort and pass it down as a param, so this only fires for callers
+        // that did not (`reasoning_effort_decided == false`) — which is also
+        // what keeps the specialist rungs ahead of the settings default below.
+        let reasoning_effort = match reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_delegate_reasoning_effort(
+                self,
+                None,
+                specialist.as_deref(),
+                resolved_model.as_deref(),
+                spec_wp.as_deref(),
+            ),
+        };
+        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
+        // model's cached `effortLevels`, with the same probe-free,
+        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
+        // means the value passes through, since providers own the vocabulary.
+        // Runs before the session is persisted so a `-32602` rejection is
+        // side-effect free.
         if let Some(effort) = reasoning_effort.as_deref() {
             ensure_effort_supported_by_model(
                 "agent.create",
@@ -2251,6 +2410,17 @@ impl Services {
                 effort,
             )?;
         }
+        // Last rung: the settings default effort, applied only when no rung
+        // above decided the effort AND the model itself came from the settings
+        // default chain (see `resolve_settings_default_reasoning_effort`).
+        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_settings_default_reasoning_effort(
+                self,
+                model_source,
+                resolved_model.as_deref(),
+            ),
+        };
         let session = AgentSession {
             id,
             workspace_id,
@@ -2810,13 +2980,45 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
-        // The appended row can move the question-hold derivation — a user
-        // row supersedes a pending question tail (retire), an assistant row
-        // with a trailing question block raises the hold — which flips the
-        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
+        // as the turn-end and user-send persists: an appended assistant row
+        // bearing question blocks arms the pending marker, an appended user
+        // row tagged `question_answers` for the marked message clears it.
+        // Only those two transitions move the hold — a plain user row leaves
+        // it pending — so they also gate the displayStatus recompute below.
+        let hold_moved = if role == "assistant" && has_question_blocks(&content) {
+            self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
+                .await;
+            true
+        } else if role == "user"
+            && self
+                .resolve_pending_questions_for_answer(
+                    &session.workspace_id,
+                    &agent_id,
+                    metadata.as_ref(),
+                )
+                .await
+        {
+            // This path only persists a row (no turn of its own), so the
+            // released hold needs an explicit drain kick for the entries it
+            // parked — same kick `agent.dismissQuestions` performs.
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
+                    .await;
+            }
+            true
+        } else {
+            false
+        };
+        // A moved question-hold derivation — an answered question set retires
+        // the hold, an assistant row with a trailing question block raises it
+        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
+        if hold_moved {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
+        }
         Ok(json!({ "success": true, "message": message }))
     }
 
@@ -2912,11 +3114,14 @@ impl Services {
             json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
         )
         .await;
-        // The swapped transcript can move the question-hold derivation in
-        // either direction, flipping the workspace's needs_attention
-        // displayStatus (§6.5 step 0): recompute-and-compare
-        // (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
+        // The swap re-mints row ids, so any surviving pending-questions marker
+        // is dangling: re-derive it from the new transcript (same contract as
+        // the `agent.editAndRegenerate` truncation). The swapped transcript can
+        // move the question-hold derivation in either direction, so the
+        // re-derivation also recomputes the workspace's needs_attention
+        // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
+        // for entries a now-released hold parked.
+        self.reconcile_pending_questions_marker(&session.workspace_id, &agent_id, &inserted)
             .await;
         Ok(json!({ "success": true, "messages": inserted }))
     }
@@ -2992,6 +3197,18 @@ impl Services {
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
+        // Question hold (PROTOCOL §5.5): truncation drops the rows the
+        // pending-questions marker may name AND re-mints ids for the kept rows
+        // (`replace_agent_messages`), so a surviving marker would be dangling
+        // — and since the hold derivation never checks that the marked row
+        // still exists, a dangling marker would wedge the hold forever. The
+        // marker is therefore explicitly RE-DERIVED from the post-truncation
+        // transcript (never tolerated as dangling), which also recomputes the
+        // needs_attention displayStatus and kicks the drain when the
+        // truncation released the hold. The dismissal marker keeps its
+        // existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+            .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -3439,11 +3656,23 @@ impl Services {
                     agent_message_event_payload(&agent_id, &message, None),
                 )
                 .await;
-                // The user row supersedes a pending question tail, which can
+                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // the runtime `AgentManager::send_message` persist — a
+                // `question_answers` tag naming the marked assistant message
+                // clears the pending-questions marker, and only that clear can
                 // retire the workspace's needs_attention displayStatus (§6.5
                 // step 0): recompute-and-compare.
-                self.maybe_emit_display_status_changed(&session.workspace_id)
-                    .await;
+                if self
+                    .resolve_pending_questions_for_answer(
+                        &session.workspace_id,
+                        &agent_id,
+                        message_metadata.as_ref(),
+                    )
+                    .await
+                {
+                    self.maybe_emit_display_status_changed(&session.workspace_id)
+                        .await;
+                }
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -3461,13 +3690,16 @@ impl Services {
                 // The agent exists but the append failed (e.g. duplicate
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
-                // path's behavior.
+                // path's behavior. `message_metadata` rides along too: an
+                // answer auto-queued after a failed write must keep its
+                // `question_answers` tag, or the drain persist can no longer
+                // clear the pending-questions marker and the hold wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
                     image_blocks,
                     file_blocks,
-                    None,
+                    message_metadata,
                     None,
                     false,
                 );
@@ -3561,31 +3793,75 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
-        // The user row supersedes a pending question tail, which can retire
-        // the workspace's needs_attention displayStatus (§6.5 step 0):
-        // recompute-and-compare.
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
+        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // runtime `send_queued_message_now` persist — only a matching answer
+        // tag clears the marker, and only that clear can retire the
+        // workspace's needs_attention displayStatus (§6.5 step 0).
+        if self
+            .resolve_pending_questions_for_answer(
+                &session.workspace_id,
+                &agent_id,
+                entry.message_metadata.as_ref(),
+            )
+            .await
+        {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
+        }
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
-    /// walking back from the tail of the transcript past any trailing
-    /// `system` rows (e.g. the resume-interruption marker —
-    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
-    /// continuation), the first non-system message is an assistant message
-    /// carrying at least one `application/vnd.intent.question+json` resource
-    /// block AND its id differs from the session's persisted dismissal
-    /// marker. `system` rows are transparent to the derivation — same as the
-    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
-    /// `assistant` row — so a system marker can neither supersede nor rescue
-    /// a pending Q&A. Derived, not stored: any later user/assistant message
-    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
-    /// supersedes the questions and flips the hold false;
-    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// session's persisted pending-questions marker
+    /// ([`intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY`], written at turn end
+    /// when the assistant tail bears `application/vnd.intent.question+json`
+    /// resource blocks) is set AND differs from the dismissal marker
+    /// ([`intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY`]). Stored-on-write,
+    /// so this is a bounded single-row metadata read: pendingness survives
+    /// later user messages, later agent turns, and daemon restarts, and only
+    /// an answer (`messageMetadata.type == "question_answers"` naming the
+    /// marked message), an explicit `agent.dismissQuestions`, or a NEWER
+    /// question-bearing turn resolves it.
+    ///
+    /// Pre-upgrade sessions (marker key absent entirely — the daemon never
+    /// wrote it) fall back to the legacy transcript tail walk so a hold that
+    /// was live across the upgrade is not lost: walk back from the tail past
+    /// any trailing `system` rows (e.g. the resume-interruption marker
+    /// `resume_interrupted_agent` appends BEFORE its `Automatic`
+    /// continuation) and hold when the first non-system row is an
+    /// un-dismissed question-bearing assistant message. A marker written as
+    /// the empty string is authoritative ("nothing pending") and does NOT
+    /// fall back. A hold derived that way is immediately MATERIALIZED as a
+    /// marker so it survives the very next user message: the tail walk stops
+    /// seeing the question once a plain user row lands, which is exactly the
+    /// disappearance this contract exists to prevent.
+    ///
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        if session.pending_questions_marker_written() {
+            return match session.pending_questions_message_id() {
+                Some(pending) => session.dismissed_questions_message_id() != Some(pending),
+                None => false,
+            };
+        }
+        let Some(pending) = self.question_hold_active_from_tail(agent_id).await else {
+            return false;
+        };
+        self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+            .await;
+        true
+    }
+
+    /// Legacy transcript tail-walk hold derivation, retained as the
+    /// pre-upgrade fallback for sessions with no persisted pending-questions
+    /// marker (see [`Services::question_hold_active`]). Returns the id of the
+    /// question-bearing assistant message holding the session, so the caller
+    /// can materialize it as the marker.
+    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> Option<String> {
         // Page back over the tail, growing the window while every fetched
         // row is `system`-role, so an arbitrarily long run of trailing
         // system markers (e.g. repeated interruption notices) can never hide
@@ -3598,23 +3874,179 @@ impl Services {
         let mut tail = HOLD_DERIVATION_TAIL_START;
         let last = loop {
             let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
-                return false;
+                return None;
             };
             if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
                 break last.clone();
             }
             if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
-                return false;
+                return None;
             }
             tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
         };
         if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return false;
+            return None;
         }
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return None;
+        };
+        (session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id)
+    }
+
+    /// Persist the pending-questions marker for `message_id` — the assistant
+    /// message whose just-persisted content carries question resource blocks
+    /// (called from the turn-end persist paths). Single-slot: a newer
+    /// question-bearing turn overwrites an older marker, which is exactly the
+    /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
+    /// sibling metadata keys (`dismissedQuestionsMessageId`,
+    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
+    /// and never fails the turn (the hold simply stays as it was).
+    pub(crate) async fn record_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                message_id,
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+        }
+    }
+
+    /// Clear the pending-questions marker (written as the empty string, which
+    /// reads back as "no pending questions" while still marking the session as
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
+    /// Best-effort: a failure is logged and never fails the caller.
+    pub(crate) async fn clear_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                "",
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+        }
+    }
+
+    /// Re-derive the pending-questions marker after a transcript swap that
+    /// re-mints row ids (`agent.editAndRegenerate` truncation,
+    /// `agent.replaceMessages`), where any surviving marker is by construction
+    /// dangling. `messages` is the post-swap transcript in order: the marker
+    /// becomes the id of the newest question-bearing assistant row that is not
+    /// followed by a user row answering it, and clears when there is none.
+    ///
+    /// Answer matching cannot be pure id equality the way
+    /// [`Services::resolve_pending_questions_for_answer`] does it: the swap
+    /// re-mints ids, so a carried-over `answeredQuestionsMessageId` names a row
+    /// that no longer exists even when it DOES answer the question directly
+    /// above it. So a `question_answers`-tagged user row resolves the pending
+    /// row unless its tag names a DIFFERENT row that is still present in the
+    /// post-swap transcript — a live reference to another question set, which
+    /// must not release this one (mirroring the exact-match rule wherever ids
+    /// are meaningful). Bounded — the caller already holds the (post-swap)
+    /// rows.
+    ///
+    /// A swap can move the hold in either direction, so this also performs the
+    /// two follow-ups every other hold-transition path performs: recompute the
+    /// workspace's `needs_attention` displayStatus (transition-only, §6.5 step
+    /// 0) and — when the re-derivation leaves no hold — kick the queue drain
+    /// for the automatic entries the hold parked (these paths start no turn of
+    /// their own, so without the kick those entries sit on an idle agent).
+    pub(crate) async fn reconcile_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        messages: &[intent_core::AgentMessage],
+    ) {
+        let resolves = |answered: &str, marked: &str| {
+            answered == marked || !messages.iter().any(|m| m.id == answered)
+        };
+        let mut pending: Option<&str> = None;
+        for msg in messages {
+            match msg.role.as_str() {
+                "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
+                "user" => {
+                    if let (Some(answered), Some(marked)) = (
+                        answered_questions_message_id(msg.metadata.as_ref()),
+                        pending,
+                    ) {
+                        if resolves(answered, marked) {
+                            pending = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        match pending {
+            Some(id) => {
+                let id = id.to_string();
+                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                    .await;
+            }
+            None => {
+                self.clear_pending_questions_marker(workspace_id, agent_id)
+                    .await;
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
+        }
+        self.maybe_emit_display_status_changed(workspace_id).await;
+    }
+
+    /// Resolve a just-persisted user row against the pending-questions marker:
+    /// when the row's `messageMetadata` is a `question_answers` tag naming
+    /// EXACTLY the marked message, the questions are answered and the marker
+    /// clears (releasing the hold). A missing/foreign/stale
+    /// `answeredQuestionsMessageId` — e.g. an answer for a question set a newer
+    /// turn already superseded — is a no-op, so a late answer can neither
+    /// release a newer hold nor re-arm an old one. The daemon never inspects
+    /// the answer TEXT (spec §Decisions 3).
+    ///
+    /// Returns `true` when the marker was cleared, so callers can recompute
+    /// displayStatus and — on the persist-only paths that start no turn of
+    /// their own — kick the queue drain for the entries the hold parked.
+    pub(crate) async fn resolve_pending_questions_for_answer(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_metadata: Option<&Value>,
+    ) -> bool {
+        let Some(answered) = answered_questions_message_id(message_metadata) else {
+            return false;
+        };
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
-        session.dismissed_questions_message_id() != Some(last.id.as_str())
+        if session.pending_questions_message_id() != Some(answered) {
+            return false;
+        }
+        self.clear_pending_questions_marker(workspace_id, agent_id)
+            .await;
+        true
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
@@ -4782,14 +5214,22 @@ impl Services {
         };
         // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
         // effort > specialist frontmatter > unset, validated against the
-        // cached catalog's `effortLevels` for the effective model (the
-        // explicit `model`, else the specialist's own pin). Runs BEFORE the
-        // child is created so a `-32602` rejection is side-effect free.
+        // cached catalog's `effortLevels` for the effective model. The
+        // effective model must be the one `agent_create_op` will actually
+        // pin — the explicit `model`, else the full default-model resolution
+        // (specialist frontmatter pin, then the settings chain) — so a
+        // specialist whose `modelOptions` entry keys on the settings default
+        // model still gets its option effort selected. Runs BEFORE the child
+        // is created so a `-32602` rejection is side-effect free.
         let effective_model = input.model.clone().or_else(|| {
-            input.specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            resolve_agent_default_model(
+                self,
+                input.specialist.as_deref(),
+                workspace_path.as_deref(),
+                delegate_provider.as_deref(),
+                // Delegated children are always background agents.
+                true,
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,
@@ -4798,7 +5238,9 @@ impl Services {
             effective_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.delegate",
                 &self.models_catalog,
@@ -6490,7 +6932,7 @@ impl Services {
                 // deployments with and without a runtime manager. Question
                 // hold (PROTOCOL §5.5): sendToTask is automatic by
                 // definition, so an active hold parks the message instead
-                // of persisting the superseding user row.
+                // of persisting a user row that buries the pending Q&A.
                 if self.question_hold_active(&agent).await {
                     let (queued, position) = self.enqueue_message(
                         &agent,
@@ -6889,11 +7331,25 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
+        // Same effective-model rule as `agent.delegate`: fall through to the
+        // full default-model resolution (specialist pin, then the settings
+        // chain) so a `modelOptions` entry keyed on the settings default
+        // model is still matched. `is_background` mirrors what
+        // `build_create_metadata` will persist (default `true`).
         let effort_model = model.clone().or_else(|| {
-            specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            let is_background = create_opts
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("isBackground"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            resolve_agent_default_model(
+                self,
+                specialist.as_deref(),
+                workspace_path.as_deref(),
+                provider.as_deref(),
+                is_background,
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,
@@ -6905,7 +7361,9 @@ impl Services {
             effort_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.wakeOrCreate",
                 &self.models_catalog,
@@ -7327,7 +7785,7 @@ impl Services {
     {
         // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
         // runtime path above — the store-only persist would append the user
-        // row that supersedes the pending Q&A, so park the wake in the queue
+        // row whose turn would bury the pending Q&A, so park the wake in the queue
         // instead (hermetic wiring keeps the hold contract testable).
         if self.question_hold_active(agent_id).await {
             let (queued, position) = self.enqueue_message(
@@ -7506,8 +7964,7 @@ impl Services {
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
     /// quarantine, append-failure). The question-hold drain gates deliver
     /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
-    /// answer supersedes the pending Q&A and must never deadlock against
-    /// the hold it releases).
+    /// answer must never deadlock against the hold its answer tag releases).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_origin(
         &self,
@@ -7608,9 +8065,9 @@ impl Services {
     /// Pop the oldest ready-to-send **user-origin** queued message, if any
     /// (question hold, PROTOCOL §5.5). While the hold is active the drain
     /// paths deliver ONLY user-origin entries — a user answer parked by the
-    /// turn-end busy race must supersede the pending Q&A instead of
-    /// deadlocking behind the hold it is supposed to release; automatic
-    /// entries stay parked.
+    /// turn-end busy race must reach the transcript instead of deadlocking
+    /// behind the hold its answer tag releases; automatic entries stay
+    /// parked.
     pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
@@ -8379,6 +8836,88 @@ fn validate_message_role(role: &str) -> Result<()> {
 }
 
 impl Services {
+    /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
+    /// daemon's resume orchestrator calls this to resume every turn Task C
+    /// enrolled as `system_suspend`-interrupted. It enumerates ONLY pending
+    /// `interrupted_agent` rows tagged [`InterruptReason::SystemSuspend`] — rows a
+    /// user left pending for any other reason (daemon restart, agent stop, manual
+    /// interrupt) are never touched — and drives each through the existing
+    /// [`Services::resume_interrupted_agent`] path, whose atomic claim dedupes
+    /// against a concurrent `agent.resolveInterrupted` / `--resume-all`.
+    ///
+    /// Guard: an agent whose persisted session has no `acpSessionId` cannot be
+    /// reloaded via `session/load`, so it is skipped and left pending for today's
+    /// manual retry (the cheap static half of the `supports_load_session` gate;
+    /// the capability half is re-checked inside the resume path). A per-agent
+    /// resume failure is logged and never aborts the sweep — the row is reset to
+    /// pending by `resume_interrupted_agent` and retried on the next wake or
+    /// manually.
+    ///
+    /// Returns the number of agents successfully resumed by this sweep.
+    pub async fn resume_suspend_interrupted_agents(&self) -> usize {
+        let rows = match self.store.list_interrupted_agents().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "wake-resume: failed to list interrupted agents");
+                return 0;
+            }
+        };
+        let suspend_reason = crate::agent_session::InterruptReason::SystemSuspend.as_str();
+        let mut resumed = 0usize;
+        for interrupted in rows {
+            // Never blanket-resume rows a user left pending for another reason.
+            if interrupted.reason.as_deref() != Some(suspend_reason) {
+                continue;
+            }
+            let agent_id = interrupted.agent_id.clone();
+            // Guard: `session/load` needs a persisted acpSessionId; without one
+            // the provider cannot reload, so leave the row pending for manual
+            // retry rather than re-running the whole turn unattended.
+            match self.store.get_agent_session(&agent_id).await {
+                Ok(session) if session.acp_session_id.is_none() => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        "wake-resume: no resumable acpSessionId; leaving pending for manual retry"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: session lookup failed; leaving row pending"
+                    );
+                    continue;
+                }
+            }
+            match self.resume_interrupted_agent(&agent_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        workspace = %interrupted.workspace_id,
+                        "wake-resume: resumed suspend-interrupted agent"
+                    );
+                    resumed += 1;
+                }
+                // A concurrent resolveInterrupted / --resume-all may have claimed
+                // the row first (atomic claim → "already resolved"): that is the
+                // expected dedupe outcome, not an error, so log it quietly.
+                Err(e) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: resume skipped (already resolved or transient failure)"
+                    );
+                }
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "wake-resume: sweep complete");
+        }
+        resumed
+    }
+
     /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
     /// parent completion watch when delegated, then deliver a continuation message.
     ///
@@ -8595,8 +9134,9 @@ impl Services {
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load).
-        // Automatic origin: a resume continuation must not supersede a Q&A
-        // the agent had pending when the harness shut down (question hold).
+        // Automatic origin: a resume continuation must not bury a Q&A the
+        // agent had pending when the harness shut down (question hold — the
+        // marker is persisted, so the hold survives the restart).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),

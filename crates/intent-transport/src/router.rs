@@ -1101,9 +1101,17 @@ async fn dispatch(
             // rejected rather than silently dropped because a dropped value
             // would flip the persisted flag's default.
             let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
+            // `reasoningEffort` deliberately uses `opt_str`, not
+            // `opt_nonempty_str`: at creation a present-but-blank value is an
+            // explicit clear, and the service seam distinguishes it from an
+            // absent param (absent is what lets the settings default
+            // `model.defaultReasoningEffort` apply). Collapsing `""` here
+            // would silently promote a caller's clear into the settings
+            // default. The blank is dropped downstream, so the persisted
+            // field is still `NULL` either way.
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
@@ -1179,8 +1187,10 @@ async fn dispatch(
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held
-            // (they supersede a pending Q&A by design).
+            // ONLY user-originated entry point — user sends are never held.
+            // They do not release the hold either: only an answer-tagged row
+            // (`messageMetadata.type = "question_answers"`) or
+            // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
                 .agent_send_message(
                     ws,
@@ -1487,9 +1497,13 @@ async fn dispatch(
                 .map_err(|e| {
                     invalid_params(format!("agent.wakeOrCreate: invalid `create` payload: {e}"))
                 })?;
+            // `reasoningEffort` uses `opt_str` for the same reason as
+            // `agent.create` above: on the create branch a present-but-blank
+            // value is an explicit clear that must not fall through to the
+            // settings default.
             let input = AgentWakeOrCreateInput {
                 model: opt_nonempty_str(params, "model"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),

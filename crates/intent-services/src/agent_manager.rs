@@ -303,10 +303,10 @@ pub struct TurnOptions {
     pub turn_id: Option<String>,
     /// Who originated this delivery (question hold, PROTOCOL §5.5):
     /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
-    /// is never held; the `Automatic` default fails closed — an automatic
-    /// send to an agent whose question hold is active enqueues instead of
-    /// claiming the turn slot, so a pending Q&A is never superseded by a
-    /// system/agent message.
+    /// is never held (but never releases the hold either); the `Automatic`
+    /// default fails closed — an automatic send to an agent whose question
+    /// hold is active enqueues instead of claiming the turn slot, so a
+    /// pending Q&A is never buried by a system/agent turn.
     pub origin: intent_core::MessageOrigin,
     /// `true` when this delivery carries `priority: "interrupt"`. Every
     /// fallback path that parks the message in the queue (question hold,
@@ -3511,13 +3511,13 @@ impl AgentManager {
             return Ok(result);
         }
         // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
-        // whose last assistant message carries un-dismissed question blocks
-        // must NOT start a turn — the resulting user row would supersede the
-        // pending Q&A and the wizard would silently vanish. Park the message
-        // in the queue instead (interrupt priority included — no exceptions,
-        // spec §Decisions); `agent.dismissQuestions` or a user answer flips
-        // the hold false and kicks the drain. Checked BEFORE `try_begin` so
-        // even an idle agent holds the delivery.
+        // with un-dismissed pending questions must NOT start a turn — its
+        // turn would bury the pending Q&A under later transcript rows and
+        // steal the user's chance to answer. Park the message in the queue
+        // instead (interrupt priority included — no exceptions, spec
+        // §Decisions); only `agent.dismissQuestions` or an answer-tagged user
+        // row flips the hold false and kicks the drain. Checked BEFORE
+        // `try_begin` so even an idle agent holds the delivery.
         if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -3670,15 +3670,29 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
-        // The persisted user row supersedes a pending question tail, which
-        // can retire the workspace's needs_attention displayStatus (§6.5
-        // step 0): recompute-and-compare. This recompute ALSO produces the
-        // visible `failed → in_progress` transition on the errored-agent
-        // redrive path (a fresh sendMessage to a non-poisoned Error session):
-        // the earlier recompute inside `try_begin`'s `agent_activity_begin`
-        // still reads `status = Error` (persisted to Active only afterwards)
-        // and is a no-op, so removing or reordering this call would leave the
-        // redriven turn stuck on `failed` for its whole duration. Pinned by
+        // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
+        // `question_answers` naming the marked assistant message resolves the
+        // pending Q&A and clears the marker (a stale/foreign
+        // `answeredQuestionsMessageId` is a no-op). Only an ANSWER retires the
+        // hold now that pendingness is persisted — a plain user row leaves the
+        // marker as it was. Runs BEFORE the displayStatus recompute so the
+        // retired hold is reflected.
+        self.services
+            .resolve_pending_questions_for_answer(
+                &workspace_id,
+                &agent_id,
+                options.message_metadata.as_ref(),
+            )
+            .await;
+        // The retired hold can drop the workspace's needs_attention
+        // displayStatus (§6.5 step 0): recompute-and-compare. This recompute
+        // ALSO produces the visible `failed → in_progress` transition on the
+        // errored-agent redrive path (a fresh sendMessage to a non-poisoned
+        // Error session): the earlier recompute inside `try_begin`'s
+        // `agent_activity_begin` still reads `status = Error` (persisted to
+        // Active only afterwards) and is a no-op, so removing or reordering
+        // this call would leave the redriven turn stuck on `failed` for its
+        // whole duration. Pinned by
         // `send_message_redrive_emits_failed_to_in_progress`.
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
@@ -3740,14 +3754,15 @@ impl AgentManager {
             }
         }
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
-        // parked while the agent's last assistant message carries
-        // un-dismissed question blocks — draining one would append a user
-        // row that supersedes the pending Q&A. `agent.dismissQuestions` and
-        // the post-answer turn end both re-kick this drain once the hold
-        // derivation flips false (mirrors the STAB-52 Error gate below). A
-        // parked USER-origin entry (a user send that lost a busy race) is
-        // exempt — the user answer is the hold's documented release, so it
-        // drains and supersedes the questions (`hold_drain` below).
+        // parked while the agent has un-dismissed pending questions — the
+        // turn a drained entry starts would bury the pending Q&A. The park
+        // now lasts across turns and daemon restarts (the marker is
+        // persisted): only `agent.dismissQuestions` and an answer-tagged user
+        // row flip the derivation false, and both re-kick this drain (mirrors
+        // the STAB-52 Error gate below). A parked USER-origin entry is
+        // exempt — it may itself BE the answer that releases the hold, so it
+        // drains rather than deadlocking behind it (`hold_drain` below); a
+        // plain user entry drains too but leaves the hold armed.
         let hold_drain = if self.services.question_hold_active(&agent_id).await {
             if !self.services.has_user_origin_ready(&agent_id) {
                 tracing::debug!(
@@ -4110,12 +4125,24 @@ impl AgentManager {
                     ),
                 )
                 .await;
-            // The persisted user row supersedes a pending question tail,
-            // which can retire the workspace's needs_attention displayStatus
-            // (§6.5 step 0): recompute-and-compare.
-            self.services
-                .maybe_emit_display_status_changed(&workspace_id)
-                .await;
+            // Answer intake (PROTOCOL §5.5, question hold): an answer that was
+            // queued and then explicitly sent still resolves the pending Q&A.
+            // An untagged entry leaves the marker (and the workspace's
+            // needs_attention displayStatus, §6.5 step 0) untouched, so the
+            // recompute only runs on an actual clear.
+            if self
+                .services
+                .resolve_pending_questions_for_answer(
+                    &workspace_id,
+                    &agent_id,
+                    entry.message_metadata.as_ref(),
+                )
+                .await
+            {
+                self.services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
         }
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
@@ -4198,8 +4225,11 @@ impl AgentManager {
         // Arm `recreated` AFTER `stop` (which clears it): it makes the next
         // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
-        // Explicit user action (question hold, PROTOCOL §5.5): the
-        // regenerated message deliberately supersedes any pending Q&A.
+        // Explicit user action (question hold, PROTOCOL §5.5): the send is
+        // user-origin so it is never held. The truncation above already
+        // re-derived the pending-questions marker against the post-truncation
+        // transcript, so a Q&A the edit cut away is gone and one that survived
+        // stays pending.
         options.origin = intent_core::MessageOrigin::User;
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
@@ -4590,9 +4620,9 @@ impl AgentManager {
             }
         }
         // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
-        // append a fresh assistant message, superseding the pending Q&A the
-        // hold protects. Skip the tick (buffered notifications stay
-        // untouched) until the questions are answered or dismissed.
+        // append a fresh assistant message, burying the pending Q&A the hold
+        // protects. Skip the tick (buffered notifications stay untouched)
+        // until the questions are answered or dismissed.
         if self.services.question_hold_active(agent_id).await {
             return true;
         }
@@ -4623,6 +4653,9 @@ impl AgentManager {
         // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
         // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
+            // A thought chunk materializes a `thinking` block just like a
+            // message chunk materializes a `text` one, so it opens a turn on
+            // the same terms (parity with `route_notification`).
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
@@ -6516,6 +6549,42 @@ async fn run_message_worker(
                             .await;
                             mgr.release_in_flight_slot(&agent_id).await;
                             break 'outer;
+                        } else if suspend_interrupt_error(&e) {
+                            // Sleep-induced interruption (Task C):
+                            // `run_prompt_turn` already enrolled the turn as
+                            // interrupted (partial persisted with
+                            // `InterruptReason::SystemSuspend` + an
+                            // `interrupted_agent` row) and emitted the
+                            // interrupted terminal `agent:stream:end` — NOT
+                            // `agent:failed`. Suppress the terminal-failure path
+                            // (no Error status, no manual-retry surface): settle
+                            // the session to idle and stop the worker, leaving
+                            // the enrolled turn for the wake orchestrator (Task
+                            // D) to resume. Placed before the pre-output redrive
+                            // arm so a suspend-overlapping pre-output failure is
+                            // resumed via `session/load` (preserving the partial
+                            // turn) rather than silently redriven on a fresh
+                            // child.
+                            tracing::info!(
+                                agent = %agent_id,
+                                error = %e,
+                                "turn interrupted by system suspend — enrolled for wake-resume, suppressing terminal failure"
+                            );
+                            // Tear down the local provider child (mirrors the
+                            // silent-redrive branch below): the upstream API
+                            // stream dropped, but the claude-code/auggie child
+                            // and its IPC connection survive the disconnect. If
+                            // the handle is left live, the wake/self-heal resume
+                            // routes through `ensure_started`'s live-child reuse
+                            // branch and returns the stale `acpSessionId`
+                            // WITHOUT issuing `session/load` — skipping the very
+                            // recovery the enrollment promises. Removing the
+                            // handle here forces the resume to spawn a fresh
+                            // child and reload the persisted session via
+                            // `session/load` (or the recreate fallback).
+                            mgr.kill_child_only(&agent_id).await;
+                            mgr.end_turn(&agent_id).await;
+                            break 'outer;
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt
@@ -6595,13 +6664,13 @@ async fn run_message_worker(
                 break 'outer;
             }
         }
-        // Question hold (PROTOCOL §5.5): the turn that just ended may have
-        // ASKED questions — draining the next AUTOMATIC queued message would
-        // append a user row that supersedes the pending Q&A. A parked
-        // USER-origin entry (a user answer that lost the busy race against
-        // this very turn) is exempt: it IS the hold's documented release, so
-        // it drains and supersedes the questions. Otherwise skip the
-        // pre-release drain (no `break 'outer` here!) and fall through to the
+        // Question hold (PROTOCOL §5.5): questions may still be pending —
+        // asked by the turn that just ended, or by an earlier turn the hold
+        // has kept armed since — so draining the next AUTOMATIC queued
+        // message would bury them. A parked USER-origin entry (a user answer
+        // that lost the busy race against this very turn) is exempt: it may
+        // itself be the hold's release, so it drains regardless. Otherwise
+        // skip the pre-release drain (no `break 'outer` here!) and fall through to the
         // post-`end_turn` raced re-check below, which repeats this same
         // hold-aware `dequeue_user_origin_message` check AFTER the slot is
         // actually released — closing the window where a user answer enqueued
@@ -7150,12 +7219,20 @@ async fn persist_user(
             crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
         .await;
-    // The persisted user row supersedes a pending question tail, which can
-    // retire the workspace's needs_attention displayStatus (§6.5 step 0):
-    // recompute-and-compare.
-    mgr.services
-        .maybe_emit_display_status_changed(workspace_id)
-        .await;
+    // Answer intake (PROTOCOL §5.5, question hold): same contract as the
+    // direct-send persist — a `question_answers` tag naming the marked
+    // assistant message clears the pending-questions marker; anything else is
+    // a no-op, and only the clear can move the workspace's needs_attention
+    // displayStatus (§6.5 step 0).
+    if mgr
+        .services
+        .resolve_pending_questions_for_answer(workspace_id, agent_id, message_metadata)
+        .await
+    {
+        mgr.services
+            .maybe_emit_display_status_changed(workspace_id)
+            .await;
+    }
     true
 }
 
@@ -7788,6 +7865,24 @@ fn pre_output_transport_failure(err: &Error) -> bool {
         err,
         Error::Internal(msg)
             if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
+}
+
+/// Whether a `run_turn` error carries the sleep-induced interrupt marker from
+/// `run_prompt_turn` (Task C): the turn died with a transient upstream
+/// disconnect whose active window overlapped a detected host suspend.
+/// `run_prompt_turn` already enrolled the turn as interrupted (persisted the
+/// partial with `InterruptReason::SystemSuspend` + an `interrupted_agent` row)
+/// and emitted the interrupted terminal `agent:stream:end` (NOT `agent:failed`),
+/// so the worker must SUPPRESS the terminal-failure path — no Error status, no
+/// manual-retry surface — and leave the enrolled turn for the wake orchestrator
+/// (Task D) to resume. Prefix-anchored for the same mid-string reason as the
+/// other markers.
+fn suspend_interrupt_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_SUSPEND_INTERRUPT_PREFIX)
     )
 }
 

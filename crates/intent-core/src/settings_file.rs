@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
     DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
 use crate::error::{Error, Result};
@@ -66,6 +67,7 @@ pub struct SettingsFile {
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
+    pub wake_resume: WakeResumeSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -90,6 +92,11 @@ pub struct ModelSettings {
     pub default: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
+    /// `model.defaultReasoningEffort` — fallback reasoning effort for new
+    /// agents. Stored as-is (providers own the vocabulary); a blank value
+    /// reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
@@ -663,6 +670,26 @@ impl Default for AgentFeaturesSettings {
     }
 }
 
+/// `[wakeResume]` — host sleep/wake detection + resume (`wakeResume.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WakeResumeSettings {
+    /// `wakeResume.enabled` — detect host sleep/wake and resume work on wake.
+    pub enabled: bool,
+    /// `wakeResume.thresholdSeconds` — minimum suspend duration (seconds) that
+    /// counts as a sleep; also the resume/enrollment gate.
+    pub threshold_seconds: u32,
+}
+
+impl Default for WakeResumeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_WAKE_RESUME_ENABLED,
+            threshold_seconds: DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+        }
+    }
+}
+
 /// Accept both TOML integers and floats for `f64` fields, so `volume = 1`
 /// parses the same as `volume = 1.0` (users hand-edit this file).
 fn de_lenient_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
@@ -686,6 +713,17 @@ where
         }
     }
     deserializer.deserialize_any(V)
+}
+
+/// Normalize a blank optional string to `None`, so a key left as `""` in the
+/// file (or cleared with an empty string over the wire) reads as unset rather
+/// than as an explicit empty value.
+fn de_blank_as_none<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
 }
 
 /// Dotted wire paths that older daemons persisted in `config.toml` but that
@@ -914,6 +952,9 @@ paths = {}
 # default = "claude-sonnet-4-5"
 # Provider default models -- default model per provider.
 providerDefaults = {}
+# Default reasoning effort -- fallback reasoning effort for new agents; the
+# value is provider-defined and stored as-is, and a blank value means unset.
+# defaultReasoningEffort = "high"
 
 [backgroundAgents]
 # Background default model -- model for background agents.
@@ -1108,6 +1149,13 @@ structuredQuestions = true
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
+
+[wakeResume]
+# Wake resume enabled -- detect host sleep/wake and resume work on wake.
+enabled = true
+# Wake resume threshold seconds -- minimum suspend duration (in seconds) that
+# counts as a sleep; also the resume/enrollment gate.
+thresholdSeconds = 10
 "##;
 
 #[cfg(test)]
@@ -1137,6 +1185,7 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
+        assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.background_agents.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
@@ -1206,6 +1255,11 @@ mod tests {
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
+        assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
+        assert_eq!(
+            d.wake_resume.threshold_seconds,
+            DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS
+        );
     }
 
     #[test]
@@ -1527,6 +1581,41 @@ mod tests {
     }
 
     #[test]
+    fn model_default_reasoning_effort_parses_as_an_optional_string() {
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"m0\"\ndefaultReasoningEffort = \"xhigh\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+
+        // Stored as-is: the daemon never normalizes the provider vocabulary.
+        let parsed = SettingsFile::parse_str("[model]\ndefaultReasoningEffort = \"Medium\"\n")
+            .expect("parse");
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("Medium")
+        );
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_reasoning_effort, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty effort.
+        for text in [
+            "[model]\ndefaultReasoningEffort = \"\"\n",
+            "[model]\ndefaultReasoningEffort = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_reasoning_effort, None, "{text}");
+        }
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_workspace_overrides() {
         let text =
             "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\", ws2 = \"m2\" }\n";
@@ -1567,6 +1656,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("server.port"), "{err}");
+    }
+
+    #[test]
+    fn sleep_resume_defaults_enabled_with_threshold_ten() {
+        // A file with no [wakeResume] section resolves to the feature-on
+        // defaults (enabled = true, thresholdSeconds = 10).
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 10);
+        // The default template ships the commented [wakeResume] section and
+        // parses back to the same defaults.
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[wakeResume]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(templated.wake_resume.enabled);
+        assert_eq!(templated.wake_resume.threshold_seconds, 10);
+    }
+
+    #[test]
+    fn sleep_resume_explicit_override_parses() {
+        let parsed =
+            SettingsFile::parse_str("[wakeResume]\nenabled = false\nthresholdSeconds = 45\n")
+                .expect("override parses");
+        assert!(!parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 45);
+    }
+
+    #[test]
+    fn sleep_resume_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[wakeResume]\nthreshholdSeconds = 20\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wakeResume"), "names the table: {msg}");
+        assert!(
+            msg.contains("threshholdSeconds"),
+            "names the bad key: {msg}"
+        );
+    }
+
+    #[test]
+    fn sleep_resume_wrong_type_is_rejected() {
+        let err =
+            SettingsFile::parse_str("[wakeResume]\nthresholdSeconds = \"soon\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("wakeResume.thresholdSeconds"),
+            "names the key: {err}"
+        );
     }
 
     #[test]

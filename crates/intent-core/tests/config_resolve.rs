@@ -9,6 +9,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use intent_core::config::{
     Config, DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    MIN_WAKE_RESUME_THRESHOLD_SECONDS,
 };
 use intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE;
 
@@ -66,6 +68,11 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
     assert_eq!(cfg.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
     assert_eq!(cfg.stream_retention_hours, DEFAULT_STREAM_RETENTION_HOURS);
     assert_eq!(cfg.hooks_max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
+    assert_eq!(cfg.wake_resume_enabled, DEFAULT_WAKE_RESUME_ENABLED);
+    assert_eq!(
+        cfg.wake_resume_threshold_seconds,
+        DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS
+    );
     let written = std::fs::read_to_string(&config_path).expect("config.toml was initialized");
     assert_eq!(written, DEFAULT_CONFIG_TEMPLATE);
 
@@ -137,7 +144,7 @@ fn resolve_reads_config_file_when_present() {
     let config_path = config_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n",
+        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n\n[wakeResume]\nenabled = false\nthresholdSeconds = 30\n",
     )
     .unwrap();
 
@@ -150,6 +157,45 @@ fn resolve_reads_config_file_when_present() {
     assert_eq!(cfg.idle_reap_minutes, 7);
     assert_eq!(cfg.stream_retention_hours, 24);
     assert_eq!(cfg.hooks_max_per_agent, 3);
+    assert!(!cfg.wake_resume_enabled);
+    assert_eq!(cfg.wake_resume_threshold_seconds, 30);
+
+    std::env::remove_var("INTENTD_DATA_DIR");
+    std::env::remove_var("INTENTD_CONFIG");
+    std::fs::remove_file(&config_path).ok();
+    std::fs::remove_dir_all(&config_dir).ok();
+}
+
+#[test]
+fn resolve_clamps_zero_threshold_to_minimum() {
+    let _g = env_lock();
+    let data_dir = unique_temp("intentd-data-thresh0");
+    let config_dir = unique_temp("intentd-cfgdir-thresh0");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    // `thresholdSeconds = 0` would make the clock-skew detector flag every
+    // ~1s sampling tick as a suspend; resolve() must clamp it up to the floor.
+    std::fs::write(
+        &config_path,
+        "[wakeResume]\nenabled = true\nthresholdSeconds = 0\n",
+    )
+    .unwrap();
+
+    std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
+    std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
+    std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+    std::env::set_var("INTENTD_CONFIG", &config_path);
+
+    let cfg = Config::resolve().expect("resolve with zero threshold should succeed");
+    assert!(cfg.wake_resume_enabled);
+    assert_eq!(
+        cfg.wake_resume_threshold_seconds, MIN_WAKE_RESUME_THRESHOLD_SECONDS,
+        "a configured thresholdSeconds of 0 is clamped up to the sane minimum"
+    );
+    assert_ne!(
+        cfg.wake_resume_threshold_seconds, 0,
+        "the clamped threshold is never 0 (which would misclassify every tick)"
+    );
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
