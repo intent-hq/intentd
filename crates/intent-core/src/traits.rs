@@ -1650,13 +1650,19 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.setModel`: change an agent's model (PROTOCOL §5.5).
+    /// `provider_id` optionally names the intended provider explicitly
+    /// (additive param): absent keeps the historical behavior; present it
+    /// must be a registered provider, must agree with a compound
+    /// `model_id`'s prefix, and owns the validation of a bare `model_id`
+    /// (session.provider is reconciled to it on success).
     fn agent_set_model(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, model_id);
+        let _ = (workspace_id, agent_id, model_id, provider_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_set_model not implemented".to_string(),
@@ -1685,7 +1691,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// a failed probe may serve the last-good cached list with `stale`/
     /// `warning` fields added. With a `provider_id` the catalog comes from
     /// that provider's registered source through the generic per-provider
-    /// cache (5-minute TTL, version-keyed), returning
+    /// cache (version-keyed, served indefinitely; a probe runs only on a
+    /// miss or forced read), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(

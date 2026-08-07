@@ -333,7 +333,11 @@ mod tests {
         let root = TempDir::new("nogit");
         let ws = test_workspace("ws-nogit", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus, api));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus,
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
 
         let watcher = GitMetadataWatcher::start(
             &SharedWatchHub::new(),
@@ -359,7 +363,11 @@ mod tests {
 
         let ws = test_workspace("ws-repo", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
         let _watcher = GitMetadataWatcher::start(
             &SharedWatchHub::new(),
             refresher,
@@ -417,7 +425,11 @@ mod tests {
 
         let ws = test_workspace("ws-quiet", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
         let _watcher = GitMetadataWatcher::start(
             &SharedWatchHub::new(),
             refresher,

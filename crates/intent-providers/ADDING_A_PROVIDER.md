@@ -266,3 +266,13 @@ Then, in a fresh workspace, spawn an agent on the new provider and verify:
   §3 paths (today: cortex) spawns fine but gets no workspace tools, which also
   means no naming nudge can succeed. Prefer wiring §3c if the provider accepts
   `session/new` `mcpServers`.
+
+## Terminal spawn (`terminal_requires_shell`)
+
+Most providers send ACP `terminal/create` as real argv (`command` = program,
+`args` = argv[1..]). Set `terminal_requires_shell: true` only when the provider
+packs a full shell line into `command` with empty `args` (Node `shell: true`
+semantics). Today that is **Grok Build** only (`/bin/bash -lc '…'` in
+`command`). intentd then spawns the packed line exactly as Node `shell: true`
+would — `/bin/sh -c` on POSIX, the native shell (PowerShell `-Command` /
+`cmd /c`) on Windows — instead of exec'ing the packed string as argv[0].

@@ -552,7 +552,11 @@ mod tests {
 
     /// Start a registry with its own refresher (the production wiring shape).
     async fn start_registry(bus: &EventBus, api: Arc<dyn WorkspaceApi>) -> WatcherRegistry {
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api.clone(),
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
         WatcherRegistry::start(bus.clone(), api, refresher).await
     }
 
