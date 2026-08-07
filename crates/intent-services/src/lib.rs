@@ -132,6 +132,10 @@ pub mod auggie_discovery {
 pub use agent_manager::{
     compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
 };
+// Re-export the suspend-overlap query trait (Task C) so the composition root
+// can implement it on the daemon's `SuspendTracker` and wire it via
+// [`Services::with_suspend_tracker`].
+pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 pub use events::{
@@ -576,6 +580,13 @@ pub struct Services {
     /// race can be decided by moving the deadline instead of racing wall
     /// clock.
     hook_clock_skew: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
+    /// recognize a sleep-induced turn failure and enroll it as interrupted for
+    /// wake-triggered resume (Task C). Wired by the composition root from the
+    /// daemon's `SuspendTracker` when `wakeResume` is enabled; `None` (read-only
+    /// / unit-test wiring, or `wakeResume` disabled) keeps today's terminal
+    /// behavior for transient upstream disconnects. Shared across clones.
+    suspend_tracker: Option<Arc<dyn agent_session::SuspendOverlapQuery>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -660,7 +671,21 @@ impl Services {
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
+            suspend_tracker: None,
         }
+    }
+
+    /// Wire the host suspend-overlap query (Task C): the composition root passes
+    /// the daemon's `SuspendTracker` when `wakeResume` is enabled so
+    /// [`Services::run_prompt_turn`] can recognize a sleep-induced turn failure
+    /// and enroll it as interrupted for wake-triggered resume. Left unset,
+    /// transient upstream disconnects keep today's terminal behavior.
+    pub fn with_suspend_tracker(
+        mut self,
+        tracker: Arc<dyn agent_session::SuspendOverlapQuery>,
+    ) -> Self {
+        self.suspend_tracker = Some(tracker);
+        self
     }
 
     /// Override the per-agent active-hook cap (`[hooks] maxPerAgent`); wired

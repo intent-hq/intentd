@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
@@ -62,6 +63,53 @@ pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
 /// counter on this marker: intervening activity means the back-to-back
 /// timeout accounting starts over.
 pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
+
+/// Prefix marking a `session/prompt` failure that was recognized as
+/// sleep-induced (Task C): the turn died with a transient upstream disconnect
+/// (per [`intent_acp::is_transient_upstream_disconnect`]) whose active window
+/// overlapped a detected host suspend (per the injected [`SuspendOverlapQuery`]).
+/// [`Services::run_prompt_turn`] enrolls such a turn as interrupted (persisting
+/// the partial with [`InterruptReason::SystemSuspend`] + an `interrupted_agent`
+/// row) and emits the interrupted terminal `agent:stream:end` instead of
+/// `agent:failed`, so the turn worker suppresses the terminal-failure path (no
+/// hard error, no manual-retry surface) and the wake orchestrator (Task D) can
+/// resume it.
+pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
+    "session/prompt interrupted by system suspend:";
+
+/// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
+/// fires directly (independent of the host-wake broadcast). It must outlast the
+/// turn worker's post-enrollment teardown (`kill_child_only` + `end_turn`) so the
+/// resume spawns a fresh child and reloads via `session/load` rather than racing
+/// the still-live handle, and it coalesces a burst of concurrent enrollments
+/// (the resume itself is idempotent via the row's atomic claim). Overridable for
+/// tests via `INTENTD_WAKE_RESUME_SELF_HEAL_MS`.
+const WAKE_RESUME_SELF_HEAL_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Resolve the self-heal debounce, honoring the `INTENTD_WAKE_RESUME_SELF_HEAL_MS`
+/// test seam (milliseconds) so e2e/unit coverage need not wait the production
+/// window.
+fn wake_resume_self_heal_debounce() -> Duration {
+    std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+}
+
+/// Query surface the turn driver uses to decide whether a failed turn's active
+/// window overlapped a host suspend. Implemented by the daemon's
+/// `SuspendTracker` (in the `intentd` binary crate, which depends on this one)
+/// and injected via [`Services::with_suspend_tracker`]: the service layer only
+/// needs the overlap query, so the concrete clock-skew detector/tracker stays
+/// in the binary crate. Absent (read-only / unit-test wiring, or `wakeResume`
+/// disabled), sleep-induced enrollment never triggers and turn failures keep
+/// today's terminal behavior.
+pub trait SuspendOverlapQuery: Send + Sync {
+    /// Total suspend duration whose recorded monotonic bracket overlaps the
+    /// window `[start, end]`, or `None` when no retained suspend overlaps it.
+    fn did_suspend_overlap(&self, start: Instant, end: Instant) -> Option<Duration>;
+}
 
 /// Whether a `session/prompt` failure is transport-shaped: the writer task
 /// observed a closed pipe (`transport closed: …`, e.g. "writer task closed")
@@ -495,6 +543,11 @@ pub(crate) enum InterruptReason {
     DaemonShutdown,
     /// Hard stop/kill teardown (agent delete, kill-path fallback, …).
     AgentStopped,
+    /// The turn's upstream stream dropped because the host suspended (laptop
+    /// sleep) mid-turn (Task C): recognized as a transient upstream disconnect
+    /// whose active window overlapped a detected suspend. Enrolled as
+    /// interrupted for wake-triggered resume instead of surfacing terminally.
+    SystemSuspend,
 }
 
 impl InterruptReason {
@@ -505,6 +558,7 @@ impl InterruptReason {
             InterruptReason::PreemptedByMessage => "preempted_by_message",
             InterruptReason::DaemonShutdown => "daemon_shutdown",
             InterruptReason::AgentStopped => "agent_stopped",
+            InterruptReason::SystemSuspend => "system_suspend",
         }
     }
 }
@@ -1682,6 +1736,39 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Sleep-induced turn failure (Task C): the turn died with a transient
+        // upstream disconnect AND a detected host suspend overlapped its active
+        // window `[turn_started, now]`. Enroll it as interrupted (so the wake
+        // orchestrator in Task D can resume it via `session/load`) instead of
+        // surfacing a hard terminal failure. Gated on an injected
+        // [`SuspendOverlapQuery`]: absent (read-only / unit wiring, or
+        // `wakeResume` disabled), this is always false and failures keep
+        // today's behavior. Placed BEFORE the plain persist + terminal emits
+        // below so it takes precedence over the pre-output silent-redrive path
+        // (monorepo#764) for the suspend-overlapping case — a `session/load`
+        // resume preserves the partial turn, which a fresh-child redrive would
+        // not. `PromptIdleTimeout` is classified non-transient, so an idle
+        // timeout never routes here.
+        let suspend_interrupt = matches!(&result, Err(e) if intent_acp::is_transient_upstream_disconnect(e))
+            && self
+                .suspend_tracker
+                .as_ref()
+                .and_then(|t| t.did_suspend_overlap(turn_started, Instant::now()))
+                .is_some();
+        if suspend_interrupt {
+            // `matches!` above guarantees the `Err` arm.
+            let err = result.expect_err("suspend_interrupt implies Err");
+            return self
+                .enroll_suspend_interrupted_turn(
+                    agent_id,
+                    workspace_id,
+                    message_id,
+                    blocks,
+                    turn_id,
+                    err,
+                )
+                .await;
+        }
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -1938,6 +2025,138 @@ impl Services {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
         })
+    }
+
+    /// Enroll a sleep-induced turn failure (Task C): a transient upstream
+    /// disconnect whose active window overlapped a detected host suspend. The
+    /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
+    /// (empty blocks still record a row — every interruption is durably
+    /// anchored), an `interrupted_agent` row is written with `prev_status` = the
+    /// session's running status (mirroring the daemon-restart heal path) so the
+    /// wake orchestrator (Task D) can resume it via `session/load`, and the
+    /// terminal event is the interrupted `agent:stream:end` (`stopReason:
+    /// "interrupted"`, `interruptReason: "system_suspend"`) — NOT
+    /// `agent:failed` — so no hard error or manual-retry surface reaches the FE.
+    ///
+    /// Returns the original error wrapped with [`PROMPT_SUSPEND_INTERRUPT_PREFIX`]
+    /// so the turn worker suppresses the terminal-failure path.
+    async fn enroll_suspend_interrupted_turn(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        message_id: String,
+        blocks: Vec<Value>,
+        turn_id: Option<&str>,
+        err: AcpError,
+    ) -> Result<StopReason> {
+        // Final live-preview values from the partial turn (same contract as the
+        // interrupt terminal emit in `agent_manager`).
+        let preview_text_blocks = text_block_strings(&blocks);
+        // Persist the partial turn tagged as suspend-interrupted. Reuses the
+        // shared interrupt-flush path so the persisted row carries the
+        // `interruptReason` metadata (and clears the live-turn slot).
+        let live = LiveTurn {
+            message_id,
+            blocks,
+            final_text_block_open: false,
+            last_activity_at: now_iso(),
+            last_activity_emit: None,
+        };
+        let interrupted_message_id = self
+            .flush_partial_turn_on_interruption(
+                agent_id,
+                live,
+                InterruptReason::SystemSuspend,
+                None,
+            )
+            .await;
+        // Capture the session's running status for restore-on-resume, serialized
+        // to the stored form (e.g. "active", "Waiting") exactly like
+        // `heal_stale_agent_sessions`. A lookup failure falls back to "active".
+        let prev_status = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => serde_json::to_string(&session.status)
+                .unwrap_or_else(|_| "\"active\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+            Err(e) => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "suspend enrollment: session status lookup failed, defaulting prev_status=active"
+                );
+                "active".to_string()
+            }
+        };
+        match self
+            .store
+            .insert_interrupted_agent_with_reason(
+                agent_id,
+                workspace_id,
+                &prev_status,
+                &now_iso(),
+                Some(InterruptReason::SystemSuspend.as_str()),
+            )
+            .await
+        {
+            Ok(_) => {
+                // Self-heal (independent of the host-wake broadcast): the wake
+                // orchestrator runs one debounced sweep per detected wake, so a
+                // disconnect that surfaces AFTER that sweep would strand this
+                // row until the NEXT host wake — even though the normal
+                // failure/retry surface was suppressed. Fire a gated, debounced
+                // resume directly for this agent so it recovers on its own; the
+                // wake sweep stays the catch-all. The debounce lets the worker's
+                // post-enrollment `kill_child_only` + `end_turn` settle first,
+                // and the row's atomic claim dedupes against a racing wake sweep
+                // / `resolveInterrupted`.
+                let services = self.clone();
+                let debounce = wake_resume_self_heal_debounce();
+                tokio::spawn(async move {
+                    tokio::time::sleep(debounce).await;
+                    services.resume_suspend_interrupted_agents().await;
+                });
+            }
+            Err(e) => {
+                // Fail-soft: the interrupted terminal state is still emitted
+                // below so the FE never sees a hard error. A missing row only
+                // forgoes the wake-triggered/self-heal resume (a manual retry
+                // still works).
+                tracing::warn!(
+                    agent = %agent_id,
+                    workspace_id = %workspace_id.0,
+                    error = %e,
+                    "failed to enroll suspend-interrupted agent row"
+                );
+            }
+        }
+        // Terminal event is the interrupted `agent:stream:end` (mirrors the
+        // interrupt path in `agent_manager`), NOT `agent:failed` — the FE
+        // renders a Stopped/resuming indicator rather than a hard error with a
+        // Retry button.
+        let mut end_data = json!({
+            "agentId": agent_id.0,
+            "stopReason": "interrupted",
+            "interruptReason": InterruptReason::SystemSuspend.as_str(),
+        });
+        if let Some(ref mid) = interrupted_message_id {
+            end_data["messageId"] = json!(mid);
+        }
+        if let Some(tid) = turn_id {
+            end_data["turnId"] = json!(tid);
+        }
+        stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
+            .await;
+        tracing::info!(
+            agent = %agent_id,
+            error = %err,
+            "turn interrupted by system suspend — enrolled for wake-resume"
+        );
+        // The wrapped marker tells the turn worker to suppress the
+        // terminal-failure path (no `agent:failed`, no Error status / retry).
+        Err(Error::Internal(format!(
+            "{PROMPT_SUSPEND_INTERRUPT_PREFIX} {err}"
+        )))
     }
 
     /// Drive one implicit agent-initiated turn (monorepo#855): the agent's

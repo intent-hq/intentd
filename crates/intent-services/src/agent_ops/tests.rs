@@ -16702,6 +16702,143 @@ async fn resume_interrupted_marker_is_idempotent_on_retry() {
     );
 }
 
+/// Wake-resume Task D: the sweep resumes ONLY rows tagged `system_suspend`
+/// (what Task C enrolls) and leaves rows a user left pending for other reasons
+/// (daemon restart, agent stop, …) untouched.
+#[tokio::test]
+async fn wake_resume_targets_only_system_suspend_rows() {
+    let (_t, svc, ws) = setup().await;
+
+    // A sleep-induced (Task C) interruption with a resumable ACP session id.
+    let slept = create_agent(&svc, &ws, "Slept").await;
+    svc.store
+        .set_acp_session_id(&ws, &slept, "acp-slept")
+        .await
+        .expect("mark resumable");
+    svc.store
+        .insert_interrupted_agent_with_reason(
+            &slept,
+            &ws,
+            "active",
+            &now_iso(),
+            Some("system_suspend"),
+        )
+        .await
+        .expect("enroll suspend row");
+
+    // A daemon-restart interruption (no reason) — must be left pending.
+    let restarted = create_agent(&svc, &ws, "Restarted").await;
+    svc.store
+        .set_acp_session_id(&ws, &restarted, "acp-restarted")
+        .await
+        .expect("mark resumable");
+    svc.store
+        .insert_interrupted_agent(&restarted, &ws, "active", &now_iso())
+        .await
+        .expect("enroll restart row");
+
+    let resumed = svc.resume_suspend_interrupted_agents().await;
+    assert_eq!(resumed, 1, "exactly the system_suspend row is resumed");
+
+    assert!(
+        svc.store
+            .get_interrupted_agent(&slept)
+            .await
+            .expect("get")
+            .is_none(),
+        "suspend-interrupted row resumed (no longer pending)"
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&restarted)
+            .await
+            .expect("get")
+            .is_some(),
+        "non-suspend pending row untouched by wake-resume"
+    );
+}
+
+/// Wake-resume Task D: an agent with no persisted `acpSessionId` cannot be
+/// reloaded via `session/load`, so the sweep skips it and leaves the row
+/// pending for today's manual retry (the `supports_load_session` gate).
+#[tokio::test]
+async fn wake_resume_skips_agents_without_resumable_session() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "NoSession").await;
+    svc.store
+        .insert_interrupted_agent_with_reason(
+            &id,
+            &ws,
+            "active",
+            &now_iso(),
+            Some("system_suspend"),
+        )
+        .await
+        .expect("enroll suspend row");
+
+    let resumed = svc.resume_suspend_interrupted_agents().await;
+    assert_eq!(resumed, 0, "no acpSessionId → not auto-resumed");
+    assert!(
+        svc.store
+            .get_interrupted_agent(&id)
+            .await
+            .expect("get")
+            .is_some(),
+        "row left pending for manual retry"
+    );
+}
+
+/// Wake-resume Task D (DoD): a wake sweep and a concurrent client
+/// `resolveInterrupted` race on the same suspend-interrupted row. The atomic
+/// claim in `resume_interrupted_agent` guarantees it effectively runs exactly
+/// once — exactly one racer transitions the pending row to resumed, and the row
+/// is never double-resumed.
+#[tokio::test]
+async fn wake_resume_runs_resume_exactly_once_under_concurrent_resolve() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Raced").await;
+    svc.store
+        .set_acp_session_id(&ws, &id, "acp-raced")
+        .await
+        .expect("mark resumable");
+    svc.store
+        .insert_interrupted_agent_with_reason(
+            &id,
+            &ws,
+            "active",
+            &now_iso(),
+            Some("system_suspend"),
+        )
+        .await
+        .expect("enroll suspend row");
+
+    let sweep = {
+        let svc = svc.clone();
+        async move { svc.resume_suspend_interrupted_agents().await }
+    };
+    let resolve = {
+        let svc = svc.clone();
+        let id = id.clone();
+        async move { svc.resume_interrupted_agent(&id).await }
+    };
+    let (swept, resolved) = tokio::join!(sweep, resolve);
+
+    let sweep_won = swept == 1;
+    let resolve_won = resolved.is_ok();
+    assert!(
+        sweep_won ^ resolve_won,
+        "resume ran exactly once (sweep_won={sweep_won}, resolve_won={resolve_won})"
+    );
+    assert!(
+        svc.store
+            .get_interrupted_agent(&id)
+            .await
+            .expect("get")
+            .is_none(),
+        "row claimed exactly once and now resolved (never double-resumed)"
+    );
+}
+
 async fn delegate_immediate(svc: &Services, ws: &WorkspaceId, parent: &AgentId) -> AgentId {
     let resp = svc
         .agent_delegate_op(
