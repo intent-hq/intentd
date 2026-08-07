@@ -62,19 +62,20 @@ fn check_git_unavailable_when_probe_fails_even_if_resolver_finds() {
 
 #[test]
 fn check_auggie_reports_unavailable_when_unresolved() {
-    let v = check_auggie_with(None, &StubProbe(None));
+    let v = check_auggie_with(None);
     assert_eq!(v["available"], false);
+    assert!(v.get("path").is_none());
+    assert!(v.get("version").is_none());
 }
 
+/// Resolution-only: a resolved path is `available:true` with no version probe
+/// (and no `version` field) — the auggie `--version` spawn is retired.
 #[test]
-fn check_auggie_reports_available_with_version_and_path() {
-    let v = check_auggie_with(
-        Some(PathBuf::from("/opt/intent/auggie")),
-        &StubProbe(Some("auggie 0.42.0".to_string())),
-    );
+fn check_auggie_is_resolution_only() {
+    let v = check_auggie_with(Some(PathBuf::from("/opt/intent/auggie")));
     assert_eq!(v["available"], true);
-    assert_eq!(v["version"], "auggie 0.42.0");
     assert_eq!(v["path"], "/opt/intent/auggie");
+    assert!(v.get("version").is_none());
 }
 
 #[cfg(unix)]
