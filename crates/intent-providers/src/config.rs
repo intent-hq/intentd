@@ -171,6 +171,14 @@ pub struct ProviderConfig {
     /// lifecycle, `unsloth_server.rs`) — reporting availability off
     /// `opencode` alone is misleading when the Unsloth CLI isn't installed.
     pub requires_secondary_binary: Option<&'static str>,
+    /// When true, ACP `terminal/create` requests from this provider are spawned
+    /// via a shell (`/bin/sh -c` on POSIX; PowerShell `-Command` / `cmd /c` on
+    /// Windows) rather than as raw argv. Needed for agents that pack a full
+    /// shell line into the
+    /// `command` field with empty `args` (Node-style `shell: true` semantics).
+    /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
+    /// argv-only clients (most providers) leave this false.
+    pub terminal_requires_shell: bool,
 }
 
 impl ProviderConfig {
@@ -213,6 +221,7 @@ impl ProviderConfig {
             fallback_npx_package: None,
             npx_only_package: None,
             requires_secondary_binary: None,
+            terminal_requires_shell: false,
         }
     }
 
@@ -410,6 +419,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         auth_check_args: Some(&["models"]),
         login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
         short_name: "Grok",
+        // Grok's ACP terminal adapter packs `/bin/bash -lc '…'` into `command`
+        // with empty `args` (Node shell:true style). intentd argv-only spawn
+        // would ENOENT that string; shell-wrap on terminal/create instead.
+        terminal_requires_shell: true,
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
