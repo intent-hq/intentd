@@ -128,11 +128,20 @@ pub struct ThoughtLevelOption {
 /// stamped with a stable id `{messageId}:{blockIndex}` (CS-0 D1), where
 /// `messageId` is the assistant `AgentMessage` id minted at turn start; blocks
 /// are append-only so a block's index (and thus id) is fixed once assigned.
+///
+/// Streamed reasoning (`agent_thought_chunk`) shares the same coalescing
+/// buffer but flushes as a `thinking` block: consecutive thoughts merge into
+/// one block and a thought↔text switch closes the open block and starts a new
+/// one (Zed's model), so thoughts interleave with text/tool blocks in stream
+/// order.
 struct Transcript {
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
     text: String,
+    /// Whether the pending [`text`](Self::text) buffer holds reasoning (flushes
+    /// as a `thinking` block) rather than assistant text.
+    pending_thought: bool,
     /// `toolCallId` → index of its `tool_use` block (for status patching).
     tool_use_index: HashMap<String, usize>,
     /// `toolCallId` → index of its `tool_result` block (append-once, then patch).
@@ -152,6 +161,7 @@ impl Transcript {
             message_id,
             blocks: Vec::new(),
             text: String::new(),
+            pending_thought: false,
             tool_use_index: HashMap::new(),
             tool_result_index: HashMap::new(),
             proposal_index: HashMap::new(),
@@ -164,15 +174,18 @@ impl Transcript {
         format!("{}:{index}", self.message_id)
     }
 
-    /// Index the currently pending (or next) coalesced text block will occupy
-    /// once flushed — the same value for every consecutive text chunk, so they
-    /// share one block id.
-    fn current_text_index(&self) -> usize {
-        self.blocks.len()
-    }
-
-    fn push_text(&mut self, t: &str) {
+    /// Append a streamed chunk to the coalescing buffer and return the index
+    /// the block it lands in will occupy once flushed — the same value for
+    /// every consecutive chunk of the same kind, so they share one block id. A
+    /// thought↔text switch (either direction) flushes the open block first, so
+    /// the returned index names the freshly opened one.
+    fn push_chunk(&mut self, t: &str, thought: bool) -> usize {
+        if thought != self.pending_thought {
+            self.flush_text();
+            self.pending_thought = thought;
+        }
         self.text.push_str(t);
+        self.blocks.len()
     }
 
     /// Push a non-text passthrough content block, stamping its id; returns its
@@ -187,13 +200,26 @@ impl Transcript {
         index
     }
 
+    /// The block type the pending buffer flushes as: `thinking` for streamed
+    /// reasoning, `text` for assistant text.
+    fn pending_block_type(&self) -> &'static str {
+        if self.pending_thought {
+            "thinking"
+        } else {
+            "text"
+        }
+    }
+
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
             let index = self.blocks.len();
             let id = self.block_id(index);
-            self.blocks
-                .push(json!({ "type": "text", "id": id, "text": std::mem::take(&mut self.text) }));
+            let block_type = self.pending_block_type();
+            self.blocks.push(
+                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) }),
+            );
         }
+        self.pending_thought = false;
     }
 
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
@@ -376,8 +402,9 @@ impl Transcript {
     }
 
     /// A non-consuming snapshot of the coalesced blocks AS THEY STAND mid-turn
-    /// (CS-0 D5): the pushed blocks plus, when text is pending, the synthetic
-    /// `text` block it will flush into (same index/id it would ultimately take).
+    /// (CS-0 D5): the pushed blocks plus, when a chunk buffer is pending, the
+    /// synthetic `text`/`thinking` block it will flush into (same index/id it
+    /// would ultimately take).
     /// Used to publish the in-flight partial into the per-agent live-turn slot so
     /// a `chat.subscribe` arriving mid-turn can reconstruct it.
     fn snapshot_blocks(&self) -> Vec<Value> {
@@ -385,7 +412,7 @@ impl Transcript {
         if !self.text.is_empty() {
             let index = blocks.len();
             blocks.push(json!({
-                "type": "text",
+                "type": self.pending_block_type(),
                 "id": self.block_id(index),
                 "text": self.text.clone(),
             }));
@@ -394,25 +421,28 @@ impl Transcript {
     }
 
     /// The text of the coalesced `type: "text"` blocks AS THEY STAND mid-turn
-    /// (the pushed text blocks plus, when text is pending, the unflushed
-    /// buffer) — the input to the `agent:stream:activity` live-preview
+    /// (the pushed text blocks plus, when assistant text is pending, the
+    /// unflushed buffer) — the input to the `agent:stream:activity` live-preview
     /// derivation. Cheaper than [`snapshot_blocks`](Self::snapshot_blocks):
-    /// tool payloads (which can be large mid-turn) are never cloned.
+    /// tool payloads (which can be large mid-turn) are never cloned. Reasoning
+    /// never contributes: `thinking` blocks are skipped by the block filter and
+    /// a pending THOUGHT buffer is not appended.
     fn text_block_strings(&self) -> Vec<String> {
         let mut out = text_block_strings(&self.blocks);
-        if !self.text.is_empty() {
+        if !self.text.is_empty() && !self.pending_thought {
             out.push(self.text.clone());
         }
         out
     }
 
-    /// Whether the FINAL text block is still open (text pending in the
-    /// coalescing buffer, not yet flushed by a non-text block boundary). The
+    /// Whether the FINAL text block is still open (assistant text pending in
+    /// the coalescing buffer, not yet flushed by a block boundary). The
     /// live preview derivation only clips the trailing partial line of an
     /// OPEN final block — a text block closed by e.g. a tool call is complete
-    /// even without a trailing newline.
+    /// even without a trailing newline. A pending THOUGHT buffer feeds no
+    /// preview, so it leaves the final text block closed.
     fn final_text_block_open(&self) -> bool {
-        !self.text.is_empty()
+        !self.text.is_empty() && !self.pending_thought
     }
 }
 
@@ -2297,21 +2327,17 @@ impl Services {
                 text,
                 thought,
             } => {
-                // Thought chunks map now (intent-acp carries the marker) but
-                // have no transcript/stream handling yet: dropped here rather
-                // than persisted as assistant text. Wiring them into
-                // interleaved thinking blocks is the follow-on change.
-                if thought {
-                    return false;
-                }
                 // Accumulate into the transcript and compute the block index this
-                // chunk lands at; consecutive text chunks coalesce onto one index
-                // (and thus one stable block id), a non-text block starts a new one.
+                // chunk lands at; consecutive chunks of the same kind coalesce
+                // onto one index (and thus one stable block id), while a
+                // thought↔text switch or a non-text block starts a new one.
+                // Thought chunks flush as `thinking` blocks (Zed's model) and
+                // ride the same `chat:stream:delta` shape.
                 let (block_index, block_type) = match &text {
                     Some(t) => {
-                        let index = transcript.current_text_index();
-                        transcript.push_text(t);
-                        (index, "text".to_string())
+                        let index = transcript.push_chunk(t, thought);
+                        let block_type = if thought { "thinking" } else { "text" };
+                        (index, block_type.to_string())
                     }
                     None => {
                         let block_type = content

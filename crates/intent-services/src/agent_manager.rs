@@ -4653,10 +4653,9 @@ impl AgentManager {
         // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
         // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
-            // A thought chunk materializes no transcript content yet, so it
-            // must not open a turn (parity with `route_notification`, which
-            // drops it).
-            Some(intent_acp::session::MappedUpdate::Chunk { thought: true, .. }) => return true,
+            // A thought chunk materializes a `thinking` block just like a
+            // message chunk materializes a `text` one, so it opens a turn on
+            // the same terms (parity with `route_notification`).
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
