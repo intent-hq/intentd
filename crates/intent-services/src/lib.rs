@@ -4032,20 +4032,20 @@ impl Services {
                     You are working in an isolated sandbox at: `{}`\n\
                     Retry {}/{} - fix conflicts in your sandbox only.",
                     conflicting_paths.join("\n- "),
+                    fetched_tip,
                     session.sandbox_path.as_ref().unwrap(),
                     retry_count + 1,
                     MAX_RETRIES
                 );
 
+                // Deliver as a REAL turn via the runtime AgentManager
+                // (`deliver_wake_message`): the agent just went idle, so a
+                // store-only append would sit unread forever — the bounce
+                // must resume the agent so it actually reconciles. A dead
+                // ACP child is tolerated (the turn worker respawns it), and
+                // a busy agent gets the bounce queued for its drain loop.
                 if let Err(e) = self
-                    .agent_send_message_op(
-                        agent_id.clone(),
-                        message,
-                        None, // messageId
-                        None, // imageBlocks
-                        None, // fileBlocks
-                        None, // messageMetadata
-                    )
+                    .deliver_wake_message(workspace_id, agent_id, &message, None)
                     .await
                 {
                     tracing::error!(
@@ -4119,15 +4119,10 @@ impl Services {
                     session.sandbox_path.as_deref().unwrap_or("<unknown>"),
                 );
 
+                // Same runtime delivery as the conflict bounce above: resume
+                // the agent so it commits, instead of leaving the row unread.
                 if let Err(e) = self
-                    .agent_send_message_op(
-                        agent_id.clone(),
-                        message,
-                        None, // messageId
-                        None, // imageBlocks
-                        None, // fileBlocks
-                        None, // messageMetadata
-                    )
+                    .deliver_wake_message(workspace_id, agent_id, &message, None)
                     .await
                 {
                     tracing::error!(

@@ -10,6 +10,7 @@
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use git2::Repository;
     use intent_core::{
@@ -547,6 +548,172 @@ mod tests {
         );
 
         // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    /// Wait for an `agent:status-changed` event carrying `status` for
+    /// `agent_id` (mirrors the DELIV-1 helper in `agent_ops::tests`).
+    async fn expect_status(
+        sub: &mut crate::events::Subscription,
+        agent_id: &AgentId,
+        status: &str,
+        within: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, sub.recv()).await {
+                Ok(Some(batch)) => {
+                    for ev in batch {
+                        if ev.event_type == "agent:status-changed"
+                            && ev.data.get("agentId").and_then(serde_json::Value::as_str)
+                                == Some(agent_id.0.as_str())
+                            && ev.data.get("status").and_then(serde_json::Value::as_str)
+                                == Some(status)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conflict_bounce_resumes_agent_via_runtime() {
+        // Regression (dev-seat merge-verification round): a conflict bounce
+        // must RESUME the bounced agent, not merely append a transcript row.
+        // With the runtime AgentManager attached, bounce delivery must route
+        // through the manager (slot claim + worker spawn) — proven by the
+        // `agent:status-changed[active]` event the `try_begin` claim emits.
+        // The pre-fix path called the store-only `agent_send_message_op`, so
+        // the conflict instructions sat unread and the sandbox stayed
+        // `conflict_bounced` until the sweep cap exhausted.
+
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("bounce-resume");
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let child_id = AgentId::from("agent-child");
+        let parent_id = AgentId::from("agent-parent");
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        create_agent_session(&store, &ws.id, &child_id, Some(&parent_id), None).await;
+        let outcome = provision_sandbox(&store, &ws.id, &child_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(&child_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", child_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        create_agent_session(&store, &ws.id, &parent_id, None, None).await;
+
+        // Conflicting commits: canonical and sandbox modify the same file.
+        let canonical_repo = Repository::open(&repo_path).unwrap();
+        fs::write(repo_path.join("conflict.txt"), "canonical version").unwrap();
+        let mut canonical_index = canonical_repo.index().unwrap();
+        canonical_index.add_path(Path::new("conflict.txt")).unwrap();
+        canonical_index.write().unwrap();
+        let canonical_tree_oid = canonical_index.write_tree().unwrap();
+        let canonical_tree = canonical_repo.find_tree(canonical_tree_oid).unwrap();
+        let canonical_parent = canonical_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        canonical_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Canonical change",
+                &canonical_tree,
+                &[&canonical_parent],
+            )
+            .unwrap();
+
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("conflict.txt"), "sandbox version").unwrap();
+        let mut sandbox_index = sandbox_repo.index().unwrap();
+        sandbox_index.add_path(Path::new("conflict.txt")).unwrap();
+        sandbox_index.write().unwrap();
+        let sandbox_tree_oid = sandbox_index.write_tree().unwrap();
+        let sandbox_tree = sandbox_repo.find_tree(sandbox_tree_oid).unwrap();
+        let sandbox_parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Sandbox change",
+                &sandbox_tree,
+                &[&sandbox_parent],
+            )
+            .unwrap();
+
+        // Wire Services WITH the runtime AgentManager attached.
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root.clone());
+        let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            services.clone(),
+            sink,
+            4,
+        ));
+        services.attach_agent_manager(&manager);
+
+        // Subscribe BEFORE the op so the live-only broadcast is captured.
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec!["agent:status-changed".to_string()],
+            ..Default::default()
+        });
+
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+
+        // The bounce landed: status conflict_bounced, retry consumed.
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::ConflictBounced);
+        assert_eq!(sandbox.retry_count, 1);
+
+        // The bounced agent MUST be resumed: the runtime slot claim emits
+        // `agent:status-changed[active]` for the child.
+        assert!(
+            expect_status(
+                &mut status_sub,
+                &child_id,
+                "active",
+                std::time::Duration::from_secs(3)
+            )
+            .await,
+            "conflict bounce must drive a turn via the runtime AgentManager"
+        );
+
+        manager.stop(&child_id).await;
         let _ = fs::remove_dir_all(&test_root);
     }
 
