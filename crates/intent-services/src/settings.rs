@@ -772,7 +772,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "model.defaultReasoningEffort",
             "Default reasoning effort",
-            "Fallback reasoning effort for new agents",
+            "Fallback reasoning effort for new agents (provider-defined value, stored as-is; blank means unset)",
             "providers",
             None,
         ),
@@ -2681,7 +2681,7 @@ mod tests {
     /// `model.defaultReasoningEffort` is a TOML-backed optional string (no
     /// default — unset means no global effort preference), stored as-is under
     /// `[model]`; it round-trips through `settings.update` / `settings.reset`
-    /// to config.toml (never SQLite), and an empty string clears it to unset.
+    /// to config.toml (never SQLite), and a blank string clears it to unset.
     #[tokio::test]
     async fn model_default_reasoning_effort_is_a_toml_backed_optional_string() {
         let path = "model.defaultReasoningEffort";
@@ -2736,22 +2736,33 @@ mod tests {
             Some("xhigh")
         );
 
-        // An empty string clears it back to unset.
+        // An empty string clears it back to unset: the effective value is
+        // `None` and the wire value reads `null`, so no client (and no future
+        // resolution step) ever observes an explicit empty effort.
         svc.update(&json!([{ "path": path, "value": "" }]))
             .await
             .expect("clear with empty string");
         let got = svc.get(path).await.expect("get after clear");
-        assert_eq!(got["value"], json!(""));
+        assert_eq!(
+            got["value"],
+            serde_json::Value::Null,
+            "an empty string must read as unset"
+        );
         assert_eq!(
             registry
                 .snapshot()
                 .effective
                 .model
                 .default_reasoning_effort
-                .as_deref()
-                .filter(|e| !e.is_empty()),
+                .as_deref(),
             None,
             "an empty string must read as unset"
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.get(path),
+            Some(serde_json::Value::Null),
+            "a blank value in the file must read as unset"
         );
 
         // Reset restores the unset default.
