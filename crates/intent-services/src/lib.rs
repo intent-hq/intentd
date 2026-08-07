@@ -143,7 +143,10 @@ pub use events::{
     SpecialistsWatcher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
-pub use pr_ops::PrRefreshOutcome;
+pub use pr_ops::{
+    fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
+    MergeRequirementsChecks, MergeRequirementsThreads, PrRefreshOutcome,
+};
 
 /// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
 /// selector returns `true` for these). After a daemon crash the runtime

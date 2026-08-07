@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, Page, PageParams, PrQuery, PrState, PullRequest, RepoRef,
-    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-    SourceControl, SourceControlRegistry, SourceControlSettings,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrQuery, PrState,
+    PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewVerdict, RollupCheck, SourceControl, SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -661,6 +661,283 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
 }
 
 // ===========================================================================
+// Merge-requirements checklist ("what is needed to merge this PR"), composed
+// from the plain PR snapshot plus the host's merge-requirement signals. The
+// camelCase serde types are shared by the MCP result and the monitor loop.
+// ===========================================================================
+
+/// One check on the merge-requirements checklist.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirementCheck {
+    pub name: String,
+    /// `passed` / `failed` / `pending` — the [`CheckState`] rollup collapsed
+    /// onto the three states the checklist reports.
+    pub status: String,
+    /// Whether the base branch requires this check to merge. `false` when the
+    /// host reports it as optional *or* when the requirement is unknown (see
+    /// [`MergeRequirementsChecks::required_known`]).
+    pub required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The `checks` block of the checklist.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirementsChecks {
+    pub total: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub pending: i64,
+    /// Every check, in rollup order, each with its own `required` flag.
+    pub items: Vec<MergeRequirementCheck>,
+    /// Names of the required checks that are failing.
+    pub failing_required: Vec<String>,
+    /// Names of the required checks that are still running.
+    pub pending_required: Vec<String>,
+    /// Whether the per-check `required` flags are trustworthy — `false` when
+    /// the host did not report the rollup (degraded probe).
+    pub required_known: bool,
+}
+
+/// The `approvals` block of the checklist.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirementsApprovals {
+    /// The `ws.pr.snapshot` decision wire word (`approved` /
+    /// `changes_requested` / `review_required` / `none`).
+    pub decision: String,
+    /// Distinct approving reviewers (latest actionable review per author).
+    pub have: i64,
+    /// Approvals the base branch requires, when the rules are readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needed: Option<u32>,
+    pub changes_requested: i64,
+}
+
+/// The `threads` block of the checklist.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirementsThreads {
+    pub unresolved: i64,
+    /// Whether the base branch requires every thread resolved before merging;
+    /// `None` when the rules are unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_required: Option<bool>,
+}
+
+/// "What is needed to merge this PR" — the reusable checklist backing
+/// `ws.pr.monitor` and the monitor loop's change detection. Composed by
+/// [`merge_requirements`] from a [`PullRequest`] snapshot, the host's
+/// [`MergeRequirementSignals`], and the already-aggregated review / thread
+/// rollups.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequirements {
+    /// The 4-value [`derive_status_state`] word.
+    pub state: String,
+    pub is_draft: bool,
+    /// True when the forge reports merge conflicts.
+    pub has_conflicts: bool,
+    /// True when the PR branch is behind its base.
+    pub is_behind: bool,
+    /// The forge's mergeability tri-state (`None` = still computing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<bool>,
+    pub checks: MergeRequirementsChecks,
+    pub approvals: MergeRequirementsApprovals,
+    pub threads: MergeRequirementsThreads,
+    /// The host's raw merge-state status (GitHub GraphQL `mergeStateStatus`),
+    /// when reported — the residual signal for rules with no finer detail
+    /// (merge queue, signed commits, hooks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_state_status: Option<String>,
+    /// The human-readable [`merge_blocked_reason`] line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_blocked_reason: Option<String>,
+    /// Whether the base branch's rules were readable; `false` marks a degraded
+    /// checklist where `approvals.needed` / `threads.resolutionRequired` are
+    /// simply unknown.
+    pub rules_known: bool,
+}
+
+/// The checklist word for a rollup check's state.
+fn check_status_word(state: CheckState) -> &'static str {
+    match state {
+        CheckState::Pending => "pending",
+        CheckState::Success | CheckState::Neutral => "passed",
+        CheckState::Failure | CheckState::Cancelled => "failed",
+    }
+}
+
+/// Compose the merge-requirements checklist (§ task 1) from a PR snapshot, the
+/// host's merge-requirement signals, the aggregated reviews, and the
+/// unresolved-thread count.
+///
+/// Degradation is per-signal, never fatal: a host that reports no rollup
+/// yields `checks.requiredKnown == false` (with every `required` flag
+/// `false`), unreadable branch rules yield `rulesKnown == false` with
+/// `approvals.needed` / `threads.resolutionRequired` omitted, and a probe that
+/// failed entirely (`signals: None`) still produces the state / conflicts /
+/// approvals / threads rows from the snapshot alone. When the rollup is
+/// unavailable, the `checks` tallies fall back to `fallback_runs` (the REST
+/// check-runs the snapshot already fetched).
+pub(crate) fn merge_requirements(
+    pr: &PullRequest,
+    signals: Option<&MergeRequirementSignals>,
+    fallback_runs: &[CheckRun],
+    agg: &ReviewAggregate,
+    unresolved_threads: i64,
+) -> MergeRequirements {
+    let state = derive_status_state(pr);
+    let mergeable_state = pr.mergeable_state.as_deref().unwrap_or("unknown");
+    let merge_state_status = signals.and_then(|s| s.merge_state_status.clone());
+    let raw_status = merge_state_status.as_deref().unwrap_or_default();
+
+    // The GraphQL `mergeStateStatus` is finer-grained than REST
+    // `mergeable_state`; either reporting the condition is enough.
+    let has_conflicts = mergeable_state == "dirty" || raw_status == "DIRTY";
+    let is_behind = mergeable_state == "behind" || raw_status == "BEHIND";
+
+    let rollup: Option<&[RollupCheck]> = signals
+        .filter(|s| s.checks_known)
+        .map(|s| s.checks.as_slice());
+    let items: Vec<MergeRequirementCheck> = match rollup {
+        Some(checks) => checks
+            .iter()
+            .map(|c| MergeRequirementCheck {
+                name: c.name.clone(),
+                status: check_status_word(c.state).to_string(),
+                required: c.is_required,
+                url: c.url.clone(),
+            })
+            .collect(),
+        None => fallback_runs
+            .iter()
+            .map(|r| MergeRequirementCheck {
+                name: r.name.clone(),
+                status: check_status_word(r.state).to_string(),
+                required: false,
+                url: r.url.clone(),
+            })
+            .collect(),
+    };
+    let tally = |word: &str| items.iter().filter(|c| c.status == word).count() as i64;
+    let names = |word: &str| {
+        items
+            .iter()
+            .filter(|c| c.required && c.status == word)
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let checks = MergeRequirementsChecks {
+        total: items.len() as i64,
+        passed: tally("passed"),
+        failed: tally("failed"),
+        pending: tally("pending"),
+        failing_required: names("failed"),
+        pending_required: names("pending"),
+        required_known: rollup.is_some(),
+        items,
+    };
+
+    let rules = signals.and_then(|s| s.branch_rules.as_ref());
+    let approvals = MergeRequirementsApprovals {
+        decision: snapshot_review_decision(agg, state, signals.and_then(|s| s.review_decision))
+            .to_string(),
+        have: agg.approval_count,
+        needed: rules.and_then(|r| r.required_approving_review_count),
+        changes_requested: agg.changes_requested_count,
+    };
+    let threads = MergeRequirementsThreads {
+        unresolved: unresolved_threads,
+        resolution_required: rules.and_then(|r| r.required_conversation_resolution),
+    };
+
+    MergeRequirements {
+        state: state.to_string(),
+        is_draft: state == "draft",
+        has_conflicts,
+        is_behind,
+        mergeable: pr.mergeable,
+        checks,
+        approvals,
+        threads,
+        merge_state_status,
+        merge_blocked_reason: merge_blocked_reason(state, pr.mergeable, mergeable_state),
+        rules_known: rules.is_some(),
+    }
+}
+
+/// Fetch and compose the merge-requirements checklist for one PR — the
+/// one-call engine behind `ws.pr.monitor` and the monitor loop's refresh.
+///
+/// Every forge read degrades independently: an `Unsupported`/failing
+/// merge-requirements probe (non-GitHub hosts) falls back to the REST
+/// check-runs on the PR head, a failing check-run read reports an empty
+/// tally, a failing review read leaves the approvals aggregate empty, and a
+/// failing review-thread read reports zero unresolved threads. Only
+/// [`SourceControl::get_pr`] is load-bearing, so a partially-visible forge
+/// still yields a usable checklist.
+pub async fn fetch_merge_requirements(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+) -> Result<MergeRequirements> {
+    let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
+
+    let (signals, reviews) = tokio::join!(
+        sc.merge_requirements(repo_ref, number),
+        sc.list_reviews(repo_ref, number)
+    );
+    let signals = signals
+        .inspect_err(|e| {
+            tracing::debug!(
+                error = %e,
+                pr_number = number,
+                "merge requirements: probe unavailable, degrading to snapshot-only checklist"
+            );
+        })
+        .ok();
+    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+
+    // The REST check-runs are only needed when the probe carried no rollup.
+    let rollup_known = signals.as_ref().is_some_and(|s| s.checks_known);
+    let head_ref = pr
+        .head_sha
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
+    let fallback_runs = match head_ref {
+        Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
+            sc.check_runs(repo_ref, &git_ref).await.unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    let unresolved = match fetch_all_pages(|p| sc.get_review_threads(repo_ref, number, p)).await {
+        Ok((threads, _, _)) => count_thread_comments(&threads).1,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pr_number = number,
+                "merge requirements: review threads unavailable, reporting zero unresolved"
+            );
+            0
+        }
+    };
+
+    Ok(merge_requirements(
+        &pr,
+        signals.as_ref(),
+        &fallback_runs,
+        &agg,
+        unresolved,
+    ))
+}
+
+// ===========================================================================
 // Merge glue shared by `github.pulls.merge` and `accept-changes.mergePR`.
 // ===========================================================================
 
@@ -1185,6 +1462,196 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "rest-thread-10");
         assert_eq!(threads[0].comments.len(), 2);
+    }
+
+    fn rollup(name: &str, state: CheckState, required: bool) -> RollupCheck {
+        RollupCheck {
+            name: name.into(),
+            state,
+            is_required: required,
+            url: None,
+        }
+    }
+
+    fn agg(approvals: i64, changes: i64) -> ReviewAggregate {
+        ReviewAggregate {
+            approval_count: approvals,
+            changes_requested_count: changes,
+        }
+    }
+
+    #[test]
+    fn merge_requirements_full_checklist_names_required_checks() {
+        let p = pr(PrState::Open, false, Some(false), Some("blocked"));
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("BLOCKED".into()),
+            review_decision: Some(ReviewDecision::ReviewRequired),
+            checks: vec![
+                rollup("build", CheckState::Success, true),
+                rollup("test", CheckState::Failure, true),
+                rollup("e2e", CheckState::Pending, true),
+                rollup("optional-lint", CheckState::Failure, false),
+            ],
+            checks_known: true,
+            branch_rules: Some(intent_sourcecontrol::BranchRules {
+                required_approving_review_count: Some(2),
+                required_conversation_resolution: Some(true),
+                required_status_checks: vec!["build".into(), "test".into(), "e2e".into()],
+            }),
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 3);
+
+        assert_eq!(req.state, "open");
+        assert!(!req.is_draft);
+        assert!(!req.has_conflicts);
+        assert!(!req.is_behind);
+        assert_eq!(req.checks.total, 4);
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 2, 1)
+        );
+        // Only required checks are named; the optional failure is excluded.
+        assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        assert_eq!(req.checks.pending_required, vec!["e2e".to_string()]);
+        assert!(req.checks.required_known);
+        assert_eq!(req.approvals.decision, "review_required");
+        assert_eq!(req.approvals.have, 1);
+        assert_eq!(req.approvals.needed, Some(2));
+        assert_eq!(req.threads.unresolved, 3);
+        assert_eq!(req.threads.resolution_required, Some(true));
+        assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
+        assert_eq!(
+            req.merge_blocked_reason.as_deref(),
+            Some("blocked by required checks or reviews")
+        );
+        assert!(req.rules_known);
+
+        // camelCase wire shape (shared by the MCP result and the monitor).
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["isDraft"], serde_json::json!(false));
+        assert_eq!(wire["hasConflicts"], serde_json::json!(false));
+        assert_eq!(wire["mergeStateStatus"], serde_json::json!("BLOCKED"));
+        assert_eq!(
+            wire["checks"]["failingRequired"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(wire["checks"]["requiredKnown"], serde_json::json!(true));
+        assert_eq!(wire["approvals"]["needed"], serde_json::json!(2));
+        assert_eq!(
+            wire["threads"]["resolutionRequired"],
+            serde_json::json!(true)
+        );
+        assert_eq!(wire["rulesKnown"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn merge_requirements_degrades_without_rules_access() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("CLEAN".into()),
+            review_decision: Some(ReviewDecision::Approved),
+            checks: vec![rollup("build", CheckState::Success, false)],
+            checks_known: true,
+            branch_rules: None,
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), 0);
+
+        assert!(!req.rules_known);
+        assert_eq!(req.approvals.needed, None);
+        assert_eq!(req.threads.resolution_required, None);
+        assert_eq!(req.approvals.decision, "approved");
+        assert!(req.merge_blocked_reason.is_none());
+        // Unknown values are omitted from the wire, not sent as null.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire["approvals"].get("needed").is_none());
+        assert!(wire["threads"].get("resolutionRequired").is_none());
+    }
+
+    #[test]
+    fn merge_requirements_falls_back_to_rest_runs_without_a_rollup() {
+        let p = pr(PrState::Open, false, Some(true), Some("unstable"));
+        let runs = vec![
+            CheckRun {
+                name: "build".into(),
+                state: CheckState::Success,
+                url: Some("https://ci/1".into()),
+            },
+            CheckRun {
+                name: "test".into(),
+                state: CheckState::Failure,
+                url: None,
+            },
+        ];
+        // A probe that failed entirely still yields the snapshot-derived rows.
+        let req = merge_requirements(&p, None, &runs, &agg(0, 0), 2);
+        assert_eq!(req.checks.total, 2);
+        assert_eq!((req.checks.passed, req.checks.failed), (1, 1));
+        assert!(!req.checks.required_known);
+        // Without the rollup no check can be named as required.
+        assert!(req.checks.failing_required.is_empty());
+        assert!(req.checks.pending_required.is_empty());
+        assert_eq!(req.checks.items[0].url.as_deref(), Some("https://ci/1"));
+        assert!(!req.rules_known);
+        assert_eq!(req.approvals.decision, "none");
+        assert_eq!(req.threads.unresolved, 2);
+        assert!(req.merge_state_status.is_none());
+
+        // A host that reports the signals but no rollup degrades the same way.
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("UNSTABLE".into()),
+            checks_known: false,
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&signals), &runs, &agg(0, 0), 0);
+        assert_eq!(req.checks.total, 2);
+        assert!(!req.checks.required_known);
+        assert_eq!(req.merge_state_status.as_deref(), Some("UNSTABLE"));
+    }
+
+    #[test]
+    fn merge_requirements_reports_draft_and_conflicts() {
+        let draft = pr(PrState::Open, true, Some(true), Some("clean"));
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("DRAFT".into()),
+            ..Default::default()
+        };
+        let req = merge_requirements(&draft, Some(&signals), &[], &agg(0, 0), 0);
+        assert_eq!(req.state, "draft");
+        assert!(req.is_draft);
+        assert_eq!(
+            req.merge_blocked_reason.as_deref(),
+            Some("draft PRs cannot be merged")
+        );
+
+        let dirty = pr(PrState::Open, false, Some(false), Some("dirty"));
+        let req = merge_requirements(&dirty, None, &[], &agg(0, 0), 0);
+        assert!(req.has_conflicts);
+        assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
+
+        // The GraphQL status alone is enough to report conflicts / behind when
+        // REST `mergeable_state` is still computing.
+        let unknown = pr(PrState::Open, false, None, Some("unknown"));
+        let signals = MergeRequirementSignals {
+            merge_state_status: Some("BEHIND".into()),
+            ..Default::default()
+        };
+        let req = merge_requirements(&unknown, Some(&signals), &[], &agg(0, 0), 0);
+        assert!(req.is_behind);
+        assert!(!req.has_conflicts);
+    }
+
+    #[test]
+    fn merge_requirements_leaves_unknown_mergeability_unresolved() {
+        let p = pr(PrState::Open, false, None, Some("unknown"));
+        let req = merge_requirements(&p, None, &[], &agg(0, 0), 0);
+        assert_eq!(req.mergeable, None);
+        assert!(!req.has_conflicts);
+        assert!(!req.is_behind);
+        // Still-computing mergeability is not a blocked reason.
+        assert!(req.merge_blocked_reason.is_none());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("mergeable").is_none());
+        assert!(wire.get("mergeBlockedReason").is_none());
     }
 
     #[test]
