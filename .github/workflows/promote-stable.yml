@@ -18,8 +18,9 @@
 # promotable release only has to exist and not be a draft. Promotion clears the
 # prerelease flag and marks vX.Y.Z as Latest on this repo and — when the mirror
 # token is configured — on intent-hq/intentd-releases, so the Latest badge
-# always tracks the newest stable version. Both steps are idempotent, so
-# re-promoting the same version just re-applies the flags.
+# tracks the most recently promoted version (a rollback re-promotion moves it
+# back). Both steps are idempotent, so re-promoting the same version just
+# re-applies the flags.
 #
 # As a best-effort extra, promotion also rewrites the `channel-stable` release
 # body with aggregated release notes covering every version since the previous
@@ -138,7 +139,7 @@ jobs:
         if: steps.mark-latest.outcome != 'success'
         shell: bash
         run: |
-          echo "::warning::Failed to mark v${VERSION} as non-prerelease/Latest on $GITHUB_REPOSITORY; the stable manifest is published and unaffected"
+          echo "::warning::Failed to mark v${VERSION} as non-prerelease/Latest on $GITHUB_REPOSITORY; the stable manifest is published and unaffected. Re-run the promotion for this version to retry the marking."
       # Fail-soft: aggregated notes are a nice-to-have; a failure here must
       # never fail the promotion (the manifest is already published).
       - name: Aggregate stable release notes
