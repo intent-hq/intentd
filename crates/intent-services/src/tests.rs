@@ -1346,6 +1346,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             "not_started".into(),
             vec!["criterion one".into()],
             Some("M".into()),
+            None,
         )
         .await
         .expect("markAsTask");
@@ -1379,6 +1380,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             id.clone(),
             "Child Step".into(),
             Some("details".into()),
+            None,
             None,
         )
         .await
@@ -1507,9 +1509,16 @@ async fn task_list_and_get_project_workspace_tasks() {
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
-    svc.mark_as_task(ws.clone(), id.clone(), "not_started".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
         .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
@@ -4271,6 +4280,365 @@ mod change_event_parity {
             ev["actor"],
             json!({ "type": "agent", "id": "agent-prov", "name": "Prov" })
         );
+    }
+
+    /// Drain every published event until the bus goes quiet, flattening
+    /// batches into one ordered list of wire-JSON envelopes.
+    async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                out.push(serde_json::to_value(&ev).expect("serialize event"));
+            }
+        }
+        out
+    }
+
+    fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+        events
+            .iter()
+            .filter(|e| e["type"] == event_type)
+            .collect::<Vec<_>>()
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_emits_task_created_and_note_updated() {
+        let h = harness().await;
+        let n = note(&h.ws, "plain-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+
+        let updated = of_type(&events, "note:updated");
+        assert_eq!(updated.len(), 1, "markAsTask must emit note:updated");
+        assert_eq!(updated[0]["data"]["noteId"], "plain-1");
+
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "exactly one task:created");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], "plain-1");
+        assert_eq!(ev["data"]["noteTitle"], "Title");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+        assert!(ev["data"].get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_emits_status_changed_not_created() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "already-task", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(
+            of_type(&events, "task:created").is_empty(),
+            "re-marking an existing task is a status move, not a creation"
+        );
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        // A status move takes the same pair `task.updateNoteStatus` publishes.
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "exactly one task:status-changed");
+        assert_envelope(changed[0], &h.ws.0, "task:status-changed");
+        assert_eq!(changed[0]["data"]["noteId"], "already-task");
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        let ready = of_type(&events, "task:ready-tasks-changed");
+        assert_eq!(ready.len(), 1, "ready-set recompute follows the transition");
+        assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], "already-task");
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_same_status_emits_no_task_event() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "same-status", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(of_type(&events, "task:created").is_empty());
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_emits_task_created_per_child() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-1",
+            "intro\n@@@task\n# Build API\nBuild it.\n@@@\ntail",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .convert_task_blocks(h.ws.clone(), n.id.clone(), None)
+            .await
+            .expect("convertBlocks");
+        assert_eq!(r.created_note_ids.len(), 1);
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "one task:created per converted block");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], r.created_note_ids[0]);
+        assert_eq!(ev["data"]["noteTitle"], "Build API");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_task_created_carries_agent_id() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-agent",
+            "intro\n@@@task\n# Agent Task\nbody\n@@@",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-conv"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Conv".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let mut sub = subscribe(&h);
+        h.services
+            .convert_task_blocks(
+                h.ws.clone(),
+                n.id.clone(),
+                Some(AgentId::from("agent-conv")),
+            )
+            .await
+            .expect("convertBlocks");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-conv");
+        assert_eq!(
+            created[0]["actor"],
+            json!({ "type": "agent", "id": "agent-conv", "name": "Conv" })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_prerequisite_emits_task_created() {
+        let h = harness().await;
+        let n = note(&h.ws, "dependent-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .create_prerequisite(
+                h.ws.clone(),
+                n.id.clone(),
+                "Prereq".to_string(),
+                None,
+                Some("not_started".to_string()),
+                None,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_envelope(created[0], &h.ws.0, "task:created");
+        assert_eq!(created[0]["data"]["noteId"], r.prerequisite_note_id.0);
+        assert_eq!(created[0]["data"]["noteTitle"], "Prereq");
+        assert_eq!(created[0]["data"]["status"], "not_started");
+    }
+
+    /// LC-1 parity for the two `task.*` paths that now thread the caller:
+    /// `markAsTask` and `createPrerequisite` attribute their emissions to the
+    /// invoking agent when the MCP front door supplies one.
+    #[tokio::test]
+    async fn mark_as_task_and_create_prerequisite_carry_agent_id() {
+        let h = harness().await;
+        let plain = note(&h.ws, "plain-agent", "body");
+        h.store.insert_note(&plain).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-task"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Tasker".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let caller = Some(AgentId::from("agent-task"));
+        let agent_actor = json!({ "type": "agent", "id": "agent-task", "name": "Tasker" });
+
+        // markAsTask on a plain note → agent-attributed task:created.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
+
+        // markAsTask on the now-task note → agent-attributed status change.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-task");
+        assert_eq!(changed[0]["actor"], agent_actor);
+
+        // createPrerequisite → the child's task:created is agent-attributed.
+        let mut sub = subscribe(&h);
+        h.services
+            .create_prerequisite(
+                h.ws.clone(),
+                plain.id.clone(),
+                "Prereq".to_string(),
+                None,
+                None,
+                caller,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
     }
 
     #[tokio::test]

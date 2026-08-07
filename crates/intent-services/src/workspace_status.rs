@@ -2069,6 +2069,7 @@ mod display_status_events {
                 "Fresh prerequisite".to_string(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("create prerequisite");

@@ -6235,6 +6235,7 @@ mod wsapi3_bindings_tests {
             status: String,
             acceptance_criteria: Vec<String>,
             effort: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
             self.mark_as_task_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -6279,6 +6280,7 @@ mod wsapi3_bindings_tests {
             title: String,
             content: Option<String>,
             status: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
             self.create_prereq_calls.lock().unwrap().push((
                 dependent_note_id.as_str().to_string(),
