@@ -50,6 +50,64 @@ use uuid::Uuid;
 
 use crate::Services;
 
+/// The concise per-agent state digest behind `ws.agent.snapshot()` and the
+/// per-turn prompt injection (`current ws.agent.snapshot() => {...}`).
+/// Serialized as single-line camelCase JSON with zero-count and null fields
+/// omitted to preserve tokens; `time` is always present.
+///
+/// `num_questions_asked` counts this agent's structured questions currently
+/// pending: questions registered via `ws.app.question.ask` in the current
+/// turn that are still waiting for the turn-end drain (turn-attachment
+/// registry), plus questions already presented on the trailing assistant
+/// message and not yet answered or dismissed (the counting form of the
+/// question-hold derivation) — see [`Services::pending_question_count`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSnapshot {
+    /// Current UTC timestamp (whole-second RFC-3339).
+    pub(crate) time: String,
+    /// Active (scheduled/running) background hooks owned by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) hooks: usize,
+    /// Active sub-agent completion watches registered by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) agent_watches: usize,
+    /// Pending messages in this agent's own delivery queue.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) queued_messages: usize,
+    /// Active workspace event subscriptions owned by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) event_subscriptions: usize,
+    /// Delegated child agents not yet settled (non-terminal status).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) running_sub_agents: usize,
+    /// Structured questions still pending presentation/answer.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) num_questions_asked: usize,
+    /// `"blocker"` / `"discussion"` when this agent has raised an attention
+    /// request that is still unresolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_attention: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl AgentSnapshot {
+    /// `true` when every field other than `time` is zero/absent — the
+    /// injection-skip condition (`time` alone never forces an injection).
+    pub(crate) fn is_trivial(&self) -> bool {
+        self.hooks == 0
+            && self.agent_watches == 0
+            && self.queued_messages == 0
+            && self.event_subscriptions == 0
+            && self.running_sub_agents == 0
+            && self.num_questions_asked == 0
+            && self.pending_attention.is_none()
+    }
+}
+
 /// Outcome of [`Services::scan_assigned_agents`]: the newest live/resumable
 /// session (occupancy), the newest known session (inheritance source), plus
 /// the stale (`cleaned_up`) and poisoned assignment ids the wakeOrCreate
@@ -1250,12 +1308,6 @@ pub(crate) fn question_block_count(content: &Value) -> usize {
             })
             .count()
     })
-}
-
-/// `true` iff a message's content-block array carries at least one pending
-/// question resource block.
-pub(crate) fn has_question_blocks(content: &Value) -> bool {
-    question_block_count(content) > 0
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -3586,35 +3638,71 @@ impl Services {
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        self.pending_question_tail_count(agent_id).await > 0
+    }
+
+    /// The number of question resource blocks still pending at the tail of
+    /// the transcript — the counting form of the question-hold derivation
+    /// ([`Services::question_hold_active`] is exactly `count > 0`): the block
+    /// count of the trailing assistant message when it carries question
+    /// blocks that were not dismissed, `0` otherwise. Backs the
+    /// `numQuestionsAsked` snapshot field alongside the turn-attachment
+    /// registry count ([`Services::pending_question_count`]).
+    pub(crate) async fn pending_question_tail_count(&self, agent_id: &AgentId) -> usize {
         // Page back over the tail, growing the window while every fetched
         // row is `system`-role, so an arbitrarily long run of trailing
         // system markers (e.g. repeated interruption notices) can never hide
         // a still-pending question underneath it. Stops as soon as a
         // non-system row is found, the fetched page comes back shorter than
         // requested (the whole transcript was system rows or empty — no
-        // hold), or the safety cap is hit (fails open to `false`).
+        // hold), or the safety cap is hit (fails open to `0`).
         const HOLD_DERIVATION_TAIL_START: i64 = 10;
         const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
         let mut tail = HOLD_DERIVATION_TAIL_START;
         let last = loop {
             let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
-                return false;
+                return 0;
             };
             if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
                 break last.clone();
             }
             if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
-                return false;
+                return 0;
             }
             tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
         };
-        if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return false;
+        if last.role != "assistant" {
+            return 0;
+        }
+        let count = question_block_count(&last.content);
+        if count == 0 {
+            return 0;
         }
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
-            return false;
+            return 0;
         };
-        session.dismissed_questions_message_id() != Some(last.id.as_str())
+        if session.dismissed_questions_message_id() == Some(last.id.as_str()) {
+            0
+        } else {
+            count
+        }
+    }
+
+    /// This agent's structured questions currently pending — the
+    /// `numQuestionsAsked` snapshot field: questions registered via
+    /// `ws.app.question.ask` earlier in the CURRENT turn that are still
+    /// waiting for the turn-end drain (turn-attachment registry, question
+    /// MIME type), plus questions already presented on the trailing
+    /// assistant message that are still awaiting an answer or dismissal
+    /// ([`Services::pending_question_tail_count`]). The two sources are
+    /// disjoint by construction: the registry drains into the trailing
+    /// message when the turn finalizes.
+    pub(crate) async fn pending_question_count(&self, agent_id: &AgentId) -> usize {
+        let in_turn = self.turn_attachments.pending_count_by_mime(
+            agent_id,
+            intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+        );
+        in_turn + self.pending_question_tail_count(agent_id).await
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
@@ -5921,6 +6009,97 @@ impl Services {
         self.redeliver_completion_after_queue_mutation(&agent_id)
             .await;
         Ok(json!({ "success": true }))
+    }
+
+    /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
+    /// behind `ws.agent.snapshot()` and the turn-prompt injection line
+    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
+    /// every field reads a per-agent registry or a per-agent store lookup —
+    /// no workspace-wide scans beyond the one summary listing that resolves
+    /// the agent's unsettled children.
+    pub(crate) async fn build_agent_snapshot(&self, agent_id: &AgentId) -> Result<AgentSnapshot> {
+        let session = self.store.get_agent_session_summary(agent_id).await?;
+        let hooks = self.active_hooks_for_agent(agent_id).await.len();
+        let agent_watches = self.list_watches_for_parent(agent_id).len();
+        let queued_messages = self.queue_snapshot(agent_id).len();
+        let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
+        // Delegated children not yet settled: sessions parented by this agent
+        // whose status is still non-terminal. One message-free summary read
+        // over the agent's home workspace (children are created there).
+        let running_sub_agents = self
+            .store
+            .list_agent_session_summaries(&session.workspace_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| {
+                s.parent_agent_id.as_ref() == Some(agent_id)
+                    && !matches!(
+                        s.status,
+                        AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+                    )
+            })
+            .count();
+        let num_questions_asked = self.pending_question_count(agent_id).await;
+        // Whole-second UTC timestamp — the snapshot line is injected into
+        // every turn prompt, so sub-second precision only spends tokens.
+        let time = {
+            let iso = now_iso();
+            match iso.split_once('.') {
+                Some((head, _)) => format!("{head}Z"),
+                None => iso,
+            }
+        };
+        Ok(AgentSnapshot {
+            time,
+            hooks,
+            agent_watches,
+            queued_messages,
+            event_subscriptions,
+            running_sub_agents,
+            num_questions_asked,
+            pending_attention: session.attention_request_kind,
+        })
+    }
+
+    /// `ws.agent.snapshot()` (MCP-only, PROTOCOL §7.1): the caller's own
+    /// state snapshot as a plain JSON object — zero-count and null fields
+    /// omitted, `time` always present. Never gated by
+    /// `agentFeatures.stateSnapshot` (the toggle governs only the turn-prompt
+    /// injection). Workspace mismatch fails closed as `NotFound`
+    /// (defense-in-depth against bare-id probes, same as `getSessionStats`).
+    pub(crate) async fn agent_snapshot_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        let snapshot = self.build_agent_snapshot(&agent_id).await?;
+        serde_json::to_value(&snapshot)
+            .map_err(|e| Error::Internal(format!("serialize agent snapshot: {e}")))
+    }
+
+    /// The per-turn snapshot injection line for `agent_id`, or `None` when
+    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off
+    /// (read LIVE each turn — a deliberate deviation from the
+    /// captured-at-creation agentFeatures convention, so flipping the toggle
+    /// affects the very next turn of every session), the snapshot is trivial
+    /// (every field other than `time` zero/absent — `time` alone never forces
+    /// an injection), or the snapshot could not be built (fails open to no
+    /// line so a store error never blocks a turn).
+    pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
+        if !self.effective_settings().agent_features.state_snapshot {
+            return None;
+        }
+        let snapshot = self.build_agent_snapshot(agent_id).await.ok()?;
+        if snapshot.is_trivial() {
+            return None;
+        }
+        let json = serde_json::to_string(&snapshot).ok()?;
+        Some(format!("current ws.agent.snapshot() => {json}"))
     }
 
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,

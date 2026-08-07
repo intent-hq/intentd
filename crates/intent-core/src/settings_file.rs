@@ -646,6 +646,13 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.attentionRequests` — expose attention requests
     /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
     pub attention_requests: bool,
+    /// `agentFeatures.stateSnapshot` — inject the per-turn agent state
+    /// snapshot line (`current ws.agent.snapshot() => {...}`) into outbound
+    /// turn prompts. Unlike the other toggles this is read LIVE each turn —
+    /// flipping it affects the very next turn of every session, existing
+    /// ones included. The `ws.agent.snapshot()` MCP tool itself is never
+    /// gated.
+    pub state_snapshot: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -659,6 +666,7 @@ impl Default for AgentFeaturesSettings {
             rich_chat_blocks: true,
             structured_questions: true,
             attention_requests: true,
+            state_snapshot: true,
         }
     }
 }
@@ -1108,6 +1116,10 @@ structuredQuestions = true
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
+# State snapshot -- inject the per-turn agent state snapshot line into turn
+# prompts; unlike the other toggles this applies to the next turn of every
+# session (live), existing sessions included.
+stateSnapshot = true
 "##;
 
 #[cfg(test)]
@@ -1206,6 +1218,7 @@ mod tests {
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
+        assert!(d.agent_features.state_snapshot);
     }
 
     #[test]
@@ -1235,6 +1248,7 @@ mod tests {
         assert!(parsed.agent_features.browser_automation);
         assert!(parsed.agent_features.structured_questions);
         assert!(parsed.agent_features.attention_requests);
+        assert!(parsed.agent_features.state_snapshot);
     }
 
     #[test]

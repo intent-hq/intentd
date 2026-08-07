@@ -1308,6 +1308,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.stateSnapshot",
+            "State snapshot",
+            "Inject the per-turn agent state snapshot line into turn prompts; applies to the next turn of every session (live)",
+            "agentFeatures",
+            true,
+        ),
     ]
 }
 
@@ -2354,7 +2361,7 @@ mod tests {
         }
     }
 
-    /// The eight `agentFeatures.*` toggles are TOML-backed booleans, all
+    /// The nine `agentFeatures.*` toggles are TOML-backed booleans, all
     /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
     /// category and a `KNOWN_PATHS` entry, and each round-trips through the
     /// registry-wired service (default origin → file override → reset).
@@ -2369,6 +2376,7 @@ mod tests {
             "agentFeatures.richChatBlocks",
             "agentFeatures.structuredQuestions",
             "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
         ];
         for path in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

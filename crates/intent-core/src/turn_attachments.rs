@@ -195,6 +195,23 @@ impl TurnAttachmentRegistry {
         claimed
     }
 
+    /// Count `agent_id`'s pending attachments carrying `mime_type` (expired
+    /// entries evicted first). Read-only introspection — backs the
+    /// `numQuestionsAsked` field of the agent state snapshot, which counts
+    /// questions registered earlier in the same turn that are still waiting
+    /// for the turn-end drain.
+    pub fn pending_count_by_mime(&self, agent_id: &AgentId, mime_type: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entries) = inner.get_mut(agent_id) else {
+            return 0;
+        };
+        evict_expired(entries);
+        entries
+            .iter()
+            .filter(|e| e.attachment.mime_type == mime_type)
+            .count()
+    }
+
     /// Finish `agent_id`'s turn: return the pending `AtTurnEnd` attachments
     /// (in registration order) and clear ALL remaining entries — unclaimed
     /// `AtToolResult` leftovers are dropped so they cannot attach to a later
@@ -331,6 +348,26 @@ mod tests {
             .claim_at_tool_result(&a, None, "workspace_api")
             .is_empty());
         assert!(reg.finish_turn(&a).is_empty());
+    }
+
+    #[test]
+    fn pending_count_by_mime_filters_and_scopes() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        let mime = "application/vnd.intent.proposal+json";
+        assert_eq!(reg.pending_count_by_mime(&a, mime), 0);
+        reg.register(&a, attachment("tar-c1", AttachmentPolicy::AtTurnEnd));
+        reg.register(&a, attachment("tar-c2", AttachmentPolicy::AtToolResult));
+        assert_eq!(reg.pending_count_by_mime(&a, mime), 2);
+        assert_eq!(reg.pending_count_by_mime(&a, "text/plain"), 0);
+        assert_eq!(
+            reg.pending_count_by_mime(&AgentId::from_string("agent-other"), mime),
+            0
+        );
+        // Counting never consumes entries.
+        assert_eq!(reg.pending_count_by_mime(&a, mime), 2);
+        reg.finish_turn(&a);
+        assert_eq!(reg.pending_count_by_mime(&a, mime), 0);
     }
 
     #[test]

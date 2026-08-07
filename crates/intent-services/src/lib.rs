@@ -17814,6 +17814,14 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_snapshot_op(workspace_id, agent_id).await })
+    }
+
     fn agent_cancel_subscriptions(
         &self,
         workspace_id: WorkspaceId,
