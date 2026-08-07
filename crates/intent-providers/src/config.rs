@@ -10,7 +10,7 @@
 /// one-line code change here.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.60.0"
+        "0.66.0"
     };
 }
 
@@ -34,13 +34,13 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. Matches the
 /// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
 /// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.7";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.14";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
 /// bumping the version is a deliberate code change. Also feeds the pi
 /// model-catalog probe in `intent-services::provider_models`.
-pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.31";
+pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
 
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
@@ -296,7 +296,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
-        // The pinned @agentclientprotocol/codex-acp adapter (1.1.7) ignores
+        // The pinned @agentclientprotocol/codex-acp adapter (1.1.14) ignores
         // `_meta.developerInstructions` (verified empirically, #479), so the
         // system prompt is delivered via the first-turn `<system>` prepend
         // instead of SessionMeta.
@@ -353,7 +353,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
-        // pi-acp (0.0.31) has no `_meta` system-prompt path and no rules/MCP
+        // pi-acp (0.0.33) has no `_meta` system-prompt path and no rules/MCP
         // CLI flags (it advertises `mcpCapabilities: { http: false, sse:
         // false }` and does not wire `session/new` `mcpServers` into the pi
         // process), so the assembled prompt is prepended on the first turn.
@@ -366,7 +366,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // The adapter's `session/new` result advertises the model as a
         // `configOptions[id="model"]` select; the stored model is applied
         // post-session via `session/set_config_option` (verified against
-        // pi-acp@0.0.31's `setSessionConfigOption`; no CLI model flag).
+        // pi-acp@0.0.33's `setSessionConfigOption`; no CLI model flag).
         supports_config_option_model: true,
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),

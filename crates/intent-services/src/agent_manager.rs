@@ -928,7 +928,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.31) reads to override the `pi` binary it spawns
+/// Env var pi-acp (0.0.33) reads to override the `pi` binary it spawns
 /// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
 /// `create_agent` points it at the generated wrapper script.
 const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
