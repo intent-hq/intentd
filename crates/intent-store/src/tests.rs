@@ -5502,6 +5502,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         last_logs: None,
         last_state: None,
         expires_at: Some(now_iso()),
+        perpetual: false,
+        dispatch_count: 0,
     }
 }
 
@@ -5537,6 +5539,46 @@ async fn hook_insert_get_round_trip() {
 
     let missing = HookId("hook-missing".to_string());
     let err = store.get_hook(&missing).await.expect_err("missing hook");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// A perpetual hook round-trips its `perpetual` / `dispatch_count` columns,
+/// and the dispatch-count bump persists.
+#[tokio::test]
+async fn hook_perpetual_and_dispatch_count_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    // Default (one-shot) row reads back as `false` / 0.
+    let one_shot_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    store
+        .insert_hook(&sample_hook(&one_shot_id, &ws, &agent, "one-shot"))
+        .await
+        .expect("insert one-shot");
+    let one_shot = store.get_hook(&one_shot_id).await.expect("get one-shot");
+    assert!(!one_shot.perpetual);
+    assert_eq!(one_shot.dispatch_count, 0);
+
+    let id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut hook = sample_hook(&id, &ws, &agent, "perpetual");
+    hook.perpetual = true;
+    hook.dispatch_count = 2;
+    store.insert_hook(&hook).await.expect("insert perpetual");
+    assert_eq!(store.get_hook(&id).await.expect("get hook"), hook);
+
+    store
+        .increment_hook_dispatch_count(&id)
+        .await
+        .expect("bump dispatch count");
+    let bumped = store.get_hook(&id).await.expect("get bumped");
+    assert!(bumped.perpetual);
+    assert_eq!(bumped.dispatch_count, 3);
+
+    let err = store
+        .increment_hook_dispatch_count(&HookId("hook-missing".to_string()))
+        .await
+        .expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 }
 

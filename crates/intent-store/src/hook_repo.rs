@@ -10,7 +10,7 @@ use crate::Store;
 
 const COLUMNS: &str = "hook_id, workspace_id, agent_id, name, code, delay_ms, state, \
     created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, \
-    expires_at";
+    expires_at, perpetual, dispatch_count";
 
 fn state_to_db(state: HookState) -> &'static str {
     match state {
@@ -53,6 +53,7 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
         r.try_get::<i64, _>(col)
             .map_err(|e| intent_core::Error::Internal(format!("read hook row failed: {e}")))
     };
+    let perpetual = get_i64("perpetual")? != 0;
     Ok(Hook {
         hook_id: HookId(get("hook_id")?),
         workspace_id: WorkspaceId(get("workspace_id")?),
@@ -69,6 +70,8 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
         last_logs: get_opt("last_logs")?,
         last_state: get_opt("last_state")?,
         expires_at: get_opt("expires_at")?,
+        perpetual,
+        dispatch_count: get_i64("dispatch_count")?,
     })
 }
 
@@ -76,7 +79,7 @@ impl Store {
     /// Insert a new hook row.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
         let sql = format!(
-            "INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
         sqlx::query(&sql)
             .bind(&h.hook_id.0)
@@ -94,6 +97,8 @@ impl Store {
             .bind(&h.last_logs)
             .bind(&h.last_state)
             .bind(&h.expires_at)
+            .bind(i64::from(h.perpetual))
+            .bind(h.dispatch_count)
             .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("insert hook failed: {e}")))?;
@@ -196,6 +201,25 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| intent_core::Error::Internal(format!("update hook run failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bump a hook's `dispatch_count`; `NotFound` when the row is absent.
+    pub async fn increment_hook_dispatch_count(&self, hook_id: &HookId) -> Result<()> {
+        let res =
+            sqlx::query("UPDATE hook SET dispatch_count = dispatch_count + 1 WHERE hook_id = ?")
+                .bind(&hook_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| {
+                    intent_core::Error::Internal(format!("update hook dispatch count failed: {e}"))
+                })?;
         if res.rows_affected() == 0 {
             return Err(intent_core::Error::NotFound(format!(
                 "hook {} not found",
