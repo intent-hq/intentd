@@ -1315,6 +1315,31 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.prMonitor",
+            "PR monitor",
+            "Expose centralized PR monitoring (ws.pr.monitor / ws.pr.unmonitor) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        number(
+            "prMonitor.debounceSeconds",
+            "PR monitor debounce seconds",
+            "Quiet window (in seconds) a changed PR must observe before its consolidated wake is delivered (minimum 10)",
+            "prMonitor",
+            Some(10.0),
+            Some(86_400.0),
+            60.0,
+        ),
+        number(
+            "prMonitor.pollSeconds",
+            "PR monitor poll seconds",
+            "How often (in seconds) the centralized loop polls each monitored PR (minimum 10)",
+            "prMonitor",
+            Some(10.0),
+            Some(3_600.0),
+            30.0,
+        ),
     ]
 }
 
@@ -2361,7 +2386,7 @@ mod tests {
         }
     }
 
-    /// The eight `agentFeatures.*` toggles are TOML-backed booleans, all
+    /// The nine `agentFeatures.*` toggles are TOML-backed booleans, all
     /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
     /// category and a `KNOWN_PATHS` entry, and each round-trips through the
     /// registry-wired service (default origin → file override → reset).
@@ -2376,6 +2401,7 @@ mod tests {
             "agentFeatures.richChatBlocks",
             "agentFeatures.structuredQuestions",
             "agentFeatures.attentionRequests",
+            "agentFeatures.prMonitor",
         ];
         for path in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -2430,6 +2456,86 @@ mod tests {
             .await
             .expect_err("string value must reject");
         assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
+    /// `debounceSeconds` (default 60) and `pollSeconds` (default 30, a
+    /// config-file key the Settings UI does not surface). Both round-trip
+    /// through the registry-wired service and reject sub-floor values.
+    #[tokio::test]
+    async fn pr_monitor_intervals_round_trip_via_registry() {
+        for (path, default) in [
+            ("prMonitor.debounceSeconds", 60.0),
+            ("prMonitor.pollSeconds", 30.0),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert_eq!(def.category, "prMonitor");
+            assert!(
+                matches!(
+                    def.ty,
+                    SettingType::Number {
+                        min: Some(10.0),
+                        ..
+                    }
+                ),
+                "{path} number with a floor of 10"
+            );
+            assert_eq!(def.default_value, Some(json!(default)), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for (path, default) in [
+            ("prMonitor.debounceSeconds", 60.0),
+            ("prMonitor.pollSeconds", 30.0),
+        ] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(default), "{path} default");
+            assert_eq!(got["origin"], json!("default"), "{path} origin");
+
+            svc.update(&json!([{ "path": path, "value": 120 }]))
+                .await
+                .expect("update");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(120.0), "{path} updated");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+
+            // Sub-floor values reject before anything is written.
+            let err = svc
+                .update(&json!([{ "path": path, "value": 5 }]))
+                .await
+                .expect_err("sub-floor value must reject");
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+
+            let reset = svc.reset(path).await.expect("reset");
+            assert_eq!(reset["value"], json!(default), "{path} reset");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
+        }
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

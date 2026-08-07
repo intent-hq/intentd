@@ -596,15 +596,15 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
-    /// Poll cadence (seconds) for the centralized PR-monitor loop
-    /// (`[prMonitor] pollSeconds`). `None` takes
-    /// [`pr_monitor::DEFAULT_PR_MONITOR_POLL_SECONDS`]; values below the
-    /// floor are clamped at read time.
+    /// Explicit override for the centralized PR-monitor loop's poll cadence
+    /// (seconds). `None` — the production wiring — reads
+    /// `prMonitor.pollSeconds` live from the settings registry; values below
+    /// the floor are clamped at read time.
     pr_monitor_poll_seconds: Option<u64>,
-    /// Debounce quiet window (seconds) before a changed PR's consolidated
-    /// wake is delivered (`[prMonitor] debounceSeconds`). `None` takes
-    /// [`pr_monitor::DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS`]; values below the
-    /// floor are clamped at read time.
+    /// Explicit override for the debounce quiet window (seconds) before a
+    /// changed PR's consolidated wake is delivered. `None` — the production
+    /// wiring — reads `prMonitor.debounceSeconds` live from the settings
+    /// registry; values below the floor are clamped at read time.
     pr_monitor_debounce_seconds: Option<u64>,
     /// Cap on concurrently active PR monitors per agent (mirrors
     /// `[hooks] maxPerAgent`).
@@ -701,17 +701,17 @@ impl Services {
         }
     }
 
-    /// Override the PR-monitor poll cadence (`[prMonitor] pollSeconds`);
-    /// wired from `Config` by the composition root. Values below the floor
+    /// Pin the PR-monitor poll cadence, bypassing the live
+    /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
     /// are clamped when read.
     pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
 
-    /// Override the PR-monitor debounce window (`[prMonitor]
-    /// debounceSeconds`); wired from `Config` by the composition root.
-    /// Values below the floor are clamped when read.
+    /// Pin the PR-monitor debounce window, bypassing the live
+    /// `prMonitor.debounceSeconds` setting (test wiring). Values below the
+    /// floor are clamped when read.
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_debounce_seconds = Some(seconds);
         self

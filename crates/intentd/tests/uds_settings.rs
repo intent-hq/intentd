@@ -503,7 +503,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     assert_eq!(reset["value"], json!(true));
     let _ = read_json(&mut sr).await; // drain the settings:changed event.
 
-    // `agentFeatures.*` — the eight agent feature toggles are plain non-secret
+    // `agentFeatures.*` — the nine agent feature toggles are plain non-secret
     // TOML-backed booleans defaulting to on: list/get expose the defaults,
     // update/reset round-trip, and mistyped values → -32602.
     let list = rpc(&mut w, &mut r, 26, "settings.list", json!({})).await;
@@ -516,11 +516,25 @@ async fn settings_round_trip_redaction_validation_and_event() {
         "agentFeatures.richChatBlocks",
         "agentFeatures.structuredQuestions",
         "agentFeatures.attentionRequests",
+        "agentFeatures.prMonitor",
     ] {
         let e = entry(&list, path);
         assert_eq!(e["type"], "boolean", "{path}");
         assert_eq!(e["value"], json!(true), "{path}");
         assert_eq!(e["category"], "agentFeatures", "{path}");
+        assert!(e.get("sensitive").is_none(), "{path}");
+    }
+
+    // `[prMonitor]` — two non-secret TOML-backed numbers with a floor of 10.
+    for (path, default) in [
+        ("prMonitor.debounceSeconds", 60.0),
+        ("prMonitor.pollSeconds", 30.0),
+    ] {
+        let e = entry(&list, path);
+        assert_eq!(e["type"], "number", "{path}");
+        assert_eq!(e["value"], json!(default), "{path}");
+        assert_eq!(e["category"], "prMonitor", "{path}");
+        assert_eq!(e["min"], json!(10.0), "{path}");
         assert!(e.get("sensitive").is_none(), "{path}");
     }
     let resp = call(

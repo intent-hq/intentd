@@ -37,19 +37,7 @@ use serde_json::{json, Value};
 use crate::pr_ops::{self, MergeRequirements};
 use crate::{publish_event, system_actor, Services};
 
-/// Default poll cadence for the centralized monitor loop
-/// (`[prMonitor] pollSeconds`).
-pub(crate) const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
-
-/// Floor for the poll cadence — a tighter interval would hammer the forge.
-pub(crate) const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
-
-/// Default quiet window a changed PR must observe before its consolidated
-/// wake is delivered (`[prMonitor] debounceSeconds`).
-pub(crate) const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
-
-/// Floor for the debounce window.
-pub(crate) const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
+use intent_core::config::{MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_POLL_SECONDS};
 
 /// Cap on concurrently ACTIVE monitors per agent (mirrors the background-hook
 /// `maxPerAgent` convention).
@@ -434,24 +422,26 @@ fn render_terminal_wake(m: &PrMonitor, changes: &[String], snapshot: &PrMonitorS
 }
 
 impl Services {
-    /// The effective poll cadence for the centralized monitor loop, clamped
-    /// to [`MIN_PR_MONITOR_POLL_SECONDS`]. Read live on every tick so a
-    /// config change applies without a restart.
+    /// The effective poll cadence for the centralized monitor loop
+    /// (`prMonitor.pollSeconds`), clamped to [`MIN_PR_MONITOR_POLL_SECONDS`].
+    /// Read live from the settings registry on every tick so a config change
+    /// applies without a restart; an explicit override wins when wired.
     pub(crate) fn pr_monitor_poll_interval(&self) -> Duration {
         let secs = self
             .pr_monitor_poll_seconds
-            .unwrap_or(DEFAULT_PR_MONITOR_POLL_SECONDS)
+            .unwrap_or_else(|| self.effective_settings().pr_monitor.poll_seconds)
             .max(MIN_PR_MONITOR_POLL_SECONDS);
         Duration::from_secs(secs)
     }
 
-    /// The effective debounce quiet window, clamped to
-    /// [`MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. Read live per evaluation so a
-    /// config change applies to the next window.
+    /// The effective debounce quiet window (`prMonitor.debounceSeconds`),
+    /// clamped to [`MIN_PR_MONITOR_DEBOUNCE_SECONDS`]. Read live from the
+    /// settings registry per evaluation so a config change applies to the
+    /// next window; an explicit override wins when wired.
     pub(crate) fn pr_monitor_debounce(&self) -> Duration {
         let secs = self
             .pr_monitor_debounce_seconds
-            .unwrap_or(DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS)
+            .unwrap_or_else(|| self.effective_settings().pr_monitor.debounce_seconds)
             .max(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
         Duration::from_secs(secs)
     }
@@ -2038,6 +2028,9 @@ mod tests {
 
     #[tokio::test]
     async fn poll_and_debounce_intervals_clamp_to_their_floors() {
+        use intent_core::config::{
+            DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
+        };
         let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
         assert_eq!(
             svc.pr_monitor_poll_interval(),

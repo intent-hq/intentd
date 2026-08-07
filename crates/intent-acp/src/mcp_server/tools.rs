@@ -1234,6 +1234,7 @@ mod tests {
                 rich_chat_blocks: false,
                 structured_questions: false,
                 attention_requests: false,
+                pr_monitor: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1479,6 +1480,7 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            pr_monitor: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -1636,6 +1638,7 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            pr_monitor: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
