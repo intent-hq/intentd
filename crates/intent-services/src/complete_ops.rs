@@ -49,9 +49,9 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// the precedence is unit-testable without an install). The provider's own
 /// launch args (`base_args` plus the caller's `model` when the provider has a
 /// CLI model flag) come from [`intent_providers::build_provider_args`], which
-/// gates the flag itself — providers that select models through other
-/// mechanisms (`session/set_config_option` on claude-code and pi) ignore
-/// `model` silently, since a best-effort model is never an error.
+/// gates the flag itself — for providers with no CLI model flag the caller
+/// applies `model` best-effort after `session/new` instead (see
+/// [`config_option_model`]).
 fn one_shot_launch(
     provider: &intent_providers::ProviderConfig,
     resolved_bin: Option<PathBuf>,
@@ -78,6 +78,22 @@ fn one_shot_launch(
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
     })
+}
+
+/// The model to apply post-`session/new` via `session/set_config_option`:
+/// the caller's `model` when the provider has no CLI model flag (claude-code
+/// / codex / pi — their adapters take the model as a session config option,
+/// not a spawn arg), filtered like [`intent_providers::build_provider_args`]
+/// filters the flag (empty and the `"default"` sentinel mean "adapter
+/// default"). `None` when the launch args already carry the model.
+fn config_option_model<'m>(
+    provider: &intent_providers::ProviderConfig,
+    model: Option<&'m str>,
+) -> Option<&'m str> {
+    if provider.model_flag.is_some() {
+        return None;
+    }
+    model.filter(|m| !m.is_empty() && *m != "default")
 }
 
 impl Services {
@@ -244,7 +260,31 @@ impl Services {
             Some(dir) => cmd.cwd(dir),
             None => cmd,
         };
-        match run_one_shot_acp(cmd, full_prompt, Duration::from_millis(timeout_ms)).await {
+        // codex loads MCP servers from its inherited CODEX_HOME regardless of
+        // the empty ACP `mcpServers` list, so the one-shot child gets the same
+        // isolated throwaway home the model probe uses — a one-shot must never
+        // start user-configured MCP servers. The TempDir binding keeps the
+        // isolated home alive for the duration of the run.
+        let (cmd, _codex_home) = if provider_id == "codex" {
+            match crate::provider_models::with_isolated_codex_home(cmd) {
+                Ok((cmd, home)) => (cmd, Some(home)),
+                Err(e) => {
+                    return Ok(unavailable(format!(
+                        "codex: failed to create isolated CODEX_HOME: {e}"
+                    )))
+                }
+            }
+        } else {
+            (cmd, None)
+        };
+        match run_one_shot_acp(
+            cmd,
+            full_prompt,
+            config_option_model(provider, model),
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+        {
             Ok(reply) => Ok(json!({ "text": clean_agent_message(&reply) })),
             Err(err) => Err(Error::Internal(format!("{provider_id}: {err}"))),
         }
@@ -448,6 +488,90 @@ rl.on('line', (line) => {{
                 "reason": "completeOnce is not supported for the effective default provider: opencode"
             })
         );
+    }
+
+    /// Regression for the MCP-isolation review (PR #991): the codex one-shot
+    /// child must run under an isolated throwaway `CODEX_HOME` — never the
+    /// user's real one, whose `config.toml` can register MCP servers. The
+    /// mock adapter streams the `CODEX_HOME` it sees back as the reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_codex_runs_with_isolated_codex_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir("intentd-complete-acp-home-");
+        let script = dir.path().join("adapter.mjs");
+        std::fs::write(
+            &script,
+            r#"import readline from 'node:readline';
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+  if (msg.method === 'session/new') return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } });
+  if (msg.method === 'session/prompt') {
+    send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.CODEX_HOME ?? 'unset' } } },
+    });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+"#,
+        )
+        .expect("write mock adapter");
+        let bin = dir.path().join("codex-acp");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nexec node {:?} \"$@\"\n",
+                script.to_string_lossy()
+            ),
+        )
+        .expect("write adapter wrapper");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_tmp, services) = services_with_settings(&[
+            ("providers.active", serde_json::json!("codex")),
+            (
+                "providers.paths",
+                serde_json::json!({ "codex": bin.to_string_lossy() }),
+            ),
+        ])
+        .await;
+        let v = services
+            .agent_complete_once_op("echo home".into(), None, None, None, None)
+            .await
+            .unwrap();
+        let child_home = v["text"].as_str().expect("adapter echoed CODEX_HOME");
+        assert!(
+            child_home.contains("intentd-codex-home-"),
+            "the one-shot child must see the isolated throwaway CODEX_HOME, got: {child_home}"
+        );
+    }
+
+    #[test]
+    fn config_option_model_gates_on_missing_cli_model_flag() {
+        // claude-code / pi have no CLI model flag: the model rides
+        // session/set_config_option — except the empty/"default" sentinels,
+        // which mean "adapter default" (mirrors build_provider_args).
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        assert_eq!(config_option_model(claude, Some("opus-x")), Some("opus-x"));
+        assert_eq!(config_option_model(claude, Some("")), None);
+        assert_eq!(config_option_model(claude, Some("default")), None);
+        assert_eq!(config_option_model(claude, None), None);
+        let pi = intent_providers::find_provider("pi").unwrap();
+        assert_eq!(config_option_model(pi, Some("pi-large")), Some("pi-large"));
+        // codex-acp also has no CLI model flag on its plain launch, so the
+        // one-shot applies the model the same way.
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert_eq!(config_option_model(codex, Some("gpt-5")), Some("gpt-5"));
+        // A provider WITH a CLI model flag carries the model in its args; no
+        // post-session application.
+        let droid = intent_providers::find_provider("droid").unwrap();
+        assert_eq!(config_option_model(droid, Some("m")), None);
     }
 
     #[test]

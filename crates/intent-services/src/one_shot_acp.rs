@@ -15,7 +15,16 @@
 //! request (`session/request_permission` above all) is answered immediately —
 //! permissions with a `cancelled` outcome, anything else with a
 //! method-not-found error — so a one-shot can never hang waiting on a human.
+//! That auto-answer posture covers the ENTIRE lifecycle: incoming requests
+//! are serviced concurrently during setup (`initialize` + `session/new`) and
+//! the optional model application, not just during the prompt phase.
 //! The child is reaped on every exit path (success, timeout, error, drop).
+//!
+//! A caller-requested model for a provider with no CLI model flag is applied
+//! best-effort after `session/new` via `session/set_config_option`
+//! (`configOptions[id="model"]`, the same mechanism the persistent agent
+//! path uses for claude-code and pi); a failed or unsupported attempt is
+//! logged and the completion proceeds on the adapter's default model.
 
 use std::time::Duration;
 
@@ -71,11 +80,14 @@ impl std::fmt::Display for OneShotError {
 /// Run one ephemeral ACP completion: spawn `cmd`, drive the turn with
 /// `prompt` as a single text content block, and return the concatenated
 /// assistant text. `prompt_timeout` bounds only the `session/prompt` phase —
-/// setup uses the launch's npx-aware staged budgets. The child is reaped
-/// before returning on every path.
+/// setup uses the launch's npx-aware staged budgets. `config_option_model`,
+/// when set, is applied best-effort after `session/new` via
+/// `session/set_config_option` (a failure never fails the completion). The
+/// child is reaped before returning on every path.
 pub(crate) async fn run_one_shot_acp(
     cmd: OneShotCommand,
     prompt: &str,
+    config_option_model: Option<&str>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
     let mut adapter = spawn_adapter(&cmd).map_err(OneShotError::Spawn)?;
@@ -86,6 +98,7 @@ pub(crate) async fn run_one_shot_acp(
         &mut adapter.requests,
         &cmd,
         prompt,
+        config_option_model,
         prompt_timeout,
     )
     .await;
@@ -99,27 +112,48 @@ pub(crate) async fn run_one_shot_acp(
 }
 
 /// `initialize` → `session/new` (both under the launch's staged setup cap) →
-/// one `session/prompt` bounded by `prompt_timeout`, accumulating
-/// `agent_message_chunk` text while answering agent→client requests inline.
+/// best-effort model application → one `session/prompt` bounded by
+/// `prompt_timeout`, accumulating `agent_message_chunk` text while answering
+/// agent→client requests inline through every phase.
 async fn drive_one_shot(
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     cmd: &AcpAdapterCommand,
     prompt: &str,
+    config_option_model: Option<&str>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
-    let session_id = tokio::time::timeout(
-        cmd.setup_timeout(),
-        setup_session(
-            conn,
-            cmd.working_dir(),
-            cmd.initialize_timeout(),
-            cmd.session_new_timeout(),
+    // Setup is serviced too: an adapter that sends
+    // `session/request_permission` during `initialize` or `session/new`
+    // still gets the immediate auto-deny instead of stalling setup into a
+    // misreported SetupTimeout.
+    let session_id = serve_requests_while(
+        conn,
+        requests,
+        tokio::time::timeout(
+            cmd.setup_timeout(),
+            setup_session(
+                conn,
+                cmd.working_dir(),
+                cmd.initialize_timeout(),
+                cmd.session_new_timeout(),
+            ),
         ),
     )
     .await
     .unwrap_or(Err(OneShotError::SetupTimeout))?;
+
+    if let Some(model) = config_option_model {
+        apply_config_option_model(
+            conn,
+            requests,
+            &session_id,
+            model,
+            cmd.session_new_timeout(),
+        )
+        .await;
+    }
 
     let params = json!({
         "sessionId": session_id,
@@ -167,6 +201,57 @@ async fn drive_one_shot(
         }
         Err(intent_acp::AcpError::Timeout(_)) => Err(OneShotError::PromptTimeout),
         Err(err) => Err(map_acp_error(err)),
+    }
+}
+
+/// Drive `fut` to completion while answering agent→client requests inline
+/// (the same auto-deny/refuse posture as the prompt phase), so no phase of
+/// the one-shot lifecycle can hang on an unanswered client-served request.
+async fn serve_requests_while<F: std::future::Future>(
+    conn: &Connection,
+    requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
+    fut: F,
+) -> F::Output {
+    tokio::pin!(fut);
+    let mut requests_open = true;
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            req = requests.recv(), if requests_open => match req {
+                Some(req) => auto_respond(conn, req).await,
+                // Channel closed (connection dropped the sender): disable
+                // this branch so the select! cannot busy-spin.
+                None => requests_open = false,
+            },
+        }
+    }
+}
+
+/// Best-effort `session/set_config_option { configId: "model" }`: the model
+/// mechanism for providers with no CLI model flag (claude-code / pi expose
+/// the model as a `configOptions[id="model"]` select in the `session/new`
+/// result). A rejected, unsupported, or timed-out attempt is logged and the
+/// completion proceeds on the adapter's default model — a best-effort model
+/// is never an error.
+async fn apply_config_option_model(
+    conn: &Connection,
+    requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
+    session_id: &str,
+    model: &str,
+    timeout: Duration,
+) {
+    let params = json!({ "sessionId": session_id, "configId": "model", "value": model });
+    let outcome = serve_requests_while(
+        conn,
+        requests,
+        conn.request_timeout("session/set_config_option", params, timeout),
+    )
+    .await;
+    if let Err(err) = outcome {
+        tracing::debug!(
+            "one-shot session/set_config_option(model={model}) failed; \
+             continuing with the adapter default: {err}"
+        );
     }
 }
 

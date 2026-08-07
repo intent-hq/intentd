@@ -159,7 +159,7 @@ pub async fn fetch_codex_models() -> ProviderModelsFetch {
             "codex-acp binary not found and npx unavailable for the pinned fallback",
         );
     };
-    let (cmd, codex_home) = match codex_probe_with_isolated_home(cmd) {
+    let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
         Ok(pair) => pair,
         Err(e) => {
             return ProviderModelsFetch::unavailable(
@@ -192,10 +192,13 @@ fn codex_probe_launch(
     }
 }
 
-/// Attach a freshly created isolated `CODEX_HOME` to the codex probe command.
-/// The returned [`tempfile::TempDir`] must outlive the probe run; dropping it
-/// removes the throwaway home.
-fn codex_probe_with_isolated_home(
+/// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex
+/// launch. Shared by the model probe and the one-shot completion runner
+/// ([`crate::complete_ops`]): both spawn throwaway codex-acp children that
+/// must never load the user's real `~/.codex/config.toml` (and the
+/// `mcp_servers` it can register). The returned [`tempfile::TempDir`] must
+/// outlive the run; dropping it removes the throwaway home.
+pub(crate) fn with_isolated_codex_home(
     cmd: AcpProbeCommand,
 ) -> std::io::Result<(AcpProbeCommand, tempfile::TempDir)> {
     let home = isolated_codex_home(user_codex_dir().as_deref())?;

@@ -56,7 +56,7 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "say hi", Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "say hi", None, Duration::from_secs(30))
         .await
         .expect("one-shot succeeds");
     assert_eq!(text, "Hello, world!");
@@ -77,7 +77,7 @@ const onPrompt = () => {{}};
 ",
         pidfile = pidfile.to_string_lossy(),
     ));
-    let err = run_one_shot_acp(cmd, "hang", Duration::from_millis(500))
+    let err = run_one_shot_acp(cmd, "hang", None, Duration::from_millis(500))
         .await
         .unwrap_err();
     assert!(
@@ -121,10 +121,104 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "touch a file", Duration::from_secs(30))
+    let text = run_one_shot_acp(cmd, "touch a file", None, Duration::from_secs(30))
         .await
         .expect("one-shot succeeds after the auto-deny");
     assert_eq!(text, "denied=\"cancelled\"");
+}
+
+#[tokio::test]
+async fn permission_request_during_setup_is_auto_denied() {
+    // Regression: the adapter demands a permission answer BEFORE answering
+    // `initialize` (and again before `session/new`). Without request
+    // servicing during the setup phase these hang into a misreported
+    // SetupTimeout instead of the documented auto-deny.
+    let (cmd, _dir) = mock_adapter(&format!(
+        "{ADAPTER_PRELUDE}
+rl.removeAllListeners('line');
+let denials = 0;
+rl.on('line', (line) => {{
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize' || msg.method === 'session/new') {{
+    onClientResponse = (resp) => {{
+      denials += 1;
+      if (msg.method === 'initialize') return result(msg.id, {{ protocolVersion: 1, agentCapabilities: {{}} }});
+      return result(msg.id, {{ sessionId: 's1' }});
+    }};
+    return send({{
+      jsonrpc: '2.0',
+      id: 9000 + denials,
+      method: 'session/request_permission',
+      params: {{ sessionId: 's1', options: [] }},
+    }});
+  }}
+  if (msg.method === 'session/prompt') {{
+    chunk('setup-denials=' + denials);
+    return result(msg.id, {{ stopReason: 'end_turn' }});
+  }}
+  if (msg.id !== undefined && msg.method === undefined) return onClientResponse(msg);
+}});
+"
+    ));
+    let text = run_one_shot_acp(cmd, "hello", None, Duration::from_secs(30))
+        .await
+        .expect("setup-phase permission requests are auto-denied, not hung");
+    assert_eq!(text, "setup-denials=2");
+}
+
+#[tokio::test]
+async fn config_option_model_is_applied_after_session_new() {
+    // A requested model for a provider with no CLI model flag rides
+    // `session/set_config_option { configId: "model" }` between `session/new`
+    // and `session/prompt`; the mock echoes what it received into the reply.
+    let (cmd, _dir) = mock_adapter(&format!(
+        "{ADAPTER_PRELUDE}
+let applied = 'none';
+rl.on('line', (line) => {{
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/set_config_option') {{
+    applied = msg.params.configId + '=' + msg.params.value + '@' + msg.params.sessionId;
+    return result(msg.id, {{}});
+  }}
+}});
+const onPrompt = (id) => {{
+  chunk('applied=' + applied);
+  result(id, {{ stopReason: 'end_turn' }});
+}};
+"
+    ));
+    let text = run_one_shot_acp(cmd, "hello", Some("opus-x"), Duration::from_secs(30))
+        .await
+        .expect("one-shot succeeds");
+    assert_eq!(text, "applied=model=opus-x@s1");
+}
+
+#[tokio::test]
+async fn rejected_config_option_model_does_not_fail_the_completion() {
+    // Best-effort contract: an adapter that rejects the model option (e.g.
+    // unknown id or unsupported method) must not fail the completion — the
+    // turn proceeds on the adapter's default model.
+    let (cmd, _dir) = mock_adapter(&format!(
+        "{ADAPTER_PRELUDE}
+rl.on('line', (line) => {{
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/set_config_option') {{
+    return send({{ jsonrpc: '2.0', id: msg.id, error: {{ code: -32601, message: 'nope' }} }});
+  }}
+}});
+const onPrompt = (id) => {{
+  chunk('default-model-reply');
+  result(id, {{ stopReason: 'end_turn' }});
+}};
+"
+    ));
+    let text = run_one_shot_acp(cmd, "hello", Some("bogus-model"), Duration::from_secs(30))
+        .await
+        .expect("a rejected set_config_option must not fail the one-shot");
+    assert_eq!(text, "default-model-reply");
 }
 
 #[cfg(unix)]
@@ -134,7 +228,7 @@ async fn nonzero_exit_surfaces_typed_exited_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", Duration::from_secs(30))
+    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
         .await
         .unwrap_err();
     let OneShotError::Exited(detail) = err else {
@@ -153,7 +247,7 @@ async fn garbage_stdout_surfaces_typed_transport_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo not json; exit 0".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", Duration::from_secs(30))
+    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
         .await
         .unwrap_err();
     assert!(
@@ -168,7 +262,7 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
         PathBuf::from("/nonexistent/intentd-one-shot-adapter"),
         Vec::new(),
     );
-    let err = run_one_shot_acp(cmd, "anything", Duration::from_secs(5))
+    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
