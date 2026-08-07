@@ -1712,10 +1712,12 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
 
 /// §6.5 step-0 turn-end trigger: a turn whose persisted assistant tail
 /// carries a question resource block promotes the workspace's derived
-/// `displayStatus` to `needs_attention` (and emits the transition); the next
-/// turn — after the user's answer superseded the questions — persists a
-/// question-free tail and the same turn-end recompute retires it back to
-/// `idle`.
+/// `displayStatus` to `needs_attention` (and emits the transition); once the
+/// user's ANSWER (a row tagged `question_answers` for that message) clears the
+/// pending-questions marker, the next turn's question-free tail lets the same
+/// turn-end recompute retire it back to `idle`. A plain user row and a
+/// question-free turn alone do NOT retire it — pendingness is persisted until
+/// answered or dismissed.
 #[tokio::test]
 async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -1766,16 +1768,28 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
     );
 
-    // The user's answer supersedes the questions (appended directly — the
-    // send paths carry their own recompute, exercised elsewhere), then turn
-    // 2 persists a question-free tail: the turn-end recompute retires the
-    // hold and emits the demotion.
-    bus.store()
-        .append_agent_message(
-            &agent_id,
-            "user",
-            &json!([{ "type": "text", "text": "answer" }]),
-            &now_iso(),
+    // The user's ANSWER resolves the questions (appended via the op so the
+    // pending-questions marker clears — the send paths carry the same
+    // resolution, exercised elsewhere), then turn 2 persists a question-free
+    // tail: the turn-end recompute retires the hold and emits the demotion.
+    let asked_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer" }]),
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            })),
         )
         .await
         .expect("append answer");
@@ -1803,6 +1817,89 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
 }
 
+/// Stored-on-write pending-questions marker (PROTOCOL §5.5, question hold):
+/// the turn-end persist writes the marker under the turn's message id when the
+/// assistant tail bears question blocks, and a subsequent question-FREE turn
+/// leaves it in place (pendingness survives the agent's own later turns).
+#[tokio::test]
+async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-q1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "question://q-1".to_string(),
+            name: "Question".to_string(),
+            text: "{\"questions\":[]}".to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("ask")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+
+    let asked_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "turn end persists the pending-questions marker"
+    );
+    assert!(services.question_hold_active(&agent_id).await);
+
+    // A question-free turn must NOT clear the marker.
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "a question-free turn end must not clear the marker"
+    );
+    assert!(
+        services.question_hold_active(&agent_id).await,
+        "hold survives the agent's later turn"
+    );
+}
+
 /// Question resource content-block array — the tail shape
 /// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
 /// over the transcript-mutation ops below.
@@ -1827,30 +1924,66 @@ fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::even
     })
 }
 
-/// monorepo#1266 regression (retire): a user row appended via
-/// `agent.appendMessage` supersedes a pending question tail, so the op's own
-/// recompute must retire the workspace's `needs_attention` displayStatus —
-/// not leave it stale until the next trigger or snapshot.
+/// monorepo#1266 regression (retire): the ANSWER row appended via
+/// `agent.appendMessage` — tagged `question_answers` for the marked question
+/// message — resolves the pending Q&A, so the op's own recompute must retire
+/// the workspace's `needs_attention` displayStatus rather than leave it stale
+/// until the next trigger or snapshot. A PLAIN user row does not: pendingness
+/// now survives it, so the status stays `needs_attention` and nothing emits.
 #[tokio::test]
-async fn append_message_op_user_row_retires_needs_attention() {
+async fn append_message_op_answer_row_retires_needs_attention() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    // Seed a question-bearing assistant tail, then the last-observed
-    // baseline (needs_attention; a first observation never emits).
-    bus.store()
-        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+    // Seed a question-bearing assistant tail through the op so the
+    // pending-questions marker is armed, then the last-observed baseline
+    // (needs_attention; a first observation never emits).
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
         .await
         .expect("append question tail");
+    let asked_id = asked["message"]["id"]
+        .as_str()
+        .expect("question row id")
+        .to_string();
     services
         .maybe_emit_display_status_changed(&workspace_id)
         .await;
     let mut sub = display_status_sub(&bus, &workspace_id);
+
+    // A plain user row leaves the Q&A pending — no transition, no emit.
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "unrelated aside" }]),
+            None,
+        )
+        .await
+        .expect("plain appendMessage succeeds");
+    assert!(
+        services.question_hold_active(&agent_id).await,
+        "a plain user row must not resolve the pending Q&A"
+    );
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no displayStatus transition for a plain user row"
+    );
 
     services
         .agent_append_message_op(
             agent_id.clone(),
             "user".to_string(),
             json!([{ "type": "text", "text": "answer" }]),
-            None,
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            })),
         )
         .await
         .expect("appendMessage succeeds");
@@ -1902,8 +2035,11 @@ async fn append_message_op_question_row_raises_needs_attention() {
 
 /// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
 /// transcript, which can move the question-hold derivation in either
-/// direction — a question-free swap retires `needs_attention`, a swap ending
-/// on a question-bearing assistant row raises it again. Both flips must emit.
+/// direction — a swap whose question row is answered retires
+/// `needs_attention`, a swap ending on an unanswered question-bearing
+/// assistant row raises it again. Both flips must emit. The swap re-mints row
+/// ids, so the pending-questions marker is re-derived from the new transcript
+/// rather than left dangling.
 #[tokio::test]
 async fn replace_messages_op_moves_needs_attention_both_ways() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -1917,13 +2053,20 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
         .await;
     let mut sub = display_status_sub(&bus, &workspace_id);
 
-    // Retire: the swapped transcript ends on a user row.
+    // Retire: the swapped transcript's question row is answered.
     services
         .agent_replace_messages_op(
             agent_id.clone(),
             json!([
                 { "role": "assistant", "contentBlocks": question_blocks() },
-                { "role": "user", "contentBlocks": [{ "type": "text", "text": "answer" }] },
+                {
+                    "role": "user",
+                    "contentBlocks": [{ "type": "text", "text": "answer" }],
+                    "metadata": {
+                        "type": "question_answers",
+                        "answeredQuestionsMessageId": "pre-swap-id",
+                    },
+                },
             ]),
         )
         .await
