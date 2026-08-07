@@ -97,7 +97,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
         ]
     );
     assert_eq!(
@@ -106,7 +106,7 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
         ]
     );
 }
@@ -5502,6 +5502,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         last_logs: None,
         last_state: None,
         expires_at: Some(now_iso()),
+        perpetual: false,
+        dispatch_count: 0,
     }
 }
 
@@ -5537,6 +5539,46 @@ async fn hook_insert_get_round_trip() {
 
     let missing = HookId("hook-missing".to_string());
     let err = store.get_hook(&missing).await.expect_err("missing hook");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// A perpetual hook round-trips its `perpetual` / `dispatch_count` columns,
+/// and the dispatch-count bump persists.
+#[tokio::test]
+async fn hook_perpetual_and_dispatch_count_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    // Default (one-shot) row reads back as `false` / 0.
+    let one_shot_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    store
+        .insert_hook(&sample_hook(&one_shot_id, &ws, &agent, "one-shot"))
+        .await
+        .expect("insert one-shot");
+    let one_shot = store.get_hook(&one_shot_id).await.expect("get one-shot");
+    assert!(!one_shot.perpetual);
+    assert_eq!(one_shot.dispatch_count, 0);
+
+    let id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut hook = sample_hook(&id, &ws, &agent, "perpetual");
+    hook.perpetual = true;
+    hook.dispatch_count = 2;
+    store.insert_hook(&hook).await.expect("insert perpetual");
+    assert_eq!(store.get_hook(&id).await.expect("get hook"), hook);
+
+    store
+        .increment_hook_dispatch_count(&id)
+        .await
+        .expect("bump dispatch count");
+    let bumped = store.get_hook(&id).await.expect("get bumped");
+    assert!(bumped.perpetual);
+    assert_eq!(bumped.dispatch_count, 3);
+
+    let err = store
+        .increment_hook_dispatch_count(&HookId("hook-missing".to_string()))
+        .await
+        .expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 }
 
@@ -5581,6 +5623,50 @@ async fn hook_list_filters_by_workspace_and_agent() {
         .await
         .expect("list none");
     assert!(empty.is_empty());
+}
+
+/// `count_active_hooks_by_agent` counts only `scheduled`/`running` rows for
+/// the given agent — terminal rows and other agents' hooks are excluded, and
+/// an unknown agent counts zero.
+#[tokio::test]
+async fn hook_count_active_by_agent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+    let (ws_other, agent_other) = seed_hook_owner(&store).await;
+
+    let scheduled = sample_hook(&HookId("hook-sched".into()), &ws, &agent, "sched");
+    let mut running = sample_hook(&HookId("hook-run".into()), &ws, &agent, "run");
+    running.state = HookState::Running;
+    let mut done = sample_hook(&HookId("hook-done".into()), &ws, &agent, "done");
+    done.state = HookState::Dispatched;
+    let mut gone = sample_hook(&HookId("hook-gone".into()), &ws, &agent, "gone");
+    gone.state = HookState::Expired;
+    let foreign = sample_hook(
+        &HookId("hook-foreign".into()),
+        &ws_other,
+        &agent_other,
+        "foreign",
+    );
+    for h in [&scheduled, &running, &done, &gone, &foreign] {
+        store.insert_hook(h).await.expect("insert hook");
+    }
+
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&agent)
+            .await
+            .expect("count"),
+        2,
+        "scheduled + running only"
+    );
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&AgentId("agent-none".into()))
+            .await
+            .expect("count none"),
+        0
+    );
 }
 
 /// State transitions, run bookkeeping, and last-error updates persist; every

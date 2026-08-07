@@ -1923,6 +1923,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.agent.snapshot` (MCP-only, PROTOCOL §7.1): the calling agent's own
+    /// compact state digest — active hooks, completion watches, queued
+    /// messages, event subscriptions, unsettled children, pending structured
+    /// questions, pending attention request, current UTC time. Zero-count and
+    /// null fields are omitted from the returned object; `time` is always
+    /// present. Never gated by `agentFeatures.stateSnapshot` (the toggle
+    /// governs only the per-turn prompt injection). A workspace mismatch
+    /// surfaces `NotFound` (defense-in-depth against bare-id probes).
+    fn agent_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_snapshot not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.listInterrupted`: list pending interrupted agents (INT-41,
     /// agent-resumption phase 1). Returns joined data: agent ID, workspace info,
     /// agent name, prev status, interrupted timestamp. Sessions deleted since

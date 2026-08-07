@@ -1,7 +1,8 @@
 //! Filesystem watcher → `file:*` events (§10).
 //!
-//! Ports the workspace file-watch slice from `~/src/intent/`: the `notify`
-//! recursive watch + per-path debounce of
+//! Ports the workspace file-watch slice from `~/src/intent/`: the recursive
+//! watch (since consolidated into a stream shared across workspaces by
+//! [`SharedWatchHub`] and demuxed by path prefix) + per-path debounce of
 //! `workspace/main/change-detection/file-watcher.ts` (`fileWatcherDebounce`,
 //! `handleFileEvent`) and the canonical event-type taxonomy of
 //! `change-detection/change-processor.ts` (`getEventType`): a `create` becomes
@@ -23,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -30,12 +32,12 @@ use ignore::{Match, WalkBuilder};
 use intent_core::{now_iso, ActorType, EventActor, WorkspaceId};
 use intent_store::NewEvent;
 use notify::event::{EventKind, ModifyKind};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::shared_watch::{SharedWatchHub, SubHandle};
 
 /// Per-path debounce window. Matches the TS `fileWatcherDebounce` (300 ms): an
 /// event is published `DEBOUNCE` after the *last* raw change for that path.
@@ -523,12 +525,14 @@ fn parent_dir(path: &str) -> String {
     }
 }
 
-/// A live recursive watch over one workspace path. Holds the `notify` watcher
-/// (the OS subscription ends when it drops) and the debounce task (aborted on
-/// drop), so dropping the [`FileWatcher`] tears the whole pipeline down — the
+/// A live watch over one workspace path. The recursive OS stream is no longer
+/// owned here: it is shared across workspaces by [`SharedWatchHub`] and demuxed
+/// by path prefix, so this holds only the subscription handle and the debounce
+/// task (aborted on drop). Dropping the [`FileWatcher`] still tears this
+/// workspace's whole pipeline down and releases its share of the stream — the
 /// clean-shutdown contract for `serve`.
 pub struct FileWatcher {
-    _watcher: RecommendedWatcher,
+    _sub: SubHandle,
     task: JoinHandle<()>,
 }
 
@@ -539,33 +543,30 @@ impl Drop for FileWatcher {
 }
 
 impl FileWatcher {
-    /// Start watching `root` recursively, publishing debounced `file:changed`
-    /// events for `workspace_id` to `bus`. The `notify` callback is synchronous
-    /// and runs off the tokio runtime, so it forwards raw events over an
-    /// unbounded channel to the async debounce loop.
-    pub fn start(bus: EventBus, workspace_id: WorkspaceId, root: PathBuf) -> notify::Result<Self> {
-        // Canonicalize so the relative-path strip works against the paths the OS
-        // reports (macOS FSEvents resolves `/var/...` → `/private/var/...`).
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<notify::Event>();
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(event) => {
-                    let _ = raw_tx.send(event);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "file watcher callback error; file:changed events may be missed"
-                    );
-                }
-            })?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
+    /// Start watching `root`, publishing debounced `file:changed` events for
+    /// `workspace_id` to `bus`. Raw events arrive from the shared stream `hub`
+    /// owns for `root`'s group, demuxed to this workspace, and are fed to the
+    /// same async debounce loop as before.
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
+        bus: EventBus,
+        workspace_id: WorkspaceId,
+        root: PathBuf,
+    ) -> Self {
+        // `subscribe` returns the canonical root it demuxes against, so the
+        // relative-path strip works against the paths the OS reports (macOS
+        // FSEvents resolves `/var/...` → `/private/var/...`).
+        let (sub, raw_rx, root) = hub.subscribe(&root);
         let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
-        Ok(Self {
-            _watcher: watcher,
-            task,
-        })
+        Self { _sub: sub, task }
+    }
+
+    /// Await the shared watch on this workspace's root actually being
+    /// established. Registration is deferred off the caller's thread
+    /// (monorepo#1572), so tests must wait for it before mutating the tree.
+    #[cfg(test)]
+    pub(super) async fn wait_established(&self, timeout: Duration) {
+        self._sub.wait_established(timeout).await;
     }
 }
 

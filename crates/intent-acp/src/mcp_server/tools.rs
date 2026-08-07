@@ -225,6 +225,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, unsettled child agents, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -256,11 +257,12 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+    `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
@@ -436,6 +438,7 @@ API:
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, unsettled child agents, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -465,11 +468,12 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+  ws.hook.schedule({ name, code, delayMs, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+    `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
@@ -1234,6 +1238,7 @@ mod tests {
                 rich_chat_blocks: false,
                 structured_questions: false,
                 attention_requests: false,
+                state_snapshot: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1479,6 +1484,7 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            state_snapshot: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -1636,6 +1642,7 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            state_snapshot: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -1669,6 +1676,10 @@ mod tests {
             denied_feature(&all_off, "agent.reportBlocker"),
             Some("agentFeatures.attentionRequests")
         );
+        // `ws.agent.snapshot()` is NEVER gated: `stateSnapshot` governs only
+        // the turn-prompt injection, so even a session created with the
+        // toggle already off keeps the tool callable.
+        assert_eq!(denied_feature(&all_off, "agent.snapshot"), None);
         // Un-gated namespaces pass even with everything off.
         assert_eq!(denied_feature(&all_off, "note.read"), None);
         assert_eq!(

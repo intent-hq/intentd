@@ -262,7 +262,13 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "auggie login",
             "please run `auggie login`",
         ]),
+        // `auggie token print` exits 0 when logged in, non-zero when logged
+        // out. Its stdout IS the auth session secret, so the probe must stay on
+        // the generic exit-code arm of `check_provider_auth_cli` (stdout and
+        // stderr nulled) — never captured, logged, or surfaced.
+        auth_check_args: Some(&["token", "print"]),
         login_command_hint: Some("auggie login"),
+        login_docs_url: Some("https://docs.augmentcode.com/cli/overview"),
         short_name: "Auggie",
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },

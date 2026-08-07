@@ -364,6 +364,8 @@ async fn handle_check_auggie_uses_configured_path() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 14);
     assert!(parsed["result"]["available"].is_boolean());
+    // Resolution-only payload: `version` is retired from `host.checkAuggie`.
+    assert!(parsed["result"].get("version").is_none());
 }
 
 #[tokio::test]
