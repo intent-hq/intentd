@@ -109,13 +109,17 @@ pub enum NoteVisibility {
 }
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
-/// the BE-owned "current cycle" status rollup over the active/latest PR,
-/// `taskStats`, live agent activity, and the per-workspace needs-attention
-/// signal. Wire values are the snake_case variant names, matching the FE
-/// union exactly. A top-level agent waiting on the user (pending attention
-/// request or pending structured questions) promotes the rollup to
-/// `NeedsAttention` above everything else; a running agent promotes it to
-/// `InProgress`; without one, a task-stage rollup (`InProgress`/`NotStarted`)
+/// the BE-owned canonical status rollup over the active/latest PR,
+/// `taskStats`, live agent activity, the per-workspace attention axes, and
+/// the dismissible workspace attention flag. Wire values are the snake_case
+/// variant names, matching the FE union exactly. Canonical precedence
+/// (§6.5): `Failed` (a top-level agent parked in `error`) > `Blocked` (a
+/// top-level pending `blocker` attention request) > `NeedsAttention`
+/// (discussion requests, pending structured questions, or the
+/// `review_required` attention flag) > `InProgress` (running agent) >
+/// `Unread` (the `unread` attention flag, promoting only over the
+/// idle/terminal bases `Idle`/`Complete`/`PrMerged`) > the PR/task rollup.
+/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
 /// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
 /// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +128,9 @@ pub enum WorkspaceDisplayStatus {
     NotStarted,
     InProgress,
     NeedsAttention,
+    Failed,
+    Blocked,
+    Unread,
     Idle,
     Complete,
     PrReady,
