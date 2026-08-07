@@ -16,9 +16,9 @@ use intent_core::events::{
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
-    TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -6328,6 +6328,62 @@ fn note_change_event(
     }
 }
 
+/// Build a `task:created` event with the payload
+/// `{ noteId, noteTitle, status, createdAt, agentId? }` (PROTOCOL §6.5).
+/// Emitted once per note becoming a task, on every creation path. Mirrors
+/// [`task_status_changed_event`]'s actor handling: agent-attributed creations
+/// use an agent actor and carry `agentId`; otherwise the system actor leaves
+/// `agentId` off the payload.
+fn task_created_event(
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    note_title: &str,
+    status: TaskStatus,
+    created_at: &str,
+    agent: Option<(String, Option<String>)>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "noteId": note_id.as_str(),
+        "noteTitle": note_title,
+        "status": status_word(status),
+        "createdAt": created_at,
+    });
+    let actor = match agent {
+        Some((agent_id, name)) => {
+            data["agentId"] = serde_json::json!(agent_id);
+            intent_core::EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id),
+                name,
+                ..Default::default()
+            }
+        }
+        None => system_actor(),
+    };
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: TASK_CREATED.to_string(),
+        actor,
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
+/// Resolve the agent provenance tuple (`id`, display name) an event payload
+/// carries for an attributed caller. `None` stays system-attributed.
+async fn resolve_event_agent(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+) -> Option<(String, Option<String>)> {
+    let agent_id = caller_agent_id?;
+    let name = store.get_agent_session(agent_id).await.ok().map(|s| s.name);
+    Some((agent_id.0.clone(), name))
+}
+
 /// Build a `task:status-changed` change event with the TS-parity payload
 /// `{ noteId, noteTitle, previousStatus, newStatus, changedAt, agentId? }`
 /// (`notes.service.ts`). When the change is agent-attributed (`agent` carries
@@ -7959,6 +8015,7 @@ impl Services {
                             body,
                             TaskStatus::NotStarted,
                             Some(peer_order),
+                            caller_agent_id,
                         )
                         .await?;
                     existing_by_title.insert(normalized, child.id.clone());
@@ -8022,7 +8079,9 @@ impl Services {
 
     /// Create a child task note nested under `parent_id`, marking it a task with
     /// `status` (and optional `peer_order`). Shared by `createPrerequisite` and
-    /// `convertBlocks`.
+    /// `convertBlocks`. `caller_agent_id` attributes the emitted `task:created`
+    /// to the acting agent when the creation is agent-driven.
+    #[allow(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -8031,6 +8090,7 @@ impl Services {
         content: String,
         status: TaskStatus,
         peer_order: Option<i64>,
+        caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
         let now = now_iso();
         let note = Note {
@@ -8064,6 +8124,22 @@ impl Services {
                 &note.title,
                 NOTE_CREATED,
                 "create",
+            ),
+        )
+        .await;
+        // The note is born a task, so the creation also emits `task:created`
+        // (§6.5) — feed/task subscribers see the new task without inferring
+        // task-ness from the `note:created` payload.
+        let agent = resolve_event_agent(&self.store, caller_agent_id).await;
+        publish_event(
+            &self.event_bus,
+            task_created_event(
+                &note.workspace_id,
+                &note.id,
+                &note.title,
+                status,
+                &note.created_at,
+                agent,
             ),
         )
         .await;
@@ -14431,6 +14507,7 @@ impl WorkspaceApi for Services {
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let now = now_iso();
+            let was_task = note.metadata.task.is_some();
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
@@ -14451,6 +14528,38 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now;
             store.update_note(&note).await?;
+            // The note's metadata changed, so subscribers need to refetch it
+            // (§6.5) — without this a task-ness flip is invisible until the
+            // next unrelated note write.
+            publish_event(
+                &services.event_bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            // Only a note that was not already a task is "created" as one;
+            // re-marking an existing task is a status move, not a creation.
+            if !was_task {
+                publish_event(
+                    &services.event_bus,
+                    task_created_event(
+                        &note.workspace_id,
+                        &note.id,
+                        &note.title,
+                        new_status,
+                        &note.updated_at,
+                        // `task.markAsTask` carries no caller-agent context on
+                        // the trait, so the emission stays system-attributed.
+                        None,
+                    ),
+                )
+                .await;
+            }
             // Marking a note as a task (or moving its status) can move the
             // derived displayStatus rollup (§6.5).
             services
@@ -14511,6 +14620,10 @@ impl WorkspaceApi for Services {
                     &title,
                     content.unwrap_or_default(),
                     task_status,
+                    None,
+                    // `task.createPrerequisite` carries no caller-agent
+                    // context on the trait, so the emission stays
+                    // system-attributed.
                     None,
                 )
                 .await?;
