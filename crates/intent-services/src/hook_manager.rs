@@ -1123,35 +1123,45 @@ impl Services {
                         .increment_hook_dispatch_count(&hook.hook_id)
                         .await?;
                     hook.last_run_at = Some(last_run_at);
-                    hook.next_run_at = None;
                     hook.run_count += 1;
                     hook.dispatch_count += 1;
                     hook.last_logs = logs;
-                    self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
-                    let message = with_wake_logs(&message, hook.last_logs.as_deref());
-                    self.wake_hook_owner(hook, &message, "dispatched").await;
-                    self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
                     // In-flight-run-at-expiry: the dispatch still wins (the
-                    // owner was woken above), but a fire at/after `expiresAt`
-                    // expires the hook instead of rescheduling it.
-                    if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
+                    // owner is woken below regardless), but a fire at/after
+                    // `expiresAt` expires the hook instead of rescheduling
+                    // it. Resolve and persist that outcome BEFORE emitting
+                    // `hook:run-completed`/`hook:dispatched` so their `state`
+                    // field reflects the real post-dispatch state rather than
+                    // the transient `running` set at run start — matching the
+                    // schedule-time validation path, which sets `state`
+                    // before emitting.
+                    let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
+                    if expired {
                         self.store
                             .update_hook_state(&hook.hook_id, HookState::Expired)
                             .await?;
                         hook.state = HookState::Expired;
+                        hook.next_run_at = None;
+                    } else {
+                        let next_run_at = next_run_at_iso(hook.delay_ms);
+                        self.store
+                            .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
+                            .await?;
+                        self.store
+                            .update_hook_state(&hook.hook_id, HookState::Scheduled)
+                            .await?;
+                        hook.state = HookState::Scheduled;
+                        hook.next_run_at = Some(next_run_at);
+                    }
+                    self.emit_hook_event(HOOK_RUN_COMPLETED, hook, None).await;
+                    let message = with_wake_logs(&message, hook.last_logs.as_deref());
+                    self.wake_hook_owner(hook, &message, "dispatched").await;
+                    self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
+                    if expired {
                         self.finish_expiry(hook).await;
                         return Ok(false);
                     }
-                    let next_run_at = next_run_at_iso(hook.delay_ms);
-                    self.store
-                        .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
-                        .await?;
-                    self.store
-                        .update_hook_state(&hook.hook_id, HookState::Scheduled)
-                        .await?;
-                    hook.state = HookState::Scheduled;
-                    hook.next_run_at = Some(next_run_at.clone());
-                    self.emit_hook_event(HOOK_SCHEDULED, hook, Some(next_run_at))
+                    self.emit_hook_event(HOOK_SCHEDULED, hook, hook.next_run_at.clone())
                         .await;
                     return Ok(true);
                 }
@@ -1434,8 +1444,12 @@ impl Services {
     }
 
     /// Emit one `hook:*` lifecycle event with the canonical
-    /// `{ workspaceId, agentId, hookId, name, nextRunAt?, state, lastError? }`
-    /// payload.
+    /// `{ workspaceId, agentId, hookId, name, nextRunAt?, state, perpetual,
+    /// dispatchCount, lastError? }` payload — `perpetual`/`dispatchCount` are
+    /// included for FE/inspection parity with `hook.list` (an event
+    /// subscriber must be able to tell a non-terminal perpetual
+    /// `hook:dispatched` from a terminal one-shot dispatch without a
+    /// follow-up `hook.list` call).
     async fn emit_hook_event(&self, event_type: &str, hook: &Hook, next_run_at: Option<String>) {
         let mut data = json!({
             "workspaceId": hook.workspace_id,
@@ -1443,6 +1457,8 @@ impl Services {
             "hookId": hook.hook_id,
             "name": hook.name,
             "state": hook.state,
+            "perpetual": hook.perpetual,
+            "dispatchCount": hook.dispatch_count,
         });
         if let Some(next) = next_run_at {
             data["nextRunAt"] = Value::String(next);

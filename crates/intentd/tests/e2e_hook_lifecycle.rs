@@ -1265,6 +1265,19 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(ran["ok"], true, "runNow ok: {ran}");
     let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("forever")).await;
     assert_eq!(dispatched["data"]["hookId"], json!(forever_id));
+    // On the scheduler-loop path the post-dispatch outcome (scheduled vs
+    // expired) is resolved and persisted BEFORE `hook:dispatched` is
+    // emitted, so `state` reflects the real outcome rather than the
+    // transient `running` set at run start — parity with the schedule-time
+    // validation path. The event also carries `perpetual`/`dispatchCount`
+    // for FE/inspection parity with `hook.list`.
+    assert_eq!(dispatched["data"]["state"], "scheduled", "{dispatched}");
+    assert_eq!(dispatched["data"]["perpetual"], json!(true), "{dispatched}");
+    assert_eq!(
+        dispatched["data"]["dispatchCount"],
+        json!(2),
+        "{dispatched}"
+    );
     let rearmed = next_hook_event(&mut sub, "hook:scheduled", Some("forever")).await;
     assert!(
         rearmed["data"]["nextRunAt"].is_string(),
