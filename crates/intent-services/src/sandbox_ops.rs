@@ -1115,7 +1115,7 @@ fn audit_diverged_sandbox_branches(
 ///   returns an error.
 /// - Otherwise (skip_worktree = true OR no worktree provisioned): the user's
 ///   repository folder (`repository_path`).
-fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
+pub(crate) fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let repo_path = match workspace.checkout_mode {
         Some(CheckoutMode::Cow) => workspace.worktree_path.as_ref().ok_or_else(|| {
             Error::InvalidParams("CoW workspace has no worktree_path".to_string())

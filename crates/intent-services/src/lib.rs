@@ -3991,8 +3991,9 @@ impl Services {
                 self.increment_sandbox_retry_count(workspace_id, agent_id)
                     .await;
 
-                // Fetch canonical state into sandbox
-                if let Err(e) = self
+                // Fetch the CURRENT canonical tip into the sandbox (forced
+                // refspec — every bounce refreshes `canonical/HEAD`).
+                let fetched_tip = match self
                     .fetch_canonical_to_sandbox(
                         workspace_id,
                         agent_id,
@@ -4001,29 +4002,32 @@ impl Services {
                     )
                     .await
                 {
-                    tracing::error!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "failed to fetch canonical to sandbox; marking merge-pending"
-                    );
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            workspace_id,
-                            agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return SandboxMergeDisposition::propagate_with("merge_pending");
-                }
+                    Ok(tip) => tip,
+                    Err(e) => {
+                        tracing::error!(
+                            agent = %agent_id.0,
+                            error = %e,
+                            "failed to fetch canonical to sandbox; marking merge-pending"
+                        );
+                        let _ = self
+                            .store
+                            .update_sandbox_status(
+                                workspace_id,
+                                agent_id,
+                                SandboxStatus::MergePending,
+                                &now_iso(),
+                            )
+                            .await;
+                        return SandboxMergeDisposition::propagate_with("merge_pending");
+                    }
+                };
 
                 // Wake agent with conflict instructions
                 let message = format!(
                     "⚠️ Merge conflict detected. Your sandbox branch has conflicts with the canonical repository.\n\n\
                     **Conflicting files:**\n{}\n\n\
                     **Instructions:**\n\
-                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD`\n\
+                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD` (commit {})\n\
                     2. Resolve conflicts by rebasing or merging: `git rebase canonical/HEAD` or `git merge canonical/HEAD`\n\
                     3. Fix conflicts in the listed files\n\
                     4. Commit the resolution: `git add <files> && git commit`\n\
@@ -4181,28 +4185,33 @@ impl Services {
     }
 
     /// Fetch canonical repository state into sandbox for conflict resolution.
+    /// The source is the merge-target repository ([`resolve_user_directory`]
+    /// — the workspace checkout for CoW/Direct checkout modes, NOT the raw
+    /// `repository_path`, which is a stale clone source there). Returns the
+    /// fetched canonical tip SHA (`refs/remotes/canonical/HEAD` after the
+    /// fetch) so bounce messages can name the exact commit to reconcile
+    /// against.
     async fn fetch_canonical_to_sandbox(
         &self,
         workspace_id: &WorkspaceId,
         _agent_id: &AgentId,
         sandbox_path: &str,
         _canonical_head: &str,
-    ) -> Result<()> {
-        // Load workspace to get canonical repo path
+    ) -> Result<String> {
+        // Resolve the canonical repo exactly like the merge path does, so
+        // the bounced agent reconciles against the tip it conflicted with.
         let workspace = self.store.get_workspace(workspace_id).await?;
-        let canonical_path = workspace
-            .repository_path
-            .as_ref()
-            .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
+        let canonical_path = crate::sandbox_ops::resolve_user_directory(&workspace)?;
 
         // Fetch canonical HEAD into sandbox as canonical/HEAD. Shell out to
         // git with an explicit refspec and tag auto-follow disabled: the
         // canonical repo carries non-commit refs (refs/intent/blobs/*,
         // refs/stash) that libgit2's local transport trips over ("object is
         // not a committish", InvalidSpec) — same failure class fixed for the
-        // merge-back fetch in sandbox_ops::merge_sandbox. Runs on the blocking
-        // pool: a large local fetch must not pin an async runtime worker.
-        let canonical_path = canonical_path.clone();
+        // merge-back fetch in sandbox_ops::merge_sandbox. The `+` refspec
+        // forces the update so every bounce refreshes the ref to the CURRENT
+        // tip. Runs on the blocking pool: a large local fetch must not pin
+        // an async runtime worker.
         let sandbox_path = sandbox_path.to_string();
         tokio::task::spawn_blocking(move || {
             let fetch_out = std::process::Command::new("git")
@@ -4222,7 +4231,15 @@ impl Services {
                     String::from_utf8_lossy(&fetch_out.stderr).trim()
                 )));
             }
-            Ok(())
+            let repo = git2::Repository::open(&sandbox_path)
+                .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+            let tip = repo
+                .find_reference("refs/remotes/canonical/HEAD")
+                .and_then(|r| r.peel_to_commit())
+                .map_err(|e| {
+                    Error::Internal(format!("resolve fetched canonical tip failed: {e}"))
+                })?;
+            Ok(tip.id().to_string())
         })
         .await
         .map_err(|e| Error::Internal(format!("fetch canonical task failed: {e}")))?

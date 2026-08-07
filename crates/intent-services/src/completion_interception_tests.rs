@@ -988,6 +988,152 @@ mod tests {
         let _ = fs::remove_dir_all(&test_root);
     }
 
+    #[tokio::test]
+    async fn test_bounce_fetches_canonical_tip_from_merge_target_repo() {
+        // Regression (dev-seat merge-verification round): the bounce's
+        // canonical fetch must come from the SAME repository the merge
+        // targets (`resolve_user_directory` — the workspace checkout for
+        // CoW/Direct checkout modes), and the bounce message must name the
+        // fetched commit. The pre-fix path fetched `repository_path`
+        // unconditionally, so a checkout-mode workspace bounced its agent
+        // against a stale tip and the conflict never converged.
+
+        let (store, _db) = temp_store().await;
+        let (test_root, origin_path) = temp_repo_in_target("bounce-fetch-origin");
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        // The workspace CHECKOUT is a clone of origin: this is the canonical
+        // repo sandboxes merge into (worktree_path, checkoutMode=cow).
+        let checkout_path = test_root.join("checkout");
+        let clone_out = std::process::Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg(&origin_path)
+            .arg(&checkout_path)
+            .output()
+            .unwrap();
+        assert!(clone_out.status.success(), "git clone must succeed");
+
+        let probe = cow_probe(&checkout_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let mut ws = workspace_for_repo(&origin_path);
+        ws.worktree_path = Some(checkout_path.to_string_lossy().to_string());
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Cow);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let child_id = AgentId::from("agent-child");
+        let parent_id = AgentId::from("agent-parent");
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        create_agent_session(&store, &ws.id, &child_id, Some(&parent_id), None).await;
+        let outcome = provision_sandbox(&store, &ws.id, &child_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(&child_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", child_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        create_agent_session(&store, &ws.id, &parent_id, None, None).await;
+
+        // Conflicting commit lands in the CHECKOUT only — origin stays at
+        // the initial commit (the stale tip the pre-fix fetch would grab).
+        let checkout_repo = Repository::open(&checkout_path).unwrap();
+        fs::write(checkout_path.join("conflict.txt"), "canonical version").unwrap();
+        let mut checkout_index = checkout_repo.index().unwrap();
+        checkout_index.add_path(Path::new("conflict.txt")).unwrap();
+        checkout_index.write().unwrap();
+        let checkout_tree_oid = checkout_index.write_tree().unwrap();
+        let checkout_tree = checkout_repo.find_tree(checkout_tree_oid).unwrap();
+        let checkout_parent = checkout_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let checkout_tip = checkout_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Checkout change",
+                &checkout_tree,
+                &[&checkout_parent],
+            )
+            .unwrap();
+
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("conflict.txt"), "sandbox version").unwrap();
+        let mut sandbox_index = sandbox_repo.index().unwrap();
+        sandbox_index.add_path(Path::new("conflict.txt")).unwrap();
+        sandbox_index.write().unwrap();
+        let sandbox_tree_oid = sandbox_index.write_tree().unwrap();
+        let sandbox_tree = sandbox_repo.find_tree(sandbox_tree_oid).unwrap();
+        let sandbox_parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Sandbox change",
+                &sandbox_tree,
+                &[&sandbox_parent],
+            )
+            .unwrap();
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root.clone());
+
+        let event = completion_event(&ws.id, &child_id);
+        services.handle_completion_event(&event).await;
+
+        // Bounced, not merge_pending: the fetch must have succeeded.
+        let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::ConflictBounced);
+
+        // The fetched tip is the CHECKOUT's head (the merge target), not
+        // origin's stale head.
+        let sandbox_repo_after = Repository::open(&sandbox_path).unwrap();
+        let fetched = sandbox_repo_after
+            .find_reference("refs/remotes/canonical/HEAD")
+            .expect("canonical HEAD must be fetched into the sandbox")
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_eq!(
+            fetched, checkout_tip,
+            "bounce must fetch the canonical tip from the merge-target repo (workspace checkout)"
+        );
+
+        // The bounce message names the exact fetched commit.
+        let messages = store.get_agent_messages(&child_id, None).await.unwrap();
+        let bounce_text = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .expect("bounce message must be delivered")
+            .content
+            .to_string();
+        assert!(
+            bounce_text.contains(&checkout_tip.to_string()),
+            "bounce message must reference the fetched canonical commit: {bounce_text}"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
     /// Provision a sandbox with one clean commit and strand it `merge_pending`,
     /// returning `(test_root, repo_path, sandbox_path, ws, services, bus)`.
     /// Returns `None` when CoW is unsupported (test should skip).
