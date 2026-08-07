@@ -77,6 +77,9 @@ fn registry_field_parity() {
     // `auggie token print` exits 0 iff logged in; its output is the auth
     // session secret, so the probe must ride the generic exit-code arm.
     assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
+    // Installed-but-logged-out auggie needs a login affordance on the generic
+    // provider row, which reads the catalog's `login_docs_url`.
+    assert!(auggie.login_docs_url.is_some());
 
     let cc = find_provider("claude-code").unwrap();
     assert_eq!(cc.command, "claude-agent-acp");

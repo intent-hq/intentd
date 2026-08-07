@@ -268,6 +268,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // stderr nulled) — never captured, logged, or surfaced.
         auth_check_args: Some(&["token", "print"]),
         login_command_hint: Some("auggie login"),
+        login_docs_url: Some("https://docs.augmentcode.com/cli/overview"),
         short_name: "Auggie",
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
