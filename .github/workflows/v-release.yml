@@ -36,8 +36,10 @@ permissions:
 # will hard limit this to 3 tags per commit, as it will assume more tags is a
 # mistake.
 #
-# If there's a prerelease-style suffix to the version, then the release(s)
-# will be marked as a prerelease.
+# LOCAL CUSTOMIZATION (see "Create GitHub Release" below): every release is
+# published as a GitHub Pre-release regardless of the version suffix. Tagged
+# releases are the beta channel; promote-stable.yml clears the prerelease flag
+# and marks the promoted version as Latest.
 on:
   pull_request:
   push:
@@ -333,7 +335,12 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
+          # LOCAL CUSTOMIZATION of this cargo-dist-generated file: always
+          # --prerelease (upstream makes it conditional on a prerelease-style
+          # version suffix). Every tagged release is a beta; promote-stable.yml
+          # clears the flag and marks the version Latest. Re-apply this after
+          # any `dist generate`.
+          PRERELEASE_FLAG: "--prerelease"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           REPO: "intent-hq/intentd"
