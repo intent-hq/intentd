@@ -2454,6 +2454,83 @@ impl Store {
         rows.iter().map(map_message_row).collect()
     }
 
+    /// The newest non-`system` message of an agent's log, hydrated as a
+    /// single row — the question-hold tail anchor (PROTOCOL §5.5). Trailing
+    /// `system` rows are skipped inside SQL (a backwards walk over the
+    /// `UNIQUE(agent_id, seq)` index), so per-call cost is one statement and
+    /// at most ONE decoded message regardless of transcript size — the
+    /// service-layer alternative pages full rows (content blobs included)
+    /// back until it finds a non-system row. `None` when the log is empty or
+    /// all-system.
+    pub async fn get_last_non_system_message(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<AgentMessage>> {
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message \
+             WHERE agent_id = ? AND role != 'system' ORDER BY seq DESC LIMIT 1"
+        );
+        let row = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get last non-system message failed: {e}")))?;
+        row.as_ref().map(map_message_row).transpose()
+    }
+
+    /// One message of an agent's log by row id, hydrated as a single row —
+    /// the pending-questions marker resolver (PROTOCOL §5.5). One statement
+    /// over the primary key, at most ONE decoded message regardless of
+    /// transcript size. `None` when the id is unknown or belongs to a
+    /// different agent.
+    pub async fn get_agent_message_by_id(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<Option<AgentMessage>> {
+        let sql =
+            format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .bind(message_id)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent message by id failed: {e}")))?;
+        row.as_ref().map(map_message_row).transpose()
+    }
+
+    /// Number of live delegated children of `parent_agent_id`: sessions
+    /// carrying this `parent_agent_id` whose status is still non-terminal
+    /// (not `Completed`/`error`/`deleted`). Deliberately UNSCOPED by
+    /// workspace — a Chief parent can delegate into another workspace
+    /// (`agent.delegate` cross-workspace), and `parent_agent_id` is globally
+    /// unique. One aggregate statement over `idx_agent_parent`, so cost is
+    /// O(this agent's children), never O(workspace sessions). Backs the
+    /// `runningSubAgents` snapshot field.
+    pub async fn count_unsettled_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
+        let terminal = [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ]
+        .iter()
+        .map(enum_to_db)
+        .collect::<Result<Vec<_>>>()?;
+        let n: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM agent_session \
+             WHERE parent_agent_id = ? AND status NOT IN (?, ?, ?)",
+        )
+        .bind(&parent_agent_id.0)
+        .bind(&terminal[0])
+        .bind(&terminal[1])
+        .bind(&terminal[2])
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("count unsettled child agents failed: {e}")))?
+        .get::<i64, _>("n");
+        Ok(n as u64)
+    }
+
     /// Total number of messages logged for an agent (`agent.getConversation`
     /// `totalMessages`).
     pub async fn count_agent_messages(&self, agent_id: &AgentId) -> Result<i64> {
