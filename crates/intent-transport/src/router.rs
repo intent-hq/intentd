@@ -2985,6 +2985,29 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        // Centralized PR monitors (§6.9): the FE reads, cancels and flushes
+        // monitors; there is NO wire registration method — monitors are
+        // agent-owned via the `ws.pr.monitor` MCP binding only.
+        "prMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            api.pr_monitor_list(ws, None).await.map_err(domain_to_rpc)
+        }
+        "prMonitor.cancel" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            // FE cancel: any monitor can be cancelled and the owning agent is
+            // woken with a cancellation notice.
+            api.pr_monitor_cancel_by_id(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "prMonitor.flush" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            api.pr_monitor_flush_pending(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "rules.list" => {
             // Optional workspaceId: present → include the workspace's read-only
             // rule files; omitted → global user-override set only.

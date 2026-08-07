@@ -2,15 +2,16 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      nine `agentFeatures.*` paths (defaults on).
+//      ten `agentFeatures.*` paths (defaults on).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
 //   3. Flip `backgroundHooks` / `hostExec` / `terminalAccess` /
-//      `richChatBlocks` / `attentionRequests` off via `settings.update`,
-//      create a NEW session: prompt sections absent, tool description pruned,
-//      dispatch denied with the explicit "disabled in settings
-//      (<path> = false)" error (`hook.schedule` included).
+//      `richChatBlocks` / `attentionRequests` / `prMonitor` off via
+//      `settings.update`, create a NEW session: prompt sections absent, tool
+//      description pruned, dispatch denied with the explicit "disabled in
+//      settings (<path> = false)" error (`hook.schedule` and the `pr.monitor*`
+//      trio included, while method-level gating leaves `pr.snapshot` intact).
 //   4. New-sessions-only: the EXISTING session's bridge — captured at agent
 //      creation — still advertises the full surface and still dispatches the
 //      gated methods after the flip.
@@ -43,8 +44,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The nine `agentFeatures.*` settings paths (all default on).
-const FEATURE_PATHS: [&str; 9] = [
+/// The ten `agentFeatures.*` settings paths (all default on).
+const FEATURE_PATHS: [&str; 10] = [
     "agentFeatures.backgroundHooks",
     "agentFeatures.hostExec",
     "agentFeatures.scripts",
@@ -54,6 +55,7 @@ const FEATURE_PATHS: [&str; 9] = [
     "agentFeatures.structuredQuestions",
     "agentFeatures.attentionRequests",
     "agentFeatures.stateSnapshot",
+    "agentFeatures.prMonitor",
 ];
 
 struct Daemon {
@@ -385,7 +387,7 @@ impl BridgeClient {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: settings round-trip for all eight agentFeatures.* paths over WSS.
+// Test 1: settings round-trip for all nine agentFeatures.* paths over WSS.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -588,6 +590,9 @@ async fn agent_features_gate_new_sessions_only() {
         "ws.script.run(",
         "ws.agent.reportBlocker(",
         "ws.agent.requestDiscussion(",
+        "ws.pr.monitor(",
+        "ws.pr.unmonitor(",
+        "ws.pr.monitors()",
     ] {
         assert!(desc_a.contains(marker), "full description missing {marker}");
     }
@@ -615,6 +620,20 @@ async fn agent_features_gate_new_sessions_only() {
         text.contains("\"rb\": \"function\"") && text.contains("\"rd\": \"function\""),
         "attention-request bindings must be installed on the full session: {text}"
     );
+    // The PR-monitor bindings are installed on the full session (typeof probe
+    // — registering would hit a real forge).
+    let (err, text) = bridge_a
+        .call_js(
+            "return { m: typeof ws.pr.monitor, u: typeof ws.pr.unmonitor, l: typeof ws.pr.monitors, s: typeof ws.pr.snapshot }",
+        )
+        .await;
+    assert!(!err, "ws.pr typeof probe must succeed: {text}");
+    assert!(
+        text.contains("\"m\": \"function\"")
+            && text.contains("\"u\": \"function\"")
+            && text.contains("\"l\": \"function\""),
+        "pr-monitor bindings must be installed on the full session: {text}"
+    );
 
     // ===== Flip the toggles off =====
     let flip = wss_rpc(
@@ -627,13 +646,14 @@ async fn agent_features_gate_new_sessions_only() {
             { "path": "agentFeatures.terminalAccess", "value": false },
             { "path": "agentFeatures.richChatBlocks", "value": false },
             { "path": "agentFeatures.attentionRequests", "value": false },
+            { "path": "agentFeatures.prMonitor", "value": false },
         ] }),
     )
     .await;
     assert_eq!(
         flip["result"]["applied"].as_array().map(Vec::len),
-        Some(5),
-        "all five toggles applied: {flip}"
+        Some(6),
+        "all six toggles applied: {flip}"
     );
 
     // ===== Session B: created AFTER the flip =====
@@ -707,6 +727,7 @@ async fn agent_features_gate_new_sessions_only() {
         "ws.terminal.",
         "ws.agent.reportBlocker",
         "ws.agent.requestDiscussion",
+        "pr.monitor",
     ] {
         assert!(
             !desc_b.contains(gated),
@@ -718,6 +739,8 @@ async fn agent_features_gate_new_sessions_only() {
         "ws.script.run(",
         "ws.note.read(",
         "ws.agent.reportToParent(",
+        // `prMonitor` is method-level: `ws.pr.snapshot` survives it.
+        "ws.pr.snapshot(",
     ] {
         assert!(desc_b.contains(kept), "gated description missing {kept}");
     }
@@ -742,6 +765,24 @@ async fn agent_features_gate_new_sessions_only() {
     assert!(
         text.contains("\"browser\": \"object\"") && text.contains("\"rtp\": \"function\""),
         "ungated prelude surface must survive on B: {text}"
+    );
+    // `prMonitor` is method-level: `ws.pr` stays installed with only
+    // `snapshot` on it.
+    let (err, text) = bridge_b
+        .call_js(
+            "return { m: typeof ws.pr.monitor, u: typeof ws.pr.unmonitor, l: typeof ws.pr.monitors, s: typeof ws.pr.snapshot }",
+        )
+        .await;
+    assert!(!err, "ws.pr typeof probe must succeed on B: {text}");
+    assert!(
+        text.contains("\"m\": \"undefined\"")
+            && text.contains("\"u\": \"undefined\"")
+            && text.contains("\"l\": \"undefined\""),
+        "gated pr-monitor bindings must be undefined on B: {text}"
+    );
+    assert!(
+        text.contains("\"s\": \"function\""),
+        "ws.pr.snapshot must survive the prMonitor gate on B: {text}"
     );
 
     // B's dispatch (defense in depth): raw `host({...})` frames that bypass
@@ -795,6 +836,29 @@ async fn agent_features_gate_new_sessions_only() {
             "host: method `agent.requestDiscussion` is disabled in settings (agentFeatures.attentionRequests = false)"
         ),
         "agent.requestDiscussion denial must name the toggle: {text}"
+    );
+    for method in ["pr.monitor", "pr.unmonitor", "pr.monitors"] {
+        let (err, text) = bridge_b
+            .call_js(&format!(
+                "return await host({{ method: '{method}', args: {{ prNumber: 1 }} }})"
+            ))
+            .await;
+        assert!(err, "{method} must be denied: {text}");
+        assert!(
+            text.contains(&format!(
+                "host: method `{method}` is disabled in settings (agentFeatures.prMonitor = false)"
+            )),
+            "{method} denial must name the toggle: {text}"
+        );
+    }
+    // Defense in depth cuts only the monitor methods: `pr.snapshot` still
+    // dispatches (it fails on the missing forge, not on the gate).
+    let (_err, text) = bridge_b
+        .call_js("return await host({ method: 'pr.snapshot', args: { prNumber: 1 } })")
+        .await;
+    assert!(
+        !text.contains("disabled in settings"),
+        "pr.snapshot must not be gated by prMonitor: {text}"
     );
 
     // Control: an ungated namespace still dispatches on B.

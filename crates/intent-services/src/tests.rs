@@ -7094,10 +7094,11 @@ mod pr {
     use async_trait::async_trait;
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
-        AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
-        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
-        PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
-        Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor,
+        Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
+        MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+        PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment,
+        ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck,
         ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
@@ -7163,6 +7164,10 @@ mod pr {
         /// When true, `review_decision` fails, exercising the degrade-to-
         /// aggregate path of `pr_state`.
         fail_review_decision: bool,
+        /// What the merge-requirements probe reports. `None` mirrors a host
+        /// without the signals (the trait default `Unsupported`), exercising
+        /// the degraded checklist path.
+        merge_signals: Option<MergeRequirementSignals>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -7422,6 +7427,16 @@ mod pr {
                 },
             ])
         }
+        async fn merge_requirements(
+            &self,
+            _: &RepoRef,
+            _: u64,
+        ) -> ScResult<MergeRequirementSignals> {
+            match &self.merge_signals {
+                Some(signals) => Ok(signals.clone()),
+                None => Err(ScError::Unsupported("merge requirements probe".into())),
+            }
+        }
         async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
             Ok(vec![Comment {
                 id: "1".into(),
@@ -7644,6 +7659,115 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
         let services = Services::new(store).with_source_control(Arc::new(forge));
         (tmp, services, ws_id)
+    }
+
+    // ---- merge-requirements checklist over the stubbed forge -------------
+
+    /// Drive `pr_ops::fetch_merge_requirements` against a stub forge.
+    async fn merge_requirements_of(forge: StubForge) -> crate::MergeRequirements {
+        let sc: Arc<dyn SourceControl> = Arc::new(forge);
+        let repo = RepoRef::new("o", "r");
+        crate::fetch_merge_requirements(sc.as_ref(), &repo, 42)
+            .await
+            .expect("merge requirements")
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_composes_probe_and_snapshot() {
+        // The stub's sample PR is open/clean with one approval (alice) and one
+        // unresolved review thread (RT1).
+        let req = merge_requirements_of(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                review_decision: Some(ReviewDecision::ReviewRequired),
+                checks: vec![
+                    RollupCheck {
+                        name: "build".into(),
+                        state: CheckState::Success,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "test".into(),
+                        state: CheckState::Failure,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "flaky".into(),
+                        state: CheckState::Failure,
+                        is_required: false,
+                        url: None,
+                    },
+                ],
+                checks_known: true,
+                branch_rules: Some(BranchRules {
+                    required_approving_review_count: Some(2),
+                    required_conversation_resolution: Some(true),
+                    required_status_checks: vec!["build".into(), "test".into()],
+                }),
+            }),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(req.state, "open");
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        assert!(req.checks.required_known);
+        assert_eq!(req.approvals.decision, "review_required");
+        assert_eq!(req.approvals.have, 1);
+        assert_eq!(req.approvals.needed, Some(2));
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.threads.resolution_required, Some(true));
+        assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
+        assert!(req.rules_known);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_degrades_when_probe_unsupported() {
+        // No probe (the trait default `Unsupported`): the checklist falls back
+        // to the REST check-runs and reports the rules as unknown.
+        let req = merge_requirements_of(StubForge::default()).await;
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 1, 1)
+        );
+        assert!(!req.checks.required_known);
+        assert!(req.checks.failing_required.is_empty());
+        assert!(!req.rules_known);
+        assert_eq!(req.approvals.needed, None);
+        assert_eq!(req.threads.resolution_required, None);
+        // The aggregate still drives the decision (alice approved).
+        assert_eq!(req.approvals.decision, "approved");
+        assert_eq!(req.threads.unresolved, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_survives_a_failing_thread_read() {
+        // A GraphQL thread failure falls back to the flat REST comments
+        // (resolution state unavailable, so each fallback thread counts as
+        // unresolved) rather than failing the whole checklist.
+        let req = merge_requirements_of(StubForge {
+            fail_threads: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.state, "open");
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_reports_conflicts_on_a_dirty_pr() {
+        let req = merge_requirements_of(StubForge {
+            dirty_pr: true,
+            ..Default::default()
+        })
+        .await;
+        assert!(req.has_conflicts);
+        assert_eq!(req.mergeable, Some(false));
+        assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
     }
 
     // ---- github.* browse / auth / identity (PROTOCOL §5.27) -------------
@@ -7999,6 +8123,8 @@ mod pr {
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
         assert_eq!(v["comments"]["totalCount"], 3);
+        // Pin the unified merge-requirements field name on the snapshot shape.
+        assert!(v["requirements"].is_object());
     }
 
     #[tokio::test]

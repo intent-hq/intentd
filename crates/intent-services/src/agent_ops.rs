@@ -84,6 +84,12 @@ pub(crate) struct AgentSnapshot {
     /// Structured questions still pending presentation/answer.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) num_questions_asked: usize,
+    /// Active PR monitors owned by this agent as `"<owner>/<name>#<number>"`
+    /// labels, suffixed with `" (changes pending)"` while a debounced emit is
+    /// accumulating. Omitted when the agent monitors nothing, so prompts stay
+    /// byte-identical for agents that never use the feature.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pr_monitors: Vec<String>,
     /// `"blocker"` / `"discussion"` when this agent has raised an attention
     /// request that is still unresolved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +110,7 @@ impl AgentSnapshot {
             && self.event_subscriptions == 0
             && self.running_sub_agents == 0
             && self.num_questions_asked == 0
+            && self.pr_monitors.is_empty()
             && self.pending_attention.is_none()
     }
 }
@@ -6543,6 +6550,9 @@ impl Services {
             .await
             .unwrap_or(0) as usize;
         let num_questions_asked = self.pending_question_count(agent_id).await;
+        // Per-agent indexed read over this agent's monitor rows; labels only,
+        // no snapshot hydration. Fails open to empty.
+        let pr_monitors = self.active_pr_monitor_labels(agent_id).await;
         // Whole-second UTC timestamp — the snapshot line is injected into
         // every turn prompt, so sub-second precision only spends tokens.
         let time = {
@@ -6560,6 +6570,7 @@ impl Services {
             event_subscriptions,
             running_sub_agents,
             num_questions_asked,
+            pr_monitors,
             pending_attention: session.attention_request_kind.clone(),
         })
     }

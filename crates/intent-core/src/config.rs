@@ -51,6 +51,22 @@ pub const DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 10;
 /// ≥1s wall/monotonic divergence.
 pub const MIN_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 1;
 
+/// Default poll cadence for the centralized PR-monitor loop
+/// (`prMonitor.pollSeconds`).
+pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
+
+/// Floor for `prMonitor.pollSeconds` — a tighter interval would hammer the
+/// forge. Sub-minimum values (notably `0`) are clamped up at read time.
+pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
+
+/// Default quiet window a changed PR must observe before its consolidated
+/// wake is delivered (`prMonitor.debounceSeconds`).
+pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
+
+/// Floor for `prMonitor.debounceSeconds`. Sub-minimum values (notably `0`)
+/// are clamped up at read time.
+pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
+
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

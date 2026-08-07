@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -2986,6 +2986,64 @@ pub struct Hook {
     /// perpetual hooks accumulate across fires.
     #[serde(default)]
     pub dispatch_count: i64,
+}
+
+/// Lifecycle state of a PR monitor. `active` is the only live state
+/// (rehydrated into the poll loop at boot); `completed` (the PR merged or
+/// closed) and `cancelled` are terminal. Completed rows are RETAINED and stay
+/// visible in list surfaces; cancelled rows are excluded. Wire/DB words are
+/// the lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrMonitorState {
+    /// Being polled; changes accumulate and wake the owner after the
+    /// debounce window.
+    Active,
+    /// The PR reached a terminal lifecycle (merged or closed); the owner was
+    /// woken immediately and monitoring stopped.
+    Completed,
+    /// Cancelled by the owning agent (`ws.pr.unmonitor`) or from the app
+    /// (`prMonitor.cancel`).
+    Cancelled,
+}
+
+/// A PR monitor: an agent-owned watch on one pull request, polled centrally
+/// by the daemon. Changes to the PR's merge-requirements checklist are
+/// accumulated (`pendingChanges`) and delivered as ONE consolidated wake once
+/// the PR has been quiet for the debounce window. Persisted to the
+/// `pr_monitor` table so monitors survive a daemon restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrMonitor {
+    pub monitor_id: PrMonitorId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: i64,
+    pub state: PrMonitorState,
+    /// JSON-serialized merge-requirements baseline the next poll diffs
+    /// against. `None` until the first successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot: Option<String>,
+    /// Change lines accumulated since the last emit, awaiting the debounce
+    /// window to close. Empty when nothing is pending.
+    #[serde(default)]
+    pub pending_changes: Vec<String>,
+    /// When the oldest un-emitted change was detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_since: Option<String>,
+    /// When the most recent change was detected — the quiet-window anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_polled_at: Option<String>,
+    /// Most recent forge-poll error (cleared by a successful poll); a failing
+    /// poll never kills the loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
