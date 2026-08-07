@@ -17,6 +17,13 @@
 //!
 //! [`GitStatusRefresher::trigger`] exposes the same debounced path to
 //! additional trigger sources (e.g. a `.git` metadata watch).
+//!
+//! The recompute also owns the read path's cache invalidation
+//! (monorepo#1648): the observed change is exactly what makes the cached
+//! [`crate::git_status_cache::GitStatusCache`] entry stale, so the refresh
+//! discards it and repopulates it with the scan it was going to run anyway —
+//! reads landing after the refresh hit a warm, current entry instead of
+//! paying (or racing) a second scan.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +36,7 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
+use crate::git_status_cache::GitStatusCache;
 use crate::{accept_changes, changes_git_status_event, git_ops};
 
 /// Per-workspace coalescing window. Scheduled on the FIRST trigger in a burst
@@ -57,7 +65,13 @@ impl GitStatusRefresher {
     /// Subscribe to `file:*` on `bus` and start the debounced refresh loop.
     /// `services` resolves workspace rows (worktree path, remote flag) at
     /// refresh time so the bridge always sees the current workspace state.
-    pub fn start(bus: EventBus, services: Arc<dyn WorkspaceApi>) -> Self {
+    /// `status_cache` is the read path's cache: each refresh invalidates and
+    /// repopulates the recomputed worktree's entry (see the module note).
+    pub fn start(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        status_cache: Arc<GitStatusCache>,
+    ) -> Self {
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![
                 FILE_CREATED.to_string(),
@@ -75,7 +89,7 @@ impl GitStatusRefresher {
                 }
             }
         });
-        let refresh_task = tokio::spawn(refresh_loop(bus, services, trigger_rx));
+        let refresh_task = tokio::spawn(refresh_loop(bus, services, status_cache, trigger_rx));
         Self {
             trigger_tx,
             forward_task,
@@ -96,6 +110,7 @@ impl GitStatusRefresher {
 async fn refresh_loop(
     bus: EventBus,
     services: Arc<dyn WorkspaceApi>,
+    status_cache: Arc<GitStatusCache>,
     mut trigger_rx: mpsc::UnboundedReceiver<WorkspaceId>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
@@ -119,7 +134,7 @@ async fn refresh_loop(
                     .collect();
                 for ws_id in due {
                     pending.remove(&ws_id);
-                    refresh_workspace(&bus, services.as_ref(), &ws_id).await;
+                    refresh_workspace(&bus, services.as_ref(), status_cache.as_ref(), &ws_id).await;
                 }
             }
         }
@@ -137,7 +152,12 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// `changes:git-status` event. Remote workspaces and workspaces without a
 /// resolvable worktree are skipped (their status cannot change via local
 /// `file:*` events). Failures are logged, never fatal to the loop.
-async fn refresh_workspace(bus: &EventBus, services: &dyn WorkspaceApi, ws_id: &WorkspaceId) {
+async fn refresh_workspace(
+    bus: &EventBus,
+    services: &dyn WorkspaceApi,
+    status_cache: &GitStatusCache,
+    ws_id: &WorkspaceId,
+) {
     let ws = match services.get_workspace(ws_id.clone()).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -151,12 +171,32 @@ async fn refresh_workspace(bus: &EventBus, services: &dyn WorkspaceApi, ws_id: &
     let Some(worktree) = git_ops::worktree_path(&ws) else {
         return;
     };
-    // Full status scan + bounded history walk (libgit2) — run on the blocking
-    // pool so a slow scan on a big repo cannot stall the runtime (parity with
-    // `accept-changes.getStatus`).
-    let status =
-        tokio::task::spawn_blocking(move || accept_changes::build_git_status_value(&worktree, &ws))
-            .await;
+    // The change that triggered this refresh is exactly what invalidates the
+    // read path's cached scan (monorepo#1648): discard the stale entry and let
+    // this recompute's scan repopulate it, so reads land on a warm, current
+    // entry instead of paying a second walk. A non-repo worktree has no scan
+    // to cache — `build_git_status_value_with` returns the minimal status
+    // without touching libgit2 — so it only invalidates.
+    let scanned = if worktree.join(".git").exists() {
+        match status_cache.refresh(&worktree).await {
+            Ok(status) => Some(status),
+            Err(e) => {
+                tracing::warn!(workspace = %ws_id, error = %e, "git-status refresh failed");
+                return;
+            }
+        }
+    } else {
+        status_cache.invalidate(&worktree);
+        None
+    };
+    // Bounded history walk + remote/trunk resolution (libgit2) — run on the
+    // blocking pool so a slow repo cannot stall the runtime (parity with
+    // `accept-changes.getStatus`). The working-tree scan itself was already
+    // paid above, and is handed in so it is not repeated.
+    let status = tokio::task::spawn_blocking(move || {
+        accept_changes::build_git_status_value_with(&worktree, &ws, scanned)
+    })
+    .await;
     let status = match status {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
@@ -335,7 +375,8 @@ mod tests {
         let root = TempDir::new("single");
         let ws = test_workspace("ws-single", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let _refresher = GitStatusRefresher::start(bus.clone(), api);
+        let _refresher =
+            GitStatusRefresher::start(bus.clone(), api, Arc::new(GitStatusCache::new()));
 
         bus.publish(&file_event(&ws.id, "src/main.rs"))
             .await
@@ -358,7 +399,8 @@ mod tests {
         let root = TempDir::new("burst");
         let ws = test_workspace("ws-burst", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let _refresher = GitStatusRefresher::start(bus.clone(), api);
+        let _refresher =
+            GitStatusRefresher::start(bus.clone(), api, Arc::new(GitStatusCache::new()));
 
         // A branch-switch-like burst: many file events well inside DEBOUNCE.
         for i in 0..25 {
@@ -404,7 +446,8 @@ mod tests {
 
         let ws = test_workspace("ws-repo", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let _refresher = GitStatusRefresher::start(bus.clone(), api);
+        let cache = Arc::new(GitStatusCache::new());
+        let _refresher = GitStatusRefresher::start(bus.clone(), api, Arc::clone(&cache));
 
         // The external hand edit + the file event the watcher would emit.
         std::fs::write(root.path.join("seed.txt"), "edited outside the app\n").unwrap();
@@ -417,5 +460,13 @@ mod tests {
             .expect("hand edit must yield a changes:git-status event");
         assert_eq!(ev.data["status"]["branch"], "main");
         assert_eq!(ev.data["status"]["uncommittedCount"], 1);
+        // The refresh repopulated the read path's cache with the scan it just
+        // paid for (monorepo#1648): a read landing now serves the post-edit
+        // snapshot without walking the tree again.
+        let cached = cache
+            .get(&root.path, None)
+            .await
+            .expect("refresh must leave a cached status");
+        assert_eq!(cached.files.len(), 1);
     }
 }
