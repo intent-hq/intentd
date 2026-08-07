@@ -3,7 +3,7 @@
 #
 # Usage: aggregate-stable-notes.sh <promoted-version> [<previous-stable-version>]
 #
-# Collects the bodies of every published, non-prerelease vX.Y.Z release in
+# Collects the bodies of every published (non-draft) vX.Y.Z release in
 # (previous-stable, promoted] (semver order, plain X.Y.Z tags only) and
 # rewrites the `channel-stable` release body as a
 # "Stable channel — currently vX.Y.Z" header followed by one "## vX.Y.Z"
@@ -46,10 +46,13 @@ if [[ -z "$PREV" ]]; then
   # just the promoted version's body.
   versions=("$PROMOTED")
 else
-  # Enumerate published, non-prerelease releases with plain vX.Y.Z tags.
+  # Enumerate published (non-draft) releases with plain vX.Y.Z tags. The
+  # prerelease flag is deliberately not a filter: every tagged release is
+  # published as a Pre-release (beta) and only loses the flag once promoted,
+  # so filtering on it would shrink the range to already-promoted versions.
   all_versions=$(gh release list --repo "$REPO" --limit 1000 \
-    --json tagName,isDraft,isPrerelease \
-    --jq '.[] | select((.isDraft or .isPrerelease) | not) | .tagName
+    --json tagName,isDraft \
+    --jq '.[] | select(.isDraft | not) | .tagName
           | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
           | ltrimstr("v")')
 

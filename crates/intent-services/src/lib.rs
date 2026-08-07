@@ -67,6 +67,7 @@ pub mod events;
 mod file_ops;
 mod git_diff_singleflight;
 mod git_ops;
+mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
 
@@ -561,6 +562,18 @@ pub struct Services {
     /// tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_diffs_walk_probe`.
     git_diffs_walk_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Single-flight registry for in-flight working-tree status scans, keyed
+    /// by canonical worktree path: concurrent `git.status` /
+    /// `accept-changes.getStatus` calls for one worktree coalesce onto a
+    /// single blocking-pool [`intent_git::status::status`] scan and share its
+    /// result; distinct worktrees never serialize. Shared across clones so
+    /// every service handle observes the same in-flight set.
+    git_status_inflight: Arc<git_status_singleflight::StatusSingleFlight>,
+    /// Test seam: when set, invoked on the blocking pool immediately before
+    /// each underlying working-tree status scan (counting + parking for
+    /// coalescing tests). Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `with_git_status_scan_probe`.
+    git_status_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
@@ -667,6 +680,8 @@ impl Services {
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
+            git_status_inflight: Arc::new(git_status_singleflight::StatusSingleFlight::default()),
+            git_status_scan_probe: None,
             hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
@@ -1133,6 +1148,90 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn git_diffs_waiters(&self, key: &git_diff_singleflight::DiffKey) -> usize {
         self.git_diffs_inflight.waiters(key)
+    }
+
+    /// Test seam: observe/park the underlying working-tree status scan on the
+    /// blocking pool so single-flight coalescing tests are deterministic.
+    /// Production wiring keeps `None`.
+    #[cfg(test)]
+    pub(crate) fn with_git_status_scan_probe(mut self, probe: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.git_status_scan_probe = Some(probe);
+        self
+    }
+
+    /// Test seam: number of followers currently awaiting the in-flight
+    /// working-tree status scan for `worktree`.
+    #[cfg(test)]
+    pub(crate) fn git_status_waiters(&self, worktree: &Path) -> usize {
+        self.git_status_inflight
+            .waiters(&git_status_singleflight::status_key(worktree))
+    }
+
+    /// Run the working-tree status scan for `worktree` under per-worktree
+    /// single-flight coalescing (monorepo#1648): the first caller leads the
+    /// scan on the blocking pool and publishes the shared result; concurrent
+    /// callers for the same worktree await it instead of re-walking the tree.
+    /// A leader that vanishes without publishing frees the flight, so the
+    /// result of a failed or cancelled scan is never reused.
+    async fn scan_git_status(&self, worktree: &Path) -> Result<Arc<intent_core::GitStatus>> {
+        let key = git_status_singleflight::status_key(worktree);
+        let inflight = Arc::clone(&self.git_status_inflight);
+        let probe = self.git_status_scan_probe.clone();
+        loop {
+            match inflight.join(&key) {
+                git_status_singleflight::Join::Leader(flight) => {
+                    // A libgit2 working-tree scan is unbounded CPU on a big
+                    // repo; never run it on a Tokio worker.
+                    let scan_path = worktree.to_path_buf();
+                    let probe = probe.clone();
+                    let scanned = tokio::task::spawn_blocking(move || {
+                        if let Some(probe) = &probe {
+                            probe();
+                        }
+                        intent_git::status::status(&scan_path)
+                    })
+                    .await
+                    .map_err(|e| Error::Internal(format!("git status scan task failed: {e}")))?;
+                    return match scanned {
+                        Ok(status) => {
+                            let shared = Arc::new(status);
+                            flight.finish(Ok(Arc::clone(&shared)));
+                            Ok(shared)
+                        }
+                        Err(e) => {
+                            // Publish the inner message: every scan error is
+                            // `Error::Internal` (map_git_err), and the follower
+                            // re-wraps as `Error::Internal`, so coalesced
+                            // callers observe the same variant and message (no
+                            // double "internal error:" prefix).
+                            flight.finish(Err(match &e {
+                                Error::Internal(msg) => msg.clone(),
+                                other => other.to_string(),
+                            }));
+                            Err(e)
+                        }
+                    };
+                }
+                git_status_singleflight::Join::Follower(mut rx) => {
+                    tracing::debug!(
+                        worktree = %key.display(),
+                        "git status: coalesced into in-flight worktree scan"
+                    );
+                    match rx.wait_for(|slot| slot.is_some()).await {
+                        Ok(slot) => {
+                            return match slot.clone().expect("wait_for guarantees Some") {
+                                Ok(shared) => Ok(shared),
+                                Err(msg) => Err(Error::Internal(msg)),
+                            };
+                        }
+                        // The leader vanished without publishing (cancelled
+                        // RPC / panicked scan): retry — the next join elects a
+                        // new leader.
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -15726,11 +15825,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
-        let store = self.store.clone();
+        let svc = self.clone();
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
             // (the TS `getStatus` fallbacks), never an error.
-            let ws = match store.get_workspace(&workspace_id).await {
+            let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
                 Err(e) => return Err(e),
@@ -15744,13 +15843,13 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
-            // Run the libgit2 status scan on the blocking pool so a slow scan
-            // on a big repo cannot stall other RPCs (same runtime-saturation
-            // vector `git_fetch_bounded` closes for `git.fetch`).
+            // The scan runs on the blocking pool under per-worktree
+            // single-flight coalescing, so a slow scan on a big repo neither
+            // stalls other RPCs (the runtime-saturation vector
+            // `git_fetch_bounded` closes for `git.fetch`) nor gets re-walked
+            // once per concurrent caller (monorepo#1648).
             let started = std::time::Instant::now();
-            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
-                .await
-                .map_err(|e| Error::Internal(format!("git.status task failed: {e}")))?;
+            let status = svc.scan_git_status(&path).await;
             if let Ok(s) = &status {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
@@ -15759,7 +15858,7 @@ impl WorkspaceApi for Services {
                     "git.status: working-tree status scan"
                 );
             }
-            status
+            status.map(|s| (*s).clone())
         })
     }
 
@@ -16730,12 +16829,12 @@ impl WorkspaceApi for Services {
     }
 
     fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
+        let svc = self.clone();
         Box::pin(async move {
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
             // empty list), but projecting only the working-tree file list.
             let empty = serde_json::json!([]);
-            let ws = match store.get_workspace(&workspace_id).await {
+            let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
@@ -16749,14 +16848,11 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            // libgit2 status on the blocking pool (same as git_status).
-            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
-                .await
-                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
-            match status {
-                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
-                Err(e) => Err(e),
-            }
+            // The same working-tree scan `git.status` pays, so it goes through
+            // the shared per-worktree single-flight (monorepo#1648): a burst
+            // mixing `git.changes` with `git.status` walks the tree once.
+            let status = svc.scan_git_status(&path).await?;
+            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
         })
     }
 
@@ -20273,14 +20369,26 @@ impl Services {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
         match git_ops::worktree_path(&ws) {
-            // `build_git_status_value` runs a full status scan plus a bounded
-            // history walk (libgit2); run it on the blocking pool so a slow
-            // scan on a big repo cannot stall other RPCs.
-            Some(worktree) => tokio::task::spawn_blocking(move || {
-                accept_changes::build_git_status_value(&worktree, &ws)
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("accept-changes.getStatus task failed: {e}")))?,
+            Some(worktree) => {
+                // The working-tree scan is the cost `git.status` also pays, so
+                // take it through the shared per-worktree single-flight
+                // (monorepo#1648) and hand the result to the builder. The
+                // remaining libgit2 work (remote/trunk resolve, ahead/behind,
+                // bounded history walk) still runs per call, on the blocking
+                // pool so a slow repo cannot stall other RPCs.
+                let scanned = if worktree.join(".git").exists() {
+                    Some(self.scan_git_status(&worktree).await?)
+                } else {
+                    None
+                };
+                tokio::task::spawn_blocking(move || {
+                    accept_changes::build_git_status_value_with(&worktree, &ws, scanned)
+                })
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
+                })?
+            }
             None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }

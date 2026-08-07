@@ -43,6 +43,13 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # replaces the inherited workflow-level permissions, so contents: write must
 # be restated.
 github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read" } }
+# v-release.yml is hand-edited: `gh release create` always passes --prerelease
+# so every tagged release lands as a beta Pre-release (promote-stable.yml clears
+# the flag and marks the promoted version Latest). dist has no config knob for
+# that, and `dist plan` fails the PR check on any hand edit, so the CI freshness
+# check is relaxed here. Re-apply the customization after any `dist init` /
+# `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
+allow-dirty = ["ci"]
 # Injected into build-local-artifacts: provisions rustup/toolchain/targets on
 # the self-hosted runners, which don't have the hosted images' preinstalled
 # toolchains (see the file header for details).
