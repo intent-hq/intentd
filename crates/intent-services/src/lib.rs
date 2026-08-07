@@ -83,6 +83,7 @@ mod linear_ops;
 mod model_catalog;
 mod note_ops;
 mod pagination;
+mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
@@ -590,6 +591,24 @@ pub struct Services {
     /// / unit-test wiring, or `wakeResume` disabled) keeps today's terminal
     /// behavior for transient upstream disconnects. Shared across clones.
     suspend_tracker: Option<Arc<dyn agent_session::SuspendOverlapQuery>>,
+    /// Monitors whose next poll must deliver without waiting out the debounce
+    /// window (`ws.pr.monitor` restart catch-up). Populated by
+    /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
+    /// that acts on each entry; shared across clones.
+    pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
+    /// Poll cadence (seconds) for the centralized PR-monitor loop
+    /// (`[prMonitor] pollSeconds`). `None` takes
+    /// [`pr_monitor::DEFAULT_PR_MONITOR_POLL_SECONDS`]; values below the
+    /// floor are clamped at read time.
+    pr_monitor_poll_seconds: Option<u64>,
+    /// Debounce quiet window (seconds) before a changed PR's consolidated
+    /// wake is delivered (`[prMonitor] debounceSeconds`). `None` takes
+    /// [`pr_monitor::DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS`]; values below the
+    /// floor are clamped at read time.
+    pr_monitor_debounce_seconds: Option<u64>,
+    /// Cap on concurrently active PR monitors per agent (mirrors
+    /// `[hooks] maxPerAgent`).
+    pr_monitors_max_per_agent: u32,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -675,7 +694,33 @@ impl Services {
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             suspend_tracker: None,
+            pr_monitor_catch_up: Arc::new(Mutex::new(HashSet::new())),
+            pr_monitor_poll_seconds: None,
+            pr_monitor_debounce_seconds: None,
+            pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
         }
+    }
+
+    /// Override the PR-monitor poll cadence (`[prMonitor] pollSeconds`);
+    /// wired from `Config` by the composition root. Values below the floor
+    /// are clamped when read.
+    pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+        self.pr_monitor_poll_seconds = Some(seconds);
+        self
+    }
+
+    /// Override the PR-monitor debounce window (`[prMonitor]
+    /// debounceSeconds`); wired from `Config` by the composition root.
+    /// Values below the floor are clamped when read.
+    pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
+        self.pr_monitor_debounce_seconds = Some(seconds);
+        self
+    }
+
+    /// Override the per-agent active-monitor cap.
+    pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
+        self.pr_monitors_max_per_agent = cap;
+        self
     }
 
     /// Wire the host suspend-overlap query (Task C): the composition root passes
