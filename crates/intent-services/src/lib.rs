@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod discovery_cache;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -22349,9 +22350,7 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
 pub fn discover_providers_with_npx_overrides(
     provider_paths: &std::collections::HashMap<String, String>,
 ) -> serde_json::Value {
-    let providers = intent_providers::discover_providers_with_overrides(&|key| {
-        provider_paths.get(key).cloned()
-    });
+    let providers = discovery_cache::discover_providers_cached(provider_paths);
     let npx_status = intent_providers::probe_npx();
 
     // Probe npx version if we found the binary

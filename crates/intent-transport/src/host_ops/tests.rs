@@ -443,6 +443,95 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));
 }
 
+/// `find_binary_op` caches a POSITIVE resolution: removing the resolved
+/// binary after the first call must not flip a second, cached call to
+/// unavailable within the TTL.
+#[cfg(unix)]
+#[test]
+fn find_binary_op_caches_positive_result_across_removal() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_temp_dir("cache-positive");
+    let dir = dir.path();
+    let name = format!(
+        "intent-cache-pos-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let bin = dir.join(&name);
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let common_paths = vec![bin.to_string_lossy().into_owned()];
+
+    let first = find_binary_op(&name, &common_paths);
+    assert_eq!(first["available"], true, "{first}");
+
+    std::fs::remove_file(&bin).unwrap();
+
+    let second = find_binary_op(&name, &common_paths);
+    assert_eq!(
+        second["available"], true,
+        "a cached positive must survive the binary's removal within the TTL: {second}"
+    );
+}
+
+/// `find_binary_op` never caches a NEGATIVE resolution: installing the binary
+/// right after an unavailable call must be visible on the very next call.
+#[cfg(unix)]
+#[test]
+fn find_binary_op_does_not_cache_negative_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_temp_dir("cache-negative");
+    let dir = dir.path();
+    let name = format!(
+        "intent-cache-neg-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let bin = dir.join(&name);
+    let common_paths = vec![bin.to_string_lossy().into_owned()];
+
+    let first = find_binary_op(&name, &common_paths);
+    assert_eq!(first["available"], false, "{first}");
+
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let second = find_binary_op(&name, &common_paths);
+    assert_eq!(
+        second["available"], true,
+        "a not-found result must never be cached, so an install is picked up \
+         immediately: {second}"
+    );
+}
+
+/// Distinct `common_paths` hint lists must not share a cache entry — a
+/// resolution found via one hint set must not leak into a call with a
+/// different (and here, empty/non-matching) hint set for the same name.
+#[cfg(unix)]
+#[test]
+fn find_binary_op_cache_key_includes_common_paths() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_temp_dir("cache-key-paths");
+    let dir = dir.path();
+    let name = format!(
+        "intent-cache-key-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    );
+    let bin = dir.join(&name);
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let common_paths = vec![bin.to_string_lossy().into_owned()];
+
+    let hinted = find_binary_op(&name, &common_paths);
+    assert_eq!(hinted["available"], true, "{hinted}");
+
+    // No hint at all for this never-on-PATH name: must resolve independently
+    // (unavailable), never reusing the hinted call's cached entry.
+    let unhinted = find_binary_op(&name, &[]);
+    assert_eq!(
+        unhinted["available"], false,
+        "a different common_paths hint list must not share the cache entry: {unhinted}"
+    );
+}
+
 #[test]
 fn tool_availability_op_defaults_to_canonical_tool_set() {
     let v = tool_availability_op(None);

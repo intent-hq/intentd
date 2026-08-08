@@ -30,10 +30,28 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use intent_core::path_utils;
+use intent_core::{path_utils, DiscoveryCache};
 use serde_json::{json, Map, Value};
+
+/// How long a positive `host.findBinary` resolution is served from cache.
+/// Matches the daemon's other short-TTL discovery caches
+/// (`intent-services::provider_auth::AUTH_CACHE_TTL`,
+/// `intent-services::discovery_cache::DISCOVERY_CACHE_TTL`): long enough to
+/// spare a burst of `host.findBinary` / `host.toolAvailability` calls the
+/// PATH/filesystem walk, short enough that a real install shows up soon.
+const FIND_BINARY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Process-wide cache for [`find_binary_op`], keyed by `name` plus the
+/// caller-supplied `common_paths` (a different hint list is a different
+/// resolution, so it gets its own entry). Only `available: true` results are
+/// cached — see [`find_binary_op`].
+fn find_binary_cache() -> &'static DiscoveryCache<Value> {
+    static CACHE: OnceLock<DiscoveryCache<Value>> = OnceLock::new();
+    CACHE.get_or_init(|| DiscoveryCache::new(FIND_BINARY_CACHE_TTL))
+}
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
 /// so `check_git` is unit-testable without spawning `which`/`where`.
@@ -368,11 +386,23 @@ fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
 /// Production `host.findBinary` — resolve `name` (honouring the optional caller
 /// `common_paths`) and best-effort version-probe it. Rejects unsafe names with
 /// `available:false`.
+///
+/// Cached (TTL, positives only — see [`find_binary_cache`]): a resolved
+/// binary rarely moves within the TTL window, so repeated `findBinary` /
+/// `toolAvailability` calls for the same `(name, common_paths)` skip the
+/// PATH/filesystem walk and the `--version` spawn entirely. An unresolved
+/// name is never cached, so installing the binary is picked up on the very
+/// next call.
 pub(crate) fn find_binary_op(name: &str, common_paths: &[String]) -> Value {
     if !is_safe_binary_name(name) {
         return json!({ "available": false });
     }
-    build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe)
+    let cache_key = format!("{name}\u{1}{common_paths:?}");
+    find_binary_cache().get_or_compute(
+        &cache_key,
+        || build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe),
+        |result| result["available"] == true,
+    )
 }
 
 /// The default tool set probed by `host.toolAvailability` when the caller does
