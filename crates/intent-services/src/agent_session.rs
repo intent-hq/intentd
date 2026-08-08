@@ -22,7 +22,7 @@ use intent_acp::session::{
 use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
     AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_ACTIVITY, AGENT_STREAM_END, AGENT_STREAM_START,
-    AGENT_STREAM_STATUS, AGENT_TOOL_CALL, CHAT_STREAM_DELTA,
+    AGENT_STREAM_STATUS, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA,
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
@@ -168,6 +168,23 @@ pub struct ThoughtLevelOption {
     /// The values the select accepts (flattened across groups). Used to skip
     /// an effort the adapter would reject.
     pub values: Vec<String>,
+}
+
+impl ThoughtLevelOption {
+    /// The levels worth surfacing to clients (PROTOCOL §5.5, Option C): the
+    /// advertised values minus the adapter's case-insensitive `"default"`
+    /// sentinel (claude-agent-acp lists it alongside the real levels; it is a
+    /// clear-selection affordance, not a level). `None` when nothing remains —
+    /// the persisted column stays NULL rather than `Some(empty)`.
+    pub fn surfaced_levels(&self) -> Option<Vec<String>> {
+        let levels: Vec<String> = self
+            .values
+            .iter()
+            .filter(|v| !v.eq_ignore_ascii_case("default"))
+            .cloned()
+            .collect();
+        (!levels.is_empty()).then_some(levels)
+    }
 }
 
 /// Accumulates streamed assistant content into one transcript message per turn,
@@ -1383,10 +1400,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         })
     }
 
@@ -1439,8 +1459,11 @@ impl Services {
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model and thought-level resolutions are skipped for
-        // the same reason.
+        // The effective-model, thought-level, and effort-levels resolutions
+        // are skipped for the same reason — in particular the loser must NOT
+        // persist (or clear) `effort_levels`: its `None` means "CAS lost /
+        // unknown", not "the provider advertised no selector", and writing it
+        // would clobber what the winner just persisted.
         let (modes, thought_level) = if canonical == new_acp_session_id {
             self.persist_effective_model(
                 &workspace_id,
@@ -1450,6 +1473,8 @@ impl Services {
             )
             .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
+            self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+                .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
@@ -1546,10 +1571,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         }))
     }
 
@@ -2841,6 +2869,53 @@ impl Services {
             crate::publish_event_transient(&self.event_bus, event);
         } else {
             crate::publish_event(&self.event_bus, event).await;
+        }
+    }
+
+    /// Persist the session-discovered effort levels (PROTOCOL §5.5, Option C)
+    /// after a session open: the `thought_level` selector's surfaced levels
+    /// ([`ThoughtLevelOption::surfaced_levels`] — advertised values minus the
+    /// `"default"` sentinel), `None` when the provider advertised no selector
+    /// (clears a set persisted by a previous provider). Emits `agent:updated`
+    /// with `effortLevels` ONLY when the stored set actually changed
+    /// ([`set_agent_effort_levels`](intent_store::Store::set_agent_effort_levels)
+    /// reports the change), so the every-open wholesale replace never spams
+    /// the bus. Best-effort: a store error is logged and never fails session
+    /// startup.
+    pub(crate) async fn persist_session_effort_levels(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        thought_level: Option<&ThoughtLevelOption>,
+    ) {
+        let levels = thought_level.and_then(ThoughtLevelOption::surfaced_levels);
+        match self
+            .store
+            .set_agent_effort_levels(workspace_id, agent_id, levels.as_deref(), &now_iso())
+            .await
+        {
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "effortLevels": levels.map_or(Value::Null, |l| json!(l)),
+                    }),
+                )
+                .await;
+            }
+            Ok(false) => {
+                // Unchanged set — no write, no event (the common case).
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "persist session effort levels failed"
+                );
+            }
         }
     }
 }

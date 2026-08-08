@@ -274,6 +274,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::RuntimeIdle, // settled after heal
             is_active: true,
@@ -328,6 +329,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::RuntimeIdle,
             is_active: true,

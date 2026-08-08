@@ -145,6 +145,7 @@ fn session(
         name_explicitly_set,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,

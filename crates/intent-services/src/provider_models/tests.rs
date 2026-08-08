@@ -763,7 +763,7 @@ fn isolated_codex_home_without_user_dir_is_empty() {
 #[test]
 fn codex_probe_command_env_carries_isolated_codex_home() {
     let cmd = super::probe::AcpProbeCommand::binary(std::path::PathBuf::from("codex-acp"), vec![]);
-    let (cmd, home) = super::codex_probe_with_isolated_home(cmd).unwrap();
+    let (cmd, home) = super::with_isolated_codex_home(cmd).unwrap();
     let envs = cmd.env_vars();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].0, "CODEX_HOME");

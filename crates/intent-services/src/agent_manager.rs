@@ -2155,8 +2155,11 @@ impl AgentManager {
     /// the config id comes from the adapter's own `configOptions`
     /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
     /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. Best-effort — a rejected call
-    /// is logged and never fails session startup.
+    /// such option silently ignores the field. The selector's surfaced levels
+    /// are persisted inside the open/recreate/resume fns themselves — where
+    /// the CAS outcome is known, so a lost CAS never clears them (see
+    /// [`Services::persist_session_effort_levels`]). Best-effort — a
+    /// rejected call is logged and never fails session startup.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
@@ -8086,6 +8089,7 @@ mod role_reminder_tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -9968,6 +9972,7 @@ mod agent_retry_tests {
             name_explicitly_set: false,
             model: Some("model-1".to_string()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("provider-1".to_string()),
             system_prompt: None,
             specialist: None,
