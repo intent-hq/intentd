@@ -41,8 +41,8 @@ pub use config::{
 };
 pub use discover::{
     discover_providers, discover_providers_with_overrides, find_npx, find_provider_binary,
-    gated_reason, gated_reason_with_env, not_installed_detail, probe_npx, resolve_on_path,
-    NpxStatus, ProviderAvailability, SecondaryBinary,
+    gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
+    provider_availability_for, resolve_on_path, NpxStatus, ProviderAvailability, SecondaryBinary,
 };
 pub use models::{
     create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
