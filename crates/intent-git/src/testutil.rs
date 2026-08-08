@@ -92,3 +92,41 @@ pub fn write_blob(worktree: &Path, bytes: &[u8]) -> String {
     let repo = Repository::open(worktree).unwrap();
     repo.blob(bytes).unwrap().to_string()
 }
+
+/// Register `child_worktree` (an existing repo with at least one commit) as a
+/// submodule of `worktree` at the worktree-relative path `sub_rel`, then
+/// commit the resulting gitlink + `.gitmodules` — a real submodule fixture
+/// for testing the gitlink guard. `worktree` must already have a commit
+/// (parent commit for the gitlink-add commit).
+pub fn add_submodule(worktree: &Path, child_worktree: &Path, sub_rel: &str) {
+    let repo = Repository::open(worktree).unwrap();
+    let url = child_worktree.to_string_lossy().to_string();
+    let sub_path = worktree.join(sub_rel);
+    // `submodule()` (git_submodule_add_setup) creates the target directory;
+    // remove it so the local clone below can populate a clean directory.
+    let mut sm = repo.submodule(&url, Path::new(sub_rel), true).unwrap();
+    let _ = std::fs::remove_dir_all(&sub_path);
+    Repository::clone(&url, &sub_path).unwrap();
+    sm.add_to_index(true).unwrap();
+    sm.add_finalize().unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = Signature::now("Test", "test@example.com").unwrap();
+    let parents = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => vec![repo.find_commit(oid).unwrap()],
+        None => Vec::new(),
+    };
+    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "add submodule",
+        &tree,
+        &parent_refs,
+    )
+    .unwrap();
+}
