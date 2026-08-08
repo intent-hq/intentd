@@ -46,6 +46,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
+mod acp_adapter;
 mod agent_manager;
 mod agent_ops;
 mod agent_session;
@@ -84,6 +85,7 @@ mod line_attribution;
 mod linear_ops;
 mod model_catalog;
 mod note_ops;
+mod one_shot_acp;
 mod pagination;
 mod pr_monitor;
 mod pr_ops;
