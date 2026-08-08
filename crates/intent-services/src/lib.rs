@@ -3365,6 +3365,12 @@ impl Services {
         // any hook was still active; kept for shape parity with the live
         // emit sites should a hook be scheduled in the window.
         self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
+        // shape-parity stamp — always empty (omitted) here, since the
+        // active-pr-monitors guard above deferred when any monitor was still
+        // active.
+        self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+            .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: session.workspace_id,

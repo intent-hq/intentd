@@ -1406,12 +1406,14 @@ impl Services {
             "status": status_value,
         });
         // Idle-visibility: a synthesized idle carries the same
-        // `waitingOnHooks` stamp as a live `agent:idle` emit (omitted when
-        // the child owns no active hook) and the same emit-time
-        // `isWaitingForOtherAgents` flag (raw pending-watch derivation, no
-        // 2-cycle guard — matching the live emit sites).
+        // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
+        // `agent:idle` emit (each omitted when the child owns none) and the
+        // same emit-time `isWaitingForOtherAgents` flag (raw pending-watch
+        // derivation, no 2-cycle guard — matching the live emit sites).
         if event_type == intent_core::events::AGENT_IDLE {
             self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+                .await;
             data["isWaitingForOtherAgents"] =
                 serde_json::json!(!self.list_watches_for_parent(child_id).is_empty());
         }
@@ -1624,7 +1626,7 @@ impl Services {
                         // delivery path later.
                         if event_type == intent_core::events::AGENT_IDLE
                             && !self
-                                .active_pr_monitors_for_agent(&child_id)
+                                .annotate_waiting_on_pr_monitors(&child_id, &mut data)
                                 .await
                                 .is_empty()
                         {
