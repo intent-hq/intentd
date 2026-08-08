@@ -1400,10 +1400,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         })
     }
 
@@ -1456,8 +1459,11 @@ impl Services {
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model and thought-level resolutions are skipped for
-        // the same reason.
+        // The effective-model, thought-level, and effort-levels resolutions
+        // are skipped for the same reason — in particular the loser must NOT
+        // persist (or clear) `effort_levels`: its `None` means "CAS lost /
+        // unknown", not "the provider advertised no selector", and writing it
+        // would clobber what the winner just persisted.
         let (modes, thought_level) = if canonical == new_acp_session_id {
             self.persist_effective_model(
                 &workspace_id,
@@ -1467,6 +1473,8 @@ impl Services {
             )
             .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
+            self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+                .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
@@ -1563,10 +1571,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         }))
     }
 

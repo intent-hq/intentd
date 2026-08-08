@@ -653,6 +653,124 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     );
 }
 
+/// PROTOCOL §5.5 (Option C): the effort levels a provider's `thought_level`
+/// select advertises at session open are persisted and served as
+/// `effortLevels` on the agent wire payloads — announced by an
+/// `agent:updated { effortLevels }` event and carried by `agent.get` — all
+/// over the real WSS transport.
+#[tokio::test]
+async fn effort_levels_persisted_and_served_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        // The provider advertises a thought_level select (low/medium/high).
+        ("MOCK_AGENT_THOUGHT_LEVEL", "medium"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "EffortLevels E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "EffortLevels", "model": "mock:sonnet" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert!(
+        created["agent"].get("effortLevels").is_none(),
+        "no levels before the first session open: {created}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The session open persisted the discovered levels and announced them
+    // with agent:updated { effortLevels } (PROTOCOL §6 events.event shape).
+    let mut saw_effort_update = false;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"].as_str() == Some(&agent_id)
+            && ev["data"]["effortLevels"] == json!(["low", "medium", "high"])
+        {
+            saw_effort_update = true;
+        }
+        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"].as_str() == Some(&agent_id) {
+            break;
+        }
+    }
+    assert!(
+        saw_effort_update,
+        "agent:updated with effortLevels [low, medium, high] on the wire"
+    );
+
+    // agent.get serves the persisted set as `effortLevels` (camelCase).
+    let got = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["agent"]["effortLevels"],
+        json!(["low", "medium", "high"]),
+        "agent.get carries the session-discovered effortLevels: {got}"
+    );
+}
+
 /// A provider that advertises no `thought_level` option silently ignores the
 /// session's `reasoningEffort` — no `session/set_config_option` is issued and
 /// the turn completes normally.
